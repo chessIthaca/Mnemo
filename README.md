@@ -115,8 +115,8 @@ PLAN.md               the technical-decisions log
 - [Node.js LTS](https://nodejs.org)
 
 ```bash
-git clone https://github.com/<owner>/mnemo
-cd mnemo
+git clone https://github.com/chessIthaca/Mnemo.git
+cd Mnemo
 npm install
 npm start
 ```

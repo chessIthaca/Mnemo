@@ -1,0 +1,10 @@
++++
+title = "README is the marketing front door — deep detail lives in docs/FEATURES.md + docs/CONFIGURATION.md"
+created = "2027-01-11"
++++
+
+As of 2026-09-12 (commit 4d4a709, branch wt/mnemo, plan 2c19aca0) the repo's front door is split:
+- README.md = marketing front door, ~176 lines / ~10 KB. Sections: hero + tagline + STATIC shields.io badges; Why Mnemo exists (pain bullets + "allocation problem" argument); Highlights table (7 rows, one line each); The enforced workflow (assets/workflow.svg + 4 states); How the repository works (annotated tree, lib/app split, .coding/ side-car, vendor patches); Quickstart — clone & build (Windows + macOS prereqs, npm start / dev / build / bundle, manual `cd src-tauri && npx tauri dev|build`); Development & tests (cargo test, cargo test -p mnemo-app, npx tsc --noEmit, npm test, optional browser/embeddings features); Where the detail lives (docs map); proof paragraph; MIT.
+- docs/FEATURES.md = the old README's Key ideas + Key features + The enforced workflow, preserved byte-exact (84 lines, only the workflow img path differs: ../assets/workflow.svg).
+- docs/CONFIGURATION.md = the old README's Configuration section, byte-exact (15 lines): ~/.mnemo/config.toml, [context], [models] routing/effort, endpoints.toml stop_boundary_strings/stop_token_ids, mcp.toml two-scope, per-project .coding/.
+CONVENTION going forward: new feature/config detail goes into docs/ (FEATURES.md / CONFIGURATION.md), NOT the README; the README stays a scannable front door. Technique used to move big single-line bullets byte-exactly: copy the source file (Copy-Item) then trim with file_edit line-range deletes — never retype long lines. Proof numbers must be RE-MEASURED and dated when touched (2026-09-12 values: 651 plans, 858 review reports, 503 knowledge records, ~210k production Rust+TS lines, 2,625 Rust + 1,100 frontend tests). Both docs files must end with exactly one LF; .gitattributes pins `* text=auto eol=lf`. Clone URL is https://github.com/chessIthaca/Mnemo.git (read from .git/config — the repo's real origin).

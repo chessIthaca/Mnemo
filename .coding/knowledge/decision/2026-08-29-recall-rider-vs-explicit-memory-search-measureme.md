@@ -1,0 +1,7 @@
++++
+title = "Recall-rider vs explicit memory_search — measurement plan (do NOT de-emphasize yet)"
+created = "2026-08-29"
+status = "superseded"
++++
+
+DECISION (2026-09-15, planning-follow-ups session, plan 0fa048a9): recall-rider vs explicit memory_search — do NOT de-emphasize explicit memory_search in TOOL_STRATEGY yet; decide after ~2 weeks of real steering data. Rationale: during b30475ba, 6/9 mid-session explicit memory_search calls returned noise the fresh auto-recall already carried — but the round-2 counters were not yet trustworthy (substring detection misfired on content-bearing outputs). Now measurable: get_steering_stats (Trace tab) counts exact per-marker fired/switched — comparison plan for the future analysis session: recall-rider fired vs switched tells whether passively-surfaced riders actually change tool choice; compare against observed memory_search redundancy rate; also fold in the search-usage tally from HOW memory 2026-08-29 (.literal "RECALLED CONTEXT" walk-vs-index miss, wrong-guess whole-slice reads). The 14-day rider age gate (this plan's step 2, steering.rs recalled_context_block_at) is the cheap half of the fix — old digests stop riding, so the rider stays signal. Only if riders + auto-recall carry the load AND explicit searches stay mostly redundant should TOOL_STRATEGY demote proactive memory_search to confirmation lookups. Counters live in src/agent/steering_stats.rs (tool-scoped since this plan), surfaced via src-tauri/src/ipc/trace.rs get_steering_stats, rendered in the Trace tab.

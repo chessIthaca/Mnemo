@@ -1,0 +1,6 @@
+{
+  "kind": "finished",
+  "reason": {
+    "other": "max_tokens"
+  }
+}

@@ -1,0 +1,6 @@
++++
+title = "provider SSE plumbing shared in sse_util.rs; backlog's parse_data_url divergence is intentional — do not unify"
+created = "2026-12-31"
++++
+
+DECISION (backlog 4047c82f, plan f8ca488f, commits c2a14d3/20468ef on wt/agenticcoding): the provider SSE/stream plumbing lives in src/provider/sse_util.rs — the four formerly-duplicated helpers (truncate_raw_stream, header_str, error_chain, finish_reason_label), the SseOutcome enum, and ONE parse_data_url, all pub(crate); openai.rs and anthropic.rs import from it (no local copies — do not re-duplicate). The shared parse_data_url takes the png-default empty-media-type contract (an empty media type in a provider image payload would be invalid on the wire). src/backlog.rs KEEPS its own intentionally-divergent parse_data_url (empty media type stays empty — it feeds mime_to_ext's default "bin" extension, a file-writing concern): do NOT unify the two — the behaviors serve different callers, and both carry doc notes saying so. parse_sse_buffer stays provider-local: the OpenAI (choices[] chunks) and Anthropic (event-typed) protocols differ materially; only verified byte-identical pieces are shared. Note: the original quality review's claim of a third parse_data_url copy in openai.rs was verified false during planning (openai.rs holds none).

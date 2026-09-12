@@ -1,0 +1,7 @@
++++
+title = "tool-card expanded views — file_edit diff, read_files line ranges, line-aware links (4a31d1c, wt/agenticcoding, unmerged)"
+created = "2026-12-28"
+status = "superseded"
++++
+
+SPEC: Tool-card expanded views (commit 4a31d1c + 27535b7 on wt/agenticcoding — NOT yet merged to main, pending merge_to_main; plan 9cf99d5e, backlog cb3461fe). Expanding a file_edit card renders the edit's Rust-computed unified diff from result.data.diff (file_edit.rs:905) via UnifiedDiffView — failed edits/missing payload fall back to the generic args+output rendering. Expanding a read_files card renders a compact clickable per-file line-range list parsed from the result's section headers (`=== {path} (lines X-Y of Z) ===`, plus (error)/(empty range) variants; SYMBOL NUDGE prefix + truncation tails ignored) — unparseable output falls back. File links (header chips + expanded rows) deep-link the Files viewer to the read line: openFileInViewer(path, line?) → requestFileOpen → pendingFileOpen {path, line} → FileViewer revealLine state (reset to null on every manual open) → SourceEditor revealLine, whose effect deps INCLUDE reloadToken so a same-file/same-line re-click re-scrolls (review LOW 1 fix). All pure helpers live in frontend/src/lib/toolCardPaths.ts (fileEditDiff, parseReadFilesSections, argPathLines, PathLine, ToolCardChip.line) with vitest contracts in toolCardPaths.test.ts + SourceEditor.test.ts (source-contract style, ?raw imports). Review: .coding/reviews/2026-12-28-toolcard-expanded-views-review-round2.md (PASS).

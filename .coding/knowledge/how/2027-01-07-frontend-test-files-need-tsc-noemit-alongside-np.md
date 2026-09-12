@@ -1,0 +1,6 @@
++++
+title = "frontend test files need tsc --noEmit alongside npm test (vitest hides type defects)"
+created = "2027-01-07"
++++
+
+For every new or modified frontend test file, run BOTH `npm test` AND `npx tsc --noEmit` in frontend/ — vitest's esbuild transform erases `import type` statements without resolving them, so type-level defects are invisible to a green test run while `npm run build` (tsc && vite build) still breaks. Proven twice in plan 2e89f955 (quality review LOW 3, agentState.test.ts, commit 5f76bc2): (1) an invalid `import type { TranscriptEntry } from "./agentState"` — the module imports it from ../lib/types but never re-exports it — vitest green, tsc TS2305; (2) an unannotated array spread `[...atCap, { kind: "error", ... }]` widened the literal's kind to string — vitest green, tsc TS2345. The second was invisible even to the round-1 reviewer's read-based analysis; only the tsc run caught it. Fix pattern: split type imports to their true source module (match the sibling test file's imports) and annotate array-literal consts with their element type so the contextual type narrows fresh literals. Also: agentState.ts now has direct coverage (agentState.test.ts, 24 tests, registered in vitest.config.ts) — the Maint H3 "fully unit-testable" claim is demonstrated; the image-budget side remains in agentState.images.test.ts.

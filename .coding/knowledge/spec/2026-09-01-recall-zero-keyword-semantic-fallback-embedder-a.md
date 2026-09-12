@@ -1,0 +1,6 @@
++++
+title = "recall zero-keyword semantic fallback + embedder-aware sim weight (in main)"
+created = "2026-09-01"
++++
+
+SPEC: Memory recall — zero-keyword semantic fallback + embedder-aware cosine weight (plan cb1914b9) — in main at 4e3f987 (2026-12-06, merge_to_main skill). (1) FtsResult::NoMatches now runs the SAME capped scan as the FTS-unavailable branch (load_recent_locked, FULL_SCAN_FALLBACK_CAP = 200 most-recent) instead of returning empty — the already-computed query embedding finally gets used in the exact case it exists for (paraphrase, unicode61 stemming misses like worktree/worktrees, zero token overlap). Keyword hits remain the fast path; the scan is bounded and identical in cost to the long-shipped unavailable path. (2) Score formula's cosine term is embedder-aware: 0.2 when embedder.model_id() == "hash" (token-overlap noise), 0.35 for real embedding models (bundled MiniLM default) — crossover vs the flat 0.3 keyword boost is sim > 6/7 ≈ 0.857. New test embedders MUST override model_id() (contract documented on the trait). Tests: recall_semantic_fallback_on_zero_keyword_hits, sim_weight_follows_embedder_model (AnchorEmbedder maps synonym pairs to shared axes). Full suite 1716 passed / 0 failed. Round-1 FINDINGS (2 doc lows) fixed, round-2 PASS.

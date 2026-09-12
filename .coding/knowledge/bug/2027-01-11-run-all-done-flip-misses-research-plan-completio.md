@@ -1,0 +1,6 @@
++++
+title = "run-all done-flip misses research-plan completions (no finish call)"
+created = "2027-01-11"
++++
+
+BUG: run-all done-flip misses research-plan completions (second done-orphan failure mode). Symptom: a backlog item whose work is fully landed keeps re-dispatching after a research plan closes it — the item stays pending/in_flight with a fresh dispatch pointer each time (observed on cd7bd623 / LlmTraceView version-skip, twice on 2027-01-12; also 395d6dad's item earlier). Root cause: the automatic done-flip appears keyed to the finish call — implementation plans exit Reviewing via finish (item a09199b1/plan aa3c8dae flipped correctly), but research plans reach Complete WITHOUT finish, so the flip never fires. Dispatch-time linkage itself works (the machinery writes plan_id + in_flight onto the item at create_plan). Interim mitigation: manual backlog_status(in_flight → done) after the research plan reaches Complete (used for cd7bd623, plan b1a89ab5). Fix direction for the run-all done-orphan guard (backlog 6c6966b9): fire the flip on ANY plan completion (research included), not only on finish. Detail: SPEC amendment in .coding/knowledge/spec/2027-01-07-trace-record-mutation-version-llmtraceview-detai.md.

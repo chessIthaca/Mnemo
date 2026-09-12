@@ -1,0 +1,10 @@
++++
+title = "symbol nudge carries the symbol id — graph_context(id=...) (b7150a3, superseded 2026-08-29 wording)"
+supersedes = "2026-08-29-search-search-read-symbol-nudge-merged-into-main"
+created = "2026-08-29"
+status = "superseded"
++++
+
+SPEC (2026-09-15, plan b30475ba, commits b7150a3 + d01e4ee on wt/agenticcoder, round-2 verify PASS; supersedes the 2026-08-29 nudge spec): the search/search_read SYMBOL NUDGE NOW EMBEDS THE SYMBOL ID — new text: "'<pattern>' is an indexed symbol — graph_context(id=\"file::name::line\") gives its definition + callers in one call; prefer the graph tools for symbol lookups (search is for text)". Backing lookup: CodeGraph::symbol_id(name) -> Option<String> (store.symbol_id_named, exact-match `SELECT id ... WHERE name = ?1 ORDER BY id LIMIT 1`, best-effort None on error/unindexed) — replaces symbol_exists in the nudge (symbol_exists itself unchanged, other callers intact). The "graph_search resolves it" phrasing and the old wording are gone; tests bare_identifier_symbol_searches_earn_the_graph_nudge / ..._earns_the_graph_nudge pin the embedded id (a.rs::hello::1). Pinning test for the metric marker: steering marker "is an indexed symbol" in src/agent/steering_stats.rs must track any future wording change. Related round-2 additions in the same commit: read_files whole-file SYMBOL NUDGE (marker "SYMBOL NUDGE:"), spawn_agent RECALLED CONTEXT rider (src/tool/steering.rs), steering metrics (src/agent/steering_stats.rs, IPC get_steering_stats, Trace tab).
+
+AMENDMENT (2026-12-29, backlog b804012f, plan 7b77cf0c): the pinned sentence is UNCHANGED but its firing window narrowed — an exact single-name hit now AUTO-DELEGATES (the answer rides inline; the block's first line still carries the marker), so the advisory note fires on the escape repeat (re-issue the same query → plain search + this nudge) and for fuzzy-only alternation branches. The byte-pin assertions moved into the escape-repeat phase of the same tests (bare_identifier_symbol_searches_earn_the_graph_nudge + the search_read twin).

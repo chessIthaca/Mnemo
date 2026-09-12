@@ -1,0 +1,25 @@
+## Verdict: PASS
+
+Commit a7bed2a is a bookkeeping-only close-out for backlog 2980ca67 (provider-correct model display), and the already-shipped conclusion is sound: the duplicate-model-id scenario is genuinely fixed by the serving-endpoint-on-the-wire chain (commit 0ce7c01, merged via 0e12ffb — both confirmed in the current branch ancestry via git log). No findings; two non-blocking verification notes at the end.
+
+**1. Bookkeeping-only tree change — confirmed.**
+`git show --stat a7bed2a` touches exactly two files: `.coding/backlog.jsonl` (one line: item 2980ca67 `pending` → `done` with a note citing commit 0ce7c01 / merge 0e12ffb) and `.coding/plans/3bf357b3.md` (+15 lines: goal/context/steps 1–2 checked, step 3 unchecked — consistent with an in-progress review round). The JSONL edit preserves `text`/`images`/`created_at` and only adds `status` + `note`. No source changes, no new issues introduced.
+
+**2. The shipped fix genuinely prevents first-match labeling on the wire path.**
+- StatusBar.tsx:146: `const activeEndpoint = wireProvider ?? endpointForModel(endpoints, effectiveModel) ?? provider` — wire-first; the comment at :137–144 names backlog 2980ca67 and documents first-match as the unreachable-on-wire fallback. `endpointForModel` has exactly one production caller (StatusBar; graph_context + text search agree — the only other consumer is endpoints.test.ts), and `agentProviders` is consumed by no other UI surface (only StatusBar.tsx:86/:145 across all .tsx).
+- Emission coverage — every path that sets the model also stamps the provider. The six resolver paths in `resolve_turn_provider` (src/agent/loop_impl.rs) set both in lockstep: skill override (:756–761), explicit picker pin (:779–780), forced model (:796–798), no-resolver default (:808–809), no-override default (:820–821), built override (:831–832). Both swap paths clear both: `swap_provider_into_loops` (src-tauri/src/ipc/config_io.rs:195–198) and `swap_provider_into_loop` (:250–254). Event emissions: `set_model` Swapped arm sends `provider: Some(endpoint_name)` (src-tauri/src/ipc/agent.rs:506–516); `swap_live_provider` sends the provider label captured before the Arc move (config_io.rs:282–301).
+- Backend plumbing: `effective_provider_name` (loop_impl.rs:645–658) = resolved non-empty → default provider's name → None; `LlmClient::provider_name` defaults to `""` for test mocks (src/provider/mod.rs:396–398) and real clients override with `config.provider` (openai.rs:583–585, anthropic.rs:716–718). `AgentInfo.provider` (agent.rs:158–159) and `SerializableAgentEvent::ModelChanged.provider` (channels.rs:456–457) both carry `skip_serializing_if = "Option::is_none"` (+ `serde(default)`), pinned byte-stable by `model_changed_roundtrips_json` (channels.rs:1074–1125: Some serializes, None skipped, absent deserializes to None).
+- Frontend plumbing: `registerAgents` presence-wins upsert (useAgentStore.ts:636–641); `reduceModelChanged` → `mergeAgentProviders` — non-empty upserts, null/empty CLEARS (agentEventReducer.ts:1059–1075, :1090–1100); effects merged via `applyAgentEvent` (:1391–1395); exited-agent cleanup deletes the entry (:1359–1360). No stale-endpoint label can survive a model change.
+
+**3. Verification evidence holds.**
+- `useAgentStore.test.ts:1005` "model_changed: stamps the serving endpoint into agentProviders (collision-safe label)" stamps `provider: "zai"` and asserts the store value, then asserts provider-less and empty-string events clear it — verified present.
+- `useAgentStore.test.ts:1334–1355` registerAgents presence-wins + the zai→openai switch at :1354 — verified present.
+- Rust roundtrip pin (channels.rs:1074) + frontend contract test `event-model-changed` (ipc-contract.test.ts:273) with a provider-less fixture (event-model-changed.json) — verified present.
+- The plan/commit's test counts (useAgentStore + preview + ipc-contract = 137; full suites cargo 1694 / frontend 684) are plausible and consistent with the suite inventory; I did not re-run tests (read-only review).
+
+**4. Nothing makes the item NOT done.**
+No other display surface uses first-match (only endpointForModel caller is the StatusBar; the agent tab's second line shows the model id, not a provider label). Mock-backed loops (empty provider name) fall back to model-id resolution, which is the documented pre-wire behavior and has nothing to mislabel in that scenario.
+
+**Verification notes (non-blocking, no action required):**
+- (a) The check phrasing "the collision-safe test at :1005 exercises a model id under two endpoints" is slightly imprecise: that test exercises the wire-value stamping/clearing; the two-endpoints first-match scenario itself is pinned separately at endpoints.test.ts:36–39 (`"shared"` under endpoints "a"+"b" → "a"). Together the two tests cover the collision case end-to-end, and the committed files (commit message, plan file) describe them accurately.
+- (b) No StatusBar-level test pins the wire-first precedence of :146 as a unit; the precedence is a single `??` chain, both of whose halves are pinned at store level, and it was code-reviewed. Optional hardening only.

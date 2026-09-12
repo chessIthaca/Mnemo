@@ -1,0 +1,186 @@
+[package]
+name = "mnemo"
+version = "0.1.0"
+edition = "2021"
+description = "Mnemo — a coding-first agentic harness in Rust with persistent memory"
+license = "MIT"
+
+[lib]
+name = "mnemo"
+path = "src/lib.rs"
+
+[features]
+# Headless-browser automation (chromiumoxide): the offscreen_browser_* tools,
+# the shared BrowserManager, and the src/browser module. Off by default —
+# coding-only/library consumers skip the heavy chromiumoxide dep tree; the
+# app (src-tauri) always selects it.
+browser = ["dep:chromiumoxide"]
+# In-process bundled embedding models (fastembed/ONNX): BundledEmbedder, the
+# model catalog, and the install/download helpers. Off by default — light
+# builds fall back to the hash embedder (keyword-tier recall); the app
+# (src-tauri) always selects it.
+embeddings = ["dep:fastembed"]
+# Test factory helpers (Endpoint::test_default, ModelSpec::test_default,
+# OpenAiClientConfig::test_default): compiled for the crate's own tests via
+# cfg(test); dependent crates' test suites (src-tauri) enable this feature
+# through dev-dependencies so the factories are visible cross-crate. Never
+# enabled in release builds.
+test-support = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# Diff
+similar = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.8"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# CLI (used by the lib for SafetyMode ValueEnum + config)
+clap = { version = "4", features = ["derive"] }
+
+# Paths / IDs / dirs
+directories = "5"
+glob = "0.3"
+uuid = { version = "1", features = ["v4", "v5"] }
+regex = "1"
+
+# OS file watching (codegraph auto-index — keeps the graph fresh on every edit)
+notify = "8"
+
+# Token counting
+tiktoken-rs = "0.6"
+
+# Memory store
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Bundled in-process embeddings (ONNX Runtime, no Python/Ollama/cloud).
+# Curated small models (MiniLM, BGE, nomic) download on first use + cache.
+#
+# In-process ONNX embedding models (BundledEmbedder + the Settings model
+# picker/catalog). Optional behind the `embeddings` feature — fastembed drags
+# in ort/ONNX Runtime + hf-hub + tokenizers + the image AV1 encoder chain
+# (~rav1e, minutes of cold compile). Coding-only/light builds skip it and run
+# the built-in hash embedder (keyword-tier recall, status Failed when a model
+# is configured). The app (src-tauri) always selects the feature.
+fastembed = { version = "4", optional = true }
+
+# HTTP for embeddings fallback (Ollama /api/embed)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "stream"] }
+
+# MCP OAuth 2.1: PKCE S256 challenge (base64url(sha256(verifier))). Small
+# pure-Rust crate; base64 is already a dependency.
+sha2 = "0.10"
+
+# Base64 encoding for image attachments (vision fallback + describe_image tool)
+base64 = "0.22"
+
+# Image decode/crop/re-encode for the agentic zoom loop in the image_* tools
+# (grid → model votes → crop the full-resolution original → re-read). Already a
+# transitive dep via fastembed; pinned here so the image_* tools can name it.
+# Only the decoders for the sandbox-accepted image formats are enabled.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+
+# Headless Chromium for the debug browser (CDP automation)
+# Headless-browser automation (offscreen_browser_* tools + the shared
+# BrowserManager the app's Browser tab drives). Optional behind the `browser`
+# feature — a heavy dep tree (~2 min dev link time) that coding-only builds
+# skip (link-time research 2026-12-07, lever #4). The app (src-tauri) always
+# selects the feature.
+chromiumoxide = { version = "0.7", optional = true }
+
+# Temp dirs for the per-launch throwaway Chromium profile (auto-removed on drop)
+tempfile = "3"
+tree-sitter = "0.26.12"
+tree-sitter-rust = "0.24.2"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.5"
+tree-sitter-ruby = "0.23.1"
+tree-sitter-php = "0.24.2"
+tree-sitter-html = "0.23.2"
+
+# Windows-only: user-only DACL for keys.toml (Quality M6). Already present
+# transitively via Tauri; pinned here so the security features are compiled in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# test-util enables tokio's paused/advanceable test clock (tokio::test
+# start_paused) so tests covering retry-backoff paths run instantly instead of
+# sleeping through the real 1s/2s backoff. Features merge with the main dep.
+tokio = { version = "1", features = ["test-util"] }
+
+# Reduced debuginfo for faster linking + smaller binaries in dev/test.
+# `line-tables-only` (= debug = 1) keeps panic backtraces with line numbers —
+# the only thing the dev loop and tests need — while cutting the link time and
+# binary size vs the default `debug = 2` (full debuginfo), which is especially
+# costly for the large Tauri app binary. Applies to all workspace members
+# (workspace-inherited profiles, Cargo 1.64+).
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies lose debuginfo entirely (link-time research 2026-12-07, lever
+# #1): workspace code keeps line-tables (panic backtraces with file:line),
+# while dep rlibs compile without debuginfo — far smaller link input and PDBs
+# for every binary. Dep backtraces keep symbol names but lose file:line.
+[profile.dev.package."*"]
+debug = false
+
+[profile.test]
+debug = "line-tables-only"
+
+# Same override for the test profile: `cargo test` links the lib test bin +
+# every integration bin against the dep set, paying the same debuginfo link
+# cost as the app binary.
+[profile.test.package."*"]
+debug = false
+
+[workspace]
+members = ["src-tauri"]
+# `vendor/tao` is a [patch.crates-io] path override, not a member — excluding
+# it keeps cargo invocations from inside vendor/ from failing with "current
+# package believes it's in a workspace when it's not" (review LOW-2,
+# 2026-09-05).
+exclude = ["vendor"]
+resolver = "2"
+
+# Vendored tao 0.35.4 = 0.35.3 + PR #1215 backport (Windows keyboard/IME
+# self-deadlock fix, AppHangB1). tauri-runtime-wry 2.11.4 / wry 0.55.1 pin
+# tao ^0.35 and 0.36.0 (which carries the fix upstream) does not satisfy
+# that, so the fix is backported onto the exact 0.35.3 the app runs and
+# renumbered 0.35.4. See vendor/tao/PATCHES.md.
+#
+# Vendored wry 0.55.3 = 0.55.1 + two patches: (1) OS-account SSO —
+# create_environment sets AllowSingleSignOnUsingOSPrimaryAccount(true) on
+# the WebView2 environment options, so the Browser tab signs in to AAD/MSA
+# sites with the Windows primary account (Edge-equivalent silent SSO;
+# Tauri 2 exposes no environment hook, so the flag cannot be set from app
+# code). (2) Hard reload — webview2 reload() issues CDP Page.reload with
+# ignoreCache (WebView2's Reload() serves cached subresources, so the
+# Browser tab went stale; no native hard-reload API exists and Tauri 2
+# exposes none). tauri-runtime-wry 2.11.4 pins wry ^0.55; renumbered
+# 0.55.3. See vendor/wry/PATCHES.md.
+[patch.crates-io]
+tao = { path = "vendor/tao" }
+wry = { path = "vendor/wry" }

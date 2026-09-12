@@ -1,0 +1,7 @@
+{
+  "description": "a photo of a cat",
+  "index": 1,
+  "kind": "vision_described",
+  "success": true,
+  "total": 2
+}

@@ -1,0 +1,62 @@
+# DeepSeek provider-errors id 1042 — request forensics + adjudication (2026-09-04)
+
+Source: .coding/logs/traces.jsonl row id=1042 (ts_ms 1788508751217 = 2026-09-04 03:59:11
+-0400, 18 s after commit ec0d794 03:58:53). Error: HTTP 400 "The `reasoning_content` in the
+thinking mode must be passed back to the API." — singleton (no burst; non-retryable
+classification held). Plan-completion auto-continue request (finish tool result +
+harness-injected system messages).
+
+## Request-level
+- model: deepseek-v4-flash, base_url api.deepseek.com/v1/
+- reasoning_effort: max  (thinking mode ON -> tail validation active)
+- messages: 398
+- claude-opus-5 400 burst (ids 1022-1030, "messages.3.content.0.thinking: each thinking
+  block must contain thinking") preceded it in the same session, 03:53-03:56.
+
+## Tail (the decisive shape)
+idx   role       tool_calls  reasoning_content   content_len  note
+394   assistant  1           ABSENT              137          "The commit landed (`ec0d794`)..." + finish tool call
+395   tool       0           ABSENT              443          finish tool result ("review passed, state -> Complete")
+396   system     0           ABSENT              1947         "# RECALLED MEMORIES" harness recall block
+397   system     0           ABSENT              50           "<context footer — cache-stable sentinel, ignore>"
+
+Age-0 assistant turn = msg[394], issuer of the trailing tool result. It went out WITHOUT
+the reasoning_content key.
+
+## Adjudication: the recurrence was a STALE PRE-FIX BINARY — not a hole in b23463c
+1. Code-path proof. `assistant_age` counts ASSISTANT turns only (openai.rs:1360-1376,
+   `age = assistant_count - 1 - seen_assistants`), so msg[394] is age 0 regardless of the
+   trailing tool/system messages. The policy consult is a pure (kind, model) function
+   (policy.rs:225-233; model contains "deepseek" -> DeepSeek policy: reasoning_required,
+   reasoning_field = "reasoning_content"). The age-0 injection (openai.rs:1443-1451) keys
+   the raw echo whenever the key is absent, and the synthetic path (:1529-1532) keys
+   unconditionally. Therefore NO post-b23463c build_request_json can emit an unkeyed
+   age-0 assistant message on a DeepSeek thinking-mode request. The id-1042 body has
+   exactly that artifact -> it was built by a binary predating the fix commit
+   (b23463c, Sep 3 20:06). A long-running app process keeps its launch-time code
+   regardless of what is on disk; the release exe was rebuilt 04:14, 15 min AFTER the
+   incident (consistent with a post-crash rebuild).
+2. Regression test. `deepseek_tail_owner_keyed_when_system_follows_tool_results`
+   (src/provider/openai.rs tests) encodes the exact incident shape — historical unkeyed
+   fallback turn, age-0 finish-call echo (content + tool_calls, unkeyed raw), tool
+   result, then the two harness system messages — and PASSES at HEAD, with assertions
+   that the age-0 echo is keyed ("" value), historical turns stay unkeyed (tolerance
+   probes A/D/G2), and system messages carry no reasoning_content.
+3. Dropped inference: the morning's successful mid-loop requests do NOT prove a post-fix
+   binary — they may have been GLM/Kimi requests (no DeepSeek tail validation; GLM
+   reasoning is mapped into reasoning_content captures), so they do not discriminate.
+   The code-path proof above is the decisive evidence.
+
+## Remedy
+No source change required — HEAD already covers the incident shape. Rebuild + relaunch
+the running app so the process no longer executes pre-fix code. The regression test
+locks the guarantee against future regressions (e.g. a tail-ownership condition added to
+the gate, or an age-semantics change).
+
+## Sibling observation (NOT this bug, uninvestigated)
+claude-opus-5 400 burst ids 1022-1030: "messages.3.content.0.thinking: each thinking
+block must contain thinking" — a Claude-side serialization issue on the same session's
+requests, 9 attempts, 03:53-03:56. Worth a separate investigation.
+
+## Regression test name
+deepseek_tail_owner_keyed_when_system_follows_tool_results

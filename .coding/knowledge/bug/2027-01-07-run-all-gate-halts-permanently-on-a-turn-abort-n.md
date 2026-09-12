@@ -1,0 +1,6 @@
++++
+title = "run-all gate halts permanently on a turn abort — never re-checks when the plan later completes"
+created = "2027-01-07"
++++
+
+Symptom: run-all halts permanently when a dispatched item's turn ends without the plan loop closing (turn abort, clean mid-plan turn end, unverifiable state) — the agent routinely recovers (auto-continue, reviewer-finish resume) and finishes the plan, but the halted run never re-checks: the item strands in_flight, the next item never dispatches (live 2027-01-07: a6a7727a, 207dc316). Root cause: on_main_turn_resolved's non-closure arm (run_all.rs:2049-2069) and turn-failure arm (:2080-2099) call end_run on any non-closure — the completing turn's resolution is blind (run_all == None); the single-dispatch branch (:2155-2235) mirrors it (takes single_in_flight unconditionally, consuming the pointer). Fix: keep the run armed (mirror the stopped path b83e891f) — guarded annotate (waiting wording) + emit, no end_run; restore the single-dispatch pointer on non-closures. Regression tests: non_closure_resolution_keeps_the_run_armed, turn_failure_resolution_keeps_the_run_armed, single_dispatch_non_closure_restores_the_pointer, plan_open_note_names_what_happened (src-tauri/src/ipc/run_all.rs tests).

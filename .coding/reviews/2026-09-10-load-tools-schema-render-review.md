@@ -1,0 +1,32 @@
+## Verdict: FINDINGS (0 high, 3 low)
+
+Review of all uncommitted changes on `wt/agenticcoding` for plan de884bcf (load_tools renders revealed tools' schemas, backlog cc52264b). The implementation is correct on every load-bearing claim I verified against source — predicate parity with `load_group`, the snapshot's construction-time safety, the ≤ 8 full/compact boundary, the empty-block passthrough, MCP dedup, and the count-semantics change. The three findings are documentation accuracy, a test-coverage gap whose failure mode is silent, and a cosmetic rendering artifact. None block the feature.
+
+### Findings
+
+**LOW 1 — Doc sync: stale counts and a missing response-contract line in `load_tools.rs` docs.**
+- The new doc comment on `FULL_SCHEMA_GROUP_MAX` (load_tools.rs:201-205) says "the browser family (15 tools)". The family is **16** tools on Windows (10 offscreen + 6 live WebView2 — pinned by the factory registry-contents test, factory.rs:2146-2173) and 10 on other platforms; the test comment at load_tools.rs:481 ("Browser-sized: 15 tools") repeats the wrong number. Behavior is unaffected (15 and 16 are both > 8 → compact), but the number is factually wrong in new code.
+- The module doc (load_tools.rs:5-23) was not updated for the new contract: it still describes only the join-notice mechanics, its "Why a round-trip" paragraph says "the browser family is ten schemas (~900 tokens)" (stale on Windows), and nothing mentions that the response now renders schemas (full ≤ 8 / compact beyond, required params with types). The reveal-response contract is now half the module's behavior and deserves a line. README's two `load_tools` mentions (README.md:82, 146) describe only the index-line mechanics and remain accurate — no README change needed.
+
+**LOW 2 — Factory snapshot wiring is untested; its failure mode is silent.**
+Every acceptance test constructs `LoadToolsTool::new` directly with explicit tools, so the production wiring — factory.rs:861-864 (`registry.iter().filter(|t| t.deferred_group().is_some()).collect()` → the ctor's 4th arg) — has zero coverage. I verified by reading `build_registry` that all static registrations (register_agent_tools … register_browser_tools, lines 842-850) precede the snapshot and the dynamic slot is empty at that point, so the wiring is correct today. But if a future refactor moves any `register_*` call after the snapshot (or drifts the filter), static groups would render an **empty block — byte-identical to the pre-feature response** — and no test would fail. The existing registry-contents test already builds a registry via `build_registry`; dispatching `load_tools {"group":"image"}` through it and asserting the response contains `"image_analysis —"` would pin the wiring cheaply. (The MCP side IS covered end-to-end: `mcp_group_reveals_and_materializes_tools` goes through a real registry + slot + reveal.)
+
+**LOW 3 — Empty MCP tool descriptions render a dangling em-dash + trailing whitespace.**
+`McpToolInfo.description` is documented as "may be empty" (src/mcp/mod.rs:85). In full mode, `render_schemas` (load_tools.rs:270) emits `"- {name} — \n"` for such a tool — a dangling "—" with a trailing space. Reachable via any MCP server with ≤ 8 tools and an empty description on one of them. One-line fix: skip the separator (or the whole description segment) when `first_sentence` returns an empty string.
+
+### Verified correct (checked against source — no action needed)
+
+- **Predicate parity**: `group_schemas` (load_tools.rs:214) filters `deferred_group() == Some(group) && t.available()` — the same predicate `load_group` uses (src/tool/mod.rs:728), so the render always matches what actually joins the tool list, per platform and per install.
+- **Snapshot safety**: `ToolRegistry::iter()` yields owned `Arc` clones (registered tools, then the dynamic slot); at factory time the slot is empty, all static tools register before the snapshot (factory.rs:842-850 → 861-864), and `LoadToolsTool` itself has no `deferred_group`. MCP tools never enter the snapshot — they render from `reveal_group`'s return value.
+- **Threshold boundary**: `count <= FULL_SCHEMA_GROUP_MAX` → exactly 8 tools renders full mode, per spec; image (7 tools) → full, browser (16 on Windows / 10 elsewhere) → compact.
+- **Empty-block case**: a static group with no (available) deferred tools renders an empty block → response byte-identical to before; `loads_a_known_group_once` pins the unchanged idempotent retry.
+- **JSON-schema extraction**: `required` handles missing/non-array values; param types come from `properties[name].type` with a bare-name fallback (which also covers array-typed `type` values); optional = properties keys minus required; `first_sentence`'s byte slice sits on char boundaries (`find` offset + 1) and the 120-char cap is char-based.
+- **MCP dedup + count semantics**: a schema is pushed iff the tool is pushed to the slot (`contains_name` guard in both loops) — no duplicates. The count change (newly materialized tools incl. capability meta tools, vs. old remote-only incl. already-in-slot) makes the normal-path message more accurate — the meta tools do join the list. The one edge that miscounts (retry after a failure between the `server_tools` and `capabilities` awaits: already-pushed tools are skipped) misreported under the old code too — not a regression.
+- **Test consistency**: `ServerCapabilities::default()` is both-false, so the load_tools fake's "1 tool" assertion matches the new semantics; `reveal_group`'s only production caller is load_tools' `execute` (graph-verified); all test callers updated.
+- **Security**: no new surface — the rendered block is strictly smaller than the tools-array payload that follows next request (descriptions capped at 120 chars); no untrusted input beyond the user-configured MCP server's own schemas.
+- **Multi-platform neutrality**: no platform-specific code in the diff; per-platform group sizes flow through the same `available()` predicate `load_group` uses.
+- **Constitution**: doc comments on all new items (field, ctor param, const, four functions, test fakes); no `#[allow]`; `deny(warnings)` build green per the stated test evidence (root 2165+16, src-tauri 293+4+2, 0 failed).
+
+### Note for the parent
+
+HOW memory 669b26e9 ("load_tools confirmation is final — the loaded tools' schemas may not be rendered") is the memory this plan fixes app-side; supersede/update it when this lands so agents stop assuming the schemas are absent from the response.

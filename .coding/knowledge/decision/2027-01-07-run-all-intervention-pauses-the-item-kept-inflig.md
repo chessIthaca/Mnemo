@@ -1,0 +1,9 @@
++++
+title = "run-all intervention PAUSES the item — kept InFlight + stopped run (single-dispatch too, plan cace17a6)"
+supersedes = "2026-09-01-backlog-steer-interrupt-requeues-the-item-merged"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-07, backlog b83e891f, plan 28bc06a2): a steer/interrupt on the main agent mid-run-all-item KEEPS the item InFlight and STOPs its run (identity-guarded stop flag, never end_run) — the plan stays active and the turn that completes it resolves the item through the kept current_item pointer; the still-open/terminal-error arms keep a STOPPED run alive until the item resolves (mirroring backlog_stop_all's "stop after the current in-flight item resolves"). Reverses the 2026-09-01 requeue semantics for run-all items (requeueing + ending the run stranded them: the user's natural resume continued the plan with no dispatch pointer and the completing turn's resolution was blind — item 45a4eb88 re-dispatched 3×). Single-dispatch items are KEPT InFlight too (amended 2027-01-09, plan cace17a6: the handler restores the single_in_flight pointer it consumed — check-and-set — instead of requeueing; the requeue arm narrows to the drained-run case). Never-terminal / never-auto-continue guarantees unchanged. Contract: .coding/knowledge/spec/2027-01-07-backlog-item-status-plan-lifecycle-failed-means.md (the 2027-01-07 successor of the 2026-12-06 file — the run-all-orphans plan 5f6515f5 further amended the dead-owner paths: exit drain requeues to Pending, run-all start adopts orphans, exit clears single_in_flight).
+
+Amended 2027-01-09 (plan cace17a6, user request): single-dispatch items are KEPT InFlight too — the handler restores the single_in_flight pointer it consumed (check-and-set) instead of requeueing; the requeue arm narrows to the drained-run case. The "Single-dispatch items still requeue" sentence above is superseded.

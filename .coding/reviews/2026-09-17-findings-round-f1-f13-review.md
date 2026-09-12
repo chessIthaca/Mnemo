@@ -1,0 +1,36 @@
+## Verdict: FINDINGS (0 high, 4 low)
+
+Reviewed ALL uncommitted changes on `wt/agenticcoder` for plan 44387fcd (17 modified files + 6 untracked files, ~1391 insertions). The round is well-engineered: F1 predecessor-context expansion is conservative and matches full-scan parity; F7 brace expansion handles nesting, unbalanced braces, and the 32-cap correctly; F10 mtime units match on both sides (unix seconds) and fail toward the walk (never toward stale content); F12 pointer reconciliation handles parentheticals and trailing newlines with the case-sensitivity contract tested; F9's store lookup is strictly gated behind an 8-4-4-4-12 hex-uuid shape with one indexed SELECT; docs (README/PLAN.md/knowledge files) are in sync with the shipped code; all 15 regression tests named in the SPEC are present and exercise their changed paths; public functions carry doc comments; no Windows-only APIs (the `set_modified` test pattern uses std, write-handle-open — the sanctioned cross-platform shape). Four low-severity findings below (advisory-counter and edge-case issues; no correctness defect in the served content was found).
+
+## Findings
+
+### 1. LOW — `observe_result` first-match-wins under-counts the two new co-occurring markers
+
+`src/agent/steering_stats.rs:317-328` detects with `MARKERS.iter().find(|k| k.detect(...))` — only the FIRST kind that matches is counted. The invariant comment at `:223-229` ("a single tool emits at most its own kind") is no longer true for the two new kinds:
+
+- **KnownMemoryHit + LiteralTip can co-occur on one `search`/`search_read` result.** A uuid-shaped pattern is metachar-free, so in regex (default) mode the same first line carries both the literal TIP and the known-memory note (`src/tool/agent/search.rs:848-850`, `merged_note` joins them). `MARKERS` orders `LiteralTip` (index 5) before `KnownMemoryHit` (6), so `find` counts only the TIP and the KnownMemoryHit fired counter silently stays at zero for exactly the case F9 was built to measure. (The F9 test at `search.rs:1872+` uses `literal:true`, where the TIP is suppressed — the co-occurrence is untested.)
+- **ConsolidationDue can co-occur with any emitting tool's own marker.** It is dispatcher-appended after the result (`src/agent/dispatch.rs:452-465`) and sits LAST in `MARKERS`, so whenever the same result also carries the tool's own kind (e.g. a `search` result with a symbol nudge + the appended note), only the earlier kind is counted.
+
+Impact is confined to advisory fired-only counters (no false fires — the tool-scoping guarantee holds; this is an under-count), but the Trace tab's numbers for the two new markers will read misleadingly low. Suggested fix: iterate all `MARKERS` and count every detecting kind (`filter` instead of `find`), or detect `ConsolidationDue` in a separate pass since it is dispatcher-owned.
+
+### 2. LOW — F11 once-per-session gate is check-then-act, not atomic
+
+`src/tool/steering.rs:92-112`: the mutex is dropped between the `contains` check and the `insert`. Two concurrent dispatches for the same session that both cross the threshold can both append the note, so the documented "fires at most once per session" (`:81-85`) is slightly stronger than the implementation. In practice the exposure is small (one `AgentLoop` dispatches serially and session ids are per-run), and the poison handling in both lock sites is correct. Suggested fix: insert a reservation *before* the count query and remove it again if the count stays below the threshold, so the gate is hold-and-decide rather than check-then-act.
+
+### 3. LOW — F10 freshness scan covers only the DISPLAYED hits, not the whole fetched page
+
+`src/tool/agent/search.rs:611-633`: the staleness comparison iterates `hits` (capped at `MAX_MATCHES` = 100), while `total`/`files` in `IndexHits` count ALL matching rows on the fetched page (`:592-601`). A file edited inside the watcher gap whose matches land beyond the display cap is not detected, so the served summary line ("N matches in M files (engine: index)") can still be stale even though the displayed lines are fresh. The comment acknowledges the scope ("each displayed hit's …"), so this is a designed tradeoff — but it means the F10 guarantee (never serve stale counts) is only partial. Low impact: displayed content is authoritative; only the count line can lag. Suggested fix (if worth it): run the mtime probe over the full `raw` page before capping `hits`, or stamp the note whenever any fetched row is stale.
+
+### 4. LOW — `reconcile_file_pointers` normalizes CRLF bodies to LF when a pointer is rewritten
+
+`src/tool/memory/mod.rs:788-812`: `body.lines()` strips `\r` and `out.join("\n")` reassembles, so a CRLF knowledge body whose stale pointer gets rewritten is fully converted to LF (a trailing `"\r\n"` becomes `"\n"`; the `ends_with('\n')` re-add preserves only the LF shape). The single-`\n` trailing-newline case is handled correctly and tested (`reconcile_file_pointers_rewrites_only_stale_leading_pointers`). Impact is minimal — knowledge files written by the app are LF, so this only bites a hand-authored CRLF body routed through `memory_supersede` — but the project rule is to preserve line-ending style of existing files. Suggested fix: detect the dominant line ending (`body.contains("\r\n")`) and re-join with `"\r\n"` when present.
+
+## Verified-clean areas (no findings)
+
+- **F7 expand_braces/split_top_level** (`search.rs:157-249`): nesting expands recursively (`{a,{b,c}}` → a·b·c), unbalanced `{`/`}` stay literal, the 32-cap bounds every level and terminates, empty alternatives degrade to harmless empty patterns, `{}` is a no-op, and `compile_globs` keeps the single-pattern error contract. Match-if-ANY is wired in both `descend` and `try_index`.
+- **F10 units** — both sides use `as_secs() as i64` (writer `codegraph/mod.rs:384-391` via `mtime_of`, checker `search.rs:624-629`); a stored 0 (mtime unreadable at index time) or a vanished file mismatches on-disk → walk, which is the safe direction; no schema change needed since `cg_files.mtime` already existed.
+- **F1 reconciliation arms** (`indexer.rs:383-398`): computed real successor wins; computed sentinel/None never regresses an existing value; (sentinel, None) → sentinel matches `index_derived` parity; rows absent from the store are skipped.
+- **F8** stable `sort_by_key` promotion (`steering.rs:191-199`) preserves rank order within groups; the None-title path (spawn_agent) is untouched and tested.
+- **F9** `backlog_id_shape` (`search.rs:751-761`) is a strict 8-4-4-4-12 hex gate — the store is only touched for that shape, via a parameterized `title_prefix` filter with limit 1; no injection or DoS surface; the commit-sha residual is documented.
+- **Docs/README/PLAN.md** claims match the shipped code; the corrected glob-shapes HOW file matches the probe evidence and the new regression tests; the SPEC/BUG/DECISION/HOW knowledge records are internally consistent and accurate (including the F12 date-claim disproof and the F13 live-Trace-tab deferral).
+- **Tests**: all 15 SPEC-named regression tests exist at their named paths. The reported full-suite result (1682 passed, 0 failed) is taken as given — a read-only reviewer cannot re-run `cargo test`.

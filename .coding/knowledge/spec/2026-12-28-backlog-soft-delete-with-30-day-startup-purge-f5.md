@@ -1,0 +1,7 @@
++++
+title = "backlog soft delete with 30-day startup purge (f5be6cf, wt/agenticcoding, unmerged)"
+created = "2026-12-28"
+status = "superseded"
++++
+
+SPEC: Backlog soft delete with 30-day startup purge (commits f5be6cf + 36feb79 on wt/agenticcoding — NOT yet merged to main, pending merge_to_main; plan c9c92da5, backlog ccad2743, reviews .coding/reviews/2026-09-04-backlog-soft-delete-review{,-round2}.md). Deleting a backlog item (BacklogStore::remove / clear_finished) is a SOFT delete: the item is marked deleted_at (secs since epoch) and stays in .coding/backlog.jsonl with its image sidecar files — invisible to items()/next_pending()/pending_item() and the memory indexer (scan_backlog filters status=="pending" && deleted_at.is_none()); by-id mutators (transition/annotate/set_note/requeue/edit) treat a deleted id as unknown (false). BacklogStore::open hard-purges items soft-deleted >= PURGE_AFTER_SECS (30 days) at every startup (both jsonl-load and legacy-migration paths), deleting their sidecars. parse_jsonl dedupes same-id lines with deletion STICKY (any line carrying deleted_at wins, max timestamp) — a git union merge can carry the same id twice (deleted on one side, live on the other) and the live duplicate must not resurrect it. serde: deleted_at is #[serde(default, skip_serializing_if)] so old lines parse unchanged and live lines serialize byte-identical. Rationale: the JSONL is git union-merged across worktrees — a hard-removed line would be resurrected by the other side's copy.

@@ -1,0 +1,6 @@
++++
+title = "Per-endpoint tok/s breakdown — request_stats.endpoint + (model, endpoint) grouping"
+created = "2027-01-07"
++++
+
+How the per-endpoint tok/s breakdown works (plan 07d2dc07, .coding/plans/07d2dc07.md): request_stats gains `endpoint TEXT` (NULL = pre-dimension rows); legacy DBs get the column via migrate_add_column_if_missing on the next apply_schema (src/memory/schema.rs, tested by migration_adds_endpoint_column_to_legacy_request_stats). src/agent/turn.rs (~:2245) records the serving provider's provider_name() at each Usage event (empty → None). session_stats + project_stats GROUP BY (model, endpoint) (src/memory/mod.rs); ModelBreakdown.endpoint: Option<String> with serde skip_serializing_if keeps None absent from JSON — old contract fixtures byte-identical (src/memory/types.rs). Frontend: ModelBreakdown.endpoint?: string | null (frontend/src/lib/tauri.ts); ModelTable (frontend/src/components/views/StatsView.tsx) shows an Endpoint column — one row per (model, endpoint), blank endpoint = pre-endpoint rows grouped per model; row key model+endpoint; totals label colSpan=2. Tests: run_turn_records_request_stats_on_usage (named mock → Some("a100"), default → None), session_stats_splits_same_model_across_endpoints, project_stats_splits_same_model_across_endpoints, plus the schema migration test.

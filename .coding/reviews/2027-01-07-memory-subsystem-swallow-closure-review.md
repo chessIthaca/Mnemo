@@ -1,0 +1,67 @@
+## Verdict: PASS
+
+Review of ALL uncommitted changes on wt/agenticcoding (`git diff HEAD`: src/runtime/agent.rs, src/memory/consolidation.rs, src/memory/indexer.rs, src/memory/mod.rs, plus .coding bookkeeping — the backlog 93eee4a3 stamp and the untracked plan file 159dc93d.md) for plan 159dc93d / backlog 93eee4a3, the LOW 6 class-closure follow-up. Evidence base: the full diff + status, direct reads of every edited site and its surrounding flow (agent.rs:520-650, consolidation.rs:1-599 and 1186-1342, indexer.rs:1020-1139, mod.rs:1200-1310), the prior round-2 verification report, the LOW 6 knowledge file, exact regex `let\s*_\s*=` sweeps over src/memory, src/runtime, src/, and src-tauri/src, and call-site verification of every record_tool_event/record_request_stats site repo-wide. No findings: all seven log-on-Err edits are provably logging-only with fire-and-forget semantics unchanged, the two best-effort keeps are correctly assessed and documented, the class is closed with no same-class swallow remaining anywhere in src/ or src-tauri/src, and both regression tests are sound and revert-sensitive. Observations (non-findings) in §6.
+
+### 1. Correctness — fire-and-forget TRULY unchanged at every edited site. VERIFIED.
+
+Every edit is the same shape: `let _ = <expr>.await;` → `if let Err(e) = <expr>.await { eprintln!("mnemo: …") }` + a rationale comment. In all seven hunks the `<expr>` is byte-identical pre/post (verified against the diff), no `?` was introduced, no early return, no spawn added or removed, and the Err payload binds to `e` and is consumed by the (infallible) `eprintln!` — no panic path, no propagation change.
+
+- **agent.rs:577-594 (record_tool_event, user-correction capture).** The call expression — including `serde_json::json!({"prompt": text, "trigger": trigger})` and `Some(trigger)` — is unchanged; only the wrapping changed. The `text` move/borrow concern is a non-issue: `text` is used later at :614 (`MessageContent::text(text)`) and :631 (`text.clone()`) exactly as before the edit, and this identical json!-then-later-uses code compiled at HEAD, so json! demonstrably does not move `text` here — and the edit touched neither. `trigger` is a `&str` (Copy) used in both the json! and the error-channel arg, unchanged. The turn continues identically on Ok and Err.
+- **consolidation.rs:186-195 (extract_semantic_facts / extract_procedural_workflows call sites).** Two sequential log-only blocks; `consolidate_session_with_events` still returns `Ok(id)` regardless of extraction outcome.
+- **consolidation.rs:207-209 (delete_working_for_session).** Log-only; `Ok(id)` still returned.
+- **consolidation.rs:439-441 / :554-556 (per-fact / per-workflow `store.write`).** Log-only inside the for-loops; the loop continues to the remaining facts/workflows exactly as before.
+- **indexer.rs:1095-1097 (delete_memory of a migrated row).** Log-only; `report.migrated += 1` still executes — correct, since the knowledge-file write at :1087 already succeeded (the file is the truth; a failed row-delete does not un-migrate it). Routing the failure into `report.skipped` instead would have changed report semantics beyond the log-only mandate; the comment documents the choice.
+
+No move/borrow issues, no new production imports, no unused bindings (`e` consumed in every block) — warning-free by construction under `#![deny(warnings)]`, consistent with the parent's green runs.
+
+### 2. Site assessments — AGREE with all nine.
+
+Seven logged (durable-state-relevant — each verified against the actual flow):
+- **agent.rs user-correction capture:** the same store method as the fixed turn.rs site; a lost correction is a lost consolidation input (the note at :567-572 exists to be distilled at consolidation time). Logging is right.
+- **The two extraction call sites:** LLM/store failures were invisible while the caller returns Ok — logging is right.
+- **delete_working_for_session:** silent failure means unbounded working-tier growth (the comment block at :198-206 documents why that matters for recall speed). Logging is right.
+- **The two per-fact/per-workflow writes:** a failed write loses LLM-extracted knowledge; loop-continuation preserved. Logging is right.
+- **indexer.rs migrated-row delete:** a zombie row duplicating the file, permanent once the marker latches (:1100-1106). Logging is right.
+
+Two kept (genuinely best-effort, both documented):
+- **indexer.rs:1102-1103 marker create_dir_all/write:** self-healing via row-level idempotency — a re-run re-writes the file (same-title overwrite) and retries the delete; the fn doc (:1021-1035) and the latch comment (:1100-1101) document it. Agree.
+- **mod.rs:1275 batch_access:** an advisory recency/strength bump that self-corrects on the next successful access and must not fail a recall that already succeeded; the extended comment (:1269-1273) now states the swallow rationale. Agree.
+
+### 3. Completeness — the class is closed; the sweep claims verify EXACTLY.
+
+Exact regex sweep (`let\s*_\s*=`, walking engine — note: the literal/index-engine search is token-fuzzy and missed known sites such as mod.rs:1275 and indexer.rs:1102, so I re-ran the sweep as a regex for precision):
+
+- **src/memory (14 hits):** 6 are the new test's own needle literals; 4 are test value-discards after `.unwrap()` (tests.rs:728, :1385, :1389, :1393 — the Result IS handled, only the returned Vec is dropped); the remaining non-test swallows are exactly the three documented keeps (embedder.rs:348 unused-marker, indexer.rs:1102-1103 marker, mod.rs:1275 batch_access). **No durable-write swallow remains in src/memory.**
+- **src/runtime (50 hits):** 17 fanin_tx UI-event sends, 26 `handle.await` spawn-detaches, 5 test `let _ = res;` (agent.rs:5399-5802, inside test fns), 2 test discards (turn_resolve.rs:299/:311, inside `#[test]` fns). **No durable-write swallow remains in src/runtime.**
+- **record_tool_event call sites repo-wide:** production sites are turn.rs:1242 (if-let-Err, LOW 1) and agent.rs:578 (this change); maintenance.rs:258/:269/:280/:488 and tool/memory/mod.rs:1566/:1600 are all test code with `.unwrap()`; the rest are tests/definitions. **record_request_stats** has exactly one production call site (turn.rs:2228, if-let-Err). The claim verifies.
+- **Broader (src/ + src-tauri/src):** config/mod.rs's six `let _ = fs::*` sites are atomic-commit/restore internals whose real failures propagate via the enclosing Result (the LOW 6 rollback collection) or are inert temp-file cleanup; factory.rs:619 (load_latest) carries a 4-line documented rationale; the rest are browser kill/close cleanup, channel sends, UI emits, watchdog Windows-API calls, and test markers. The two src-tauri candidates I dug into both return **bool**, not Result — ipc/agent.rs:646 (`swap_live_provider`, config_io.rs:287-293) and backlog_cmds.rs:232 (`requeue`, backlog.rs:494) are documented bool-discards, not error swallows. **No unassessed same-class swallow exists anywhere in src/ or src-tauri/src.**
+
+### 4. Regression test quality. SOUND.
+
+- **fn_body scoping is correct.** The needle `fn {name}(` cannot self-match the test module's own `fn_body(&src, "name")` calls (no `fn `-prefix/`(`-suffix adjacency); all three target definitions precede the tests module, so `find()` lands on the definition; the `\n}\n` end marker is the fn's column-0 closing brace (rustfmt indents every nested brace — verified against the actual layouts: consolidate_session_with_events :133-212, extract_semantic_facts :338-445, extract_procedural_workflows :454-559). The helper is byte-identical to the established run_all.rs precedent (src-tauri/src/ipc/run_all.rs:526, 12+ call sites).
+- **Revert-sensitivity is double-pinned.** Any revert of a logged site removes the log line (positive needle fails) AND reintroduces the banned `let _ =` shape. The cross-file includes (agent.rs, indexer.rs, mod.rs) cannot self-match — the needles live only in consolidation.rs's test module. The two best-effort rationales are pinned too ("idempotency keeps re-runs safe", "advisory and deliberately swallowed"). The parent's A/B claim (fails pre-fix with "missing log line: mnemo: semantic fact extraction failed") is exactly the first assertion that fires pre-fix — consistent with my reading of the pre-change fn bodies.
+- **The behavioral test exercises the changed path.** FailingLlm (every `complete()` → Err) drives the real edited branches: synthesize_with_llm fails at :306 → `unwrap_or_else` synthetic fallback (:146-152, verified); both extractions return Err via the `?` at :378/:473 → the new if-let-Err blocks actually execute (the log fires, consolidation continues); the working tier is still cleaned; Ok is returned. It pins no-propagation (reintroducing `?` anywhere in the chain fails the `.unwrap()`), the synthetic fallback, and the cleanup. All assumptions verified against the code.
+- Minor (not a finding): the per-fact/per-workflow `store.write` failure branches are not behaviorally exercised (extraction fails before any facts are parsed — exercising them would need a failing-store mock); the source-contract test pins those sites instead. Acceptable coverage split.
+
+### 5. Constitution.
+
+- **Doc comments:** accurate at all nine sites and on both mocks/tests; the FailingLlm doc correctly describes what it pins; no new public functions (fn_body and the tests are private, all documented). ✓
+- **Warning-free build:** the parent's green runs (root ~2037 tests, src-tauri 233, both crates `#![deny(warnings)]`) attest zero warnings; my static review finds no warning surface (`e` consumed everywhere, FailingLlm's fields used, no new production imports — the tests module's imports pre-existed for MockLlm). As a read-only reviewer I cannot run cargo myself (same position as both prior LOW 6 review rounds); the production delta is provably logging-only, so inspection + attestation is sufficient. ✓
+- **Multi-platform neutrality:** `eprintln!` is std and platform-neutral; no OS-specific code, paths, or shell syntax; the "mnemo:" prefix matches the established pattern (thread_util.rs:83, watchdog.rs:271, turn.rs). ✓
+- **Documentation sync:** no README/PLAN.md surface (internal error-logging hardening — no feature, config, or provider-strategy change); module-level behavior is documented in-code at every site. Knowledge-file posture judged ACCEPTABLE — see §6.3. ✓
+- **Security:** log lines carry only error values and ids (session_id, m.id) — no prompt content (the agent.rs log deliberately excludes the user's prompt text), no secrets, no injection surface. ✓
+
+### 6. Observations (NOT findings — no action required for this plan)
+
+1. **Behavioral coverage split** (see §4): the per-fact/per-workflow write-failure branches are pinned by the source-contract test only. If a future change touches those loops, consider a failing-store mock to cover them behaviorally.
+2. **ipc/agent.rs:646 cosmetics (pre-existing, out of scope):** `let _ = swap_live_provider(...)` discards a bool (not a Result — not same-class), but the adjacent `eprintln!("switched model to '{model}' …")` at :654 logs success unconditionally even when the swap returned false. Pre-existing, untouched by this delta, outside the backlog item's memory-subsystem scope — noting for completeness only.
+3. **Knowledge-file posture — ACCEPTABLE.** The LOW 6 knowledge file (.coding/knowledge/bug/2027-01-07-swallowed-errors-on-durable-writes-let-on-store.md) was not extended with the class-closure sites (the file tools refuse .coding/knowledge/ writes in this session). I judge this acceptable: (a) the file remains accurate for its original scope — the turn.rs/config defect — and makes no repo-wide-closure claim; (b) the bug_fixing workflow auto-captures a BUG: memory record at plan finish, which is this plan's sanctioned durable capture; (c) all nine sites carry in-code "quality review LOW 6, class-closure" comments; (d) the source-contract test pins the sites. Nice-to-have if the guard lifts before commit: a one-sentence class-closure addendum. Nothing in the project's review targets (README/PLAN.md/module doc comments) is left stale.
+4. **Bookkeeping:** the backlog stamp (pending → in_flight, carrying the prior session's abort note) and the untracked plan file are consistent with the workflow — the item is marked done at finish, and the plan file rides the closing commit.
+
+### Test status
+
+As a read-only reviewer I cannot run `cargo test` (the same position as both prior LOW 6 review rounds, which likewise relied on the parent's stated runs). The parent's stated green runs (root ~2037 tests exit=0; src-tauri 233 passed exit=0; both crates `#![deny(warnings)]`, so green = zero warnings) are consistent with my inspection: the production delta is seven logging-only edits (no observable state change except stderr on error paths, which no test captures) plus two self-contained tests whose imports and trait impls mirror the pre-existing MockLlm pattern in the same module.
+
+### Conclusion
+
+The LOW 6 swallow class is closed in the memory subsystem exactly as the backlog item mandated: seven durable-state-relevant sites now log on Err with fire-and-forget semantics provably unchanged, the two genuinely best-effort sites are kept with their rationales documented (and pinned by test), no same-class swallow remains anywhere in src/ or src-tauri/src, and the fix is pinned by a revert-sensitive source-contract test plus a behavioral no-propagation guard. PASS.

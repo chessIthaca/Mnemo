@@ -1,0 +1,5 @@
+{
+  "kind": "workflow_state_changed",
+  "state": "executing",
+  "top_plan_id": "plan-1a2b3c"
+}

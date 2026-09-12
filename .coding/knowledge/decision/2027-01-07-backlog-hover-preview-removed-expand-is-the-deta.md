@@ -1,0 +1,6 @@
++++
+title = "backlog hover preview removed — expand is the details mechanism (2027-01-07)"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-07, user request, plan a9821f61, commits 667fce3 + 36999a6 on wt/agenticcoder): the backlog hover preview is REMOVED — the user judged it "no longer needed now that item cards have expanding details". The expand/collapse affordance (chevron + expanded body markdown) is the sole details mechanism. Coverage verified before removal — no content becomes unreachable: the headline always renders in the card row, the body is reachable via expand (collapsed by default only when > 200 chars), and images are ALWAYS visible as small (h-10) thumbnails on the card. ACCEPTED LOSS: the popup's larger (h-16) hover thumbnails — no replacement added. Also fixed in passing (review Finding 1, accepted + acknowledged): the card div's pre-existing className typo bg-bg-terriary → bg-bg-tertiary (the Tailwind theme defines `tertiary`; the card now gets its intended background fill). Tests pin the new contract: a removal pin (no previewOpen/showPreviewDelayed/hidePreview/createPortal in BacklogView.tsx) + an images-reachable pin (the always-rendered thumbnail strip); the expand coverage stays pinned by the existing tests. Do not restore the hover preview without a new user ask.

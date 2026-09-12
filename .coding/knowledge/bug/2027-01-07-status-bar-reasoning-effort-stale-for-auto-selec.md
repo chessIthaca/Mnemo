@@ -1,0 +1,6 @@
++++
+title = "Status-bar reasoning effort stale for auto-selected models — display never reads the effective effort"
+created = "2027-01-07"
++++
+
+BUG (user report 2027-01-07, backlog 51dab4da): the status bar's reasoning-effort indicator shows a stale/wrong value when the active model is auto-selected / resolved per-context. Root cause: StatusBar.tsx effectiveEffort (~:157) reads the toolbar echo (agentEfforts[activeAgent]) ?? the ENDPOINT-level default (ep.reasoning_effort ?? "max") — never the resolution the request builder uses (client_factory.rs resolve_effort: ModelRef.reasoning_effort → normalize; else effective_reasoning_effort_for: ModelSpec.reasoning_effort → endpoint → "max"); the wire (ModelChanged { model, provider } / AgentInfo) carries no effort at all — the same gap the model display had before backlog 2980ca67 went wire-first. Fix: wire-first — backend reports the display-space effective effort alongside the model (resolved_effort mirror on AgentLoop, set at every resolve_turn_provider site; ModelChanged + AgentInfo gain reasoning_effort); StatusBar prefers the wire value. Regression test: useAgentStore.test.ts "model_changed: records the wire-reported reasoning effort for the agent" (fails pre-fix). Plan 3e680de3.

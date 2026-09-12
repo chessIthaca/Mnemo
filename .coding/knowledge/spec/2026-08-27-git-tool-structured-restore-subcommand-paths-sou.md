@@ -1,0 +1,7 @@
++++
+title = "git tool structured `restore` subcommand (paths/source/target)"
+created = "2026-08-27"
+status = "superseded"
++++
+
+SPEC: The git tool has a structured `restore` subcommand (plan 514dcee1, commits e039f56 + 07fcb9e on branch wt/agenticcoder — NOT yet merged to main). Use it instead of the shell for `git checkout -- <path>`-style restores. Fields (src/tool/agent/git.rs, GitArgs): `paths` (REQUIRED array of pathspecs; a singular string `path` is forgivingly lifted when `paths` is absent/empty), `source` (optional tree-ish — branch/tag/commit/HEAD~1 — validated like a branch name, embedded as one `--source=<src>` argv element), `target` ("worktree" default | "staged" = unstage | "both" = discard staged+worktree). argv: restore [--staged] [--worktree] [--source=<src>] -- paths… — the mandatory `--` separator plus no-empty/no-'-'-leading pathspec validation makes flag injection impossible; free-form `args` stay REJECTED for restore (read-only-args decision stands). git defaults apply: worktree restores from the index, staged/both from HEAD. Tool-card label: `restore [target] [source] -- paths`. Reviews: .coding/reviews/2026-09-08-git-restore-subcommand-review.md (FINDINGS 0 high/1 low, low fixed) + -verify-review.md (PASS). Side effect: tools-array budget ceilings raised deliberately (factory.rs: Executing 23_500, ExecutingResearch 20_100, dated justification comment). Tests: 12 new in git.rs, 2 regression expects in messageArgLabel.test.ts.

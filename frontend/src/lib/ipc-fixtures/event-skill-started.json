@@ -1,0 +1,5 @@
+{
+  "kind": "skill_started",
+  "name": "merge_to_main",
+  "prompt": "Merge the branch into main."
+}

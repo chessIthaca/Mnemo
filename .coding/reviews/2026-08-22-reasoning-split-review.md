@@ -1,0 +1,45 @@
+# Review: reasoning/completion split (uncommitted diff on fix/git-action-subcommand-forgiving)
+
+Scope: all uncommitted changes per `git status` / `git diff HEAD` (22 modified files + 1 untracked plan file). The committed forgiving-git work (2bebfc3) was excluded as instructed. `.coding/backlog.json` / `.coding/plans/stack.json` are sandbox bookkeeping — not reviewed as source.
+
+## Verdict
+
+No correctness, security, or test-coverage blockers. Four **Low** findings (three documentation-sync, one design trade-off worth documenting). The core mechanics — ThinkTagFilter state machine, emit-on-change phase tracking, reasoning_ms boundaries, dual-path answer mirroring, and the re-indented stream loop — are correct.
+
+## Verified correct (spot-checked in full context, not just the diff)
+
+- **ThinkTagFilter** (`src/provider/openai.rs:1531-1665`): split open/close tags (holdback via `partial_tag_suffix`, strict-prefix only so a full tag can never be "held"), undecided prefix flushes as text, unclosed block flushes as reasoning, position-0 rule (mid-answer literal passes through), empty deltas never emitted, `feed` loop always terminates (each arm returns or transitions Start→InThink→Passthrough monotonically), `buf` bounded in InThink (≤7-byte holdback). The 8 unit tests match hand-traced expectations.
+- **Parser alias** (`openai.rs:1457-1475`): `reasoning_content` wins; empty strings filtered on both names; `{"content":"","reasoning":"…"}` yields exactly one ReasoningDelta (no empty TextDelta — pre-existing content guard).
+- **Phase tracking** (`src/agent/turn.rs:773-861`): `stream_phase` is per-request (declared beside `stream_error` inside the request loop); content-only streams still emit exactly [Sending, Waiting, Streaming]; reasoning-first emits Reasoning then Streaming; interleaved Anthropic streams oscillate truthfully; regression test `phase_cycle_reasoning_then_answering` pins the new sequence and would fail without the fix.
+- **Stream-loop re-indent** (`openai.rs:867-1039`): the `for event in events` split is safe — non-TextDelta events pass through as `vec![other]` exactly once, so `finish_logged` and the tx.send abort-return behave identically to before; the think-filter flush (1034-1039) is correctly placed after the read loop and before the fallback Finish, and flushed events need no trace mirroring (only Finish/Error are mirrored).
+- **reasoning_ms**: `reasoning_ms ⊆ generation_ms` holds by construction (both anchored at `first_chunk`; reasoning end = `first_content_chunk` or `now` ≤ generation end = `now`); the StubServer test asserts it. `generation_ms` stays inclusive; the Usage wire event is unchanged, so session tok/s math (`reduceUsage`) is untouched. All six `set_usage` call sites updated (openai.rs:938, anthropic.rs:1004, trace.rs:1389/1510/1779 + From impl). Anthropic mirrors the same tracking (`anthropic.rs:954-1002`).
+- **Frontend dual paths**: `reduceTextDelta` (reducer) and `appendStreamingText` (rAF-buffered production path) both mirror via the same `appendAnswerEntry`; text_delta reaches exactly one path (the rAF interception is pre-existing — `streamingText` would double-append otherwise). Clear-on-new-reasoning preserved verbatim in both `reduceReasoningDelta` and `appendStreamingReasoning` (log replaced when the tail entry isn't reasoning, which now also correctly evicts a tailing answer entry).
+- **IPC contract**: `PhaseKind` is `#[serde(rename_all = "snake_case")]` → `"reasoning"` is purely additive; `event-phase.json` holds one representative value (`running_tools`), not an enumeration, so no fixture change is needed; the roundtrip pair in `channels.rs` tests pins the new variant. Trace DTOs derive `Serialize` with no `skip_serializing_if`, so `reasoning_ms: None` → `null`, matching TS `number | null`; TS fixtures updated (LlmTraceView.test.ts, traceStats.test.ts).
+- **Constitution**: new pub items carry doc comments (`PhaseKind::Reasoning`, both `reasoning_ms` fields, `appendAnswerEntry`, `ActivityEntry`); no new `#[allow]`; no Windows-only APIs/paths (pure string ops); README (3 bullets) + PLAN.md (bullet 6) + openai.rs module doc updated.
+- **Security**: no new network/exec/file-write paths; filter/parser are pure string ops; trace redaction (`append_response`, request-body cap) untouched.
+- **Regression tests per defect**: Ollama alias ×2, think filter ×8, phase split (backend + frontend phase list), timing split (2 StubServer + 3 traceStats), answer-in-box ×3 — each fails without its fix (e.g. alias test errors on a pre-fix parser producing zero events; phase test would see [Sending, Waiting, Streaming]; `reasoning_ms` would be `None`).
+
+## Findings
+
+### Low 1 — "generate" means two different things on the same Trace tab (documentation sync)
+
+`frontend/src/components/views/LlmTraceView.tsx` renders `g` from the **inclusive** `generation_ms` (thinking + answer) in both `PhaseTimes` (~line 177) and `UsageCard` (~line 244), and its doc comment now says "g = generate (answer)" (line ~56). `frontend/src/components/views/TraceStats.tsx` renders the "generate" chart segment as **answer-only** (`answerMs = genMs − reasoningMs`, line ~87). For one request the row shows e.g. `r 2s · g 5s` while the chart stacks reason 2s + generate 3s — same label, same tab, different values; a user adding r+g from the row double-counts. README (`README.md` trace-timings bullet) likewise says "generation (answer time)" although `generation_ms` is inclusive by design. Fix either way: clamp `g` to answer-only in LlmTraceView for consistency with the chart, or keep `g` inclusive and reword the PhaseTimes doc comment + README bullet to "generation (thinking + answer; the reason share is broken out)".
+
+### Low 2 — `reasoning_ms` field docs say "first reasoning delta →" but the code anchors at `first_chunk`
+
+`src/provider/trace.rs:144-146` (and the Summary struct ~line 213) plus `frontend/src/lib/types.ts:354-355,396` document the window as "first reasoning delta → first answer/tool delta", but both providers anchor the start at `first_chunk` — the arrival of the first **bytes**, which is usually a role-only chunk that emits no event (openai.rs:925-933, anthropic.rs:991-996 get it right in their inline comments: "first chunk →"). Practically sub-millisecond, but the DTO docs overstate the precision. Reword the four doc sites to match the code ("first chunk → first answer/tool delta").
+
+### Low 3 — ThinkTagFilter is engaged for every OpenAI-compatible endpoint, including non-thinking models
+
+`openai.rs:816` creates the filter unconditionally. The position-0 rule protects mid-answer literals, but a non-thinking model whose answer legitimately *begins* with the literal text `<think>` (e.g. the user asks "what does the `<think>` tag do?" and the reply opens with "`<think>` is…") has its entire answer rerouted to ReasoningDelta until a literal `</think>` appears; if none does, the whole reply flushes as reasoning at stream end — empty answer bubble, text only in the thinking box, and the stored assistant message then carries the reply as `reasoning_content`, which is echoed back on every subsequent request (`openai.rs:1147-1154`). This matches the ecosystem-standard heuristic (Ollama/llama.cpp behave the same way) and may be an accepted trade-off, but it is currently undocumented and ungated: DeepSeek-direct/GLM use `reasoning_content` and never need tag extraction. Consider gating on `ProviderKind::Local` or a per-endpoint flag, or at minimum noting the position-0 false-positive in the module doc/README.
+
+### Low 4 — Two stale doc comments contradict the new answer-mirroring behavior (documentation sync)
+
+- `frontend/src/hooks/agentEventReducer.ts:207-211` (`reducePhase`): still says the label cycles "sending → waiting → **thinking** → running tools" — should read reasoning/answering.
+- `frontend/src/hooks/agentState.ts:401-404` (`flushStreamingText`): states "The response text lives in the transcript … it is **NOT duplicated into the activity log**. The thinking box shows **only reasoning**" — directly contradicted by this change (the answer is now mirrored into the activity log as `answer` entries). This doc describes the exact invariant the plan deliberately changed, so it must be updated to avoid misleading the next reader.
+
+## Notes (not findings)
+
+- Cross-request answer coalescing: within one turn, if request N+1 produces no reasoning, its answer coalesces into request N's trailing `answer` entry (the box then shows the concatenated output across tool calls). Visually reasonable and consistent with "live completion in the box"; flagged only as a behavior to be aware of.
+- `Started` still clears `activityLog` per attempt, so the mirrored answer survives a turn end exactly as long as reasoning did before (until the next turn/reasoning) — the preserved rule, working as intended.
+- Verification caveat accepted: I could not re-run `cargo test` / `npm test` / `tsc`; all conclusions are from static inspection of the full files (not just the diff).

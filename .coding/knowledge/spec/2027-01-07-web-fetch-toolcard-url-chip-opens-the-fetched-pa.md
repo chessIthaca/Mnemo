@@ -1,0 +1,6 @@
++++
+title = "web_fetch ToolCard URL chip — opens the fetched page in the system browser"
+created = "2027-01-07"
++++
+
+How the clickable web_fetch chip works (plan 22001355, commit dcda445 on wt/agenticcoding): a web_fetch ToolCard's header chip (webFetchLabel's 60-char truncation) renders as a button that opens the FULL fetched URL in the user's default browser. frontend/src/lib/openExternal.ts is the shared opener (AboutDialog imports it too) — validates http/https via new URL, opens the parsed URL's normalized href through @tauri-apps/plugin-shell (production CSP blocks plain anchors; shell:allow-open granted), logs+swallows errors. webFetchUrl (frontend/src/lib/toolCardPaths.ts) extracts the full untruncated normalized href from web_fetch args (null for other tools/malformed/blank/non-http(s)); ToolCardChip.url carries it; Message.tsx renders the chip button with stopPropagation + ExternalLink icon, and the header's onKeyDown returns early when e.target !== e.currentTarget so chip keyboard activation doesn't toggle expand (also fixes the file-chip keyboard gap). Tests: webFetchUrl block in toolCardPaths.test.ts (normalization + scheme rejection + untruncated-vs-label decoupling).

@@ -1,0 +1,12 @@
++++
+title = "over-threshold re-compaction loop drives cross-turn re-emission (maybe_compact unbounded)"
+created = "2027-01-07"
++++
+
+SYMPTOM: The same assistant message (identical text + identical read_files tool call) re-emitted many times in a row, each executed with its result appended — "endless re-emission". Also: post-completion, ~114 LLM requests over 95 minutes with "no new work" (the app's own summary: "resumed/re-injected with this summary thirty-one times").
+
+ROOT CAUSE (confirmed in code): the over-threshold re-compaction loop in maybe_compact (src/agent/turn.rs:1433). Its own comment: "a turn that stays over the threshold re-compacts every iteration" — the compact_announced flag suppresses only EVENT spam, not the loop. When the kept-verbatim recent tail (keep_recent=6, or 3 over the hard ceiling) keeps the context over effective_summarize_at, every iteration re-compacts (an extra summarizer LLM call) and produces a nearly-identical context ([system, summary, same tail]) → the model re-emits the same response (pattern continuation) → the tool re-executes → still over → compact again. Unbounded. Secondary path: a pure tool-loop conversation blocks compaction entirely (Rule 4, context.rs:231 — never trim inside an open tool loop) and the count balloons to the provider 400 (the 5.5M-token endpoint).
+
+WHY GUARDS MISS IT: R10 (stream.rs:447-489) is in-stream only; the auto-continue budget doesn't apply (the loop is inside one turn); workflow_expects_progress(Complete)=false parks — auto-continue is not the driver.
+
+FIX (plan 70d2283d, commit d0798f9 on wt/agenticcoding): (a) per-turn compaction-attempt budget in maybe_compact — escalate keep_recent (6/3 → 1) after 2 attempts, abort the turn with a clear error at attempt 5; (b) cross-turn repetition guard — 3 consecutive byte-identical assistant responses (name+args, ids excluded) → break the turn with an error event (turn-level R10 mirror). Regression tests: over_threshold_turn_bounds_compaction_attempts + identical_responses_trip_repetition_guard (src/agent/tests.rs) — both fail pre-fix; legitimate_long_turn_compactions_reset_budget (review round 1) pins the attempt-budget reset + the keep_recent=1 escalation on the legitimate long-turn path (drives maybe_compact directly — a run_turn shape cannot oscillate past Rule 4's retreat). Evidence: .coding/logs/traces.jsonl id 398, provider-errors.jsonl:405 (5,526,459-token 400). Detail: .coding/knowledge/bug/2027-01-07-cross-turn-re-emission-tool-loop-pattern-continu.md

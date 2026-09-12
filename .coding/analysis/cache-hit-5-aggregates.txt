@@ -1,0 +1,347 @@
+==============================================================================
+A. request_stats (memory.db, always-on per-request stats)
+==============================================================================
+rows: 29759   window: 2026-08-10 .. 2026-09-10 UTC (epoch clock)
+R12/R13/R17 cutoff: 2026-08-31 UTC (epoch 1788134400)
+models (18): deepseek-v4-flash, deepseek-v4-flash-gcp, gemini-vlm-gcp, glm-5.2, glm-5.2-amp, glm-5.2-gcp, glm-5.2-maas-gcp, glm-5.3, glm-5.3-flash, glm-5.3-flash-gcp, glm-5.3-flash-gcp-h200-bf16-01, glm-5.3-flash-gcp-h200-fp8-01, glm-5.3-flash-gcp-h200-sglang-01, glm-5.3-gcp, glm-5.3-gcp-b200-01, glm-5.3-gcp-b200-02, glm-5.3-gcp-b200-sglang-01, glm-5.3-gcp-h200-01
+distinct sessions: 677
+ttft_ms=0 rows: 29518 (0 = unrecorded)
+
+--- A0. Cache-reporting tier split (R19) ---
+reporting models (13): deepseek-v4-flash, deepseek-v4-flash-gcp, glm-5.2, glm-5.2-amp, glm-5.2-gcp, glm-5.2-maas-gcp, glm-5.3, glm-5.3-flash-gcp-h200-fp8-01, glm-5.3-gcp, glm-5.3-gcp-b200-01, glm-5.3-gcp-b200-02, glm-5.3-gcp-b200-sglang-01, glm-5.3-gcp-h200-01
+non-reporting models (5): gemini-vlm-gcp, glm-5.3-flash, glm-5.3-flash-gcp, glm-5.3-flash-gcp-h200-bf16-01, glm-5.3-flash-gcp-h200-sglang-01
+static-list cross-check: stale (heuristic=reporting, list=non-reporting): deepseek-v4-flash, deepseek-v4-flash-gcp, glm-5.2-maas-gcp, glm-5.3-flash-gcp-h200-fp8-01; unlisted non-reporters: none
+all-time:
+  reporting     n=27544  hit=  88.6%  resets(<50%)=3435 (12.5%)
+  non-reporting n=2215   hit=   0.0%  resets(<50%)=2215 (100.0%)
+  reconciliation: rows 27544+2215=29759 (of 29759)  resets 3435+2215=5650 (of 5650)
+post-R12:
+  reporting     n=14751  hit=  79.8%  resets(<50%)=2664 (18.1%)
+  non-reporting n=2215   hit=   0.0%  resets(<50%)=2215 (100.0%)
+  reconciliation: rows 14751+2215=16966 (of 16966)  resets 2664+2215=4879 (of 4879)
+
+--- A1. Per-model aggregates (all time; t: R=reporting, N=non-reporting tier) ---
+model                              t     n   hit%  res%    avgP    p90P    maxP   avgR  ttft50  ttft90  gen50  gen90
+deepseek-v4-flash                  R     7  18.6% 57.1%   27782  114461  114461      0       0       0   2648   6036
+deepseek-v4-flash-gcp              R     7  49.2% 71.4%   18712   49424   49424      0       0       0   1527 603936
+gemini-vlm-gcp                     N   761   0.0%100.0%   52909   83844  242949    195       4       4    174    321
+glm-5.2                            R 15247  93.6%  9.3%  149356  333323  540779    692       1       1   1186  16460
+glm-5.2-amp                        R   221  96.0%  4.1%  296359  486807  489409    288       1       2    910  11083
+glm-5.2-gcp                        R   225  89.8%  4.9%  124601  161017  499038   1063       2       2   1865  37691
+glm-5.2-maas-gcp                   R    28  17.5% 82.1%   53016   94502  106603   2177       1       1   5428  64736
+glm-5.3                            R  6444  81.8% 15.2%  119806  251024  408956   1309       7      15   3659  28168
+glm-5.3-flash                      N   412   0.0%100.0%  105403  215295  353797   1038       0       0   4240  18484
+glm-5.3-flash-gcp                  N  1013   0.0%100.0%  115536  238817  367708   1128       1       1   5693  22438
+glm-5.3-flash-gcp-h200-bf16-01     N    16   0.0%100.0%  179863  265834  277109   4110       0       0  12564  85545
+glm-5.3-flash-gcp-h200-fp8-01      R   864  57.8% 32.9%  130956  264371  374396    994       6       6   2127  12406
+glm-5.3-flash-gcp-h200-sglang-01   N    13   0.0%100.0%  218338  247295  248188   2658       0       0  13448  31628
+glm-5.3-gcp                        R  2125  76.0% 25.2%  122547  243035  306727   1733       7       8   3811  27243
+glm-5.3-gcp-b200-01                R    67  83.0% 10.4%  151775  194421  308749   2226       0       0   6546  42958
+glm-5.3-gcp-b200-02                R   266  87.0%  9.0%  155104  260433  302601   1240       7       9   3127  22427
+glm-5.3-gcp-b200-sglang-01         R  1385  89.0%  6.5%  131289  254068  307590   1339       5       8   2944  23421
+glm-5.3-gcp-h200-01                R   658  92.0%  6.2%  133523  267332  304491   1279       1       1   3504  27423
+
+--- A2. Daily trend (UTC) ---
+rep* = reporting-tier rows only (the prompt-shape baseline); nonN = non-reporting rows (cached
+always 0). Read day dips as nonN share + fallback-induced cold caches + over-cliff requests,
+not prompt-shape regression (R19).
+day              n   hit%    avgP    maxP resets |   repN repHit% repRes%  nonN
+08-10         1266  98.7%  115201  392800     42 |   1266   98.7%    3.3%     0
+08-11         1413  99.3%  151113  376466     20 |   1413   99.3%    1.4%     0
+08-12         2526  99.0%  149720  509209     67 |   2526   99.0%    2.7%     0
+08-13          601  97.9%  108530  215441     28 |    601   97.9%    4.7%     0
+08-14         1417  98.0%  160773  540779     68 |   1417   98.0%    4.8%     0
+08-15          839  98.7%  165950  311419     29 |    839   98.7%    3.5%     0
+08-16         1730  96.8%  239776  499954    110 |   1730   96.8%    6.4%     0
+08-17          304  95.6%  109161  168040     18 |    304   95.6%    5.9%     0
+08-24          360  87.7%  135215  406648     64 |    360   87.7%   17.8%     0
+08-25          683  89.2%  173903  383141     89 |    683   89.2%   13.0%     0
+08-26          422  84.9%  236649  518567     74 |    422   84.9%   17.5%     0
+08-30         1232  88.5%  193921  428843    162 |   1232   88.5%   13.1%     0
+08-31         1586  67.7%   77697  353797    520 |   1465   74.3%   27.2%   121
+09-01          112  26.3%   84185  201984     73 |     86   44.0%   54.7%    26
+09-03         1676  60.2%   93788  367708    682 |   1179   79.2%   15.7%   497
+09-04         1449  43.5%   91377  304393   1004 |    601   73.4%   26.0%   848
+09-05         2037  56.6%  123346  306727    847 |   1621   76.1%   26.6%   416
+09-06         2931  85.5%  116642  308316    313 |   2905   86.6%    9.9%    26
+09-07         3037  83.1%  136593  408956    396 |   3021   83.7%   12.6%    16
+09-08         1870  85.2%  124457  308515    262 |   1870   85.2%   14.0%     0
+09-09         1289  41.8%  114200  378792    652 |   1024   51.9%   37.8%   265
+09-10          979  82.8%  113896  374396    130 |    979   82.8%   13.3%     0
+
+--- A3. Hit rate by prompt-size bucket (all rows): all-time | post-R12 ---
+        bucket      n   hit%  res% |      n   hit%  res%  post-R12
+        0K-50K  5874  61.2% 35.9% |   3746  52.1% 44.6%
+      50K-100K  7919  72.0% 23.7% |   5525  63.1% 31.5%
+     100K-200K  9202  84.8% 11.3% |   4869  74.1% 19.5%
+     200K-300K  4432  85.5% 11.2% |   2609  77.7% 17.1%
+     300K-340K   852  92.5%  6.1% |    168  78.9% 16.7%
+     340K-400K   702  91.4%  8.1% |     45  18.5% 84.4%
+         >400K   778  96.2%  3.3% |      4   3.5%100.0%
+
+--- A3. Hit rate by prompt-size bucket (reporting tier): all-time | post-R12 ---
+        bucket      n   hit%  res% |      n   hit%  res%  post-R12
+        0K-50K  5175  69.5% 27.2% |   3047  63.0% 31.9%
+      50K-100K  7152  79.6% 15.5% |   4758  73.2% 20.5%
+     100K-200K  8680  89.9%  6.0% |   4347  83.0%  9.8%
+     200K-300K  4223  89.7%  6.8% |   2400  84.4%  9.9%
+     300K-340K   849  92.8%  5.8% |    165  80.4% 15.2%
+     340K-400K   687  93.3%  6.1% |     30  27.7% 76.7%
+         >400K   778  96.2%  3.3% |      4   3.5%100.0%
+
+--- A3. Hit rate by prompt-size bucket (non-reporting tier): all-time | post-R12 ---
+        bucket      n   hit%  res% |      n   hit%  res%  post-R12
+        0K-50K   699   0.0%100.0% |    699   0.0%100.0%
+      50K-100K   767   0.0%100.0% |    767   0.0%100.0%
+     100K-200K   522   0.0%100.0% |    522   0.0%100.0%
+     200K-300K   209   0.0%100.0% |    209   0.0%100.0%
+     300K-340K     3   0.0%100.0% |      3   0.0%100.0%
+     340K-400K    15   0.0%100.0% |     15   0.0%100.0%
+         >400K     0      -     - |      0      -     -
+
+--- A4. Post-R12 subset, all rows (real provider-reported cached tokens) ---
+rows: 16966  hit: 71.3%  resets(<50%): 4879 (28.8%)
+hit distribution: >=90%: 40.1%   50-90%: 31.1%   <50%: 28.8%
+rows with prompt>340K: 49  their hit: 17.1%  resets: 42
+per-model (post-R12):
+  deepseek-v4-flash                  n=7      hit=  18.6%  resets= 57.1%  avgP=27782
+  gemini-vlm-gcp                     n=761    hit=   0.0%  resets=100.0%  avgP=52909
+  glm-5.2                            n=2907   hit=  75.8%  resets= 23.3%  avgP=84908
+  glm-5.2-maas-gcp                   n=28     hit=  17.5%  resets= 82.1%  avgP=53016
+  glm-5.3                            n=6444   hit=  81.8%  resets= 15.2%  avgP=119806
+  glm-5.3-flash                      n=412    hit=   0.0%  resets=100.0%  avgP=105403
+  glm-5.3-flash-gcp                  n=1013   hit=   0.0%  resets=100.0%  avgP=115536
+  glm-5.3-flash-gcp-h200-bf16-01     n=16     hit=   0.0%  resets=100.0%  avgP=179863
+  glm-5.3-flash-gcp-h200-fp8-01      n=864    hit=  57.8%  resets= 32.9%  avgP=130956
+  glm-5.3-flash-gcp-h200-sglang-01   n=13     hit=   0.0%  resets=100.0%  avgP=218338
+  glm-5.3-gcp                        n=2125   hit=  76.0%  resets= 25.2%  avgP=122547
+  glm-5.3-gcp-b200-01                n=67     hit=  83.0%  resets= 10.4%  avgP=151775
+  glm-5.3-gcp-b200-02                n=266    hit=  87.0%  resets=  9.0%  avgP=155104
+  glm-5.3-gcp-b200-sglang-01         n=1385   hit=  89.0%  resets=  6.5%  avgP=131289
+  glm-5.3-gcp-h200-01                n=658    hit=  92.0%  resets=  6.2%  avgP=133523
+
+--- A4. Post-R12 subset, reporting tier (the prompt-shape baseline) (real provider-reported cached tokens) ---
+rows: 14751  hit: 79.8%  resets(<50%): 2664 (18.1%)
+hit distribution: >=90%: 46.2%   50-90%: 35.8%   <50%: 18.1%
+rows with prompt>340K: 34  their hit: 24.5%  resets: 27
+per-model (post-R12):
+  deepseek-v4-flash                  n=7      hit=  18.6%  resets= 57.1%  avgP=27782
+  glm-5.2                            n=2907   hit=  75.8%  resets= 23.3%  avgP=84908
+  glm-5.2-maas-gcp                   n=28     hit=  17.5%  resets= 82.1%  avgP=53016
+  glm-5.3                            n=6444   hit=  81.8%  resets= 15.2%  avgP=119806
+  glm-5.3-flash-gcp-h200-fp8-01      n=864    hit=  57.8%  resets= 32.9%  avgP=130956
+  glm-5.3-gcp                        n=2125   hit=  76.0%  resets= 25.2%  avgP=122547
+  glm-5.3-gcp-b200-01                n=67     hit=  83.0%  resets= 10.4%  avgP=151775
+  glm-5.3-gcp-b200-02                n=266    hit=  87.0%  resets=  9.0%  avgP=155104
+  glm-5.3-gcp-b200-sglang-01         n=1385   hit=  89.0%  resets=  6.5%  avgP=131289
+  glm-5.3-gcp-h200-01                n=658    hit=  92.0%  resets=  6.2%  avgP=133523
+
+--- A4. Post-R12 subset, non-reporting tier (cached_tokens field absent — 0 is not a miss) ---
+rows: 2215  hit: 0.0%  resets(<50%): 2215 (100.0%)
+hit distribution: >=90%: 0.0%   50-90%: 0.0%   <50%: 100.0%
+rows with prompt>340K: 15  their hit: 0.0%  resets: 15
+per-model (post-R12):
+  gemini-vlm-gcp                     n=761    hit=   0.0%  resets=100.0%  avgP=52909
+  glm-5.3-flash                      n=412    hit=   0.0%  resets=100.0%  avgP=105403
+  glm-5.3-flash-gcp                  n=1013   hit=   0.0%  resets=100.0%  avgP=115536
+  glm-5.3-flash-gcp-h200-bf16-01     n=16     hit=   0.0%  resets=100.0%  avgP=179863
+  glm-5.3-flash-gcp-h200-sglang-01   n=13     hit=   0.0%  resets=100.0%  avgP=218338
+
+--- A5. 10 worst sessions by token-weighted hit rate, all rows (>=20 requests) ---
+1de857da  n=34    hit=0.0%  models=gemini-vlm-gcp,glm-5.2
+52496c01  n=31    hit=0.0%  models=glm-5.3-flash
+617acedf  n=53    hit=0.0%  models=glm-5.3-flash-gcp
+ac4c4e37  n=70    hit=0.0%  models=gemini-vlm-gcp,glm-5.3-flash-gcp
+af803ee9  n=285   hit=0.0%  models=gemini-vlm-gcp
+b2f5c543  n=93    hit=0.0%  models=glm-5.3-flash-gcp
+b970caf0  n=61    hit=0.0%  models=gemini-vlm-gcp,glm-5.3-gcp
+d00c134a  n=34    hit=0.0%  models=glm-5.3-flash-gcp
+d18669fe  n=23    hit=0.0%  models=gemini-vlm-gcp
+d68d2576  n=80    hit=0.0%  models=glm-5.3-flash-gcp
+
+--- A5. 10 worst sessions by token-weighted hit rate, reporting tier only (>=20 requests) ---
+e87198f3  n=40    hit=41.7%  models=glm-5.2
+6e6d39f1  n=20    hit=44.1%  models=glm-5.2
+f4d20ff7  n=69    hit=45.1%  models=glm-5.2,glm-5.2-maas-gcp
+ae8ec2df  n=105   hit=46.9%  models=glm-5.3,glm-5.3-flash-gcp-h200-fp8-01,glm-5.3-gcp-b200-02
+7a269e80  n=24    hit=49.4%  models=glm-5.2
+db719d8c  n=32    hit=51.1%  models=glm-5.2
+a4d83626  n=54    hit=52.1%  models=glm-5.3
+32339dbf  n=45    hit=52.9%  models=glm-5.2
+88a7e9e5  n=492   hit=53.2%  models=glm-5.3,glm-5.3-flash-gcp-h200-fp8-01
+5b9bacf5  n=48    hit=53.4%  models=glm-5.2
+
+==============================================================================
+B. traces.jsonl (opt-in full request traces)
+==============================================================================
+id=74  ts=2026-09-10 12:59:28  model=glm-5.3  provider=<gateway>
+top-level keys: ['backoff_ms', 'base_url', 'compact_ms', 'connect_ms', 'error', 'finish_reason', 'generation_ms', 'guard_cut', 'http_status', 'id', 'is_complete', 'model', 'prep_ms', 'provider', 'raw_tool_calls', 'reasoning_ms', 'request_json', 'request_truncated', 'response_evicted', 'response_raw', 'response_truncated', 'stall_ms', 'tools_ms', 'ts_ms', 'ttft_ms', 'usage']
+max_completion_tokens=32000  nMessages=80  nTools=34
+role counts: {'system': 3, 'user': 12, 'assistant': 29, 'tool': 36}
+system head len: 22053 chars
+largest messages (chars, role, idx): 65561@tool[62], 22053@system[0], 11030@tool[77], 2364@system[78], 1605@user[21], 1287@tool[68], 1232@assistant[31], 1179@assistant[18]
+last msg: role=system len=48 head80='<context footer — cache-stable sentinel, ignore>'
+usage: {'prompt': 122049, 'completion': 4996, 'reasoning': 4075, 'cached': 79808}
+ttft_ms: 0
+generation_ms: 22301
+finish_reason: tool_calls
+error: None
+id=75  ts=2026-09-10 12:59:55  model=glm-5.3  provider=<gateway>
+top-level keys: ['backoff_ms', 'base_url', 'compact_ms', 'connect_ms', 'error', 'finish_reason', 'generation_ms', 'guard_cut', 'http_status', 'id', 'is_complete', 'model', 'prep_ms', 'provider', 'raw_tool_calls', 'reasoning_ms', 'request_json', 'request_truncated', 'response_evicted', 'response_raw', 'response_truncated', 'stall_ms', 'tools_ms', 'ts_ms', 'ttft_ms', 'usage']
+max_completion_tokens=32000  nMessages=83  nTools=34
+role counts: {'system': 3, 'user': 12, 'assistant': 30, 'tool': 38}
+system head len: 22053 chars
+largest messages (chars, role, idx): 65561@tool[62], 22053@system[0], 11030@tool[77], 2364@system[81], 1605@user[21], 1287@tool[68], 1232@assistant[31], 1179@assistant[18]
+last msg: role=system len=48 head80='<context footer — cache-stable sentinel, ignore>'
+usage: {'prompt': 127081, 'completion': 312, 'reasoning': 254, 'cached': 121216}
+ttft_ms: 0
+generation_ms: 1894
+finish_reason: tool_calls
+error: None
+
+==============================================================================
+C. provider-errors.jsonl
+==============================================================================
+total: 486   window: 2026-08-14 08:06:19 .. 2026-09-10 12:56:35 UTC
+
+--- C1. Histogram by (http_status, model) ---
+status=404   n=66    model=glm-5.2
+   e.g. litellm.NotFoundError: NotFoundError: OpenAIException - Error code: 404. Received Model Group=glm-5.2 Availabl
+status=0     n=52    model=glm-5.2
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=200   n=45    model=glm-5.2
+   e.g. stream aborted — consumer dropped
+status=502   n=32    model=deepseek-v4-flash-gcp
+   e.g. litellm.BadGatewayError: BadGatewayError: OpenAIException - Error code: 502 - {'detail': 'vertex: {"error":{"m
+status=0     n=26    model=glm-5.3-gcp
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=400   n=22    model=glm-5.3-flash-gcp-h200-fp8-01
+   e.g. /chat/completions: Invalid model name passed in model=glm-5.3-flash-gcp-h200-fp8-01. Call `/v1/models` to view
+status=400   n=20    model=gemini-vlm-gcp
+   e.g. litellm.BadRequestError: OpenAIException - Error code: 400 - {'detail': 'vertex: [{\n  "error": {\n    "code":
+status=500   n=19    model=glm-5.3-flash
+   e.g. litellm.InternalServerError: InternalServerError: OpenAIException - Connection error.No fallback model group f
+status=401   n=18    model=deepseek-v4-flash-gcp
+   e.g. LiteLLM Virtual Key expected. Received=****, expected to start with 'sk-'.
+status=0     n=12    model=glm-5.3-flash
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=404   n=12    model=glm-5.3-gcp
+   e.g. litellm.NotFoundError: NotFoundError: OpenAIException - Error code: 404 - {'detail': 'No model configured for 
+status=200   n=12    model=glm-5.3
+   e.g. stream aborted — consumer dropped
+status=400   n=11    model=qwen-3.6
+   e.g. litellm.BadRequestError: OpenAIException - max_completion_tokens=131072 cannot be greater than max_model_len=m
+status=400   n=9     model=glm-5.3-flash-gcp
+   e.g. litellm.BadRequestError: OpenAIException - Error code: 400 - {'detail': 'vertex: {"error":{"message":"3 valida
+status=503   n=9     model=glm-5.3-flash-gcp-h200-sglang-01
+   e.g. litellm.ServiceUnavailableError: ServiceUnavailableError: OpenAIException - Error code: 503 - {'detail': 'vert
+status=400   n=9     model=glm-5.3-gcp-b200-sglang-01
+   e.g. /chat/completions: Invalid model name passed in model=glm-5.3-gcp-b200-sglang-01. Call `/v1/models` to view av
+status=0     n=9     model=glm-5.3-flash-gcp-h200-fp8-01
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=200   n=8     model=deepseek-v4-flash
+   e.g. stream aborted — consumer dropped
+status=502   n=8     model=glm-5.3-flash-gcp-h200-bf16-01
+   e.g. litellm.BadGatewayError: BadGatewayError: OpenAIException - upstream: ReadError('')No fallback model group fou
+status=200   n=6     model=deepseek-v4-flash-gcp
+   e.g. stream aborted — consumer dropped
+status=200   n=6     model=glm-5.2-amp
+   e.g. stream aborted — consumer dropped
+status=200   n=6     model=glm-5.3-flash
+   e.g. stream aborted — consumer dropped
+status=502   n=6     model=glm-5.3-flash
+   e.g. litellm.BadGatewayError: BadGatewayError: OpenAIException - upstream: ConnectError('[Errno -2] Name or service
+status=200   n=6     model=glm-5.3-gcp
+   e.g. stream aborted — consumer dropped
+status=200   n=6     model=glm-5.3-gcp-b200-sglang-01
+   e.g. stream aborted — consumer dropped
+status=0     n=6     model=glm-5.3
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=200   n=5     model=glm-5.3-flash-gcp
+   e.g. stream aborted — consumer dropped
+status=200   n=4     model=glm-5.2-gcp
+   e.g. stream stalled — no data for 90s (HTTP 200 OK). The connection appears dead. content-encoding: (none) transfer
+status=502   n=4     model=glm-5.3-gcp
+   e.g. litellm.BadGatewayError: BadGatewayError: OpenAIException - upstream: ConnectError('[Errno -2] Name or service
+status=400   n=3     model=glm-5.2
+   e.g. litellm.BadRequestError: OpenAIException - Invalid request format: Input should be 'function' at ('body', 0, '
+status=404   n=3     model=glm-5.3-flash-gcp
+   e.g. litellm.NotFoundError: NotFoundError: OpenAIException - Error code: 404 - {'detail': 'No model configured for 
+status=200   n=3     model=glm-5.3-flash-gcp-h200-fp8-01
+   e.g. stream aborted — consumer dropped
+status=502   n=3     model=glm-5.3-flash-gcp-h200-fp8-01
+   e.g. litellm.BadGatewayError: BadGatewayError: OpenAIException - upstream: ConnectError('[Errno -2] Name or service
+status=0     n=2     model=gemini-vlm-gcp
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=0     n=2     model=glm-5.3-gcp-b200-sglang-01
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=0     n=2     model=glm-5.3-gcp-h200-01
+   e.g. failed to start stream: error sending request for url (<gateway>/v1/chat/completions)
+status=400   n=2     model=glm-5.3-flash
+   e.g. litellm.BadRequestError: OpenAIException - Error code: 400 - {'detail': 'vertex: {"error":{"code":500,"message
+status=429   n=2     model=glm-5.3-flash
+   e.g. No deployments available for selected model, Try again in 1 seconds. Passed model=glm-5.3-flash. pre-call-chec
+status=400   n=1     model=deepseek-v4-flash
+   e.g. litellm.ContextWindowExceededError: litellm.BadRequestError: ContextWindowExceededError: OpenAIException - Thi
+status=200   n=1     model=glm-5.2-maas-gcp
+   e.g. stream aborted — consumer dropped
+status=503   n=1     model=glm-5.3-gcp
+   e.g. upstream connect error or disconnect/reset before headers. reset reason: connection termination
+status=429   n=1     model=glm-5.3-gcp
+   e.g. No deployments available for selected model, Try again in 30 seconds. Passed model=glm-5.3-gcp. pre-call-check
+status=200   n=1     model=glm-5.3-flash-gcp-h200-sglang-01
+   e.g. stream aborted — consumer dropped
+status=503   n=1     model=glm-5.3-gcp-h200-01
+   e.g. upstream connect error or disconnect/reset before headers. reset reason: connection termination
+status=200   n=1     model=glm-5.3-gcp-h200-01
+   e.g. stream error (HTTP 200 OK): error decoding response body cause chain: error decoding response body → error rea
+status=200   n=1     model=glm-5.3-gcp-b200-02
+   e.g. stream aborted — consumer dropped
+status=503   n=1     model=glm-5.3-flash-gcp-h200-bf16-01
+   e.g. litellm.ServiceUnavailableError: ServiceUnavailableError: OpenAIException - Error code: 503 - {'detail': 'vert
+status=400   n=1     model=glm-5.3
+   e.g. litellm.BadRequestError: OpenAIException - Error code: 400 - {'detail': 'vertex: {"error":{"code":500,"message
+
+--- C2. Per-day counts ---
+08-14: 53
+08-15: 62
+08-16: 8
+08-17: 16
+08-24: 20
+08-25: 27
+08-26: 15
+08-30: 15
+08-31: 21
+09-01: 11
+09-02: 12
+09-03: 34
+09-04: 4
+09-05: 47
+09-06: 34
+09-07: 29
+09-08: 1
+09-09: 22
+09-10: 55
+
+--- C3. Top bursts (errors within 120s of each other, size>=5) ---
+n=29   span=424s  start=2026-08-15 13:08:12  statuses={404: 29}  model=glm-5.2
+n=19   span=132s  start=2026-08-14 08:06:19  statuses={401: 18, 200: 1}  model=deepseek-v4-flash-gcp
+n=19   span=198s  start=2026-08-15 13:17:42  statuses={404: 19}  model=glm-5.2
+n=19   span=53s  start=2026-09-10 12:43:22  statuses={400: 15, 500: 3, 429: 1}  model=glm-5.3-flash-gcp-h200-fp8-01
+n=17   span=306s  start=2026-08-24 20:22:18  statuses={404: 17}  model=glm-5.2
+n=16   span=350s  start=2026-08-25 08:47:33  statuses={502: 11, 200: 3, 400: 2}  model=deepseek-v4-flash-gcp
+
+--- C4. Post-R12 subset ---
+rows: 270
+status=0     n=26    model=glm-5.3-gcp
+status=400   n=22    model=glm-5.3-flash-gcp-h200-fp8-01
+status=400   n=20    model=gemini-vlm-gcp
+status=500   n=19    model=glm-5.3-flash
+status=200   n=12    model=glm-5.2
+status=0     n=12    model=glm-5.3-flash
+status=404   n=12    model=glm-5.3-gcp
+status=200   n=12    model=glm-5.3
+status=400   n=9     model=qwen-3.6
+status=400   n=9     model=glm-5.3-flash-gcp
+status=503   n=9     model=glm-5.3-flash-gcp-h200-sglang-01
+status=400   n=9     model=glm-5.3-gcp-b200-sglang-01

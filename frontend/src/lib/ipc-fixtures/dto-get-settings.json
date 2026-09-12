@@ -1,0 +1,70 @@
+{
+  "config_dir": "/home/user/.mnemo",
+  "context": {
+    "summarize_at_fill_rate": 0.5,
+    "proxy_cache_ceiling_tokens": 340000
+  },
+  "endpoints": [],
+  "general": {
+    "auto_compact_on_plan_complete": false,
+    "bundled_embedding_model": null,
+    "default_model": null,
+    "default_provider": null,
+    "embedding_model": null,
+    "enable_browser_inspection": false,
+    "safety": "approve-each-action",
+    "vision_model": null
+  },
+  "markdown": {
+    "skip_dirs": [".git", "node_modules", "target", "dist"]
+  },
+  "memory": {
+    "decay_half_life_days": 7.0,
+    "per_query_cap": 50,
+    "derived_per_class_cap": 5,
+    "plan_budget": 400,
+    "bug_budget": 600,
+    "spec_budget": 500,
+    "decision_budget": 300,
+    "review_budget": 500
+  },
+  "git": {
+    "core_operations": ["merge", "push"]
+  },
+  "trace": {
+    "memory_budget_mb": 16,
+    "request_body_cap_kb": 256
+  },
+  "models": {
+    "bug_fixing": null,
+    "complete": null,
+    "executing": null,
+    "planning": null,
+    "reviewing": null,
+    "skill": {},
+    "subagent": null,
+    "summarize": null
+  },
+  "pricing": [],
+  "projects": [
+    {
+      "name": "demo",
+      "path": "C:/code/demo"
+    }
+  ],
+  "ui": {
+    "show_token_usage": true,
+    "show_tool_activity": false,
+    "show_knowledge_activity": true,
+    "show_delegation_notes": false,
+    "show_tool_images": true,
+    "chat_thread_line": true,
+    "chat_prose_cap": true,
+    "chat_turn_tint": true,
+    "chat_hover_timestamps": true,
+    "sound_complete": true,
+    "sound_input_needed": true,
+    "sound_stopped_errors": true,
+    "theme": "dark"
+  }
+}

@@ -1,0 +1,6 @@
++++
+title = "list_models/list_vision_models share resolve_endpoint_credentials + fetch_by_kind (HIGH 2 dedup)"
+created = "2027-01-07"
++++
+
+The two model-listing IPC commands in `src-tauri/src/ipc/models.rs` are thin wrappers over two shared helpers: `resolve_endpoint_credentials(config, endpoint_name, base_url, api_key, kind)` — override → saved endpoint → kind-aware env fallback (ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN vs OPENAI_API_KEY) → terminal "dummy"; kind defaults to "openai" — and `fetch_by_kind(kind, base_url, api_key)` — anthropic → `fetch_models_anthropic`, else `fetch_models_with_vision`. `kind_wire` was deleted; settings.rs `endpoint_kind_wire` (pub(crate), ~:638) is the single wire-mapping source. Lock scoping preserved: the config guard drops at block close, before the HTTP fetch. The test module serializes env-mutating tests with `ENV_TEST_LOCK` (the `src/provider/client_factory.rs` pattern); all four env-touching tests hold it for their full duration, `empty_base_url_errors` correctly doesn't (errors in base_url resolution before any env read). Commit `5cf6030` on wt/agenticcoding; reviews r1/r2/r3 at `.coding/reviews/2027-01-07-list-models-dedup*.md` (final round-3 PASS).

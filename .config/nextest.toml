@@ -1,0 +1,20 @@
+# cargo-nextest configuration.
+#
+# NOTE (2026-09-19): cargo-nextest is NOT the recommended test runner for this
+# project on Windows. Its process-per-test model causes hangs on the ~300 tests
+# that spawn subprocesses (git, shell) — child processes inherit nextest's
+# stdout/stderr pipe handles, and nextest waits forever for them to close.
+# `cargo test --lib` (9.52s, already parallel across 32 cores) is the optimal
+# runner. This config is kept so `cargo nextest run -- --ignored` works for the
+# browser integration tests, and so the leak-timeout prevents indefinite hangs
+# if someone does use nextest on a subset.
+#
+# leak-timeout: how long to wait for a test process to exit after the test
+# function returns. Some tests spawn child processes (shell, git) that inherit
+# the test process's stdout/stderr pipe handles — nextest waits for those pipes
+# to close, and a child that outlives the test hangs nextest forever. A
+# leak-timeout kills the process after this duration and marks the test as
+# "leaked", so the suite completes instead of hanging.
+[profile.default]
+slow-timeout = { period = "15s", terminate-after = 1 }
+leak-timeout = "500ms"

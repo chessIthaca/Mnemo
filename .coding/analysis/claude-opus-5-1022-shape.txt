@@ -1,0 +1,87 @@
+# claude-opus-5 provider-errors ids 1022-1030 + 879-888 — request forensics + adjudication (2026-12-29)
+
+Source: provider-errors.jsonl bursts ids 1022-1030 (ts_ms 1788508444631-1788508460358
+= 2026-09-04 03:53-03:56 -0400) and 879-888 — 9 + 10 non-retryable HTTP 400
+"messages.3.content.0.thinking: each thinking block must contain thinking"
+(claude-opus-5). The failing request bodies were force-mirrored to traces.jsonl,
+but those rows are 256KiB-truncated (unparsable) and no longer on disk
+(traces.jsonl absent from .coding/logs; provider-errors.jsonl has since rotated —
+its current rows restart at id 1). The shape below is reconstructed from the
+error path + the capture code, then pinned by fails-without-fix regression
+tests (the DeepSeek adjudication method, adapted to synthetic reproduction —
+see deepseek-1042-shape.txt for the original).
+
+## The failing shape (reconstructed)
+
+`messages[3].content[0]` — the FIRST content block of the 4th message (an
+echoed assistant turn) — was a thinking block with an empty `thinking`
+string:
+
+    { "type": "thinking", "thinking": "", "signature": "sig-…" }
+
+Anthropic validates every thinking block on echo: an empty `thinking`
+string is rejected with the observed non-retryable 400. Because the poisoned
+block lives in stored conversation history, every retry of the conversation
+fails identically — hence the 9- and 10-attempt bursts.
+
+## Root cause (code-path, verified)
+
+1. `build_raw_content_block` (src/provider/anthropic.rs) captures the
+   `content_block_start` payload verbatim; for a thinking block that payload
+   carries `thinking: ""` (the field is initialized empty; the signature may
+   arrive here or via `signature_delta`).
+2. `accumulate_raw_block_delta` fills `thinking` only via `thinking_delta`.
+   A stream that never delivers a `thinking_delta` for that block (a gateway
+   that strips thinking content but preserves structure, or an edge stream)
+   leaves the captured block at `thinking: ""`.
+3. The `message_stop` finalization parsed tool_use inputs but performed no
+   thinking-block validation before emitting `RawAssistantDelta` — the empty
+   block was stored on the assistant message.
+4. `raw_content_is_usable` checked block types (and tool_use id/name/input)
+   but never a thinking block's CONTENT, so `message_to_json` echoed the raw
+   array verbatim — empty thinking block included — producing the 400.
+
+## The fix (wt/agenticcoding)
+
+Two layers, sharing one helper `is_always_invalid_thinking_block` (a
+`thinking` block with missing/empty `thinking`, or a `redacted_thinking`
+block with missing/empty `data` — always invalid on the wire, zero
+information):
+
+- Capture-side: the `message_stop` finalization now retains only valid
+  blocks — an empty thinking block is never stored, so new history cannot be
+  poisoned. If the retain empties the array (the turn's only block was an
+  empty thinking block), no raw is emitted at all (matching the
+  raw-none-when-no-blocks semantics).
+- Echo-side: `message_to_json`'s raw echo sanitizes the stored array with
+  the same helper before echoing — already-poisoned conversations (the
+  incident histories) are unblocked: the empty block is dropped, valid
+  thinking blocks (content + signature) and text/tool_use blocks still echo
+  verbatim (Rule 1). If the sanitized array is empty, the existing H1
+  fall-through to field construction applies.
+
+## Rule 4 trade-off (documented)
+
+Filtering a VALID thinking block historically caused 400 "Expected thinking
+or redacted_thinking, but found text" (Rule 4). This fix filters only
+ALWAYS-INVALID blocks: echoing an empty thinking block is a GUARANTEED 400
+(the observed bug), so dropping it is never worse. Valid thinking blocks are
+untouched.
+
+## Regression tests (fail without the fix, pass with it)
+
+- `build_request_json_drops_empty_thinking_block_from_echoed_history` —
+  echo-side: raw content [thinking(""), thinking("real reasoning"), text]
+  must echo as [thinking(valid), text].
+- `raw_drops_empty_thinking_block_that_never_received_content` —
+  capture-side: a stream with thinking block-start (signature, no
+  thinking_delta) + text must capture only the text block.
+
+Both verified red against the pre-fix code (2026-12-29) and green after;
+full suite 1919 + 16 passed / 0 failed.
+
+## Sibling family
+
+The Anthropic sibling of the DeepSeek reasoning_content echo bugs (BUG
+memories 1284933d, 8401fb46, 429a3d7b): assistant reasoning must survive
+every wire path when echoed — and its INVALID forms must never be echoed.

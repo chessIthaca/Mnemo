@@ -1,0 +1,173 @@
+# Multi-platform build pipeline (Windows + macOS).
+#
+# Triggers: manual (Actions tab → Run workflow) or pushing a v* tag.
+#
+# macOS signing + notarization is SECRETS-DRIVEN and group-gated: configure
+# each group completely or leave it entirely unset — a partial group fails
+# fast with a clear error (the consistency-check step) instead of a confusing
+# codesign/notarytool failure at the end of the build. Groups:
+#   Signing:    APPLE_CERTIFICATE (base64 .p12 of the "Developer ID
+#               Application" cert) + APPLE_CERTIFICATE_PASSWORD (.p12
+#               password) + APPLE_SIGNING_IDENTITY (cert name, e.g.
+#               "Developer ID Application: Acme Inc (ABCD1234)")
+#   Notarizing: APPLE_API_ISSUER + APPLE_API_KEY (key id) +
+#               APPLE_API_KEY_CONTENT (the .p8 private key body)
+#
+# With no Apple secrets the job still produces a valid ad-hoc-signed .dmg
+# (runs locally, Gatekeeper-warned).
+#
+# Background: .coding/analysis/2026-08-20-macos-port-research.md (macOS builds
+# must run on macOS — hence the macos-latest runner; no Windows cross-build).
+
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+# One run per ref — a superseded push cancels the in-flight run (saves
+# minutes, especially for the 10x-billed macOS runners on private repos).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "1"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install npm deps (root + frontend workspace)
+        run: npm ci
+      - name: Rust tests (workspace: mnemo + mnemo-app)
+        run: cargo test --workspace
+      - name: Frontend type-check
+        run: npx tsc --noEmit
+        working-directory: frontend
+      - name: Frontend unit tests
+        run: npx vitest run
+        working-directory: frontend
+      - name: Frontend production build
+        run: npm run build
+        working-directory: frontend
+      - name: Tauri build (unsigned installers)
+        run: npx tauri build
+      # NOTE: the workspace root is the REPO ROOT (root Cargo.toml declares
+      # [workspace] members = ["src-tauri"]), so all bundles land under
+      # <repo-root>/target/... — not src-tauri/target (review F1).
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Install npm deps (root + frontend workspace)
+        run: npm ci
+      # Compile + test validation for the macOS target (the game_* tools and
+      # the child webview are Windows-gated; everything else must be green
+      # here). Browser tests launch the runner's preinstalled Chrome.
+      - name: Rust tests (workspace, macOS compile validation)
+        run: cargo test --workspace
+      - name: Frontend type-check
+        run: npx tsc --noEmit
+        working-directory: frontend
+      - name: Frontend unit tests
+        run: npx vitest run
+        working-directory: frontend
+      - name: Frontend production build
+        run: npm run build
+        working-directory: frontend
+      # Fail fast (before the expensive build) on a half-configured Apple
+      # secret group — each group must be complete or entirely unset, else
+      # the build would fail late with a confusing codesign/notarytool error
+      # (review F3).
+      - name: Check Apple secrets consistency
+        if: ${{ (secrets.APPLE_CERTIFICATE != '') != (secrets.APPLE_SIGNING_IDENTITY != '') || (secrets.APPLE_API_ISSUER != '') != (secrets.APPLE_API_KEY_CONTENT != '') || (secrets.APPLE_API_KEY != '') != (secrets.APPLE_API_KEY_CONTENT != '') }}
+        run: |
+          echo "::error::Inconsistent Apple secrets. Set each group completely or leave it unset — signing: APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD + APPLE_SIGNING_IDENTITY; notarization: APPLE_API_ISSUER + APPLE_API_KEY + APPLE_API_KEY_CONTENT."
+          exit 1
+      # Import the signing certificate only when the WHOLE signing group is
+      # present. The identity for the build step is exported via GITHUB_ENV
+      # here — so a partial config can never hand tauri an empty
+      # APPLE_SIGNING_IDENTITY (a statically-declared env of an unset secret
+      # would be set-but-empty, which the bundler treats as a real identity).
+      - name: Import Apple signing certificate
+        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: build-keychain
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+          rm certificate.p12
+          echo "APPLE_SIGNING_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> "$GITHUB_ENV"
+      # Write the notarization API key only when the WHOLE notarization group
+      # is present; the notarytool env is exported via GITHUB_ENV the same
+      # way (set-only-when-complete, never set-but-empty).
+      - name: Write notarization API key
+        if: ${{ secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_CONTENT != '' }}
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          mkdir -p "$HOME/private_keys"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$HOME/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+          echo "APPLE_API_KEY_PATH=$HOME/private_keys/AuthKey_${APPLE_API_KEY}.p8" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY=$APPLE_API_KEY" >> "$GITHUB_ENV"
+          echo "APPLE_API_ISSUER=$APPLE_API_ISSUER" >> "$GITHUB_ENV"
+      # Tauri signs + notarizes only when the APPLE_* env vars (exported by
+      # the gated steps above) exist; with none set the bundle is ad-hoc
+      # signed (still runnable locally). No static APPLE_* env is declared
+      # here on purpose — see the gated steps.
+      - name: Tauri build (.app + .dmg, aarch64)
+        run: npx tauri build --target aarch64-apple-darwin
+      # upload-artifact@v4 does not preserve file permissions (the Mach-O
+      # exec bit) or symlinks, so a raw .app would not launch after download
+      # (review F2). ditto preserves both — zip the .app and upload the zip
+      # alongside the real distributable (the .dmg).
+      - name: Zip the .app bundle
+        run: |
+          ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/*.app mnemo.app.zip
+      # Same root-target layout note as the Windows job (review F1).
+      - name: Upload macOS bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-bundles-aarch64
+          path: |
+            mnemo.app.zip
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error

@@ -1,0 +1,12 @@
++++
+title = "429 fallback pinned the model-picker pin — per-phase model overrides stopped switching"
+created = "2026-09-01"
++++
+
+Symptom: per-phase model switching stopped firing — no switch to [models.planning]/[models.executing]/[models.reviewing]/[models.complete] on state transitions (plan→execute) or at conversation start. User suspected a race; it was a priority inversion.
+
+Root cause: try_429_fallback (src/agent/loop_impl.rs, introduced by commit 914ca32 "429 → automatic cross-provider model fallback", plan 6d221559, 2026-12-04) made the automatic 429 endpoint fallback sticky by calling set_explicit_provider — the per-agent model-picker pin. That pin sits at priority 2 in resolve_turn_provider (skill > explicit pin > forced model > state/subagent chain) and is NEVER cleared (loop lifetime = process lifetime for the main agent, spanning conversations). So a single 429 permanently froze the agent on the fallback model; all [models.*] overrides were silently discarded. The pin also swapped the default slot.
+
+Fix (plan 0aeb92cd, branch wt/agenticcoder, 2026-12-05): endpoint stickiness instead of a provider pin. AgentLoop gained fallback_endpoints: RwLock<HashMap<model_id, (failed_endpoint, ModelRef alternate)>>; try_429_fallback records an entry (validates buildability AND that the alternate's context window is >= the live conversation's budget, no set_explicit_provider, no default-slot swap); resolve_turn_provider consults it via sticky_endpoint() on every path (skill, the explicit picker pin, state/subagent override, forced model, and the default-provider path) — it reroutes a model to its alternate endpoint but never changes WHICH model the chain picks. Sticky entries store ModelRef (rebuilt per use → config reloads picked up); a later 429 on the alternate overwrites the entry (self-healing flip). The picker pin (set_explicit_provider) is now picker-only again.
+
+Regression tests (src/runtime/agent.rs): state_override_survives_429_fallback + default_path_429_fallback_does_not_pin + picker_pin_429_fallback_reroutes_endpoint (2026-12-06 review follow-up: the pinned endpoint serves exactly one attempt, the 429, then the retry reroutes to the alternate endpoint) — the first two failed on the pin (exec-model never called, left: 0; the pin-path test fails on the pre-fix code with a terminal error and pinned_calls == 2) and pass with the fix. README 429 wording updated (sticky alternate endpoint, overrides keep firing).

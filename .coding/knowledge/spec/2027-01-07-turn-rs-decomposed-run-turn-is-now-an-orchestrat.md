@@ -1,0 +1,6 @@
++++
+title = "turn.rs decomposed — run_turn is now an orchestrator over 11 phase methods"
+created = "2027-01-07"
++++
+
+The 2,120-line run_turn (92% of turn.rs, ~10-level nesting) was decomposed (quality review HIGH 1 + LOW 7; plan c4eb5525, commit 0cf3af9 on wt/agenticcoding). run_turn is now a ~470-line orchestrator over 11 phase methods on impl AgentLoop: handle_pending_swap, resolve_iteration_provider, maybe_compact, auto_recall, install_system_messages, request_stream, consume_stream, record_interrupted_output, handle_bad_json, execute_tool_batch, emit_workflow_state — plus free fn synthesize_not_run_results. Loop-carried state lives in the TurnState struct (tool_error_count, bad_json_count, deny_all_latched, stop_reason, compact_announced, token_accounting, recall cache) threaded through phases as &mut; stream accumulation returns a StreamOutcome struct; the swap magic numbers are named consts SWAP_SUMMARIZE_FILL (0.8) and KEEP_RECENT_ON_SWAP (6). Pure code motion — behavior pinned by the 2004-test suite; the source-contract test workflow_state_changed_emission_requires_success greps turn.rs for the "If this was a workflow tool that succeeded" marker inside emit_workflow_state (keep that comment + the result.success gate in turn.rs when editing). Editing the agent loop now means editing the relevant phase method, not a monolith.

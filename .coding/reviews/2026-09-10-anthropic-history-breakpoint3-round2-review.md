@@ -1,0 +1,42 @@
+## Verdict: PASS
+
+Round-2 verification of plan ee33d615 ("Anthropic conversation-history caching (3rd breakpoint)") at HEAD d5cfd52 on wt/agenticcoding — clean tree (`git diff HEAD` and `git status --short` both empty). Round 1 (.coding/reviews/2026-09-10-anthropic-history-breakpoint3-review.md) returned FINDINGS (0 high, 1 low); its single finding — the stale PLAN.md "Prompt caching strategy" bullet — is fixed correctly, the rest of the changeset is unchanged from what round 1 verified, and the new PLAN.md text is factually accurate against the code. No new findings.
+
+## 1. Round-1 finding LOW 1 — VERIFIED FIXED
+
+PLAN.md :158-171 (bullet (2) of "Prompt caching strategy") now reads: only the FIRST system message is hoisted into `system` with `cache_control: {"type": "ephemeral"}` (breakpoint 1); later system messages (volatile tail: steps, progress, memories + the byte-stable CONTEXT_FOOTER) are relocated into the final message's content as trailing text blocks — the uncached varying suffix; a 3rd breakpoint on the final message's last real block caches the conversation history (tools + head + history + the current turn's real content; the next request's 20-position lookback finds the prior write since tool_use/tool_result runs coalesce to one position); automatic caching (a top-level `cache_control` field) was evaluated and rejected — it would land on the varying tail block, a fresh write every turn and never a read. This is the required fix element-for-element; the old "(2) ... system block splitting ... volatile tail ... is uncached" text is gone (confirmed in the d5cfd52 PLAN.md hunk, +13/-2 lines, confined to bullet (2)).
+
+## 2. Cross-check of the new PLAN.md text against the code — accurate, no overclaiming
+
+Verified against `build_request_json` (src/provider/anthropic.rs :229-427) in the committed tree:
+
+- **"only the FIRST system message is hoisted into `system` with cache_control (breakpoint 1)"** — the hoist loop (:255-273) pushes the first non-blank system message into `system_blocks` with `cache_control: {"type": "ephemeral"}` (:262-266); every later non-blank system message goes to `tail_blocks` (:267-272); blank texts are skipped (:258-260). Nuance, not a finding: "FIRST" means first non-blank — blank system texts contribute nothing (the code comment says so); the doc-level simplification is faithful.
+- **"later system messages ... relocated into the final message's content as trailing text blocks — the uncached varying suffix"** — `tail_blocks` are appended to the final message's content array AFTER the breakpoint stamp (:341-343), i.e. after the last real block, uncached.
+- **"a 3rd breakpoint on the final message's last real block"** — the stamp (:328-340) walks back via `content.iter_mut().rev().find(...)`, skipping thinking/redacted_thinking (which cannot be marked directly), lands on the last markable block, and is skipped entirely when none exists; the tail is appended only after the stamp.
+- **"caches the conversation history (tools + head + history + the current turn's real content)"** — correct: the breakpoint sits on the final message's last real block, so the cached prefix extends through it; the code comment (:314-318) states the same coverage.
+- **"the next request's 20-position lookback finds the prior write since tool_use/tool_result runs coalesce to one position"** — matches the code comment (:319-322); round 1 verified both claims verbatim against the live-fetched Anthropic prompt-caching docs ("The lookback window is 20 blocks..."; "a run of consecutive tool_use blocks counts as one position..."). The claim is unchanged from what round 1 already verified against the docs.
+- **"automatic caching ... evaluated and rejected — it would land on the varying tail block, a fresh write every turn and never a read"** — matches the code comment (:362-370) and the docs' "Common mistake" trap (round-1 live fetch).
+- **"volatile tail: steps, progress, memories + the byte-stable CONTEXT_FOOTER"** — factually right: the turn loop pushes both as trailing system messages on the non-local path (src/agent/turn.rs :2294-2297), so they arrive as "later system messages" and take the relocation path.
+- Bullets (1), (3)-(7) are untouched by this change and remain accurate ((3) last-tool breakpoint still at :356-360). The bullet claims mechanism, not runtime-verified savings — the cache_read_input_tokens acceptance criterion remains honestly dependent on the separate "Parse Anthropic cache usage fields" backlog item (648051bf), as round 1 noted. No overclaim.
+
+## 3. Changeset confinement — unchanged from round 1
+
+`git show d5cfd52 --stat`: source files = `src/provider/anthropic.rs` (282 lines) + `PLAN.md` (13 lines) — exactly the task's claim. Everything else is `.coding/` bookkeeping: backlog.jsonl status flips (this plan's item fe3fcd55 note; D1 item 959b669f in_flight→done), the D1 finish artifacts (knowledge/bug/814f27c9.md, knowledge/spec/2027-01-07-user-cancels-are-stamped-cancelled-not-provider.md, plans/814f27c9.md +3), this plan's file (plans/ee33d615.md), and the round-1 report itself — all app-managed, matching what round 1 already classified as expected bookkeeping.
+
+The anthropic.rs delta is 282 lines — the same size round 1 reviewed — and its content matches round 1's feature-by-feature description (the hoist loop keeping only the first system message, `tail_blocks`, the breakpoint-3 stamp with the thinking/redacted_thinking walk-back, the `expect("message content is always an array")`, the replaced design note, the test set). The only post-round-1 source change is PLAN.md — documentation only, not compiled — so the code round 1 verified is byte-identical in d5cfd52.
+
+## 4. Round-1 conclusions re-verified
+
+- **No other code path depends on the old `system[1..]` shape** — re-ran the `["system"]` search across `src/`: exactly 3 matches, same as round 1 found — the builder's own write (anthropic.rs :407) and two test assertions (:2052, :2282). No reader of the body's system shape. `message_to_json`'s `unreachable!("system messages are hoisted before mapping")` (:432) still holds — system messages are filtered out of `rest` (:276) before the mapping loop.
+- **Tests pin the new contract (1 replaced, 4 updated, 3 added)** — confirmed in the tree: `volatile_tail_relocates_into_final_message_and_breakpoint_lands_on_last_real_block` (:2261, replacing `messages_do_not_carry_cache_control_when_system_has_volatile_tail` — zero matches for the old name), `breakpoint_lands_on_last_tool_result_block_with_tail_after_it` (:2319), `breakpoint_lands_on_final_block_when_no_volatile_tail` (:2364), `breakpoint_stays_within_lookback_window_on_long_tool_history` (:2387); the 4 updated tests (the two raw-echo tests with explicit no-`cache_control` assertions on thinking/redacted_thinking, the empty-thinking-drop test, the system-hoisting test) carry the new assertions in the diff.
+- **cargo test --workspace green (2278 lib + 16 + 293 + 4 + 2, zero warnings)** — not re-run by this reviewer (no shell in the read-only allow-list; same basis as round 1). Accepted on the implementer's recorded run with this additional guarantee: the tree is clean at d5cfd52 and the only post-round-1 change (PLAN.md) is not part of the build, so the recorded green run applies to exactly the committed code; the `deny(warnings)` crate-root gate makes a green run the zero-warnings proof.
+
+## 5. Constitution checks
+
+- **Documentation sync**: the round-1 gap is closed — PLAN.md now matches the implementation. (The related stale knowledge record round 1 flagged — .coding/knowledge/spec/2026-12-21-multi-provider-prompt-caching-and-waiting-reduct.md line 14 — is acknowledged for the main agent's post-PASS amendment per the task note; out of this review's scope.)
+- **Multi-platform neutrality**: the only new change is PLAN.md prose; no OS-specific anything. ✔
+- **File-tools-first**: no shell-based mutation in the changeset. ✔
+
+## Verdict rationale
+
+The single round-1 finding is fixed exactly as required, the new PLAN.md text is factually accurate against the committed code with no overclaiming, the source changeset remains confined to src/provider/anthropic.rs + PLAN.md with the code byte-identical to what round 1 verified, and round 1's other conclusions (no hidden dependents on the old system shape; meaningful test pinning of the new contract; recorded green test run under deny(warnings)) re-verify. Ready to finish.

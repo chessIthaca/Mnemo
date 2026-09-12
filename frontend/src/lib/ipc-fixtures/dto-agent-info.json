@@ -1,0 +1,7 @@
+{
+  "id": 1,
+  "model": "gpt-5",
+  "name": "main",
+  "parent_id": null,
+  "running": true
+}

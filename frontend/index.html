@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mnemo</title>
+    <style>
+      /* Pre-React splash spinner (see the #root splash below): inline so
+         it animates before the CSS bundle loads. */
+      @keyframes mnemo-boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .mnemo-boot-spinner {
+        width: 20px;
+        height: 20px;
+        border: 2px solid #334155;
+        border-top-color: #22d3ee;
+        border-radius: 50%;
+        animation: mnemo-boot-spin 1s linear infinite;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Static pre-React splash (backlog 486955d5): shown from first
+           paint until React mounts — createRoot(#root).render replaces
+           this content. Everything is inline-styled (no CSS bundle
+           dependency) so the window never flashes white on startup or a
+           project-switch restart. Dark-only by design: #0f172a is the
+           dark --bg-primary default; the light-mode override is a user
+           setting the pre-JS splash cannot know. The text wordmark (not
+           MnemoLogo) matches the React BootSplash for a seamless
+           handoff. Numeric values are aligned to the React twin's
+           Tailwind utilities (text-2xl / tracking-widest / h-5 w-5 /
+           animate-spin / text-sm) so the handoff is pixel-identical
+           (review LOW 1, plan 969510fc). -->
+      <div
+        style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.75rem;background:#0f172a;font-family:system-ui,sans-serif;"
+      >
+        <div
+          style="font-size:1.5rem;font-weight:600;color:#e2e8f0;letter-spacing:0.1em;"
+        >
+          mnemo
+        </div>
+        <div class="mnemo-boot-spinner"></div>
+        <div style="font-size:0.875rem;color:#94a3b8;">Starting…</div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

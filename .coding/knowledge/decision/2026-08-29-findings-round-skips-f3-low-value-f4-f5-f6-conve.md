@@ -1,0 +1,6 @@
++++
+title = "findings round skips — F3 low-value, F4/F5/F6 convention-only (no code)"
+created = "2026-08-29"
++++
+
+DECISION (findings round F1–F13, plan 44387fcd, 2026-09-17): explicit skips, recorded so the round's scope is auditable. (F3) graph modules carry no incoming edges — SKIPPED: low value per the finding itself; "who uses this module" stays a text-search question (graph_context on a module can't answer it); revisit only if module-level impact queries become a real need. (F4) memory_search result caps hiding lower-ranked rows — SKIPPED code: convention only, already a HOW memory (treat "[truncated]" as incomplete and re-run with a higher limit before concluding absence). (F5) plan-grounding "verified" claims can be stale — SKIPPED code: convention only, already a HOW memory (absence/bug claims cite pickaxe/commit evidence). APPLIED TWICE THIS ROUND with decisive results: F12's "tool dates the successor from the predecessor" claim was disproven by git + front-matter evidence (hand-authored file), and F7's "bare ** tails match 0 files" claim was disproven by a glob-crate probe — both would have been wasted code changes without the verification habit. (F6) tool-schema description char budgets — SKIPPED code: convention only (additions paid by trims; the detail lives in README/PLAN.md, updated this round).

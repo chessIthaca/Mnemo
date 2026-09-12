@@ -1,0 +1,8 @@
+{
+  "kind": "tool_result",
+  "result": {
+    "output": "ok",
+    "success": true
+  },
+  "tool_call_id": "call-1"
+}

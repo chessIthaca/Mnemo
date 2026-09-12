@@ -1,0 +1,39 @@
+## Verdict: FINDINGS (0 high, 2 low)
+
+Review of all uncommitted changes on `wt/agenticcoding` for plan 0b07d0da — "Dedicated summarization model slot ([models.summarize])" (backlog 3f87b22c, proposal 4 of the 2026-09-08 model-pipeline review). 16 files (15 listed + the plan file + backlog bookkeeping). The routing, fallback, plumbing, UI, and docs are correct and complete; two low-severity documentation defects found (one doc-comment misattachment in code, one missing operational caveat in user docs). No correctness, security, or multi-platform issues.
+
+## Verified claims
+
+**(a) Routing correct and complete.** A full text sweep of `summarize_with_interrupt(` across all `.rs` sources finds exactly three production call sites — `src/agent/turn.rs:859` (`handle_pending_swap`), `src/agent/turn.rs:1632` (`maybe_compact`), `src/runtime/agent.rs:1020` (`compact_context`) — and all three now route through `AgentLoop::summarize_provider` (turn.rs:857/:1630, runtime/agent.rs:1014). The plain `ContextManager::summarize` variant has zero production callers (context.rs tests only), so no site was missed. `summarize_provider` itself has exactly those three callers plus the new test — no other path is affected. The run-all claim is verified end-to-end: `src-tauri/src/ipc/run_all.rs:3561` sends `AgentCommand::Compact` to the main agent → the between-turns arm at `src/runtime/agent.rs:848` → `compact_context`. Subagent loops compact through the same `run_turn` path, so they inherit the slot too — consistent with the slot's "compaction summaries" scope.
+
+**(b) Unset/dangling/build-failure all fall back to the turn's provider.** `summarize_provider` (loop_impl.rs:1092-1109) returns `turn_provider.clone()` on: no resolver; `resolve_summarize_model() == None` (unset, or dangling — `Config::resolve_model_ref` at src/config/mod.rs:109 drops refs whose endpoint no longer exists); `build_turn_provider() == None` (build failure — the impl at src/model_resolver.rs:392 propagates `build_provider_for`'s `None` via `?`). When unset the returned Arc is the identical turn provider, so the three call sites are byte-identical to pre-change behavior. The `sticky_endpoint` application (loop_impl.rs:1104) is endpoint-rerouting keyed by model id with a failed-endpoint match guard (loop_impl.rs:1365-1375) — the same pattern as `resolve_turn_provider`'s skill arm; it cannot reroute to a different model.
+
+**(c) Display state untouched.** `summarize_provider` calls no `set_resolved_model`/`set_resolved_provider`/`set_resolved_effort`; `build_turn_provider` only builds/caches a provider + CM. The `compact_ms` stamp (turn.rs:1644) stays on the turn's provider — the rationale is sound: `record_compact_ms` parks a pending value stamped onto that client's NEXT record, and the turn's next POST is exactly what the compaction delayed; the summary request itself gets its own trace record via the shared `LlmRequestLog`. Stamping on the one-off summary provider instead would risk the pending value sitting unconsumed or attaching to a much later unrelated summary request.
+
+**(d) Config plumbing round-trips.** DTO: `summarize: Option<Option<ModelRefDto>>` with `deserialize_optional_nullable` (absent → keep, null → clear, set → replace — subagent pattern at settings_dto.rs:610-612); the validation loop includes `&models.summarize` (settings_dto.rs:443) and `check` rejects empty endpoint/model and unknown endpoints (settings_dto.rs:421-435). Wire: `ModelsConfigWire.summarize` + config→wire mapping (settings.rs:702) + both wire fixtures + patch-semantics test 3c (set/clear asserted). `contract_fixtures.rs` and `dto-get-settings.json` updated. Rust struct-literal completeness is guaranteed by the compiler (green build under `deny(warnings)`).
+
+**(e) Frontend row persists and loads.** `FIXED_SLOTS` gains the Summarization row, rendered by the shared `FIXED_SLOTS.map` (ModelsSection.tsx:266) with the standard model picker + effort dropdown; `Draft`/`emptyDraft`/`draftFromSettings`/`handleSave` all extended. A sweep for `subagent:`-shaped `ModelsConfig` literals finds no other construction site in the frontend (all six test fixtures + `emptyDraft` updated) — nothing missed that vitest's non-type-checking run would hide.
+
+**(f) Docs match the code.** README :15 bullet and :128 slots paragraph, and the PLAN.md "Summarize slot (2027-01-09)" paragraph, all match the implementation — including the run-all funnel claim (verified above), the sole-consumer claim (`resolve_summarize_model` is called only from `summarize_provider`), and the no-display-state-stamp claim. The `.coding/backlog.jsonl` delta is workflow bookkeeping (0bba3241 → done, 3f87b22c → in_flight), not feature code.
+
+**(g) Multi-platform neutrality.** No paths, no platform APIs, no shell syntax — pure routing/config/UI changes. Nothing assumes Windows.
+
+**(h) Security.** No new unvalidated input: the slot ref passes the same `check` validation as every other slot; no secrets, no injection surface; the resolver reads config under its existing RwLock.
+
+## Findings
+
+### LOW 1 — `summarize_provider`'s insertion hijacked `resolve_turn_provider`'s doc comment (src/agent/loop_impl.rs:1084-1111)
+
+The new fn + its doc were inserted **between** `resolve_turn_provider`'s doc comment and `resolve_turn_provider` itself. The contiguous `///` block — resolve_turn_provider's ~30-line doc (ending "…switches the next request within the same turn to the configured per-context model. See [`AgentLoop::run_turn`].") followed immediately by the new "The provider a compaction summary call runs on." paragraph — now attaches to `summarize_provider` (:1092), and `resolve_turn_provider` (:1111) is left with **no doc comment**. `summarize_provider`'s doc misleadingly opens with the per-turn resolution-chain description ("Called at the top of EVERY `run_turn` loop iteration…"), which is false for a one-off summary helper. No compile warning fired because `missing_docs` doesn't apply to `pub(crate)` items — which is why the green build missed it.
+
+**Fix:** move the `summarize_provider` fn + its doc comment above `resolve_turn_provider`'s doc comment (or below the fn), restoring the 1:1 doc↔fn pairing. Doc-only; no behavior change.
+
+### LOW 2 — Undocumented window-mismatch caveat: the summarize model's context window is never consulted (docs gap)
+
+The cut/threshold logic stays on the turn's `ContextManager` (correct), but the summary request sends the whole to-summarize region to the summarize model — whose own window (the discarded CM half of `build_turn_provider`) is never checked. With a cheap-but-small summarize model under a large-window turn model (e.g. 1M turn model, 128k summarize model), every compaction of a large context 400s: "context summarization failed (auto-compact skipped)" on every iteration / "context compaction failed" between items. It fails safe (turn continues; the run-all loop proceeds — compaction is never a blocker) and unset is byte-identical, so no regression — but the slot's advertised use case (cheaper model, which typically means smaller window) silently doesn't work for large contexts, and neither README :128 nor the PLAN.md paragraph mentions the constraint.
+
+**Fix (doc sentence, either or both sites):** the summarize model's context window must cover the summarized region — pick a cheap model with a large window. Optionally queue a follow-up improvement: size/chunk the summary input to the summarize model's window.
+
+## Test note
+
+Static review only — this reviewer session has no shell, so I did not re-run the suites; I relied on the reported green runs (mnemo lib 2149+16/0, src-tauri 291+4+2/0, vitest 76 files/1068/exit 0) plus compiler-guaranteed struct-literal completeness. Both findings are doc-only and cannot affect test outcomes; LOW 1's fix should be followed by a `cargo test` re-run per the constitution.

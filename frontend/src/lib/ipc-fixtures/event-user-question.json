@@ -1,0 +1,18 @@
+{
+  "kind": "user_question",
+  "options": [
+    {
+      "description": "Play any instrument",
+      "label": "Music"
+    },
+    {
+      "description": "Speak every language",
+      "label": "Languages"
+    },
+    {
+      "label": "Cooking"
+    }
+  ],
+  "question": "Pick a skill to master",
+  "question_id": "q_1"
+}

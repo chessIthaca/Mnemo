@@ -1,0 +1,6 @@
++++
+title = "tao 0.35.3 keyboard self-deadlock (AppHangB1) — vendored PR #1215 backport"
+created = "2026-08-24"
++++
+
+BUG: AppHangB1 UI hang — tao 0.35.3 keyboard self-deadlock. Symptom: main thread permanently blocked (0% CPU, episode 1, 3 byte-identical stacks in .coding/logs/hang-1787574592659.txt / -7575710423 / -7586964715: public_window_callback → KeyEventBuilder::process_message → PeekMessageW → SendMessageW → re-entered public_window_callback → parking_lot RawMutex::lock_slow). Root cause: public_window_callback takes KEY_EVENT_BUILDERS.lock() then process_message calls PeekMessageW under the lock; PeekMessage dispatches inbound SENDs (WebView2 COM marshalling), re-entering the window proc on the same thread → non-reentrant parking_lot mutex self-deadlock. Trigger: typing while the agent streams. Fix: vendored tao 0.35.3 → vendor/tao renumbered 0.35.4 with PR #1215 backport (peek hoisted before the lock; process_message takes next_key_message/more_char_coming) + [patch.crates-io] in root Cargo.toml; plus Rust-side delta coalescing in src-tauri/src/ipc/events.rs. Regression test: src-tauri/tests/tao_backport.rs (source-guard, fails on pristine 0.35.3). Upstream: tao 0.36.0 c704261c; tauri-runtime-wry 2.11.4 still pins ^0.35 so no upgrade path.

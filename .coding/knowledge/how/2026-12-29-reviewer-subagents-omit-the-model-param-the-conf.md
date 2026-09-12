@@ -1,0 +1,6 @@
++++
+title = "Reviewer subagents — omit the model param; the configured reviewing model is authoritative"
+created = "2026-12-29"
++++
+
+When spawning role:reviewer subagents, OMIT the model parameter — the spawn resolves to the configured reviewing model (resolution chain: reviewing → executing → subagent → default). Since 2026-01-03 (plan d8e7b39d, backlog c8e48f81) this is STRUCTURALLY ENFORCED, not just guidance: reviewer_spawn_gate (src/agent/dispatch.rs) denies a reviewer spawn carrying an explicit model unless the failed-reviewer retry is sanctioned (a reviewer failed without a report → ask_user → the ask_user interception opens a one-spawn retry sanction → respawn on the user-picked model is allowed and consumes the sanction; any reviewer spawn — with or without a model — consumes it). The 2026-12-30 session (plan 72329f2c) showed the agent inventing per-reviewer "model diversity" (glm-5.2/glm-5.3-gcp/deepseek-v4-flash); the deepseek reviewer failed with no report — exactly what the configured model prevents. Regression tests: reviewer_spawn_gate_denies_ad_hoc_model_picks, reviewer_spawn_gate_allows_the_sanctioned_retry_and_consumes_it, reviewer_spawn_gate_no_model_spawn_consumes_sanction_and_passes, reviewer_spawn_gate_failure_pending_denies_and_preserves_sanction (src/agent/dispatch.rs).

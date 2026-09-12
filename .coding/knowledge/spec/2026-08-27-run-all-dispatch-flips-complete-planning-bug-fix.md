@@ -1,0 +1,6 @@
++++
+title = "run-all dispatch flips Complete→Planning + bug_fixing steer (plan 9057fa1f)"
+created = "2026-08-27"
++++
+
+SPEC: Run-All backlog dispatch now deterministically enters Planning (plan 9057fa1f, commit 31ca3bd on wt/agenticcoder — NOT yet merged to main). When run_all_dispatch_next dispatches an item and the main agent's workflow rests in Complete, it transitions to Planning BEFORE the Prompt runs (Workflow::enter_planning_for_task — Complete-only, stack untouched, not persisted/self-healing; run_all.rs enter_planning_if_complete + emit_agent_event straight to the UI, so the status flips immediately). Gate untouched: the transition never enters the runtime channel and TurnResolveLatch::on_started wipes any stale note at turn start — a never-planning turn still cannot be marked Done (pinning test dispatch_time_planning_entry_is_not_loop_evidence). RUN_ALL_STEER rule (5): defect-shaped items (bug/error/panic/regression/crash) are planned with kind "bug_fixing" + `bug` symptom param → the locked reproduce→root-cause→fix→verify skeleton engages from the first plan. Chat prompts keep the advisory PLAN_NUDGE (scope decision — dispatch only). Backlog 037fee62 requeued pending after this fix. Reviews: .coding/reviews/2026-09-08-run-all-dispatch-planning-entry-review.md (0 high/1 low, fixed) + -verify-review.md (PASS).

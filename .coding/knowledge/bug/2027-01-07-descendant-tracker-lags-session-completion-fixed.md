@@ -1,0 +1,7 @@
++++
+title = "Descendant tracker lags session completion — FIXED (2c406d72, commit 194d925)"
+supersedes = "c8c49338"
+created = "2027-01-07"
++++
+
+FIXED (commit 194d925, 2027-01-07, plan c8c49338; closure session re-verified the A/B first-hand: the 3 regression tests fail with the fix line removed, pass with it). Symptom: complete_step stayed refused ("cannot change workflow state while spawned subagents are still running") for a full turn or more after every spawned child had verifiably ended (finish notification received, report on disk) — live-observed twice 2026-12-30 (plan 72329f2c). Root cause: the event forwarder's notification match ran BEFORE the running-state match for a child's Finished/final-Error event — notify_parent_on_completion sent the completion Suggestion (waking the parent) and only afterwards cleared the running flag; under a saturated frontend that window stretched across a whole parent turn. Fix: notify_parent_on_completion clears set_running(agent_id, false) FIRST (src-tauri/src/ipc/events.rs:800); the forwarder's later running-state match clears again (idempotent). Regression tests: child_finish_notification_leaves_no_running_descendant, child_final_error_notification_leaves_no_running_descendant, tracker_agrees_at_notification_receipt. Authoritative record: 1d39a5eb; knowledge file .coding/knowledge/bug/2027-01-07-descendant-tracker-lagged-the-finish-notificatio.md; reviews round-1 (0 high, 1 low → fixed) + round-2 verification PASS.

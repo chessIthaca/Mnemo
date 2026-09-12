@@ -1,0 +1,43 @@
+## Verdict: FINDINGS (2 high, 2 low)
+
+Reviewed all uncommitted changes on wt/agenticcoder for plan 844180a8 (MCP follow-ups batch: per-project config, prompts/resources/sampling, OAuth). The bulk of the work is correct and well-tested — merge order, the stdio decline path, capability gating, PKCE/state handling, and log hygiene are all sound. Two integration-level bugs: the split-save silently deletes global servers shadowed by project overrides, and OAuth tokens stored in keys.toml are wiped by the next unrelated Config `save_all` (the phase-1 mcp.toml sync has no keys.toml analogue). Two low-severity issues: Bearer injection is not gated on the def's `auth` (name-keyed store), and the OAuth redirect `code` is not percent-decoded.
+
+## HIGH 1 — Split-save deletes global servers shadowed by a same-name project override
+
+`src-tauri/src/ipc/mcp.rs:100-138` (`mcp_save_servers`) rewrites the global file from the payload's global subset only. The payload comes from `mcp_list_servers` (ipc/mcp.rs:33-84), which lists the MANAGER's MERGED view — one row per name, tagged by source. A global server whose name is overridden by a project server is invisible in the list, so it cannot appear in the payload; the whole-file rewrite of the global mcp.toml then drops the shadowed twin on ANY save (even an unrelated edit to another server).
+
+Concrete scenario: `~/.mnemo/mcp.toml` has `filesystem`; project A's `.coding/mcp.toml` overrides `filesystem`. Settings shows one row (tagged "project"). The user edits any server in any file and saves → the global file is rewritten without `filesystem` → every OTHER project (and the global baseline, per the documented "global baseline, project overrides" philosophy) loses the server permanently; if the override is later removed, the server is gone from both files. This contradicts the stated design (merge keeps non-colliding globals; the UI can't express "delete the global twin").
+
+Fix: in `mcp_save_servers`, before writing, load the CURRENT global file and re-add any defs whose names are in `project_defs` and not already in `global_defs` (preserving the shadowed baseline), then write. Add a regression test at the merge/save level (global X + project X → save → global file still contains X).
+
+## HIGH 2 — OAuth tokens in keys.toml are wiped by the next Settings save (`save_all`)
+
+The OAuth flow writes tokens via `McpTokenStore` (src/mcp/oauth.rs:334-339) which loads/writes keys.toml DIRECTLY — it never updates the in-memory `Config.keys`. But `Config::save_all` (src/config/mod.rs:145-162) rewrites keys.toml from the in-memory `self.keys`, and the Settings save path (`save_endpoints`, src-tauri/src/ipc/settings.rs:162-209, via `apply_endpoints` + `persist_and_reload`) rebuilds that store from the frontend's `get_api_keys` payload (endpoint keys only). So: Connect (tokens stored on disk) → user saves any endpoint/config edit → keys.toml rewritten without the `mcp-<name>` entries → tokens silently gone; the next remote MCP call 401s and demands re-authorization. This is exactly the clobber class the plan fixed for mcp.toml ("syncs config.mcp to the global subset so save_all never clobbers the project file") — the keys.toml analogue is missing.
+
+Fix: after a successful `store.store(...)` in the spawned OAuth task (ipc/mcp.rs:241), also insert the blob into `state.project.config.keys` (the command has the state handle), or make `Config::save_all`'s keys payload merge on-disk keys.toml entries not present in memory. Add a regression test (store → save_all → store still readable).
+
+## LOW 3 — Bearer injection / 401-refresh are not gated on the def's `auth`, and the token key is name-only
+
+`McpManager::from_config` wires the token store into `default_factory` for ALL remote servers, and `HttpMcpClient::new` (src/mcp/http.rs:58-91) accepts it unconditionally (its doc comment claims it is "wired when the def carries auth = oauth" — the code doesn't check). `post()` (http.rs:187-200) injects Bearer whenever the store has a blob under the server's NAME, and `request()` (http.rs:105) refreshes on 401 whenever `tokens.is_some()`. Consequences once a Connect has stored tokens: removing `auth = "oauth"` from the def still sends the old access token, and re-pointing the server's URL to a different host sends the access token there AND hands the refresh token to that host's token endpoint (refresh_tokens uses the CURRENT url's discovery). The store key should also bind the origin (name + URL), not just the name.
+
+Fix: `let tokens = if def.auth.as_deref() == Some("oauth") { tokens } else { None };` in `HttpMcpClient::new`, and ideally include the URL origin in the token key or validate it when loading.
+
+## LOW 4 — OAuth redirect `code` is not percent-decoded before reuse
+
+`wait_for_code` (src/mcp/oauth.rs:275-308) copies the `code` query value verbatim; `build_token_request` (oauth.rs:204-217) then percent-encodes it again. A code containing reserved characters (e.g. base64 `+` arrives as `%2B`) is therefore double-encoded (`%252B`) and the token exchange fails. State is unaffected (hex-only). Fix: percent-decode the code value once after parsing (and decode `state` symmetrically for robustness), with a test for a `%2B`-style code.
+
+## LOW 5 — Every save writes the project file even when no project servers exist
+
+`mcp_save_servers` unconditionally `mcp::save(&project_path, &project_defs)` (ipc/mcp.rs:121-122). A purely-global edit therefore creates `.coding/mcp.toml` (serialized as `server = []`) in projects that never had one — a new file landing in the git-mergeable `.coding/` side-car from a save that touched nothing project-specific. Fix: skip the project write when `project_defs` is empty and the file does not exist.
+
+## Verified sound (focus areas)
+
+- **(a) merge correctness (except HIGH 1):** `merge_servers` (src/config/mcp.rs:242-253) — project wins by name, non-colliding globals kept, stable order; unit-tested (incl. disabled-state and empty-project cases). Per-file AND merged validation before any write; `config.mcp` synced to the global subset so save_all cannot clobber the project file. `McpServerWire` flatten + `source` default round-trips cleanly; legacy payloads default to global (v1 behavior).
+- **(b) secret hygiene:** all eprintln sites in the OAuth task (ipc/mcp.rs:243-252) and oauth.rs errors carry status/names only — no token values, no response bodies; `McpServerDef` remains secret-free (env/header NAMES only); frontend never sees tokens (authorize_url + note only). The bearer-injection gap (LOW 3) is the one hygiene deviation.
+- **(c) sampling decline:** `classify_incoming`/`decline_response` pure + unit-tested; responses (id+result/error) route to pending, requests (id+method, no result/error) get `-32601` written to the shared `Arc<Mutex<ChildStdin>>`, notifications ignored. Lock order (pending → stdin, never nested) has no deadlock; request timeouts/kill unchanged; HTTP transport has no server→client stream (documented).
+- **(d) capability gating:** meta tools registered only when `initialize` advertised prompts/resources; real-tool name collisions are safely skipped via `contains_name`; listing snapshots capped at 20 and documented as snapshots; schema requires `name`/`uri`.
+- **(e) OAuth correctness (except LOW 3/4):** PKCE S256 correct (64-char base64url verifier, sha256 challenge), RFC 8414 path insertion correct, state mismatch aborts before exchange, 401 refresh retried exactly once (second 401 surfaces — no loop), corrupt blob degrades to absent, round-trip + corrupt-blob + state-validation tests present.
+- **(f) gates unaffected:** `McpTool::category` Agent + `safety` NeedsApproval unchanged and inherited by meta tools; `load_tools.rs` diff is test-only; research-prefix exclusion still applies (`mcp__` prefix on all kinds).
+- **(g) docs:** README + PLAN.md accurately describe both scopes, split-save, capability-gated meta tools, the decline behavior, and the OAuth flow/limitations.
+- **(h) platform/hygiene:** no Windows-only APIs (loopback bind is plain tokio; keys perms already handle the Windows DACL), no `#[allow]` additions, `sha2` is the only new dep (Cargo.lock consistent), all public items documented.
+- **(i) tests:** strong pure-function coverage (merge, PKCE, URL/body builders, sanitization, store round-trip + corrupt blob, state validation, classify/decline, capability parsing, reveal gating, meta execute routing, frontend auth rules). The two HIGH findings sit precisely in the untested integration seams (no IPC-level split-save test; no store↔save_all interplay test) — the regression tests called for above close that gap.

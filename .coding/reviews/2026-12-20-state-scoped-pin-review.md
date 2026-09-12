@@ -1,0 +1,42 @@
+## Verdict: FINDINGS (0 high, 2 low)
+
+Review of all uncommitted changes for plan 1ea8f680 (state-scoped model-picker pin). Scope: 7 modified files (src/agent/loop_impl.rs, src/agent/tests.rs, src-tauri/src/ipc/agent.rs, src-tauri/src/ipc/config_io.rs, README.md, PLAN.md, .coding/backlog.jsonl) + 2 untracked .coding artifacts. No correctness bugs found — the gate/stamp implementation matches the 2026-12-20 amendment exactly, lock discipline is sound, the existing 2026-08-22 pin test and 429-stickiness semantics are preserved, and docs are synced. Two low findings below (one commit-hygiene, one inaccurate comment phrase).
+
+### Findings
+
+**L1 (low, commit hygiene):** The closing commit must include the two untracked `.coding/` artifacts: `.coding/knowledge/decision/2026-12-19-model-picker-pin-is-state-scoped-configured-phas.md` (the DECISION record backing this amendment — plan step 5's memory deliverable) and `.coding/plans/1ea8f680.md` (the plan file). `.coding/` is the mergeable side-car that travels with git; if only tracked modified files are staged, the decision record never reaches other instances. No code change — an instruction for step 6's commit.
+
+**L2 (low, comment accuracy):** src/agent/loop_impl.rs:958-960 (the first-serve stamp arm) says the pin "belongs to the state the picker acted in (or, for a deferred swap, the state the turn loop completed the swap in)". The code actually stamps the state of the first TURN THAT SERVES the pin, which can differ from the pick-time state without any deferral: the user picks in Planning, `create_plan` flips Planning → Executing before the next turn, and the first serve stamps **Executing** — the pin becomes an Executing pin even though the picker acted in Planning. The `pinned_state` field doc ("lazily stamped … the state is recorded at first serve") and the plan both state the correct rule; only this inline phrase is loose. Fix: reword to "the state of the turn that first serves it", e.g. "// First serve of this pin — it belongs to the state of the turn that first serves it (normally the state the picker acted in; with a deferred swap, the state the turn loop completed the swap in)."
+
+### Verification detail (appended below)
+### Verification detail
+
+**(1) Gate/stamp correctness — matches the amendment.**
+- `resolve_turn_provider` (src/agent/loop_impl.rs:880-1088): step 1 (skill) unchanged — resolves a true skill-map hit with `ModelContext::new(WorkflowState::Skill, Some(name), false)` so only the skill slot can fire (the resolver maps the Skill state itself to `None`, model_resolver.rs:270), so configured `[models.skill.<name>]` still beats the pin and unconfigured skill turns still keep the pin (`skill_override_beats_explicit_picker_pin` at tests.rs:5324 and the 4506-4513 assertions in the 2026-08-22 test stay green by construction).
+- Branch 2 (loop_impl.rs:938-1008) implements exactly the three stamp cases: `None` → stamp current state + serve; `Some(stamped) == workflow_state` → serve (pin beats forced/subagent/state in its own state — the 2026-08-22 guarantee); `Some(_)` → serve only while `resolver.resolve(ModelContext::new(workflow_state, skill_name, is_subagent()))` is `None`, else fall through WITHOUT deleting the pin (dormant; `set_explicit_provider` is the only reset). No resolver attached → `unwrap_or(true)` → pin holds (nothing can take over). The gate's resolve call uses the same context the chain would consult at :1043, so gate and chain agree.
+- Fall-through path: when the pin yields, flow reaches forced model (:1017) and the resolver chain (:1043) with no double-serving — the pin branch returns only when `pin_holds`. Sticky-endpoint reroute is consulted on all five resolution paths: skill :906, pin :987, forced :1022, default :1059, chain :1077 — the 2026-12-06 review's HIGH finding (pin path skipping `sticky_endpoint`) remains fixed, and the 429 runtime test path (picker_pin_429_fallback_reroutes_endpoint, src/runtime/agent.rs — untouched by the diff) is preserved.
+- Reviewing state: the resolver maps Reviewing → the executing slot (model_resolver.rs:268), so with `[models.executing]` configured a pin stamped in another state yields at Reviewing — consistent with the amendment's letter ("a configured slot takes over in any other state").
+
+**(2) Lock/deadlock analysis — sound.**
+- `resolve_turn_provider` is a **sync** fn (no `async`, no await points), so no lock can be held across an await anywhere in the gate.
+- Lock ordering is acyclic: the `explicit_provider` read guard is a statement temporary (dropped at :942 before `pinned_state` is taken); the `pinned_state` guard is scoped to the `pin_holds` block (:951-981) and, in `set_explicit_provider`, a statement temporary (:1336-1339) dropped before `context_manager`/`pending_swap` are touched. The only nested acquisition is `resolver.resolve` (config RwLock read) under the `pinned_state` guard — no config-lock holder anywhere acquires `pinned_state`, so no cycle exists. Holding the guard across the cheap sync resolve is at most a style nit, not a hazard.
+- Poisoning via `.expect("pinned_state lock poisoned")` matches the house pattern used by every other lock in the file.
+
+**(3) Pending-swap interaction — correct.**
+- The turn.rs completion writes (:161-169 interrupt path, :179-187 normal) write `explicit_provider` directly and deliberately do NOT touch `pinned_state` — as the plan requires (completing the SAME pick).
+- Graph-verified: `resolve_turn_provider`'s only production caller is `run_turn` (turn.rs:54); tests call it directly. Since `run_turn` takes/completes the pending swap at its top (before the per-iteration resolution loop), the old pin can never serve between the stamp reset in `set_explicit_provider` and the swap completion — the "first serve re-stamps" narrative has no production window. The reset placement (:1331-1335) covers both immediate and deferred paths correctly.
+
+**(4) Tests — genuine and regression-effective.**
+- The 2026-08-22 test (tests.rs:4378-4518) is unchanged; the shared module-level `FixedModelProvider` (:4524) coexists with the older tests' inner structs by scoping (documented in its doc comment).
+- `picker_pin_yields_to_configured_model_on_state_change`: pin deepseek stamps Planning and beats the o3 planning slot; Executing yields to gpt-5-codex; Planning resumes the pin (dormant-not-deleted asserted). Under the old never-cleared behavior the Executing assertion (deepseek would serve) FAILS — effective regression test.
+- `fresh_picker_pick_restamps_in_the_current_state`: after a yield, the fresh kimi pick resets the stamp, serves in Executing (stamping there, beating the executing slot), and yields to the o4-mini complete slot — also fails under the old behavior. 
+- `picker_pin_survives_state_change_when_no_model_configured`: passes under old code too (by design — it pins the complementary rule that the pin must NOT be dropped in unconfigured states, guarding against over-correction).
+- All resolved models are listed on the test endpoint (build_turn_provider validation satisfied); `crate::config::Config::default()` exists (config/mod.rs:723 et al.) so the `..Config::default()` struct updates compile.
+
+**(5) Docs sync — clean.**
+- README.md + PLAN.md paragraphs amended to state-scoped semantics. Repo-wide greps for the old claims ("never cleared", "until switched again", "wins over per-state routing"): the only src/ hit is loop_impl.rs:1309, which cites the old rule **in quotes as history** (intentional); all other hits are historical `.coding/` plan/bug/review records (correct to leave). The `fallback_endpoints` FIELD doc keeps its historical 2026-12-05 narrative untouched per plan; the `try_429_fallback` fn doc was scrubbed of the now-false "never cleared" claim while retaining the bug reference. IPC `set_model` / `swap_provider_into_loop` docs match the amended rule.
+
+**(6) Platform neutrality / warnings / misc.**
+- Only `std::sync::Mutex` added — nothing Windows-specific, no path/shell assumptions. No `#[allow]` introduced; every new item (pub(crate) field, helper fn, test structs) has a doc comment.
+- `.coding/backlog.jsonl`: the change replaces a bare empty line with one valid pending JSONL record — not corrupt; unrelated to the plan but harmless.
+- Note: this reviewer is read-only and did not execute `cargo test`; the closing sequence must re-run it unpiped per project rules before commit.

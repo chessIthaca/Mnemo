@@ -1,0 +1,7 @@
++++
+title = "claude-opus-5 400 empty thinking block echoed — FIXED (capture retain + echo sanitize)"
+supersedes = "2026-12-24-claude-opus-5-400-each-thinking-block-must-conta"
+created = "2026-12-29"
++++
+
+FIXED (backlog bd5eb19d, plan 37f3bfda, 2026-12-29). Symptom: claude-opus-5 non-retryable 400 "messages.3.content.0.thinking: each thinking block must contain thinking" (bursts provider-errors ids 1022-1030 + 879-888, 2026-09-04) — an empty thinking block (thinking:"" + signature, from a stream that never delivered a thinking_delta) echoed verbatim into history, poisoning every retry. Root cause: capture initializes thinking:"" at content_block_start; only thinking_delta fills it; message_stop finalization + raw_content_is_usable never validated thinking content; message_to_json echoed raw verbatim. Fix: is_always_invalid_thinking_block helper (thinking missing/empty thinking; redacted_thinking missing/empty data) + capture-side retain at message_stop (never stored; no raw if retain empties) + echo-side sanitize in message_to_json (valid blocks still echo verbatim; Rule 4 applies only to VALID blocks). Regression tests: build_request_json_drops_empty_thinking_block_from_echoed_history, raw_drops_empty_thinking_block_that_never_received_content (red pre-fix, green post; suite 1919+16/0). Analysis: .coding/analysis/claude-opus-5-1022-shape.txt. Evidence note: incident rows rotated out of provider-errors.jsonl; traces.jsonl absent — shape reconstructed from the error path + capture code.

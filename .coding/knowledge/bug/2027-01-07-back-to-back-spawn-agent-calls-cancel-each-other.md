@@ -1,0 +1,6 @@
++++
+title = "Back-to-back spawn_agent calls cancel each other — cleanup races the first Started event"
+created = "2027-01-07"
++++
+
+Symptom: four reviewers spawned via four spawn_agent tool calls in one message (2026-09-08, plan ccff0138) — only the last-spawned survived; the first three were silently cancelled before their first turn (no reports, no ChildFinished notifications, tabs vanished). Root cause: cleanup_inactive_subagents filtered on !is_running() alone — a freshly spawned agent reads running=false until its first Started event reaches the forwarder, so each spawn's cleanup cancelled its not-yet-started siblings. Fix: the has_ever_started latch on AgentHandle + the cleanup filter change (has_ever_started() && !is_running()), plus the Q1 ordering hardening (running stored before the latch, Release store / Acquire load, latch-first filter evaluation — first-transition guarantee; the re-start residual documented as designed idle-gap semantics). LANDED: commit e66e4b6 on wt/agenticcoding (2026-09-08, backlog b18ef70d / plan 660d60af), round-2 verified PASS (.coding/reviews/2026-09-08-spawn-cancel-event-delivery-landing-review-round2.md). Regression tests: cleanup_tests (src-tauri/src/ipc/events.rs), the console bookkeeping test, the runtime latch test. Detail: .coding/knowledge/bug/2027-01-07-back-to-back-spawn-agent-calls-cancel-each-other.md

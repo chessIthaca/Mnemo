@@ -1,0 +1,47 @@
+## Verdict: PASS
+
+Round-2 verification of plan 024a06e1 (backlog 45a4eb88, branch `wt/agenticcoding`). Both round-1 LOW findings are fixed correctly and completely; the fixes introduced no regressions; and every round-1 "verified correct" conclusion re-checked against the current tree still holds. No new findings.
+
+## Fix verification
+
+### LOW-1 — draft-restore clobber → FIXED (frontend/src/components/views/BacklogView.tsx:157-160)
+
+The unconditional `setText(input)` / `setAttachedImages(images)` restore is now guarded by a live store read:
+
+- **No clobber of in-flight typing — verified against the store wiring.** `setText` is the store's `setBacklogDraft` (BacklogView.tsx:81 → useAgentStore.ts:896, a plain `set({ backlogDraft: text })` — not local component state), and the textarea's onChange writes through it (BacklogView.tsx:207-210). So any keystroke while the add is in flight updates `backlogDraft` in the store, and the catch's `useAgentStore.getState()` (BacklogView.tsx:157) sees it: non-empty draft → `if (!s.backlogDraft)` is false → no restore. The images guard is symmetric (`s.backlogDraftImages.length === 0`, :159). A repo-wide search confirms `setBacklogDraft` has no other production writer that could race the guard (only the BacklogView binding + tests).
+- **Common case still restores.** On the fast validator rejection the user hasn't typed: the optimistic clear (:143-144) left `backlogDraft` = `""` (falsy) and `backlogDraftImages` = `[]` → both restore, raw untrimmed text included (`input` captured at :141, before the clear — no stale-closure change from round 1).
+- **Error surface unchanged and correct.** `setAddError(errMsg(e))` (:160); cleared at attempt start (:145) and on textarea edit (:209). `errMsg` (frontend/src/lib/tauri.ts:137-145) extracts `.message` from the structured `{ kind, message }` IpcError DTO the command rejects with (src-tauri/src/ipc/error.rs:30-35, `From<String>` → `kind:"error"` at :47-51) — pinned by the DTO test at frontend/src/lib/tauri.test.ts:25-29. `backlogAdd` (tauri.ts:1556-1561) propagates the rejection (no catch), and the code graph confirms `handleAdd` is its only frontend caller.
+- **Pattern consistency:** the `getState()` read matches `addImageFiles` (:109-110) and `removeImage` (:135-136) in the same component, as the fix intended.
+- Edge behavior is sound: user types-then-deletes back to empty during flight → draft empty → restore (nothing to clobber); user types text but adds no images during flight → their text kept, the rejected draft's images restored alongside (correct union — otherwise the images would be silently lost); image-only add that fails → text restore is a harmless no-op, images restored. The only behavioral delta from round 1 is the guard itself — no regression surface.
+
+### LOW-2 — hardcoded limits in tool-schema prose → FIXED (src/tool/workflow/backlog.rs:127-135, test :591-601)
+
+- **Const-built description.** The text-param description is now `format!`-templated on `MAX_ITEM_TEXT_CHARS` and `MAX_HEADLINE_CHARS` (src/tool/workflow/backlog.rs:127-135), imported from the enforcing module (:60-63). Those are exactly the consts `normalize_item_text` enforces (src/backlog.rs:45 used at :81; src/backlog.rs:51 used at :90) — the drift round 1 flagged is closed at the source.
+- **Prose faithful.** The rendered string is "…Max 4000 chars total; single-line texts and headlines over 100 chars are rejected." — identical to the round-1 prose with only the two numbers templated; the `\` line-continuations preserve the single spaces correctly ("short headline", "fix direction, tests", "headlines over"). `json!` accepts the expression value, and the schema test reads it back through `tool.schema().parameters` (:584-587).
+- **Test pins the wiring.** `add_schema_declares_the_required_shape` now asserts `desc.contains(&MAX_ITEM_TEXT_CHARS.to_string())` and `desc.contains(&MAX_HEADLINE_CHARS.to_string())` (:594-601). If either const is tuned while the description lags (e.g. re-hardcoded), the test fails — exactly the drift scenario round 1 described.
+- **No stragglers.** The old private `MAX_TEXT_CHARS` is deleted; the only remaining textual reference is in a historical review document (.coding/reviews/2026-08-20-backlog-add-tool-review.md:49), not code. No test anywhere pins the old prose ("self-contained task or prompt" — zero repo matches), so the rewrite breaks nothing.
+
+## Round-1 "verified correct" conclusions — re-confirmed
+
+1. **Shared validator** (src/backlog.rs:42-126): consts, `normalize_item_text` (trim → empty → total-length → headline-length → body checks, in that order), and the image-aware `normalize_new_item_text` (empty text + ≥1 image → `Ok("")`; everything else delegates) are unchanged by the fixes; all 10 unit tests present (src/backlog.rs:1087-1195 region), including the boundary tests round 1 cited.
+2. **Agent tool** (src/tool/workflow/backlog.rs): `execute()` routes through `normalize_item_text` before the store lock and notifier (:156-159); the 4 pre-existing single-line test texts are shape-updated (:463, :513-516, :622/:626, :642); the 4 new tests stand (:522-543 single-line rejection, :545-563 overlong headline, :565-575 trimmed storage, :577-602 schema contract); module doc carries the shape-contract paragraph.
+3. **IPC command** (src-tauri/src/ipc/backlog_cmds.rs:158-177): validates via `normalize_new_item_text(&text, &images).map_err(IpcError::from)` at :169 — before the store lock and `emit_backlog_changed`, so a rejection is a clean no-write, no-refresh failure. The source-contract test (:519-542) pins the exact call including `&images` and the IpcError mapping; its slice logic is sound (first `pub async fn backlog_add` is the real command at :159; the first `\n}\n` after it is the command's own closing brace).
+4. **Frontend error surface**: `addError` state, `role="alert"` paragraph (BacklogView.tsx:238-242), clearing semantics — all as round 1 verified, plus the LOW-1 guard above.
+5. **errMsg tests** (frontend/src/lib/tauri.test.ts): 4 tests covering string passthrough, `Error.message`, the IpcError DTO extraction, and the `String` fallback — accurate and registered in the allow-list (frontend/vitest.config.ts:81; 71 → 72 files, matching the reported 72-file green run).
+6. **Docs**: README.md Backlog bullet and PLAN.md "Backlog + Run-All" paragraph are unchanged by the fixes and remain accurate — "surfaces the rejection inline and restores the draft" holds for the guarded restore. useAgentStore.ts:589's "Cleared after a successful `backlogAdd`" comment remains accurate (the optimistic clear at :143 is the clear; the failure path now restores).
+7. **Security / multi-platform**: unchanged — pure string logic + React state, no paths, no OS APIs, no `cfg(windows)`; validation still runs before any lock/disk I/O on both paths.
+
+## Side-car changes
+
+- **45a4eb88** (this plan's item): harness bookkeeping only — note carries the pre-item checkpoint sha `bd754a2` (confirmed in git log as "backlog: pre-item checkpoint (45a4eb88…)") + the steer-halt record; plan_id/plan_title added; status correctly still `pending` (the plan is not yet finished).
+- **3b395d27** (browser stop/reload, user-requested): legitimate unrelated add — and it itself carries the headline+body shape (38-char headline, blank line, body).
+- **Status corrections (backlog audit)**: both verified against git. **6d56943a** → done: commits `dcda445` (feat: per-endpoint tok/s) and `38c5425` (round-2 review PASS for 07d2dc07) are both on the branch, matching the note's evidence. **42302c2d** → done: commits `60f508d` ("search: inline stale-index reindex + single note prefix (plan a00d05fc)") and `7a8b679` ("docs: round-3 review report (PASS) — plan a00d05fc ready to finish") both exist with exactly the described content. Both items also gained `deleted_at`, consistent with the file's established done-item soft-delete pattern (66c65db9, e4e85d96, 93eee4a3, 950e81f3, 51dab4da all carry it).
+- **Knowledge record** (vitest allow-list) and **plan file** 024a06e1.md: accurate; the record's "71 files" describes the pre-registration discovery state, which is the point it documents.
+
+## Observations (not findings)
+
+- The schema-test pin asserts the rendered const *values*, not the `format!` wiring itself — a description that hardcoded "4000"/"100" while the consts happen to equal them would still pass. This is precisely the pin round 1 requested ("asserts the const values appear"), and any future const change re-couples the two, so the drift risk is closed in practice.
+- `oversize_text_errors` (src/tool/workflow/backlog.rs:504, :514) uses literal 4000/4001 rather than the consts — pre-existing style that round 1 already reviewed and accepted, and it is implicitly coupled to the const in both drift directions (a lowered const breaks the boundary acceptance; a raised const breaks the "4000" error assertion). No production impact.
+- I could not execute the test suites myself (read-only reviewer); the green matrix (root 2059+16 doc, src-tauri 234+4, frontend 1011/72 files, tsc clean, zero warnings under `#![deny(warnings)]`) is the parent's report and is consistent with everything verified by inspection — in particular the 72-file count matches the allow-list + the new file, and the warning-free build proves the const import shuffle left no unused imports.
+
+Both round-1 findings are fully resolved; the change is ready to land.

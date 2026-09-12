@@ -1,0 +1,6 @@
++++
+title = "plan 70d2283d finish may auto-flip backlog d84bb99b — verify + re-queue post-finish (R1 residual)"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-07, plan 70d2283d review round 2, finding R1): the re-queue of backlog item d84bb99b (the Files/Diff-tabs .coding/reviews defect) to pending CANNOT clear the in-memory single-dispatch pointer (single_in_flight / run_all.current_item) that still references it from the steer pivot — at the plan's finish resolution the success arm (src-tauri/src/ipc/run_all.rs:2433-2484) transitions the pointer-referenced item to Done with no status guard (Pending → Done is legal, backlog.rs:478-480) and wipes the note. Resolution per the round-2 reviewer: (1) the durable fix is queued as backlog item 5bb1e4cd (the success arm must guard the Done transition on the item's plan_id matching the completing plan); (2) POST-FINISH PROCEDURAL STEP — at the next turn/session after plan 70d2283d finishes, verify d84bb99b is still pending (backlog_list / the Backlog tab); if it flipped to done, re-queue it (Done → Pending is the sanctioned requeue row, backlog.rs:485-488 — one backlog_status call or one UI click). The flip is detectable-and-recoverable; the residual window is one finish resolution. Commits: d0798f9 + c3fd62b on wt/agenticcoding.

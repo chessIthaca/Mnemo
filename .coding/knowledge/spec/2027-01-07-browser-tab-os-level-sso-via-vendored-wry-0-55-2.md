@@ -1,0 +1,6 @@
++++
+title = "Browser tab OS-level SSO via vendored wry 0.55.2 (commit 847e450)"
+created = "2027-01-07"
++++
+
+SPEC (plan 0631168e, commit 847e450 on wt/agenticcoding, reviews round1 + round2-PASS under .coding/reviews/2026-09-07-wry-sso-*): the embedded WebView2 Browser tab now signs in to AAD/MSA sites silently with the Windows primary account (Edge-equivalent OS SSO) — authenticated sites like forms.cloud.microsoft no longer hit the login wall. Mechanism: pristine wry 0.55.1 vendored at vendor/wry, renumbered to 0.55.2, one patch in src/webview2/mod.rs create_environment (options.set_allow_single_sign_on_using_os_primary_account(true) right after set_additional_browser_arguments), wired via [patch.crates-io] wry = { path = "vendor/wry" } in the root Cargo.toml (vendored-tao precedent). Guarded by src-tauri/tests/wry_sso_patch.rs — a source-level regression test asserting the SSO call sits between CoreWebView2EnvironmentOptions::default() and CreateCoreWebView2EnvironmentWithOptions(, plus the 0.55.2 renumber. Windows-only by design (wry's webview2 module is cfg-gated upstream); the flag is inert for the main app webview and agent-chat child (local content only). vendor/wry/PATCHES.md documents the delta vs 0.55.1.

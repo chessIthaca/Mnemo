@@ -1,0 +1,55 @@
+[package]
+name = "mnemo-app"
+version = "0.1.0"
+edition = "2021"
+description = "The Mnemo Tauri app shell"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+mnemo = { path = "..", features = ["browser", "embeddings"] }
+tauri = { version = "2", features = ["unstable"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+async-trait = "0.1"
+base64 = "0.22"
+log = "0.4"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"
+# `futures` is a transitive dep via `mnemo`; pinned here so test mocks can
+# name `futures::stream::BoxStream` (the LlmClient::complete return type).
+futures = "0.3"
+# tokio's `test-util` feature (paused-clock tests: `start_paused` +
+# `tokio::time::advance`) is NOT part of the `full` feature set above; the
+# events.rs forwarder deadline tests need it.
+tokio = { version = "1", features = ["test-util"] }
+# Enables mnemo's `test-support` feature for this crate's tests only: the
+# test_default() config factories (Endpoint/ModelSpec/OpenAiClientConfig)
+# are cfg-gated in the lib and invisible to dependents without it. Dev-deps
+# never apply to release builds.
+mnemo = { path = "..", features = ["test-support"] }
+
+# Windows-only: main-thread CPU-time sampling, stack walk + wait-chain
+# capture for the hang watchdog's evidence report (watchdog.rs). Mirrors the
+# mnemo lib's target-cfg entry; the watchdog degrades gracefully on other
+# platforms. Win32_System_Diagnostics_Debug + Win32_System_Kernel provide
+# StackWalk64/SymInitialize/SymFromAddr/GetThreadContext + the x64 CONTEXT;
+# Win32_System_SystemInformation provides IMAGE_FILE_MACHINE_AMD64.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

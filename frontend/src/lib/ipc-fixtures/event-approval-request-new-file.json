@@ -1,0 +1,14 @@
+{
+  "args": {
+    "path": "new.ts"
+  },
+  "kind": "approval_request",
+  "preview": {
+    "content": "export const x = 1;\n",
+    "kind": "new_file",
+    "path": "new.ts"
+  },
+  "tool_call_id": "call-3",
+  "tool_name": "file_write",
+  "core_operation": false
+}

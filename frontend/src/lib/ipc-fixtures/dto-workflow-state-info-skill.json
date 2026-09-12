@@ -1,0 +1,16 @@
+{
+  "depth": 0,
+  "parents": [
+    {
+      "id": "parent-plan-id",
+      "title": "Parent plan title"
+    }
+  ],
+  "plan": null,
+  "skill": {
+    "name": "merge_to_main",
+    "prompt": "Merge the branch into main.",
+    "target_state": "complete"
+  },
+  "state": "skill"
+}

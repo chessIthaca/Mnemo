@@ -1,0 +1,6 @@
++++
+title = "SearchNudge graduated gate — break 'never gates' for symbol-lookup intercept (C5)"
+created = "2026-08-31"
++++
+
+DECISION (2026-12-04, plan a41a0d82): Superseded the "steering nudges are advisory, never gates" principle for the SearchNudge case specifically. The symbol-lookup redirect is now a graduated gate: advisory for 2 ignored fires (ESCALATION_THRESHOLD), then the next symbol-shaped search/search_read call is INTERCEPTED at the dispatch funnel — the search does not run, and a redirect result embedding the symbol id (graph_context(id="file::name::line")) is returned instead. The gate lifts the moment the agent switches to a graph tool once (agent_switched > 0, same condition as the one-shot C3 NOTE). Justification: the 2026-12-04 run-all/steer investigation showed 6 symbol lookups via search with the nudge ignored — the advisory NOTE had no teeth; the intercept would have caught the drift on call 3, saving 4 wasted round-trips. Other waste classes (alternation absorption C1, literal retry hint C2, shell redirect C4) remain advisory-only — gates stay reserved for expensive/irreversible wrongs, and this is the sole exception. The prior "never gates" stance lived in the C1–C4 enforcement-ladder SPEC (memory 1fbfaf83), now updated in place to C1–C5. File: .coding/knowledge/spec/2026-08-31-enforcement-ladder-c1-c5-alternation-absorption.md

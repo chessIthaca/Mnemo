@@ -1,0 +1,270 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --app-font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --app-font-size: 14px;
+
+  /* Dark theme (default) color tokens. */
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-tertiary: #334155;
+  --border-color: #334155;
+  --text-primary: #e2e8f0;
+  --text-muted: #94a3b8;
+
+  /* Accent color — drives all cyan-* Tailwind classes via the overrides
+     below. Defaults to the original cyan (#22d3ee); overridden at runtime by
+     applyColors() from the store. */
+  --accent-color: #22d3ee;
+  /* Text/icons painted ON an accent-filled surface (e.g. bg-cyan-600
+     buttons): dark slate on the bright cyan (≈9.9:1). The light theme
+     overrides this to white on its darker accent. */
+  --accent-contrast-text: #0f172a;
+
+  /* Code block (syntax highlighting) colors — drive the .hljs-* rules below.
+     Overridden at runtime by applyCodeColors() from the store. Defaults are
+     the github-dark subset originally hardcoded in the .hljs rules. */
+  --code-text: #e2e8f0;
+  --code-comment: #8b949e;
+  --code-keyword: #ff7b72;
+  --code-string: #a5d6ff;
+  --code-number: #79c0ff;
+  --code-title: #d2a8ff;
+  --code-variable: #ffa657;
+}
+
+/* Light theme — activated by the `.light` class on <html>. Palette: slate on
+   white (GitHub-light-inspired), WCAG-AA tuned — muted text deepened to
+   slate-600 (≈7.5:1 on white), and the accent drops to cyan-700 (≈5.4:1 on
+   white): the shared cyan-400 accent was ≈1.8:1 on white (user-reported
+   unreadable). */
+html.light {
+  color-scheme: light;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f1f5f9;
+  --bg-tertiary: #e2e8f0;
+  --border-color: #cbd5e1;
+  --text-primary: #1e293b;
+  --text-muted: #475569;
+  --accent-color: #0e7490;
+  /* White text on the cyan-700 accent (≈5.4:1) for accent-filled buttons. */
+  --accent-contrast-text: #ffffff;
+}
+
+/* ─── Accent color overrides ───────────────────────────────────────────────
+   The accent color (--accent-color) drives all cyan-* Tailwind utility classes
+   used across the app. Rather than replacing every cyan-* class in every
+   component, we override the specific shades here so changing one variable
+   updates the whole UI. The !important is needed because Tailwind's generated
+   rules have equal specificity.
+
+   The store's applyColors() writes --accent-color at runtime; these rules
+   derive the hover/border/text/bg variants from it. */
+.bg-cyan-600 { background-color: var(--accent-color) !important; color: var(--accent-contrast-text) !important; }
+.hover\:bg-cyan-500:hover { background-color: var(--accent-color) !important; }
+.hover\:bg-cyan-500 { background-color: var(--accent-color) !important; }
+.text-cyan-400 { color: var(--accent-color) !important; }
+.text-cyan-300 { color: var(--accent-color) !important; }
+.border-cyan-500 { border-color: var(--accent-color) !important; }
+.focus\:border-cyan-500:focus { border-color: var(--accent-color) !important; }
+.bg-cyan-600\/20 { background-color: color-mix(in srgb, var(--accent-color) 20%, transparent) !important; }
+.bg-cyan-600\/30 { background-color: color-mix(in srgb, var(--accent-color) 30%, transparent) !important; }
+.hover\:bg-cyan-600\/30:hover { background-color: color-mix(in srgb, var(--accent-color) 30%, transparent) !important; }
+/* The "running" thinking-dots use a hardcoded cyan — override to the accent. */
+.thinking-dots span { background: var(--accent-color) !important; }
+/* Prose links use a hardcoded cyan — override to the accent. */
+.prose a { color: var(--accent-color) !important; }
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family: var(--app-font-family);
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* Utility: apply the user-chosen app font family + size to a component. */
+.app-font {
+  font-family: var(--app-font-family);
+  font-size: var(--app-font-size);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+/* Inset the thumb 1px on all four sides: the transparent 1px border ring lets
+   the track show through as a thin gap around the thumb. Both thumb rules
+   (base and :hover) MUST use the background-color longhand — the `background`
+   shorthand resets background-clip to border-box and would silently erase
+   the gap. */
+::-webkit-scrollbar-thumb {
+  background-color: var(--bg-tertiary);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-muted);
+}
+/* Scrollbar corner — the little square where the horizontal and vertical
+   scrollbars meet. Chromium's default corner is WHITE, which blazes against
+   the dark panels whenever BOTH scrollbars are visible (user-reported bug:
+   the "white little square"). Paint it the track color so it reads as the
+   seamless continuation of the track. Uses the background-color longhand
+   (no shorthand) for consistency with the thumb rules above. */
+::-webkit-scrollbar-corner {
+  background-color: var(--bg-secondary);
+}
+
+/* Code block highlighting (rehype-highlight uses highlight.js theme).
+   Scoped to `pre.hljs`: rehype-highlight also adds `hljs` to the inline
+   <code> element, and on an inline element the background + vertical
+   padding paints over adjacent lines (lines overlap, last line's
+   background obscures the text above it). The box styles belong on the
+   block <pre> only; the code element gets just the language-* class. */
+pre.hljs {
+  background: var(--bg-primary) !important;
+  color: var(--code-text);
+  padding: 1em !important;
+  border-radius: 0.5em;
+  font-size: 0.875em;
+  overflow-x: auto;
+}
+
+/* highlight.js github-dark theme (subset) — colors driven by the --code-*
+   variables so they're configurable in Settings (applyCodeColors). */
+.hljs-comment, .hljs-quote { color: var(--code-comment); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-type { color: var(--code-keyword); }
+.hljs-string, .hljs-attr, .hljs-symbol, .hljs-regex { color: var(--code-string); }
+.hljs-number, .hljs-bullet { color: var(--code-number); }
+.hljs-title, .hljs-name, .hljs-section, .hljs-built_in { color: var(--code-title); }
+.hljs-variable, .hljs-template-variable { color: var(--code-variable); }
+.hljs-attribute { color: var(--code-number); }
+.hljs-meta { color: var(--code-comment); }
+.hljs-deletion { color: #ffa198; background: #67060c; }
+.hljs-addition { color: #aff5b4; background: #033a16; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: bold; }
+
+/* ─── Light-theme code highlighting ────────────────────────────────────────
+   applyCodeColors() (useAgentStore.ts) writes the dark-default --code-* vars
+   as INLINE styles on <html>, which outrank every stylesheet declaration —
+   including `--code-*` re-declared under `html.light`. So the light palette
+   below sets `color` directly on higher-specificity selectors
+   (`html.light .hljs-*` = 0-2-1, beating the 0-1-0 base rules above), which
+   wins regardless of the inline vars. Palette: github-light, contrast-tuned
+   for the #ffffff / #f1f5f9 backgrounds. Dark theme is untouched. */
+html.light pre.hljs { color: #24292f; }
+html.light .hljs-comment, html.light .hljs-quote { color: #6e7781; }
+html.light .hljs-keyword, html.light .hljs-selector-tag, html.light .hljs-literal, html.light .hljs-type { color: #cf222e; }
+html.light .hljs-string, html.light .hljs-attr, html.light .hljs-symbol, html.light .hljs-regex { color: #0a3069; }
+html.light .hljs-number, html.light .hljs-bullet { color: #0550ae; }
+html.light .hljs-title, html.light .hljs-name, html.light .hljs-section, html.light .hljs-built_in { color: #8250df; }
+html.light .hljs-variable, html.light .hljs-template-variable { color: #953800; }
+html.light .hljs-attribute { color: #0550ae; }
+html.light .hljs-meta { color: #6e7781; }
+html.light .hljs-deletion { color: #82071e; background: #ffebe9; }
+html.light .hljs-addition { color: #116329; background: #dafbe1; }
+
+/* Thinking dots animation (in-flight indicator) */
+.thinking-dots {
+  display: inline-flex;
+  gap: 2px;
+}
+.thinking-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #22d3ee;
+  animation: thinking-pulse 1.4s infinite ease-in-out;
+}
+.thinking-dots span:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.thinking-dots span:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes thinking-pulse {
+  0%, 80%, 100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+
+/* Agent running indicator in the top tab bar — a soft, slow pulse so it reads
+   as "alive" without being distracting. */
+.agent-running-dot {
+  animation: agent-pulse 2s infinite ease-in-out;
+}
+@keyframes agent-pulse {
+  0%, 100% {
+    opacity: 0.45;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-color) 35%, transparent);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 6px 1px color-mix(in srgb, var(--accent-color) 50%, transparent);
+  }
+}
+
+/* Prose tweaks for markdown */
+.prose pre { margin: 0; }
+/* prose-sm sets its own font-size (0.875rem) which would override the
+   inherited --app-font-size. Force .prose to inherit so the user's chosen
+   font size applies to markdown views (MdViewer, PlanProgress, chat). */
+.prose { font-size: inherit; }
+
+/* Inline code (single backticks) — theme-aware color. The previous hardcoded
+   `text-pink-300` was ~3.5:1 on the dark tertiary bg and illegible in light
+   theme; these keep the "code" accent while meeting contrast in both themes. */
+.inline-code { color: #f9a8d4; }            /* dark: pink-300 on bg-tertiary (#334155) */
+html.light .inline-code { color: #be185d; } /* light: pink-700 on bg-tertiary (#e2e8f0) */
+
+.prose table { border-collapse: collapse; }
+.prose th, .prose td { border: 1px solid var(--border-color); padding: 0.25rem 0.5rem; }
+.prose th { background: var(--bg-secondary); }
+.prose ul { list-style: disc; padding-left: 1.25rem; }
+.prose ol { list-style: decimal; padding-left: 1.25rem; }
+.prose a { color: #22d3ee; }
+.prose blockquote { border-left: 3px solid var(--border-color); padding-left: 0.75rem; color: var(--text-muted); }
+
+/* ─── Reduced motion ───────────────────────────────────────────────────────
+   Respect the OS "reduce motion" setting: stop the pulsing thinking-dots and
+   agent-running indicator, and kill the smooth transitions (e.g. the context
+   bar's width transition). Users who opt out of animation get static, fully
+   opaque indicators instead of moving ones. */
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dots span {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+  .agent-running-dot {
+    animation: none;
+    opacity: 1;
+  }
+  .transition-all,
+  .transition-colors,
+  .transition {
+    transition: none !important;
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "cached_tokens": 20,
+  "completion_tokens": 50,
+  "generation_ms": 2000,
+  "kind": "usage",
+  "prompt_tokens": 100,
+  "reasoning_tokens": 10,
+  "ttft_ms": 1000
+}

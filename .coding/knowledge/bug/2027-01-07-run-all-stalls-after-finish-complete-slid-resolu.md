@@ -1,0 +1,14 @@
++++
+title = "Run-All stalls after finish→Complete — slid resolution sees (Complete, false), non-closure arm returns, nothing re-checks"
+created = "2027-01-07"
++++
+
+BUG (2027-01-08, backlog e33a07fd, plan 51553f40): Run-All stalls after finish→Complete — next item never dispatches.
+
+SYMPTOM: with ≥2 pending items and Run-All active, completing the first item's plan (tests → review → commit 08a9295 → finish) never dispatches the second item — the session sits idle with the run active, requiring a manual restart (live 2027-01-08, plan 4354296c; the [done] stamp in backlog.jsonl came from the manual restart's drain done-orphan guard, NOT the turn resolution).
+
+ROOT CAUSE: the run-all arm's gate in on_main_turn_resolved (src-tauri/src/ipc/run_all.rs:2570) requires (workflow==Complete, loop_evidence==true) to stamp Done + dispatch; the non-closure arm (:2611-2639) annotates + RETURNS — no dispatch. Complete is a RESTING state (no transition ever fires again; no auto-continue — Complete ∉ workflow_expects_progress), so a resolution that slides to (Complete, false) stalls the run forever. The slide mechanism: the finish turn's Finished arrives while a descendant still runs → on_finished defers (pending_finished) → the descendant's completion notification starts a NEW main-agent turn → on_started CLEARS the deferred entry (the 2026-08-26 deferral class: "the deferred success is lost when the next turn starts") → the notification turn ends with loop_evidence=false (no workflow transition — already Complete) → gate fails → non-closure arm returns → STALL. Verified facts: top_plan_id() = the ROOT plan and finish() keeps the stack (src/workflow/mod.rs:797-804), so main_agent_top_plan_id still reports the completed plan after finish; the dispatch pre-transitions Complete→Planning (enter_planning_if_complete), so a pre-create_plan turn end lands at (Planning, false) — covered by the a6a7727a auto-continue fix, NOT this defect.
+
+FIX (plan 51553f40): (1) the landed arm — closed_earlier = (Complete, !loop_evidence, item InFlight) && orphan_work_landed(item.plan_id, item.note) (the drain's done-orphan predicate: plan file all-checked + commit after the pre-item checkpoint — proves the item's OWN plan completed on an earlier turn); the gate scrutinee becomes (main_state, loop_evidence || closed_earlier). (2) same pass, backlog 5bb1e4cd: plan_linkage_allows_done(status, item_plan_id, completed_plan_id) guards every Done transition (run-all gate arm + single-dispatch Done row) — only a currently-InFlight item owning the completing plan may flip; a re-queued Pending item or mismatched/absent linkage must not transition (note preserved, no commit_success).
+
+REGRESSION TESTS: complete_state_turn_end_with_landed_plan_dispatches_next + done_transitions_are_guarded_on_status_and_plan_linkage (source-contract, confirmed failing pre-fix) + plan_linkage_allows_done_matrix (unit, added with the guard helper).

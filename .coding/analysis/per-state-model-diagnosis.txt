@@ -1,0 +1,134 @@
+﻿=== C:\Users\carst\.myharness listing ===
+config.toml  630B  08/13/2026 18:02:07
+endpoints.toml  1372B  08/13/2026 18:02:07
+keys.toml  505B  08/13/2026 18:02:07
+projects.toml  72B  08/09/2026 11:32:09
+
+=== config.toml ===
+[general]
+default_provider = "ollama"
+default_model = "glm-5.2"
+safety = "autonomous"
+run_all_strict_success = false
+
+[general.vision_model]
+endpoint = "gemini"
+model = "gemini-3-flash-preview"
+
+[context]
+summarize_at_fill_rate = 0.5
+
+[ui]
+theme = "dark"
+show_token_usage = true
+
+[models.planning]
+endpoint = "kimi"
+model = "kimi-k3"
+
+[models.executing]
+endpoint = "deepseek"
+model = "deepseek-v4-flash"
+
+[models.complete]
+endpoint = "deepseek"
+model = "deepseek-v4-flash"
+
+[models.subagent]
+endpoint = "kimi"
+model = "kimi-k3"
+
+[models.skill]
+
+[markdown]
+skip_dirs = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+]
+
+=== endpoints.toml (names + models only) ===
+pricing = []
+
+[[endpoint]]
+name = "kimi"
+kind = "openai"
+base_url = "https://api.kimi.com/coding/v1/"
+models = ["kimi-k3"]
+max_context = 1000000
+max_output_tokens = 32768
+multimodal = false
+supports_reasoning_effort = true
+
+[[endpoint]]
+name = "ollama"
+kind = "local"
+base_url = "https://ollama.com/v1/"
+models = ["glm-5.2"]
+max_context = 1000000
+max_output_tokens = 32768
+multimodal = false
+supports_reasoning_effort = true
+
+[[endpoint]]
+name = "gemini"
+kind = "openai"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+models = ["gemini-3-flash-preview"]
+max_context = 1000000
+max_output_tokens = 65536
+multimodal = true
+supports_reasoning_effort = true
+
+[[endpoint]]
+name = "deepseek"
+kind = "openai"
+base_url = "https://api.deepseek.com/v1/"
+models = [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+]
+max_context = 1000000
+max_output_tokens = 32768
+multimodal = false
+supports_reasoning_effort = true
+
+[[endpoint]]
+name = "Opencode"
+kind = "openai"
+base_url = "https://opencode.ai/zen/go/v1/"
+models = ["kimi-k3"]
+multimodal = false
+supports_reasoning_effort = true
+reasoning_effort = "max"
+
+[[endpoint]]
+name = "Grok"
+kind = "openai"
+base_url = "https://api.x.ai/v1/"
+models = [
+    "grok-4.5",
+    "grok-build-0.1",
+]
+max_context = 500000
+max_output_tokens = 250000
+multimodal = true
+supports_reasoning_effort = false
+reasoning_effort = "high"
+
+
+
+=== TRACE CORRELATION (traces.jsonl, 2026-08-13 04:19-17:23) ===
+Distinct models seen per request id ranges (from the earlier cache-hit-2 summary):
+  ids 1-17:  deepseek-v4-pro      (default at the time)
+  ids 18-88: deepseek-v4-flash    (executing-heavy session — matches [models.executing])
+  ids 89-99: kimi-k3              (fresh context, 3-25 messages — subagent/planning-shaped; matches [models.subagent]/[models.planning])
+  ids 100-112: deepseek-v4-flash
+NOTE: config.toml was last written 2026-08-13 18:02:07 — AFTER the last trace (17:23). The traces therefore reflect an OLDER config generation. They still show multiple models in use per session (kimi + deepseek), consistent with per-state overrides firing (not a single fixed model).
+
+=== VERDICT ===
+(b) OVERRIDE FIRES BUT UI SHOWS DEFAULT (observability) — primary.
+Evidence: config valid + endpoint names match (resolve_model_ref succeeds); the resolution chain is wired (turn.rs:78 -> loop_impl.rs:405 -> ConfigModelResolver); traces show multiple models per session (kimi + deepseek-flash) matching the configured overrides; yet AgentInfo.model (src-tauri/src/ipc/agent.rs:331) reads loop.provider().model() — the DEFAULT slot (ollama/glm-5.2) — and StatusBar.tsx:23/407 shows the store's global default model. The user therefore sees "glm-5.2" permanently and concludes the per-step models are ignored.
+Secondary: (c-partial) CONFIG-SHAPE GAP — ModelsConfig has NO `reviewing` field and the UI has no Reviewing slot; a `reviewing = {...}` key in config.toml is silently dropped by serde (no deny_unknown_fields) and erased by the next save_all (config.toml is rewritten from the in-memory struct). Reviewing currently falls back to executing (model_resolver.rs:211).
+FIX (this plan): (1) track the effective resolved model per agent loop and report it via AgentInfo.model so the UI shows the model actually used; (2) add the `reviewing` phase slot end-to-end (config field + resolver arm reviewing.or(executing) + wire DTO/patch/validation + UI slot).

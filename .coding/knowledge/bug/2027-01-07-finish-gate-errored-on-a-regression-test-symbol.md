@@ -1,0 +1,14 @@
++++
+title = "finish gate errored on a regression-test symbol that exists on disk (648e0ad5)"
+created = "2027-01-07"
++++
+
+BUG (backlog 648e0ad5, plan 1dbb8c66, live case 2027-01-08): the finish gate errored on a regression-test symbol that exists on disk — "regression test symbol 'checkFillContract' not found in the code graph (even after a refresh) — the verify step must record the actual test function name" — and the dispatched agent chased a phantom rename (renamed the test, recorded a wrong name) or stalled.
+
+Symptom: a bug_fixing plan's finish gate rejected the verify step even though the test function exists in the source.
+
+Root cause: the gate's self-freshen (src/tool/workflow/plan.rs:1425, spawn_blocking(|| g.index(None)) — the backlog #91 fix) runs ONE incremental pass and retries the resolve once. The incremental pass is mtime/hash-based (src/codegraph/mod.rs:287-294 — the mtime fast-path skips the read entirely when stored mtime == disk mtime && has_content && stored_hash.is_some(); :312 — needs_reindex only when the stored hash differs or there is no content row). When the DB's meta rows are FRESH but the SYMBOL rows are stale or missing (a partial write, schema drift, or a prior best-effort skip at :341-343), the pass never re-parses that file — the retry misses and the gate errors on a symbol that exists on disk. The F10 self-healing (stale_source_files, mod.rs:500) is mtime-based and shares the same blind spot: fresh meta + missing symbol rows is NOT mtime-stale.
+
+Fix: the gate escalates before erroring — CodeGraph::reindex_files_containing(needle) (src/codegraph/mod.rs, near reindex_stale_files) walks the searchable files and force re-parses every SOURCE file whose on-disk bytes contain the needle, regardless of stored mtime/hash (the disk truth; no indexing-flag bail — a concurrent mtime/hash pass cannot fix this case, and the upserts are idempotent). The gate then re-resolves; only when the symbol is absent after the forced re-index does it error, with a message naming the case: 0 files re-parsed = the name is absent from every source file (a wrong test name); N files but no symbol = the name appears as text only; the refresh itself failed = inconclusive (re-run finish, do not rename the test).
+
+Regression tests (red-first): finish_force_reindexes_when_meta_fresh_but_symbols_missing (src/tool/workflow/plan.rs — the gate-level test: index, simulate_partial_write_for_test, finish must SUCCEED via the escalation) + reindex_files_containing_reparses_despite_fresh_meta (src/codegraph/mod.rs — pins the no-op root cause: index(None) after the partial write still misses, then the forced re-parse finds it). Test scaffolding: #[cfg(test)] CodeGraph::simulate_partial_write_for_test(rel) writes fresh meta rows (hash + mtime + content) with EMPTY symbol rows — the partial-write simulation (store() is private, so the plan.rs test corrupts via this pub(crate) helper).

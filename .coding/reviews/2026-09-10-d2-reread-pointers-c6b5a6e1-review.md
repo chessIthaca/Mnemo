@@ -1,0 +1,49 @@
+## Verdict: FINDINGS (0 high, 3 low)
+
+D2 (commit cdfb9aa, plan c6b5a6e1, backlog a6b3fa57) is correctly implemented and fully tested on its mainline: the borrow structure, arguments lookup, idempotency, and prefix-cache safety are all sound, and the four new tests assert the acceptance. Three LOW findings — a debug-build panic path on degenerate `read_files` args, `file_read` results getting no pointer, and search pointers dropping the `literal` flag — plus non-blocking observations.
+
+## Scope and method
+
+Reviewed commit cdfb9aa (HEAD on wt/agenticcoding, no uncommitted changes) via `git show`: src/agent/context.rs (`rerun_pointer` + `compact_old_tool_results` + 4 tests), the SPEC record, the plan file, and the backlog bookkeeping. Verified against the live tree: the full compaction function (context.rs:609-682), `rerun_pointer` (:501-567), the canonical read_files arg parse it mirrors (dispatch.rs:1055-1068; read_files.rs:102-199, :372), the message-construction claim (turn.rs:1400-1406 — confirmed: the ToolResult envelope's `data` is dropped; only `result.output` reaches the Message, so deriving the pointer from the assistant tool_calls' arguments is the only viable source), the sole production call site (turn.rs:1460), the Message/ToolCall definitions (provider/mod.rs:323-360, :641), and the tool registry (tool/mod.rs:950-1021). Tests were reported green by the committer (`cargo test --workspace`: 2249+16+293+4+2 passed, 0 failed) and are not re-runnable in this review; all code paths were verified by inspection instead.
+
+## Correctness walkthrough (all verified)
+
+- **Borrow structure** — correct. `tool_call_id`/`name` are cloned out of `messages[idx]` and the arguments scan (`messages.iter().find_map`) completes before `let msg = &mut messages[idx]`; `pointer` is an owned `Option<String>`, so no borrow crosses the mutable reborrow. NLL-clean; the green build confirms.
+- **Arguments lookup** — correct. Tool-result messages carry `tool_calls: Vec::new()` (provider/mod.rs:349), so only assistant messages can match; tool_call_ids are unique per provider response, and the first match is the originating call. The result message's `name` and the call's `arguments` both derive from the same `tc` at construction (turn.rs:1405), so they cannot disagree. Unmatched id → `None` → plain marker (graceful, tested).
+- **Malformed arguments JSON** — safe. `serde_json::from_str(arguments).ok()?` returns `None` for unparseable/empty arguments; non-object JSON falls through `args.get(...)` → `None`; wrong-typed fields (`path` a number, `files` not an array) are skipped via `as_str()`/`as_array()`. No panics.
+- **UTF-8 safety** — safe. All truncation/capping is `chars()`-based (`take(summary_chars)`, `take(80)`); the `…` ellipsis is appended to a `String`, never sliced into one. The one panic risk is integer, not UTF-8 — finding 1.
+- **Idempotency** — holds. The intact-indices filter and the in-loop `contains(COMPACTED_MARKER)` check (both pre-existing, untouched by this diff) govern; the pointer is appended after the marker in the same write, and a second pass excludes the message entirely — asserted byte-identical by `compact_pointer_keeps_idempotency`.
+- **Prefix-cache safety** — holds. The pointer is resolved before the write and lands inside the same single-pass mutation; the hysteresis no-op path still returns before any pointer work, so byte-stability across consecutive requests within the window is unchanged.
+- **Tests assert the acceptance** — they do. `compact_appends_reread_pointer_for_read_files` asserts the exact `[re-read: read_files src/foo.rs:10-59]` line (file + line range = the acceptance) plus marker presence and the kept-newest-untouched check; the search test asserts the full pattern+glob pointer; the idempotency test asserts second pass == 0 AND byte-identical content; the no-match test covers both the orphan-id and non-pointer-tool degradation paths. Pre-existing tests are unaffected (their tool names are `file_read` with `{}` args or their results have no matching calls — either way no pointer; expectations unchanged).
+
+## Findings
+
+### LOW 1 — `s + m - 1` can underflow/overflow (debug panic) on degenerate read_files args
+
+context.rs:533. `(Some(s), Some(m)) => format!("{p}:{s}-{}", s + m - 1)` on u64 values taken straight from the model's arguments. `start_line: 0` + `max_lines: 0` → `0 + 0 - 1` → u64 underflow: **panic in debug builds** (dev runs, `cargo test`), wraps to `u64::MAX` in release ("path:0-18446744073709551615" — garbage pointer). Huge values can overflow `s + m` the same way. This is reachable: the pointer is resolved for every message in `to_compact` BEFORE the length/marker skip checks (context.rs:644-671), so even a short result triggers it — and the tool itself deliberately tolerates `start_line: 0` (read_files.rs:372 `unwrap_or(1).saturating_sub(1)`, with its own regression test `start_line_zero_reads_from_top` at :838), so a call the tool handles gracefully can later panic the compaction loop in a dev build. Related cosmetic case: `s=0, m>=1` renders "0-{m-1}" while the tool actually read lines 1..m (off-by-one pointer). Fix: checked/saturating arithmetic in the project's own style — e.g. `s.saturating_add(m).saturating_sub(1)`, or normalize `s=0 → 1` to match the tool — plus a regression test calling `rerun_pointer("read_files", r#"{"path":"a.rs","start_line":0,"max_lines":0}"#)` asserting no panic and a sane pointer.
+
+### LOW 2 — `file_read` results get no pointer
+
+`file_read` is a live, registered, AutoRun tool (tool/mod.rs:975/:1015/:1555, priority class 1 "universal read tools" alongside read_files) taking the identical `{path, start_line?, max_lines?}` args (file_read.rs:36/:76/:144). `rerun_pointer` matches only "read_files" (context.rs:504), so a truncated `file_read` result — the exact D2 scenario, a file read whose content left the context — keeps the plain marker and forces the re-search D2 exists to avoid. The backlog item's wording ("file + line range for file reads") covers it; the plan scoped it to read_files only. Fix: add `"file_read"` to the match arm (the arg shape is identical; `files[]` is simply absent) and emit the actual tool name in the pointer prefix (`[re-read: file_read …]`) so the agent re-issues the tool it actually used; extend the read-files test with a file_read case.
+
+### LOW 3 — search pointers drop the `literal` flag, so a re-run changes semantics
+
+Both `search` and `search_read` take `literal` (search_read.rs:127; search.rs tests exercise it heavily, e.g. :1575 `{"pattern": "$5.00", "literal": true}`). The pointer emits only pattern + glob (context.rs:559-563), so re-running `[re-run: search pattern="$5.00"]` interprets the pattern as a REGEX — typically zero matches — and the agent concludes the content is gone, defeating the pointer's purpose for literal searches (a common mode: patterns full of metachars like `->`, `$`, `(`). Fix: append ` literal=true` when `args.literal` is true (one line + a test). (`max_files` on search_read defaults sensibly on re-run — fine to omit.)
+
+## Non-blocking observations
+
+- **Sanitization asymmetry.** The pattern is control-char-collapsed and capped at 80 chars, but `glob` and the read paths are neither collapsed nor capped (a quote/newline inside them lands raw in the pointer; an arbitrarily long glob bloats the "compact" marker). The plan promised "always one line, newline-sanitized". Practically unreachable via successful calls (a newline glob/path matches nothing → short result → no pointer appended), so noted, not counted — but applying the same collapse to glob/path is a two-line alignment if LOW 3 is fixed anyway.
+- **Untested branches.** The `files[]` batch form, the 3-spec cap + "(+N more)", the 80-char pattern cap, and the control-char collapse have no direct tests (the four tests cover the single-spec and search happy paths, idempotency, and degradation). Worth one compact test if the arm is touched for LOW 2/LOW 3.
+- **Pointer resolved before the skip checks.** `rerun_pointer` (JSON parse + full-history id scan) runs for every `to_compact` message even when the marker/length checks then skip it. Bounded and cheap relative to an LLM round-trip — fine as-is; just be aware it is what makes LOW 1 reachable from short results.
+
+## Constitution checks
+
+- **Multi-platform neutrality** — PASS. Pure Rust, no platform APIs, no cfg gates, no path assumptions (paths are echoed from args for display only).
+- **Warning-free build** — PASS by evidence: `#![deny(warnings)]` at both crate roots + the reported green `cargo test --workspace` (2249+16+293+4+2 passed, 0 failed) ⇒ zero warnings; no `#[allow]` introduced.
+- **Documentation sync** — PASS. Both functions carry doc comments (the new "# Re-read pointers (D2)" section documents semantics + the arguments-not-envelope rationale); README.md and PLAN.md contain no compaction-marker docs (verified by search — matches only under .coding/), so nothing to sync; the SPEC knowledge record is written and accurate.
+- **File-tools-first / branch policy** — PASS. No shell mutation in the diff; the commit lands on wt/agenticcoding, not main; backlog a6b3fa57 correctly marked in_flight with plan_id pending finish.
+- **Design rationale** — SOUND. Verified at turn.rs:1400-1406: the ToolResult envelope's `data` never reaches the Message, so the assistant tool_calls' arguments are indeed the only creation-time metadata in history; deriving the pointer there avoids wire-format changes and keeps the signature unchanged.
+
+## Recommendation
+
+Fix the three LOWs (all small, localized to `rerun_pointer` + tests), re-run `cargo test --workspace`, and this is a clean PASS. None block the feature's mainline value: well-formed read_files/search results — the overwhelming majority — already get correct, idempotent, cache-safe pointers.

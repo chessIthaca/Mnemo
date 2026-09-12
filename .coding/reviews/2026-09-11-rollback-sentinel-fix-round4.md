@@ -1,0 +1,51 @@
+## Verdict: PASS
+
+Round-4 verification of the RECONCILED final state for the sentinel-fix rollback (plan f84fb83f, branch wt/agenticcoding @ 2104be7 plus uncommitted .coding/ changes). The round-3 LOW-1 reconciliation is complete and correct, and all four verification axes pass: the uncommitted state is exactly the three reconciled tracked files plus the two untracked round-2/round-3 reports and nothing else; refs are unchanged (main = 2769fca, wt/agenticcoding = 2104be7, origin/main = 2769fca) with nothing compiled differing from 2769fca's verified-green tree; the memory live set is converged (bed5106d the sole fact-carrier, 8d34b1f1 the fact-free redirect, 2edb2989's digest DeepSeek-only, no live landed-on-main claim); and the backlog retirement note, the GLM file's amendments, and 7bb9a608.md's correction cross-reference consistently. The tree was stable throughout this review — no mutation between any of this reviewer's reads. The state is ready to commit.
+
+### Verification detail
+
+**1. Final uncommitted state — PASS (exactly the reconciled three + two, nothing else).**
+
+- `git diff HEAD --stat`: 3 files changed, 9 insertions(+), 5 deletions(-) — exactly:
+  - `.coding/backlog.jsonl` (the single 0d4f54e3 line rewritten): `"status":"pending","note":null` → `"status":"failed"` with the retirement note.
+  - `.coding/knowledge/bug/2027-01-07-deepseek-glm-reasoning-tokens-in-main-chat-open.md`: the DeepSeek-only head correction (title + body first paragraph) plus the two amendment paragraphs.
+  - `.coding/knowledge/bug/7bb9a608.md`: the title extension plus the USER CORRECTION paragraph.
+- `git status --short`: exactly `M` on those three files and exactly two untracked files — `.coding/reviews/2026-09-11-rollback-sentinel-fix-round2.md` and `.coding/reviews/2026-09-11-rollback-sentinel-fix-round3.md`. Nothing else.
+- Content verified by full reads:
+  - **Backlog 0d4f54e3** — status `failed`, note: "Retired 2027-01-10 at user direction: the stream-level ThinkTagFilter approach is PROVEN NOT TO WORK — twice: (a) the vendor-policy per-model think_tags fix (plan 77278715) rolled back 2027-01-09 with the leak persisting, and (b) the reasoning still leaked into the main window with the sentinel fix live at 5cdd822. The bug is REAL but DeepSeek-only now (deepseek-v4-flash-gcp/aws via the proxy; GLM-5.3 verified working flawlessly 2027-01-10). The leak's fix needs fresh investigation of the proxy's stream parsing / serving stack … NOT another render-level attempt. See the amended records: [the GLM file] (both dated USER CORRECTION paragraphs) and [7bb9a608.md] (the USER CORRECTION paragraph)." `backlog_list` confirms the item renders `[failed]` with that note.
+  - **GLM truth file** — title: "DeepSeek reasoning tokens in main chat — OPEN (fix rolled back; GLM-5.3 no longer affected)"; body head: "scope corrected 2027-01-10 (user-verified): DeepSeek-only — deepseek-v4-flash-gcp/aws via the the LiteLLM proxy (<gateway>); GLM-5.3 is no longer affected (works flawlessly — see the second amendment)"; amendment 1 = the authoritative twice-proven USER CORRECTION (verbatim, including its now-superseded "AND glm-5.3" scope); amendment 2 = the follow-up ("supersedes the scope above … The 'AND glm-5.3' scope in this record's earlier text is stale — do not treat GLM as affected"). Both paragraphs match round-3's quoted text verbatim — no mutation since round 3's re-verification.
+  - **7bb9a608.md** — title: "… — OPEN, fix reverted; ThinkTagFilter ladder step PROVEN NOT TO WORK"; the USER CORRECTION paragraph carries the twice-proven history and bars ladder step 2.
+
+**2. Refs and compiled-tree identity — PASS.**
+
+- `main` = 2769fca8bdd318b4d29fdcd02947150a59faa7af (the Anthropic 3rd-breakpoint merge); `origin/main` = 2769fca8bdd (synced — the wt bookkeeping commit is local-only, as the plan intends); `wt/agenticcoding` = 2104be765d12e098a26918d70aada4d31cc0439e, sitting directly on 2769fca (HEAD log: 2104be7 → 2769fca, no intermediate commits).
+- 2104be7 is bookkeeping-only: 6 files, all `.coding/` (backlog.jsonl, two bug truth files, the rollback decision file, plans/f84fb83f.md, the round-1 report), 89+/1−. Every uncommitted change is likewise `.coding/`-only. → The working tree's compiled sources are byte-identical to 2769fca's verified-green tree (its merge message records `cargo test --workspace` green: 2278 lib + 16 + 293 + 4 + 2, zero warnings) — green by tree identity. (This reviewer cannot execute cargo test — the same limitation as rounds 1–3.)
+- Pre-fix behavior independently re-verified by direct read: `src/agent/prompt.rs:460` = `pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ignore>";` — the ORIGINAL angle-bracket form; the 942bc44 bracket-flip payload is absent.
+
+**3. Memory live set — PASS (converged).**
+
+- The sentinel-fix PLAN family, enumerated by a superseded-inclusive prefix search: exactly six records — `7f9e3e6b` [superseded], `7f12a3b8` [superseded], `7ffd6d33` [superseded], `b45a4a48` (MERGED into main 5cdd822) [superseded], `bed5106d` (ROLLED BACK) live, `8d34b1f1` (redirect) live. `bed5106d` is the only live fact-carrier; `8d34b1f1`'s digest carries no independent facts — it points at bed5106d and restates the target's rolled-back status for orientation.
+- `2edb2989` — title: "BUG: DeepSeek reasoning tokens in main chat — OPEN (fix rolled back; GLM-5.3 no longer affected)"; digest: "OPEN on main (e0ac5dd) as of 2027-01-09; scope corrected 2027-01-10 (user-verified): DeepSeek-only — deepseek-v4-flash-gcp/aws via the the LiteLLM proxy (<gateway>); GLM-5.3 is no longer af…". The stale "AND glm-5.3" is gone from the digest, and the re-index is proven — live search serves the new content.
+- No live record claims the fix is landed on main: the only MERGED-5cdd822 record is superseded; every live record mentioning 5cdd822 describes the rollback correctly (`bed5106d`, `8d34b1f1`, DECISION `1ad9d724`, BUG `80c859a1` MOOT/off-main, BUG `5cf5469c` OPEN/fix reverted, PLAN `f7d9b6bf` FAILED/retired, PLAN `3fcae5b3` ROLLED BACK); DECISION `e312b918` is the historical direction approval; SPEC `cbe53819` describes the angle form — the current post-rollback state; the episodic (`636b4fa0`) and REVIEW (`713fd49b`, `08cf373d`) records are historical. A landing-claims query surfaces only genuinely-landed unrelated plans (8957b12, 0703cf8, e20b1df, 2aeb0a8).
+- The dependent records mirror their truth files: `5cf5469c` ↔ 7bb9a608.md; `f7d9b6bf` ↔ the 0d4f54e3 retirement; `2edb2989` ↔ the GLM file's DeepSeek-only head.
+
+**4. Internal coherence — PASS.**
+
+- Twice-proven history: the identical (a)/(b) enumeration in all three places — (a) the vendor-policy think_tags fix (plan 77278715) rolled back 2027-01-09 with the leak persisting; (b) the reasoning still leaked with the sentinel fix live at 5cdd822.
+- DeepSeek-only scope: the backlog note ("The bug is REAL but DeepSeek-only now … GLM-5.3 verified working flawlessly 2027-01-10") ↔ the GLM file's second amendment ("the bug is NO LONGER REAL for GLM-5.3 — GLM works flawlessly now (user-verified live 2027-01-10). The leak is DeepSeek-only"). 7bb9a608.md is DeepSeek-scoped throughout (it never mentions glm), consistent with the corrected scope.
+- ThinkTagFilter barred as the fix: all three bar the stream-level heuristic ("the same approach a third time") and direct fresh investigation at the proxy's stream parsing / serving stack.
+- Cross-references resolve: the backlog note points at both files with accurate paragraph descriptions (the GLM file does carry both dated USER CORRECTION paragraphs; 7bb9a608.md carries its USER CORRECTION paragraph); the GLM file's head points at "the second amendment"; amendment 2 explicitly marks amendment 1's scope stale in-file. The only remaining "AND glm-5.3" text lives inside the explicitly-superseded amendment, preserved verbatim as history by design — no live contradiction.
+- Provenance (round-3 LOW-1(a)): the main agent attests both mid-round-3 changes were direct user instructions in the same session. A read-only reviewer cannot independently verify user-statement provenance — round 3's stated limitation, and the reason the reconciliation was assigned to the main agent (the only writer). The final state matches the attested reconciliation exactly and is internally coherent; the attestation is accepted as first-party knowledge.
+
+### Constitution checks
+
+- **Documentation sync — PASS.** No source, README, or PLAN.md changes since 2769fca; the knowledge records carry the rolled-back / off-main / DeepSeek-only statuses accurately, and the memory digests mirror them.
+- **Multi-platform neutrality — PASS.** Zero source changes; the only new content is `.coding/` markdown and a backlog.jsonl line — platform-neutral.
+- **File-tools-first — PASS.** The truth-file corrections follow the dated-amendment convention; the backlog change is a single-line status edit; no shell-based mutation is visible in the diffs.
+
+### Observations (not findings)
+
+1. **The running app binary predates the rollback** — this reviewer session's own context footer renders as `[context footer — cache-stable sentinel, ignore]` (square brackets, the 5cdd822 form) while the repo carries the angle form (verified by direct read above). Same as rounds 2–3 observation 1: a git reset does not rebuild the running binary; not evidence of an incomplete rollback.
+2. **"Amended 2027-01-07" prefixes vs. in-body 2027-01-10 dates** — the environment-clock skew rounds 2–3 already noted; unchanged and harmless (each paragraph self-dates as "2027-01-10 USER CORRECTION" in its first clause).
+3. **Dated main-ref anchors differ between the two bug files** — the GLM file anchors "OPEN on main (e0ac5dd) as of 2027-01-09" while 7bb9a608.md anchors "OPEN on main (2769fca) as of 2027-01-10"; both are accurate dated snapshots (main moved e0ac5dd → 2769fca between them), the bug is open at both, and no fix landed. 2edb2989's digest mirrors its truth file.
+4. **Tree stability this round** — the diff/stat/status reads and the full file reads were mutually consistent across every call this reviewer made, and the amendment paragraphs match round-3's quoted text verbatim: no mutation during round 4. The moving-target condition that produced round-3's LOW-1 is gone.

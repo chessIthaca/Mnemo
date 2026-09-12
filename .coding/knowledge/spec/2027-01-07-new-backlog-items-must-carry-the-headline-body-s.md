@@ -1,0 +1,6 @@
++++
+title = "New backlog items must carry the headline+body shape — enforced at both write paths"
+created = "2027-01-07"
++++
+
+Every NEW backlog item must carry the headline+body shape the Backlog tab renders — first line a short headline (≤100 chars), then a blank line, then the body (≤4000 chars total). Enforced at both write paths by the shared validator in src/backlog.rs: `normalize_item_text` (the agent's backlog_add tool calls it directly — it takes no images), `normalize_new_item_text` (the UI's IPC backlog_add command — image-aware: empty text + ≥1 image passes with empty text, since the Backlog tab's add path explicitly supports pasting a screenshot with no caption). The Backlog tab surfaces the rejection inline (errMsg extracts the {kind, message} IpcError DTO) and restores the draft, guarded so in-flight typing is never clobbered. Existing items grandfathered (no migration); the store's `add` and `backlog_edit` deliberately stay unvalidated so editing a grandfathered single-line item never forces restructuring. Tool-schema prose is built from the enforcing consts (MAX_ITEM_TEXT_CHARS / MAX_HEADLINE_CHARS) so it can't drift. Shipped 2027-01-07, plan 024a06e1, commit 568d405 on wt/agenticcoding; unit tests in src/backlog.rs tests module + source-contract test in src-tauri/src/ipc/backlog_cmds.rs.

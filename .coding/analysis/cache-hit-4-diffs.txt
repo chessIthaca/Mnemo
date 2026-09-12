@@ -1,0 +1,57 @@
+﻿# Cache-Hit Round 4 — Consecutive Request Diffs
+
+**Source:** .coding/logs/traces.jsonl (2 lines, ids 295-296)
+**Provider:** glm-5.2 via the LiteLLM proxy (<gateway>/v1/)
+
+## Pair 295 → 296
+
+| Field | id=295 | id=296 | Verdict |
+|---|---|---|---|
+| prompt tokens | 341,619 | 370,340 | +28,721 (3 tool results appended) |
+| cached tokens (provider) | 0 | 16,320 | only head cached |
+| hit % | 0.0% | 4.4% | RESET |
+| nMessages | 483 | 486 | +3 (1 assistant + 2 tool) |
+| nTools | 25 | 25 | toolsEq = TRUE (byte-identical) |
+| sysLen (messages[0]) | 16,733 | 16,733 | sysEq = TRUE (byte-identical) |
+| tail (2nd-to-last msg) | 1,725 chars | 1,725 chars | tailEq = TRUE (byte-identical) |
+| footer (last msg) | 50 chars | 50 chars | footerEq = TRUE (byte-stable) |
+| max_completion_tokens | 131,072 | 131,072 | unchanged |
+| model | glm-5.2 | glm-5.2 | no switch |
+
+## Classification: NOT a prompt-structure reset
+
+This reset does NOT match any of the known cache-breaker patterns:
+- NOT TAIL-CHANGE — the volatile tail is byte-identical
+- NOT TOOLS-CHANGE — the tools array is byte-identical (no state transition)
+- NOT MODEL-SWITCH — same model + base_url
+- NOT SUMMARIZE — no summarization occurred (context 370K < threshold 500K)
+- NOT PRIMER-CHANGE — the session primer is part of the stable head (byte-identical)
+- NOT HEAD-CHANGE — the stable head is byte-identical
+
+## Root cause: litellm proxy cache size limit
+
+The R1/R5 structure is fully intact — every byte the cache law says should be stable IS stable.
+The cache miss is caused by the litellm proxy's cache behavior, not our prompt management:
+
+1. At 341K tokens (id=295), the proxy cached 0 tokens — a full reset.
+2. At 370K tokens (id=296), the proxy cached only 16,320 tokens (the system head ~16K).
+3. In the memory.db sample, the cache held 99% from 330K→341K, then dropped at 370K.
+
+This suggests the litellm proxy has a cacheable prefix limit around 340-350K tokens.
+Beyond that limit, it stops caching the conversation prefix and only caches the system head.
+
+## Memory.db evidence (12,713 requests, glm-5.2)
+
+The heuristic-inflated stats show 95.7% overall, but the provider-reported values (from the
+2 opt-in traces) reveal the real picture: the heuristic records min(prev,curr) when the
+provider reports cached=0, masking the miss. The 740 resets (6%) are concentrated at high
+context sizes (>340K tokens), consistent with the proxy cache limit hypothesis.
+
+## Verdict on R5 CONTEXT_FOOTER
+
+The R5 footer IS working as designed — it is the byte-stable last message. The cache law it
+was designed for (DeepSeek: "last message must match") is satisfied. The remaining resets
+are caused by a DIFFERENT mechanism (proxy cache size limit) that R5 cannot address.
+
+Mitigation: keep context under the proxy's cache limit (~340K) via R13 (lower summarization
+threshold) and R14 (truncate consumed tool results).

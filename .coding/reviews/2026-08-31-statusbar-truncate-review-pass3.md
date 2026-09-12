@@ -1,0 +1,3 @@
+## Verdict: FINDINGS (0 high, 1 low)
+
+**Summary:** The pass-2 residual (safety-mode button wrap vector) is genuinely and correctly fixed — `whitespace-nowrap` sits in the button's **base** className (StatusBar.tsx:860), ahead of the variant ternary, so all three safety modes inherit it; the label renders as direct button text with no inner span, and the 7th regression assertion matches the source string char-for-char. Full re-sweep of every child of the bar root (:551) finds **no remaining wrap vector**; all checks pass except one: the BUG knowledge file is stale — it still documents the pre-pass-2 state ("6 source-contract assertions", "697/697", FIX list ending at the merge button) and thus does not describe the fix set it ships with.

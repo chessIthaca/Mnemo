@@ -1,0 +1,53 @@
+# The merge_to_main skill — an agent-driven merge into main.
+#
+# Started via the "Merge to main" button (Complete/Planning only) or by the
+# agent calling skill_start("merge_to_main"). The agent drives the merge
+# itself using its tools (git commit/merge/checkout/branch + file_edit for
+# conflict resolution), then calls skill_end to return to Planning; a final
+# step supersedes branch-status memories citing the merged branch (memory
+# tools are always available inside a skill — no allow-list entry needed).
+#
+# The prompt below is deliberately terse — it is injected into the system
+# prompt EVERY turn the skill runs. The rationale for its hard rules lives
+# here in comments (never injected); do not move it back into the prompt,
+# and do not "simplify" the rules away — each encodes a real failure:
+# - NEVER stash before the merge: ten orphan stashes accumulated by
+#   2026-08-24, every one `.coding/` bookkeeping this skill had dirtied by
+#   writing its own state into stack.json. The pre-merge commit covers it.
+# - Post-merge verification needs BOTH builds: `npm run build` (catches
+#   TS-only breaks, e.g. a Record<...> map missing a newly added tab key)
+#   and `cd src-tauri && cargo build` (compiles the bin crate, catching
+#   E0425/E0027 from renames or new struct/enum fields that the root
+#   cargo build/test never sees). Post-merge breaks shipped repeatedly
+#   before this rule existed.
+# - Memory convergence after the merge is automatic: the index re-derives
+#   from the merged files at the next project open (in-session shortcut:
+#   Settings → Memory → "Rebuild index from files"). Never hand-edit the DB.
+# - Topology (one wt/* working branch per agent directory → protected main)
+#   and the always-on approval gate for git merge/push (Tool::never_auto_for,
+#   even in Autonomous mode) are documented in agent.md — not repeated in
+#   the prompt. The old `develop` integration tier was removed 2026-08-24.
+
+name = "merge_to_main"
+available_in = ["complete", "planning"]
+target_state = "planning"
+tools = [
+  "file_read",
+  "file_edit",
+  "file_write",
+  "file_append",
+  "shell",
+  "search",
+  "git",
+  "skill_end",
+  "abandon_skill",
+]
+prompt = """\
+Merge the current working branch into main and clean up. Steps:
+1. Check `git status`; commit ALL uncommitted work on the current branch with a clear message, including `.coding/` (plans, knowledge, reviews, backlog.jsonl must land in the merge). NEVER stash — a stash here is never popped.
+2. `git checkout main` → `git merge --no-ff <branch>` (main receives only these merge commits, never a direct one). Conflicts: resolve with file_edit, then `git add` + `git commit`. `.coding/backlog.jsonl` carries git's union merge driver (concurrent adds concatenate); the rest of `.coding/` is plain text.
+3. VERIFY THE MERGED TREE BUILDS before cleanup — branch verification never compiles the src-tauri bin crate. Run BOTH `npm run build` (frontend tsc + vite) AND `cd src-tauri && cargo build` (bin crate). On failure: fix with file_edit, re-run both until green.
+4. Merge commit in main AND both builds green → delete the merged branch (`git branch -d <branch>`).
+5. Supersede stale branch-status memories (memory tools work inside a skill even though absent from the allow-list): memory_recall the branch name and its pre-merge tip commit, memory_list with prefix "SHIPPED" (finish digests carry an unmerged-branch hint), and working-tier "ACTIVE:"/"STEP MARKER:" crash markers citing the branch or its plan. Supersede each stale match with a short successor recording "MERGED into main at <merge commit sha> (`git rev-parse main`) on <date>" — never records about other branches or genuinely unmerged work; skip cleanly when nothing matches. The memory index re-derives from the files automatically — never hand-edit or re-derive the DB.
+6. skill_end → Planning. Unresolvable conflicts → abandon_skill (roll back to the pre-skill state). Optional: `git push` via the git tool (approval-gated).\
+"""

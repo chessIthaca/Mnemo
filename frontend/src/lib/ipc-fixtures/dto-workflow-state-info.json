@@ -1,0 +1,22 @@
+{
+  "depth": 1,
+  "parents": [],
+  "plan": {
+    "context": "Context notes here.",
+    "goal": "Add the thing.",
+    "steps": [
+      {
+        "done": false,
+        "index": 0,
+        "text": "Step one"
+      },
+      {
+        "done": false,
+        "index": 1,
+        "text": "Step two"
+      }
+    ],
+    "title": "Implement feature X"
+  },
+  "state": "executing"
+}

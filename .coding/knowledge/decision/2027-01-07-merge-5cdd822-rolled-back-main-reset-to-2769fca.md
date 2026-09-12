@@ -1,0 +1,6 @@
++++
+title = "merge 5cdd822 rolled back — main reset to 2769fca"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-10, user): merge 5cdd822 rolled back — "the merge should not have happened." The merge carried TWO plans' work from the shared wt/agenticcoding branch: the ABANDONED plan 833fa2fc reasoning_effort allow-list work (0012714/67328a3 — abandoned at user request during review; broke GLM per user report) AND the plan 7bb9a608 sentinel fix (942bc44) which failed live verification (DeepSeek still mirrored the bracket-form footer). Execution: main + wt/agenticcoding reset --hard to the merge's first parent 2769fca (Anthropic conversation-history caching); origin/main fast-forwarded d71f613..2769fca (no force needed); cargo test green at 2769fca (2254+16 passed, 0 failed); backlog 86fec233 re-flipped to failed (the reset had reverted its committed status flip). Stays on main: everything ≤2769fca (GLM stop-boundaries e20b1df, 429-fallback e0ac5dd, Anthropic caching 2769fca). Re-opens: the DeepSeek sentinel-mirror bug (fallback ladder in the BUG record), the reasoning-leak BUG 5 (backlog 0d4f54e3, stream-level ThinkTagFilter heuristic), and the reasoning_effort allow-list misalignment (backlog 86fec233). Recovery: git reflog → 5cdd822 (~90 days); commits 0012714/67328a3/942bc44/09f3ed9/5cdd822 reflog-only; merge-added knowledge files removed by the reset.

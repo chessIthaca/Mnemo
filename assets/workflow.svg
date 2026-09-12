@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" role="img" aria-labelledby="wf-title wf-desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title id="wf-title">The Mnemo workflow state machine</title>
+  <desc id="wf-desc">Four states — Planning, Executing, Reviewing, Complete — connected by create_plan, step completion, and the review gate, with back-edges for reviewer findings and abandoning a plan.</desc>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0891b2"/>
+    </marker>
+    <marker id="arrow-dim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <!-- state boxes -->
+  <g>
+    <rect x="30" y="60" width="170" height="64" rx="10" fill="rgba(8,145,178,0.10)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="115" y="88" text-anchor="middle" font-size="16" font-weight="700" fill="#0e7490">Planning</text>
+    <text x="115" y="108" text-anchor="middle" font-size="11" fill="#64748b">read-only · plan required</text>
+
+    <rect x="275" y="60" width="170" height="64" rx="10" fill="rgba(8,145,178,0.10)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="360" y="88" text-anchor="middle" font-size="16" font-weight="700" fill="#0e7490">Executing</text>
+    <text x="360" y="108" text-anchor="middle" font-size="11" fill="#64748b">all tools · one step at a time</text>
+
+    <rect x="520" y="60" width="170" height="64" rx="10" fill="rgba(8,145,178,0.10)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="605" y="88" text-anchor="middle" font-size="16" font-weight="700" fill="#0e7490">Reviewing</text>
+    <text x="605" y="108" text-anchor="middle" font-size="11" fill="#64748b">test → review → fix → commit</text>
+
+    <rect x="765" y="60" width="170" height="64" rx="10" fill="rgba(8,145,178,0.10)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="850" y="88" text-anchor="middle" font-size="16" font-weight="700" fill="#0e7490">Complete</text>
+    <text x="850" y="108" text-anchor="middle" font-size="11" fill="#64748b">read-only · next plan</text>
+  </g>
+
+  <!-- forward edges -->
+  <g stroke="#0891b2" stroke-width="1.5" fill="none">
+    <line x1="202" y1="92" x2="270" y2="92" marker-end="url(#arrow)"/>
+    <line x1="447" y1="92" x2="515" y2="92" marker-end="url(#arrow)"/>
+    <line x1="692" y1="92" x2="760" y2="92" marker-end="url(#arrow)"/>
+  </g>
+  <g font-size="12" fill="#64748b" text-anchor="middle">
+    <text x="236" y="82">create_plan</text>
+    <text x="481" y="82">all steps done</text>
+    <text x="726" y="82">finish</text>
+  </g>
+
+  <!-- back edge: Reviewing → Executing (findings) -->
+  <path d="M 605 124 V 168 H 360 V 130" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow-dim)"/>
+  <text x="482" y="162" text-anchor="middle" font-size="12" fill="#64748b">review findings → fix every one</text>
+
+  <!-- back edge: Executing → Planning (abandon) -->
+  <path d="M 300 124 V 216 H 115 V 130" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow-dim)"/>
+  <text x="207" y="210" text-anchor="middle" font-size="12" fill="#64748b">abandon_plan</text>
+
+  <!-- note above Executing -->
+  <text x="360" y="36" text-anchor="middle" font-size="12" font-style="italic" fill="#64748b">sub-plans push/pop · skills overlay the active plan</text>
+
+  <!-- note beside Complete -->
+  <text x="850" y="152" text-anchor="middle" font-size="11" fill="#64748b">research plans skip review</text>
+
+  <!-- reviewer callout -->
+  <line x1="670" y1="124" x2="670" y2="252" stroke="#94a3b8" stroke-width="1" stroke-dasharray="3 3"/>
+  <rect x="480" y="252" width="280" height="56" rx="8" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="620" y="274" text-anchor="middle" font-size="12" font-weight="600" fill="#475569">reviewer subagent (read-only)</text>
+  <text x="620" y="292" text-anchor="middle" font-size="11" fill="#64748b">unskippable for implementation plans</text>
+</svg>

@@ -1,0 +1,183 @@
+# Safety rules — auto-approve matching tool calls without prompting.
+#
+# Each rule has a `tool` name and a `pattern`. For `literal` rules (the
+# default when `kind` is omitted), `pattern` is a regex matched against the
+# tool call's signature ("<tool>:<key_argument>"). For `command_class` rules
+# (shell-only), `pattern` is a normalized safety class: the command is
+# classified into its primary operation (ignoring cosmetic output filtering
+# like Select-String patterns and redirections), and any call with the same
+# class is auto-approved. Chained (`&&`, `;`) or unknown commands classify to
+# nothing and always prompt.
+#
+# Examples:
+#   [[rule]]
+#   tool = "file_write"
+#   pattern = "^file_write:src/.*\.rs$"   # all Rust file writes (literal)
+#
+#   [[rule]]
+#   tool = "shell"
+#   kind = "command_class"
+#   pattern = "cargo test"                # any `cargo test ...` variant
+
+[[rule]]
+tool = "shell"
+pattern = "cargo test"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cargo build"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cargo check"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;cargo test"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;npm run build"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;npx tsc"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;npx vite build"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "git diff"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "git branch"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "git log"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "Get-ChildItem"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "Get-Location"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "rustc;cargo"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "git branch;git log"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "Get-Location;Get-ChildItem"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;npx eslint"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "rustc"
+kind = "command_class"
+
+[[rule]]
+tool = "spawn_agent"
+pattern = "^spawn_agent:$"
+
+[[rule]]
+tool = "git"
+pattern = "^git:merge$"
+
+[[rule]]
+tool = "shell"
+pattern = "Get-ChildItem;Get-ChildItem;Get-ChildItem;Get-ChildItem"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "Get-ChildItem;Get-ChildItem"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "cd;npm test"
+kind = "command_class"
+
+[[rule]]
+tool = "git"
+pattern = "^git:"
+
+[[rule]]
+tool = "shell"
+pattern = '^shell:Get\-ChildItem \.coding\\reviews\\ \-Filter "\*stats\-model\*" \| Select\-Object \-ExpandProperty Name; if \(\-not \(Test\-Path \.coding\\reviews\\\*stats\-model\*\)\) \{ Get\-ChildItem \.coding\\reviews\\ \| Sort\-Object LastWriteTime \-Descending \| Select\-Object \-First 2 \-ExpandProperty Name \}$'
+
+[[rule]]
+tool = "shell"
+pattern = "cd;cargo build"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "npm test"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = '^shell:Get\-ChildItem \.coding/reviews \-Filter \*\.md \| Sort\-Object LastWriteTime \-Descending \| Select\-Object \-First 5 Name, LastWriteTime \| Format\-Table \-AutoSize$'
+
+[[rule]]
+tool = "shell"
+pattern = '^shell:Get\-ChildItem \.coding/reviews \-Filter \*\.md \| Sort\-Object LastWriteTime \-Descending \| Select\-Object \-First 3 Name, LastWriteTime \| Format\-Table \-AutoSize$'
+
+[[rule]]
+tool = "shell"
+pattern = "git status"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "npm run build"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "npx tsc;npx vitest"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "npx tsc"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = "npx vitest"
+kind = "command_class"
+
+[[rule]]
+tool = "shell"
+pattern = '''^shell:cargo test \-\-quiet > \$env:TEMP\\tauri\-test\.log 2>\&1; "tauri_exit=\$LASTEXITCODE"; Select\-String \-Path \$env:TEMP\\tauri\-test\.log \-Pattern 'test result\|error\\\[\|warning: unused\|FAILED' \| Select\-Object \-First 8$'''

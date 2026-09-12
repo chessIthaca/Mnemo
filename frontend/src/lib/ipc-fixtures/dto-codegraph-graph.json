@@ -1,0 +1,19 @@
+{
+  "edges": [
+    {
+      "from_id": "src/main.rs::main::1",
+      "kind": "calls",
+      "to_id": "src/lib.rs::helper::12"
+    }
+  ],
+  "nodes": [
+    {
+      "end_line": 30,
+      "file": "src/lib.rs",
+      "id": "src/lib.rs::helper::12",
+      "kind": "function",
+      "name": "helper",
+      "start_line": 12
+    }
+  ]
+}

@@ -1,0 +1,7 @@
++++
+title = "backlog inline editor couldn't edit images (text-only save passed item.images unchanged)"
+created = "2026-08-28"
+status = "superseded"
++++
+
+FIXED (2026-09-11, plan 952aa10b, commits 3fb2094 + 64927d0 on wt/agenticcoder, NOT yet merged to main). User request (backlog item cb04ddea): "For items in the backlog I can't edit the images or add new screenshots". Root cause: the per-card inline editor in frontend/src/components/views/BacklogView.tsx (BacklogItemCard) was text-only — handleSaveEdit called backlogEdit(item.id, editText, item.images), passing the ORIGINAL images unchanged, and the edit branch had no thumbnails/remove/paste/drop UI (image attach existed only in BacklogInput, the new-item box). Backend already supported it: BacklogStore::edit (src/backlog.rs:300) + backlog_edit IPC persist text+images. Fix (frontend-only): editImages state synced from item.images when not editing; removable thumbnail strip + paste/drop in the edit branch; save passes editImages; save enabled when text OR images present (image-only valid); display thumbnails gated on !editing (review finding — single strip while editing). Regression: 6 source-contract tests in BacklogView.test.ts ("BacklogView inline editor image editing" describe). Review: round-1 FINDINGS (1 low) fixed; round-2 PASS (.coding/reviews/2026-09-11-backlog-edit-images-final-review.md). Tests: vitest 662/662, cargo test 1566 passed, tsc+vite clean.

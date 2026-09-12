@@ -1,0 +1,6 @@
++++
+title = "LOW 5 appendStreamingText concat — profiled, not worth it (0.556 ms worst flush = 3.3% of frame budget at the 128 KB cap)"
+created = "2027-01-07"
++++
+
+Mem-perf review LOW 5 (appendStreamingText per-flush string concat) was profiled and closed as NOT WORTH IT — no code change (2027-01-07, plan 2abe62d3). Pre-registered gate: implement only if worst per-flush string cost at the 128 KB SANE cap (SANE_MAX_OUTPUT_TOKENS = 32K tokens) exceeds ~10% of the 16.7 ms frame budget AND array-chunks reduces it ≥5×. Measured (node v24.7.0 V8, frontend/bench/streaming-concat.bench.mjs): worst flush 0.556 ms = 3.3% of budget at 128 KB — gate does not fire. Key insight: the store-side `acc + chunk` is a V8 ConsString (rope) — O(1) alloc, whole-response store cost 0.026 ms; the review's "3-5 MB transient copying" is entirely the RENDER-side DOM text-node flatten, which any full-text display incurs. The pattern only matters at 512 KB (30% of a frame) = 4× beyond the output cap. RE-OPEN CONDITION: if SANE_MAX_OUTPUT_TOKENS rises ≥4×, re-run the benchmark before reconsidering. Full numbers + method: .coding/knowledge/2027-01-07-low5-streaming-concat-profile.md (bench script committed alongside).

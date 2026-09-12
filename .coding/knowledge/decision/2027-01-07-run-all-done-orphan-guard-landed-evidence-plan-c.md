@@ -1,0 +1,6 @@
++++
+title = "run-all done-orphan guard — landed evidence = plan complete + commits after checkpoint (6c6966b9)"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-07, plan 5b988455, commits fcc1010..3a3f97f on wt/agenticcoding, backlog 6c6966b9): the run-all done-orphan guard — orphaned InFlight items whose work already landed auto-resolve Done at the main-exit drain / run-start adoption sweep instead of requeueing for duplicate re-dispatch. Landed evidence = plan file all steps checked AND ≥1 commit after the pre-item checkpoint sha (note head); anything unverifiable requeues (safe default). Rationale: (1) "any commit after the checkpoint", NOT "commits referencing the item id" — agent commits don't reliably carry the id and commit_success is a no-op on a clean tree (exactly the died-after-commit case); during an item's flight its session is the only committer. (2) No separate "work landed" marker — the death window sits between the agent's own commit and its finish call, with no harness-controlled point inside it; the commit anchored by the per-item checkpoint IS the marker. (3) The git check never runs under the backlog store lock; ownership re-verified after the unlocked window. Regression: drain_run_all_on_main_exit_consults_landed_evidence + adopt_orphaned_in_flight_consults_landed_evidence (source contracts, run_all.rs tests).

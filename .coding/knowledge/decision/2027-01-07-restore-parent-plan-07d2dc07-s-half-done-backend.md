@@ -1,0 +1,6 @@
++++
+title = "restore parent plan 07d2dc07's half-done backend; named() removed pending step-2 test"
+created = "2027-01-07"
++++
+
+The per-endpoint tok/s plan (07d2dc07, .coding/plans/07d2dc07.md) had its step-1/2 backend work left in the working tree half-done by an earlier session: endpoint on RequestStats (src/memory/types.rs), schema column + legacy-DB migration (src/memory/schema.rs), INSERT (src/memory/mod.rs), turn.rs recording provider_name at the Usage event, and MockProvider's name field — but a mangled bulk edit had eaten the field names + indentation of 20 MockProvider initializer sites in src/agent/tests.rs, and the named() builder was dead code. The webfetch session (plan 22001355) chose to RESTORE rather than revert: all 20 sites repaired (tools_phases:/name: restored, proper indentation), endpoint: None added to the memory tests' record() helper, and the dead named() builder REMOVED (deny(warnings) forbids keeping it) — parent step 2 must re-add named() together with the run_turn_records_request_stats_on_usage extension (asserting the endpoint dimension; the per_model[0].endpoint assertion needs step 3's ModelBreakdown.endpoint). Full matrix green after restoration: root cargo test 2042+16 passed, src-tauri 233+4 passed, frontend vitest 1007 + tsc clean.

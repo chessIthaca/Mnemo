@@ -1,0 +1,6 @@
++++
+title = "MCP per-server trust is approval-only; health UX = lazy idle expiry + status map"
+created = "2026-08-29"
++++
+
+DECISION (2026-02-13, plan 5a1eb5b1, commit a1775e5 wt/agenticcoder): MCP per-server trust (`trusted = true` in mcp.toml / Settings checkbox) is APPROVAL-ONLY — McpTool::safety() returns AutoRun for trusted servers (skips the per-call approval prompt), but the ToolFilter Planning+Complete arms exclude `mcp__`-prefixed names from the AutoRun visibility arm, so a trusted server's tools are NEVER visible in read-only states (plan-first gates never widen; research arm already excludes mcp__). Implemented via safety() rather than auto-managing safety_rules (rules are user-owned in safety.toml — avoiding two sources of truth). Companion: `idle_timeout_secs` enforces LAZY idle expiry (drop + reconnect in the next ensure(), a counted restart); ServerStatus (connected/tool_count/last_error/restarts) feeds IPC mcp_status + Settings status lines; private ever_connected flag distinguishes first-connect-after-failed-attempts (NOT a restart) from re-establishing a server that ran (counts); replace_servers clears connections AND status (a save invalidates both). Detail: PLAN.md MCP subsection; review .coding/reviews/2026-02-13-trust-health-review-2.md (PASS).

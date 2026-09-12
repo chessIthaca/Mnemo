@@ -1,0 +1,6 @@
++++
+title = "trace ring mirror erases diagnostics history; cancels unpersisted (F3)"
+created = "2027-01-11"
++++
+
+BUG: trace diagnostics erased by the ring mirror — no persistent cancel record (F3, plan e06a76d5, backlog 20bd12c5). Symptom: the failure window is unrecoverable within minutes — .coding/logs/traces.jsonl mirrors the bounded 32-record ring (write_records_to_file rewrites the file from the ring snapshot per batch; over-cap fresh-starts drop every row not in the current batch), so one busy turn (~25-30+ requests) erases the previous turn's records; user cancels (D1-stamped cancelled in-ring) rotate out too, and D1 deliberately removed their provider-errors row. Root cause: the trace file is a live MIRROR of the ring, not a log. Fix: (a) dedicated always-on .coding/logs/cancels.jsonl — one compact summary line appended at stamping time (LlmTraceLog::cancelled); (b) append-only .coding/logs/traces-history.jsonl terminal-record archive (gated on log_enabled like the mirror), rotated at HISTORY_ROTATE_BYTES=64 MiB keeping the 4 newest archives. Regression tests: cancelled_request_persists_to_cancels_log, terminal_records_archive_to_history_beyond_the_ring, history_file_rotates_and_prunes_archives. Context: .coding/knowledge/bug/2027-01-07-deepseek-hello-turn-failure-fresh-eyes-analysis.md (F3).

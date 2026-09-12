@@ -1,0 +1,39 @@
+## Verdict: FINDINGS (0 high, 1 low)
+
+Summary: The change is correct and well-scoped. The `str::from_utf8` + `contains` scan is semantically identical to the old byte scan (ASCII needle, UTF-8 self-synchronization, byte-scan fallback), the re-parse cap preserves every existing invariant (`matched` stays truthful, `reparsed` caps at exactly 16, `capped` is set only when a match is actually skipped, and the cap can never produce `reparsed == 0` when `matched > 0`), `reindex_stale_files` and the pre-existing regression test are untouched vs HEAD, and the gate's other error paths are byte-identical. One LOW doc-sync finding: the method's own doc comment still promises an unconditional re-parse of every matching file, which the cap now falsifies.
+
+---
+
+### LOW-1 — `reindex_files_containing` doc comment still claims "re-parse + upsert unconditionally" for every match
+
+**Location:** `src/codegraph/mod.rs:585-592` (the method doc, sentence: *"walk the searchable files, and for each parseable source file whose bytes contain the needle, re-parse + upsert unconditionally (the [`Self::reindex_stale_files`] machinery: hash, containment guard, [`Self::reindex_one`])"*).
+
+**Problem:** This diff introduces `REPARSE_CAP` — matches beyond the 16th successful re-parse are now counted but NOT re-parsed (`capped: true`). The behavior is correctly documented one screen up (`ReindexOutcome::capped` field doc :111-114 and the `REPARSE_CAP` const doc :118-124), but the method's own behavior sentence still over-claims that *every* file whose bytes contain the needle is re-parsed. A reader of the method doc alone would wrongly conclude the escalation's refresh is complete, which matters because the gate's absence-verdict reasoning depends on exactly this guarantee. Per the project's documentation-sync rule, a behavior change that leaves its primary doc comment stale is an incomplete change.
+
+**Suggested fix (doc-only, one clause):** amend the sentence to e.g. *"…whose bytes contain the needle, re-parse + upsert unconditionally up to [`REPARSE_CAP`] — matches beyond the cap are counted but not re-parsed ([`ReindexOutcome::capped`])…"*, and optionally extend the "Returns the outcome" sentence with one clause noting `capped` flags the partial refresh.
+
+Everything else is documentation-complete: the new field/const docs match the code, and a repo-wide `*.md` search confirms README.md and PLAN.md make no claims about `reindex_files_containing` (only `.coding/` bookkeeping mentions it — historical records, correctly left as-is).
+
+---
+
+### Verified correct (no findings)
+
+**(a) Scan replacement is semantically identical.** `src/codegraph/mod.rs:643-646`. For valid UTF-8, `source.contains(needle)` ≡ the old `bytes.windows(needle.len()).any(...)` : the needle is an ASCII identifier (all bytes < 0x80), UTF-8 continuation bytes are ≥ 0x80 and lead bytes ≥ 0xC0, so an ASCII byte sequence inside valid UTF-8 can only occur as itself — no false positives or negatives either way. For invalid UTF-8 the fallback IS the original byte scan, verbatim. The empty-needle early return (:601-607) still guards the `windows(0)` panic in the fallback (needle.len() ≥ 1 is guaranteed at that point). `str::contains` delegates to `find` (Two-Way) — the comment's performance claim is accurate.
+
+**(b) Cap semantics.** `matched += 1` at :655 precedes every skip (containment guard :659-666, cap :672-675, re-parse failure :684), and the loop continues past the cap, so `matched` stays truthful. `reparsed` increments only on `reindex_one` Ok (:681) and the cap check precedes it, so `reparsed ≤ 16`, and once it reaches 16 every subsequent match takes the skip branch — so `capped == true ⟺ at least one match was skipped` (the branch sets the flag and continues atomically), which also implies `reparsed == 16` exactly. A re-parse *failure* (not a cap skip) leaves `capped == false` — correct, since the failure case is already covered by the `matched > reparsed` inconclusive semantics.
+
+**(c) Existing invariants hold.** `matched > 0 && reparsed == 0` still means inconclusive-refresh: with `REPARSE_CAP = 16` the cap can never produce `reparsed == 0` (the first 16 matches always attempt `reindex_one`); only store-write failures can, exactly as before. The gate's three-way split (plan.rs: matched==0 → wrong-test-name :1471-1483; reparsed==0 → inconclusive :1484-1500; else → not-found :1502-1518) is preserved, with the third path now optionally annotated.
+
+**(d) Untouched code confirmed vs HEAD.** The full `git diff HEAD` hunks in mod.rs fall at old lines 108-115, 588-593, 599-604, 617-626, 640-645, 654-660, 850-855. `reindex_stale_files` spans old ~457-547 (current :471-561) — no hunk inside it; its tail (:540-575) shows the unchanged refresh/prune pattern. The regression test `reindex_files_containing_reparses_despite_fresh_meta` (current :844-888, old :746-790) sits in the gap between hunks — body unchanged (still asserts `matched == 1`, `reparsed == 1`, and the resolve round-trip; no `capped` assertion, which is fine). The earlier-version-edit-in-the-wrong-function risk from the spawn brief is clean.
+
+**(e) Gate error paths otherwise byte-identical.** plan.rs: the matched==0 and reparsed==0 messages are untouched; the third path interpolates `String::new()` when not capped, reproducing the old message byte-for-byte; when capped, the `\` line continuations strip the newline + leading indentation, so the note renders as a clean single-spaced sentence ("…containing the name (re-parse budget capped — 16 of 20 matching file(s) re-parsed; the absence verdict is inconclusive for the rest) — the verify step…"). The `notes.push` (:1520-1524) and the `None` (escalation-failed) arm are untouched. The note's numbers are accurate (`reparsed` successful of `matched` total).
+
+**(f) New test is sound.** `reindex_files_containing_caps_its_reparse_budget` (:890-920): 20 root-level `.rs` files each containing the needle; asserts all three outcome fields with distinct messages. It exercises the changed path and fails without the fix (no cap → `reparsed == 20`; a broken cap → wrong `reparsed`/`capped`). `walk_searchable` picks up root-level source files (same pattern as the pre-existing fixture), and the assertion is order-independent (all 20 match, so exactly the first 16 re-parse regardless of walk order).
+
+**(g) Multi-platform neutrality.** Pure `std` logic (`str::from_utf8`, `str::contains`, `slice::windows`) — no paths, no `cfg(windows)`, no platform APIs, no shell syntax. ✅
+
+**(h) Security.** No new attack surface: the cap check runs *after* the containment guard, so an out-of-root match is still skipped before any cap logic (it counts toward `matched` only — pre-existing, documented behavior at :650-654). The fallback scan performs no new reads. The gate message interpolates only counters. ✅
+
+**(i) Build/warning analysis.** Under `#![deny(warnings)]`: `REPARSE_CAP` is used (function + test), `capped` is read (gate + test), no new imports, the derive list remains valid, and both `ReindexOutcome` construction sites are updated (the graph confirms the type is named only in mod.rs; the gate accesses fields via the `outcome` binding). A missing field anywhere would be a hard compile error, and the reported test run (mnemo lib 2150+16 passed / 0 failed, including the unchanged regression test and the new cap test) proves the crate compiles warning-free. I have no shell tool as a reviewer, so I did not independently re-run the suite — no compile or warning risks found by inspection.
+
+**(j) Bookkeeping.** The `.coding/backlog.jsonl` change is the item's own status flip (pending → in_flight with plan_id/plan_title) — expected. The untracked `.coding/plans/5d0d9e4e.md` is the plan document. Neither affects code.

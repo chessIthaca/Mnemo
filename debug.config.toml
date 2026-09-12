@@ -1,0 +1,59 @@
+# debug.config.toml — debug-oriented sample configuration for Mnemo.
+#
+# Global config lives in `~/.mnemo/`. To use this for a debugging session:
+#   Copy this file to  %USERPROFILE%\.mnemo\config.toml  (Windows)
+#   or                 ~/.mnemo/config.toml               (macOS)
+#   (or merge the sections into an existing config.toml).
+#
+# Every key below matches the serde schema in src/config/general.rs, so this
+# file parses with `toml::from_str` — `Config::load()` will not reject it.
+# All sections are optional (#[serde(default)]); only the keys you set
+# override defaults.
+
+[general]
+# Default provider — must match an [[endpoint]] name in endpoints.toml.
+default_provider = "ollama-local"
+# Model id served at that endpoint.
+default_model = "qwen2.5-coder:7b"
+# SafetyMode, kebab-case:
+#   approve-each-action | auto-read-approve-writes | auto-approve-project | autonomous
+# Debugging hint: use a permissive mode so iterations don't stall on prompts.
+safety = "auto-read-approve-writes"
+
+# Optional vision fallback (image-to-text) when the main LLM is not multimodal.
+# [general.vision_model]
+# endpoint = "ollama-local"
+# model = "qwen2.5-vl:7b"
+
+# Optional embedding model for memory recall — an OpenAI-compatible
+# /v1/embeddings endpoint (Ollama, OpenAI, vLLM, LM Studio). When set, recall
+# ranks by genuine semantic similarity (with a zero-vector fallback if the
+# service is down, so recall never fails). When unset, the store uses the
+# built-in deterministic HashEmbedder (offline, keyword-overlap only).
+# Local Ollama endpoints are auto-started + the model auto-pulled on startup.
+[general.embedding_model]
+endpoint = "ollama-local"
+model = "nomic-embed-text"
+
+[context]
+# Summarize earlier than default (0.5) to exercise the context-management
+# code path during a long debugging session.
+summarize_at_fill_rate = 0.3
+
+[ui]
+theme = "dark"
+show_token_usage = true
+
+# [shell_filter]
+# Command-aware filtering of shell tool output before it reaches the
+# transcript. Defaults to enabled with no overrides — known commands
+# (cargo build/test, npm test/build, git status) are filtered out of the box;
+# error-marked lines are never dropped and the raw output stays in the
+# Output tab.
+# enabled = true
+#
+# [[shell_filter.override]]
+# command = "^cargo"              # first matching regex wins
+# drop = ["^\\s*Compiling"]       # remove lines matching these regexes
+# keep = ["Compiling my-crate"]   # always keep these (wins over drop)
+# disable_builtin = false         # true = generic fallback for this command

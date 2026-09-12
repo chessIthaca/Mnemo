@@ -1,0 +1,6 @@
++++
+title = "bc235340 skip-load_latest for subagents — superseded by WorkflowState::Subagent, closed done"
+created = "2026-12-31"
++++
+
+Backlog bc235340 ("subagents must not inherit the main plan's workflow state — skip load_latest() for parented subagents", root-cause hardening behind the !is_subagent auto-continue gate, plan 75deaec0 follow-up) was verified ALREADY SATISFIED and closed done without a plan. Shipped mechanism (plan 3fb064c4, commits 5f395f1+590afc2, superseding backlog c5ded15d): the spawn path stamps dedicated WorkflowState::Subagent (src-tauri/src/ipc/spawn.rs:155 → enter_subagent_state, src/workflow/mod.rs:284) over whatever load_latest() derived in build_inner (src/agent/factory.rs:617); the plan stack stays loaded as a READ-ONLY mirror (current_plan for reviewers + UI staircase). workflow_expects_progress() is false for Subagent state (pinned by subagent_stamp_replaces_derived_state_keeps_mirror, src/agent/factory.rs:2122), so even a full !is_subagent gate regression (src/runtime/agent.rs:253, kept as belt-and-braces) cannot auto-continue a subagent — the task's success criterion. The literal skip-load_latest fix is REJECTED (round-3 review §6 of plan 75deaec0): it breaks current_plan for reviewers, silently changes state-based model selection, and empties subagent tabs. Do not implement it.

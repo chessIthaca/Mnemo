@@ -1,0 +1,16 @@
+{
+  "args": {
+    "new_string": "y",
+    "old_string": "x",
+    "path": "a.ts"
+  },
+  "kind": "approval_request",
+  "preview": {
+    "diff": "--- a\n+++ b",
+    "kind": "diff",
+    "path": "a.ts"
+  },
+  "tool_call_id": "call-1",
+  "tool_name": "file_edit",
+  "core_operation": false
+}

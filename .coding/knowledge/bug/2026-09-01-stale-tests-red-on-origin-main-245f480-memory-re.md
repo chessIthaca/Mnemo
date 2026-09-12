@@ -1,0 +1,8 @@
++++
+title = "stale tests red on origin/main 245f480 — memory recall + 429 harness deadlock"
+created = "2026-09-01"
++++
+
+BUG (found during plan 1c712c30 step 3, 2026-12-19): 5 tests red on origin/main 245f480 — pre-existing, exposed by the from-clean cargo test run.
+1) Three stale memory-recall tests in src/memory/tests.rs (recall_returns_empty_when_no_fts_match, recall_no_fts_match_returns_empty_no_full_scan, update_memory_roundtrips_and_keeps_fts_in_sync): written before plan cb1914b9 (merged 4e3f987) made FTS-miss recall fall through to a capped (200) semantic scan. Fix: tests updated to assert the fallback returns rows; roundtrip test now probes MemoryStore::fts_candidates_locked directly for the FTS-empty guarantee (returns FtsResult::NoMatches).
+2) Two 429-fallback tests in src/runtime/agent.rs (state_override_survives_429_fallback, default_path_429_fallback_does_not_pin): auto-continuation (2891c05, MAX_AUTO_CONTINUE=12, landed AFTER the tests) makes an Executing-state Stop reply drive up to 12 synthetic turns → (a) provider-call counts are no longer exactly 1 → assertion changed to >=1 (which provider serves the turn is still pinned exactly via frozen fallback counter); (b) REAL HARNESS DEADLOCK exposed: the chain's events overflow the bounded fanin mpsc::channel(64) after the test stops draining at turn 2's first Finished → agent blocks on send → handle.await hangs forever. Fix: spawn a drainer task (while fanin_rx.recv().await.is_some()) before handle.await. Symptom signature: test "has been running for over 60 seconds" + rust-lld permission-denied on the test exe (hung process holds it). Kill stale mnemo-* test processes from target\debug\deps before relinking.

@@ -1,0 +1,5 @@
+{
+  "default_model": "gpt-4o",
+  "default_provider": "openai",
+  "provider_swapped": true
+}

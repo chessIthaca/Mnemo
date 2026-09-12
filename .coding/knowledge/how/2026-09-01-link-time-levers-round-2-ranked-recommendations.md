@@ -1,0 +1,6 @@
++++
+title = "link-time levers round 2 — ranked recommendations (detail: .coding/knowledge/link-time-research.md)"
+created = "2026-09-01"
++++
+
+Link-time research round 2 (post-lld) — ranked recommendations, full detail in .coding/knowledge/link-time-research.md. Measured: warm loop already healthy (full cargo test 19.4s; app exe link 8.6s; lib incremental 3.5s); pain is full rebuilds (~33.8s full lib recompile + 6-7 binary links vs ~480MB PDB each) + 158GB target bloat (2649 rlibs/4-5 stale variants per crate, 392 PDBs, stale myharness_app relics) + Defender real-time ON. Ranked levers: (1) [profile.dev.package."*"] debug=false + [profile.test.package."*"] debug=false — deps lose debuginfo, workspace keeps line-tables; (2) Defender exclusions for target\, ~\.cargo, ~\.rustup (admin); (3) one-time cargo clean; (4) feature-gate chromiumoxide + fastembed/ort (biggest structural link-mass cut, ort/onnxruntime native lib dominates PDB); (5) merge 4 integration test bins into 1; (6) CGU tune (marginal). Gotchas: cargo build at workspace root links NOTHING (root-package default-members — app needs -p mnemo-app); mtime-only touches don't dirty cargo fingerprints; cargo Compiling lines are noise-filtered so "no-op" timings can hide rebuilds.

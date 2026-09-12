@@ -1,0 +1,6 @@
++++
+title = "single-dispatch steer requeues the item while its plan stays active"
+created = "2027-01-07"
++++
+
+Symptom: steering/interrupting a SINGLE-DISPATCHED backlog item mid-plan requeued it to Pending ("steered by the user, returned to queue") while its plan stayed active — item 0296d448 sat Pending with finished work (plan eda38891 complete, commits f4a2e6d..50969db). Root cause: handle_user_intervention's single-dispatch arm (src-tauri/src/ipc/run_all.rs) consumed the single_in_flight pointer via .take() and transitioned the item to Pending, blinding the completing turn's resolution (no pointer → no done-flip). Fix (plan cace17a6): the `BacklogStatus::InFlight if !from_run_all` arm KEEPS the item InFlight (annotated "kept in flight — the plan stays active, resume to continue") and RESTORES the consumed pointer check-and-set (`if slot.is_none()` — never clobbers a concurrent ▶ dispatch); the requeue arm narrows to `from_run_all && !interrupted_run_active` (drained run = genuinely dead, the queue is its only recovery). Regression test: intervention_keeps_a_single_dispatch_item_in_flight (src-tauri run_all tests, source-contract style). Contract: .coding/knowledge/spec/2027-01-07-backlog-item-status-plan-lifecycle-failed-means.md (2027-01-09 amendment).

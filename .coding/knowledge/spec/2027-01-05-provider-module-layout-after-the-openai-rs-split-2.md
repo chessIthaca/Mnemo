@@ -1,0 +1,9 @@
++++
+title = "provider module layout after the openai.rs split — MERGED into main (e20b1df)"
+supersedes = "2027-01-05-provider-module-layout-after-the-openai-rs-split"
+created = "2027-01-05"
++++
+
+MERGED into main at e20b1df (e20b1dfb6d022365485c5afb6eba61231fa025db) on 2027-01-05 (merge_to_main skill), branch wt/agenticcoding deleted (pre-merge tip ccc844d). Provider module layout after the openai.rs split (backlog 76efacba, plan 5ee62832, commits 523b99d/10884e1/d1e4897/f60fcc8/b9d7b8f): src/provider/openai.rs (config, client, LlmClient impl, complete() = prepare_request → open_stream → spawn_stream); openai/{request,sse,stream,guard,tests}.rs; src/provider/models.rs; sse_util.rs. Knowledge file: .coding/knowledge/spec/2027-01-05-provider-module-layout-after-the-openai-rs-split.md
+
+Amended 2027-01-07: 2027-01-10 amendment (plan 7c8d90cd, L3 request-rebuild perf fix): the chat-completions body builder moved to a pre-serialized String path — `OpenAiClient::build_request_body(messages, tools, tool_choice, omit_effort) -> Result<String>` in src/provider/openai/request.rs serializes each message exactly once into a Box<serde_json::value::RawValue> and splices them verbatim into the wire body (no intermediate Value tree, no reqwest .json() re-serialization). `build_request_json` remains in request.rs but is now a #[cfg(test)] lens (build + parse) used only by the request-body test suite; the send path (prepare_request/open_stream) ships the wire string via reqwest .body(), and the reasoning_effort 400-rejection retry rebuilds the body via the builder with omit_effort=true instead of editing a Value in place. A fingerprint-validated serialized-prefix cache (request::PrefixCache, single-slot Mutex on the client) reuses the stable prefix's serialized boxes across iterations; the estimate walk is skipped on hits (cached prefix char sum + fresh tail chars reproduce estimate_prompt_tokens exactly).

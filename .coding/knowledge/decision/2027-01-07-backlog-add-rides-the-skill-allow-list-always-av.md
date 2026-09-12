@@ -1,0 +1,6 @@
++++
+title = "backlog_add rides the Skill allow-list always-available set (66c65db9)"
+created = "2027-01-07"
++++
+
+DECISION (2027-01-07, plan 274af962, backlog 66c65db9, commit ef54d30): backlog_add joins backlog_status/backlog_list in the ToolFilter::Skill(allowed) always-available set (src/tool/mod.rs:505) — extending the 2026-12-30 reversal (record 07643ffe: backlog_add/backlog_status available in ALL workflow states) to skill allow-lists: a direct user request to queue an item must never be impossible mid-skill either (e.g. a run-all item invoking merge_to_main when the user steers to queue an item — the 2026-12-30 run-all incident's exact symptom: status+list present, add absent). The widening applies uniformly to interactive and run-all skill surfaces (the filter is state-derived with no run-all special-casing — the run-all dispatch is a plain Prompt, pinned by the run_all_dispatch_rides_the_main_agent_surface source-contract test); the interactive BASE surface is unchanged; the reviewer ROLE filter stays read-only (backlog_add NOT auto-granted there). Loop-prevention accepted: the concern (an agent queueing work for itself) is already accepted for every base state, and the tool's description says "Only add items the user actually asked to queue". Regression: backlog_add_visible_in_all_states (flipped Skill assertion, A/B-verified).

@@ -1,0 +1,6 @@
++++
+title = "long-session tool payloads — scope search globs, small batches (cache-miss floods + GLM empty-output stalls)"
+created = "2026-12-31"
++++
+
+In very long sessions, repo-wide regex searches (e.g. (?i)glm-5) pull raw .coding/logs JSONL lines + full backlog rows — 100+ matches, a huge fresh-suffix token flood. Observed in the GLM stop-boundary exploration session (backlog f322277c): (1) the next call's cache hit rate craters — new tool-result tokens are always misses, and the litellm proxy's prefix cache is size-limited (.coding/analysis/cache-hit-4-report.md), so long sessions cache only a bounded prefix; (2) the post-result continuation can emit NOTHING valid — the turn parks (no auto-continue in Complete state) until manual "c". Three consecutive empty turns in one session, two of them attempts to answer a question ABOUT the stalls. Mitigations: scope search globs to source dirs (src/**, *.toml, README) — never let a regex walk .coding/logs; prefer line-ranged reads over broad regex; keep tool batches small; keep replies short when context is huge — answers that echo the GLM boundary tag strings risk the stream guard cutting the turn (unverified which mechanism dominated; the trace finish_reason + generation_ms discriminates: fast Stop = guard cut, long ttft/stall = emission fragmentation).

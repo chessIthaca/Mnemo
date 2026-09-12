@@ -1,0 +1,52 @@
+# Deterministic line endings for the whole repo (backlog #48).
+#
+# `* text=auto eol=lf` — git auto-detects text files and checks them out with
+# LF endings on EVERY platform, overriding machine-global core.autocrlf
+# settings (the source of the endless "LF will be replaced by CRLF" warnings
+# on this Windows machine). LF is the canonical style: the agent file tools
+# pin new files to LF (src/tool/agent/file_write.rs / file_append.rs) and
+# file_edit matches any style, so a uniform LF working tree removes the
+# whole mixed-ending failure class.
+#
+# Binary files must never be touched by the eol/text machinery.
+* text=auto eol=lf
+
+# Images / media.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.bmp binary
+*.ico binary
+*.icns binary
+*.mp3 binary
+*.mp4 binary
+*.wav binary
+*.ogg binary
+*.avi binary
+*.mov binary
+
+# Fonts.
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+
+# Executables / libraries / debug symbols.
+*.exe binary
+*.dll binary
+*.pdb binary
+
+# SQLite databases under .coding/ (memory, codegraph) + WAL/SHM sidecars.
+*.db -text
+*.db-wal -text
+*.db-shm -text
+
+# The backlog is jsonl (one item per line, UUID ids): concurrent backlog_add
+# calls from multiple worktrees must merge by concatenation, never conflict.
+# The union driver keeps BOTH sides' lines on a conflict — the UUID ids make
+# the union collision-free (a duplicate id line would only occur if the same
+# item was edited on both sides, which the store tolerates on load).
+.coding/backlog.jsonl merge=union

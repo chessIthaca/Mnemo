@@ -1,0 +1,48 @@
+## Verdict: FINDINGS (0 high, 4 low)
+
+Review of all uncommitted changes on `wt/agenticcoding` for plan 4405d82d (backlog 77ff8f45) — bug_fixing create_plan persists caller steps as `## Detailed steps`. The core change is correct and well-tested; four low findings: one stale comment, one doc-sync gap (PLAN.md/README), one hardening recommendation (section injection via multi-line steps), and one factual error + pattern break in the budget dated notes.
+
+### Verified correct (evidence)
+
+1. **Round-trip** (plan_file.rs:280-303, 322-323; test `detailed_steps_roundtrip` at 619-637): parse accumulates raw lines with `\n` separators, `trim()` at both ends, empty→`None`; serialize writes `\n## Detailed steps\n{detail}\n` after the Steps checklist, before `## Bug`. Blank lines inside the body round-trip exactly; only leading/trailing blank lines normalize (benign — the render path never produces them, only a hand-edited file could). Old plans without the section parse to `None`.
+2. **Empty steps**: `args.steps.is_empty()` → no bullets → `detailed_steps = None` → no section, `detailed_step_count = 0` → no result mention. Non-bug kinds pass `None` — no section, no mention, `detailed_step_count` absent from the data JSON.
+3. **Skeleton still forced + locked**: the bug branch still assigns `BUG_FIXING_SKELETON`; `update_plan` (mod.rs:621-628) still refuses steps replacement AND append for BugFixing; the lock tests are untouched and still pass.
+4. **`update_plan`/`complete_step` preserve the section** (the risk I specifically checked): both mutate `frame.plan` in place (title/goal/context/regression_test/steps fields) and re-serialize — `detailed_steps` is never dropped. The mandatory verify-step `update_plan(regression_test)` call every bug plan makes cannot silently delete the section.
+5. **Resume footer** (prompt.rs): BUG only when `bug_symptom` is present (bug plans only); CONTEXT when non-empty (all kinds — matches the backlog wording "an in-flight plan", not just bug plans); `short_context_line` collapses whitespace and truncates via `chars().take(budget)` + `…` — char-safe, single-line. The detailed steps deliberately stay out of the tail (asserted by the test).
+6. **The read path exists — the crash-resumption contract is closed**: the sandbox guard (`is_protected_write_target`, sandbox.rs:189-234) blocks only WRITES to `.coding/plans/`; the agent's `read_files` has no protected-path check, and `current_plan` (plan.rs:1570-1595) reports the plan-file path (the F2 pointer). A fresh session: tail gist (BUG/CONTEXT) → `current_plan` → `read_files` the plan file → full Detailed steps. The simulated-resume test (`load_latest` → tail surfaces bug + context) covers the reload path.
+7. **Delegating wrapper**: `create_plan_with_kind` keeps its exact signature and delegates with `None`; the 23 existing call sites are untouched.
+8. **`#[serde(skip)]`**: the field is off the UI wire shape — no frontend impact; the UI reads plans via IPC serde, not by parsing the markdown.
+9. **Regression tests pin the defect**: `create_plan_bug_fixing_persists_detailed_steps_section` asserts the section + bullet form + result mention + `detailed_step_count` + skeleton still forced — all red before the fix (the section didn't exist and the result said nothing). `workflow_section_surfaces_bug_and_context_for_resume` was likewise red (no BUG/CONTEXT lines existed).
+10. **Filters/budgets**: `create_plan` rides Planning/Executing/ExecutingResearch/Complete; only Executing + ExecutingResearch needed raises (Planning/Complete had headroom — suites green). The raises are deliberate, dated, and the additions were trimmed before raising.
+
+### Findings
+
+**L1 (low) — Stale test comment: "provided steps are ignored"** — src/tool/workflow/plan.rs:1797-1798, in `create_plan_bug_fixing_forces_skeleton_and_persists_symptom`: "the 4-step skeleton is FORCED (provided steps are ignored) and the symptom is persisted." After this change the parenthetical is factually wrong — provided steps persist as `## Detailed steps` (that test's own input "my own step" now lands in the section). Fix: update the comment (optionally also assert the section there, though the new sibling test covers it).
+
+**L2 (low) — Doc-sync: PLAN.md + README.md bug-plan contract not updated** — PLAN.md:351-360 (the `bug_fixing` kind bullet — the canonical contract: locked skeleton, required `bug` param, regression-test gate, finish capture) and README.md:24 (the "Bugs get their own plan kind" feature bullet) still describe only the old behavior; a reader would conclude caller steps are discarded. The persistence (option B: separate immutable `## Detailed steps` section, the crash-resumption document) is a contract change that belongs in both. Fix: one clause each, e.g. "provided steps persist verbatim as the `## Detailed steps` section (the crash-resumption detail; immutable like the skeleton)".
+
+**L3 (low) — Section injection via multi-line detailed steps (hardening)** — src/tool/workflow/plan.rs (the bug branch's `detail` render). `StepInput::Text` passes through verbatim (embedded newlines preserved), and the section body is written verbatim. The parser switches sections on any line whose TRIMMED form starts with `## ` (and sets the title on `# `) — so a step containing e.g. "…the serialize() output looks like:\n## Steps\n- [x] 1. fake" would, on serialize→re-parse: truncate the Detailed steps section at the injected header and inject checklist items; `## Bug` would overwrite the symptom (parse keeps the last non-blank line); `## Regression test` would set the finish-gate field; `## Kind` + `research` would flip the kind (skipping review on completion); `# ` would overwrite the title. Severity assessment: LOW — the input is the calling agent's own steps (same trust level as the plan file; no privilege escalation: the agent can already create research plans directly, and an injected regression-test name still goes through finish's code-graph validation), and the class pre-exists for non-bug step text and context (both written verbatim). But the new section extends the unsanitized surface to bug-plan files (previously immune — steps were discarded), the codebase's own precedent guards the one-line fields (`collapse_whitespace` for symptom + regression_test, "section injection, review HIGH 2", with dedicated tests), and there is a realistic accidental trigger: a bug plan about this very codebase whose steps quote the plan-file format. Note the parser trims before matching, so indenting does not protect — a sanitize must alter the leading `#` itself. Fix: at render time, escape/prefix any line whose trimmed form starts with `#` (e.g. prefix `\`), plus a regression test (a step containing "\n## Bug\ninjected" must not corrupt the re-parsed plan).
+
+**L4 (low) — Budget dated notes: wrong id label + measured values omitted + thin headroom** — src/agent/factory.rs:1667-1681. (a) Both new notes cite "backlog 4405d82d" — that is the PLAN id; the backlog item is 77ff8f45 (the prior notes cite backlog item ids, e.g. "backlog 24e1c98e"). (b) Unlike both prior notes ("measures Executing at 24_507 chars"), the new ones omit the measured values (Executing 24_957, ExecutingResearch 21_543), so the next raiser has no baseline; "(~700 chars, trimmed to ~530)" also doesn't match the ceiling-to-ceiling deltas (450 / 443 bytes). (c) The resulting headroom (43 and 57 bytes) is far thinner than every prior raise (~290-380 bytes) — either record that as deliberate or widen to match the pattern. Fix: relabel to "plan 4405d82d" (or "backlog 77ff8f45") and record the measured values.
+
+### Design decisions — judged sound
+
+1. Separate `## Detailed steps` section (option B) over merging into the phases — correct: no lossy 6→4 mapping, skeleton lock untouched, file remains the complete resumption document. The read path (verified-correct #6) closes the loop.
+2. Delegating wrapper over a signature change — correct: 23 call sites untouched, the detail param is explicit at the one caller that needs it.
+3. Detailed steps immutable like the skeleton — consistent: `update_plan` never touches the field; the file is written once at creation. Verified the in-place mutation pattern preserves it across all rewrites.
+4. BUG (160) + CONTEXT (240) one-liners in the tail, full detail in the file — correct trade: the tail is paid per step bump; the budgets bound it; the test pins the truncation and the exclusion of the detail from the tail.
+5. Budget raises — deliberate, dated, trimmed first; only the note accuracy issues (L4).
+
+### Constitution checks
+
+- Documentation sync: findings L1 + L2.
+- Multi-platform neutrality: no platform-specific code in the diff; parser/serializer are pure string handling. PASS.
+- Doc comments on public functions: `create_plan_with_kind_and_detail` documented; `short_context_line` is private and documented anyway. PASS.
+- Warning-free build: green suites under `deny(warnings)` (per the task; no dead code/unused imports visible in the diff). PASS.
+- Regression tests: both new tests exercise the changed paths and were red before the fix. PASS.
+- Security: assessed in L3 (LOW); no other injection/exfiltration surface — the field never reaches the UI wire, the tail, or any shell/IPC boundary.
+
+### Notes for the main agent (not findings)
+
+- The plan's own step 4 (record the regression-test names via `update_plan regression_test`) is still open — required before `finish`; the BUG: memory is auto-captured at finish.
+- The `.coding/backlog.jsonl` change is the app's in_flight stamping (expected); `.coding/plans/4405d82d.md` is the plan file (untracked — commit it with the change).

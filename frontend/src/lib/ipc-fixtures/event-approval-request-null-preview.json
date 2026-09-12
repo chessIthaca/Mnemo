@@ -1,0 +1,8 @@
+{
+  "args": {},
+  "kind": "approval_request",
+  "preview": null,
+  "tool_call_id": "call-2",
+  "tool_name": "shell",
+  "core_operation": false
+}

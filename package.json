@@ -1,0 +1,17 @@
+{
+  "name": "mnemo",
+  "private": true,
+  "license": "MIT",
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "dev": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend"
+  },
+  "allowScripts": {
+    "esbuild": true
+  }
+}

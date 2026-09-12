@@ -1,0 +1,43 @@
+## Verdict: PASS
+
+Round-3 read-only verification of the LOW-3 documentation sync (commit dbc1367, HEAD of wt/agenticcoding, clean tree — `git diff HEAD` and `git status --short` both empty). **LOW-3 is actually resolved**: the knowledge file's Fix paragraph now states the OR'd window comparison verbatim and lists all four regression tests, and the derived memory row is synced to the same shape (stored title exact-matches the file, prefix-search-proven). dbc1367 changed nothing else (exactly the knowledge-file rewrite + the round-2 report), and every round-2 resolution still holds at HEAD. No new findings.
+
+## 1. LOW-3 resolution — verified
+
+### Knowledge file (.coding/knowledge/bug/2027-01-07-429-fallback-viability-compared-context-windows.md, 10 lines, at HEAD)
+
+- **OR'd window comparison — present verbatim.** Fix paragraph (line 10): "…viability = alt_window >= live + alt_cm.effective_summarize_at() (…) **OR alt_window >= the current window — the OR keeps every pre-fix acceptance at any fill rate** (with fill_rate > 0.5 the headroom bar alone sits below the incumbent's own operating band and would wrongly reject equal/larger-window alternates). Window comparison alone when live == 0." This matches the shipped code term for term — src/agent/loop_impl.rs:1735-1740: `alt_cm.max_tokens() >= live + alt_cm.effective_summarize_at() || alt_cm.max_tokens() >= cur_window`, else window-only when live == 0.
+- **All four regression tests listed.** Same paragraph: "Regression tests: the mixed-window failover test (fails pre-fix), the genuine-overflow reject test, the live=0 window-fallback unit test, and the high-fill-rate regression (verified red on the headroom-only rule)." These map 1:1 to the tests at HEAD: rate_limit_429_falls_back_to_smaller_window_alternate_when_live_conversation_fits (src/runtime/agent.rs:1794), rate_limit_429_rejects_alternate_when_live_conversation_genuinely_exceeds_it (:1925), try_429_fallback_viability_uses_live_count_with_window_fallback (:2055), and rate_limit_429_high_fill_rate_does_not_regress_window_viability (:2135) — the fourth test is now in the list, with its distinguishing property (verified red on the headroom-only rule).
+- **Pointers updated.** Symptom tail (line 6) now reads "Backlog a117e827; fixed in commit 739c68a on wt/agenticcoding (plan de1f874b)" (was: a pointer to the original full-review LOW-1), and the Fix paragraph carries the round-1 + round-2 review pointers. The root-cause paragraph (line 8) also dropped the now-stale line-number anchor (1701-1710).
+- **Naming note (observation, not a finding).** The fourth test is named descriptively ("the high-fill-rate regression…") rather than by its literal Rust symbol — the same style as the other three entries, and the same standard round-2 itself used when it counted the old file's equally descriptive three as "lists 3 of the 4". The reference is unambiguous (exactly one high-fill-rate regression test exists, at src/runtime/agent.rs:2135) and the symbols with file:line live in the pointed-to reviews. The LOW-3 failure mode — a future reader implementing "the fix" from the record and reintroducing the HIGH-1 regression — is closed: the record now prescribes the OR'd rule verbatim. (Optional one-word polish: spell out the symbol.)
+
+### Derived memory row (BUG: 429-fallback viability compared context windows, id 1e5f96b1-1bff-5980-ad92-cea77c75b1e9)
+
+- **Stored title synced — proven by prefix search.** A case-sensitive title starts-with search for "BUG: 429-fallback viability compared context windows, not the live conversation" returns exactly one record: id 1e5f96b1…, semantic tier, bug type, dated 2026-09-08. The stored title now exactly matches the knowledge file's `title` field ("429-fallback viability compared context windows, not the live conversation"). The pre-sync shape (the session-start auto-recall snapshot carried the title WITHOUT the ", not the live conversation" suffix, same record id) no longer exists — the sync landed on this record, updated in place; no duplicate or stale twin surfaces in any live search for this bug.
+- **Digest shape.** The row's digest is the file's current Symptom lead, auto-truncated to ~200 chars by the derived index (by design — the derived index truncates digests to stay compact); the Fix-paragraph detail cannot live in the compact digest and instead lives in the file the row points at (pointer-first: the file stays the truth) — and that file is verified synced above. A future memory_search for this bug returns the row → the file → the OR'd rule and all four regression tests.
+
+## 2. dbc1367 changed nothing else — verified
+
+`git show dbc1367` (full diff): exactly two files —
+
+1. `.coding/knowledge/bug/2027-01-07-429-fallback-viability-compared-context-windows.md` — the LOW-3 sync itself (three hunks: symptom pointer, root-cause paragraph, Fix paragraph), and
+2. `.coding/reviews/2026-09-08-429-fallback-live-token-count-review-round2.md` — new file, 64 lines, the round-2 report (its on-disk opening matches the committed content: "## Verdict: FINDINGS (0 high, 1 low)").
+
+No src/, no frontend/, no other files. Docs-only → the verified-green 739c68a test matrix (cargo test --workspace, 2479 passed / 0 failed, trusted per the task brief) is unaffected: no code path, test, or config changed between 739c68a and HEAD.
+
+## 3. Round-2 resolutions still hold at HEAD — verified
+
+- **HIGH-1 (OR'd viability rule)** — src/agent/loop_impl.rs:1728-1743 read verbatim at HEAD: `cur_window` hoisted (:1729-1733), `live` loaded (:1734), `live > 0` → headroom OR window (:1735-1738), `live == 0` → window-only (:1739-1740), `if !viable { return None; }` still precedes the sticky insert (:1741-1743). Identical to the shape round-2 verified; untouched by dbc1367 (no src/ files in its diff).
+- **Four regression tests** — all present at HEAD, untouched by dbc1367 by construction: (a) :1794 mixed-window failover; (b) :1925 genuine-overflow reject; (c) :2055 live=0 unit test (read in full — asserts `None` at live=0, stores 20k, expects `Some` with to_endpoint "primary": exactly round-2's description); (d) :2135 high-fill regression (read in full — `.with_fill_rate(0.75)` :2192, CM 128k :2185, alternate caps 200k :2169, ~60k prompt :2203; round-2's margins re-confirmed: headroom branch 60k + 150k = 210k > 200k rejects, the OR's window branch 200k ≥ 128k accepts, and 60k < 96k so no compaction interferes).
+- **LOW-1 (count-basis docs)** — field doc at src/agent/loop_impl.rs:104-115 (basis: messages + tools-schema overhead, EXCLUDING per-request scaffolding; headroom absorbs it; the alternate's preflight is the backstop; 0 = none recorded) and store-site comment at src/agent/turn.rs:316-325 (basis + absorption + backstop + Relaxed rationale) — both in place verbatim.
+- **LOW-2 (README clause)** — README.md:60: "…surfacing an actionable \"no alternate provider found\" error only when no other endpoint serves the model or none can hold the live conversation" — in the single 429 sentence.
+- **Change-set shape** — `git show --stat 739c68a`: 8 files (.coding/backlog.jsonl, the knowledge file, plan de1f874b, the round-1 report, README.md, src/agent/loop_impl.rs, src/agent/turn.rs, src/runtime/agent.rs); no frontend/ files in either commit, so the frontend is untouched throughout (no npm run needed). Both prior reports are on disk at HEAD (round-1: 60 lines, "## Verdict: FINDINGS (1 high, 2 low)"; round-2: 64 lines, "## Verdict: FINDINGS (0 high, 1 low)").
+
+## Non-finding observations
+
+1. The fourth regression test is referenced descriptively in the knowledge file rather than by its literal symbol (see §1) — unambiguous and consistent with the file's own style; optional polish only.
+2. The Fix paragraph's "Full detail:" sentence points at the knowledge file itself (self-referential; it mirrors the pointer text the derived memory row carries). Harmless — the substantive pointers are the two review files. Cosmetic; no action needed.
+
+## Bottom line
+
+LOW-3 is genuinely resolved: the durable BUG record (file + derived memory row) now describes the shipped OR'd viability rule — the exact sentence round-2 asked for — and counts all four regression tests including the high-fill-rate one; the memory row's title/gist/pointer are synced to the same file (prefix-search-proven, same record id, no stale twin). dbc1367 is exactly the knowledge-file sync plus the round-2 report — nothing else. Every round-1/round-2 resolution (HIGH-1 OR, LOW-1 basis docs, LOW-2 README clause, four regression tests, test doubles) still holds verbatim at HEAD dbc1367 on a clean tree. The 429-fallback live-token-count change set is fully clean: code, tests, docs, knowledge, and memory all tell the same story. PASS.

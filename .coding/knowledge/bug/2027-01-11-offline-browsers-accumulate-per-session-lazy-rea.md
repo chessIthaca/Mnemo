@@ -1,0 +1,12 @@
++++
+title = "Offline browsers accumulate per session — lazy reap + launch-only sweep"
+created = "2027-01-11"
++++
+
+Symptom (user report 2027-01-12, backlog 2ccf92b0): offline browsers accumulated throughout a session — a headless Chromium that went offline (process death or dropped CDP connection) was only cleaned up when the NEXT browser operation ran; if none came, the process + its `mnemo-browser-*` temp profile dir lingered until app exit. The profile sweep ran only at browser-launch time and only removed >1h-old dirs, so in-session orphans accumulated and a live browser's session never swept at all.
+
+Root cause: (L1) dead-browser detection was lazy — only `ensure_browser` (src/browser/mod.rs, called from `navigate`) checked `handler.is_finished()`; no background liveness check existed. (L2) `sweep_stale_profiles` ran only at launch time, >1h-aged, and could not distinguish a live long-running profile from an orphan (the 1h cutoff was the only cross-instance protection). (L3) `schedule_profile_removal` retried removal for only ~15s; dirs that outlived it (AV/crashpad locks) orphaned.
+
+Fix (plan bcf507c7, wt/agenticcoding): a watchdog task (spawned on first browser launch, `State.watchdog`, `Weak`-held so it exits when the manager drops) reaps a dead browser every 30s tick via the `reap_dead_browser` helper shared with `ensure_browser` — no subsequent operation needed. A process-wide `LIVE_PROFILES` registry + a `.mnemo-live` marker file inside each profile dir (touched every tick, backdated past the 15min MARKER_GRACE on retirement) make `sweep_orphan_profiles` age-independent for dead managers' dirs while never touching live profiles (this process's via the registry; another instance's via fresh marker mtime — any doubt keeps the dir, review LOW-1). The sweep runs at launch, every watchdog tick, and at app startup (main.rs setup). Also fixed: `ensure_webview`'s concurrent-winner path now aborts the loser's handler task (previously leaked the task + CDP WebSocket forever).
+
+Regression tests: `sweep_reaps_orphans_but_never_live_profiles` (src/browser/mod.rs, non-ignored — fails against the old sweep) and `watchdog_reaps_dead_browser_without_subsequent_operation` (#[ignore] integration, real headless Chromium — fails against the old lazy-only detection). Detail: .coding/plans/bcf507c7.md; review .coding/reviews/2026-09-11-offline-browser-reap-watchdog-review.md.

@@ -1,0 +1,6 @@
++++
+title = "Subagent state-transition gate = review-exit transitions only (backlog 569b5922, commit 264ba82)"
+created = "2026-12-30"
++++
+
+The dispatch-layer descendant gate (src/agent/dispatch.rs, commit 264ba82 on wt/agenticcoding, backlog 569b5922 / plan 593f4a4e) gates ONLY the phase-EXIT transitions while spawned subagents run: finish (Reviewing→Complete) always; complete_step only when the call would complete the ROOT plan (Workflow::completing_step_exits_executing — sub-plan completion pops to the parent and stays Executing, ungated). All other state-touching tools (non-final complete_step checklist ticks, update_plan, create_plan sub-plan pushes, abandon_plan escape hatch, skill_*) are deliberately ungated so parallel subagent work proceeds. No blocking/non-blocking spawn classification — blanket-at-exit is simpler and stricter where it counts. The step_index arg mirror in dispatch trims numeric strings to match the tool's StepNumber::parse. Pinned by five dispatch tests in src/agent/tests.rs (allows: parallel-work tools, non-final step, sub-plan final step; blocks: final root step incl. whitespace-padded args, finish). Supersedes the f7f2e2fc blanket-gate semantics (2026-09-15).

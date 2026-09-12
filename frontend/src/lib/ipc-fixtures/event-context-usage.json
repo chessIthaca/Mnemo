@@ -1,0 +1,11 @@
+{
+  "kind": "context_usage",
+  "max": 8000,
+  "used": 1000,
+  "breakdown": {
+    "system": 500,
+    "user": 200,
+    "assistant": 200,
+    "tool": 100
+  }
+}

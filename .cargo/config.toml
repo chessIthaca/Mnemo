@@ -1,0 +1,11 @@
+# Cargo configuration for Mnemo.
+#
+# Linker: use rust-lld (the LLVM lld linker shipped in the Rust toolchain)
+# for the Windows MSVC target. The default MSVC `link.exe` is dramatically
+# slower for large binaries like the Tauri app (~60s link → ~10-15s with lld).
+# rust-lld.exe lives in the toolchain under
+# lib/rustlib/x86_64-pc-windows-msvc/bin/, so no PATH setup is needed — cargo
+# resolves it from the active toolchain. Gated to the MSVC target so macOS
+# builds (which use the system linker) are unaffected.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

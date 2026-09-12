@@ -1,0 +1,71 @@
+# ===== Rust =====
+/target/
+**/*.rs.bk
+*.pdb
+
+# ===== Node / Frontend (Vite) =====
+node_modules/
+dist/
+dist-ssr/
+*.local
+# tsc -b incremental-build cache — machine-specific, pure churn in diffs.
+*.tsbuildinfo
+
+# This repo is an npm workspace (root package.json declares "workspaces":
+# ["frontend"]). The root package-lock.json is the single source of truth.
+# A second lockfile inside frontend/ is a leftover from a standalone install
+# and silently desyncs from the workspace lockfile — it caused
+# @radix-ui/react-dialog to go missing. Ignore it so it can't sneak back.
+frontend/package-lock.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== Tauri =====
+src-tauri/gen/
+src-tauri/WixTools/
+
+# ===== Environment / secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Editor / OS =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ===== Local agent / memory store =====
+.coding/memory.db
+.coding/memory.db-*
+.coding/codegraph.db
+.coding/codegraph.db-*
+.coding/logs/
+# Backlog image attachments are stored as gitignored sidecar files (not inline
+# base64 in the tracked backlog.jsonl — that made diffs huge). The JSONL
+# carries relative path refs; the binary image data never enters git.
+.coding/backlog-images/
+# The plan STACK is per-worktree live state (which plan is active in THIS
+# worktree) — tracked plans/*.md are the history, the stack pointer is not.
+.coding/plans/stack.json
+# Scratch shards from in-session payload-decomposition workarounds — never commit.
+.coding/tmp-shard/
+# Parallel run-all worktrees (plan ffd7a86f) — linked worktrees for
+# concurrently dispatched backlog items + the landing worktree. Disposable
+# working trees, never committed.
+.worktrees/
+.claude/
+
+# Temp/cache artifacts — never commit
+__pycache__/
+~$*
+
+# Patch-tool backup files — never commit
+*.orig

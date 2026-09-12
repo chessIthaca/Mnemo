@@ -1,0 +1,6 @@
+{
+  "id": "call-1",
+  "index": 0,
+  "kind": "tool_call_start",
+  "name": "shell"
+}

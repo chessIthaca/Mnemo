@@ -218,8 +218,10 @@ fn hash_message(h: &mut impl std::hash::Hasher, m: &Message) {
 /// The prefix fingerprint (perf review L3, 2027-01-09): a fresh O(n) fold
 /// over `messages[0..len]` (see [`hash_message`]) PLUS — per assistant
 /// message — the two age-dependent mutation decisions the builder applies at
-/// echo time: [`ReasoningRetention::strips_reasoning`] and the age-0
-/// `reasoning_content` re-add. Ages are counted from the END of history (the
+/// echo time: [`ReasoningRetention::strips_reasoning`] and the
+/// `reasoning_content` re-add MODE (0 = none, 1 = bare `""` key, 2 = key with
+/// the structured text at age 0; the mode flips 2→1 when a keyless tool-call
+/// turn ages out). Ages are counted from the END of history (the
 /// builder's convention) and grow as the conversation does, so each decision
 /// flips at most once per message (the re-add at age 0→1, the strip when age
 /// crosses keep_recent under pressure) — a flip changes the fingerprint and
@@ -227,6 +229,50 @@ fn hash_message(h: &mut impl std::hash::Hasher, m: &Message) {
 /// encoding is injective (length-prefixed strings — review round-1,
 /// Finding 1): two different prefixes share a fingerprint only via a
 /// negligible 2⁻⁶⁴ SipHash collision.
+/// Whether a raw assistant turn carries at least one tool call.
+///
+/// Read from the raw, not the `Message` struct, so the decision matches what
+/// the echo actually puts on the wire: the retention strip preserves
+/// tool-call structure, and a raw with unusable tool calls falls through to
+/// the synthetic path, which re-adds the key after any strip on assistant
+/// turns carrying tool_calls.
+fn raw_has_tool_calls(raw: &serde_json::Value) -> bool {
+    raw.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+/// Whether the outgoing echo must (re-)add the `reasoning_content` key.
+///
+/// Live-verified DeepSeek thinking-mode contract (probes T/T2/A/D/G2, bug
+/// plan c9b5cbe4) plus the third recurrence (2026-09-12, bug plan c6cb69f7):
+/// with `reasoning_effort` present the validator needs the key on the
+/// assistant turn that owns the request tail AND on every older assistant
+/// turn that carries `tool_calls` — the recurrence's only distinguishing
+/// feature was a mid-turn cross-vendor re-entry (a GLM skill run stripped
+/// `reasoning_content` from every cross-vendor turn, then `skill_end`
+/// re-resolved back to the deepseek pin with a stripped tool-call chain) and
+/// DeepSeek rejected the request even though the tail-owner was keyed.
+///
+/// Shared by the echo and the serialized-prefix fingerprint so the splice
+/// decision can never diverge from the fresh path. The strip clause keeps the
+/// guarantee true under pressure: a key the retention strip is about to
+/// remove counts as needing a re-add.
+fn needs_reasoning_readd(
+    policy: &crate::provider::ProviderPolicy,
+    assistant_age: usize,
+    under_pressure: bool,
+    raw: &serde_json::Value,
+) -> bool {
+    (assistant_age == 0 || raw_has_tool_calls(raw))
+        && policy.reasoning_required
+        && policy.reasoning_field == Some("reasoning_content")
+        && (raw.get("reasoning_content").is_none()
+            || policy
+                .retention
+                .strips_reasoning(assistant_age, under_pressure))
+}
+
 fn fingerprint_prefix(
     messages: &[Message],
     len: usize,
@@ -242,15 +288,24 @@ fn fingerprint_prefix(
         hash_message(&mut h, m);
         if m.role == Role::Assistant {
             let needs_strip = policy.retention.strips_reasoning(*age, under_pressure);
-            let needs_readd = *age == 0
-                && policy.reasoning_required
-                && policy.reasoning_field == Some("reasoning_content")
-                && m.raw
-                    .as_ref()
-                    .and_then(|r| r.get("reasoning_content"))
-                    .is_none();
+            let rekey = m
+                .raw
+                .as_ref()
+                .is_some_and(|raw| needs_reasoning_readd(policy, *age, under_pressure, raw));
+            // Re-add MODE, not a bool: 0 = none, 1 = bare "" key (age >= 1),
+            // 2 = key carrying the structured text (age 0). A tool-call turn
+            // keeps its key as it ages but the MODE flips 2 -> 1, so the cache
+            // must rebuild there too — a stale splice would keep the age-0
+            // value the fresh path no longer writes.
+            let readd_mode = if !rekey {
+                0
+            } else if *age == 0 {
+                2
+            } else {
+                1
+            };
             h.write_u8(u8::from(needs_strip));
-            h.write_u8(u8::from(needs_readd));
+            h.write_u8(readd_mode);
         }
     }
     h.finish()
@@ -559,29 +614,29 @@ impl OpenAiClient {
                 if let Some(name) = &m.name {
                     obj["name"] = serde_json::json!(name);
                 }
-                // DeepSeek thinking mode validates the request TAIL: the
-                // assistant turn that owns it — the last message, or the
-                // issuer of trailing tool results — must carry a
-                // `reasoning_content` KEY (any value, even ""), or the API
-                // rejects the request with HTTP 400 "The `reasoning_content`
-                // in the thinking mode must be passed back to the API"
-                // (live-verified 2026-12-23, bug plan c9b5cbe4). This branch
+                // DeepSeek thinking mode needs a `reasoning_content` KEY (any
+                // value, even "") on the assistant turn that owns the request
+                // tail — the last message, or the issuer of trailing tool
+                // results — and on every older assistant turn carrying
+                // `tool_calls` (live-verified 2026-12-23 bug plan c9b5cbe4,
+                // widened 2026-09-12 bug plan c6cb69f7); a request missing it
+                // is rejected with HTTP 400 "The `reasoning_content` in the
+                // thinking mode must be passed back to the API". This branch
                 // is only reached for SYNTHETIC assistant messages (no raw):
-                // real provider turns echo their raw above, where the age-0
-                // injection guarantees the key for reasoning_required
-                // providers. Fall back to an empty string so the key is
-                // always present on synthetic assistant messages too — a
-                // synthetic turn can own the tail (e.g. the request ends
+                // real provider turns echo their raw above, where the same
+                // guarantee is applied. Fall back to an empty string so the
+                // key is always present on synthetic assistant messages too —
+                // a synthetic turn can own the tail (e.g. the request ends
                 // with an assistant summary).
                 if m.role == Role::Assistant {
                     obj["reasoning_content"] =
                         serde_json::json!(m.reasoning_content.clone().unwrap_or_default());
                 }
                 // Vendor-specific reasoning retention on the synthetic path
-                // too: applied AFTER the reasoning_content re-add above so a
-                // pressure-triggered DeepSeek strip also removes the re-added
-                // key. Age >= 1 only — the most recent assistant turn is never
-                // stripped (the provider resumes reasoning from it).
+                // too: the stripped TEXT is what the retention feature
+                // targets; a tool-call turn gets its bare key re-added just
+                // below. Age >= 1 only — the most recent assistant turn is
+                // never stripped (the provider resumes reasoning from it).
                 if m.role == Role::Assistant
                     && policy
                         .retention
@@ -591,6 +646,22 @@ impl OpenAiClient {
                         &mut obj,
                         policy.retention.signatures_required,
                     );
+                }
+                // The widened guarantee must survive this path's ordering too
+                // (review LOW 2, 2026-09-12): the re-add above runs BEFORE the
+                // strip, so a pressure strip would leave a synthetic
+                // tool-call turn keyless — the exact shape the recurrence
+                // proved fatal. Re-add the bare key when the strip just took
+                // it, mirroring the raw-echo path, so "every wire tool-call
+                // turn carries the key under a requires-rc policy" holds on
+                // both paths.
+                if m.role == Role::Assistant
+                    && policy.reasoning_required
+                    && policy.reasoning_field == Some("reasoning_content")
+                    && !m.tool_calls.is_empty()
+                    && obj.get("reasoning_content").is_none()
+                {
+                    obj["reasoning_content"] = serde_json::json!("");
                 }
                 Cow::Owned(obj)
             })
@@ -1042,31 +1113,42 @@ fn raw_is_usable(raw: &serde_json::Value) -> bool {
 /// 1. Reasoning-text strip ([`ReasoningRetention::strips_reasoning`]) —
 ///    historical thinking text dropped from the OUTGOING echo only.
 ///
-/// 2. The age-0 `reasoning_content` re-add — live-verified DeepSeek
-///    thinking-mode contract (2026-12-23 curl probes against
-///    api.deepseek.com/v1, bug plan c9b5cbe4): when `reasoning_effort` is
-///    present, the assistant turn that owns the request tail — the last
-///    message, or the issuer of trailing tool results — must carry a
-///    `reasoning_content` KEY (any value, even ""); a missing key is an HTTP
-///    400 "The `reasoning_content` in the thinking mode must be passed back
-///    to the API" (probe T: [user, assistant(tool_calls, no rc), tool] →
-///    400; T2: same with rc:"" → 200). Historical assistant turns tolerate a
-///    missing key (probes A/D/G2), so only the most recent assistant turn
-///    (age 0) gets the guarantee — and only for providers whose continuity
-///    field IS `reasoning_content`: Gemini also sets `reasoning_required`,
-///    but its contract is `thought_signature` and fabricating the key would
-///    break its Rule-1 byte-identical echo (review finding 2026-12-23).
-///    Foreign 429-fallback turns (GLM/Kimi) issue tool calls whose raw lacks
-///    the key — the recurring session-killer bursts in
-///    provider-errors.jsonl. Value: the structured field when present, else
-///    "" — an empty key satisfies the validator, and HISTORICAL reasoning
-///    text stays strippable under pressure (plan ffe59699; age-0 text is
-///    never stripped).
+/// 2. The `reasoning_content` re-add — live-verified DeepSeek thinking-mode
+///    contract (2026-12-23 curl probes against api.deepseek.com/v1, bug plan
+///    c9b5cbe4): when `reasoning_effort` is present, the assistant turn that
+///    owns the request tail — the last message, or the issuer of trailing
+///    tool results — must carry a `reasoning_content` KEY (any value, even
+///    ""); a missing key is an HTTP 400 "The `reasoning_content` in the
+///    thinking mode must be passed back to the API" (probe T:
+///    [user, assistant(tool_calls, no rc), tool] → 400; T2: same with rc:""
+///    → 200). Historical TEXT-ONLY turns tolerate a missing key (probes
+///    A/D/G2) — but the third recurrence (2026-09-12, bug plan c6cb69f7)
+///    proved the tail guarantee alone is not sufficient: its requests had
+///    the tail-owner keyed and still 400'd, and their only distinguishing
+///    feature was a mid-turn cross-vendor re-entry (the merge_to_main skill
+///    runs on glm-5.3-flash; Rule 5 [`strip_cross_vendor_reasoning`] removed
+///    `reasoning_content` from every cross-vendor assistant turn, and
+///    `skill_end` re-resolved the provider back to deepseek-v4-flash with a
+///    stripped open tool-call chain). The key is therefore (re-)added on the
+///    age-0 turn AND on every older turn that carries `tool_calls` — a
+///    superset of the tail guarantee, satisfying the validator whichever
+///    turn it inspects. Only for providers whose continuity field IS
+///    `reasoning_content`: Gemini also sets `reasoning_required`, but its
+///    contract is `thought_signature` and fabricating the key would break
+///    its Rule-1 byte-identical echo (review finding 2026-12-23). Foreign
+///    429-fallback turns (GLM/Kimi) issue tool calls whose raw lacks the key
+///    — the recurring session-killer bursts in provider-errors.jsonl. Value:
+///    the tail-owner (age 0) uses the structured field when present, else "";
+///    older tool-call turns get the bare "" key so HISTORICAL reasoning text
+///    stays strippable under pressure (plan ffe59699; age-0 text is never
+///    stripped).
 ///
-/// The re-add condition is checked against `raw` (not a post-strip clone):
-/// the strip never runs at age 0 ([`ReasoningRetention::strips_reasoning`]
-/// protects age 0 unconditionally) and the re-add only applies at age 0, so
-/// the two mutations are mutually exclusive and the check is equivalent.
+/// The re-add condition is checked against `raw` (not a post-strip clone) and
+/// ALSO fires when the retention strip is about to remove the key from an
+/// older tool-call turn — otherwise the strip would reopen the recurrence's
+/// hole under pressure. For age 0 the strip never runs
+/// ([`ReasoningRetention::strips_reasoning`] protects age 0 unconditionally),
+/// so the tail-owner branch stays exactly as live-verified.
 pub(super) fn echo_assistant_raw<'a>(
     raw: &'a serde_json::Value,
     policy: &crate::provider::ProviderPolicy,
@@ -1077,10 +1159,7 @@ pub(super) fn echo_assistant_raw<'a>(
     let needs_strip = policy
         .retention
         .strips_reasoning(assistant_age, under_pressure);
-    let needs_readd = assistant_age == 0
-        && policy.reasoning_required
-        && policy.reasoning_field == Some("reasoning_content")
-        && raw.get("reasoning_content").is_none();
+    let needs_readd = needs_reasoning_readd(policy, assistant_age, under_pressure, raw);
     if !needs_strip && !needs_readd {
         return Cow::Borrowed(raw);
     }
@@ -1092,7 +1171,16 @@ pub(super) fn echo_assistant_raw<'a>(
         );
     }
     if needs_readd {
-        echoed["reasoning_content"] = serde_json::json!(reasoning_content.unwrap_or_default());
+        // The tail-owner keeps its own thinking text (the API may use it for
+        // the continuation); older tool-call turns get the bare key so the
+        // retention strip's token savings stay intact — "" is accepted
+        // wherever the validator checks key existence (probe T2).
+        let value = if assistant_age == 0 {
+            reasoning_content.unwrap_or_default()
+        } else {
+            ""
+        };
+        echoed["reasoning_content"] = serde_json::json!(value);
     }
     Cow::Owned(echoed)
 }

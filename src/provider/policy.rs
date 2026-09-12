@@ -75,15 +75,20 @@ pub enum StatefulKey {
 /// long sessions the echoed reasoning balloons the context and pushes requests
 /// past proxy cache ceilings. Some vendors do not need historical thinking
 /// text for continuity: Gemini 3.x requires only `thought_signature` on tool
-/// calls (the thinking *text* is droppable), while DeepSeek validates only the
-/// request TAIL: the assistant turn that owns it — the last message, or the
-/// issuer of trailing tool results — must carry a `reasoning_content` KEY (any
-/// value, even `""`), while older turns tolerate a missing key entirely
-/// (live-verified 2026-12-23 against api.deepseek.com, bug plan c9b5cbe4). The
-/// retention value records, per provider, how many of the most recent
-/// assistant turns are protected and whether the remainder may be stripped —
-/// `keep_recent >= 1` keeps the tail turn's key intact even under pressure,
-/// so stripping historical text never violates the tail contract.
+/// calls (the thinking *text* is droppable), while DeepSeek requires a
+/// `reasoning_content` KEY (any value, even `""`) on the assistant turn that
+/// owns the request tail — the last message, or the issuer of trailing tool
+/// results — AND on every older assistant turn that carries `tool_calls`
+/// (live-verified 2026-12-23 against api.deepseek.com, bug plan c9b5cbe4;
+/// widened by the third recurrence 2026-09-12, bug plan c6cb69f7: a
+/// cross-vendor re-entry left the open tool-call chain keyless while the
+/// tail-owner was keyed, and the API still returned 400). Historical
+/// TEXT-ONLY turns tolerate a missing key entirely. The retention value
+/// records, per provider, how many of the most recent assistant turns are
+/// protected and whether the remainder may be stripped — `keep_recent >= 1`
+/// keeps the tail turn's key intact even under pressure, and the builder
+/// re-adds the bare key on stripped tool-call turns, so stripping historical
+/// text never violates the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReasoningRetention {
     /// The number of most-recent assistant turns whose reasoning payload is
@@ -402,9 +407,11 @@ fn openai_responses() -> ProviderPolicy {
 /// the user/tool message like every other client.
 ///
 /// **Historical retention:** the most recent assistant turn must always carry
-/// `reasoning_content`, but older turns tolerate dropping it — historical
-/// reasoning is stripped only under context pressure (near the proxy cache
-/// ceiling), never unconditionally.
+/// `reasoning_content`, and every older turn carrying `tool_calls` must carry
+/// the KEY too (the builder re-adds the bare `""` key when the strip or a
+/// cross-vendor re-entry removed it — plan c6cb69f7); the historical reasoning
+/// TEXT is what is droppable, and only under context pressure (near the proxy
+/// cache ceiling), never unconditionally.
 fn deepseek() -> ProviderPolicy {
     ProviderPolicy {
         name: "deepseek".into(),

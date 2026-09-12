@@ -1640,9 +1640,10 @@ fn raw_echo_injects_reasoning_content_when_required_but_absent() {
     // thinking mode must be passed back to the API". Probe T:
     // [user, assistant(tool_calls, NO rc key), tool] → 400; T2 (same
     // with rc:"") → 200; probe R: [user, assistant] trailing, key
-    // absent → 400. Historical assistant turns tolerate a missing key
-    // (probes A/D/G2) — only the most recent assistant turn (age 0) is
-    // validated. Foreign 429-fallback turns (GLM/Kimi) issue tool calls
+    // absent → 400. Text-only historical assistant turns tolerate a missing
+    // key (probes A/D/G2), but the age-0 turn AND every older turn carrying
+    // tool_calls are validated (third recurrence, 2026-09-12 plan c6cb69f7).
+    // Foreign 429-fallback turns (GLM/Kimi) issue tool calls
     // whose raw lacks the key — the recurring session-killer bursts in
     // provider-errors.jsonl (ids 39-47, 48-56, 101). The raw echo is
     // verbatim (Rule 1), so the builder must inject the key.
@@ -1736,16 +1737,19 @@ fn deepseek_tail_owner_keyed_when_system_follows_tool_results() {
     // built before b23463c (a long-running app process), NOT from a hole
     // in the guarantee. This test locks the incident shape so the
     // guarantee can never regress: trailing system messages (or any
-    // non-assistant tail) must not affect the age-0 key contract, and
-    // historical turns must stay within the missing-key tolerance.
+    // non-assistant tail) must not affect the age-0 key contract; the
+    // historical tool-call turn gets the bare key (the third recurrence,
+    // 2026-09-12 plan c6cb69f7, widened the guarantee beyond the tail), while
+    // text-only historical turns stay within the missing-key tolerance.
     let client = OpenAiClient::new(OpenAiClientConfig {
         model: "deepseek-v4-flash".into(),
         reasoning_effort: Some("max".into()),
         ..OpenAiClientConfig::test_default()
     });
     // Historical foreign-fallback turn (age 1): raw carries NO
-    // reasoning_content key — historical turns tolerate a missing key
-    // (probes A/D/G2) and must NOT get a fabricated one.
+    // reasoning_content key — text-only historical turns tolerate a missing
+    // key (probes A/D/G2), but this one carries tool_calls, so the widened
+    // guarantee (2026-09-12 plan c6cb69f7) gives it the bare "" key below.
     let historical_raw = serde_json::json!({
         "role": "assistant",
         "content": "earlier turn from a fallback provider",
@@ -1807,11 +1811,15 @@ fn deepseek_tail_owner_keyed_when_system_follows_tool_results() {
         "the injected key is empty: the structured reasoning text stays strippable under \
          pressure, and an empty key satisfies the validator"
     );
-    // The historical turn (age 1) stays within the missing-key tolerance —
-    // no over-injection, no fabricated history.
-    assert!(
-        body["messages"][0].get("reasoning_content").is_none(),
-        "historical assistant echoes must not get an injected key (tolerance probes A/D/G2)"
+    // The historical turn (age 1) carries tool_calls, so the third
+    // recurrence (2026-09-12, plan c6cb69f7) widens the guarantee to it: it
+    // gets the BARE key — the validator is satisfied whichever turn it
+    // inspects, and no stripped history text is re-sent. Text-only historical
+    // turns stay unkeyed (tolerance probes A/D/G2).
+    assert_eq!(
+        body["messages"][0].get("reasoning_content"),
+        Some(&serde_json::json!("")),
+        "historical tool-call echoes get the bare key, never the stripped history text"
     );
     // The trailing system messages must stay untouched.
     for i in [4usize, 5] {
@@ -1820,6 +1828,100 @@ fn deepseek_tail_owner_keyed_when_system_follows_tool_results() {
             "system messages must not carry reasoning_content"
         );
     }
+}
+
+#[test]
+fn deepseek_keys_every_tool_call_turn_after_cross_vendor_reentry() {
+    // provider-errors.jsonl ids 104 + 112 (2026-09-12 17:31:17 / 17:32:57,
+    // plan c6cb69f7): the FIRST deepseek-v4-flash requests after a mid-turn
+    // cross-vendor re-entry. The merge_to_main skill runs on glm-5.3-flash
+    // (Ollama Cloud), so Rule 5 (strip_cross_vendor_reasoning) removed
+    // `reasoning_content` from every cross-vendor assistant turn during the
+    // GLM iterations; skill_end then re-resolved the provider back to the
+    // deepseek pin and the request went out with a stripped, keyless open
+    // tool-call chain — the tail-owner itself keyed — and DeepSeek still
+    // answered HTTP 400 "The `reasoning_content` in the thinking mode must be
+    // passed back to the API". Every assistant turn that carries tool_calls
+    // must therefore carry the key, not just the age-0 tail-owner.
+    let client = OpenAiClient::new(OpenAiClientConfig {
+        model: "deepseek-v4-flash".into(),
+        reasoning_effort: Some("max".into()),
+        ..OpenAiClientConfig::test_default()
+    });
+    let tool_call_raw = |call_id: &str, name: &str, text: &str| {
+        serde_json::json!({
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [{
+                "id": call_id, "type": "function",
+                "function": { "name": name, "arguments": "{}" }
+            }]
+        })
+    };
+    // The stripped open chain: every tool-call raw lacks the key (Rule 5
+    // removed it as cross-vendor), exactly like the incident bodies.
+    let first = Message {
+        raw: Some(tool_call_raw("call_1", "git", "pushing")),
+        ..Message::assistant_text("pushing")
+    };
+    let first_result = Message::tool_result("call_1", "git", "pushed");
+    let second = Message {
+        raw: Some(tool_call_raw("call_2", "skill_end", "spec amended")),
+        ..Message::assistant_text("spec amended")
+    };
+    let second_result = Message::tool_result("call_2", "skill_end", "skill ended");
+    let body = client
+        .build_request_json(
+            &[
+                Message::user_text("merge and push"),
+                first,
+                first_result,
+                second.clone(),
+                second_result.clone(),
+            ],
+            &[],
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        body["reasoning_effort"], "max",
+        "test sanity: thinking mode must be active (the effort activates the validation)"
+    );
+    assert!(
+        body["messages"][1].get("tool_calls").is_some(),
+        "messages[1] must be the older tool-call echo (test sanity)"
+    );
+    assert_eq!(
+        body["messages"][1].get("reasoning_content"),
+        Some(&serde_json::json!("")),
+        "every tool-call turn needs the key: the age-1 echo must carry the bare \
+         reasoning_content key after a cross-vendor strip"
+    );
+    assert!(
+        body["messages"][3].get("reasoning_content").is_some(),
+        "the age-0 tail-owner keeps its key (the original tail guarantee)"
+    );
+    // The widened guarantee covers tool-call turns only: a text-only
+    // historical raw still stays unkeyed (tolerance probes A/D/G2), so no
+    // reasoning text or fabricated keys leak into plain history.
+    let plain = Message {
+        raw: Some(serde_json::json!({
+            "role": "assistant",
+            "content": "plain earlier turn"
+        })),
+        ..Message::assistant_text("plain earlier turn")
+    };
+    let body = client
+        .build_request_json(
+            &[Message::user_text("hi"), plain, second, second_result],
+            &[],
+            None,
+        )
+        .unwrap();
+    assert!(
+        body["messages"][1].get("reasoning_content").is_none(),
+        "text-only historical echoes must stay unkeyed (probes A/D/G2)"
+    );
 }
 
 #[test]
@@ -2196,10 +2298,12 @@ fn prefix_cache_rebuilds_on_pressure_flip_and_strips_history() {
 #[test]
 fn prefix_cache_rebuilds_when_the_readd_ages_out() {
     // DeepSeek thinking mode: the age-0 assistant gets the reasoning_content
-    // key injected (the tail-turn contract, SPEC e010881d); when it ages to 1
-    // the key must NOT be injected anymore (Rule-1 byte-identical echo for
-    // historical turns) — the serialized form changes and the cache must
-    // rebuild (a stale hit would fabricate the key on a historical turn).
+    // key injected with the structured text (the tail-turn contract, SPEC
+    // e010881d); when it ages to 1 a TOOL-CALL turn keeps the guarantee — the
+    // bare key — so the serialized form still changes (mode 2 -> 1) and the
+    // cache must rebuild: the third recurrence (2026-09-12, plan c6cb69f7)
+    // proved a stripped tool-call chain must stay keyed whichever turn the
+    // validator inspects.
     let client = OpenAiClient::new(OpenAiClientConfig {
         model: "deepseek-v4".into(),
         ..OpenAiClientConfig::test_default()
@@ -2241,14 +2345,14 @@ fn prefix_cache_rebuilds_when_the_readd_ages_out() {
     let cold = fresh.build_request_body(&aged, &[], None, false).unwrap();
     assert_eq!(b2, cold, "the aged-out rebuild must match the cold build");
     let v2: serde_json::Value = serde_json::from_str(&b2).unwrap();
-    assert!(
-        v2["messages"][2].get("reasoning_content").is_none(),
-        "age 1 → byte-identical echo, no fabricated key"
+    assert_eq!(
+        v2["messages"][2]["reasoning_content"], "",
+        "age 1 tool-call turn → the bare key (never a stale age-0 serialization)"
     );
     assert_eq!(
         client.hit_count.load(std::sync::atomic::Ordering::Relaxed),
         0,
-        "the re-add aging out must genuinely miss (a stale hit would fabricate the key)"
+        "the re-add aging out must genuinely miss (the mode flips 2 -> 1)"
     );
 }
 
@@ -2465,6 +2569,37 @@ fn retention_deepseek_synthetic_path_strips_under_pressure() {
         .build_request_json(&[Message::user_text(filler), hist, recent], &[], None)
         .unwrap();
     assert!(body["messages"][1].get("reasoning_content").is_none());
+    assert_eq!(body["messages"][2]["reasoning_content"], "latest thinking");
+}
+
+#[test]
+fn retention_deepseek_synthetic_tool_call_turn_keeps_bare_key_under_pressure() {
+    // Review LOW 2 (2026-09-12, plan c6cb69f7): the synthetic branch re-adds
+    // reasoning_content BEFORE the retention strip, so a pressure strip could
+    // leave a synthetic TOOL-CALL turn keyless — the exact shape the third
+    // DeepSeek recurrence proved fatal. The widened guarantee (every wire
+    // tool-call turn carries the key under a requires-rc policy) must hold on
+    // both paths: the strip drops the historical TEXT, the bare key returns.
+    let client = OpenAiClient::new(OpenAiClientConfig {
+        model: "deepseek-v4".into(),
+        ..OpenAiClientConfig::test_default()
+    });
+    let hist = Message {
+        reasoning_content: Some("earlier thinking".into()),
+        ..Message::assistant("earlier", vec![ToolCall::new("call_1", "read", "{}")])
+    };
+    let recent = Message {
+        reasoning_content: Some("latest thinking".into()),
+        ..Message::assistant_text("latest")
+    };
+    let filler = "x".repeat(crate::provider::PROXY_CACHE_CEILING_TOKENS * 5);
+    let body = client
+        .build_request_json(&[Message::user_text(filler), hist, recent], &[], None)
+        .unwrap();
+    assert_eq!(
+        body["messages"][1]["reasoning_content"], "",
+        "a stripped synthetic tool-call turn gets the bare key back, never the stripped text"
+    );
     assert_eq!(body["messages"][2]["reasoning_content"], "latest thinking");
 }
 

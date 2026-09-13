@@ -54,7 +54,7 @@
   ],
   "ui": {
     "show_token_usage": true,
-    "show_tool_activity": false,
+    "show_tool_activity": true,
     "show_knowledge_activity": true,
     "show_delegation_notes": false,
     "show_tool_images": true,

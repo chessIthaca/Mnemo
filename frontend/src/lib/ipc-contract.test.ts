@@ -108,7 +108,7 @@ function resetStore(): void {
     backlog: [],
     autoFeed: false,
     runAll: { active: false, done: 0, total: 0, compacting: false, concurrency: 1, spawned: [], note: null },
-    showToolActivity: false,
+    showToolActivity: true,
     showKnowledgeActivity: true,
     chatThreadLine: true,
     chatProseCap: true,

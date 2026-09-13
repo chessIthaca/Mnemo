@@ -453,7 +453,8 @@ export interface AppSettings {
     /** Inline images from image commands in the agent chat. */
     show_tool_images: boolean;
     /** Agent-activity cards (tool/memory/vision/skill) in the chat
-     *  transcript — GUI-only display filter, default off. */
+     *  transcript — GUI-only display filter, default on (tool results show
+     *  by default; set false to hide). */
     show_tool_activity: boolean;
     /** Knowledge-access activity cards (graph_* tool calls, memory tool
      *  calls, auto-recall entries) in the chat transcript — GUI-only

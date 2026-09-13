@@ -613,7 +613,8 @@ export function capActivityLog(entries: ActivityEntry[]): ActivityEntry[] {
  * Whether a transcript entry is an agent-activity card — a tool call, memory
  * read/write, vision image-parsing, or skill announcement — the entry kinds
  * gated by the `show_tool_activity` setting (Settings → Chat → "Show tool
- * activity in chat", default off). Conversation.tsx skips these at RENDER
+ * activity in chat", default on — tool results show by default; turn the
+ * toggle off to hide them). Conversation.tsx skips these at RENDER
  * time when the toggle is off; the transcript store always contains every
  * entry (the model's context echo is built server-side and is unaffected),
  * and the Output tab + console still log every tool call. Conversation

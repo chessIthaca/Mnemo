@@ -258,7 +258,8 @@ interface AppState extends AppStateLike {
   showToolImages: boolean;
   /** Whether agent-activity cards (tool calls, memory reads/writes, vision
    *  image-parsing, skill announcements) render in the chat transcript
-   *  (persisted to config.toml [ui].show_tool_activity, default off). GUI-only
+   *  (persisted to config.toml [ui].show_tool_activity, default on — tool
+   *  results show by default; turn the toggle off to hide them). GUI-only
    *  display filter: the transcript store always contains every entry and the
    *  model's context echo is unaffected; the Output tab still logs every tool
    *  result. */
@@ -638,12 +639,13 @@ export const useAgentStore = create<AppState>((set, get) => ({
   theme: readTheme(),
   showTokenUsage: readShowTokenUsage(),
   showToolImages: true,
-  // Agent-activity cards are hidden by default (backlog db489070); hydrated
-  // from config.toml [ui] by the App bootstrap (getSettings). No localStorage
+  // Agent-activity cards are shown by default (backlog 57687857 — user
+  // request 2027-01-13: tool results visible out of the box); hydrated from
+  // config.toml [ui] by the App bootstrap (getSettings). No localStorage
   // mirror — config.toml is the single persisted source (same pattern as the
   // sound flags below); the default only covers the brief pre-hydration
   // startup window.
-  showToolActivity: false,
+  showToolActivity: true,
   // Knowledge-access cards (graph + memory + auto-recall) are visible by
   // default (backlog 68c4c9a5); hydrated from config.toml [ui] by the App
   // bootstrap (getSettings). No localStorage mirror — config.toml is the

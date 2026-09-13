@@ -148,6 +148,11 @@ pub struct AgentRuntimeContext {
     /// emitted to the frontend via the `embedder://status` event so the UI can
     /// show a banner when semantic recall has degraded to keyword-only.
     pub embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
+    /// The same-project instance conflict resolved at startup (main.rs):
+    /// `Some` when another live mnemo instance already holds this project —
+    /// the frontend warns before opening it (2027-01-13). Computed once, so
+    /// the startup snapshot is stable for the whole session.
+    pub instance_conflict: Option<crate::ipc::startup::InstanceConflict>,
 }
 
 /// The project slice of [`IpcState`].

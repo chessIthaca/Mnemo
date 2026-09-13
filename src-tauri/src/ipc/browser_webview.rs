@@ -327,13 +327,21 @@ pub async fn browser_webview_ensure(
         let window = app
             .get_window("main")
             .ok_or_else(|| IpcError::msg("main window not found"))?;
-        let builder = WebviewBuilder::new(
-            CHILD_WEBVIEW_LABEL,
-            WebviewUrl::External(
-                normalized
-                    .parse()
-                    .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
+        // Per-instance WebView2 user data folder (webview_udf.rs): the
+        // child webview must share the instance's per-pid profile — a plain
+        // builder would re-resolve the default UDF and collide with the first
+        // instance (blank white window, 2027-01-13). A no-op for the first
+        // instance and on non-Windows platforms.
+        let builder = crate::webview_udf::apply(
+            WebviewBuilder::new(
+                CHILD_WEBVIEW_LABEL,
+                WebviewUrl::External(
+                    normalized
+                        .parse()
+                        .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
+                ),
             ),
+            CHILD_WEBVIEW_LABEL,
         );
         let webview = window
             .add_child(
@@ -408,13 +416,21 @@ pub(crate) async fn ensure_for_agent_impl(
         let window = app
             .get_window("main")
             .ok_or_else(|| IpcError::msg("main window not found"))?;
-        let builder = WebviewBuilder::new(
-            CHILD_WEBVIEW_LABEL,
-            WebviewUrl::External(
-                normalized
-                    .parse()
-                    .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
+        // Per-instance WebView2 user data folder (webview_udf.rs): the
+        // child webview must share the instance's per-pid profile — a plain
+        // builder would re-resolve the default UDF and collide with the first
+        // instance (blank white window, 2027-01-13). A no-op for the first
+        // instance and on non-Windows platforms.
+        let builder = crate::webview_udf::apply(
+            WebviewBuilder::new(
+                CHILD_WEBVIEW_LABEL,
+                WebviewUrl::External(
+                    normalized
+                        .parse()
+                        .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
+                ),
             ),
+            CHILD_WEBVIEW_LABEL,
         );
         // Created via add_child (visible by default — WebviewBuilder has no
         // visibility builder flag); `apply_visibility` below immediately

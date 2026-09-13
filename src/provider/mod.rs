@@ -195,10 +195,13 @@ pub struct Message {
     /// carry a `reasoning_content` KEY (any value, even ""); a missing key is
     /// an HTTP 400 "The `reasoning_content` in the thinking mode must be
     /// passed back to the API" (live-verified 2026-12-23, bug plan c9b5cbe4).
-    /// Historical assistant turns tolerate a missing key. Captured during the
-    /// turn and stored here so the request builder can round-trip it; the
-    /// builder additionally guarantees the key on the tail turn (age 0) when
-    /// the raw echo lacks it (foreign 429-fallback turns).
+    /// Text-only historical assistant turns tolerate a missing key; every
+    /// historical turn that carries `tool_calls` is validated too (third
+    /// recurrence, 2026-09-12, bug plan c6cb69f7). Captured during the turn
+    /// and stored here so the request builder can round-trip it; the builder
+    /// guarantees the key on the tail turn (age 0, carrying the structured
+    /// text) and on every older tool-call turn (the bare "" when the raw echo
+    /// lacks it) — foreign 429-fallback turns included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// Opaque provider metadata captured verbatim from a streamed response and

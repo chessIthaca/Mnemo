@@ -17,6 +17,7 @@ pub mod browser;
 pub mod codegraph;
 pub mod config;
 pub mod error;
+pub mod instance_marker;
 pub mod mcp;
 pub mod memory;
 pub mod model_resolver;

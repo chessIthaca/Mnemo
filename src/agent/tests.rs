@@ -8700,21 +8700,29 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
         .await
         .unwrap();
 
-    // The bound: at most 5 compaction attempts per turn — the 5th aborts
-    // with a clear error instead of re-compacting forever.
+    // The bound: a runaway tool loop that compaction CAN fix (the ingestion
+    // caps shrink every result, so each cycle lands under the threshold and
+    // re-arms the attempt budget) must still terminate — the per-turn TOTAL
+    // ceiling stops it with a clear error instead of re-compacting forever.
+    // Before the sendable post-condition existed this fixture exhausted the
+    // stuck ladder instead; compaction now genuinely fixes the size each cycle,
+    // so the ladder never fills and the total ceiling is what bounds the burn.
     let summarizer_calls = *provider.summarizer_calls.lock().unwrap();
     assert!(
-        summarizer_calls <= 5,
-        "the re-compaction loop must be bounded (≤5 summarizer calls per \
-         turn), got {summarizer_calls}"
+        summarizer_calls <= super::turn::MAX_COMPACTIONS_PER_TURN as usize,
+        "the re-compaction loop must be bounded (≤{} summarizer calls per \
+         turn), got {summarizer_calls}",
+        super::turn::MAX_COMPACTIONS_PER_TURN
     );
-    let mut saw_stuck_error = false;
+    let mut saw_churn_error = false;
     let mut compacted_events = 0usize;
     let mut finished_events = 0usize;
     while let Ok((_, ev)) = fanin_rx.try_recv() {
         match ev {
-            AgentEvent::Error { error, .. } if error.contains("stuck over threshold") => {
-                saw_stuck_error = true;
+            AgentEvent::Error { error, .. }
+                if error.contains("unbounded re-compaction loop") =>
+            {
+                saw_churn_error = true;
             }
             AgentEvent::Compacted { .. } => compacted_events += 1,
             AgentEvent::Finished { .. } => finished_events += 1,
@@ -8722,12 +8730,12 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
         }
     }
     assert!(
-        saw_stuck_error,
-        "the 5th over-threshold compaction must abort the turn with a \
+        saw_churn_error,
+        "hitting the per-turn compaction ceiling must abort the turn with a \
          clear error event"
     );
     assert!(
-        compacted_events <= 5,
+        compacted_events <= super::turn::MAX_COMPACTIONS_PER_TURN as usize,
         "Compacted events must be bounded too, got {compacted_events}"
     );
     assert_eq!(

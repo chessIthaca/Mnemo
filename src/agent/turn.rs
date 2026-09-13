@@ -81,6 +81,16 @@ const SWAP_SUMMARIZE_FILL: f64 = 0.8;
 /// preflight hard-ceiling tier uses 3).
 const KEEP_RECENT_ON_SWAP: usize = 6;
 
+/// Hard ceiling on auto-compactions per turn, across every reset.
+///
+/// The stuck ladder aborts at 5 CONSECUTIVE failed attempts and re-arms
+/// whenever a compaction lands under the threshold — which, now that compaction
+/// is total (the sendable post-condition always fits the result), is every
+/// cycle of a runaway tool loop. This total keeps a turn's summarizer burn
+/// finite regardless: 10 leaves room for a long legitimate turn crossing the
+/// fill rate several times, while stopping a loop that is not making progress.
+pub(crate) const MAX_COMPACTIONS_PER_TURN: u32 = 10;
+
 /// Loop-carried state for one [`AgentLoop::run_turn`] call: the counters,
 /// signals, and per-turn caches that survive across loop iterations. The
 /// phase methods take `&mut TurnState` so this state threads through them
@@ -131,6 +141,15 @@ pub(crate) struct TurnState {
     /// brings the count back under the threshold (the legitimate long-turn
     /// path crosses the fill rate repeatedly).
     compact_attempts: u32,
+    /// Per-turn TOTAL auto-compaction counter (2027-01-23 runaway-tool-output
+    /// report follow-up): `compact_attempts` re-arms whenever a compaction
+    /// lands the count back under the threshold, and compaction became TOTAL in
+    /// this change — the sendable post-condition always fits the result. A
+    /// runaway tool loop therefore re-arms the attempt budget every cycle and
+    /// would re-compact without bound (measured: 12 summarizer calls in one
+    /// turn, with the attempt-5 abort never firing at all). This counter never
+    /// resets within a turn, so the burn stays finite whatever the reset does.
+    compact_total: u32,
     /// Ring of the last assistant-response signatures (text + tool
     /// name+arguments; provider-assigned ids EXCLUDED — the live incident
     /// re-emitted with fresh ids). Three identical consecutive signatures
@@ -176,6 +195,7 @@ impl TurnState {
             stop_reason: None,
             compact_announced: false,
             compact_attempts: 0,
+            compact_total: 0,
             recent_response_sigs: std::collections::VecDeque::new(),
             token_accounting: TokenAccounting::new(),
             last_recalled_user_query: None,
@@ -912,6 +932,9 @@ impl AgentLoop {
                     .summarize_with_interrupt(
                         messages,
                         KEEP_RECENT_ON_SWAP,
+                        // The result must fit the window it is being swapped
+                        // TO — the new model is what will receive it.
+                        context::sendable_budget(pending.provider.capabilities()),
                         summary_provider.as_ref(),
                         cmd_rx,
                     )
@@ -1508,10 +1531,18 @@ impl AgentLoop {
             // interrupt classifiers (is_user_denial_tool_output) keep
             // matching by substring and MAX_RETRIES stays blind to
             // deliberate denials.
+            //
+            // INGESTION CAP: the output is bounded here, before it ever
+            // becomes prompt content — a runaway result (base64 dump, whole
+            // file, recursive grep) is otherwise already in flight by the time
+            // compaction could trim it. Under the cap the text passes through
+            // byte-for-byte, so the substring classifiers are unaffected (a
+            // denial is orders of magnitude shorter than the cap).
+            let capped = context::cap_tool_result_text(&result.output);
             let tool_content = if result.success {
-                result.output.clone()
+                capped
             } else {
-                format!("[tool error] {}", result.output)
+                format!("[tool error] {capped}")
             };
             let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), tool_content);
             messages.push(tool_message);
@@ -1705,6 +1736,7 @@ impl AgentLoop {
         // compaction brings the count back under the threshold (the
         // legitimate long-turn path crosses the fill rate repeatedly).
         state.compact_attempts += 1;
+        state.compact_total += 1;
         if state.compact_attempts >= 5 {
             // Terminal failure — Error only, no trailing Finished (the
             // MAX_RETRIES terminal-exclusivity contract: one terminal
@@ -1718,6 +1750,38 @@ impl AgentLoop {
                             "context stuck over threshold after {} compaction attempts — \
                              aborting turn",
                             state.compact_attempts
+                        ),
+                        retrying: false,
+                    },
+                ))
+                .await;
+            return Some(TurnOutcome {
+                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls_made: 0,
+                stop_reason: None,
+            });
+        }
+        if state.compact_total >= MAX_COMPACTIONS_PER_TURN {
+            // Absolute per-turn ceiling, independent of the reset below: a
+            // compaction that lands the count back under the threshold re-arms
+            // the attempt budget, and compaction became TOTAL with the sendable
+            // post-condition — so a runaway tool loop re-arms on every cycle
+            // and the attempt-5 abort above never fires (measured on that
+            // fixture: 12 summarizer calls in one turn, each preceded by a
+            // compaction that reported success). The reset stays, because a
+            // legitimate long turn DOES cross the fill rate repeatedly while
+            // making progress; this ceiling is what keeps the burn finite when
+            // the turn is not making progress at all. One terminal outcome per
+            // turn failure (Error only, no trailing Finished).
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::Error {
+                        error: format!(
+                            "context compacted {} times in one turn — aborting to avoid an \
+                             unbounded re-compaction loop",
+                            state.compact_total
                         ),
                         retrying: false,
                     },
@@ -1765,6 +1829,9 @@ impl AgentLoop {
             .summarize_with_interrupt(
                 messages,
                 keep_recent,
+                // The compacted result is what the TURN provider sends next, so
+                // its window is the one that has to fit — not the summarizer's.
+                context::sendable_budget(provider.capabilities()),
                 summary_provider.as_ref(),
                 cmd_rx,
             )
@@ -1837,6 +1904,44 @@ impl AgentLoop {
                 (messages.clone(), Vec::new(), None, None)
             }
         };
+        // R21 (round-1 review LOW 2): a MECHANICAL compaction means the
+        // summarizer rejected the request for SIZE, so the "summary" is a
+        // harness note and there is no Usage to record — compaction succeeded
+        // (that is the fallback's whole point) but the downgrade is otherwise
+        // invisible: a chronically undersized [models.summarize] slot would
+        // look like ordinary compaction in the transcript and in .coding/logs.
+        // Record it as a summarize-purpose failure row (the request DID fail)
+        // plus a once-per-turn note explaining why the summary reads like one.
+        if !compact_failed && context::is_mechanical_compaction(&summarized) {
+            self.record_stats_row(
+                session_id,
+                summary_provider.as_ref(),
+                StatsRow {
+                    prompt_tokens: crate::provider::estimate_prompt_tokens(messages, &[]) as u32,
+                    completion_tokens: 0,
+                    reasoning_tokens: 0,
+                    cached_tokens: None,
+                    ttft_ms: None,
+                    generation_ms: None,
+                    outcome: Some("error".into()),
+                    purpose: Some("summarize".into()),
+                },
+            );
+            if announce {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Error {
+                            error: "the summarizer rejected the request for size — the context was \
+                                    compacted MECHANICALLY (the summary is a harness note, not a \
+                                    model summary); check the [models.summarize] window"
+                                .to_string(),
+                            retrying: true,
+                        },
+                    ))
+                    .await;
+            }
+        }
         // R21: compaction's own mega-prompt is invisible to the main loop's
         // Usage arm — record it tagged purpose='summarize' so its cost (up to
         // ~300K tokens, guaranteed 0% cache) shows in the aggregates.
@@ -1930,11 +2035,13 @@ impl AgentLoop {
         let used = used as u32;
         let max = context_manager.max_tokens() as u32;
         *breakdown = bd;
-        // A compaction that brought the count back under the threshold is
-        // the legitimate path (a long turn legitimately crossing the fill
-        // rate repeatedly) — reset the attempt budget. Still over: the
-        // kept-verbatim tail dominates and the next iteration re-compacts
-        // (the counter climbs toward the abort above).
+        // A compaction that brought the count back under the threshold is the
+        // legitimate path (a long turn legitimately crossing the fill rate
+        // repeatedly) — reset the attempt budget. Still over: the kept-verbatim
+        // tail dominates and the next iteration re-compacts (the counter climbs
+        // toward the abort above). The per-turn TOTAL ceiling is what keeps
+        // this reset from becoming an unbounded loop now that compaction always
+        // succeeds.
         if (used as usize) < context_manager.effective_summarize_at() {
             state.compact_attempts = 0;
         }

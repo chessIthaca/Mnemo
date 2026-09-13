@@ -128,3 +128,9 @@ auto-run; mutations need approval.
 - **The CDP debug endpoint** is an unauthenticated localhost WebSocket. Any
   local process could attach to the debug browser; the throwaway profile keeps
   the exposure to what that page can see.
+## Multi-instance notes
+
+- **Per-instance user data folders (Windows).** Every webview is built through `src-tauri/src/webview_udf.rs` (`apply` wraps all three builder sites; `install_default_data_dir` decides at startup after project resolution): the FIRST instance keeps the persistent default UDF (`%LOCALAPPDATA%\com.mnemo.app\EBWebView — the AUMID-resolved default for an empty data dir; NOT `{exe}.WebView2`), every ADDITIONAL instance gets its own `%LOCALAPPDATA%\com.mnemo.app\WebView2\mnemo-<pid>. A UDF holds at most one WebView2 session, so without this a second instance's session cannot initialize — blank white window (fixed 2027-01-13, guarded by `src-tauri/tests/webview_udf.rs`).
+- **While an old (pre-fix) release build still runs, a freshly started primary instance may still blank-screen** — the old build holds the persistent default UDF. Restart the old instance with the new build once.
+- **Debug-build gotcha:** plain `cargo build` does NOT enable the opt-in `custom-protocol` feature (`src-tauri/Cargo.toml`), so debug binaries resolve every webview to the Vite devUrl `http://localhost:5179` — a white window even with the UDF fix (this invalidated several acceptance runs on 2027-01-13). Build acceptance binaries with `cargo build --features custom-protocol` (release builds and `tauri build` always pass it).
+- **Same-project double-start:** each launching instance writes `<project>/.coding/instance.json` {pid, started_at}; when that pid is another live mnemo-app process, the startup snapshot carries a conflict and the frontend shows the InstanceConflictDialog — [Choose another project] opens the ProjectPicker, [Open it anyway] dismisses.

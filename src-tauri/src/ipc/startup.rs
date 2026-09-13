@@ -39,6 +39,25 @@ pub struct StartupSnapshot {
     pub backlog: Vec<BacklogItemView>,
     /// Embedder status (same as `get_embedder_status`).
     pub embedder_status: EmbedderStatus,
+    /// The same-project instance conflict resolved at startup: `Some` when
+    /// ANOTHER live mnemo instance already holds this project (the frontend
+    /// asks before opening it), `None` otherwise. The incumbent's marker is
+    /// read before this instance's marker overwrites it (main.rs), so this
+    /// reports the state that existed the moment this instance launched.
+    pub instance_conflict: Option<InstanceConflict>,
+}
+
+/// The same-project instance conflict (a second instance opening a project
+/// another LIVE instance already holds) — surfaced to the frontend as a
+/// startup warning before it opens the project (2027-01-13: multiple
+/// instances are now supported via per-instance WebView2 profiles, so the
+/// shared project deserves an explicit ask).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct InstanceConflict {
+    /// The pid of the incumbent instance (the one already on this project).
+    pub pid: u32,
+    /// Unix epoch seconds when the incumbent instance launched.
+    pub started_at: u64,
 }
 
 /// Fetch the startup snapshot: agents, context caps, ALL workflow states,
@@ -125,12 +144,18 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
     // Embedder status.
     let embedder_status = state.embedder_status()?;
 
+    // The same-project conflict was resolved at startup, before this
+    // instance's marker overwrote the incumbent's (main.rs) — the snapshot
+    // reports the state that existed the moment this instance launched.
+    let instance_conflict = state.runtime.instance_conflict.clone();
+
     Ok(StartupSnapshot {
         agents,
         context_caps,
         workflow_states,
         backlog,
         embedder_status,
+        instance_conflict,
     })
 }
 

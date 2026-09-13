@@ -28,6 +28,7 @@ export default defineConfig({
       "src/components/common/MnemoLogo.test.tsx",
       "src/components/common/SourceEditor.test.ts",
       "src/components/common/SplashCard.test.tsx",
+      "src/components/projects/InstanceConflictDialog.test.tsx",
       "src/components/settings/sections/ModelCombobox.test.tsx",
       "src/components/layout/InputBar.test.ts",
       "src/components/layout/InputBar.steerEdit.test.ts",

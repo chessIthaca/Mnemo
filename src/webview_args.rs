@@ -108,6 +108,49 @@ pub fn env_flag_enabled(value: Option<std::ffi::OsString>) -> bool {
     }
 }
 
+/// The per-instance WebView2 user data folder, recorded exactly once at
+/// startup by the app (`src-tauri/src/webview_udf.rs::install_default_data_dir`):
+/// unset = "first instance, keep WebView2's default persistent profile",
+/// `Some(dir)` = "additional instance, use this private per-pid profile".
+/// WebView2 bakes the folder into its environment at first-creation time,
+/// so this must be recorded before any webview is built.
+static WEBVIEW_DATA_DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Record this instance's WebView2 user data folder (first call wins; only
+/// the app calls it, once, at startup). Additional instances pass their
+/// private per-pid folder here; the first instance never calls it.
+pub fn set_webview_data_dir(dir: std::path::PathBuf) {
+    let _ = WEBVIEW_DATA_DIR.set(Some(dir));
+}
+
+/// The per-instance WebView2 user data folder, when this instance is not the
+/// first one on the machine (see [`set_webview_data_dir`]).
+pub fn webview_data_dir() -> Option<&'static std::path::PathBuf> {
+    WEBVIEW_DATA_DIR.get().and_then(|o| o.as_ref())
+}
+
+/// The private per-pid user data folder for additional instances:
+/// `<app-local-data>/WebView2/mnemo-<pid>` — one profile per process, so a
+/// second (or third …) mnemo instance gets its own WebView2 browser process
+/// instead of colliding with the first instance's in-use default user data
+/// folder (blank white window, fix 2027-01-13).
+pub fn secondary_webview_data_dir(base: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    base.join("WebView2").join(format!("mnemo-{pid}"))
+}
+
+/// The Windows named-mutex name that arbitrates which instance may keep the
+/// default profile: derived from the default user data folder, so builds of
+/// different app identities never share the arbitration. Deterministic for
+/// a given build (same input — same name on every instance).
+pub fn mutex_name_for(default_udf: &std::path::Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    default_udf.as_os_str().hash(&mut hasher);
+    format!("mnemo-webview2-udf-{:016x}", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +236,44 @@ mod tests {
         assert!(!env_flag_enabled(Some(std::ffi::OsString::from("OFF"))));
         assert!(env_flag_enabled(Some(std::ffi::OsString::from("1"))));
         assert!(env_flag_enabled(Some(std::ffi::OsString::from("yes"))));
+    }
+
+    #[test]
+    fn secondary_udf_is_per_pid_under_webview2() {
+        let base = std::path::Path::new(r"C:\Users\carst\AppData\Local\com.mnemo.app");
+        let dir = secondary_webview_data_dir(base, 4242);
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from(
+                r"C:\Users\carst\AppData\Local\com.mnemo.app\WebView2\mnemo-4242"
+            )
+        );
+        // Distinct pids get distinct folders.
+        assert_ne!(dir, secondary_webview_data_dir(base, 4243));
+    }
+
+    #[test]
+    fn mutex_name_is_deterministic_and_path_scoped() {
+        let a = mutex_name_for(std::path::Path::new(r"C:\Apps\mnemo\mnemo-app.exe.WebView2"));
+        let b = mutex_name_for(std::path::Path::new(r"C:\Apps\mnemo\mnemo-app.exe.WebView2"));
+        let c = mutex_name_for(std::path::Path::new(r"D:\Apps\other\mnemo-app.exe.WebView2"));
+        assert_eq!(a, b, "same default UDF must yield the same mutex name");
+        assert_ne!(a, c, "different default UDFs must not share arbitration");
+        assert!(
+            a.starts_with("mnemo-webview2-udf-"),
+            "the name carries the app prefix"
+        );
+        assert!(
+            !a.contains('\\') && !a.contains('/'),
+            "the name must be a legal Windows mutex name (no path separators)"
+        );
+    }
+
+    #[test]
+    fn webview_data_dir_defaults_to_unset() {
+        assert!(
+            webview_data_dir().is_none(),
+            "no instance is a secondary until the app records a folder"
+        );
     }
 }

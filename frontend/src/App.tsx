@@ -18,7 +18,7 @@ import {
   onEmbedderStatus,
   onReconcileEvent,
 } from "./lib/tauri";
-import type { ReconcileEvent } from "./lib/tauri";
+import type { ReconcileEvent, InstanceConflict } from "./lib/tauri";
 import type { WorkflowState } from "./lib/types";
 import { fmtPct } from "./lib/format";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -28,6 +28,7 @@ import { StatusBar } from "./components/layout/StatusBar";
 import { InputBar } from "./components/layout/InputBar";
 import { InflightBar } from "./components/chat/InflightBar";
 import { ProjectPicker } from "./components/projects/ProjectPicker";
+import { InstanceConflictDialog } from "./components/projects/InstanceConflictDialog";
 import { IndexingOverlay } from "./components/projects/IndexingOverlay";
 import { BootSplash } from "./components/common/BootSplash";
 import { SplashCard, SplashProgress } from "./components/common/SplashCard";
@@ -99,6 +100,12 @@ export default function App() {
   const [checkedStartup, setCheckedStartup] = useState(false);
   const [embedderStatus, setEmbedderStatus] = useState<string | Record<string, unknown> | null>(null);
   const [embedderBannerDismissed, setEmbedderBannerDismissed] = useState(false);
+  // Same-project instance conflict (startup snapshot): another LIVE mnemo
+  // instance holds this project — the dialog asks before opening. The
+  // [Choose another project] flow opens the picker on top of it (the picker
+  // restarts the app into the chosen project).
+  const [instanceConflict, setInstanceConflict] = useState<InstanceConflict | null>(null);
+  const [instanceConflictPicker, setInstanceConflictPicker] = useState(false);
   // The startup reconciliation dialog: `null` = no reconcile running (silent
   // when the corpus is in sync — no events, no dialog). A `done`/`failed`
   // event leaves the dialog visible until the user dismisses it (the
@@ -111,11 +118,12 @@ export default function App() {
     | null
   >(null);
 
-  // The reconcile dialog is a full-viewport modal — hide the native child
-  // WebView2 while it is visible (the Browser-tab HWND would otherwise punch
-  // through), like IndexingOverlay and every other modal. Called with the
-  // hooks at the top (before the early-return branches) per rules of hooks.
-  useBrowserOverlay(reconcile !== null);
+  // The reconcile dialog and the instance-conflict dialog are full-viewport
+  // modals — hide the native child WebView2 while either is visible (the
+  // Browser-tab HWND would otherwise punch through), like IndexingOverlay and
+  // every other modal. Called with the hooks at the top (before the
+  // early-return branches) per rules of hooks.
+  useBrowserOverlay(reconcile !== null || instanceConflict !== null);
 
   // Subscribe to the startup reconciliation stream once. The backend emits
   // ONLY when the corpus drifted (git merge / edit / deleted DB) — an
@@ -239,6 +247,11 @@ export default function App() {
         }
         // Seed the embedder status from the snapshot.
         setEmbedderStatus(snap.embedder_status);
+        // Same-project instance conflict (backend field, resolved from
+        // `.coding/instance.json` at startup before this instance's marker
+        // overwrote the incumbent's). `?? null` also tolerates an older
+        // backend that predates the field.
+        setInstanceConflict(snap.instance_conflict ?? null);
         // Seed the backlog from the snapshot (L2 — spec required this; the
         // backlog_changed event + backlogList() poll still catch later updates).
         useAgentStore.getState().setBacklog(snap.backlog);
@@ -682,6 +695,21 @@ export default function App() {
             )}
           </SplashCard>
         </div>
+      )}
+      {/* Same-project instance conflict — a second instance on a LIVE
+          project: ask before opening (two instances on one project are
+          supported now, but two agents on the same files can step on each
+          other). The picker variant runs on top until a project is chosen
+          (it restarts the app into it). */}
+      {instanceConflict !== null && !instanceConflictPicker && (
+        <InstanceConflictDialog
+          conflict={instanceConflict}
+          onDismiss={() => setInstanceConflict(null)}
+          onChooseProject={() => setInstanceConflictPicker(true)}
+        />
+      )}
+      {instanceConflictPicker && (
+        <ProjectPicker onClose={() => setInstanceConflictPicker(false)} />
       )}
       {/* Indexing progress overlay — visible only while the startup/create
           code-index pass runs (self-subscribing; hidden otherwise). */}

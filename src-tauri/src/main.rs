@@ -33,6 +33,7 @@ mod console;
 mod ipc;
 mod startup;
 mod watchdog;
+mod webview_udf;
 
 use ipc::IpcState;
 use ipc::PendingApprovals;
@@ -243,10 +244,23 @@ fn main() {
                 .min_inner_size(800.0, 560.0)
                 .center()
                 .build()?;
+            // Per-instance WebView2 user data folder: the FIRST instance
+            // keeps WebView2's default profile; every ADDITIONAL instance
+            // gets its own per-pid folder (see webview_udf.rs — without it a
+            // second instance's session never initializes and its window is
+            // a blank white frame, 2027-01-13). MUST run before the first
+            // webview: WebView2 bakes the folder into its environment at
+            // creation time.
+            webview_udf::install_default_data_dir(app.handle(), std::process::id());
+
             // The agent-chat webview fills the whole window (the browser-tab
             // child is positioned over its placeholder rect by browser_webview.rs).
-            let agent_chat = window.add_child(
+            let agent_chat_builder = webview_udf::apply(
                 WebviewBuilder::new("agent-chat", WebviewUrl::App("index.html".into())),
+                "agent-chat",
+            );
+            let agent_chat = window.add_child(
+                agent_chat_builder,
                 PhysicalPosition::new(0, 0),
                 window.inner_size()?,
             )?;
@@ -303,6 +317,31 @@ fn main() {
                 // the NeedsProject path no agent can run so nothing is added.
                 _ => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             };
+
+            // Same-project instance conflict + marker (2027-01-13):
+            // `.coding/instance.json` in the project records which instance
+            // launched last on it. The conflict is read BEFORE this
+            // instance's marker overwrites the incumbent's, so a second
+            // instance on a LIVE project can warn the user before opening.
+            // Both are best-effort — a read-only project must still open
+            // (the marker write is `let _ =`).
+            let instance_conflict: Option<ipc::startup::InstanceConflict> =
+                if matches!(&brain_result, Ok(BrainOutcome::Ready(_))) {
+                    use mnemo::instance_marker::{conflict_for, InstanceMarker};
+
+                    let conflict = conflict_for(
+                        &backlog_root,
+                        std::process::id(),
+                        startup::instance_pid_alive,
+                    );
+                    let _ = InstanceMarker::new_self().write(&backlog_root);
+                    conflict.map(|m| ipc::startup::InstanceConflict {
+                        pid: m.pid,
+                        started_at: m.started_at,
+                    })
+                } else {
+                    None
+                };
 
             // Set the OS window title to the product name + the loaded
             // project's folder name, so the user can tell which project is
@@ -460,6 +499,7 @@ fn main() {
                             startup_error: None,
                             needs_project: false,
                             embedder_status: brain.embedder_status.clone(),
+                            instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
                             root: brain.project.clone(),
@@ -587,6 +627,7 @@ fn main() {
                             browser: fallback_browser,
                             startup_error: None,
                             needs_project: true,
+                            instance_conflict: None,
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
@@ -673,6 +714,7 @@ fn main() {
                             browser: fallback_browser,
                             startup_error: Some(msg),
                             needs_project: false,
+                            instance_conflict: None,
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),

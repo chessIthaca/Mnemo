@@ -1,0 +1,12 @@
+info: bundled embedding model 'bge-base-en-v1.5' is installed; starting with the built-in hash embedder and loading the model in the background (keeps the ONNX load off the main thread)
+codegraph: file watcher started (auto-refresh on edits)
+mnemo: build_brain took 10ms on the main thread (ready)
+codegraph: indexed 9 files (1 re-parsed, 42 symbols, 47 edges) in 3ms
+mnemo[fwd] event forwarder task spawning
+mnemo[fwd] event forwarder task RUNNING
+mnemo[fwd] recv #1 agent=1 ContextUsage { used: 0, max: 1000000, breakdown: ContextBreakdown { sy
+mnemo[emit] #1 channel=agent://event agent=1 webviews=["agent-chat"] result=ok
+mnemo[probe] eval into 'agent-chat' queued ok
+info: re-embedding memories for model 'bge-base-en-v1.5' (dim 768)
+info: re-embedded 0 memories
+info: bundled embedding model 'bge-base-en-v1.5' active

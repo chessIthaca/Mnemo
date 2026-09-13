@@ -250,6 +250,26 @@ export interface StartupSnapshot {
   workflow_states: [number, string][];
   backlog: BacklogItem[];
   embedder_status: string;
+  /**
+   * Same-project instance conflict: set when another LIVE mnemo instance
+   * already holds this project — the app asks before opening it (a second
+   * instance is otherwise fine now, thanks to per-instance WebView2
+   * profiles). Absent/null on the first instance, and absent on backends
+   * that predate the field.
+   */
+  instance_conflict?: InstanceConflict | null;
+}
+
+/**
+ * The incumbent claim of another mnemo instance on this project (from
+ * `<project>/.coding/instance.json`, resolved at startup before this
+ * instance overwrote it).
+ */
+export interface InstanceConflict {
+  /** The pid of the incumbent instance (the one already on this project). */
+  pid: number;
+  /** Unix epoch seconds when the incumbent instance launched. */
+  started_at: number;
 }
 
 /**

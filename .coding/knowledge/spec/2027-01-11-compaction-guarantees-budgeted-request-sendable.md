@@ -1,0 +1,16 @@
++++
+title = "compaction guarantees — budgeted request, sendable result, mechanical fallback, per-result caps"
+created = "2027-01-11"
++++
+
+Landed in plan 65af4c62 (commit c97f29f on wt/mnemo; verification review .coding/reviews/2026-09-13-runaway-tool-output-compaction-verify.md — verdict PASS). Context management in src/agent/context.rs now enforces four guarantees; anything touching them must keep all four.
+
+INVARIANTS
+1. LINEAR MEASUREMENT — `prompt_text_tokens` is BPE-exact up to TOKEN_MEASURE_CHUNK_CHARS=2_048; longer strings are measured chunk-wise (tiktoken is O(n²) per pretoken — a 400K-char run costs ~5 min). The chunked sum over-counts in practice; SUMMARY_BUDGET_SLACK_TOKENS=16 absorbs junction rounding. `count_message_tokens` uses it too, so turn accounting and the summarization budget share ONE measure.
+2. BUDGETED REQUEST — `summary_prompt_budget(caps)` sizes the summarization prompt from the SUMMARIZER's window; `budgeted_cut_index` marches the cut back (losslessly moving messages into the verbatim tail) but BAILS OUT when a single region message exceeds the allowance (truncation then bounds it — marching would keep the monster verbatim and re-wedge the tail). `budgeted_conv_text` guarantees the built prompt fits by construction; the cut never lands on a Tool result.
+3. SENDABLE RESULT — `enforce_sendable(result, budget)` with `sendable_budget(caps)` from the TURN model: no-op when under; aggressive `compact_old_tool_results(result, 0, 0, AGGRESSIVE_TOOL_RESULT_CHARS=2_000)` (re-run pointers kept); then dropping the OLDEST tail messages — never indices 0/1, always the newest message, and never a boundary on a Tool result. When the surviving tail IS one open batch it is kept whole and totality YIELDS (a clear provider error beats a permanent dangling tool_call_id).
+4. FALLBACK + CAPS — `mechanical_compaction` replaces the region with MECHANICAL_SUMMARY_NOTE when the provider rejects the request for size (both the immediate and mid-stream rejection shapes; `Error::is_context_overflow`); non-size errors still Err. `cap_tool_result_text` bounds a result at ingestion (TOOL_RESULT_MAX_CHARS=100_000, byte-identical below the cap) from turn.rs's tool-feedback site; `compact_old_tool_results` runs hysteresis THEN an oversize pass, and can now shrink image-bearing (Parts/ImageUrl) results. Image payloads are priced in token accounting, so vision turns trip the threshold (ctx numbers moved).
+
+TURN-LOOP BOUNDS (src/agent/turn.rs) — the stuck ladder (5 consecutive failed attempts) RE-ARMS whenever a compaction lands under the threshold, and compaction is now total, so a runaway tool loop would re-arm forever: `MAX_COMPACTIONS_PER_TURN=10` (TurnState.compact_total, never reset in a turn) is the absolute ceiling, emitting an Error-only abort. Verified by `over_threshold_turn_bounds_compaction_attempts` (ceiling) and `legitimate_long_turn_compactions_reset_budget` (the reset stays for real crossings) — never tighten one without the other.
+
+OPEN (recorded, not queued): src/runtime/agent.rs compact_context (manual /compact) does not yet report a mechanical downgrade; `is_mechanical_compaction` can misfire when a call did not actually compact (no-op/interrupted on a lineage that once compacted mechanically).

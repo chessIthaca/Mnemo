@@ -646,13 +646,18 @@ never stamped into the turn's display state — a summary is a one-off
 internal call, not a turn model switch; the `compact_ms` metric stays
 attached to the turn's provider trace wherever the summary ran. The summary
 prompt is model-agnostic (structured handoff format), so a cheaper model is
-low-risk. Caveat: the summarize model's own context window is never
-consulted — the cut/threshold logic stays on the turn's `ContextManager`, and
-the summary request sends the whole to-summarize region to the summarize
-model. A cheap-but-small model under a large-window turn model fails
-compaction on large contexts (fails safe — the turn continues; compaction is
-never a blocker). Pick a cheap model with a large window; a follow-up could
-size/chunk the summary input to the summarize model's window.
+low-risk. Caveat: the summarization REQUEST is now budgeted against the
+summarize model's own advertised window (`summary_prompt_budget` →
+`context_budget`), so a cheap-but-small model no longer fails on large
+contexts: the cut marches backward until the serialized region fits (keeping
+more recent turns verbatim), an over-budget region caused by a single monster
+message is truncated per-message with a marker, and if the provider still
+rejects the request for size the turn falls back to a mechanical compaction
+(the region becomes a harness note) instead of failing. Naming the summarize
+slot to a model that mis-advertises its window therefore degrades the SUMMARY
+quality rather than the session (and the downgrade is recorded); pick a cheap
+model with a large window, and note the budget comes from the *advertised*
+window — only the mechanical fallback catches a wrongly advertised one.
 
 **Subagent role state (2026-01-03).** A parented sub-agent's `Workflow` loads
 the main plan's stack from the shared plans dir (the read-only mirror that

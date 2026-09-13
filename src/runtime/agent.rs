@@ -1017,7 +1017,15 @@ impl AgentTask {
         // event (before → after) so the user sees the reduction.
         let before = crate::agent::context::ContextManager::count_tokens(&self.messages) as u32;
         let (summarized, mut buffered, stop, summarize_usage) = match context_manager
-            .summarize_with_interrupt(&self.messages, 6, provider.as_ref(), cmd_rx)
+            .summarize_with_interrupt(
+                &self.messages,
+                6,
+                // The TURN provider is what sends the compacted history next, so
+                // the result is bounded by its window, not the summarizer's.
+                crate::agent::context::sendable_budget(turn_provider.capabilities()),
+                provider.as_ref(),
+                cmd_rx,
+            )
             .await
         {
             Ok(result) => result,

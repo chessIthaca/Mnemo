@@ -10,6 +10,48 @@
 //! threshold, summarize the oldest turns into a single system message, keeping
 //! recent turns + the system prompt verbatim.
 //!
+//! ## Fitting the request (and the result) into the window
+//!
+//! Compaction has to work on exactly the histories that break it, so every
+//! bound below is enforced by construction rather than hoped for:
+//!
+//! - **Linear measurement.** Token counts are BPE-exact up to
+//!   [`TOKEN_MEASURE_CHUNK_CHARS`]; longer strings are measured chunk-wise.
+//!   tiktoken's byte-pair merge is quadratic in the length of a single unbroken
+//!   run (a base64 dump, a minified line, a repeated character), so measuring
+//!   one as a single piece costs minutes — on the runaway tool output this
+//!   module exists to survive. The chunked sum over-counts in practice (a chunk
+//!   split forfeits the merges across it), which is the safe direction for a
+//!   budget; [`SUMMARY_BUDGET_SLACK_TOKENS`] absorbs the residual rounding and
+//!   the mechanical fallback backstops anything that slips through.
+//! - **Budgeted summarization REQUEST.** [`summary_prompt_budget`] derives the
+//!   summarizer's budget from its OWN window (the `[models.summarize]` slot may
+//!   be a smaller model), and [`budgeted_cut_index`] marches the cut back —
+//!   keeping more recent messages verbatim, losslessly — until the serialized
+//!   region fits. A region that is over budget only because ONE message is a
+//!   monster is truncated per-message with a marker instead, because marching
+//!   there would keep the monster verbatim in the tail and re-wedge the next
+//!   turn: it would also stay in the conversation rather than leave it.
+//! - **Sendable RESULT.** The compacted conversation must itself fit the TURN
+//!   model's window ([`sendable_budget`], [`enforce_sendable`]) — otherwise the
+//!   session reports "Compacted" and then breaks on the next request. Levers,
+//!   in order: aggressive per-result caps that keep their re-run pointers, then
+//!   dropping the oldest tail messages — never the system message, never the
+//!   summary, never the newest message, and never splitting a tool batch.
+//! - **Mechanical fallback.** A provider size rejection on the summarization
+//!   request itself (the provider counts more than the harness can see) is
+//!   answered with [`mechanical_compaction`]: the region becomes a note that
+//!   says what happened and how to re-fetch, instead of failing the compaction
+//!   and leaving the session wedged until `/new`. Non-size errors still surface.
+//! - **Per-result caps.** [`cap_tool_result_text`] bounds a result as it ENTERS
+//!   the conversation ([`TOOL_RESULT_MAX_CHARS`]) — the only lever that acts
+//!   before the damage — and [`compact_old_tool_results`] cuts any intact
+//!   oversize result back to that cap even inside the hysteresis keep window.
+//! - **Image blocks are priced.** Token accounting counts image payloads by
+//!   length ([`content_text_and_image_bytes`]) instead of dropping them behind
+//!   `as_text()`, so an image-heavy context trips the threshold it always
+//!   should have — the ctx readout's numbers move for vision turns as a result.
+//!
 //! ## Compaction prompt design
 //!
 //! The summarization prompt (see [`ContextManager::build_summary_prompt`]) uses
@@ -49,7 +91,7 @@
 //!    verbatim, so it should focus on the older context that will be dropped.
 
 use crate::error::Result;
-use crate::provider::{LlmClient, LlmEvent, Message, MessageContent, Role};
+use crate::provider::{ContentPart, LlmClient, LlmEvent, Message, MessageContent, Role};
 
 /// A context manager that counts tokens and triggers summarization.
 ///
@@ -244,10 +286,15 @@ impl ContextManager {
     /// in a tool-result run longer than `keep_recent`, the tail is empty and a
     /// synthetic user continuation is appended so the result never consists
     /// only of system messages.
+    ///
+    /// `sendable_budget` is the TURN model's window ([`sendable_budget`]): the
+    /// compacted result is bounded by it, so compaction is total — what comes
+    /// back is sendable, not merely smaller.
     pub async fn summarize(
         &self,
         messages: &[Message],
         keep_recent: usize,
+        sendable_budget: usize,
         provider: &dyn LlmClient,
     ) -> Result<Vec<Message>> {
         if messages.len() <= keep_recent + 1 {
@@ -255,25 +302,45 @@ impl ContextManager {
             return Ok(messages.to_vec());
         }
 
-        let cut = summary_cut_index(messages, keep_recent);
+        let mut cut = summary_cut_index(messages, keep_recent);
         // Rule 4: if the open tool loop spans the entire conversation (nothing
         // to summarize before it), skip compaction — never trim inside an open
         // loop. Compaction "did not run" (spec acceptance test #3).
         if cut <= 1 {
             return Ok(messages.to_vec());
         }
+        // Budget the summarization request against the summarizer's OWN
+        // window: a history that dwarfs the window must not produce a
+        // summarization prompt that dwarfs it too (the provider rejects that
+        // request with an HTTP 400 and compaction fails exactly when it is
+        // needed most). Marching the cut backward keeps more recent messages
+        // verbatim in the kept tail — no data loss, the region simply
+        // shrinks until the request fits.
+        let budget = summary_prompt_budget(provider.capabilities());
+        cut = budgeted_cut_index(messages, cut, budget);
         let system = &messages[0];
         let to_summarize = &messages[1..cut];
         let recent = &messages[cut..];
 
         // Build the structured summarization prompt (detects an existing
-        // summary in messages[1] for a running-update path).
-        let summary_prompt = build_summary_prompt(messages, to_summarize);
+        // summary in messages[1] for a running-update path). The budget is
+        // enforced per-message (markers) when the region alone is too big.
+        let summary_prompt = build_summary_prompt(messages, to_summarize, budget);
 
         let summary_messages = vec![Message::user_text(summary_prompt)];
 
-        // Request the summary from the LLM.
-        let stream = provider.complete(&summary_messages, &[], None).await?;
+        // Request the summary from the LLM. A size rejection HERE means the
+        // budgeted request was still refused — the provider counts more than
+        // this harness can see (its own chat template, tool schemas, a smaller
+        // window than advertised) — so fall back to the mechanical compaction
+        // rather than wedging the session until `/new`.
+        let stream = match provider.complete(&summary_messages, &[], None).await {
+            Ok(stream) => stream,
+            Err(e) if e.is_context_overflow() => {
+                return Ok(mechanical_compaction(messages, cut, sendable_budget));
+            }
+            Err(e) => return Err(e),
+        };
         use futures::StreamExt;
         let mut summary_text = String::new();
         tokio::pin!(stream);
@@ -293,6 +360,7 @@ impl ContextManager {
         result.push(summary_message);
         result.extend(recent.iter().cloned());
         ensure_sendable_tail(&mut result, recent);
+        enforce_sendable(&mut result, sendable_budget);
         Ok(result)
     }
 
@@ -314,6 +382,7 @@ impl ContextManager {
         &self,
         messages: &[Message],
         keep_recent: usize,
+        sendable_budget: usize,
         provider: &dyn LlmClient,
         cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::runtime::AgentCommand>,
     ) -> Result<(
@@ -330,25 +399,44 @@ impl ContextManager {
             return Ok((messages.to_vec(), Vec::new(), None, None));
         }
 
-        let cut = summary_cut_index(messages, keep_recent);
+        let mut cut = summary_cut_index(messages, keep_recent);
         // Rule 4: if the open tool loop spans the entire conversation (nothing
         // to summarize before it), skip compaction — never trim inside an open
         // loop. Compaction "did not run" (spec acceptance test #3).
         if cut <= 1 {
             return Ok((messages.to_vec(), Vec::new(), None, None));
         }
+        // Budget the summarization request against the summarizer's OWN
+        // window — see [`ContextManager::summarize`]. Marching the cut
+        // backward keeps more recent messages verbatim: no data loss, the
+        // region shrinks.
+        let budget = summary_prompt_budget(provider.capabilities());
+        cut = budgeted_cut_index(messages, cut, budget);
         let system = &messages[0];
         let to_summarize = &messages[1..cut];
         let recent = &messages[cut..];
 
         // Build the structured summarization prompt (detects an existing
-        // summary in messages[1] for a running-update path).
-        let summary_prompt = build_summary_prompt(messages, to_summarize);
+        // summary in messages[1] for a running-update path). The budget is
+        // enforced per-message (markers) when the region alone is too big.
+        let summary_prompt = build_summary_prompt(messages, to_summarize, budget);
 
         let summary_messages = vec![Message::user_text(summary_prompt)];
 
-        // Request the summary from the LLM.
-        let stream = provider.complete(&summary_messages, &[], None).await?;
+        // Request the summary from the LLM. See [`ContextManager::summarize`]
+        // for why a size rejection falls back instead of failing.
+        let stream = match provider.complete(&summary_messages, &[], None).await {
+            Ok(stream) => stream,
+            Err(e) if e.is_context_overflow() => {
+                return Ok((
+                    mechanical_compaction(messages, cut, sendable_budget),
+                    Vec::new(),
+                    None,
+                    None,
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         let mut summary_text = String::new();
         tokio::pin!(stream);
         let mut buffered: Vec<AgentCommand> = Vec::new();
@@ -390,8 +478,19 @@ impl ContextManager {
                             // conversation with a truncated summary — surface
                             // it as an Err so the caller keeps the original
                             // messages and records a purpose='summarize'
-                            // error row.
-                            return Err(crate::error::Error::Provider(error));
+                            // error row. A SIZE rejection is the exception: it
+                            // is exactly the failure the mechanical fallback
+                            // exists for, and the stream is dead anyway.
+                            let error = crate::error::Error::Provider(error);
+                            if error.is_context_overflow() {
+                                return Ok((
+                                    mechanical_compaction(messages, cut, sendable_budget),
+                                    Vec::new(),
+                                    None,
+                                    None,
+                                ));
+                            }
+                            return Err(error);
                         }
                         _ => {}
                     }
@@ -440,6 +539,7 @@ impl ContextManager {
         result.push(summary_message);
         result.extend(recent.iter().cloned());
         ensure_sendable_tail(&mut result, recent);
+        enforce_sendable(&mut result, sendable_budget);
         Ok((result, buffered, None, usage))
     }
 }
@@ -545,6 +645,37 @@ fn retreat_past_open_tool_loop(messages: &[Message], cut: usize) -> usize {
 /// idempotent — a second pass skips messages already truncated.
 const COMPACTED_MARKER: &str = "[… truncated for context efficiency]";
 
+/// Aggressive per-result cap applied by [`enforce_sendable`] when the compacted
+/// conversation is still over the turn model's window: small enough that a
+/// monster-heavy history comes back under it, large enough to keep ordinary
+/// results useful. Every capped result carries a re-run pointer
+/// ([`rerun_pointer`]), so what the cap drops is recoverable by re-issuing the
+/// call.
+const AGGRESSIVE_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// The mechanical fallback's note — what replaces the summarized region when
+/// the SUMMARIZER itself rejected the request as too large, so no model summary
+/// exists to put there. It says plainly what happened and how to recover the
+/// detail that was dropped. `pub(crate)` so the turn loop can recognize a
+/// mechanical compaction and record the downgrade (it carries no Usage and
+/// would otherwise look like ordinary compaction).
+pub(crate) const MECHANICAL_SUMMARY_NOTE: &str = "[harness note] The conversation was compacted MECHANICALLY: the \
+     summarizer rejected the request as too large, so the older turns could not be \
+     summarized. They have been dropped, and every tool result was truncated to its \
+     head with a re-run pointer. Re-run read_files/search for anything you still need.";
+
+/// Whether a compacted conversation carries [`MECHANICAL_SUMMARY_NOTE`] — i.e.
+/// the summarizer rejected the request for size and [`mechanical_compaction`]
+/// substituted a note for a model summary. The turn loop uses this to record
+/// the downgrade: the compaction SUCCEEDED, but a chronically undersized
+/// `[models.summarize]` slot would otherwise be invisible — no Usage, no error
+/// row, and a summary that reads like a normal one in the transcript.
+pub(crate) fn is_mechanical_compaction(result: &[Message]) -> bool {
+    result
+        .iter()
+        .any(|m| m.content.as_text().contains(MECHANICAL_SUMMARY_NOTE))
+}
+
 /// Build the one-line re-read/re-run pointer appended after [`COMPACTED_MARKER`]
 /// when a tool result is truncated (D2): the originating tool call's arguments,
 /// condensed so the agent can re-issue the call cheaply instead of re-searching
@@ -646,6 +777,111 @@ fn one_line(s: &str, cap: usize) -> String {
     out
 }
 
+/// Longest tool-result text that enters the conversation at all (ingestion
+/// cap): ~25K tokens, several times any sane single result, but far below what
+/// a base64 image dump, a whole-file read, or a recursive grep can produce.
+///
+/// A result arrives in the same instant it becomes prompt content, so by the
+/// time compaction could trim it the request has already been rejected — this
+/// cap is the only lever that acts BEFORE the damage (see
+/// [`cap_tool_result_text`]).
+pub const TOOL_RESULT_MAX_CHARS: usize = 100_000;
+
+/// Bound an individual tool result at INGESTION time.
+///
+/// Text at or under [`TOOL_RESULT_MAX_CHARS`] is returned unchanged —
+/// byte-for-byte, so prefix caching and the classifiers that match substrings
+/// (`is_user_denial_tool_output`, the retry logic) see exactly what the tool
+/// produced. Longer text keeps its head plus a trailer that names the cap, the
+/// dropped count, and the way to get the content back.
+pub(crate) fn cap_tool_result_text(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= TOOL_RESULT_MAX_CHARS {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(TOOL_RESULT_MAX_CHARS).collect();
+    format!(
+        "{head}\n[tool output truncated at {TOOL_RESULT_MAX_CHARS} chars: {} of {total} chars dropped \
+         — re-run the tool to see the full output]",
+        total - TOOL_RESULT_MAX_CHARS
+    )
+}
+
+/// The truncation trailer: [`COMPACTED_MARKER`] plus the re-read/re-run pointer
+/// ([`rerun_pointer`]) when the originating tool call has one.
+fn truncation_trailer(pointer: Option<&str>) -> String {
+    match pointer {
+        Some(p) => format!("{COMPACTED_MARKER}\n{p}"),
+        None => COMPACTED_MARKER.to_string(),
+    }
+}
+
+/// Truncate ONE tool result to `keep_chars` plus the truncation trailer,
+/// replacing image-bearing multipart content with plain text. Returns whether
+/// anything was truncated.
+///
+/// Shared by both compaction levers in [`compact_old_tool_results`]: the
+/// hysteresis pass (cut results that fell out of the keep window back to
+/// `summary_chars`) and the oversize pass (cut a runaway result back to
+/// [`TOOL_RESULT_MAX_CHARS`] wherever it sits). The re-read pointer is resolved
+/// from the originating tool call BEFORE the mutable borrow, and idempotency is
+/// enforced on the marker, so repeat passes are no-ops.
+fn truncate_tool_result_at(messages: &mut [Message], idx: usize, keep_chars: usize) -> bool {
+    let (tool_call_id, name) = {
+        let m = &messages[idx];
+        (m.tool_call_id.clone(), m.name.clone())
+    };
+    let pointer = tool_call_id.as_deref().and_then(|id| {
+        let arguments = messages.iter().find_map(|m| {
+            m.tool_calls
+                .iter()
+                .find(|tc| tc.id == id)
+                .map(|tc| tc.arguments.clone())
+        });
+        arguments.and_then(|a| name.as_deref().and_then(|n| rerun_pointer(n, &a)))
+    });
+    let marker = truncation_trailer(pointer.as_deref());
+    let msg = &mut messages[idx];
+    let head_source: String = match &msg.content {
+        // Only truncate if the content is meaningfully longer than the
+        // summary (avoid truncating a 300-char result to 500 chars).
+        MessageContent::Text(s) => {
+            if s.contains(COMPACTED_MARKER) || s.chars().count() <= keep_chars + 100 {
+                return false;
+            }
+            s.clone()
+        }
+        MessageContent::Parts(parts) => {
+            // A multipart result holds an image payload: shrink it by dropping
+            // the payload and keeping whatever text came with it. Previously
+            // these were skipped outright, so an image result could never
+            // shrink — no matter how many of them the history held. The payload
+            // IS the size, so this path never takes the `keep_chars + 100`
+            // shortcut above.
+            if !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+            {
+                return false;
+            }
+            let text: String = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect();
+            if text.contains(COMPACTED_MARKER) {
+                return false;
+            }
+            text
+        }
+    };
+    let head: String = head_source.chars().take(keep_chars).collect();
+    msg.content = MessageContent::text(format!("{head}…\n{marker}"));
+    true
+}
+
 /// Truncate old tool-result messages to a compact summary using a hysteresis
 /// window that preserves prefix caching across consecutive tool batches.
 ///
@@ -671,8 +907,22 @@ fn one_line(s: &str, cap: usize) -> String {
 /// outputs, git diffs) are replaced with their first `summary_chars`
 /// characters plus a truncation marker. The `tool_call_id` and `name` fields
 /// are preserved so the conversation structure stays valid (N tool calls → N
-/// tool results). Only `MessageContent::Text` is truncated; multipart content
-/// is left untouched (tool results are always plain text in practice).
+/// tool results). A multipart result holding an image block is compacted to
+/// its text plus the marker: the payload (a base64 `data:` URL) is the size, so
+/// it is dropped while the result ages out.
+///
+/// Two rules run in this order, because prefix caching must survive both:
+///
+/// 1. The hysteresis pass above — cut results back to `summary_chars` once the
+///    intact window passes the high-water mark. Byte-identical while under it.
+/// 2. The OVERSIZE pass — cut any intact Text result longer than
+///    [`TOOL_RESULT_MAX_CHARS`] back to that cap and no further, EVEN when the
+///    hysteresis gate was a no-op and EVEN inside the keep window. Only
+///    monsters qualify, so ordinary results stay byte-identical and the cache
+///    still holds; a monster that stayed intact is precisely what wedges the
+///    context, and it is new content for the cache either way. Running second
+///    is deliberate: the aggressive pass (`keep = 0`) has already cut
+///    everything there, so this only reaches what that pass SPARED.
 ///
 /// # Re-read pointers (D2)
 ///
@@ -693,7 +943,10 @@ pub fn compact_old_tool_results(
     summary_chars: usize,
 ) -> usize {
     let effective_high = keep_high.max(keep);
-    // Collect the indices of all intact (not yet compacted) tool results.
+    // Collect the indices of all intact (not yet compacted) tool results. A
+    // multipart result counts as intact only while it still holds an image
+    // part: compaction rewrites it to plain text, and the marker then keeps it
+    // out of this list on later passes (idempotency).
     let intact_indices: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -701,7 +954,9 @@ pub fn compact_old_tool_results(
             m.role == Role::Tool
                 && match &m.content {
                     MessageContent::Text(s) => !s.contains(COMPACTED_MARKER),
-                    MessageContent::Parts(_) => false,
+                    MessageContent::Parts(parts) => parts
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
                 }
         })
         .map(|(i, _)| i)
@@ -710,52 +965,41 @@ pub fn compact_old_tool_results(
     // Hysteresis window: no-op while the intact window is below or at the
     // high-water mark. This keeps history byte-identical across batches so
     // the provider's longest-common-prefix cache holds.
-    if intact_indices.len() <= effective_high {
-        return 0;
+    let mut truncated_count = 0;
+    if intact_indices.len() > effective_high {
+        // Cut back to `keep` intact tool results in one pass.
+        let to_compact = &intact_indices[..intact_indices.len() - keep];
+        for &idx in to_compact {
+            if truncate_tool_result_at(messages, idx, summary_chars) {
+                truncated_count += 1;
+            }
+        }
     }
 
-    // Cut back to `keep` intact tool results in one pass.
-    let to_compact = &intact_indices[..intact_indices.len() - keep];
-    let mut truncated_count = 0;
-    for &idx in to_compact {
-        // Resolve the re-read pointer before taking the mutable borrow: it
-        // needs the originating tool call's arguments, which live in the
-        // preceding assistant message's `tool_calls` (matched by id).
-        let (tool_call_id, name) = {
-            let m = &messages[idx];
-            (m.tool_call_id.clone(), m.name.clone())
-        };
-        let pointer = tool_call_id.as_deref().and_then(|id| {
-            let arguments = messages.iter().find_map(|m| {
-                m.tool_calls
-                    .iter()
-                    .find(|tc| tc.id == id)
-                    .map(|tc| tc.arguments.clone())
-            });
-            arguments.and_then(|a| name.as_deref().and_then(|n| rerun_pointer(n, &a)))
-        });
-        let msg = &mut messages[idx];
-        // Only truncate plain-text content (tool results are always Text).
-        let content_str = match &msg.content {
-            MessageContent::Text(s) => s.as_str(),
-            MessageContent::Parts(_) => continue,
-        };
-        // Idempotent: skip if already compacted.
-        if content_str.contains(COMPACTED_MARKER) {
-            continue;
+    // Oversize pass: runs whatever the gate above decided, because a single
+    // runaway result is what wedges a context. Scans again rather than tracking
+    // during the pass — the intact list is short by construction (a handful of
+    // results), and this keeps the two rules independent.
+    let oversize: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::Tool
+                && match &m.content {
+                    MessageContent::Text(s) => {
+                        !s.contains(COMPACTED_MARKER) && s.chars().count() > TOOL_RESULT_MAX_CHARS
+                    }
+                    // Images inside the keep window are the aggressive pass's
+                    // job (`enforce_sendable`), not the hysteresis path's.
+                    MessageContent::Parts(_) => false,
+                }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for idx in oversize {
+        if truncate_tool_result_at(messages, idx, TOOL_RESULT_MAX_CHARS) {
+            truncated_count += 1;
         }
-        // Only truncate if the content is meaningfully longer than the
-        // summary (avoid truncating a 300-char result to 500 chars).
-        if content_str.chars().count() <= summary_chars + 100 {
-            continue;
-        }
-        let summary: String = content_str.chars().take(summary_chars).collect();
-        let marker = match pointer.as_deref() {
-            Some(p) => format!("{COMPACTED_MARKER}\n{p}"),
-            None => COMPACTED_MARKER.to_string(),
-        };
-        msg.content = MessageContent::text(format!("{summary}…\n{marker}"));
-        truncated_count += 1;
     }
 
     truncated_count
@@ -775,6 +1019,115 @@ fn ensure_sendable_tail(result: &mut Vec<Message>, recent: &[Message]) {
             "[harness note] The conversation was compacted — continue from \
              the summary above.",
         ));
+    }
+}
+
+/// The last-resort compaction: replace the summarized region with a mechanical
+/// note when the SUMMARIZER rejected the request for size.
+///
+/// Reached when the budgeted request ([`build_summary_prompt`]) was still
+/// refused, so there is no model summary to insert. Without this the very path
+/// meant to recover an over-full context fails and the session stays wedged
+/// until `/new` — the reported symptom.
+///
+/// No summarization happens here: the region becomes a system note that says so
+/// plainly ([`MECHANICAL_SUMMARY_NOTE`]) and tells the agent how to re-fetch
+/// what it needs. The recent tail is kept verbatim, every tool result is capped
+/// aggressively (each keeping its re-run pointer), and the result is bounded by
+/// `sendable_budget` — the fallback must not hand back a conversation that the
+/// next request would reject for the same reason.
+fn mechanical_compaction(messages: &[Message], cut: usize, sendable_budget: usize) -> Vec<Message> {
+    let recent = &messages[cut..];
+    let mut result = Vec::with_capacity(2 + recent.len());
+    result.push(messages[0].clone());
+    result.push(Message::system(format!(
+        "## Conversation summary\n\n{MECHANICAL_SUMMARY_NOTE}"
+    )));
+    result.extend(recent.iter().cloned());
+    ensure_sendable_tail(&mut result, recent);
+    compact_old_tool_results(&mut result, 0, 0, AGGRESSIVE_TOOL_RESULT_CHARS);
+    enforce_sendable(&mut result, sendable_budget);
+    result
+}
+
+/// The compaction result's budget, from the TURN model's advertised window.
+///
+/// The request and the result are budgeted SEPARATELY and deliberately: the
+/// summarizer may be a cheaper model with a smaller window than the turn model
+/// ([`summary_prompt_budget`]), so using the summarizer's window here would
+/// shrink a conversation the turn model could still hold — while using the turn
+/// model's window for the request would overflow the summarizer.
+pub fn sendable_budget(caps: &crate::provider::Capabilities) -> usize {
+    context_budget(caps.max_context, caps.max_output_tokens)
+}
+
+/// The "compaction is total" post-condition: the compacted conversation must
+/// ITSELF be sendable — otherwise the wedge survives a "successful" compaction.
+///
+/// Budgeting the summarization REQUEST is not enough. The cut march keeps more
+/// recent messages verbatim (no data loss), so on a 7.2M-token history the
+/// compacted result is still millions of tokens and the next request is
+/// rejected exactly as before — the user compacts, sees "Compacted (7.2M →
+/// 6.1M)", and the session breaks again on the following turn. This bounds the
+/// OUTPUT, in escalating order:
+///
+/// 1. Under budget — untouched (the common case: nothing to do).
+/// 2. Cap every tool result at [`AGGRESSIVE_TOOL_RESULT_CHARS`] (hysteresis
+///    disabled via `keep=0, keep_high=0`), so even results inside the normal
+///    keep window are cut. Each capped result keeps its re-run pointer, so the
+///    content is recoverable by re-issuing the call rather than lost.
+/// 3. If still over: drop the OLDEST tail messages one batch at a time. The
+///    system message and the summary are never dropped, the newest message is
+///    always kept, and a drop boundary never lands on a tool result (its call
+///    would leave with it and orphan it — see the loop below). When the
+///    surviving tail is a single open tool batch, no legal boundary exists and
+///    the batch is kept whole: system + summary + that batch is the untouchable
+///    core, and totality yields to it rather than emitting a request the
+///    provider would reject for a dangling tool call.
+///
+/// Dropped tokens are SUBTRACTED from a running total instead of re-measuring
+/// the whole conversation per pass: this path exists for multi-million-token
+/// histories, where a full recount per dropped batch is exactly the O(n²)
+/// shape the budget work removed elsewhere. The counter is the same per-message
+/// one [`ContextManager::count_tokens`] sums, so the arithmetic is exact.
+fn enforce_sendable(result: &mut Vec<Message>, sendable_budget: usize) {
+    let mut total = ContextManager::count_tokens(result);
+    if total <= sendable_budget {
+        return;
+    }
+    compact_old_tool_results(result, 0, 0, AGGRESSIVE_TOOL_RESULT_CHARS);
+    total = ContextManager::count_tokens(result);
+    if total <= sendable_budget {
+        return;
+    }
+    let bpe = try_tiktoken_bpe();
+    // Always keep system + summary + the newest message, so each iteration
+    // drops at least one message and the loop terminates.
+    while result.len() > 3 && total > sendable_budget {
+        let mut drop_to = 3;
+        // Never start the new tail with an orphaned tool result: its call sits
+        // in the run being dropped, so step past the tool messages.
+        while drop_to < result.len() && result[drop_to].role == Role::Tool {
+            drop_to += 1;
+        }
+        if drop_to >= result.len() {
+            // The surviving tail IS one open tool batch that ends on the newest
+            // message, so NO legal boundary exists. Dropping any of it would
+            // leave a tool result whose call went with the dropped run, and
+            // `validate_request_messages` rejects a dangling `tool_call_id` on
+            // every LATER request — a wedge auto-compaction will not repair,
+            // because the context is under the threshold by then (round-1
+            // review HIGH 1). Keep the whole batch verbatim: system + summary +
+            // the final batch is the untouchable core, and totality yields to
+            // it.
+            break;
+        }
+        let dropped: usize = result[2..drop_to]
+            .iter()
+            .map(|m| count_message_tokens(bpe, m) as usize)
+            .sum();
+        total = total.saturating_sub(dropped);
+        result.drain(2..drop_to);
     }
 }
 
@@ -817,7 +1170,380 @@ const SUMMARY_FORMAT: &str = "\n\n\
              conversational filler — do not lose any decision, file path, or error that \
              the agent still needs.";
 
-/// Build the structured summarization prompt for the LLM.
+/// Fresh-summary prompt head: intro + the "## Conversation turns" label that
+/// precedes the conversation block. Extracted as a constant so the budget
+/// arithmetic ([`summary_prompt_frame_tokens`], [`budgeted_cut_index`])
+/// measures exactly what [`build_summary_prompt`] emits.
+const SUMMARY_PROMPT_HEAD: &str = "Summarize the following conversation turns into a structured summary. The system \
+     prompt and the most recent messages are kept verbatim (not summarized), so focus on \
+     the older context that will be dropped.\n\n\
+     ## Conversation turns\n\n";
+
+/// Running-update prompt head, up to and including the previous-summary
+/// block (the existing summary text is spliced after it).
+const SUMMARY_PROMPT_UPDATE_HEAD: &str = "You are updating an existing conversation summary with new turns. The previous \
+     summary is below, followed by the new conversation turns to incorporate.\n\n\
+     ## Previous summary\n\n";
+
+/// Running-update prompt middle: the label before the new conversation turns.
+const SUMMARY_PROMPT_UPDATE_MID: &str = "\n\n## New conversation turns\n\n";
+
+/// Running-update prompt tail: the update instruction, up to (not including)
+/// the shared [`SUMMARY_FORMAT`].
+const SUMMARY_PROMPT_UPDATE_TAIL: &str = "\n\nProduce an UPDATED summary that merges the previous summary with the new turns. \
+     Keep the same structured format:";
+
+/// Marker appended to a message's truncated head when the conversation region
+/// alone exceeds the summarization budget.
+const SUMMARY_BUDGET_TRUNCATION: &str = "\n[… truncated — exceeded the summary budget]";
+
+/// Note appended at the end of the conversation block when parts of it were
+/// truncated/omitted to fit the summarizer's window.
+const SUMMARY_BUDGET_NOTE: &str = "[Note: the conversation region exceeded the summarization budget — content \
+     after the first '…' marker was omitted. The kept tail (the most recent messages) is verbatim.]";
+
+/// The separator between serialized messages in the conversation block.
+const CONV_SEPARATOR: &str = "\n\n";
+
+/// Longest string handed to the BPE encoder in ONE call.
+///
+/// tiktoken's byte-pair merge is quadratic in the length of a single pretoken
+/// (the regex `\p{L}+` matches an unbroken run as one piece), so one long run —
+/// a base64 image blob, a minified JSON line, a repeated character — costs
+/// minutes: measured on this machine, 8K chars = 0.14s, 32K = 2.1s, 64K = 8.3s,
+/// 400K ≈ 5 min (4x per doubling). Compaction must never stall on the runaway
+/// tool output it exists to recover from, so longer strings are measured in
+/// chunks of this width (see [`prompt_text_tokens`]).
+const TOKEN_MEASURE_CHUNK_CHARS: usize = 2_048;
+
+/// Headroom reserved for BPE merges across the summary prompt's junctions.
+///
+/// The frame ([`summary_prompt_frame_tokens`]) and the conversation block are
+/// measured separately and then concatenated: a token that would have merged
+/// across a junction becomes two, so the assembled prompt can measure a
+/// token or two above `frame + block + separators`. 16 covers every junction
+/// with room to spare, which keeps "the built prompt fits its budget" a
+/// strict guarantee instead of one that lands a token over.
+const SUMMARY_BUDGET_SLACK_TOKENS: usize = 16;
+
+/// Serialize one message for the summary prompt exactly as
+/// [`build_summary_prompt`] embeds it (role label + text content).
+fn format_conversation_turn(m: &Message) -> String {
+    format!("{}: {}", role_str(m.role), m.content.as_text())
+}
+
+/// The largest index `<= i` that is a UTF-8 char boundary (clamped to
+/// `s.len()`).
+///
+/// Chunked measurement must never split a multi-byte character: `i` is walked
+/// back at most 3 bytes, so a caller chunking wider than that always makes
+/// progress (see [`prompt_text_tokens`]).
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut j = i.min(s.len());
+    while j > 0 && !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    j
+}
+
+/// Token count of `s`, using the context module's standard BPE (the embedded
+/// tiktoken rank table) with the ~4 chars/token fallback.
+///
+/// Strings up to [`TOKEN_MEASURE_CHUNK_CHARS`] are measured exactly. Longer
+/// ones are split into chunks of that width and the chunk counts summed, which
+/// keeps the cost linear (the alternative is the quadratic blowup documented
+/// on the constant) at the price of a conservative over-count: a chunk split
+/// forfeits any BPE merge across it, so the parts measure HIGHER in practice —
+/// greedy BPE is not globally optimal, so a contrived input could in principle
+/// measure lower, which [`SUMMARY_BUDGET_SLACK_TOKENS`] absorbs and the
+/// mechanical fallback backstops. Over-counting is the safe direction — every
+/// caller spends this number against a budget or a fill-rate threshold, so the
+/// guard trips marginally early rather than ever letting a request exceed the
+/// window.
+fn prompt_text_tokens(bpe: Option<&tiktoken_rs::CoreBPE>, s: &str) -> usize {
+    match bpe {
+        None => s.chars().count().div_ceil(4).max(1),
+        Some(bpe) if s.len() <= TOKEN_MEASURE_CHUNK_CHARS => {
+            bpe.encode_with_special_tokens(s).len()
+        }
+        Some(bpe) => {
+            let mut total = 0usize;
+            let mut start = 0usize;
+            while start < s.len() {
+                let end = floor_char_boundary(s, start + TOKEN_MEASURE_CHUNK_CHARS);
+                // Progress: `start` is a char boundary and the chunk is far
+                // wider than the 4-byte walk-back, so `end > start` always.
+                debug_assert!(end > start, "chunked measurement must advance");
+                total += bpe.encode_with_special_tokens(&s[start..end]).len();
+                start = end;
+            }
+            total
+        }
+    }
+}
+
+/// Token count of `messages[start..end]` serialized into the summary prompt's
+/// conversation block — role labels + content joined with [`CONV_SEPARATOR`],
+/// exactly what [`build_summary_prompt`] embeds for a budget-fitting region.
+fn conv_text_tokens(
+    bpe: Option<&tiktoken_rs::CoreBPE>,
+    messages: &[Message],
+    start: usize,
+    end: usize,
+) -> usize {
+    let mut total = 0usize;
+    for (i, m) in messages[start..end].iter().enumerate() {
+        if i > 0 {
+            total += prompt_text_tokens(bpe, CONV_SEPARATOR);
+        }
+        total += prompt_text_tokens(bpe, &format_conversation_turn(m));
+    }
+    total
+}
+
+/// Token budget for a request/context against a model's window.
+///
+/// The summary prompt embeds the old conversation region, so without a
+/// ceiling a conversation whose history exceeds the model's window produces
+/// a summarization request that exceeds it too — every provider rejects
+/// that ("stream request: HTTP 400 … the token count is longer than the
+/// limit", user report 2027-01-23 with a 7.2M-token tool history) and
+/// compaction fails exactly when it is needed most. The budget reserves the
+/// output allowance plus a small slack for provider-side overhead, so the
+/// request always fits the model's OWN window. A degenerate capabilities
+/// object still gets a minimal floor so the last-resort mechanical fallback
+/// has room to run.
+///
+/// Also used for the compaction post-condition ([`enforce_sendable`]): the
+/// compacted result must fit the window it will be sent to (the TURN model —
+/// which may be larger than the summarizer).
+pub fn context_budget(max_context: usize, max_output_tokens: usize) -> usize {
+    max_context
+        .saturating_sub(max_output_tokens.max(4096).saturating_add(2048))
+        .max(8192)
+}
+
+/// The summarization request's budget, from the summarizer's advertised
+/// window (the summarizer may be a cheaper model with a smaller window than
+/// the turn model, which is why the request and the result are budgeted
+/// separately).
+fn summary_prompt_budget(caps: &crate::provider::Capabilities) -> usize {
+    context_budget(caps.max_context, caps.max_output_tokens)
+}
+
+/// The token counts of the summary prompt's fixed frame — everything except
+/// the conversation block: the head (intro, plus the previous-summary block
+/// when `messages[1]` is already a summary) and the tail ([`SUMMARY_FORMAT`],
+/// or the running-update variant's update instruction + format). Mirrors
+/// [`build_summary_prompt`]'s structure exactly so the budget arithmetic
+/// here and the final prompt agree.
+fn summary_prompt_fixed_tokens(messages: &[Message], bpe: Option<&tiktoken_rs::CoreBPE>) -> usize {
+    let (head_tokens, tail_tokens) = summary_prompt_frame_tokens(messages, bpe);
+    head_tokens + tail_tokens + SUMMARY_BUDGET_SLACK_TOKENS
+}
+
+/// Token budget left for the summary prompt's conversation block: `budget_tokens`
+/// minus the fixed frame and the boundary slack.
+///
+/// [`build_summary_prompt`] (which enforces the budget) and [`budgeted_cut_index`]
+/// (which decides how much history the prompt will contain) must agree on this
+/// number — the march assumes what the builder enforces — so both call this
+/// instead of recomputing the frame arithmetic.
+fn conv_block_budget(
+    messages: &[Message],
+    bpe: Option<&tiktoken_rs::CoreBPE>,
+    budget_tokens: usize,
+) -> usize {
+    budget_tokens.saturating_sub(summary_prompt_fixed_tokens(messages, bpe))
+}
+
+fn summary_prompt_frame_tokens(
+    messages: &[Message],
+    bpe: Option<&tiktoken_rs::CoreBPE>,
+) -> (usize, usize) {
+    let (head, tail) = match existing_summary_at(messages) {
+        Some(summary) => (
+            format!("{SUMMARY_PROMPT_UPDATE_HEAD}{summary}{SUMMARY_PROMPT_UPDATE_MID}"),
+            format!("{SUMMARY_PROMPT_UPDATE_TAIL}{SUMMARY_FORMAT}"),
+        ),
+        None => (SUMMARY_PROMPT_HEAD.to_string(), SUMMARY_FORMAT.to_string()),
+    };
+    (prompt_text_tokens(bpe, &head), prompt_text_tokens(bpe, &tail))
+}
+
+/// Detect an existing summary in `messages[1]` (the slot where summaries are
+/// placed): a system message starting with `## Conversation summary`.
+fn existing_summary_at(messages: &[Message]) -> Option<String> {
+    messages
+        .get(1)
+        .filter(|m| {
+            m.role == Role::System && m.content.as_text().starts_with("## Conversation summary")
+        })
+        .map(|m| m.content.as_text())
+}
+
+/// March the summarization cut TOWARD `messages[1]` while the summarized
+/// region would overflow the summarization request's token budget.
+///
+/// The cut is the boundary between the summarized region `messages[1..cut]`
+/// and the verbatim kept tail `messages[cut..]`. Moving it backward keeps
+/// MORE recent messages verbatim — no data loss, the region simply shrinks,
+/// so the summary covers less old context — until the serialized region fits
+/// the summarizer's own window (the summarizer may be a cheaper model than
+/// the turn model). The backward march never splits a tool batch: a boundary
+/// that lands on a tool result keeps marching until it sits on a non-tool
+/// message, so the kept tail never starts with an orphaned tool result and
+/// every tool result stays with its call.
+///
+/// Marching is the LOSSLESS lever, so it is only spent where it can win: when
+/// a single region message already busts the region allowance, removing other
+/// messages cannot fit the request — the oversized one stays, and staying it
+/// also stays in the conversation (the march would move it to the verbatim
+/// tail), which is precisely what re-wedges the next turn. In that case the
+/// cut is returned untouched and [`budgeted_conv_text`] bounds the region by
+/// truncating the oversized message with a marker, keeping the summary's
+/// coverage while the runaway result leaves the history for good.
+fn budgeted_cut_index(messages: &[Message], cut: usize, budget: usize) -> usize {
+    let bpe = try_tiktoken_bpe();
+    let conv_budget = conv_block_budget(messages, bpe, budget);
+    let sep_tokens = prompt_text_tokens(bpe, CONV_SEPARATOR);
+    // Normalize the incoming cut first: the march's rule (the tail never starts
+    // with an orphaned tool result) has to hold for the bail-out return below
+    // too, and a caller's cut can land on a tool result. Clamped at 1 — a
+    // decrement to 0 would make the callers' `&messages[1..cut]` slice panic,
+    // and this normalization exists precisely to defend against caller shapes
+    // the module cannot prove absent.
+    let mut cut = cut;
+    while cut > 1 && cut < messages.len() && messages[cut].role == Role::Tool {
+        cut -= 1;
+    }
+    // Seed the region total (and its largest turn) in ONE pass, then subtract
+    // per marched step — re-serializing the region each iteration is O(n²)
+    // and a 7.2M-token history would spend minutes in the tokenizer exactly
+    // when the session is already wedged.
+    let mut region_tokens: usize = 0;
+    let mut max_turn_tokens: usize = 0;
+    for (i, m) in messages[1..cut].iter().enumerate() {
+        if i > 0 {
+            region_tokens += sep_tokens;
+        }
+        let turn_tokens = prompt_text_tokens(bpe, &format_conversation_turn(m));
+        max_turn_tokens = max_turn_tokens.max(turn_tokens);
+        region_tokens += turn_tokens;
+    }
+    if max_turn_tokens > conv_budget {
+        return cut;
+    }
+    while cut > 1 && region_tokens > conv_budget {
+        let old_cut = cut;
+        cut -= 1;
+        // Keep the boundary on a non-tool message so the kept tail never
+        // starts with an orphaned tool result.
+        while cut > 1 && messages[cut].role == Role::Tool {
+            cut -= 1;
+        }
+        // Every message leaving the region contributed its serialized form
+        // plus one separator (the region's first message is `messages[1]`,
+        // so anything at index >= 1 carried a separator).
+        for m in &messages[cut..old_cut] {
+            region_tokens = region_tokens
+                .saturating_sub(prompt_text_tokens(bpe, &format_conversation_turn(m)) + sep_tokens);
+        }
+    }
+    cut
+}
+
+/// Serialize `to_summarize` into the summary prompt's conversation block,
+/// honoring a token ceiling.
+///
+/// When the region fits `conv_budget` the output is byte-identical to the
+/// unconstrained join (the normal case — history below the model window, so
+/// prompt output and provider cache behavior are unchanged). When even the
+/// WHOLE region exceeds the budget (a monster tool result, or an enormous
+/// number of turns), as much as fits is kept, the first message that would
+/// bust the budget is truncated with [`SUMMARY_BUDGET_TRUNCATION`], and
+/// everything after it is omitted with a [`SUMMARY_BUDGET_NOTE`] — the total
+/// is bounded by `conv_budget` by construction.
+fn budgeted_conv_text(
+    bpe: Option<&tiktoken_rs::CoreBPE>,
+    to_summarize: &[Message],
+    conv_budget: usize,
+) -> String {
+    if conv_text_tokens(bpe, to_summarize, 0, to_summarize.len()) <= conv_budget {
+        return to_summarize
+            .iter()
+            .map(format_conversation_turn)
+            .collect::<Vec<_>>()
+            .join(CONV_SEPARATOR);
+    }
+
+    let note_tokens = prompt_text_tokens(bpe, SUMMARY_BUDGET_NOTE);
+    let trunc_tokens = prompt_text_tokens(bpe, SUMMARY_BUDGET_TRUNCATION);
+    let sep_tokens = prompt_text_tokens(bpe, CONV_SEPARATOR);
+    // Reserve the note up front so the closing marker always fits — plus the
+    // separator that precedes it, which is only spent when `out` is non-empty
+    // (reserving it unconditionally is conservative by exactly one separator).
+    let usable = conv_budget.saturating_sub(note_tokens + sep_tokens);
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for m in to_summarize {
+        let part = format_conversation_turn(m);
+        let part_tokens = prompt_text_tokens(bpe, &part);
+        let sep = if out.is_empty() { 0 } else { sep_tokens };
+        if !truncated && used + sep + part_tokens <= usable {
+            if !out.is_empty() {
+                out.push_str(CONV_SEPARATOR);
+            }
+            out.push_str(&part);
+            used += sep + part_tokens;
+            continue;
+        }
+        // The first message that does not fit: append its head (truncated to
+        // whatever budget remains) + the marker, then stop — everything after
+        // it is omitted.
+        truncated = true;
+        let left = usable.saturating_sub(used + sep);
+        if left > trunc_tokens + 16 {
+            let head = truncate_to_token_budget(bpe, &part, left - trunc_tokens);
+            if !out.is_empty() {
+                out.push_str(CONV_SEPARATOR);
+            }
+            out.push_str(&head);
+            out.push_str(SUMMARY_BUDGET_TRUNCATION);
+        }
+        break;
+    }
+    if truncated {
+        if !out.is_empty() {
+            out.push_str(CONV_SEPARATOR);
+        }
+        out.push_str(SUMMARY_BUDGET_NOTE);
+    }
+    out
+}
+
+/// Truncate `s` to a prefix whose token count is at most `budget` (empty when
+/// even a tiny prefix cannot fit). Token count is the module measure — the
+/// char-based start estimate overruns on multi-token characters (CJK, emoji),
+/// so the candidate is measured and halved until it fits or is empty. Above
+/// [`TOKEN_MEASURE_CHUNK_CHARS`] that measure is the chunked one, which errs
+/// high, so the truncation lands short rather than long.
+fn truncate_to_token_budget(
+    bpe: Option<&tiktoken_rs::CoreBPE>,
+    s: &str,
+    budget: usize,
+) -> String {
+    let mut chars = s.chars().take(budget.saturating_mul(4)).collect::<String>();
+    while prompt_text_tokens(bpe, &chars) > budget && !chars.is_empty() {
+        let keep = chars.chars().count() / 2;
+        chars = s.chars().take(keep).collect::<String>();
+    }
+    chars
+}
+
+/// Build the structured summarization prompt for the LLM, honoring a token
+/// budget for the REQUEST.
 ///
 /// Detects whether `messages[1]` is an existing summary (starts with
 /// `## Conversation summary`) and, if so, includes it so the model UPDATES it
@@ -826,42 +1552,28 @@ const SUMMARY_FORMAT: &str = "\n\n\
 /// Immediate Next Step — see [`SUMMARY_FORMAT`]) and instructs aggressive
 /// compression of tool outputs + verbatim preservation of identifiers.
 ///
+/// The budget guards the summarization request against a history that
+/// dwarfs the summarizer's window (see [`summary_prompt_budget`]): the fixed
+/// frame ([`summary_prompt_fixed_tokens`]) is reserved first, and the
+/// conversation block is serialized through [`budgeted_conv_text`] so the
+/// total always fits — truncated with a marker instead of failing the
+/// compaction.
+///
 /// See the module-level docs for the full design rationale.
-fn build_summary_prompt(messages: &[Message], to_summarize: &[Message]) -> String {
-    // Detect an existing summary in messages[1] (the slot where summaries are
-    // placed). When present, include it so the model updates rather than
-    // re-summarizes from scratch.
-    let existing_summary = messages
-        .get(1)
-        .filter(|m| {
-            m.role == Role::System && m.content.as_text().starts_with("## Conversation summary")
-        })
-        .map(|m| m.content.as_text());
+fn build_summary_prompt(
+    messages: &[Message],
+    to_summarize: &[Message],
+    budget_tokens: usize,
+) -> String {
+    let bpe = try_tiktoken_bpe();
+    let conv_budget = conv_block_budget(messages, bpe, budget_tokens);
+    let conv_text = budgeted_conv_text(bpe, to_summarize, conv_budget);
 
-    let conv_text = to_summarize
-        .iter()
-        .map(|m| format!("{}: {}", role_str(m.role), m.content.as_text()))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    if let Some(summary) = existing_summary {
-        // Running-update path: the model builds on the existing summary.
-        format!(
-            "You are updating an existing conversation summary with new turns. The previous \
-             summary is below, followed by the new conversation turns to incorporate.\n\n\
-             ## Previous summary\n\n{summary}\n\n\
-             ## New conversation turns\n\n{conv_text}\n\n\
-             Produce an UPDATED summary that merges the previous summary with the new turns. \
-             Keep the same structured format:{SUMMARY_FORMAT}"
-        )
-    } else {
-        // Fresh-summary path: no existing summary to build on.
-        format!(
-            "Summarize the following conversation turns into a structured summary. The system \
-             prompt and the most recent messages are kept verbatim (not summarized), so focus on \
-             the older context that will be dropped.\n\n\
-             ## Conversation turns\n\n{conv_text}{SUMMARY_FORMAT}"
-        )
+    match existing_summary_at(messages) {
+        Some(summary) => format!(
+            "{SUMMARY_PROMPT_UPDATE_HEAD}{summary}{SUMMARY_PROMPT_UPDATE_MID}{conv_text}{SUMMARY_PROMPT_UPDATE_TAIL}{SUMMARY_FORMAT}"
+        ),
+        None => format!("{SUMMARY_PROMPT_HEAD}{conv_text}{SUMMARY_FORMAT}"),
     }
 }
 
@@ -1030,30 +1742,75 @@ impl TokenAccounting {
     }
 }
 
+/// The text and image payload of a message's content, split for pricing.
+///
+/// [`MessageContent::as_text`] returns TEXT parts only, so pricing a message
+/// through it makes image blocks invisible to token accounting: a message
+/// carrying a 400KB base64 `data:` URL counted as a handful of tokens, and an
+/// image-heavy context could never trip the summarize trigger, the preflight
+/// ceiling, or the ctx readout. Images are what the provider bills for, so
+/// this walks the content once and reports both halves — the concatenated text
+/// (BPE-measured by the caller) and the image payload bytes (priced by ratio).
+fn content_text_and_image_bytes(content: &MessageContent) -> (String, usize) {
+    match content {
+        MessageContent::Text(s) => (s.clone(), 0),
+        MessageContent::Parts(parts) => {
+            let mut text = String::new();
+            let mut image_bytes = 0usize;
+            for part in parts {
+                match part {
+                    ContentPart::Text { text: t } => text.push_str(t),
+                    ContentPart::ImageUrl { image_url } => image_bytes += image_url.url.len(),
+                }
+            }
+            (text, image_bytes)
+        }
+    }
+}
+
+/// Price an image payload at ~4 chars per token — the same ratio the no-BPE
+/// text fallback uses, and the one the real tokenizer lands near for base64.
+///
+/// A `data:` URL carries the base64 image inline (with its own header), so the
+/// URL's byte length stands in for the payload the provider is billed for;
+/// remote URLs cost their few bytes plus what the client fetches, which this
+/// measure cannot see and deliberately does not invent.
+fn image_payload_tokens(image_bytes: usize) -> u32 {
+    (image_bytes.div_ceil(4)) as u32
+}
+
 /// The token count of a single message: the shared 4-token overhead plus the
 /// BPE length of its content, its `reasoning_content` echo, and tool-call
 /// names/arguments; falls back to ~4 chars per token (no overhead) when the
 /// BPE tokenizer is unavailable, mirroring the historical per-role fallback.
+/// Every part goes through [`prompt_text_tokens`] so turn accounting and the
+/// summarization budget share ONE measure (a large tool result cannot stall
+/// the count — see [`TOKEN_MEASURE_CHUNK_CHARS`]). Image blocks are priced by
+/// payload length ([`content_text_and_image_bytes`]) instead of vanishing
+/// behind `as_text()`.
 /// Reasoning text round-trips on the wire (DeepSeek thinking mode HTTP-400s
 /// without the echo) and the provider counts it in `usage.prompt_tokens`, so
 /// it must be counted here too (regression
 /// `token_accounting_counts_reasoning_content`).
 fn count_message_tokens(bpe: Option<&tiktoken_rs::CoreBPE>, msg: &Message) -> u32 {
+    let (content_text, image_bytes) = content_text_and_image_bytes(&msg.content);
+    let image_tokens = image_payload_tokens(image_bytes);
     match bpe {
         Some(bpe) => {
             let mut total = 4;
-            total += bpe.encode_with_special_tokens(&msg.content.as_text()).len() as u32;
+            total += prompt_text_tokens(Some(bpe), &content_text) as u32;
+            total += image_tokens;
             if let Some(rc) = &msg.reasoning_content {
-                total += bpe.encode_with_special_tokens(rc).len() as u32;
+                total += prompt_text_tokens(Some(bpe), rc) as u32;
             }
             for tc in &msg.tool_calls {
-                total += bpe.encode_with_special_tokens(&tc.name).len() as u32;
-                total += bpe.encode_with_special_tokens(&tc.arguments).len() as u32;
+                total += prompt_text_tokens(Some(bpe), &tc.name) as u32;
+                total += prompt_text_tokens(Some(bpe), &tc.arguments) as u32;
             }
             total
         }
         None => {
-            let mut content_chars = msg.content.as_text().len();
+            let mut content_chars = content_text.len() + image_bytes;
             if let Some(rc) = &msg.reasoning_content {
                 content_chars += rc.len();
             }
@@ -1099,6 +1856,15 @@ fn role_str(role: Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ImageUrl;
+
+    /// Budget handed to compaction by tests that are NOT about the sendable
+    /// post-condition: large enough that [`enforce_sendable`] is a no-op, so
+    /// those fixtures keep asserting what they were written to assert (the
+    /// summary prompt, the cut, the tail). Tests that target the
+    /// post-condition pass a tight budget instead (see
+    /// `enforce_sendable_bounds_the_compacted_result`).
+    const TEST_SENDABLE_BUDGET: usize = 10_000_000;
 
     #[test]
     fn effective_summarize_threshold_mirrors_effective_summarize_at() {
@@ -1264,6 +2030,140 @@ mod tests {
         assert_eq!(truncated, 1);
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("call-42"));
         assert_eq!(messages[0].name.as_deref(), Some("git_read"));
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report, L3): the ingestion
+    /// cap must bound a result the instant it enters the conversation — by the
+    /// time compaction could trim it, the request carrying it has already been
+    /// rejected. Under the cap the text must pass through BYTE-FOR-BYTE (the
+    /// substring classifiers and prefix caching depend on it); over the cap the
+    /// head survives with a trailer naming the cap and the dropped count.
+    #[test]
+    fn cap_tool_result_text_bounds_at_ingestion() {
+        // Under the cap: identical, byte for byte (including a result exactly
+        // at the cap, which must NOT be touched).
+        let under = "line of output\n".repeat(100);
+        assert_eq!(cap_tool_result_text(&under), under);
+        let exact = "x".repeat(TOOL_RESULT_MAX_CHARS);
+        assert_eq!(cap_tool_result_text(&exact), exact);
+
+        // Over the cap: head kept, trailer present, dropped count reported.
+        let over = "x".repeat(TOOL_RESULT_MAX_CHARS + 37);
+        let capped = cap_tool_result_text(&over);
+        assert!(capped.starts_with(&"x".repeat(TOOL_RESULT_MAX_CHARS)));
+        assert!(
+            capped.contains("truncated at 100000 chars"),
+            "the trailer must name the cap: {}",
+            &capped[TOOL_RESULT_MAX_CHARS..]
+        );
+        assert!(
+            capped.contains("37 of 100037 chars dropped"),
+            "the trailer must report the dropped count: {}",
+            &capped[TOOL_RESULT_MAX_CHARS..]
+        );
+        assert!(capped.contains("re-run the tool"));
+        // Multi-byte text must be cut on a char boundary, not a byte one.
+        let wide = "é".repeat(TOOL_RESULT_MAX_CHARS + 10);
+        let capped_wide = cap_tool_result_text(&wide);
+        assert!(
+            capped_wide.starts_with(&"é".repeat(TOOL_RESULT_MAX_CHARS)),
+            "the head must be whole characters"
+        );
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report, L3): a single
+    /// oversized result must be cut back even while the hysteresis gate is a
+    /// no-op and even INSIDE the keep window — a monster left intact is what
+    /// wedges the context, and waiting for it to age out is what fails. Normal
+    /// results must stay byte-identical so prefix caching holds.
+    #[test]
+    fn compact_caps_oversized_results_inside_keep_window() {
+        let monster = "x".repeat(TOOL_RESULT_MAX_CHARS + 5_000);
+        let normal = "y".repeat(5_000);
+        let args = "{\"path\":\"src/agent/context.rs\"}";
+        let mut messages = vec![
+            Message::assistant("read", vec![crate::provider::ToolCall::new("c1", "read_files", args)]),
+            Message::tool_result("c1", "read_files", &normal),
+            Message::assistant("read", vec![crate::provider::ToolCall::new("c2", "read_files", args)]),
+            Message::tool_result("c2", "read_files", &monster),
+        ];
+        // keep_high = 2 → the hysteresis gate counts 2 intact results and is a
+        // no-op; the oversize rule must still fire on the monster only.
+        let truncated = compact_old_tool_results(&mut messages, 2, 2, 1_000);
+        assert_eq!(truncated, 1, "only the monster must be cut");
+        let monster_text = messages[3].content.as_text();
+        assert!(
+            monster_text.contains(COMPACTED_MARKER),
+            "the monster must be marked"
+        );
+        assert!(
+            monster_text.contains("re-read"),
+            "the monster must keep its re-read pointer: {}",
+            &monster_text[monster_text.len().saturating_sub(200)..]
+        );
+        assert!(
+            monster_text.chars().count() < TOOL_RESULT_MAX_CHARS + 200,
+            "the monster must be cut back to the cap: {} chars",
+            monster_text.chars().count()
+        );
+        assert_eq!(
+            messages[1].content.as_text(),
+            normal,
+            "a normal result inside the keep window must stay byte-identical"
+        );
+        // Idempotent: a second pass truncates nothing more.
+        assert_eq!(compact_old_tool_results(&mut messages, 2, 2, 1_000), 0);
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report, L3): an image-bearing
+    /// tool result used to be skipped outright by compaction
+    /// (`MessageContent::Parts(_) => continue`), so image results could never
+    /// shrink — however many the history held. Once such a result is old enough
+    /// to compact, its payload must be dropped and replaced with the marker.
+    #[test]
+    fn compact_old_tool_results_replaces_image_parts_with_marker() {
+        let payload = "A".repeat(20_000);
+        let image_result = Message {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "screenshot of the failing test".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{payload}"),
+                    },
+                },
+            ]),
+            ..Message::tool_result("c1", "read_files", "")
+        };
+        let mut messages = vec![
+            image_result,
+            Message::tool_result("c2", "read_files", "x".repeat(5_000)),
+        ];
+        let before = ContextManager::count_tokens(&messages);
+        let truncated = compact_old_tool_results(&mut messages, 1, 1, 1_000);
+        assert_eq!(truncated, 1, "the old image result must be compacted");
+        let text = messages[0].content.as_text();
+        assert!(
+            text.contains(COMPACTED_MARKER),
+            "the image result must be marked: {text}"
+        );
+        assert!(
+            text.contains("screenshot of the failing test"),
+            "the text that came with the image must survive"
+        );
+        assert!(
+            !text.contains("data:image/png;base64"),
+            "the base64 payload must be gone"
+        );
+        let after = ContextManager::count_tokens(&messages);
+        assert!(
+            after < before,
+            "dropping the payload must shrink the history: {before} → {after}"
+        );
+        // Pairing survives, and a second pass is a no-op.
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(compact_old_tool_results(&mut messages, 1, 1, 1_000), 0);
     }
 
     #[test]
@@ -1664,6 +2564,71 @@ mod tests {
         );
     }
 
+    /// Regression (2027-01-23 runaway-tool-output report, L1): an image block
+    /// is billed by the provider but was invisible to token accounting —
+    /// [`MessageContent::as_text`] drops non-text parts, so a message carrying
+    /// a 400KB base64 `data:` URL counted as a handful of tokens. Image-heavy
+    /// contexts (screenshots, vision turns) therefore never tripped the
+    /// summarize trigger or the preflight ceiling until the provider itself
+    /// rejected the request. Every part must be priced, on both the BPE and
+    /// the chars/4 fallback path, and the breakdown must stay consistent with
+    /// the total.
+    #[test]
+    fn image_part_is_priced_in_token_accounting() {
+        // ~400KB of base64 → ~100K tokens at 4 chars/token.
+        let payload = "A".repeat(400_000);
+        let msg = Message {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "look at this".into(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{payload}"),
+                    },
+                },
+            ]),
+            ..Message::user_text("")
+        };
+        let payload_price = payload.len().div_ceil(4) as u32;
+
+        // The BPE path must price the payload, not just the text part, and it
+        // must price it on the CONSERVATIVE 4 chars/token law: base64 is
+        // high-entropy (mixed case, digits, `+/`), so it needs MORE tokens per
+        // char than prose — pricing it lower would undercount exactly the
+        // image-heavy context this guards. The window keeps the price from
+        // drifting into pure inflation.
+        let counted = count_message_tokens(try_tiktoken_bpe(), &msg);
+        assert!(
+            counted >= payload_price,
+            "a 400KB base64 image part must be priced at >= {payload_price}: {counted} tokens"
+        );
+        assert!(
+            counted <= payload_price + 64,
+            "the image price must not inflate past the payload: {counted} vs {payload_price}"
+        );
+        // The no-BPE fallback prices it too (chars/4, no overhead).
+        let fallback = count_message_tokens(None, &msg);
+        assert!(
+            fallback >= payload_price,
+            "the chars/4 fallback must price image payloads: {fallback}"
+        );
+
+        // The breakdown totals stay consistent with the per-message sum.
+        let messages = vec![Message::system("head"), msg];
+        let (total, breakdown) = ContextManager::count_tokens_and_breakdown(&messages);
+        assert!(
+            breakdown.user >= payload_price,
+            "user bucket: {}",
+            breakdown.user
+        );
+        assert_eq!(
+            total,
+            breakdown.system as usize + breakdown.user as usize,
+            "breakdown must sum to the total"
+        );
+    }
+
     /// Regression (2026-12-23, backlog da4fc87d): every request carries the
     /// tool-schema array (name + description + parameters JSON per tool) and
     /// the provider counts it in `usage.prompt_tokens`, but the accounting
@@ -1779,6 +2744,65 @@ mod tests {
         }
     }
 
+    /// A mock provider whose `complete` call itself FAILS — the shape of a
+    /// provider that rejects the summarization request with an HTTP 400 before
+    /// any stream exists (the real-world size-rejection path).
+    struct FailingCompleteMock {
+        error: String,
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for FailingCompleteMock {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock-failing-complete"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            Err(crate::error::Error::Provider(self.error.clone()))
+        }
+    }
+
+    /// A mock provider that records the messages of the last `complete` call
+    /// (so a test can assert what the summarization prompt actually was) and
+    /// otherwise behaves like [`SummaryMockProvider`].
+    struct RecordingSummaryMock {        events: Vec<LlmEvent>,
+        caps: Capabilities,
+        requested: std::sync::Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for RecordingSummaryMock {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock-recording-summary"
+        }
+        async fn complete(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            *self.requested.lock().unwrap() = Some(messages.to_vec());
+            Ok(Box::pin(futures::stream::iter(self.events.clone())))
+        }
+    }
+
     /// A mock provider whose stream yields one delta, then parks forever
     /// (pending) so an interrupt sent mid-stream is observed by select!.
     struct HangingMockProvider {
@@ -1842,7 +2866,7 @@ mod tests {
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
 
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 2, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -1872,7 +2896,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
                 .await
         });
 
@@ -1903,7 +2927,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
                 .await
         });
 
@@ -1930,7 +2954,7 @@ mod tests {
         let messages_clone = messages.clone();
         let handle = tokio::spawn(async move {
             cm_clone
-                .summarize_with_interrupt(&messages_clone, 2, &provider, &mut cmd_rx)
+                .summarize_with_interrupt(&messages_clone, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
                 .await
         });
 
@@ -1966,12 +2990,268 @@ mod tests {
         let messages = make_messages(2); // system + 2 = 3, keep_recent=2 → 3 <= 3
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 2, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 2, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
             .await
             .unwrap();
         assert!(buffered.is_empty());
         assert!(stop.is_none());
         assert_eq!(result.len(), messages.len());
+    }
+
+    #[tokio::test]
+    async fn summarize_with_interrupt_budgets_prompt_when_history_over_window() {
+        // Regression (2027-01-23 user report): with a 7.2M-token tool-role
+        // history, the summarization prompt itself exceeded the model window,
+        // the provider rejected it (HTTP 400 "token count … longer than the
+        // limit"), and compaction failed — the session stayed wedged until
+        // /new. The request must be budgeted to the summarizer's OWN window:
+        // the cut marches backward (more recent messages stay verbatim), so
+        // the prompt that reaches the provider never exceeds the window.
+        let cm = ContextManager::new(128_000, 0.5);
+        let mut messages = vec![Message::system("system prompt")];
+        for i in 0..5 {
+            messages.push(Message::user_text(format!("question {i}")));
+            messages.push(Message::assistant(
+                "using tools".to_string(),
+                vec![crate::provider::ToolCall::new(
+                    format!("call_{i}"),
+                    "read_files",
+                    r#"{"path":"a.rs"}"#.to_string(),
+                )],
+            ));
+            // ~325K chars > 81K tokens per result — a fraction of the
+            // history is several times the mock's entire window.
+            messages.push(Message::tool_result(
+                format!("call_{i}"),
+                "read_files".to_string(),
+                "line of data ".repeat(25_000),
+            ));
+        }
+        messages.push(Message::text(Role::Assistant, "final answer"));
+        messages.push(Message::text(Role::User, "recent tail message"));
+        let provider = RecordingSummaryMock {
+            events: vec![
+                LlmEvent::TextDelta {
+                    text: "compact summary".into(),
+                },
+                LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ],
+            caps: Capabilities {
+                max_context: 16_384,
+                max_output_tokens: 2_048,
+                ..Capabilities::openai()
+            },
+            requested: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
+
+        let (result, buffered, stop, _) = cm
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .await
+            .unwrap();
+        assert!(buffered.is_empty());
+        assert!(stop.is_none());
+        assert!(
+            result.len() < messages.len(),
+            "compaction must have dropped the summarized region"
+        );
+
+        // The prompt that reached the provider fits the summarizer window.
+        let requested = provider.requested.lock().unwrap();
+        let request = requested.as_ref().expect("provider must have been called");
+        assert_eq!(request.len(), 1, "summary request is a single user message");
+        let prompt = request[0].content.as_text();
+        let budget = summary_prompt_budget(&provider.caps);
+        let tokens = prompt_text_tokens(try_tiktoken_bpe(), &prompt);
+        assert!(
+            tokens <= budget,
+            "summary prompt must fit the summarizer window: {tokens} > {budget}"
+        );
+
+        // The kept tail survived verbatim: system + summary, then a
+        // byte-identical SUFFIX of the original conversation. WHICH suffix is
+        // the budget march's call — it moves whole messages into the tail to
+        // fit the summarizer's window — but that the tail is a contiguous
+        // suffix of unrewritten messages, every tool result still paired with
+        // its call, is the guarantee.
+        assert_eq!(result[0].content.as_text(), "system prompt");
+        assert!(result[1].content.as_text().contains("compact summary"));
+        let kept_tail: Vec<Message> = result[2..].to_vec();
+        let offset = messages.len() - kept_tail.len();
+        assert!(
+            offset > 1 && offset < messages.len(),
+            "compaction must drop the summarized region and keep a tail: kept {} of {} messages",
+            kept_tail.len(),
+            messages.len()
+        );
+        for (kept, original) in kept_tail.iter().zip(messages[offset..].iter()) {
+            assert_eq!(kept.role, original.role);
+            assert_eq!(
+                kept.content.as_text(),
+                original.content.as_text(),
+                "kept tail must be byte-identical to the original"
+            );
+            assert_eq!(kept.tool_call_id, original.tool_call_id);
+        }
+        assert_tool_pairing_intact(&result);
+    }
+
+    #[tokio::test]
+    async fn summarize_with_interrupt_keeps_recent_verbatim_when_region_over_budget() {
+        // Many moderately-sized tool results (not one monster): the region
+        // alone exceeds the summarizer window, but a shorter region fits —
+        // the cut must march back exactly far enough, keeping the rest of
+        // the conversation verbatim WITHOUT per-message truncation markers
+        // (the budgeted region is still summarized as a whole).
+        let cm = ContextManager::new(128_000, 0.5);
+        let mut messages = vec![Message::system("system prompt")];
+        for i in 0..40 {
+            messages.push(Message::user_text(format!("question {i}")));
+            messages.push(Message::assistant(
+                "searching".to_string(),
+                vec![crate::provider::ToolCall::new(
+                    format!("call_{i}"),
+                    "search",
+                    format!(r#"{{"pattern":"hit {i}"}}"#),
+                )],
+            ));
+            // ~2K chars ≈ 500 tokens each — 40 results ≈ 20K tokens, twice
+            // the budget (10_240), but each pair fits comfortably.
+            messages.push(Message::tool_result(
+                format!("call_{i}"),
+                "search".to_string(),
+                format!("hit line {i}: {} data", "x".repeat(2_000)),
+            ));
+        }
+        messages.push(Message::text(Role::Assistant, "done"));
+        messages.push(Message::text(Role::User, "recent tail"));
+        let provider = RecordingSummaryMock {
+            events: vec![
+                LlmEvent::TextDelta {
+                    text: "compact summary".into(),
+                },
+                LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ],
+            caps: Capabilities {
+                max_context: 16_384,
+                max_output_tokens: 2_048,
+                ..Capabilities::openai()
+            },
+            requested: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
+
+        let (result, buffered, stop, _) = cm
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
+            .await
+            .unwrap();
+        assert!(buffered.is_empty());
+        assert!(stop.is_none());
+
+        // The prompt fits the window and was NOT per-message-truncated.
+        let requested = provider.requested.lock().unwrap();
+        let request = requested.as_ref().expect("provider must have been called");
+        let prompt = request[0].content.as_text();
+        let budget = summary_prompt_budget(&provider.caps);
+        assert!(
+            prompt_text_tokens(try_tiktoken_bpe(), &prompt) <= budget,
+            "summary prompt must fit the summarizer window"
+        );
+        assert!(
+            !prompt.contains(SUMMARY_BUDGET_TRUNCATION),
+            "the backward march must suffice — no per-message truncation"
+        );
+        // The summarized region starts at the oldest content …
+        assert!(prompt.contains("question 0"));
+        // … but the region shrank: content that ended up in the kept tail
+        // (verbatim) is not re-summarized.
+        assert!(
+            !prompt.contains("question 39"),
+            "newest content must be kept verbatim, not summarized"
+        );
+
+        // The kept tail is the original conversation's suffix, byte-identical
+        // (system + summary first).
+        assert_eq!(result[0].content.as_text(), "system prompt");
+        assert!(result[1].content.as_text().contains("compact summary"));
+        let original_tail: Vec<Message> = messages[messages.len() - (result.len() - 2)..].to_vec();
+        let kept_tail: Vec<Message> = result[2..].to_vec();
+        assert_eq!(kept_tail.len(), original_tail.len());
+        for (kept, original) in kept_tail.iter().zip(original_tail.iter()) {
+            assert_eq!(kept.role, original.role);
+            assert_eq!(
+                kept.content.as_text(),
+                original.content.as_text(),
+                "kept tail must be byte-identical to the original"
+            );
+            assert_eq!(kept.tool_call_id, original.tool_call_id);
+        }
+        assert_tool_pairing_intact(&result);
+    }
+
+    #[test]
+    fn build_summary_prompt_enforces_budget_with_marker() {
+        // Direct-caller backstop: a region holding one runaway message (a
+        // single unbroken 200K-char run — the size class of a base64 image or
+        // a minified dump) truncates per-message with a marker and always fits
+        // the budget by construction. The budget is the frame plus a small
+        // region allowance, so the per-message backstop is what fires.
+        let messages = vec![
+            Message::system("system prompt"),
+            Message::user_text("what is the plan?"),
+            Message::text(Role::Tool, format!("huge result {}", "x".repeat(200_000))),
+        ];
+        let bpe = try_tiktoken_bpe();
+        let budget = summary_prompt_fixed_tokens(&messages, bpe) + 400;
+        let prompt = build_summary_prompt(&messages, &messages[1..], budget);
+        assert!(
+            prompt.contains(SUMMARY_BUDGET_TRUNCATION),
+            "over-budget region must carry the truncation marker"
+        );
+        assert!(
+            prompt.contains("what is the plan?"),
+            "the fitting part of the region must survive"
+        );
+        assert!(
+            prompt.contains(SUMMARY_BUDGET_NOTE),
+            "the omission note must tell the summarizer what was dropped"
+        );
+        let tokens = prompt_text_tokens(bpe, &prompt);
+        assert!(
+            tokens <= budget,
+            "the built prompt must never exceed its budget: {tokens} > {budget}"
+        );
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report): token measurement
+    /// must stay LINEAR in the length of a single unbroken run. tiktoken's
+    /// byte-pair merge is O(n²) in pretoken length (measured on this machine:
+    /// 64K chars ≈ 8.3s, 400K ≈ 5 min), and a runaway tool result is exactly
+    /// such a run — so an unbounded measure stalls compaction on the input it
+    /// exists to recover from. The cap is generous (the chunked measure needs
+    /// well under a second) because it guards a blowup of two orders of
+    /// magnitude, not a tight budget.
+    #[test]
+    fn prompt_text_tokens_stays_linear_on_one_huge_piece() {
+        let huge = "x".repeat(128_000);
+        let start = std::time::Instant::now();
+        let tokens = prompt_text_tokens(try_tiktoken_bpe(), &huge);
+        let elapsed = start.elapsed();
+        assert!(
+            tokens >= 8_000,
+            "measurement must stay in the right magnitude: {tokens} tokens for {} chars",
+            huge.len()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "measuring one {}-char pretoken took {elapsed:?} — the quadratic \
+             pretoken blowup is back (chunked measurement expects < 1s)",
+            huge.len()
+        );
     }
 
     #[tokio::test]
@@ -1992,7 +3272,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_messages(10);
-        let result = cm.summarize(&messages, 2, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         // system + summary + 2 recent = 4 messages.
         assert_eq!(result.len(), 4);
         // System prompt preserved verbatim.
@@ -2014,7 +3294,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_messages(2); // system + 2 = 3, keep_recent=2 → 3 <= 3
-        let result = cm.summarize(&messages, 2, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         assert_eq!(result.len(), messages.len());
         // Unchanged.
         assert_eq!(result[0].content.as_text(), "system prompt");
@@ -2028,7 +3308,7 @@ mod tests {
         // (the sentinel markers) plus the verbatim-preservation rule.
         let messages = make_messages(6);
         let to_summarize = &messages[1..messages.len() - 2];
-        let prompt = build_summary_prompt(&messages, to_summarize);
+        let prompt = build_summary_prompt(&messages, to_summarize, usize::MAX);
         assert!(
             prompt.contains("1. **Objective**"),
             "missing Objective heading: {prompt}"
@@ -2056,7 +3336,7 @@ mod tests {
             Message::system("## Conversation summary\n\nPRIOR STATE"),
         );
         let to_summarize = &messages[1..messages.len() - 2];
-        let prompt = build_summary_prompt(&messages, to_summarize);
+        let prompt = build_summary_prompt(&messages, to_summarize, usize::MAX);
         assert!(prompt.contains("## Previous summary"));
         assert!(prompt.contains("PRIOR STATE"));
         // Still carries the handoff format for the update.
@@ -2128,7 +3408,7 @@ mod tests {
             caps: Capabilities::openai(),
         };
         let messages = make_tool_batch_messages();
-        let result = cm.summarize(&messages, 3, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 3, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         assert_tool_pairing_intact(&result);
         // The cut advanced past the orphaned tool result: the kept tail is
         // the trailing assistant + user, so result = system + summary + 2.
@@ -2157,7 +3437,7 @@ mod tests {
         let messages = make_tool_batch_messages();
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 3, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 3, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -2219,7 +3499,7 @@ mod tests {
         let messages = make_all_tool_tail_messages();
         // The cut advances off the end.
         assert_eq!(summary_cut_index(&messages, 6), messages.len());
-        let result = cm.summarize(&messages, 6, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 6, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         // system + summary + synthetic user continuation = 3 messages.
         assert_eq!(result.len(), 3);
         assert!(
@@ -2250,7 +3530,7 @@ mod tests {
         let messages = make_all_tool_tail_messages();
         let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(8);
         let (result, buffered, stop, _) = cm
-            .summarize_with_interrupt(&messages, 6, &provider, &mut cmd_rx)
+            .summarize_with_interrupt(&messages, 6, TEST_SENDABLE_BUDGET, &provider, &mut cmd_rx)
             .await
             .unwrap();
         assert!(buffered.is_empty());
@@ -2358,7 +3638,7 @@ mod tests {
         // keep_recent=4 → naive cut 5 (inside the loop) → retreats to 3.
         let cut = summary_cut_index(&messages, 4);
         assert_eq!(cut, 3, "cut must retreat to the open-loop start");
-        let result = cm.summarize(&messages, 4, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 4, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         // system + summary + [user, assistant(tool_calls), tool(c1..c4)] = 8.
         assert_eq!(result.len(), 8);
         // The kept tail starts at the user message (loop start) — the entire
@@ -2405,10 +3685,408 @@ mod tests {
         // Retreat to loop_start = 1 (the user message). cut = 1 ≤ 1 → skip.
         let cut = summary_cut_index(&messages, 2);
         assert_eq!(cut, 1);
-        let result = cm.summarize(&messages, 2, &provider).await.unwrap();
+        let result = cm.summarize(&messages, 2, TEST_SENDABLE_BUDGET, &provider).await.unwrap();
         // Compaction did not run — original messages returned unchanged.
         assert_eq!(result.len(), messages.len());
         assert_eq!(result[1].role, Role::User);
         assert_eq!(result[2].tool_calls.len(), 8);
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report, L2): when the
+    /// summarizer rejects the request for SIZE, compaction must fall back to a
+    /// mechanical compaction instead of failing — failing is what wedged the
+    /// session until `/new`. Both rejection shapes are covered: the immediate
+    /// `complete()` error and a mid-stream [`LlmEvent::Error`].
+    #[tokio::test]
+    async fn summarize_with_interrupt_falls_back_to_mechanical_compaction_on_context_overflow() {
+        // The two wordings the provider stack produces: the OpenAI request
+        // rejection and the DeepSeek/GLM "longer than the limit" 400.
+        let overflow_errors = [
+            "HTTP 400: This model's maximum context length is 16384 tokens",
+            "HTTP 400: input is longer than the limit of the model",
+        ];
+        for error in overflow_errors {
+            // (a) the request itself is refused.
+            let failing = FailingCompleteMock {
+                error: error.to_string(),
+                caps: Capabilities::openai(),
+            };
+            let messages = make_messages(10);
+            let cm = ContextManager::new(128_000, 0.5);
+            let (_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+            let (result, buffered, stop, usage) = cm
+                .summarize_with_interrupt(
+                    &messages,
+                    2,
+                    TEST_SENDABLE_BUDGET,
+                    &failing,
+                    &mut cmd_rx,
+                )
+                .await
+                .expect("a size rejection must fall back, not fail");
+            assert!(buffered.is_empty(), "no commands buffered: {error}");
+            assert!(stop.is_none(), "must not report a stop: {error}");
+            assert!(usage.is_none(), "a mechanical compaction calls no model");
+            assert!(
+                result[1].content.as_text().contains(MECHANICAL_SUMMARY_NOTE),
+                "the mechanical note must explain what happened: {}",
+                result[1].content.as_text()
+            );
+            assert_eq!(
+                result.last().expect("non-empty").content.as_text(),
+                messages.last().expect("non-empty").content.as_text(),
+                "the recent tail must survive verbatim"
+            );
+            assert_tool_pairing_intact(&result);
+
+            // (b) the rejection arrives mid-stream instead.
+            let streaming = SummaryMockProvider {
+                events: vec![LlmEvent::Error {
+                    error: error.to_string(),
+                }],
+                caps: Capabilities::openai(),
+            };
+            let (_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+            let (result, _buffered, _stop, _usage) = cm
+                .summarize_with_interrupt(
+                    &messages,
+                    2,
+                    TEST_SENDABLE_BUDGET,
+                    &streaming,
+                    &mut cmd_rx,
+                )
+                .await
+                .expect("a mid-stream size rejection must fall back too");
+            assert!(
+                result[1].content.as_text().contains(MECHANICAL_SUMMARY_NOTE),
+                "the mechanical note must explain what happened: {error}"
+            );
+        }
+    }
+
+    /// The mechanical fallback must be narrow: a rejection that is NOT about
+    /// size keeps the existing behaviour (an `Err` the caller surfaces), so a
+    /// bad API key is never silently turned into "your context was compacted".
+    #[tokio::test]
+    async fn summarize_with_interrupt_surfaces_non_size_errors() {
+        let messages = make_messages(10);
+        let cm = ContextManager::new(128_000, 0.5);
+        for error in [
+            "HTTP 401: unauthorized — invalid api key",
+            "HTTP 429: rate limit exceeded",
+        ] {
+            let failing = FailingCompleteMock {
+                error: error.to_string(),
+                caps: Capabilities::openai(),
+            };
+            let (_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+            let result = cm
+                .summarize_with_interrupt(
+                    &messages,
+                    2,
+                    TEST_SENDABLE_BUDGET,
+                    &failing,
+                    &mut cmd_rx,
+                )
+                .await;
+            assert!(result.is_err(), "a non-size error must surface: {error}");
+
+            let streaming = SummaryMockProvider {
+                events: vec![LlmEvent::Error {
+                    error: error.to_string(),
+                }],
+                caps: Capabilities::openai(),
+            };
+            let (_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+            let result = cm
+                .summarize_with_interrupt(
+                    &messages,
+                    2,
+                    TEST_SENDABLE_BUDGET,
+                    &streaming,
+                    &mut cmd_rx,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a mid-stream non-size error must surface: {error}"
+            );
+        }
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report, L1 acceptance): the
+    /// END-TO-END post-condition. A real compaction through the provider stub
+    /// must leave a conversation that is ITSELF sendable — merely "smaller" is
+    /// not enough, because the very next request is the one that gets rejected.
+    ///
+    /// The fixture ends in an OPEN tool loop (the last assistant message is
+    /// still calling its tool, with a 120K-char result), so the cut retreats to
+    /// the last user turn and the whole loop — including the monster result —
+    /// is kept VERBATIM. That is exactly the shape the post-condition exists
+    /// for; with the cut landing after the last tool batch instead, the tail
+    /// would be tiny and this test would pass even with the post-condition
+    /// disabled (it did, until the fixture below was fixed).
+    #[tokio::test]
+    async fn compaction_result_is_sendable() {
+        let payload = "x".repeat(120_000);
+        let args = "{\"path\":\"src/lib.rs\"}";
+        let mut messages = vec![Message::system("system prompt")];
+        for i in 0..4 {
+            messages.push(Message::user_text(format!("question {i}")));
+            messages.push(Message::assistant(
+                format!("calling tool {i}"),
+                vec![crate::provider::ToolCall::new(
+                    format!("c{i}"),
+                    "read_files",
+                    args,
+                )],
+            ));
+            messages.push(Message::tool_result(format!("c{i}"), "read_files", &payload));
+        }
+        messages.push(Message::user_text("one more"));
+        messages.push(Message::assistant(
+            "calling tool 4",
+            vec![crate::provider::ToolCall::new("c4", "read_files", args)],
+        ));
+        messages.push(Message::tool_result("c4", "read_files", &payload));
+        let provider = SummaryMockProvider {
+            events: vec![
+                LlmEvent::TextDelta {
+                    text: "compact summary".into(),
+                },
+                LlmEvent::Finish {
+                    reason: crate::provider::FinishReason::Stop,
+                },
+            ],
+            caps: Capabilities::openai(),
+        };
+        let cm = ContextManager::new(128_000, 0.5);
+        let (_cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(4);
+        let sendable = 8_192;
+        let (result, buffered, stop, _) = cm
+            .summarize_with_interrupt(&messages, 2, sendable, &provider, &mut cmd_rx)
+            .await
+            .unwrap();
+        assert!(buffered.is_empty());
+        assert!(stop.is_none());
+        assert!(
+            result.len() < messages.len(),
+            "compaction must have dropped the summarized region"
+        );
+        let tokens = ContextManager::count_tokens(&result);
+        assert!(
+            tokens <= sendable,
+            "the compacted conversation must itself be sendable: {tokens} > {sendable}"
+        );
+        assert_tool_pairing_intact(&result);
+    }
+
+    /// The result budget must be derived from the TURN model's window and sit
+    /// strictly below it (the reply has to fit too) — the summarizer may be a
+    /// cheaper model with a different window, which is why request and result
+    /// are budgeted separately.
+    #[test]
+    fn sendable_budget_sits_below_the_window() {
+        let caps = Capabilities::openai();
+        let budget = sendable_budget(&caps);
+        assert_eq!(budget, context_budget(caps.max_context, caps.max_output_tokens));
+        assert!(
+            budget < caps.max_context,
+            "the result budget must leave room for the reply: {budget} vs {}",
+            caps.max_context
+        );
+        // A generous budget must not shrink an already-sendable history.
+        let messages = vec![Message::system("head"), Message::user_text("hello")];
+        let mut untouched = messages.clone();
+        enforce_sendable(&mut untouched, budget);
+        assert_eq!(untouched.len(), messages.len());
+        assert_eq!(untouched[1].content.as_text(), messages[1].content.as_text());
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report): budgeting only the
+    /// summarization REQUEST let the wedge survive compaction. The march keeps
+    /// recent messages verbatim, so a monster-heavy history compacts to a
+    /// still-over-window result — the user sees "Compacted", and the next
+    /// request is rejected exactly as before. The post-condition must bound the
+    /// RESULT: here by capping the runaway tool results (which keep their
+    /// re-run pointer, so the content is recoverable rather than lost).
+    #[tokio::test]
+    async fn enforce_sendable_bounds_the_compacted_result() {
+        let payload = "x".repeat(120_000);
+        let mut messages = vec![Message::system("system prompt")];
+        for i in 0..4 {
+            messages.push(Message::assistant(
+                format!("calling tool {i}"),
+                vec![crate::provider::ToolCall::new(
+                    format!("c{i}"),
+                    "read_files",
+                    format!("{{\"path\":\"src/agent/context.rs\",\"n\":{i}}}"),
+                )],
+            ));
+            messages.push(Message::tool_result(format!("c{i}"), "read_files", &payload));
+        }
+        messages.push(Message::user_text("newest message"));
+        let before = ContextManager::count_tokens(&messages);
+        assert!(
+            before > 50_000,
+            "fixture must be a runaway history: {before} tokens"
+        );
+
+        // The minimum legal sendable budget ([`context_budget`] floors here),
+        // far below the fixture — the same shape as the report's 7.2M-token
+        // history against a 1M window.
+        let budget = 8_192;
+        let mut result = vec![
+            messages[0].clone(),
+            Message::system("## Conversation summary\n\nsummary text"),
+        ];
+        result.extend(messages[1..].iter().cloned());
+        enforce_sendable(&mut result, budget);
+
+        let after = ContextManager::count_tokens(&result);
+        assert!(
+            after <= budget,
+            "compaction must be TOTAL: {after} tokens still over {budget}"
+        );
+        assert!(
+            after < before,
+            "the post-condition must shrink the history: {before} → {after}"
+        );
+        // The frame survives: the system head, the summary, and the newest turn.
+        assert_eq!(result[0].content.as_text(), "system prompt");
+        assert!(result[1].content.as_text().contains("## Conversation summary"));
+        assert_eq!(
+            result.last().expect("non-empty").content.as_text(),
+            "newest message",
+            "the newest message must always survive"
+        );
+        // Capping is the lossless-ish lever: the capped results are MARKED and
+        // keep the re-run pointer, so the agent can re-issue the call.
+        assert!(
+            result
+                .iter()
+                .any(|m| m.content.as_text().contains(COMPACTED_MARKER)),
+            "capped results must be marked"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|m| m.content.as_text().contains("read_files")),
+            "a capped result must keep its re-run pointer"
+        );
+        assert_tool_pairing_intact(&result);
+    }
+
+    /// Regression (2027-01-23 review HIGH 1): the drop lever must never orphan
+    /// a tool result. When the surviving tail IS a single open tool batch — the
+    /// batch's call plus its parallel results, ending on the newest message —
+    /// no non-tool boundary exists to start the new tail on. Dropping any of it
+    /// removes the call and leaves a dangling `tool_call_id`, which
+    /// `validate_request_messages` rejects on every LATER request; the context
+    /// is under the threshold by then, so auto-compaction never runs again and
+    /// the session is wedged for good. The batch stays whole and totality
+    /// yields to the untouchable core (system + summary + final batch).
+    #[test]
+    fn enforce_sendable_keeps_an_open_final_tool_batch_intact() {
+        let args = "{\"path\":\"src/agent/context.rs\"}";
+        let monster = "x".repeat(120_000);
+        let mut result = vec![
+            Message::system("system prompt"),
+            // The summary is big enough that the residual after the aggressive
+            // cap is still over budget — caps cannot touch a summary message.
+            Message::system(format!("## Conversation summary\n\n{}", "s".repeat(120_000))),
+            // One open batch: a call for TWO parallel results, ending on the
+            // newest message.
+            Message::assistant(
+                "final call",
+                vec![
+                    crate::provider::ToolCall::new("f1", "read_files", args),
+                    crate::provider::ToolCall::new("f2", "read_files", args),
+                ],
+            ),
+            Message::tool_result("f1", "read_files", &monster),
+            Message::tool_result("f2", "read_files", &monster),
+        ];
+        let budget = 8_192;
+        enforce_sendable(&mut result, budget);
+
+        // The whole batch survives: the call and BOTH results.
+        assert!(
+            result.iter().any(|m| m.tool_calls.len() == 2),
+            "the final batch's call must survive"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("f1")),
+            "the first parallel result must survive"
+        );
+        assert!(
+            result
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("f2")),
+            "the newest message must survive"
+        );
+        // The invariant a dangling tool_call_id would break.
+        assert_tool_pairing_intact(&result);
+        // Documented outcome: with no legal boundary the batch is kept whole, so
+        // the result can stay over the sendable budget. That is the intended
+        // trade — a request that is too large gets a clear provider error and
+        // the retry path, whereas an orphaned tool result would be rejected
+        // forever. The caller's stuck ladder handles the size case.
+        assert!(
+            ContextManager::count_tokens(&result) > budget,
+            "totality yields to the untouchable core: {} should exceed {budget}",
+            ContextManager::count_tokens(&result)
+        );
+        // Idempotent: a second pass changes nothing.
+        let before = result.len();
+        enforce_sendable(&mut result, budget);
+        assert_eq!(result.len(), before);
+        assert_tool_pairing_intact(&result);
+    }
+
+    /// Regression (2027-01-23 runaway-tool-output report): capping is not
+    /// always enough — an oversized history of big TEXT turns is untouched by
+    /// the tool-result cap, and only dropping the oldest tail messages can fit
+    /// it. The dropped end must never take the system message, the summary, or
+    /// the newest message with it, and must never orphan a tool result.
+    #[tokio::test]
+    async fn enforce_sendable_drops_oldest_turns_when_capping_is_not_enough() {
+        let mut result = vec![
+            Message::system("system prompt"),
+            Message::system("## Conversation summary\n\nsummary text"),
+        ];
+        for i in 0..20 {
+            let filler = "y".repeat(10_000);
+            result.push(if i % 2 == 0 {
+                Message::user_text(format!("turn {i} {filler}"))
+            } else {
+                Message::assistant(format!("turn {i} {filler}"), vec![])
+            });
+        }
+        result.push(Message::user_text("newest message"));
+        let fixture_len = result.len();
+        let before = ContextManager::count_tokens(&result);
+        assert!(before > 20_000, "fixture must be over budget: {before}");
+
+        enforce_sendable(&mut result, 8_192);
+
+        let after = ContextManager::count_tokens(&result);
+        assert!(after <= 8_192, "must fit the sendable window: {after}");
+        assert!(after < before, "must shrink: {before} → {after}");
+        assert!(
+            result.len() < fixture_len,
+            "the oldest turns must have been dropped: kept {} of {fixture_len}",
+            result.len()
+        );
+        assert_eq!(result[0].content.as_text(), "system prompt");
+        assert!(result[1].content.as_text().contains("## Conversation summary"));
+        assert_eq!(
+            result.last().expect("non-empty").content.as_text(),
+            "newest message",
+            "the newest message must always survive"
+        );
+        assert_tool_pairing_intact(&result);
     }
 }

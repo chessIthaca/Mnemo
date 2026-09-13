@@ -107,15 +107,51 @@ impl Error {
         if self.is_serialization_bug() {
             return true;
         }
+        // Context overflow: the prompt + requested output exceed the
+        // model's context window — permanent. The shared classification
+        // lives in is_context_overflow (compaction's mechanical fallback
+        // relies on it, so the size needles must stay in one place).
+        if self.is_context_overflow() {
+            return true;
+        }
         let s = match self {
             Error::Provider(msg) => msg.to_lowercase(),
             _ => return false,
         };
-        // Context overflow: the prompt + requested output exceed the
-        // model's context window. Retrying with the same prompt always
-        // fails (the prompt doesn't shrink between attempts). Covers native
-        // endpoints, LiteLLM proxy wrappers, and cloud gateway 500/502 errors
-        // that embed provider context overflow messages.
+        // Auth: the API key is wrong or missing. Retrying never helps.
+        s.contains("unauthorized")
+            || s.contains("auth_error")
+            || s.contains("virtual key expected")
+            // Model not found: the model name is wrong or unavailable.
+            // Retrying never helps.
+            || s.contains("notfounderror")
+            || (s.contains("model") && s.contains("not found"))
+    }
+
+    /// Whether this error is a context-window overflow — the prompt + output
+    /// exceed the model's context window.
+    ///
+    /// The shared classifier for size errors: [`is_non_retryable`](Self::is_non_retryable)
+    /// delegates its size needles here (retrying the same oversized prompt
+    /// never succeeds), and compaction's mechanical fallback uses it to
+    /// recognize when the summarizer cannot accept the history — the budget
+    /// guard makes the summarization prompt fit by construction, and a
+    /// provider whose reported window is smaller than its `Capabilities` (or
+    /// wording the budget missed) falls back to dropping the old region
+    /// instead of wedging the session.
+    ///
+    /// The check is string-based because provider errors arrive as
+    /// `Error::Provider(String)` — the HTTP status and body are folded into
+    /// the message text by the provider client. Covers native endpoints,
+    /// LiteLLM proxy wrappers, cloud gateway 500/502 errors that embed
+    /// provider context-overflow messages, native Anthropic Messages-API
+    /// wording ("prompt is too long: N tokens > M maximum"), and
+    /// DeepSeek/GLM-style "longer than the limit" 400s.
+    pub fn is_context_overflow(&self) -> bool {
+        let s = match self {
+            Error::Provider(msg) => msg.to_lowercase(),
+            _ => return false,
+        };
         s.contains("maximum context length")
             || s.contains("context length is")
             || s.contains("max_completion_tokens")
@@ -127,6 +163,7 @@ impl Error {
             || s.contains("reduce the length of the messages")
             || s.contains("exceeds the context window")
             || s.contains("exceeded the context window")
+            || s.contains("longer than the limit")
             || (s.contains("input_tokens")
                 && (s.contains("maximum")
                     || s.contains("exceeds")
@@ -137,14 +174,6 @@ impl Error {
             // LiteLLM gateway wraps it in OpenAI format, but native endpoints
             // return "prompt is too long: N tokens > M maximum").
             || s.contains("prompt is too long")
-            // Auth: the API key is wrong or missing. Retrying never helps.
-            || s.contains("unauthorized")
-            || s.contains("auth_error")
-            || s.contains("virtual key expected")
-            // Model not found: the model name is wrong or unavailable.
-            // Retrying never helps.
-            || s.contains("notfounderror")
-            || (s.contains("model") && s.contains("not found"))
     }
 
     /// Whether this error is a rate-limit (HTTP 429) — the provider rejected
@@ -275,12 +304,48 @@ mod tests {
             "litellm.ContextWindowExceededError: ContextWindowExceededError: OpenAIException - \
              exceeds the context window",
             "context_window_exceeded: input_tokens 150000 exceeds maximum allowable tokens",
+            // 2027-01-23 user report: DeepSeek-style 400 on a 7.2M-token tool
+            // history — the wording that wedged compaction.
+            "stream request: HTTP 400 from https://api.deepseek.com/v1 — \
+             {\"error\":{\"message\":\"The number of input tokens is longer than the limit: \
+             7211000 > 1000000\"}}",
         ];
         for msg in cases {
             let e = Error::Provider(msg.into());
             assert!(
                 e.is_non_retryable(),
                 "context overflow must be non-retryable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_overflow_is_classified_directly() {
+        // is_context_overflow is the shared classifier: is_non_retryable
+        // delegates the size needles to it, and compaction's mechanical
+        // fallback uses it to recognize when the summarizer cannot accept
+        // the history.
+        let cases = [
+            "stream request: HTTP 400 from https://api.deepseek.com/v1 — \
+             {\"error\":{\"message\":\"input is longer than the limit\"}}",
+            "This model's maximum context length is 262144 tokens",
+            "prompt is too long: 150001 tokens > 131072 maximum",
+            "litellm.ContextWindowExceededError: exceeds the context window",
+        ];
+        for msg in cases {
+            assert!(
+                Error::Provider(msg.into()).is_context_overflow(),
+                "context overflow must be classified: {msg}"
+            );
+        }
+        let negatives = [
+            "stream request: HTTP 401 — {\"error\":{\"message\":\"Unauthorized\"}}",
+            "failed to start stream: error sending request for url",
+        ];
+        for msg in negatives {
+            assert!(
+                !Error::Provider(msg.into()).is_context_overflow(),
+                "non-overflow error must not be classified: {msg}"
             );
         }
     }

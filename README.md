@@ -165,11 +165,7 @@ Two heavyweight optional cargo features exist on the library — `browser` (head
 
 ---
 
-## Proof, not promises
 
-Mnemo wrote itself. Its own development runs on its own harness — every change leaves a plan, an independent review, and a test suite behind. As of **September 2026**: 651 plans, 858 review reports, and 503 knowledge records in its own `.coding/` archive, ~210,000 lines of production Rust + TypeScript, and 2,625 Rust + 1,100 frontend tests.
-
----
 
 ## License
 

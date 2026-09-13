@@ -29,8 +29,6 @@ If you've iterated with coding agents, you know the pattern. The pain points Mne
 
 The spec-loop, enforced end to end: **spec → plan → code → test → review → commit**, with every artifact persisted — not remembered.
 
-Mnemo wrote itself. Its own development runs on its own harness — [~210,000 lines of production Rust + TypeScript](#proof-not-promises), with every change leaving a plan, an independent review, and a test suite behind.
-
 ---
 
 ## Highlights
@@ -152,6 +150,15 @@ npm test                   # frontend unit tests
 
 Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off by default for light builds; the app always selects both.
 
+## A few configs you should check right away
+
+In the config dialog download a semantic model that runs locally on your machine for the memory to be most effective and reindex after that.
+
+If you want in browser debugging you have to enable it in the advanced section of the config dialog.
+
+Have fun and let me know where we can improve things.
+Pull requests gratefully considered.
+
 ---
 
 ## Where the detail lives
@@ -165,11 +172,7 @@ Two heavyweight optional cargo features exist on the library — `browser` (head
 
 ---
 
-## Proof, not promises
 
-Mnemo wrote itself. Its own development runs on its own harness — every change leaves a plan, an independent review, and a test suite behind. As of **September 2026**: 651 plans, 858 review reports, and 503 knowledge records in its own `.coding/` archive, ~210,000 lines of production Rust + TypeScript, and 2,625 Rust + 1,100 frontend tests.
-
----
 
 ## License
 

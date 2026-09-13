@@ -96,7 +96,7 @@ describe("serializeChat", () => {
   const base: ChatDraft = {
     showTokenUsage: true,
     showToolImages: true,
-    showToolActivity: false,
+    showToolActivity: true,
     showKnowledgeActivity: true,
     showDelegationNotes: false,
     chatThreadLine: true,
@@ -117,7 +117,7 @@ describe("serializeChat", () => {
       serializeChat({ ...base, showToolImages: false }),
     );
     expect(serializeChat(base)).not.toBe(
-      serializeChat({ ...base, showToolActivity: true }),
+      serializeChat({ ...base, showToolActivity: false }),
     );
     expect(serializeChat(base)).not.toBe(
       serializeChat({ ...base, showDelegationNotes: true }),

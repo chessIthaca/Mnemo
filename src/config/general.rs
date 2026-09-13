@@ -362,9 +362,10 @@ pub struct UiConfig {
     /// image-parsing, skill announcements) in the chat transcript. GUI-only
     /// display filter: the transcript store and the model's context echo are
     /// unaffected — the Output tab and the console still log every tool call.
-    /// Defaults to `false` (the cards serve the model's self-visibility, not
-    /// the end user — a long agent turn otherwise buries the conversation
-    /// under dozens of cards); set `true` to show them.
+    /// Defaults to `true` — tool results show in the chat out of the box
+    /// (user request 2027-01-13, backlog 57687857); set `false` to hide them
+    /// (an explicit `show_tool_activity = false` in config opts out and wins
+    /// over the default).
     pub show_tool_activity: bool,
     /// Show knowledge-access activity cards (graph_* tool calls, memory tool
     /// calls, and auto-recall entries) in the chat transcript. GUI-only
@@ -422,7 +423,7 @@ impl Default for UiConfig {
             theme: "dark".to_string(),
             show_token_usage: true,
             show_tool_images: true,
-            show_tool_activity: false,
+            show_tool_activity: true,
             show_knowledge_activity: true,
             show_delegation_notes: false,
             chat_thread_line: true,
@@ -1023,13 +1024,12 @@ codegraph = false
     }
 
     #[test]
-    fn show_tool_activity_defaults_false() {
-        // Agent-activity cards are hidden out of the box (backlog db489070):
-        // they serve the model's self-visibility, not the end user — a long
-        // agent turn otherwise buries the conversation under dozens of cards.
-        // Users opt IN by setting show_tool_activity to true.
+    fn show_tool_activity_defaults_true() {
+        // Agent-activity cards are SHOWN out of the box (backlog 57687857 —
+        // user request 2027-01-13: tool results visible by default).
+        // Users opt OUT by setting show_tool_activity to false.
         let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.ui.show_tool_activity);
+        assert!(cfg.ui.show_tool_activity);
     }
 
     #[test]
@@ -1061,25 +1061,27 @@ sound_stopped_errors = false
 
     #[test]
     fn show_tool_activity_round_trips() {
+        // Explicit `false` (the user's opt-out) must survive a save/reload
+        // round trip; the default is covered by show_tool_activity_defaults_true.
         let text = r#"
 [ui]
 theme = "dark"
 show_token_usage = true
-show_tool_activity = true
+show_tool_activity = false
 "#;
         let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.ui.show_tool_activity);
+        assert!(!cfg.ui.show_tool_activity);
         // Re-serialize + re-parse.
         let back = toml::to_string(&cfg).unwrap();
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.ui.show_tool_activity);
+        assert!(!cfg2.ui.show_tool_activity);
     }
 
     #[test]
     fn show_delegation_notes_defaults_false() {
         // The AUTO-DELEGATED steering note is model guidance (the re-issue
-        // escape hatch), not end-user information — hidden out of the box,
-        // like show_tool_activity. Users opt in by setting it to true.
+        // escape hatch), not end-user information — hidden out of the box
+        // (users opt in by setting it to true).
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert!(!cfg.ui.show_delegation_notes);
     }

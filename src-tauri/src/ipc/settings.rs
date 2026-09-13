@@ -1283,7 +1283,7 @@ mod settings_dto_tests {
                 theme: "dark".into(),
                 show_token_usage: true,
                 show_tool_images: true,
-                show_tool_activity: false,
+                show_tool_activity: true,
                 show_knowledge_activity: true,
                 show_delegation_notes: false,
                 chat_thread_line: true,
@@ -1333,7 +1333,7 @@ mod settings_dto_tests {
         assert_eq!(v["context"]["summarize_at_fill_rate"], 0.3);
         assert_eq!(v["ui"]["theme"], "dark");
         assert_eq!(v["ui"]["show_token_usage"], true);
-        assert_eq!(v["ui"]["show_tool_activity"], false);
+        assert_eq!(v["ui"]["show_tool_activity"], true);
         assert_eq!(v["ui"]["show_knowledge_activity"], true);
         assert_eq!(v["ui"]["show_delegation_notes"], false);
         // The four chat-readability flags ride the ui object.
@@ -1398,7 +1398,7 @@ mod settings_dto_tests {
                 theme: "system".into(),
                 show_token_usage: false,
                 show_tool_images: false,
-                show_tool_activity: false,
+                show_tool_activity: true,
                 show_knowledge_activity: true,
                 show_delegation_notes: false,
                 chat_thread_line: true,

@@ -42,7 +42,7 @@ function resetStore(): void {
     runAll: { active: false, done: 0, total: 0, compacting: false, concurrency: 1, spawned: [], note: null },
     backlogDraft: "",
     backlogDraftImages: [],
-    showToolActivity: false,
+    showToolActivity: true,
     showKnowledgeActivity: true,
     chatThreadLine: true,
     chatProseCap: true,

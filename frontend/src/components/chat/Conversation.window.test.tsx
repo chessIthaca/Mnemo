@@ -42,7 +42,7 @@ function stateWith(
 
 function renderConversation(state: AgentState): string {
   // The activity toggles are store reads (initial values under SSR — the
-  // default showToolActivity=false is fine: user/assistant entries pass the
+  // default showToolActivity=true is fine: user/assistant entries pass the
   // filter regardless).
   return renderToStaticMarkup(<Conversation state={state} />);
 }

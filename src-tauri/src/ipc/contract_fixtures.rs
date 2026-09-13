@@ -249,7 +249,7 @@ fn dto_fixtures_match_serde() {
             theme: "dark".into(),
             show_token_usage: true,
             show_tool_images: true,
-            show_tool_activity: false,
+            show_tool_activity: true,
             show_knowledge_activity: true,
             show_delegation_notes: false,
             chat_thread_line: true,

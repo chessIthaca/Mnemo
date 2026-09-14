@@ -352,6 +352,32 @@ prompt = "Merge."
             merge.prompt.contains("MERGED into main"),
             "merge_to_main prompt carries the memory-cleanup step"
         );
+        // The remote sync (2026-09-13: a stale main surfaced as a rejected
+        // push only after the branch had already landed). The ORDERING is the
+        // point — a pull that runs after `git merge --no-ff <branch>` cannot
+        // prevent that, so pin sync-before-merge, not merely present. Both
+        // halves of the sync are pinned: a bare `git pull` with no prior fetch
+        // pulls a remote-tracking ref that may itself be stale.
+        let fetch = merge
+            .prompt
+            .find("git fetch origin")
+            .expect("merge_to_main prompt carries the fetch half of the sync");
+        let sync = merge
+            .prompt
+            .find("git pull --no-rebase")
+            .expect("merge_to_main prompt carries the remote-sync step");
+        let branch_merge = merge
+            .prompt
+            .find("--no-ff <branch>")
+            .expect("merge_to_main prompt carries the branch merge step");
+        assert!(
+            fetch < sync,
+            "the sync must fetch before it pulls (fetch at {fetch}, pull at {sync})"
+        );
+        assert!(
+            sync < branch_merge,
+            "the origin sync must precede the branch merge (sync at {sync}, merge at {branch_merge})"
+        );
     }
 
     #[test]

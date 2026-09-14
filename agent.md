@@ -18,6 +18,8 @@ command.
   commands — never Linux paths (`/c/AgenticCoder`) or bash syntax in the
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
+- Never commit to `main` — commit to the current feature branch.
+- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` (`git fetch` + `git pull --no-rebase`) before it merges the branch — the sync runs on `shell` (the `git` tool has no fetch/pull subcommand), while `git merge`/`git push` MUST go through the approval-gated `git` tool: `ShellTool` does not override `never_auto_for`, so a shell-invoked `git merge`/`push` would run unprompted even in Autonomous mode.
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,
@@ -79,9 +81,9 @@ command.
 
 ## Branch policy (working-branch topology)
 
-- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only ever receives merge commits (via the `merge_to_main` skill: `wt/*` → `main`). The old `develop` integration tier was removed (2026-08-24).
+- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only ever receives merge commits (via the `merge_to_main` skill: `wt/*` → `main`). The skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push), and only the sync runs on the shell tool; the merge and push stay on the approval-gated `git` tool. The old `develop` integration tier was removed (2026-08-24).
 - `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. `merge_to_main` deletes the merged branch after landing it, so no branches accumulate.
-- `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` (per-instance local state) are gitignored — never committed.
+- `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` + `instance.json` (per-instance local state) are gitignored — never committed.
 - After a git merge, the memory index converges automatically at the next project open (startup reconciliation re-derives on content-hash drift); in-session, Settings → Memory → "Rebuild index from files".
 - Never commit to main — commit to the current feature branch.
 - Parallel run-all (plan ffd7a86f) adds per-item worktree branches

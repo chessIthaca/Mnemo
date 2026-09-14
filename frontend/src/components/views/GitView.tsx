@@ -77,11 +77,12 @@ export function mergePrompt(branch: string): string {
   return `Merge branch '${branch}' into main and clean up. Steps:
 1. git status — if the working tree is dirty, commit uncommitted work on the current branch with a clear message (stash only if it belongs to another branch).
 2. If the current branch is not '${branch}', git checkout ${branch} first.
-3. git checkout main, then git merge --no-ff ${branch}.
-4. If there are merge conflicts, resolve them with file_edit taking the UNION of both sides' fixes — never drop a side's change; never use -X ours / -X theirs.
-5. VERIFY THE MERGED TREE BUILDS before cleanup: cd frontend; npm run build AND cd src-tauri; cargo build (the root cargo build never compiles the bin crate). After the merge also run root cargo test and frontend npm test, unpiped, reading $LASTEXITCODE. If anything fails, fix with file_edit and re-run until green.
-6. Once main has the merge commit AND everything is green, delete the branch with git branch -d ${branch} (never -D).
-7. Call skill_end to return to Planning. Do NOT push.`;
+3. git checkout main, then sync main with origin FIRST via shell (the git tool has no fetch/pull): git fetch origin + git pull --no-rebase (nothing new or no remote → continue; conflicts here too: resolve with file_edit taking the UNION of both sides, then git add + git commit to conclude the pull merge — never drop a side's change).
+4. git merge --no-ff ${branch} — use the git tool, never shell: the git tool forces the core-operation approval prompt, shell does not.
+5. If there are merge conflicts, resolve them with file_edit taking the UNION of both sides' fixes, then git add + git commit — never drop a side's change; never use -X ours / -X theirs.
+6. VERIFY THE MERGED TREE BUILDS before cleanup: cd frontend; npm run build AND cd src-tauri; cargo build (the root cargo build never compiles the bin crate). After the merge also run root cargo test and frontend npm test, unpiped, reading $LASTEXITCODE. If anything fails, fix with file_edit and re-run until green.
+7. Once main has the merge commit AND everything is green, delete the branch with git branch -d ${branch} (never -D).
+8. Call skill_end to return to Planning. Do NOT push.`;
 }
 
 /** Row Y for the i-th commit (commits are newest-first). */

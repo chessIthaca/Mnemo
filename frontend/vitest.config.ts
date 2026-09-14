@@ -35,6 +35,7 @@ export default defineConfig({
       "src/components/views/BacklogView.test.ts",
       "src/components/views/BacklogView.test.tsx",
       "src/components/views/DiffViewer.test.ts",
+      "src/components/views/GitView.test.ts",
       "src/components/views/GraphView.test.ts",
       "src/components/views/gitLanes.test.ts",
       "src/components/views/LlmTraceView.test.ts",

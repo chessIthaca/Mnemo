@@ -893,12 +893,22 @@ fn truncate_tool_result_at(messages: &mut [Message], idx: usize, keep_chars: usi
 /// cache on every request and dropping cache hits to ~46% (measured traces.jsonl
 /// id 15, glm-5.3-gcp, 2027-01-04).
 ///
-/// To prevent this, compaction uses a hysteresis high-water mark: while the count
-/// of intact (un-truncated) tool results is `<= keep_high`, this function is a
+/// To prevent this, compaction uses a hysteresis high-water mark over the
+/// TRUNCATABLE population — the results [`tool_result_is_truncatable`] can
+/// actually shrink: while that count is `<= keep_high`, this function is a
 /// strict no-op that mutates nothing, allowing consecutive requests to hit
-/// ~95% cache. Once the intact window exceeds `keep_high`, it cuts all but the
-/// newest `keep` intact results back to `summary_chars` plus [`COMPACTED_MARKER`]
-/// in a single pass.
+/// ~95% cache. Once it exceeds `keep_high`, it cuts all but the newest `keep`
+/// truncatable results back to `summary_chars` plus [`COMPACTED_MARKER`] in a
+/// single pass.
+///
+/// Measuring the truncatable population rather than the intact one is load-
+/// bearing: a result at or below `summary_chars + 100` is REFUSED by
+/// [`truncate_tool_result_at`] and left unmarked, so it stays intact forever.
+/// Counting those held the gate open on EVERY request in a real session (60+
+/// short results against `keep_high = 20`), and the sliding window then rewrote
+/// one already-sent result per turn — measured 70-78% cache where the same
+/// session reaches 99% whenever the prefix stays byte-stable (round-6 analysis,
+/// 2027-01-11, `.coding/analysis/cache-hit-6-report.md`).
 ///
 /// Returns the number of tool results newly truncated in this pass (0 on no-op).
 /// The caller should only reset token accounting when the return value is > 0.
@@ -965,10 +975,22 @@ pub fn compact_old_tool_results(
     // Hysteresis window: no-op while the intact window is below or at the
     // high-water mark. This keeps history byte-identical across batches so
     // the provider's longest-common-prefix cache holds.
+    //
+    // The gate counts the TRUNCATABLE population, not the intact one: a short
+    // result is refused by `truncate_tool_result_at` without being marked, so
+    // it stays intact forever. Counting those held the gate permanently open
+    // (60+ short results in a real session) and the sliding window then
+    // rewrote an already-sent result on every request.
+    let truncatable_indices: Vec<usize> = intact_indices
+        .iter()
+        .copied()
+        .filter(|&i| tool_result_is_truncatable(&messages[i], summary_chars))
+        .collect();
+
     let mut truncated_count = 0;
-    if intact_indices.len() > effective_high {
-        // Cut back to `keep` intact tool results in one pass.
-        let to_compact = &intact_indices[..intact_indices.len() - keep];
+    if truncatable_indices.len() > effective_high {
+        // Cut back to `keep` truncatable tool results in one pass.
+        let to_compact = &truncatable_indices[..truncatable_indices.len() - keep];
         for &idx in to_compact {
             if truncate_tool_result_at(messages, idx, summary_chars) {
                 truncated_count += 1;
@@ -1003,6 +1025,42 @@ pub fn compact_old_tool_results(
     }
 
     truncated_count
+}
+
+/// Whether [`truncate_tool_result_at`] would actually shrink this message.
+///
+/// Mirrors that function's refusal rules exactly: a text result at or below
+/// `keep_chars + 100` is refused AND left unmarked, and a multipart result
+/// without an image part is refused — while one that carries an image is always
+/// truncatable, because the payload (a base64 `data:` URL) IS the size. A
+/// refused result therefore stays in the intact population forever, which is
+/// why the hysteresis gate measures the TRUNCATABLE population instead
+/// (round-6 cache-hit analysis, 2027-01-11: counting unmarkable short results
+/// held the gate open on every request, so the sliding keep window rewrote one
+/// already-sent tool result per turn and broke the provider's prefix cache
+/// every time — 70-78% measured against 99% when the prefix stays stable).
+fn tool_result_is_truncatable(msg: &Message, keep_chars: usize) -> bool {
+    match &msg.content {
+        MessageContent::Text(s) => {
+            !s.contains(COMPACTED_MARKER) && s.chars().count() > keep_chars + 100
+        }
+        MessageContent::Parts(parts) => {
+            if !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. }))
+            {
+                return false;
+            }
+            let text: String = parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect();
+            !text.contains(COMPACTED_MARKER)
+        }
+    }
 }
 
 /// Append a synthetic user continuation when the boundary-aligned kept tail
@@ -2190,6 +2248,54 @@ mod tests {
                 m.content.as_text(),
                 b.content.as_text(),
                 "message {i} content was mutated below the high-water mark"
+            );
+        }
+    }
+
+    #[test]
+    fn short_results_do_not_hold_the_gate_open() {
+        // Round-6 cache-hit analysis (2027-01-11): `truncate_tool_result_at`
+        // refuses a result of <= summary_chars + 100 AND does not mark it, so
+        // short results never leave the intact population. Counting them kept
+        // the gate permanently open, and the sliding keep window then rewrote
+        // one already-sent tool result on EVERY request — breaking the
+        // provider prefix cache each time (70-78% hit where the same session
+        // reaches 99% whenever the prefix stays stable).
+        let mut messages = vec![
+            Message::text(Role::System, "system head"),
+            Message::text(Role::User, "user task"),
+        ];
+        // Two truncatable results FIRST, so the pre-fix window (keep=10 of the
+        // intact population) reaches them.
+        for i in 0..2 {
+            messages.push(Message::tool_result(
+                format!("long_{i}"),
+                "read_files",
+                format!("big result {i}: {}", "x".repeat(5_000)),
+            ));
+        }
+        // 24 short results: unmarkable by construction, permanently intact.
+        for i in 0..24 {
+            messages.push(Message::tool_result(
+                format!("short_{i}"),
+                "read_files",
+                format!("small result {i}: {}", "s".repeat(200)),
+            ));
+        }
+        let before = messages.clone();
+
+        let truncated = compact_old_tool_results(&mut messages, 10, 20, 500);
+
+        assert_eq!(
+            truncated, 0,
+            "2 truncatable results must not open a keep_high=20 gate: the gate \
+             has to measure what it can actually shrink, not the intact count"
+        );
+        for (i, (m, b)) in messages.iter().zip(&before).enumerate() {
+            assert_eq!(
+                m.content.as_text(),
+                b.content.as_text(),
+                "message {i} was rewritten although nothing was truncatable"
             );
         }
     }

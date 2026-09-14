@@ -1,0 +1,247 @@
+==============================================================================
+A. traces.jsonl — 11 record(s) (opt-in; provider-reported usage)
+==============================================================================
+window: 2026-09-14 03:01:14 .. 2026-09-14 03:02:30 UTC
+models: ['deepseek-v4.1-flash', 'glm-5.3-flash']
+providers: ['Ollama Cloud']
+SAMPLE WARNING: a handful of trace records is ground truth for the MECHANISM
+(real cached_tokens + exact prefix breaks), not for rates — request_stats (section C)
+carries the statistics.
+
+per record:
+  [ 0] id=149 2026-09-14 03:01:14 glm-5.3-flash nmsg=1 ntools=0 prompt=None cached={'cached': 0} sys_chars=80200 tail_chars=80200 finish=stop err=None cancelled=False guard_cut=None
+  [ 1] id=150 2026-09-14 03:01:22 deepseek-v4.1-flash nmsg=291 ntools=30 prompt=None cached={'cached': 86656} sys_chars=26993 tail_chars=89 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 2] id=151 2026-09-14 03:01:25 deepseek-v4.1-flash nmsg=293 ntools=30 prompt=None cached={'cached': 87296} sys_chars=26993 tail_chars=133 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 3] id=152 2026-09-14 03:01:28 deepseek-v4.1-flash nmsg=295 ntools=30 prompt=None cached={'cached': 87552} sys_chars=26993 tail_chars=2474 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 4] id=153 2026-09-14 03:01:32 deepseek-v4.1-flash nmsg=298 ntools=30 prompt=None cached={'cached': 89088} sys_chars=26993 tail_chars=4955 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 5] id=154 2026-09-14 03:01:41 deepseek-v4.1-flash nmsg=300 ntools=30 prompt=None cached={'cached': 89344} sys_chars=26993 tail_chars=4961 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 6] id=155 2026-09-14 03:01:51 deepseek-v4.1-flash nmsg=302 ntools=26 prompt=None cached={'cached': 6016} sys_chars=25831 tail_chars=151 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 7] id=156 2026-09-14 03:02:01 glm-5.3-flash nmsg=1 ntools=0 prompt=None cached={'cached': 0} sys_chars=32214 tail_chars=32214 finish=None err=None cancelled=False guard_cut=None
+  [ 8] id=157 2026-09-14 03:02:07 deepseek-v4.1-flash nmsg=304 ntools=34 prompt=None cached={'cached': 6016} sys_chars=27036 tail_chars=1161 finish=tool_calls err=None cancelled=False guard_cut=None
+  [ 9] id=158 2026-09-14 03:02:26 deepseek-v4.1-flash nmsg=306 ntools=34 prompt=None cached={'cached': 6528} sys_chars=27036 tail_chars=61 finish=tool_calls err=None cancelled=False guard_cut=None
+  [10] id=159 2026-09-14 03:02:30 deepseek-v4.1-flash nmsg=308 ntools=34 prompt=None cached={'cached': 0} sys_chars=27036 tail_chars=1001 finish=None err=None cancelled=False guard_cut=None
+
+usage cache-key inventory (per provider field name):
+  cached: 11/11 records
+
+request_json key inventory:
+  max_completion_tokens(11), messages(11), model(11), reasoning_effort(11), stream(11), stream_options(11), tools(9)
+
+==============================================================================
+B. prefix-break localizer (consecutive records, same model)
+==============================================================================
+k = first differing message index | HEAD=system rewritten | TOOLS=tools array
+rewritten while messages match | MID=an ALREADY-SENT message mutated in place
+(the R14 failure shape) | TAIL=pure append (healthy).
+predicted = tokens before the break (chars/4, ESTIMATE); a large positive
+delta with MID means our own mutation, a ~0 delta with low cached means the
+provider/proxy limit.
+
+  pair                     model              k   class   cached   pred_msg  pred_byte  from_end
+  [0->1] model switch (glm-5.3-flash -> deepseek-v4.1-flash): skipped
+  [ 1-> 2] 2026-09-14 03:01:25 deepseek-v4.1-flas 271  MID      87296      27916      28045        22
+  [ 2-> 3] 2026-09-14 03:01:28 deepseek-v4.1-flas 275  MID      87552      28650      28776        20
+  [ 3-> 4] 2026-09-14 03:01:32 deepseek-v4.1-flas 276  MID      89088      28786      28914        22
+  [ 4-> 5] 2026-09-14 03:01:41 deepseek-v4.1-flas 280  MID      89344      29166      29294        20
+  [ 5-> 6] 2026-09-14 03:01:51 deepseek-v4.1-flas   0  HEAD      6016          0          0       302
+  [6->7] model switch (deepseek-v4.1-flash -> glm-5.3-flash): skipped
+  [7->8] model switch (glm-5.3-flash -> deepseek-v4.1-flash): skipped
+  [ 8-> 9] 2026-09-14 03:02:26 deepseek-v4.1-flas 286  MID       6528      29561      29687        20
+  [ 9->10] 2026-09-14 03:02:30 deepseek-v4.1-flas 306  TAIL         0      33844      34095         2
+
+  --- MID at record 2, message index 271 (22 from the end), byte offset inside it: 517 ---
+      role=tool  prev_len=4336  cur_len=717
+      prev[...]: '  \\"Clean up now\\",\\n 345:         Brush,\\n 346:       )}\\n 347:       {renderOp(\\n 348:         \\"rebuild\\",\\n 349:         rebuild,\\n 350:         \\"Rebuild semantic search\\",\\n 351:         \\"Re-embeds every memory with the active embedd'
+      cur [...]: '  \\"Clean up now\\",\\n 345:         Brush,\\n 346:       )}\\n 347:       {renderOp…\\n[… truncated for context efficiency]\\n[re-read: read_files frontend/src/components/settings/sections/MemorySection.tsx:340-379, frontend/src/components/setti'
+  --- MID at record 3, message index 275 (20 from the end), byte offset inside it: 506 ---
+      role=tool  prev_len=2831  cur_len=546
+      prev[...]: 'he-hit + context optimization batch (id: 24b50248-5d2f-5b22-a59d-bd13753b8b2c, score: 0.87, strength: 1.00)\\n  Implement the 5 cache-hit + context optimization recommendations (R12-R15, R17) from the round-4 analysis: fix the cache-hit heur'
+      cur [...]: 'he-hit + context optimization batch (id: 24b50248-5d2f-5b22-a59d-bd13753b8b2c, s…\\n[… truncated for context efficiency]"'
+  --- MID at record 4, message index 276 (22 from the end), byte offset inside it: 509 ---
+      role=tool  prev_len=2697  cur_len=589
+      prev[...]: 'e 1789243994)\\ncache-hit-2-inventory.txt (file, 270 bytes, mtime 1789243994)\\ncache-hit-2-rawdiff.txt (file, 5688 bytes, mtime 1789243994)\\ncache-hit-2-report.md (file, 6573 bytes, mtime 1789243994)\\ncache-hit-2-structure.txt (file, 8537 by'
+      cur [...]: 'e 1789243994)\\ncache-hit-2-inventory.txt (file, 270 bytes, mtime 1789243994)\\nca…\\n[… truncated for context efficiency]\\n[re-read: read_files .coding/analysis]"'
+  --- MID at record 5, message index 280 (20 from the end), byte offset inside it: 513 ---
+      role=tool  prev_len=8745  cur_len=711
+      prev[...]: '% within-state pre-R14.\\n   7: \\n   8: ROOT CAUSE (proven from code + CONFIRMED EMPIRICALLY 2027-01-04): R14 tool-result compaction (shipped 2026-12-04, R12-R17 batch, commit 9f3f0d7) breaks the prefix cache on EVERY tool batch. `compact_ol'
+      cur [...]: '% within-state pre-R14.\\n   7: \\n   8: ROOT CAUSE (proven from code + CONFIRMED …\\n[… truncated for context efficiency]\\n[re-read: read_files .coding/knowledge/bug/2026-12-31-cache-hit-terrible-at-any-context-size-r14-per-b.md, .coding/anal'
+  --- HEAD at record 6, message index 0 (302 from the end), byte offset inside it: None ---
+      role=system  prev_len=26993  cur_len=25831
+      (differs by length/array position only)
+  --- MID at record 9, message index 286 (20 from the end), byte offset inside it: 504 ---
+      role=tool  prev_len=1193  cur_len=544
+      prev[...]: 'ptimization (id: 9676ee48-c5b7-5bb4-a617-279c6d0a44d2) — Analyze the current LLM trace log (.coding/logs/traces.jsonl) to measure the cache-hit rate after the R1–R3 prompt-management fixes, compare\\n- [semantic] PLAN: Trace log cache-hit an'
+      cur [...]: 'ptimization (id: 9676ee48-c5b7-5bb4-a617-279c6d0a44d2) — Analyze the current LLM…\\n[… truncated for context efficiency]"'
+
+pairs compared: 7   classification: {'MID': 5, 'HEAD': 1, 'TAIL': 1}
+
+B2. calibrated boundary check (provider prompt_tokens vs chars)
+
+  pair    prompt  tokens/char  cached  pre-break(tok)  post-break(tok)  cached~pre?
+  [ 1-> 2] 122,597        0.641   87296           71,929           50,668  NO (cached +15,367 above pre-break)
+  [ 2-> 3] 122,239        0.639   87552           73,514           48,725  NO (cached +14,038 above pre-break)
+  [ 3-> 4] 122,187        0.704   89088           81,458           40,729  YES (our mutation)
+  [ 4-> 5] 115,448        0.677   89344           79,287           36,161  YES (our mutation)
+  [ 5-> 6] 114,805        0.707    6016           15,112           99,693  YES (our mutation)
+  [ 8-> 9] 121,274        0.679    6528           80,598           40,676  NO (cached -74,070 above pre-break)
+  [ 9->10] 125,722        0.700       0           94,721           31,001  NO (cached -94,721 above pre-break)
+
+==============================================================================
+B3. hysteresis-gate audit (is the gate ever closed?)
+==============================================================================
+`compact_old_tool_results(messages, 10, 20, 500)` fires only while the
+INTACT population (tool results without the marker) exceeds keep_high=20.
+`truncate_tool_result_at` REFUSES to touch a result of <= keep_chars+100 and
+does NOT mark it (src/agent/context.rs:849-851) -> such results stay intact
+forever. If 11+ of them exist, `intact > 20` is true on EVERY request and
+the sliding keep window cuts one more already-sent result per request.
+
+  rec  toolmsgs  marked  intact  short(<=601)  truncatable  gate
+    0         0       0       0             0            0 closed
+    1       161      93      68            60            8 OPEN (fires)
+    2       162      94      68            61            7 OPEN (fires)
+    3       163      95      68            61            7 OPEN (fires)
+    4       165      97      68            61            7 OPEN (fires)
+    5       166      98      68            61            7 OPEN (fires)
+    6       167      98      69            62            7 OPEN (fires)
+    7         0       0       0             0            0 closed
+    8       168      98      70            62            8 OPEN (fires)
+    9       169      99      70            63            7 OPEN (fires)
+   10       170      99      71            63            8 OPEN (fires)
+
+Read it as: 'short' results are permanently unmarkable by construction, so
+the gate cannot close while short >= keep_high - keep + 1 = 11 (the recent
+window keeps at most 10 intact). 'truncatable' > 0 with the gate OPEN means
+this request rewrote an already-sent result — a guaranteed prefix break.
+
+==============================================================================
+C. request_stats (memory.db, always-on)
+==============================================================================
+rows: 1043  (loaded up-front — sections B2/C/D share the same set)
+window: 2026-09-12 .. 2026-09-14 UTC (epoch clock)
+models (6): deepseek-v4-flash, deepseek-v4-flash:0731, deepseek-v4.1-flash, glm-5.3, glm-5.3-flash, kimi-k3
+distinct sessions: 21
+main-loop rows (outcome=None AND purpose=None): 1037
+reporting models (6): deepseek-v4-flash, deepseek-v4-flash:0731, deepseek-v4.1-flash, glm-5.3, glm-5.3-flash, kimi-k3
+non-reporting models (0): 
+  (non-reporting = 0% BY CONSTRUCTION, excluded from the headline)
+
+  tier            n       hit%      cached          prompt     resets<50%
+  main reporting     1037     79.0%   103,985,348     131,709,658      183 (17.6%)
+  main all           1037     79.0%   103,985,348     131,709,658      183 (17.6%)
+
+per-model (main-loop rows; R = reporting tier):
+  model                          tier  n      hit%     resets   avgP      p90P      maxP
+  deepseek-v4-flash            R       454    83.7%      53    140,344   268,355   322,619
+  deepseek-v4-flash:0731       R       270    74.7%      57    131,801   226,149   242,195
+  deepseek-v4.1-flash          R       152    71.7%      39    126,144   191,512   218,023
+  glm-5.3-flash                R       130    78.7%      25     87,224   178,140   199,205
+  glm-5.3                      R        19    79.7%       5     81,360   122,168   124,255
+  kimi-k3                      R        12    42.4%       4     28,957    32,274    48,832
+
+per-session shape (sessions using the traced models, first 3 by size;
+request index is the position within the session):
+  session 958d6727-27ba-44 (deepseek-v4.1-flash), n=140:
+    0:70.2%  11:57.9%  22:61.7%  33:46.4%  44:59.4%  55:48.8%  66:83.9%  77:88.2%  88:88.9%  99:96.7%  110:56.4%  121:54.4%  132:84.6%
+  session 0fab53b2-369d-4d (glm-5.3-flash), n=52:
+    0:49.6%  4:82.8%  8:61.8%  12:73.9%  16:72.4%  20:68.4%  24:63.5%  28:78.5%  32:63.4%  36:60.2%  40:80.8%  44:81.1%  48:71.4%
+  session 97785ff5-3bf8-4d (glm-5.3-flash), n=18:
+    0:0.0%  1:91.3%  2:96.2%  3:96.1%  4:95.2%  5:91.0%  6:95.9%  7:90.5%  8:91.0%  9:84.4%  10:91.9%  11:96.3%  12:91.7%  13:96.1%  14:92.3%  15:94.8%  16:95.5%  17:94.5%
+
+prompt-size histogram (main reporting rows, 40K bins, hit% per bin):
+       0K-    40K  n=   104  hit=  60.8%
+      40K-    80K  n=   273  hit=  67.4%
+      80K-   120K  n=   157  hit=  79.0%
+     120K-   160K  n=   152  hit=  88.0%
+     160K-   200K  n=   138  hit=  81.2%
+     200K-   240K  n=   130  hit=  79.1%
+     240K-   280K  n=    69  hit=  79.0%
+     280K-   320K  n=     9  hit=  65.3%
+     320K-   360K  n=     5  hit=  96.9%
+
+miss buckets (main-loop rows; one bucket each, precedence SWITCH > COLD >
+NONREPORTING > CLIFF > STEADY). STEADY is the residual where a real
+prefix mutation or provider behavior must be hiding — it is the bucket
+section B's MID findings should be checked against:
+  bucket          n      share_n    miss_tokens   share_of_miss   hit%
+  STEADY            1000      96.4%      26,059,339           94.0%   79.9%
+  COLD                21       2.0%         260,415            0.9%   10.2%
+  SWITCH              16       1.5%       1,404,556            5.1%   14.5%
+  total misses: 27,724,310 tokens across 1,037 main-loop rows
+  reconciliation: buckets 1037 == main-loop rows 1037 -> OK
+
+==============================================================================
+E. mutation-path cross-check verdicts (code read, no edits)
+==============================================================================
+
+A. PERMANENT-OPEN HYSTERESIS GATE — BUG (avoidable), the steady-state cap
+   code: src/agent/context.rs::compact_old_tool_results (939-1006; gate at
+     969, intact population built at 950-963); truncate_tool_result_at
+     (829-851: the `s.chars().count() <= keep_chars + 100` early return at
+     849-851 returns false WITHOUT adding COMPACTED_MARKER); call site
+     src/agent/turn.rs:1602 = compact_old_tool_results(messages, 10, 20, 500).
+   evidence: B3 — intact 68-71 > keep_high 20 on EVERY request, of which
+     60-63 are permanently unmarkable short results and only 7-8 truncatable.
+     B — MID on 5/5 same-model pairs, always ~20 messages from the end,
+     byte offset 504-517 inside the result, 1193-8745 chars -> 544-717.
+     B2 — cached == the calibrated pre-break prefix on pairs 3->4/4->5
+     (prediction CONFIRMED): our own rewrite, not a provider limit.
+   consequence: ~36-41K tokens of tail re-billed EVERY request; steady
+     state 70-78% where 99.0-99.7% is reached whenever the prefix is stable.
+   fix direction: make the gate honest — count only TRUNCATABLE results
+     (len > keep_chars + 100) toward the high-water mark, or mark a short
+     result once so it leaves the intact population for good.
+
+B. HEAD REWRITE ON PLAN-KIND CHANGE - AVOIDABLE, deliberate design cost
+   code: src/workflow/mod.rs::schema_filter (458-474) freezes the ADVERTISED
+     schema once per plan (ToolFilter::PlanFrozen, src/tool/mod.rs:219-239)
+     and picks ExecutingResearch for kind=research - pinned by the test
+     schema_filter_research_plan_uses_executing_research (workflow/mod.rs:1836).
+   evidence: pair 5->6 HEAD - system 26,993 -> 25,831 chars, tools 30 -> 26,
+     cached collapses to 6,016 (the common system prefix). request_stats:
+     7 of 24 window rows at ~5% with ttft 15.7s/17.9s, then 99.7% recovery.
+   verdict: AVOIDABLE but a DESIGN DECISION - the research filter is
+     advertisement-only (dispatch enforces), so the schema COULD be the
+     stable superset for both kinds. Not changed here: it is documented
+     intent with its own test; the cost is now measured.
+
+C. NOT the cause (measured): the 340K cliff - the 320-360K bin hits 96.9%,
+   max prompt 322,619; non-reporting models - none in this dataset (all 6
+   models report cache); the R14 shape - hysteresis exists, but see A.
+
+D. INSTRUMENT: the trace log is appended while a request streams, so its
+   last line is a partial record (section A note) - any consumer must
+   tolerate it (the round-5 extractor crashed on it).
+
+==============================================================================
+F. the trace session in request_stats (real prompt_tokens → true hit%)
+==============================================================================
+rows in the trace window (2026-09-14 02:59:14 .. 2026-09-14 03:04:30 + pad),
+matched to the traced models — this is the session's TRUE cache picture:
+  #   time              model                    prompt    cached   hit%    ttft  out  purpose
+    0 2026-09-14 02:59:40 deepseek-v4.1-flash      92,355     6,016    6.5%   2894  731 None           None
+    1 2026-09-14 02:59:50 deepseek-v4.1-flash      94,644     6,016    6.4%   2342 1452 None           None
+    2 2026-09-14 02:59:57 deepseek-v4.1-flash     103,864    82,304   79.2%   1079 1179 None           None
+    3 2026-09-14 03:00:04 deepseek-v4.1-flash     108,176   103,808   96.0%    817 1011 None           None
+    4 2026-09-14 03:00:38 deepseek-v4.1-flash     108,794    82,688   76.0%   1467 5675 None           None
+    5 2026-09-14 03:00:49 deepseek-v4.1-flash     114,260    83,712   73.3%   1674 3178 None           None
+    6 2026-09-14 03:00:53 deepseek-v4.1-flash     119,509     6,016    5.0%   3140  213 None           None
+    7 2026-09-14 03:01:22 deepseek-v4.1-flash     117,528     6,016    5.1%   3116 5827 None           None
+    8 2026-09-14 03:01:25 deepseek-v4.1-flash     122,597    86,656   70.7%   1673  488 None           None
+    9 2026-09-14 03:01:28 deepseek-v4.1-flash     122,239    87,296   71.4%   2123   64 None           None
+   10 2026-09-14 03:01:32 deepseek-v4.1-flash     122,187    87,552   71.7%   1587  444 None           None
+   11 2026-09-14 03:01:41 deepseek-v4.1-flash     115,448    89,088   77.2%   1141  886 None           None
+   12 2026-09-14 03:01:51 deepseek-v4.1-flash     114,805    89,344   77.8%   1685 1445 None           None
+   13 2026-09-14 03:02:07 deepseek-v4.1-flash     114,227     6,016    5.3%  15772 2957 None           None
+   14 2026-09-14 03:02:25 deepseek-v4.1-flash     121,274     6,016    5.0%  17874 4616 None           None
+   15 2026-09-14 03:02:29 deepseek-v4.1-flash     125,722     6,528    5.2%   3635   78 None           None
+   16 2026-09-14 03:02:37 deepseek-v4.1-flash     126,117   125,696   99.7%    979  962 None           None
+   17 2026-09-14 03:02:39 deepseek-v4.1-flash     127,333   126,080   99.0%   1224   69 None           None
+   18 2026-09-14 03:02:43 deepseek-v4.1-flash     127,779   127,232   99.6%   1018  828 None           None
+   19 2026-09-14 03:03:32 deepseek-v4.1-flash     128,201   104,320   81.4%  49053   74 None           None
+   20 2026-09-14 03:03:35 deepseek-v4.1-flash     128,267   111,360   86.8%   1231  167 None           None
+   21 2026-09-14 03:04:21 deepseek-v4.1-flash     130,616   111,872   85.6%   1105 6557 None           None
+   22 2026-09-14 03:04:26 deepseek-v4.1-flash     136,027   112,128   82.4%   4829  783 None           None
+   23 2026-09-14 03:04:27 deepseek-v4.1-flash     136,834   135,936   99.3%   1322   77 None           None
+   24 2026-09-14 03:04:30 deepseek-v4.1-flash     136,884   113,152   82.7%   1761   70 None           None
+  window total: 2,995,687 prompt tokens, 1,902,848 cached → hit 63.5%

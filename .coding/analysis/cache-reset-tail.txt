@@ -1,0 +1,103 @@
+==============================================================================
+A. traces.jsonl - 6 parseable record(s), 0 partial
+==============================================================================
+window: 2026-09-14 10:06:17 .. 2026-09-14 10:07:35 UTC
+models: ['deepseek-v4-flash', 'deepseek-v4.1-flash']
+providers: ['Ollama Cloud', 'deepseek']
+
+per record (last 6 - index 0 is the OLDEST of the tail):
+  [0] id=57 2026-09-14 10:06:17 deepseek-v4.1-flash/Ollama Cloud
+      session=- nmsg=101 ntools=34 prompt=None cached=124176 hit=n/a
+      finish=tool_calls err=None cancelled=False guard_cut=None
+      head: len=24403 sha=cc1403365345 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 11 message(s)
+  [1] id=58 2026-09-14 10:06:25 deepseek-v4.1-flash/Ollama Cloud
+      session=- nmsg=103 ntools=34 prompt=None cached=125148 hit=n/a
+      finish=tool_calls err=None cancelled=False guard_cut=None
+      head: len=24403 sha=cc1403365345 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 11 message(s)
+  [2] id=59 2026-09-14 10:06:59 deepseek-v4.1-flash/Ollama Cloud
+      session=- nmsg=106 ntools=34 prompt=None cached=125950 hit=n/a
+      finish=tool_calls err=None cancelled=False guard_cut=None
+      head: len=24403 sha=cc1403365345 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 11 message(s)
+  [3] id=60 2026-09-14 10:07:10 deepseek-v4.1-flash/Ollama Cloud
+      session=- nmsg=109 ntools=34 prompt=None cached=20048 hit=n/a
+      finish=tool_calls err=None cancelled=False guard_cut=None
+      head: len=24403 sha=cc1403365345 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 22 message(s)
+  [4] id=61 2026-09-14 10:07:30 deepseek-v4.1-flash/Ollama Cloud
+      session=- nmsg=112 ntools=34 prompt=None cached=123188 hit=n/a
+      finish=tool_calls err=None cancelled=False guard_cut=None
+      head: len=24403 sha=cc1403365345 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 22 message(s)
+  [5] id=62 2026-09-14 10:07:35 deepseek-v4-flash/deepseek
+      session=- nmsg=114 ntools=26 prompt=None cached=13184 hit=n/a
+      finish=stop err=None cancelled=False guard_cut=None
+      head: len=24232 sha=ce08d83da304 fold_markers=none
+      head300: "You are a coding agent operating under a plan-first workflow. You help the user build software by reading files, writing code, running commands, and managing a plan.\n\nCORE PRINCIPLES:\n- Plan before you code: create_plan lays out your steps first.\n- Use the semantic memory system (memory_search)
+      last: role=user len=50 sha=29b55f7bd7de
+      last300: "<context footer — cache-stable sentinel, ignore>"
+      in-place compaction marker in request: 22 message(s)
+
+==============================================================================
+B. prefix-break localizer (consecutive pairs)
+==============================================================================
+  pair [0]->[1] id 57 -> 58
+      class=MID (already-sent message mutated in place) k=99 nmsg 101->103 ntools 34->34 tools_same=True
+      tokens_before_k~=62636 (chars/4 APPROXIMATION, tools excluded) actual_cached=125148 delta=62512
+      prev msg[99]=('user', '9359b362bc96', 2431)  cur msg[99]=('assistant', 'bbaa7b563b27', 120)
+  pair [1]->[2] id 58 -> 59
+      class=MID (already-sent message mutated in place) k=101 nmsg 103->106 ntools 34->34 tools_same=True
+      tokens_before_k~=62729 (chars/4 APPROXIMATION, tools excluded) actual_cached=125950 delta=63221
+      prev msg[101]=('user', '9359b362bc96', 2431)  cur msg[101]=('assistant', 'b1c3b5700d72', 173)
+  pair [2]->[3] id 59 -> 60
+      class=MID (already-sent message mutated in place) k=23 nmsg 106->109 ntools 34->34 tools_same=True
+      tokens_before_k~=8238 (chars/4 APPROXIMATION, tools excluded) actual_cached=20048 delta=11810
+      prev msg[23]=('tool', '20db556c3629', 30262)  cur msg[23]=('tool', 'e4558ffc7a4e', 628)
+  pair [3]->[4] id 60 -> 61
+      class=MID (already-sent message mutated in place) k=107 nmsg 109->112 ntools 34->34 tools_same=True
+      tokens_before_k~=55490 (chars/4 APPROXIMATION, tools excluded) actual_cached=123188 delta=67698
+      prev msg[107]=('user', '9359b362bc96', 2431)  cur msg[107]=('assistant', '2d6bb4764634', 256)
+  pair [4]->[5] id 61 -> 62
+      class=UNRELATED (session or model differs) k=0 nmsg 112->114 ntools 34->26 tools_same=False
+      tokens_before_k~=0 (chars/4 APPROXIMATION, tools excluded) actual_cached=13184 delta=13184
+      prev msg[0]=('system', '55d1709f1fc0', 24403)  cur msg[0]=('system', '2fd0da26132a', 24232)
+
+==============================================================================
+C. request_stats (always-on) - 15 newest rows
+==============================================================================
+  [ 0] 2026-09-14 10:12:17 deepseek-v4-flash c23b593c-995 prompt=177722 cached=174080 ttft=1453 main
+  [ 1] 2026-09-14 10:11:55 deepseek-v4-flash c23b593c-995 prompt=175091 cached=173056 ttft=1040 main
+  [ 2] 2026-09-14 10:11:52 deepseek-v4-flash c23b593c-995 prompt=174093 cached=170880 ttft=1129 main
+  [ 3] 2026-09-14 10:11:50 deepseek-v4-flash c23b593c-995 prompt=171890 cached=162944 ttft=1242 main
+  [ 4] 2026-09-14 10:11:39 deepseek-v4-flash c23b593c-995 prompt=163964 cached=155520 ttft=1183 main
+  [ 5] 2026-09-14 10:11:07 deepseek-v4-flash c23b593c-995 prompt=156580 cached=4992 ttft=1453 main
+  [ 6] 2026-09-14 10:10:42 deepseek-v4-flash c23b593c-995 prompt=148502 cached=139136 ttft=1302 main
+  [ 7] 2026-09-14 10:10:27 deepseek-v4-flash c23b593c-995 prompt=140045 cached=133376 ttft=1080 main
+  [ 8] 2026-09-14 10:09:49 deepseek-v4-flash c23b593c-995 prompt=134225 cached=126848 ttft=1080 main
+  [ 9] 2026-09-14 10:09:24 deepseek-v4-flash c23b593c-995 prompt=127714 cached=105344 ttft=1002 main
+  [10] 2026-09-14 10:08:57 deepseek-v4-flash c23b593c-995 prompt=106240 cached=104064 ttft=1049 main
+  [11] 2026-09-14 10:07:43 deepseek-v4-flash c23b593c-995 prompt=105398 cached=13184 ttft=1220 main
+  [12] 2026-09-14 10:07:35 deepseek-v4.1-flash c23b593c-995 prompt=125495 cached=123188 ttft=1709 main
+  [13] 2026-09-14 10:07:30 deepseek-v4.1-flash c23b593c-995 prompt=124025 cached=20048 ttft=9378 main
+  [14] 2026-09-14 10:07:10 deepseek-v4.1-flash c23b593c-995 prompt=144948 cached=125950 ttft=5488 main
+
+kinds in window: {'main': 15}
+newest main-loop rows (idx, session, prompt, cached): [(0, 'c23b593c-995', 177722, 174080), (1, 'c23b593c-995', 175091, 173056), (2, 'c23b593c-995', 174093, 170880), (3, 'c23b593c-995', 171890, 162944), (4, 'c23b593c-995', 163964, 155520)]
+

@@ -130,10 +130,16 @@ vitest (frontend), `tsc --noEmit` clean.
   as is the `.git` control plane (any path containing a `.git` component -
   planted hooks/`core.fsmonitor`); `keys.toml` is
   written with user-only permissions (Unix `0600` / Windows DACL).
-- **Structural perf.** All synchronous file-system I/O in the async agent
-  tools (`file_read`/`file_edit`/`file_write`/`file_append`/`search`/
+- **Structural perf.** Synchronous file-system I/O in the async agent tools'
+  `execute` paths (`file_read`/`file_edit`/`file_write`/`file_append`/`search`/
   `describe_image`) runs inside `tokio::task::spawn_blocking` so concurrent
-  multi-agent tool use cannot stall the async runtime.
+  multi-agent tool use cannot stall the async runtime. The one deliberate
+  exception is the approval-preview hook (`file_edit`/`file_write`
+  `approval_preview` → `prepare_for_approval`, called inline from
+  `dispatch::execute_tool_call`): one `canonicalize` plus one preview read on the
+  async task, the same accepted trade-off as `approval::is_project_scoped` (the
+  full caller list lives in `src/tool/agent/sandbox.rs`'s async-callers
+  contract).
 - **file_edit EOL-agnostic matching.** Literal/fuzzy edits match in LF space
   on BOTH sides (the content is projected to LF with a byte-offset map back
   to the original; the needle is normalized to LF), then the replacement is
@@ -390,8 +396,10 @@ prefix and re-bill the entire conversation (~40-75s of server-side prefill at
 late-plan context sizes). Dispatch re-checks the per-state `allowed_tools()`,
 so tools advertised by the frozen surface but not allowed in the current state
 (`complete_step`/`create_plan` during Reviewing, `finish` during Executing,
-every write tool during a research plan) are still rejected at dispatch —
-advertisement is frozen, enforcement is not.
+write tools during a research plan except on `.coding/**` artifacts) are still
+rejected at dispatch — advertisement is frozen, enforcement is not. The
+research write rule is path-scoped and lives in the dispatch layer, the only
+place that sees the call's target path.
 Outside an active plan (Planning/Complete) and for allow-listed sub-agents
 (reviewer/skill) the per-state filter applies unchanged.
 
@@ -425,7 +433,15 @@ shot.
 - `implementation` (default) — completing the root plan's last step enters
   `Reviewing`; `finish` is gated on a reviewer report.
 - `research` — completes straight to `Complete` (no review; for
-  investigation/planning that changes no source code).
+  investigation/planning that changes no source code). Its file tools are
+  denied by NAME (`ToolFilter::ExecutingResearch`) but pass at dispatch on
+  `.coding/**` ARTIFACT paths (2027-01-11) — source, docs, protected side-car
+  files and `..` escapes stay denied, so "no source diff" still holds. A root
+  that would skip review still owes one when an `implementation`/`bug_fixing`
+  SUB-plan completed OR was abandoned under it (`Workflow::review_required`,
+  persisted in the stack sidecar): the write filter keys on the ACTIVE plan
+  while the review decision keys on the ROOT kind, so without that flag nested
+  source edits shipped unreviewed.
 - `bug_fixing` — CONTAINED bug fixes use this kind (never `implementation`
   for a contained defect). A bug-triggered FEATURE (the fix adds
   capabilities, new dependencies, or spans multiple modules) belongs in

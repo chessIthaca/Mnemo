@@ -85,7 +85,12 @@ struct CreatePlanArgs {
     /// The plan kind — `implementation` (default, reviewed on completion),
     /// `research` (skips review, goes straight to Complete), or `bug_fixing`
     /// (locked 4-step skeleton + required `bug` param + BUG: memory at
-    /// finish). Defaults to `implementation` when omitted.
+    /// finish). Defaults to `implementation` when omitted. A research plan may
+    /// still write its own `.coding/**` artifacts with the file tools
+    /// (dispatch allows artifact paths only), and an implementation/bug_fixing
+    /// SUB-plan completing under a research root forces that root through
+    /// Reviewing — see `Workflow::review_required` and
+    /// `research_write_verdict`.
     #[serde(default)]
     kind: PlanKind,
     /// The bug symptom for `kind = bug_fixing` plans — REQUIRED (the tool
@@ -538,7 +543,7 @@ impl Tool for CreatePlanTool {
                     "kind": {
                         "type": "string",
                         "enum": ["implementation", "research", "bug_fixing"],
-                        "description": "Decides what happens when the ROOT plan's last step completes. 'implementation' (default) enters Reviewing — a code review before Complete. 'research' skips review, straight to Complete — only for work producing no source-code changes. 'bug_fixing' is for CONTAINED bug fixes — never 'implementation' for a contained defect: locked reproduce→root-cause→fix→verify skeleton, requires `bug`, auto-captures a BUG: memory at finish; context must name the regression-test design; provided steps persist as checkable '## Detailed steps' sub-items (the crash-resumption detail). A bug-triggered FEATURE (the fix adds capabilities, new dependencies, or spans multiple modules) belongs in kind=implementation with the bug documented as motivation in goal/context."
+                        "description": "Decides what happens when the ROOT plan's last step completes. 'implementation' (default) enters Reviewing — a code review before Complete. 'research' skips review, straight to Complete — only for work producing no source-code changes (its own .coding/ artifacts stay writable with the file tools; source writes are dispatch-denied, and a completed implementation/bug_fixing sub-plan forces this root's review). 'bug_fixing' is for CONTAINED bug fixes — never 'implementation' for a contained defect: locked reproduce→root-cause→fix→verify skeleton, requires `bug`, auto-captures a BUG: memory at finish; context must name the regression-test design; provided steps persist as checkable '## Detailed steps' sub-items (the crash-resumption detail). A bug-triggered FEATURE (the fix adds capabilities, new dependencies, or spans multiple modules) belongs in kind=implementation with the bug documented as motivation in goal/context."
                     },
                     "bug": {
                         "type": "string",

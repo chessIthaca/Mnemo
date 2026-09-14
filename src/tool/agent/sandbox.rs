@@ -18,11 +18,15 @@
 //! multi-agent tool use.
 //!
 //! The six async file/search tools (`file_read`, `file_edit`, `file_write`,
-//! `file_append`, `search`, `describe_image`) now wrap their entire blocking
-//! work — including the `validate` call — in one `spawn_blocking` closure
-//! (they `clone()` the cheap `Sandbox` and move it in). The two remaining
-//! sync-path callers each perform a *single* `canonicalize` and are kept sync
-//! by design, with the trade-off noted:
+//! `file_append`, `search`, `describe_image`) now wrap their ENTRY-POINT
+//! blocking work — including the `validate` call — in one `spawn_blocking`
+//! closure (they `clone()` the cheap `Sandbox` and move it in). Four sync-path
+//! callers remain in THIS crate's tool layer. The app's IPC file commands
+//! (`src-tauri/src/ipc/files.rs`) validate by design as well — inline on the
+//! async task or inside their own `spawn_blocking` closure depending on the
+//! command, never with `State` held across an await. Those four perform one
+//! `canonicalize` (the fourth adds one preview read) and are kept sync by
+//! design, with the trade-off noted:
 //! - [`crate::agent::approval::is_project_scoped`] — one `validate` per
 //!   tool-call approval decision; async-ifying it would make `needs_approval`
 //!   + its callers async (a larger cross-cutting seam). Low-leverage (one
@@ -30,6 +34,23 @@
 //! - `shell::resolve_cwd` — one `validate` + `is_dir` per shell command; the
 //!   command itself already runs via `tokio::process::Command` (async). Low
 //!   leverage (one syscall per command).
+//! - `dispatch::research_write_verdict` (2027-01-11, plan ee65fd4b) — the
+//!   research artifact carve-out: one `validate` plus a depth-bounded
+//!   `symlink_metadata` walk ([`Sandbox::lexical_path_is_link_free`]) per
+//!   file-tool-named call while a research plan executes. It runs **under the
+//!   workflow mutex** (the guard is held across it), so that hold grows by
+//!   those syscalls; it is bounded to the four `RESEARCH_ARTIFACT_TOOLS` names
+//!   and only fires while the filter is `ExecutingResearch`, so no other plan
+//!   kind or state can reach it.
+//! - the **approval-preview hook** — `Tool::approval_preview` called inline
+//!   from `dispatch::execute_tool_call` (no `spawn_blocking`) →
+//!   `file_edit`/`file_write::prepare_for_approval`, which calls `validate` /
+//!   `validate_for_creation` and then reads the file to build the diff. One
+//!   `canonicalize` + one preview read per *prompted* file-tool call, in the
+//!   same approval flow as `is_project_scoped`. Only those two tools override
+//!   the trait default (`file_append` and `convert_line_endings` have no hook);
+//!   their own `execute` paths ARE wrapped, so the hook is the exception rather
+//!   than the rule.
 //!
 //! Keeping `validate` sync preserves the clean `pub fn` API the tools + tests
 //! call directly; the heavy FS work (whole-file reads/writes, the search scan)
@@ -191,18 +212,29 @@ impl Sandbox {
     /// `path` may be either a canonical path (from [`validate`](Self::validate))
     /// or a lexically normalized one (from
     /// [`validate_for_creation`](Self::validate_for_creation)); both are
-    /// root-absolute, so the `strip_prefix(root)` + forward-slash normalization
-    /// makes the check work before the file exists (closing the creation gap).
+    /// root-absolute, so `strip_prefix(root)` yields the relative component walk
+    /// below — which works before the file exists (closing the creation gap).
     pub fn is_protected_write_target(&self, path: &Path) -> bool {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
-        // Lowercase the relative path before comparison: NTFS (Windows) is
-        // case-insensitive, so `.coding/SAFETY.TOML` resolves to the real
-        // protected file and must not bypass this guard. The comparison
-        // literals below are all lowercase ASCII, so they match case-variants.
-        let rel_str = rel
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase();
+        // Component-wise comparison, each component lowercased AND stripped of
+        // trailing dots/spaces. Two platform realities drive this:
+        //  * NTFS is case-insensitive, so `.coding/SAFETY.TOML` resolves to the
+        //    real protected file and must not bypass this guard.
+        //  * Win32 path normalization strips trailing dots/spaces from EVERY
+        //    component, so `.coding/plans./x.md` creates and writes inside the
+        //    real `.coding/plans/` — a string-prefix test on the raw spelling
+        //    misses it (review LOW-3, 2027-01-11).
+        // Trimming on POSIX as well over-refuses a directory literally named
+        // `plans.`, which is the fail-safe direction for a REFUSAL.
+        let comps: Vec<String> = rel
+            .components()
+            .map(|c| {
+                c.as_os_str()
+                    .to_string_lossy()
+                    .trim_end_matches(['.', ' '])
+                    .to_ascii_lowercase()
+            })
+            .collect();
 
         // NTFS Alternate Data Streams (ADS): on Windows, `file:stream` writes
         // a hidden stream attached to `file` — e.g. `.coding/memory.db:evil`
@@ -211,45 +243,120 @@ impl Sandbox {
         // after the drive prefix (the drive prefix `C:` is on the root, not
         // the final component, so it's not affected). This closes the ADS
         // exfiltration/tampering vector on protected files.
-        if let Some(file_name) = rel_str.rsplit('/').next() {
-            if file_name.contains(':') {
-                return true;
-            }
+        if comps.last().is_some_and(|c| c.contains(':')) {
+            return true;
         }
 
-        // The memory DB + codegraph DB, each with its SQLite sidecar files.
-        rel_str == ".coding/memory.db"
-            || rel_str == ".coding/memory.db-wal"
-            || rel_str == ".coding/memory.db-shm"
-            || rel_str == ".coding/codegraph.db"
-            || rel_str == ".coding/codegraph.db-wal"
-            || rel_str == ".coding/codegraph.db-shm"
-            || rel_str == ".coding/safety.toml"
-            || rel_str == ".coding/backlog.jsonl"
-            // The legacy pre-jsonl path stays protected (it may linger until
-            // git removes it after migration).
-            || rel_str == ".coding/backlog.json"
-            || rel_str.starts_with(".coding/plans/")
-            // Review reports are authored ONLY by the reviewer's
-            // write_review_report tool (constructor-granted) — never by the
-            // file tools, so the main agent cannot fabricate a report.
-            || rel_str.starts_with(".coding/reviews/")
-            // Knowledge records (typed semantic files) are authored ONLY
-            // through the memory tools' file-backed writer — never by the
-            // file tools (the writer is the sole sanctioned path).
-            || rel_str.starts_with(".coding/knowledge/")
-            // The .git control plane (2027-01-09 security review HIGH-1): a
-            // planted .git/hooks/pre-commit or .git/config (core.fsmonitor)
-            // executes unsandboxed on the next commit or an auto-approved
-            // `git status`. Any `.git` path component counts: the root
-            // control-plane dir, its contents, a nested repo's .git, and the
-            // plain `.git` FILE used by linked worktrees. Trailing dots and
-            // spaces are trimmed per component first (Win32 path normalization
-            // strips them, so mkdir(".git.") creates the real `.git`).
-            // Component equality only - .gitignore/.gitattributes stay writable.
-            || rel_str
-                .split('/')
-                .any(|c| c.trim_end_matches(['.', ' ']) == ".git")
+        // The `.git` control plane (2027-01-09 security review HIGH-1): a
+        // planted .git/hooks/pre-commit or .git/config (core.fsmonitor)
+        // executes unsandboxed on the next commit or an auto-approved
+        // `git status`. Any `.git` path component counts: the root
+        // control-plane dir, its contents, a nested repo's .git, and the
+        // plain `.git` FILE used by linked worktrees. Component equality only —
+        // .gitignore/.gitattributes stay writable.
+        if comps.iter().any(|c| c == ".git") {
+            return true;
+        }
+
+        // Only the `.coding/` side-car tree is protected by name, and
+        // everything BELOW one of these entries stays protected too (a nested
+        // write into them is the same refusal).
+        if !comps.first().is_some_and(|c| c == ".coding") {
+            return false;
+        }
+        match comps.get(1).map(String::as_str) {
+            // The memory DB + codegraph DB, each with its SQLite sidecar files,
+            // plus safety.toml and the backlog file. The legacy pre-jsonl path
+            // stays protected (it may linger until git removes it after
+            // migration).
+            Some(
+                "memory.db" | "memory.db-wal" | "memory.db-shm" | "codegraph.db"
+                | "codegraph.db-wal" | "codegraph.db-shm" | "safety.toml" | "backlog.jsonl"
+                | "backlog.json",
+            ) => true,
+            // Plan files, review reports and knowledge records are authored
+            // ONLY by their own tools' writers: review reports by the
+            // reviewer's `write_review_report` (constructor-granted — the main
+            // agent cannot fabricate one), knowledge records by the memory
+            // tools' file-backed writer, plan files by the plan tools.
+            Some("plans" | "reviews" | "knowledge") => true,
+            _ => false,
+        }
+    }
+
+    /// Whether `path` points at an ARTIFACT the file tools may write even under
+    /// a research plan: the `.coding/**` side-car tree, minus everything
+    /// [`is_protected_write_target`](Self::is_protected_write_target) refuses.
+    ///
+    /// This is the permission-GRANTING side of the path policy, so it fails
+    /// closed: `path` must already be root-absolute (a validated path — from
+    /// [`validate`](Self::validate) or
+    /// [`validate_for_creation`](Self::validate_for_creation), which also folds
+    /// `..` lexically and refuses escapes); anything else — an unresolved raw
+    /// argument, a path outside the root — is never an artifact.
+    ///
+    /// Protected entries deliberately stay OUT of the allowance, so the
+    /// research-plan carve-out in the dispatch layer (`execute_tool_call`) can
+    /// never widen into `.coding/plans/`, `.coding/reviews/`,
+    /// `.coding/knowledge/`, `.coding/backlog.jsonl`, the SQLite DBs,
+    /// `.coding/safety.toml`, or `.git/**`. The comparison is component-wise
+    /// (platform-correct separator handling) and case-insensitive — NTFS
+    /// resolves `.CODING/` to the same tree.
+    pub fn is_artifact_write_target(&self, path: &Path) -> bool {
+        // Fail closed on an unresolved path: a permission grant must never be
+        // inferred from an argument the caller has not normalized.
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        // Compare COMPONENTS, not a re-written string. A backslash is an
+        // ordinary name character on POSIX, so a string-level `\`→`/` fold
+        // (the idiom both predicates used before the 2027-01-11 review) would
+        // read the single component `.coding\\x.md` as `.coding/x.md` and grant a
+        // stray file in the repo root (review LOW-2b). `components()` splits
+        // exactly the way the platform does; the comparison is case-insensitive
+        // because NTFS resolves `.CODING/` to the same tree.
+        let mut comps = rel.components();
+        match comps.next() {
+            Some(std::path::Component::Normal(first))
+                if first.to_string_lossy().eq_ignore_ascii_case(".coding") => {}
+            _ => return false,
+        }
+        // A write always names a FILE under `.coding/` — the bare directory is
+        // not a writable target.
+        if comps.next().is_none() {
+            return false;
+        }
+        !self.is_protected_write_target(path)
+    }
+
+    /// Whether a LEXICALLY resolved path (from
+    /// [`validate_for_creation`](Self::validate_for_creation)) can be trusted:
+    /// `true` only when no component that already exists is a symlink or a
+    /// Windows junction — including a dangling one.
+    ///
+    /// The research artifact carve-out judges the lexical form only when
+    /// [`validate`](Self::validate) refused the path (nothing to canonicalize
+    /// yet). This is that fallback's fail-closed companion: a link inside
+    /// `.coding/` pointing out of the root reads as an artifact in lexical form
+    /// while the OS would follow the link at write time, so a grant inferred
+    /// from the spelling must never survive a link component. Components that do
+    /// not exist yet cannot be links (nothing below them exists either), so the
+    /// walk stops at the first missing one.
+    pub fn lexical_path_is_link_free(&self, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut prefix = self.root.clone();
+        for comp in rel.components() {
+            prefix.push(comp);
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(meta) if meta.file_type().is_symlink() => return false,
+                Ok(_) => {}
+                // Not created yet — nothing below it can exist either.
+                Err(_) => return true,
+            }
+        }
+        true
     }
 
     /// Validate a path for a write operation, implementing the full creation
@@ -539,6 +646,161 @@ mod tests {
         assert!(
             sandbox.is_protected_write_target(&validated),
             "non-existent safety.toml must be protected"
+        );
+    }
+
+    // --- research-plan artifact allowance (2027-01-11) ---
+
+    #[test]
+    fn artifact_target_is_the_coding_tree_minus_protected() {
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        // Side-car artifacts are artifacts in both path forms: the lexical
+        // creation path and the canonical (existing-file) path.
+        std::fs::create_dir_all(dir.path().join(".coding/analysis")).unwrap();
+        for raw in [
+            ".coding/analysis/cache-report.md",
+            ".CODING/Analysis/Report.MD",
+        ] {
+            let created = sandbox.validate_for_creation(Path::new(raw)).unwrap();
+            assert!(
+                sandbox.is_artifact_write_target(&created),
+                "{raw} (creation form) must be an artifact"
+            );
+            // The canonical form needs the parent to EXIST, and on a
+            // case-sensitive filesystem `.CODING/Analysis` is a DIFFERENT
+            // directory than the one just created — so the case variant only
+            // resolves on Windows (review LOW-2, round 3).
+            #[cfg(windows)]
+            {
+                let canonical = sandbox.validate(Path::new(raw)).unwrap();
+                assert!(
+                    sandbox.is_artifact_write_target(&canonical),
+                    "{raw} (canonical form) must be an artifact"
+                );
+            }
+        }
+        // The canonical-form assertion stays unconditional for the lowercase
+        // spelling, which resolves on every platform.
+        let canonical = sandbox
+            .validate(Path::new(".coding/analysis/cache-report.md"))
+            .unwrap();
+        assert!(sandbox.is_artifact_write_target(&canonical));
+        // The protected entries INSIDE .coding/ stay out of the allowance.
+        for raw in [
+            ".coding/plans/stack.json",
+            ".coding/reviews/2026-04-08-review.md",
+            ".coding/knowledge/decision/2026-08-23-x.md",
+            ".coding/backlog.jsonl",
+            ".coding/memory.db",
+            ".coding/safety.toml",
+            ".git/hooks/pre-commit",
+        ] {
+            let created = sandbox.validate_for_creation(Path::new(raw)).unwrap();
+            assert!(
+                !sandbox.is_artifact_write_target(&created),
+                "{raw} must stay protected (not an artifact)"
+            );
+        }
+        // Source, docs and config are never artifacts.
+        for raw in [
+            "src/lib.rs",
+            "frontend/src/App.tsx",
+            "docs/FEATURES.md",
+            "README.md",
+        ] {
+            let created = sandbox.validate_for_creation(Path::new(raw)).unwrap();
+            assert!(
+                !sandbox.is_artifact_write_target(&created),
+                "{raw} is not an artifact"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_target_rejects_traversal_escapes() {
+        // The trap the dispatch carve-out leans on: `.coding/..` must never be
+        // read as "inside .coding/". Two layers close it — the resolver folds
+        // `..` lexically (so the escape is either refused as out-of-root or
+        // resolved to its true target), and the predicate then judges the
+        // FOLDED path.
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        // Folds back INSIDE the root, onto a source file: resolves fine, but is
+        // NOT an artifact — a naive `starts_with(".coding/")` on the raw
+        // argument would have said it was.
+        let folded = sandbox
+            .validate_for_creation(Path::new(".coding/../src/main.rs"))
+            .unwrap();
+        assert!(folded.starts_with(sandbox.root()));
+        assert!(folded.ends_with("src/main.rs"));
+        assert!(
+            !sandbox.is_artifact_write_target(&folded),
+            ".coding/../src/main.rs must not count as an artifact"
+        );
+        // Escapes ABOVE the root are refused outright.
+        for raw in ["../.coding/x.md", ".coding/../../outside.md"] {
+            let err = sandbox.validate_for_creation(Path::new(raw)).unwrap_err();
+            assert!(
+                matches!(err, Error::PathOutsideRoot(_)),
+                "{raw} must be refused as outside the root, got {err:?}"
+            );
+        }
+        // A raw, unresolved argument is never an artifact: the
+        // permission-granting side fails closed.
+        assert!(!sandbox.is_artifact_write_target(Path::new(".coding/analysis/x.md")));
+    }
+
+    #[test]
+    fn protected_check_trims_win32_trailing_dots_and_spaces() {
+        // Win32 path normalization strips trailing dots/spaces from every
+        // component, so `.coding/plans./x.md` creates and writes INSIDE the
+        // real `.coding/plans/` — the protected check must match what the
+        // filesystem does, not the spelling (review LOW-3, 2027-01-11).
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        for raw in [
+            ".coding/plans./x.md",
+            ".coding/reviews./2026-04-08-review.md",
+            ".coding/knowledge./spec/x.md",
+            ".coding/memory.db.",
+            ".coding/codegraph.db ",
+            ".coding/safety.toml.",
+            ".coding/backlog.jsonl ",
+            ".git./hooks/pre-commit",
+        ] {
+            let created = sandbox.validate_for_creation(Path::new(raw)).unwrap();
+            assert!(
+                sandbox.is_protected_write_target(&created),
+                "{raw} must be protected (Win32 strips the trailing dot/space)"
+            );
+            assert!(
+                !sandbox.is_artifact_write_target(&created),
+                "{raw} must not be an artifact either"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_grant_does_not_fold_posix_backslashes() {
+        // A backslash is an ordinary name character on POSIX, so
+        // `.coding\x.md` is ONE component: a stray file in the repo root, not
+        // an artifact. Folding `\`→`/` (the REFUSAL-side idiom, where a false
+        // positive is fail-safe) would silently grant it (review LOW-2b).
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        let created = sandbox
+            .validate_for_creation(Path::new(".coding\\x.md"))
+            .unwrap();
+        #[cfg(windows)]
+        assert!(
+            sandbox.is_artifact_write_target(&created),
+            "on Windows a backslash IS the separator: this is .coding/x.md"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !sandbox.is_artifact_write_target(&created),
+            "on POSIX .coding\\x.md is a repo-root file, never an artifact"
         );
     }
 

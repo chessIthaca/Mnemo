@@ -87,6 +87,7 @@ export default defineConfig({
       "src/components/projects/projectPickerPhases.test.ts",
       "src/components/resizeHandleMotif.test.ts",
       "src/lib/tauri.test.ts",
+      "src/lib/windowRestore.test.ts",
       "src/lib/vitestInclude.test.ts",
       "src/App.shellRender.test.ts",
     ],

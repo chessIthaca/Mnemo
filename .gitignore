@@ -55,6 +55,10 @@ Thumbs.db
 # The plan STACK is per-worktree live state (which plan is active in THIS
 # worktree) — tracked plans/*.md are the history, the stack pointer is not.
 .coding/plans/stack.json
+# Each running instance writes its own {pid, started_at} marker here (last
+# writer wins) — per-instance ephemeral state like the stack pointer, so the
+# merge flow must not drag pid churn into main (nor conflict on it).
+.coding/instance.json
 # Scratch shards from in-session payload-decomposition workarounds — never commit.
 .coding/tmp-shard/
 # Parallel run-all worktrees (plan ffd7a86f) — linked worktrees for

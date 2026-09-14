@@ -56,6 +56,60 @@ const REDIRECT_NOTE: &str = "TIP: output redirection detected — failure detail
 /// `1>$null`, `2>&1>$null` all contain one of these substrings). C4: the
 /// redirect hides failure details the tool would have surfaced, so the
 /// result carries a one-line warning.
+/// Whether a shell command runs a core git operation (`git merge`, `git push`,
+/// or whatever `[git] core_operations` lists).
+///
+/// The shell tool bypassed the core-operation gate until 2027-01-11: `git`
+/// raises it through `Tool::never_auto_for`, but `shell git push` sailed past
+/// the always-on prompt that agent.md, the APP RULES and the merge-confirmation
+/// dialog all promise (found while fixing merge_to_main, plan d826b9ad).
+///
+/// Conservative by construction: only a `git` executable at the START of a
+/// command segment counts, so a command that merely mentions the words (a path,
+/// an echoed string, a commit message) is never gated. Known residual, matching
+/// the one the git tool's own guard documents: an alias, a wrapper script, or
+/// `sh -c "git push"` still evades.
+fn command_is_core_git_op(command: &str, core_operations: &[String]) -> bool {
+    // LF and CR are built from bytes: an escaped char literal in this spot was
+    // mangled by the editing tooling once already, and a byte-built char is
+    // exact for ASCII.
+    let lf = char::from(10u8);
+    let cr = char::from(13u8);
+    let lowered = command.to_ascii_lowercase();
+    lowered
+        .split(|c: char| c == ';' || c == '|' || c == '&' || c == lf || c == cr)
+        .any(|segment| {
+            let mut tokens = segment.split_whitespace();
+            let Some(exe) = tokens.next() else {
+                return false;
+            };
+            if exe != "git" && exe != "git.exe" {
+                return false;
+            }
+            // Step over git's global options (and the value of the ones that
+            // take one) to reach the subcommand.
+            let mut sub = None;
+            while let Some(tok) = tokens.next() {
+                if matches!(
+                    tok,
+                    "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
+                ) {
+                    let _ = tokens.next();
+                    continue;
+                }
+                if tok.starts_with('-') {
+                    continue;
+                }
+                sub = Some(tok);
+                break;
+            }
+            match sub {
+                Some(sub) => core_operations.iter().any(|c| c.eq_ignore_ascii_case(sub)),
+                None => false,
+            }
+        })
+}
+
 fn has_blinding_redirection(command: &str) -> bool {
     command.contains(">$null") || command.contains(">/dev/null") || command.contains(">nul")
 }
@@ -107,6 +161,10 @@ pub struct ShellTool {
     /// shares the handle, so a config save is observed on the next command
     /// without a registry rebuild.
     filter_config: Arc<RwLock<ShellFilterConfig>>,
+    /// Shared, runtime-mutable core-operation list (`[git] core_operations`,
+    /// the SAME handle `GitTool` holds). Seeded by the factory so a Settings →
+    /// Git save takes effect on the next shell call without a registry rebuild.
+    core_operations: Arc<RwLock<Vec<String>>>,
 }
 
 impl ShellTool {
@@ -116,6 +174,7 @@ impl ShellTool {
             sandbox,
             timeout: DEFAULT_TIMEOUT,
             filter_config: Arc::new(RwLock::new(ShellFilterConfig::default())),
+            core_operations: Arc::new(RwLock::new(vec!["merge".to_string(), "push".to_string()])),
         }
     }
 
@@ -131,6 +190,16 @@ impl ShellTool {
     /// command.
     pub fn with_filter_config(mut self, cfg: Arc<RwLock<ShellFilterConfig>>) -> Self {
         self.filter_config = cfg;
+        self
+    }
+
+    /// Wire the shared core-operation list (mirrors
+    /// `GitTool::with_core_operations`). `git merge`/`git push` run through
+    /// `shell` must raise the same always-on approval prompt the `git` tool
+    /// raises; without this handle the shell guard could only use a hard-coded
+    /// default and would drift from the Settings → Git list.
+    pub fn with_core_operations(mut self, ops: Arc<RwLock<Vec<String>>>) -> Self {
+        self.core_operations = ops;
         self
     }
 
@@ -188,6 +257,22 @@ impl Tool for ShellTool {
 
     fn safety(&self) -> SafetyLevel {
         SafetyLevel::NeedsApproval
+    }
+
+    /// `git merge`/`git push` (and whatever `[git] core_operations` lists) must
+    /// raise the interactive approval prompt even in Autonomous mode — the same
+    /// always-on gate `GitTool` enforces. Without this override a shell-invoked
+    /// `git push` ran UNPROMPTED, contradicting agent.md, the APP RULES and the
+    /// merge-confirmation dialog (plan d826b9ad follow-up A, 2027-01-11).
+    fn never_auto_for(&self, args: &serde_json::Value) -> bool {
+        let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let ops = self
+            .core_operations
+            .read()
+            .expect("core_operations lock poisoned");
+        command_is_core_git_op(command, &ops)
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
@@ -325,6 +410,56 @@ mod tests {
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
         ShellTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    #[test]
+    fn core_git_op_detection_is_conservative_and_list_driven() {
+        // Follow-up A (2027-01-11): `shell git push` used to bypass the
+        // always-on core-operation prompt that the git TOOL raises. The guard
+        // only fires on a `git` executable at the START of a command segment,
+        // so a command that merely mentions the words stays auto-runnable.
+        let ops = vec!["merge".to_string(), "push".to_string()];
+        for cmd in [
+            "git push origin main",
+            "git merge --no-ff wt/mnemo",
+            "git.exe push",
+            "git -C repo push",
+            "git --no-pager merge",
+            "cd repo && git push",
+            "foo; git push",
+            "git push | Select-String x",
+        ] {
+            assert!(command_is_core_git_op(cmd, &ops), "{cmd} must be gated");
+        }
+        for cmd in [
+            "git status",
+            "git log --oneline -5",
+            "git pull --no-rebase",
+            "cargo test",
+            "echo git-push-note",
+            "rg 'git push' src/",
+            "git commit -m \"mention git push\"",
+        ] {
+            assert!(
+                !command_is_core_git_op(cmd, &ops),
+                "{cmd} must stay auto-runnable"
+            );
+        }
+        // The list is runtime-driven (Settings → Git), exactly like the git
+        // tool's guard.
+        let custom = vec!["checkout".to_string()];
+        assert!(command_is_core_git_op("git checkout main", &custom));
+        assert!(!command_is_core_git_op("git push", &custom));
+    }
+
+    #[test]
+    fn never_auto_for_reads_the_command_argument() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        assert!(tool.never_auto_for(&serde_json::json!({"command": "git push"})));
+        assert!(!tool.never_auto_for(&serde_json::json!({"command": "ls"})));
+        // No command argument at all (a malformed call) must not gate.
+        assert!(!tool.never_auto_for(&serde_json::json!({})));
     }
 
     #[test]

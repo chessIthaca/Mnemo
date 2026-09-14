@@ -1595,8 +1595,8 @@ fn redacted_record_line(record: &LlmRequestRecord) -> Option<String> {
 /// *latest* state. Keeping a record's JSON to exactly one line preserves the
 /// one-row-per-request invariant (pretty-printing would break it).
 ///
-/// Deliberate debugging-aid tradeoffs (unchanged from the synchronous
-/// implementation, plus one new one):
+/// Deliberate debugging-aid tradeoffs (the asynchronous writer below is newer
+/// than the original synchronous implementation; the caps are unchanged):
 /// - **The file is capped** at [`MAX_TRACE_FILE_BYTES`], with residual
 ///   behavior to be aware of: below the cap each writer wakeup still re-reads
 ///   + rewrites the whole file (up to ~`MAX_TRACE_FILE_BYTES` of I/O per
@@ -1605,10 +1605,12 @@ fn redacted_record_line(record: &LlmRequestRecord) -> Option<String> {
 ///   "recent history past 8 MiB", not a complete log. With a hot ring
 ///   (`MAX_RECORDS` × 2 MiB bodies can exceed the cap on their own) the file
 ///   can oscillate grow→fresh-start.
-/// - **The write is not atomic** — `std::fs::write` can tear the file on a
-///   mid-write crash, losing previously logged lines (a write-to-temp-then
-///   -rename would be crash-safe but is skipped here as overkill for a
-///   debugging aid).
+/// - **The write is atomic** — the merged file goes to a temp file in the same
+///   directory and is renamed over the target, so a reader sees either the old
+///   file or the new one, never a truncated or half-written one
+///   ([`write_mirror_atomically`]). A failed temp write or rename leaves the
+///   previous mirror in place, intact, and the batch is retried on the next
+///   writer wakeup.
 /// - **The write is asynchronous** — it happens on the writer thread, after
 ///   the update that queued it returned. The file is eventually-latest per
 ///   id; a crash before the writer drains can lose the most recent state.
@@ -1632,6 +1634,20 @@ fn write_records_to_file(path: &Path, records: &[LlmRequestRecord]) {
         String::new()
     } else {
         std::fs::read_to_string(path).unwrap_or_default()
+    };
+    // A kill during a previous rewrite leaves a half-written final line, and a
+    // concurrent reader can observe one while a rewrite is in flight. Such a
+    // fragment has no id, so it can never be merged — and keeping it verbatim
+    // (the behavior until 2027-01-11) carried the corruption forward into every
+    // later rewrite. The writer always terminates its output with '\n', so a
+    // missing trailing newline is exactly the fragment signature.
+    // (LF spelled as 0x0a byte: an escape sequence in this literal kept getting
+    // mangled by the editing tooling, and a byte compare on ASCII LF is exact.)
+    let existing = if existing.is_empty() || existing.as_bytes().last() == Some(&0x0a) {
+        existing
+    } else {
+        let keep = existing.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        existing[..keep].to_string()
     };
     let mut replaced: Vec<bool> = vec![false; lines.len()];
     let mut out: Vec<String> = Vec::new();
@@ -1663,10 +1679,48 @@ fn write_records_to_file(path: &Path, records: &[LlmRequestRecord]) {
     }
     let mut content = out.join("\n");
     content.push('\n');
-    let _ = std::fs::write(path, content);
+    write_mirror_atomically(path, &content);
+}
+
+/// Replace the mirror file atomically: write a temp file in the same directory,
+/// restrict it to the current user, then rename it over the target.
+///
+/// Why not `std::fs::write`: the mirror MERGES the ring into the file, so every
+/// writer wakeup rewrites the whole thing — and `fs::write` truncates first. A
+/// concurrent reader (the analysis tooling reads this file live) could therefore
+/// observe an empty file or a half-written final line, and a kill mid-write left
+/// the truncation on disk permanently: the 444 KB unterminated line found in
+/// `.coding/logs/traces.jsonl` on 2027-01-11 (cache-hit round 6, R6-3). A rename
+/// is atomic on both Unix and Windows (std uses MoveFileEx with
+/// replace-existing), so a reader observes either the old file or the new one;
+/// a failed temp write leaves the previous mirror untouched, and a failed
+/// rename (e.g. a Windows reader holding the target open without
+/// FILE_SHARE_DELETE) drops the temp and leaves the same previous mirror in
+/// place — degraded, never torn, retried on the next writer wakeup.
+///
+/// The temp name carries the PID so two instances on the same project (the
+/// double-start conflict dialog warns, it does not lock) cannot interleave
+/// temp writes and rename a torn temp into place.
+fn write_mirror_atomically(path: &Path, content: &str) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("traces.jsonl");
+    let tmp = dir.join(format!("{file_name}.tmp{}", std::process::id()));
+    if std::fs::write(&tmp, content).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
     // Restrict the log file to the current user (mirrors keys.toml) so the
-    // persisted bodies are not world-readable on a shared machine.
-    restrict_log_file(path);
+    // persisted bodies are not world-readable on a shared machine — applied to
+    // the temp file, because the rename carries its metadata to the target.
+    restrict_log_file(&tmp);
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Rotate the F3 history archive when it exceeds `threshold`: rename it to
@@ -2491,6 +2545,75 @@ mod tests {
     /// exactly once (deduped across re-mirrors) and never an in-flight one,
     /// and it retains the full history even after the mirror's over-cap
     /// fresh-start drops rows.
+    #[test]
+    fn mirror_drops_a_crash_truncated_trailing_fragment() {
+        // A kill during the mirror's rewrite leaves a half-written final line.
+        // Before 2027-01-11 the merge loop copied that fragment forward into
+        // every subsequent rewrite (it has no id, so it never matched), making
+        // the corruption permanent — the 444 KB unterminated line found in
+        // `.coding/logs/traces.jsonl` (cache-hit round 6, R6-3).
+        let dir = tempfile::tempdir().unwrap();
+        let traces_path = dir.path().join("traces.jsonl");
+        let fragment = "{\"id\":2,\"request_json\":{\"messages\":[{\"content\":\"cut off he";
+        std::fs::write(&traces_path, format!("{{\"id\":1}}
+{fragment}")).unwrap();
+
+        let log = LlmRequestLog::new();
+        log.set_log_file_path(traces_path.clone());
+        log.set_logging_enabled(true);
+        let id = log.start("m", "http://u/v1/", "p", json_body());
+        log.finish(id, "stop");
+        log.flush_file_writes();
+
+        let content = std::fs::read_to_string(&traces_path).unwrap();
+        assert!(
+            !content.contains("cut off he"),
+            "the truncated trailing fragment must not survive the next write"
+        );
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("every mirrored line must be valid JSON: {e}"));
+        }
+        // No temp file is left behind by the atomic replace.
+        assert!(!dir.path().join(format!("traces.jsonl.tmp{}", std::process::id())).exists());
+    }
+
+    #[test]
+    fn mirror_write_failure_leaves_the_previous_mirror_intact() {
+        // The mirror REWRITES the whole file on every writer wakeup, so a failed
+        // write must not destroy what is already there — which is exactly what a
+        // truncate-first `std::fs::write` does: the target is emptied before the
+        // new bytes land. The atomic replace writes a temp file first and
+        // renames it over the target only on success.
+        //
+        // The transient half of the R6-3 defect — a concurrent reader observing
+        // a half-written line — is guarded by construction (the rename) and not
+        // by a race test: an earlier version of this test raced a reader thread
+        // against 200 rewrites of a 300 KB body and never caught a
+        // truncate-in-place implementation, so it could not fail without the fix
+        // and was dropped rather than shipped as theater.
+        let dir = tempfile::tempdir().unwrap();
+        let traces_path = dir.path().join("traces.jsonl");
+        let seeded = "{\"id\":1,\"finish_reason\":\"stop\"}\n";
+        std::fs::write(&traces_path, seeded).unwrap();
+        // Occupy the temp path with a directory so the temp write must fail.
+        std::fs::create_dir(dir.path().join(format!("traces.jsonl.tmp{}", std::process::id())))
+            .unwrap();
+
+        let log = LlmRequestLog::new();
+        log.set_log_file_path(traces_path.clone());
+        log.set_logging_enabled(true);
+        let id = log.start("m", "http://u/v1/", "p", json_body());
+        log.finish(id, "stop");
+        log.flush_file_writes();
+
+        assert_eq!(
+            std::fs::read_to_string(&traces_path).unwrap(),
+            seeded,
+            "a failed mirror write must leave the previous file untouched"
+        );
+    }
+
     #[test]
     fn terminal_records_archive_to_history_beyond_the_ring() {
         let dir = tempfile::tempdir().unwrap();

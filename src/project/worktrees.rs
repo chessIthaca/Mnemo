@@ -184,6 +184,27 @@ fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<(), LandError
     // be stale — and it must be clean for the merge. `reset --hard` is
     // safe here: the landing worktree holds no work of its own.
     git_raw(&landing, &["reset", "--hard", "main"]).map_err(LandError::Git)?;
+    // Sync `main` with its upstream BEFORE merging (mirrors the merge_to_main
+    // skill's step 2, plan d826b9ad): landing onto a stale local `main` only
+    // surfaces later as a rejected push, and these landings are app-managed —
+    // nobody is watching for it.
+    //
+    // Tolerance is NARROW (review H1): a branch with no upstream at all is
+    // normal (local-only repos, never-pushed branches) and must never fail a
+    // landing, so that case skips the sync entirely. But once `main` TRACKS a
+    // remote, a fetch/pull failure is a real problem — a transient network
+    // error or expired credentials would otherwise land the branch onto exactly
+    // the stale `main` this sync exists to prevent — so it surfaces as a
+    // LandError instead of being swallowed.
+    let tracks_a_remote = git_raw(
+        &landing,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .is_ok();
+    if tracks_a_remote {
+        git_raw(&landing, &["fetch", "origin"]).map_err(LandError::Git)?;
+        git_raw(&landing, &["pull", "--no-rebase"]).map_err(LandError::Git)?;
+    }
     // --no-ff: main only ever receives merge commits (the branch policy),
     // mirroring the merge_to_main skill's merge.
     let merge = git_raw(
@@ -244,6 +265,106 @@ mod tests {
         git_raw(dir.path(), &["add", "-A"]).unwrap();
         git_raw(dir.path(), &["commit", "-m", "init"]).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn land_syncs_main_with_its_upstream_before_merging() {
+        // Follow-up B (plan f69317d4, 2027-01-11): the app-managed landing used
+        // to merge into a possibly STALE local main — the same defect plan
+        // d826b9ad fixed in the merge_to_main skill — and nobody is watching
+        // these landings for the rejected push that surfaces hours later.
+        let upstream = tempfile::tempdir().unwrap();
+        git_raw(upstream.path(), &["init", "--bare", "-b", "main"]).unwrap();
+        let repo = init_repo();
+        let upstream_str = upstream.path().to_str().unwrap();
+        git_raw(repo.path(), &["remote", "add", "origin", upstream_str]).unwrap();
+        git_raw(repo.path(), &["push", "-u", "origin", "main"]).unwrap();
+        // A second clone advances the upstream, so the local main is behind.
+        let other = tempfile::tempdir().unwrap();
+        let clone = other.path().join("clone");
+        let clone_str = clone.to_str().unwrap();
+        git_raw(other.path(), &["clone", upstream_str, clone_str]).unwrap();
+        git_raw(&clone, &["config", "user.email", "t@t"]).unwrap();
+        git_raw(&clone, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(clone.join("upstream.txt"), "from upstream\n").unwrap();
+        git_raw(&clone, &["add", "-A"]).unwrap();
+        git_raw(&clone, &["commit", "-m", "upstream-change"]).unwrap();
+        git_raw(&clone, &["push", "origin", "main"]).unwrap();
+        // Production shape: the main worktree sits on the agent's working
+        // branch, which is what frees `main` for the landing worktree.
+        git_raw(repo.path(), &["checkout", "-b", "wt/test"]).unwrap();
+
+        let (worktree, branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+                .await
+                .unwrap();
+        std::fs::write(worktree.join("item.txt"), "item work\n").unwrap();
+        git_raw(&worktree, &["add", "-A"]).unwrap();
+        git_raw(&worktree, &["commit", "-m", "item work"]).unwrap();
+
+        land_item_branch(repo.path().to_path_buf(), branch)
+            .await
+            .unwrap();
+        let log = git_raw(repo.path(), &["log", "--oneline", "main"]).unwrap();
+        assert!(
+            log.contains("upstream-change"),
+            "the landing must sync main with origin first, got: {log}"
+        );
+        assert!(log.contains("item work"));
+    }
+
+    #[tokio::test]
+    async fn land_fails_when_a_configured_remote_cannot_be_reached() {
+        // Review H1: the sync must not swallow EVERY error. Once main tracks a
+        // remote, an unreachable one (network share gone, credentials expired)
+        // must surface — landing anyway would recreate the stale-main defect
+        // this sync exists to prevent.
+        let upstream = tempfile::tempdir().unwrap();
+        git_raw(upstream.path(), &["init", "--bare", "-b", "main"]).unwrap();
+        let repo = init_repo();
+        let upstream_str = upstream.path().to_str().unwrap().to_string();
+        git_raw(repo.path(), &["remote", "add", "origin", &upstream_str]).unwrap();
+        git_raw(repo.path(), &["push", "-u", "origin", "main"]).unwrap();
+        git_raw(repo.path(), &["checkout", "-b", "wt/test"]).unwrap();
+        // The remote disappears from under the landing.
+        std::fs::remove_dir_all(&upstream_str).unwrap();
+
+        let (worktree, branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+                .await
+                .unwrap();
+        std::fs::write(worktree.join("item.txt"), "item work\n").unwrap();
+        git_raw(&worktree, &["add", "-A"]).unwrap();
+        git_raw(&worktree, &["commit", "-m", "item work"]).unwrap();
+
+        let result = land_item_branch(repo.path().to_path_buf(), branch).await;
+        assert!(
+            result.is_err(),
+            "a tracked-but-unreachable remote must surface, not land on stale main"
+        );
+    }
+
+    #[tokio::test]
+    async fn land_still_succeeds_without_any_remote() {
+        // The sync must tolerate a repo with no remote/upstream (local-only
+        // repos): a landing may never fail because of it.
+        let repo = init_repo();
+        // Production shape: the main worktree holds the agent's branch, so the
+        // landing worktree can check out `main`.
+        git_raw(repo.path(), &["checkout", "-b", "wt/test"]).unwrap();
+        let (worktree, branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+                .await
+                .unwrap();
+        std::fs::write(worktree.join("item.txt"), "item work\n").unwrap();
+        git_raw(&worktree, &["add", "-A"]).unwrap();
+        git_raw(&worktree, &["commit", "-m", "item work"]).unwrap();
+
+        land_item_branch(repo.path().to_path_buf(), branch)
+            .await
+            .unwrap();
+        let log = git_raw(repo.path(), &["log", "--oneline", "main"]).unwrap();
+        assert!(log.contains("item work"), "got: {log}");
     }
 
     #[test]

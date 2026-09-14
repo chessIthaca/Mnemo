@@ -24,8 +24,8 @@ interface MergeToMainDialogProps {
 /**
  * Confirmation dialog for the "Merge to main" action. This dialog IS the
  * approval gate for the UI-initiated merge — confirming enters the
- * `merge_to_main` skill, where the agent drives the merge itself (stash,
- * commit, merge, resolve conflicts, delete branch). Built on Radix Dialog
+ * `merge_to_main` skill, where the agent drives the merge itself (commit,
+ * checkout main, sync with origin, merge, resolve conflicts, delete branch). Built on Radix Dialog
  * (role="dialog", aria-modal, focus trap, Escape-to-close).
  */
 export function MergeToMainDialog({
@@ -71,9 +71,10 @@ export function MergeToMainDialog({
               <span className="font-medium text-cyan-400">main</span> itself:
             </p>
             <ul className="mb-3 space-y-1 pl-4 text-slate-400">
-              <li>• Stash uncommitted changes if needed</li>
-              <li>• Commit your work on <span className="text-purple-400">{sourceBranch}</span></li>
-              <li>• <code className="inline-code">git checkout main</code> + <code className="inline-code">git merge</code></li>
+              <li>• Commit uncommitted changes on the branch (the skill never stashes)</li>
+              <li>• <code className="inline-code">git checkout main</code></li>
+              <li>• Sync <code className="inline-code">main</code> with origin (<code className="inline-code">git fetch</code> + <code className="inline-code">git pull</code>) before merging</li>
+              <li>• <code className="inline-code">git merge</code> the branch</li>
               <li>• Resolve any conflicts</li>
               <li>• Delete the branch once merged</li>
               <li>• Call <code className="inline-code">skill_end</code> to return to Planning</li>

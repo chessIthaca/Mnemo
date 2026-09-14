@@ -187,9 +187,10 @@ export const StatusBar = memo(function StatusBar() {
   }
 
   /** Run the merge after the user confirms in the dialog (the approval gate).
-   *  Enters the merge_to_main skill on the active agent + sends the skill's
-   *  goal as a prompt — the agent then drives the merge itself (stash, commit,
-   *  merge, resolve conflicts, delete branch) using its tools. */
+   *  Enters the merge_to_main skill on the active agent — the agent then drives
+   *  the merge itself: commit on the branch, checkout main, sync main with
+   *  origin (fetch + pull --no-rebase), merge the branch, verify both builds,
+   *  delete the branch. It NEVER stashes (see .coding/skills/merge_to_main.toml). */
   async function handleMergeConfirm() {
     if (activeAgent === null) return;
     setMerging(true);
@@ -777,9 +778,10 @@ export const StatusBar = memo(function StatusBar() {
         )}
         {/* Merge-to-main: shown when the workflow is Complete or Planning and
             we're on a non-main branch. Gated by the MergeToMainDialog
-            confirmation. Enters the merge_to_main skill — the agent drives
-            the merge itself (stash, commit, merge, resolve conflicts, delete
-            branch). */}
+            confirmation. Enters the merge_to_main skill — the agent drives the
+            merge itself: commit, checkout main, sync main with origin (fetch +
+            pull --no-rebase), merge, resolve conflicts, delete branch; it never
+            stashes. */}
         {((workflowState === "complete" || workflowState === "planning") && gitBranch && gitBranch !== "main" && gitBranch !== "no-branch") && (
           <button
             onClick={() => setMergeOpen(true)}

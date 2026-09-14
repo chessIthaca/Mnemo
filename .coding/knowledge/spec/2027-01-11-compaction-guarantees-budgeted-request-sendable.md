@@ -14,3 +14,5 @@ INVARIANTS
 TURN-LOOP BOUNDS (src/agent/turn.rs) — the stuck ladder (5 consecutive failed attempts) RE-ARMS whenever a compaction lands under the threshold, and compaction is now total, so a runaway tool loop would re-arm forever: `MAX_COMPACTIONS_PER_TURN=10` (TurnState.compact_total, never reset in a turn) is the absolute ceiling, emitting an Error-only abort. Verified by `over_threshold_turn_bounds_compaction_attempts` (ceiling) and `legitimate_long_turn_compactions_reset_budget` (the reset stays for real crossings) — never tighten one without the other.
 
 OPEN (recorded, not queued): src/runtime/agent.rs compact_context (manual /compact) does not yet report a mechanical downgrade; `is_mechanical_compaction` can misfire when a call did not actually compact (no-op/interrupted on a lineage that once compacted mechanically).
+
+Amended 2027-01-11: MERGED into main at d88d922 (d88d9228f3373ec58318db178f66ab2767ab7499) on 2026-09-13 (merge_to_main skill); branch wt/mnemo deleted (pre-merge tip 21d4f5f). The cited commit c97f29f is reachable from main; wt/mnemo no longer exists — the invariant text above is the standing truth for src/agent/context.rs.

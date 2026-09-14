@@ -204,17 +204,25 @@ pub enum ToolFilter {
     /// Executing a `kind: "research"` plan — [`Executing`](Self::Executing)
     /// minus the source-mutating file tools.
     ///
+    /// DISPATCH-ONLY since 2027-01-11: [`Workflow::schema_filter`] no longer
+    /// advertises this surface for research plans — a per-kind advertised
+    /// array rewrote the head on every plan-KIND change and collapsed the
+    /// provider's prefix cache to 6,016 tokens with 15.7–17.9s TTFT
+    /// (`.coding/analysis/cache-hit-6-report.md`, cause 2). The restriction
+    /// itself is unchanged and still enforced here, at the gate.
+    ///
+    /// [`Workflow::schema_filter`]: crate::workflow::Workflow::schema_filter
+    ///
     /// A research plan is *defined* as work that produces no source-code
     /// changes (it is the kind that skips review on completion). Hiding
     /// `file_edit`/`file_write`/`file_append`/`convert_line_endings` turns
     /// that from a rule the prompt merely asserts into one the tool gate
-    /// enforces, and drops ~780 tokens from every research turn.
+    /// enforces.
     ///
     /// NOT a security boundary: `shell` stays visible because investigation
     /// genuinely needs it, and a determined `shell` call can still write a
     /// file. The point is to stop the *accidental* drift where a plan marked
-    /// research quietly starts editing code — and to stop paying for schemas
-    /// the plan has no business using.
+    /// research quietly starts editing code.
     ExecutingResearch,
     /// Plan-frozen executing surface — the ADVERTISEMENT filter for an active
     /// plan: [`Executing`](Self::Executing) plus `finish`.
@@ -226,9 +234,8 @@ pub enum ToolFilter {
     /// resets the cached prefix and re-bills the entire conversation
     /// (~40-75s of server-side prefill at late-plan context sizes; perf
     /// review L4, 2026-09-09). While a plan is active the schema array is
-    /// therefore built from THIS filter — chosen once at plan activation by
-    /// plan kind and byte-stable for the plan's whole lifetime (see
-    /// `Workflow::schema_filter`).
+    /// therefore built from THIS filter — one byte-stable surface for the
+    /// plan's whole lifetime (see `Workflow::schema_filter`).
     ///
     /// ADVERTISEMENT ONLY, NOT ENFORCEMENT: dispatch re-checks the per-state
     /// filter (`allowed_tools()`), so `complete_step`/`create_plan` being
@@ -236,6 +243,13 @@ pub enum ToolFilter {
     /// Executing are rejected at dispatch with the state named in the error.
     /// The state discipline (no step/new-plan work mid-review, no finishing
     /// mid-execution) is unchanged — only the schema bytes are frozen.
+    ///
+    /// Since 2027-01-11 this is the advertised surface for EVERY active plan,
+    /// research plans included: a per-kind array changed the request head on
+    /// every plan-kind change and collapsed the provider's prefix cache to
+    /// 6,016 tokens with 15.7–17.9s TTFT (`.coding/analysis/cache-hit-6-report.md`,
+    /// cause 2). A research plan's write restriction is enforced at dispatch by
+    /// [`ToolFilter::ExecutingResearch`], never by this advertisement.
     PlanFrozen,
     /// Complete: read agent tools + `create_plan` + all memory tools.
     Complete,

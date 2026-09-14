@@ -436,11 +436,17 @@ impl Workflow {
     /// Executing→Reviewing transition resets the cached prefix and re-bills
     /// the entire conversation (~40-75s of server-side prefill at late-plan
     /// context sizes; perf review L4, 2026-09-09). This method therefore
-    /// returns the plan-frozen surface ([`ToolFilter::PlanFrozen`] —
-    /// Executing ∪ `finish`) for implementation/bug-fixing plans and
-    /// [`ToolFilter::ExecutingResearch`] for research plans (which skip
-    /// review and never enter Reviewing), keyed on the ACTIVE plan exactly
-    /// like the research arm of [`allowed_tools`](Self::allowed_tools).
+    /// returns the ONE plan-frozen surface ([`ToolFilter::PlanFrozen`] —
+    /// Executing ∪ `finish`) for every plan kind, research included: the array
+    /// must survive a research↔implementation transition as well, and a
+    /// per-kind surface changed it on every plan change (measured 2027-01-11:
+    /// the cached prefix collapsed to 6,016 tokens with 15.7–17.9s TTFT —
+    /// `.coding/analysis/cache-hit-6-report.md`).
+    ///
+    /// The research restriction is NOT enforced by this choice: dispatch
+    /// re-checks the research arm of [`allowed_tools`](Self::allowed_tools)
+    /// ([`ToolFilter::ExecutingResearch`]), exactly as
+    /// [`ToolFilter::PlanFrozen`] documents for `finish`.
     ///
     /// Outside an active plan (Planning/Complete — no plan, or the plan was
     /// popped at finish/abandon) and for allow-listed sub-agents
@@ -464,10 +470,15 @@ impl Workflow {
         }
         match self.state {
             WorkflowState::Executing | WorkflowState::Reviewing if self.plan().is_some() => {
-                match self.active_plan_kind() {
-                    Some(PlanKind::Research) => ToolFilter::ExecutingResearch,
-                    _ => ToolFilter::PlanFrozen,
-                }
+                // ONE surface for every plan kind, research included: the array
+                // must survive a research↔implementation transition too. A
+                // per-kind surface rewrote the head on every plan change —
+                // measured 2027-01-11: a kind change collapsed the provider
+                // cache to 6,016 tokens (the common system prefix) and cost
+                // 15.7–17.9s TTFT (`.coding/analysis/cache-hit-6-report.md`,
+                // cause 2). The research restriction is enforced at dispatch
+                // (`ExecutingResearch` in `ToolFilter::allows`), never here.
+                ToolFilter::PlanFrozen
             }
             _ => self.allowed_tools(),
         }
@@ -1833,33 +1844,70 @@ mod tests {
     }
 
     #[test]
-    fn schema_filter_research_plan_uses_executing_research() {
-        // A research plan skips review (never enters Reviewing), so its
-        // frozen surface is ExecutingResearch for the plan's whole lifetime —
-        // the source-mutating file tools stay unadvertised from activation
-        // to completion.
+    fn schema_filter_is_stable_across_plan_kinds() {
+        // The advertised array must be byte-identical across a research↔
+        // implementation transition: it rides at the head of the request body,
+        // so any change resets the provider's prefix cache. A per-kind surface
+        // (research used to get ExecutingResearch) rewrote the head on every
+        // plan change — measured 2027-01-11: cached collapsed to 6,016 tokens
+        // and TTFT hit 15.7–17.9s (cache-hit round 6, cause 2).
+        let dir = tempdir().unwrap();
+        let mut research = Workflow::new(dir.path());
+        research
+            .create_plan_with_kind(
+                "R",
+                "G",
+                "C",
+                vec!["a".into(), "b".into()],
+                PlanKind::Research,
+                None,
+            )
+            .unwrap();
+        let impl_dir = tempdir().unwrap();
+        let mut implementation = Workflow::new(impl_dir.path());
+        implementation
+            .create_plan("I", "G", "C", vec!["a".into(), "b".into()])
+            .unwrap();
+
+        assert_eq!(research.schema_filter(), ToolFilter::PlanFrozen);
+        assert_eq!(
+            research.schema_filter(),
+            implementation.schema_filter(),
+            "the advertised surface must not depend on the plan kind"
+        );
+        // ... and not on the state transition either, for the plan's lifetime.
+        research.complete_step(0).unwrap();
+        assert_eq!(research.schema_filter(), ToolFilter::PlanFrozen);
+        research.complete_step(1).unwrap();
+        // Research plans skip Reviewing on completion: the plan is popped and
+        // the per-state filter applies again.
+        assert_eq!(research.schema_filter(), ToolFilter::Complete);
+    }
+
+    #[test]
+    fn research_plan_still_cannot_write_despite_the_advertised_surface() {
+        // Advertising the full frozen surface must NOT grant write access: the
+        // research restriction lives in the dispatch filter.
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path());
         wf.create_plan_with_kind(
             "R",
             "G",
             "C",
-            vec!["a".into(), "b".into()],
+            vec!["a".into()],
             PlanKind::Research,
             None,
         )
         .unwrap();
-        assert_eq!(wf.schema_filter(), ToolFilter::ExecutingResearch);
-        wf.complete_step(0).unwrap();
-        assert_eq!(
-            wf.schema_filter(),
-            ToolFilter::ExecutingResearch,
-            "the research surface must not depend on the state transition"
-        );
-        wf.complete_step(1).unwrap();
-        // Research plans skip Reviewing on completion: the plan is popped and
-        // the per-state filter applies again.
-        assert_eq!(wf.schema_filter(), ToolFilter::Complete);
+        assert_eq!(wf.schema_filter(), ToolFilter::PlanFrozen);
+        let enforced = wf.allowed_tools();
+        assert_eq!(enforced, ToolFilter::ExecutingResearch);
+        for name in ["file_write", "file_edit", "file_append", "convert_line_endings"] {
+            assert!(
+                !enforced.allows(ToolCategory::Agent, SafetyLevel::NeedsApproval, name),
+                "a research plan must still be unable to call {name}"
+            );
+        }
     }
 
     #[test]

@@ -924,7 +924,8 @@ fn truncate_tool_result_at(messages: &mut [Message], idx: usize, keep_chars: usi
 /// Two rules run in this order, because prefix caching must survive both:
 ///
 /// 1. The hysteresis pass above — cut results back to `summary_chars` once the
-///    intact window passes the high-water mark. Byte-identical while under it.
+///    TRUNCATABLE population passes the high-water mark. Byte-identical while
+///    under it.
 /// 2. The OVERSIZE pass — cut any intact Text result longer than
 ///    [`TOOL_RESULT_MAX_CHARS`] back to that cap and no further, EVEN when the
 ///    hysteresis gate was a no-op and EVEN inside the keep window. Only

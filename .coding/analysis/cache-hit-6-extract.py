@@ -15,6 +15,11 @@ Sections:
   B  prefix-break localizer: first differing message index per consecutive
      same-model record pair -> HEAD / TOOLS / MID / TAIL, plus the falsifiable
      prediction cached ~= tokens before the break (ESTIMATE: chars/4).
+  B2 calibrated boundary check: tokens-per-char calibrated from the provider's
+     own prompt_tokens, so the pre-break prefix is compared in tokens rather
+     than the crude chars/4 estimate.
+  B3 hysteresis-gate audit: is the compaction gate ever closed? Counts the
+     intact vs permanently-unmarkable vs truncatable tool-result populations.
   C  request_stats: headline hit% split by the R19 reporting tier, per-model
      table, prompt-size histogram (the cliff's MEASURED location), per-session
      shape for the trace session, and the miss buckets.
@@ -101,7 +106,7 @@ def record_body(r):
     return (rj.get("messages") or []), (rj.get("tools") or [])
 
 
-# request_stats is loaded UP-FRONT: sections A/B2/C/D all need it (B2 runs
+# request_stats is loaded UP-FRONT: sections B2/C/E/F all need it (B2 runs
 # before C and cannot re-query).
 _conn = sqlite3.connect(f"file:{MEMDB}?mode=ro", uri=True)
 _conn.execute("PRAGMA busy_timeout=3000")

@@ -2,10 +2,12 @@
 
 **Date:** 2027-01-11 (epoch clock 2026-09-14)
 **Instruments:** `.coding/logs/traces.jsonl` (13 records captured / 11 parseable, 1 session, full
-request bodies + provider `usage`), `.coding/memory.db` `request_stats` (972 rows, 20 sessions,
-2026-09-12..14), `.coding/logs/provider-errors.jsonl`.
+request bodies + provider `usage`), `.coding/memory.db` `request_stats` (1,064 rows, 22 sessions,
+2026-09-12..14 — the size at the snapshot below; the table grows while the report is read),
+`.coding/logs/provider-errors.jsonl`.
 **Artifacts:** `.coding/analysis/cache-hit-6-extract.py` (the extractor) →
-`.coding/analysis/cache-hit-6-aggregates.txt` (250 lines, sections A–F).
+`.coding/analysis/cache-hit-6-aggregates.txt` (sections A / B / B2 / B3 / C / E / F; no line count is
+quoted on purpose — it drifts on every re-run by design).
 
 **Sample honesty:** the trace log covers 76 seconds of ONE session (03:01:14–03:02:30 UTC) — it is
 proof of MECHANISM (byte-exact breaks + real provider `cached`), not of rates. Every rate claim below
@@ -19,18 +21,18 @@ comes from `request_stats`. Numbers are marked measured (M) or estimated (E).
 |---|---|---|---|---|
 | round 5, all-time reporting tier | 27,544 | 88.6% | 12.5% | ~120–300K |
 | round 5, post-R12 | 14,751 | 79.8% | 18.1% | — |
-| **round 6, all rows (2026-09-12..14)** | 1,037 | **79.0%** | 17.6% | 127K |
+| **round 6, all rows (2026-09-12..14)** | 1,058 | **78.8%** | 18.0% | 128K |
 | **round 6, traced window (03:01–03:02:30)** | 25 | **63.5%** | — | 120K |
 
 **Snapshot, not truth.** These are the numbers the extractor printed at the run that produced
-`cache-hit-6-aggregates.txt` (1,043 rows / 21 sessions then). `request_stats` keeps accumulating —
+`cache-hit-6-aggregates.txt` (1,064 rows / 22 sessions then). `request_stats` keeps accumulating —
 including from the very session that wrote this report — so re-running the extractor yields slightly
-different counts (an earlier draft of this table was checked against 972 rows / 24 window rows).
-Only the *shape* is load-bearing: ~79% overall with a ~63% session, against 99% when the prefix is
-stable. Re-run `.coding/analysis/cache-hit-6-extract.py` for current figures.
+different counts (earlier drafts of this table were checked against 972 and 1,043 rows). Only the
+*shape* is load-bearing: ~79% overall with a ~63% session, against 99% when the prefix is stable.
+Re-run `.coding/analysis/cache-hit-6-extract.py` for current figures.
 
 Per model (main-loop rows, M, same snapshot): deepseek-v4-flash 83.7% (n=454) · deepseek-v4-flash:0731
-74.7% (n=270) · deepseek-v4.1-flash 71.7% (n=152) · glm-5.3-flash 78.7% (n=130) · glm-5.3 79.7%
+74.7% (n=270) · deepseek-v4.1-flash 72.2% (n=166) · glm-5.3-flash 78.1% (n=137) · glm-5.3 79.7%
 (n=19) · kimi-k3 42.4% (n=12). All six models report cache in this dataset — **no non-reporting tier
 this round**.
 
@@ -112,8 +114,8 @@ opportunistic.
 
 ## 6. Caveats
 
-- The traced session is one 76-second window; the *rate* figures rest on `request_stats` (1,043 rows
-  / 21 sessions at the report snapshot), which does not capture request bodies — the two instruments
+- The traced session is one 76-second window; the *rate* figures rest on `request_stats` (1,064 rows
+  / 22 sessions at the report snapshot), which does not capture request bodies — the two instruments
   are complementary, and the causal claims here rest on the traces.
 - `cached` field naming differs per provider; the extractor walks `usage` recursively for any
   cache-named key, so it keeps working across providers.

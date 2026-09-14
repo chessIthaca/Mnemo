@@ -117,44 +117,44 @@ this request rewrote an already-sent result — a guaranteed prefix break.
 ==============================================================================
 C. request_stats (memory.db, always-on)
 ==============================================================================
-rows: 1043  (loaded up-front — sections B2/C/D share the same set)
+rows: 1064  (loaded up-front — sections B2/C/E/F share the same set)
 window: 2026-09-12 .. 2026-09-14 UTC (epoch clock)
 models (6): deepseek-v4-flash, deepseek-v4-flash:0731, deepseek-v4.1-flash, glm-5.3, glm-5.3-flash, kimi-k3
-distinct sessions: 21
-main-loop rows (outcome=None AND purpose=None): 1037
+distinct sessions: 22
+main-loop rows (outcome=None AND purpose=None): 1058
 reporting models (6): deepseek-v4-flash, deepseek-v4-flash:0731, deepseek-v4.1-flash, glm-5.3, glm-5.3-flash, kimi-k3
 non-reporting models (0): 
   (non-reporting = 0% BY CONSTRUCTION, excluded from the headline)
 
   tier            n       hit%      cached          prompt     resets<50%
-  main reporting     1037     79.0%   103,985,348     131,709,658      183 (17.6%)
-  main all           1037     79.0%   103,985,348     131,709,658      183 (17.6%)
+  main reporting     1058     78.8%   106,513,220     135,133,018      190 (18.0%)
+  main all           1058     78.8%   106,513,220     135,133,018      190 (18.0%)
 
 per-model (main-loop rows; R = reporting tier):
   model                          tier  n      hit%     resets   avgP      p90P      maxP
   deepseek-v4-flash            R       454    83.7%      53    140,344   268,355   322,619
   deepseek-v4-flash:0731       R       270    74.7%      57    131,801   226,149   242,195
-  deepseek-v4.1-flash          R       152    71.7%      39    126,144   191,512   218,023
-  glm-5.3-flash                R       130    78.7%      25     87,224   178,140   199,205
+  deepseek-v4.1-flash          R       166    72.2%      42    134,107   216,311   229,316
+  glm-5.3-flash                R       137    78.1%      29     85,216   177,429   199,205
   glm-5.3                      R        19    79.7%       5     81,360   122,168   124,255
   kimi-k3                      R        12    42.4%       4     28,957    32,274    48,832
 
 per-session shape (sessions using the traced models, first 3 by size;
 request index is the position within the session):
-  session 958d6727-27ba-44 (deepseek-v4.1-flash), n=140:
-    0:70.2%  11:57.9%  22:61.7%  33:46.4%  44:59.4%  55:48.8%  66:83.9%  77:88.2%  88:88.9%  99:96.7%  110:56.4%  121:54.4%  132:84.6%
+  session 958d6727-27ba-44 (deepseek-v4.1-flash), n=154:
+    0:72.7%  12:52.3%  24:49.8%  36:71.1%  48:44.4%  60:65.6%  72:88.1%  84:89.3%  96:94.2%  108:59.7%  120:58.1%  132:87.8%  144:68.0%
   session 0fab53b2-369d-4d (glm-5.3-flash), n=52:
     0:49.6%  4:82.8%  8:61.8%  12:73.9%  16:72.4%  20:68.4%  24:63.5%  28:78.5%  32:63.4%  36:60.2%  40:80.8%  44:81.1%  48:71.4%
   session 97785ff5-3bf8-4d (glm-5.3-flash), n=18:
     0:0.0%  1:91.3%  2:96.2%  3:96.1%  4:95.2%  5:91.0%  6:95.9%  7:90.5%  8:91.0%  9:84.4%  10:91.9%  11:96.3%  12:91.7%  13:96.1%  14:92.3%  15:94.8%  16:95.5%  17:94.5%
 
 prompt-size histogram (main reporting rows, 40K bins, hit% per bin):
-       0K-    40K  n=   104  hit=  60.8%
-      40K-    80K  n=   273  hit=  67.4%
-      80K-   120K  n=   157  hit=  79.0%
+       0K-    40K  n=   107  hit=  60.4%
+      40K-    80K  n=   275  hit=  67.3%
+      80K-   120K  n=   159  hit=  78.9%
      120K-   160K  n=   152  hit=  88.0%
      160K-   200K  n=   138  hit=  81.2%
-     200K-   240K  n=   130  hit=  79.1%
+     200K-   240K  n=   144  hit=  78.7%
      240K-   280K  n=    69  hit=  79.0%
      280K-   320K  n=     9  hit=  65.3%
      320K-   360K  n=     5  hit=  96.9%
@@ -164,11 +164,11 @@ NONREPORTING > CLIFF > STEADY). STEADY is the residual where a real
 prefix mutation or provider behavior must be hiding — it is the bucket
 section B's MID findings should be checked against:
   bucket          n      share_n    miss_tokens   share_of_miss   hit%
-  STEADY            1000      96.4%      26,059,339           94.0%   79.9%
-  COLD                21       2.0%         260,415            0.9%   10.2%
-  SWITCH              16       1.5%       1,404,556            5.1%   14.5%
-  total misses: 27,724,310 tokens across 1,037 main-loop rows
-  reconciliation: buckets 1037 == main-loop rows 1037 -> OK
+  STEADY            1020      96.4%      26,945,791           94.2%   79.8%
+  COLD                22       2.1%         269,451            0.9%   11.2%
+  SWITCH              16       1.5%       1,404,556            4.9%   14.5%
+  total misses: 28,619,798 tokens across 1,058 main-loop rows
+  reconciliation: buckets 1058 == main-loop rows 1058 -> OK
 
 ==============================================================================
 E. mutation-path cross-check verdicts (code read, no edits)

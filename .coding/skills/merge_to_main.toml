@@ -27,7 +27,8 @@
 #   had drifted behind origin/main, so the landed merge could not be pushed
 #   until a separate fetch + `pull --no-rebase` catch-up (merge commit 76af04b).
 #   Syncing first keeps the merge pushable in one pass.
-# - The prompt names the TOOL for every git step (HIGH 1, review 2026-09-14):
+# - The prompt names the TOOL for every git step (HIGH 1 of the merge_to_main
+#   review, plan d826b9ad, 2026-09-14):
 #   the sync runs on `shell` because the git tool has no fetch/pull subcommand,
 #   but the branch merge and the push MUST stay on the git tool — it is the
 #   structured, subcommand-checked core-operation path. Both tools force the

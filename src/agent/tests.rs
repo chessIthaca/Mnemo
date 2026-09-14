@@ -2491,6 +2491,11 @@ struct CapturingProvider {
     /// The content of the LAST message of each `complete` call — lets tests
     /// assert the byte-stable CONTEXT_FOOTER is the final message sent.
     captured_tails: Arc<Mutex<Vec<String>>>,
+    /// The (role, content) of the LAST TWO messages of each `complete` call —
+    /// lets tests assert the trailing placement's roles (user on
+    /// `tail_as_user_messages` vendors, which must never see a trailing system
+    /// block) as well as the byte-stable footer position.
+    captured_trailing: Arc<Mutex<Vec<Vec<(String, String)>>>>,
     /// The serialized tools array of each `complete` call — lets tests assert
     /// the plan-frozen advertisement is byte-stable across state transitions.
     captured_tool_sets: Arc<Mutex<Vec<String>>>,
@@ -2500,7 +2505,7 @@ struct CapturingProvider {
     kind: ProviderKind,
     /// The model id reported by `model()` — "mock-capture" by default,
     /// settable so tests can drive vendor-policy packaging branches (e.g.
-    /// the DeepSeek fold-volatile-tail path).
+    /// the DeepSeek `tail_as_user_messages` path).
     model: &'static str,
 }
 
@@ -2518,14 +2523,15 @@ impl CapturingProvider {
 
     /// Like [`new_with_tails`](Self::new_with_tails) but the provider reports
     /// `ProviderKind::Local` — drives the Ollama message-placement branch in
-    /// `run_turn` (tail folded into the leading system message, no footer).
+    /// `run_turn` (tail + footer as trailing USER messages, no trailing system
+    /// block).
     fn new_local_with_tails() -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
         Self::build(ProviderKind::Local)
     }
 
     /// Like [`new_with_tails`](Self::new_with_tails) but the provider reports
     /// the given model id — drives vendor-policy packaging branches (e.g.
-    /// DeepSeek's fold-volatile-tail) while `kind()` stays OpenAI.
+    /// DeepSeek's `tail_as_user_messages`) while `kind()` stays OpenAI.
     fn new_with_model_with_tails(
         model: &'static str,
     ) -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
@@ -2554,11 +2560,13 @@ impl CapturingProvider {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_tails = Arc::new(Mutex::new(Vec::new()));
         let captured_tool_sets = Arc::new(Mutex::new(Vec::new()));
+        let captured_trailing = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 captured: Arc::clone(&captured),
                 captured_tails: Arc::clone(&captured_tails),
                 captured_tool_sets: Arc::clone(&captured_tool_sets),
+                captured_trailing: Arc::clone(&captured_trailing),
                 caps: Capabilities::openai(),
                 kind,
                 model: "mock-capture",
@@ -2578,6 +2586,13 @@ impl CapturingProvider {
         Arc<Mutex<Vec<String>>>,
     ) {
         Self::build_with_tool_sets(ProviderKind::OpenAI)
+    }
+
+    /// Handle to the trailing (role, content) pairs captured so far — grab it
+    /// before the provider is moved into the agent loop. One entry per
+    /// `complete` call: the last two messages of the request.
+    fn trailing_handle(&self) -> Arc<Mutex<Vec<Vec<(String, String)>>>> {
+        Arc::clone(&self.captured_trailing)
     }
 }
 
@@ -2609,6 +2624,21 @@ impl LlmClient for CapturingProvider {
                 .await
                 .push(last.content.as_text());
         }
+        // Capture the last TWO messages with their roles — the trailing
+        // placement (volatile tail + footer), whose roles differ per vendor.
+        let trailing: Vec<(String, String)> = messages
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(|m| {
+                (
+                    format!("{:?}", m.role).to_lowercase(),
+                    m.content.as_text(),
+                )
+            })
+            .collect();
+        self.captured_trailing.lock().await.push(trailing);
         // Capture the serialized tools array (the plan-frozen advertisement).
         self.captured_tool_sets
             .lock()
@@ -2785,13 +2815,15 @@ async fn volatile_tail_then_stable_footer_appended_and_popped() {
 }
 
 #[tokio::test]
-async fn deepseek_vendor_folds_volatile_tail_no_trailing_system_messages() {
+async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() {
     // Regression (2027-01-11 deepseek exit-note loop + OPEN sentinel-mirror
-    // 5cf5469c): DeepSeek-vendor models echo trailing system blocks instead
-    // of answering the user. The request must end with the user message —
-    // the standard shape every other client sends — with the volatile tail
-    // folded into the head and NO trailing CONTEXT_FOOTER. Other vendors keep
-    // the trailing placement (empirical cache law); only DeepSeek folds.
+    // 5cf5469c): DeepSeek-vendor models echo trailing SYSTEM blocks instead of
+    // answering the user. The tail + footer therefore ride at the end as USER
+    // messages — the request ends the way a normal client turn does — while
+    // messages[0] stays the byte-stable head, i.e. the prefix a prompt cache
+    // keys on. Folding the tail into the head (the previous strategy) cost
+    // 5.1-9.0% cache hit and 115-120K re-read tokens per complete_step:
+    // `deepseek_head_stays_byte_stable_across_plan_progress_bumps`.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -2806,6 +2838,7 @@ async fn deepseek_vendor_folds_volatile_tail_no_trailing_system_messages() {
 
     let (provider, captured, captured_tails) =
         CapturingProvider::new_with_model_with_tails("deepseek-v4-flash");
+    let trailing = provider.trailing_handle();
     let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
@@ -2829,28 +2862,49 @@ async fn deepseek_vendor_folds_volatile_tail_no_trailing_system_messages() {
         .await
         .unwrap();
 
-    // (a) The request's LAST message is the user message — not the
-    // CONTEXT_FOOTER, not the volatile tail.
-    let tails = captured_tails.lock().await;
-    assert_eq!(tails.len(), 1);
-    assert_eq!(tails[0], "hi", "request must end with the user message");
-    drop(tails);
+    // (a) The trailing pair is [volatile tail, footer], both USER-role: nothing
+    // trailing for DeepSeek to mirror, and the footer stays the byte-stable
+    // final message (empirical cache law).
+    let trailing = trailing.lock().await;
+    assert_eq!(trailing.len(), 1);
+    assert_eq!(trailing[0].len(), 2, "tail + footer must both be sent");
+    assert_eq!(
+        trailing[0][0].0, "user",
+        "the volatile tail must ride as a user message"
+    );
+    assert!(
+        trailing[0][0].1.contains("# WORKFLOW STATE"),
+        "the workflow state must still reach the request"
+    );
+    assert_eq!(trailing[0][1].0, "user", "the footer must be a user message");
+    assert_eq!(
+        trailing[0][1].1,
+        crate::agent::prompt::CONTEXT_FOOTER,
+        "the byte-stable footer must be the final message"
+    );
+    drop(trailing);
 
-    // (b) The head carries the folded volatile tail (workflow state) —
-    // DeepSeek still gets the context, just not as trailing blocks.
+    // (b) The head is the stable prefix: no workflow state folded in, so a
+    // complete_step progress bump cannot change messages[0].
     let prompts = captured.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(
-        prompts[0].contains("# WORKFLOW STATE"),
-        "volatile tail must be folded into the head for DeepSeek-vendor models"
+        !prompts[0].contains("# WORKFLOW STATE"),
+        "the volatile tail must not be folded into the leading system message"
     );
     assert!(
-        !prompts[0].contains(crate::agent::prompt::CONTEXT_FOOTER),
-        "the footer is not sent at all on the fold path"
+        prompts[0].contains("plan-first workflow"),
+        "head has the preamble"
     );
     drop(prompts);
 
-    // (c) Nothing transient persisted: head + user + assistant only.
+    // (c) The final message is the footer — no trailing system block exists.
+    let tails = captured_tails.lock().await;
+    assert_eq!(tails.len(), 1);
+    assert_eq!(tails[0], crate::agent::prompt::CONTEXT_FOOTER);
+    drop(tails);
+
+    // (d) Nothing transient persisted: head + user + assistant only.
     assert_eq!(
         messages.len(),
         3,
@@ -2861,6 +2915,96 @@ async fn deepseek_vendor_folds_volatile_tail_no_trailing_system_messages() {
             .iter()
             .any(|m| m.content.as_text() == crate::agent::prompt::CONTEXT_FOOTER),
         "no footer must remain in the persistent vec"
+    );
+}
+
+/// Regression (cache resets on every plan-item check-off — measured in a live
+/// DeepSeek session, trace window 2026-09-14 04:48:52-04:51:06 UTC): the
+/// volatile tail was folded into the LEADING system message, so each
+/// `complete_step` rewrote messages[0] and the provider's prefix cache died at
+/// ~6.9K tokens — five check-off rows landed at 5.1-9.0% hit while re-billing
+/// 115-120K tokens each (`.coding/analysis/cache-hit-6-aggregates.txt`: section
+/// B classifies the breaks as HEAD, k=0; section F carries the true per-request
+/// numbers). The prefix a provider caches is messages[0], so it must not move on
+/// a progress bump: the volatility rides in trailing USER messages instead, with
+/// the constant CONTEXT_FOOTER as the byte-stable final message.
+#[tokio::test]
+async fn deepseek_head_stays_byte_stable_across_plan_progress_bumps() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("P", "G", "C", vec!["step 1".into(), "step 2".into()])
+            .unwrap();
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let (provider, captured, captured_tails) =
+        CapturingProvider::new_with_model_with_tails("deepseek-v4-flash");
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(provider),
+            tools: registry,
+            workflow: workflow.clone(),
+            sandbox: sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+    let mut messages = vec![Message::user_text("hi")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    // The check-off: step 1 of 2 done — PROGRESS moves from 0/2 to 1/2.
+    {
+        let mut wf = workflow.lock().await;
+        wf.complete_step(1).unwrap();
+    }
+    agent
+        .run_turn(&mut messages, &fanin_tx, 2, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // (a) The cacheable prefix — the leading system message — is byte-identical
+    // across the progress bump. This is the reproduction: with the tail folded
+    // into the head the two differ by the PROGRESS line.
+    let prompts = captured.lock().await;
+    assert_eq!(prompts.len(), 2, "one captured system prompt per turn");
+    assert_eq!(
+        prompts[0], prompts[1],
+        "the leading system message is the provider's cached prefix and must not \
+         change on a plan-progress bump"
+    );
+    assert!(
+        !prompts[1].contains("# WORKFLOW STATE"),
+        "the volatile tail must not be folded into the leading system message"
+    );
+    drop(prompts);
+
+    // (b) The volatility rides at the end instead, and the LAST message stays
+    // the constant footer (the empirical cache law needs a byte-stable final
+    // message).
+    let tails = captured_tails.lock().await;
+    assert_eq!(tails.len(), 2);
+    assert_eq!(
+        tails[0],
+        crate::agent::prompt::CONTEXT_FOOTER,
+        "the constant footer must be the final message on the DeepSeek path"
+    );
+    assert_eq!(
+        tails[0], tails[1],
+        "the final message must be byte-stable across progress bumps"
     );
 }
 
@@ -3057,13 +3201,13 @@ async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
 }
 
 #[tokio::test]
-async fn local_provider_tail_folded_into_leading_system_message() {
+async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
     // A Local (Ollama/vLLM/LM Studio) provider rejects any system message that
     // is not the FIRST message ("system message must be at the beginning").
-    // So for Local, run_turn must NOT append the volatile tail + footer as
-    // trailing system messages — the tail is folded into the leading system
-    // message (messages[0]) and the footer is omitted entirely. Mirrors the
-    // OpenAI test above but with a Local-kind CapturingProvider.
+    // So for Local the volatile tail + footer ride at the end as USER messages
+    // (permitted there) and messages[0] stays the byte-stable head — the same
+    // placement DeepSeek-vendor needs for a different reason (echo). Mirrors
+    // the DeepSeek test above with a Local-kind CapturingProvider.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -3077,6 +3221,7 @@ async fn local_provider_tail_folded_into_leading_system_message() {
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
     let (provider, captured, captured_tails) = CapturingProvider::new_local_with_tails();
+    let trailing = provider.trailing_handle();
     let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
@@ -3100,21 +3245,32 @@ async fn local_provider_tail_folded_into_leading_system_message() {
         .await
         .unwrap();
 
-    // (a) NO trailing system message after the user message: the LAST message
-    // captured is the input user prompt, NOT the footer and NOT the volatile
-    // tail (which carries the '# WORKFLOW STATE' marker).
+    // (a) The trailing pair is [volatile tail, footer], both USER-role — the
+    // only placement Ollama accepts (a system message may occupy first
+    // position only), and it leaves messages[0] byte-stable.
+    let trailing = trailing.lock().await;
+    assert_eq!(trailing.len(), 1);
+    assert_eq!(trailing[0].len(), 2, "tail + footer must both be sent");
+    assert_eq!(
+        trailing[0][0].0, "user",
+        "the volatile tail rides as a user message"
+    );
+    assert!(trailing[0][0].1.contains("# WORKFLOW STATE"));
+    assert_eq!(trailing[0][1].0, "user", "the footer rides as a user message");
+    assert_eq!(trailing[0][1].1, crate::agent::prompt::CONTEXT_FOOTER);
+    drop(trailing);
+
+    // (a2) The LAST message is the footer, so the request ends with a user
+    // message and carries no trailing system block at all.
     let tails = captured_tails.lock().await;
     assert_eq!(tails.len(), 1);
-    assert_eq!(tails[0], "hi", "the last message must be the user prompt");
-    assert!(
-        tails[0] != crate::agent::prompt::CONTEXT_FOOTER && !tails[0].contains("# WORKFLOW STATE"),
-        "no trailing system message may follow the user message on Local"
-    );
+    assert_eq!(tails[0], crate::agent::prompt::CONTEXT_FOOTER);
     drop(tails);
 
-    // (b) The single leading system message (messages[0]) carries BOTH the
-    // stable head (the preamble) AND the volatile tail (the workflow state) —
-    // everything Ollama needs in the one allowed position.
+    // (b) The single leading system message (messages[0]) is the STABLE HEAD
+    // only — deliberately: it is the prefix a prompt cache keys on, so the
+    // workflow state must never be folded into it (folding cost DeepSeek
+    // 115-120K re-read tokens per complete_step, and Local shares the path).
     let prompts = captured.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(
@@ -3122,18 +3278,14 @@ async fn local_provider_tail_folded_into_leading_system_message() {
         "head has the preamble"
     );
     assert!(
-        prompts[0].contains("# WORKFLOW STATE"),
-        "the volatile tail is folded into the leading system message on Local"
-    );
-    assert!(
-        !prompts[0].contains(crate::agent::prompt::CONTEXT_FOOTER),
-        "the footer is omitted entirely on Local (no cache benefit)"
+        !prompts[0].contains("# WORKFLOW STATE"),
+        "the volatile tail must not be folded into the leading system message"
     );
     drop(prompts);
 
     // (c) Nothing transient leaks into the persistent vec: exactly the stable
     // head (index 0), the input user message, and the turn's assistant
-    // message. Since nothing trailing was pushed, nothing had to be popped.
+    // message — the tail + footer were pushed for the request and popped.
     assert_eq!(
         messages.len(),
         3,

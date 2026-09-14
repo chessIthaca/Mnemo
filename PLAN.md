@@ -189,12 +189,15 @@ vitest (frontend), `tsc --noEmit` clean.
   DeepSeek-vendor models echo trailing system blocks instead of answering
   the user (sentinel-mirror 5cf5469c + the 2027-01-11 exit-note loop — the
   model echoed the injected RECALLED MEMORIES block, fabricated sections,
-  and looped 366× on a 74-byte unit), so `ProviderPolicy::fold_volatile_tail`
-  folds the volatile tail into the leading system message and omits the
-  CONTEXT_FOOTER for that vendor — the standard request shape every other
-  client sends, at the cost of that vendor's prefix-cache reuse (accepted
-  for a vendor that is otherwise unusable; GLM/Anthropic/OpenAI keep the
-  trailing placement). Related loop defense: the in-stream R10 repetition
+  and looped 366× on a 74-byte unit), so `ProviderPolicy::tail_as_user_messages`
+  sends the volatile tail + CONTEXT_FOOTER as trailing USER messages for that
+  vendor — the standard request shape (a tool turn ending in a user message),
+  with no system block in the tail position, and messages[0] left byte-stable.
+  Folding the tail into the leading system message instead (the first
+  mitigation) cost that vendor its prefix cache: every complete_step progress
+  bump rewrote messages[0], the cache died at the head, and each check-off
+  re-billed ~115-120K tokens at 5.1-9.0% hit (2026-09-14 trace window).
+  GLM/Anthropic/OpenAI keep trailing SYSTEM messages. Related loop defense: the in-stream R10 repetition
   guard (`detect_repetition`) detects loops of ANY byte period ≤ the
   window — the old exact-window suffix check was structurally blind to
   periods not dividing 200 (the 74-byte exit-note unit evaded it for

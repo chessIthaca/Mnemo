@@ -66,10 +66,12 @@ struct RequestBody<'a> {
 /// head swap, pressure flip, or strip crossing simply misses and rebuilds.
 pub(super) struct PrefixCache {
     /// Number of leading messages covered by `prefix` — always
-    /// `messages.len()` minus the trailing system-message run (the volatile
-    /// per-request tail + CONTEXT_FOOTER are pushed after the token
-    /// accounting and popped after the request; they disappear between
-    /// iterations, so caching them would make the cache never hit).
+    /// `messages.len()` minus the trailing transient run (the volatile
+    /// per-request tail + CONTEXT_FOOTER, pushed just before the request and
+    /// popped after it; they disappear between iterations, so caching them
+    /// would make the cache never hit). The run is located by the footer
+    /// sentinel, not by role: it is a SYSTEM pair on most vendors but a USER
+    /// pair on `ProviderPolicy::tail_as_user_messages` vendors.
     pub(super) len: usize,
     /// The serialized JSON of `messages[0..len]`, one entry per message. The
     /// boxes circulate: taken out on a hit, stored back on refresh — the
@@ -367,16 +369,30 @@ impl OpenAiClient {
             self.config.kind,
             &self.config.model,
         );
-        // Trailing system run (the volatile per-request tail + CONTEXT_FOOTER,
-        // pushed after the token accounting and popped after the request):
-        // never byte-stable across iterations — excluded from the prefix
-        // cache and always serialized fresh.
-        let trailing_systems = messages
-            .iter()
-            .rev()
-            .take_while(|m| m.role == Role::System)
-            .count();
-        let cacheable_len = messages.len() - trailing_systems;
+        // Trailing transient run (the volatile per-request tail + the
+        // byte-stable CONTEXT_FOOTER, pushed just before the request and popped
+        // right after it): never byte-stable across iterations — excluded from
+        // the prefix cache and always serialized fresh. The pair's ROLE depends
+        // on the vendor (`ProviderPolicy::tail_as_user_messages`: a trailing
+        // USER pair on DeepSeek-vendor/Local, SYSTEM elsewhere), so the run is
+        // located by the footer sentinel rather than by role — a role-keyed
+        // count would leave the user-role pair inside the cached prefix and
+        // force a full rebuild every iteration, the churn this exclusion exists
+        // to avoid. A real user turn never equals the sentinel, so it stays
+        // cacheable.
+        let trailing_transient = if matches!(
+            messages.last(),
+            Some(m) if m.content.as_text() == crate::agent::prompt::CONTEXT_FOOTER
+        ) {
+            2.min(messages.len())
+        } else {
+            messages
+                .iter()
+                .rev()
+                .take_while(|m| m.role == Role::System)
+                .count()
+        };
+        let cacheable_len = messages.len() - trailing_transient;
 
         // Prefix-cache lookup (perf review L3, 2027-01-09): on a fingerprint
         // match the serialized prefix is reused and only the tail is
@@ -1191,10 +1207,12 @@ pub(super) fn echo_assistant_raw<'a>(
 /// Local endpoints (Ollama/vLLM/LM Studio) render prompts through a Jinja
 /// chat template that raises "System message must be at the beginning" when a
 /// `system` role shows up mid-conversation. Several upstream paths produce
-/// exactly that (the conversation summary is placed at index 1, suggestion
-/// re-injection appends a `system` message at the end, the volatile tail and
-/// CONTEXT_FOOTER are pushed as trailing `system` messages on the OpenAI
-/// path). Rather than chase each producer, this function rewrites the list at
+/// exactly that (the conversation summary is placed at index 1; suggestion
+/// re-injection and the volatile tail + CONTEXT_FOOTER are trailing `system`
+/// messages on vendors that accept them — Local and DeepSeek-vendor get the
+/// user-role variants via `ProviderPolicy::tail_as_user_messages` and
+/// `AgentLoop::tail_is_user_role`, so the summary is their remaining
+/// producer). Rather than chase each producer, this function rewrites the list at
 /// the single serialization choke point:
 ///
 /// - The first message keeps its role (it may be `system`).

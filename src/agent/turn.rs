@@ -443,17 +443,16 @@ impl AgentLoop {
 
             // Build + install the system prompt (stable head + volatile
             // tail + session primer + hidden tool groups) — see
-            // install_system_messages. Returns whether the tail was folded
-            // into the head (Local providers + DeepSeek-vendor; no
-            // trailing pushes).
-            let tail_folded = self
-                .install_system_messages(
-                    messages,
-                    &provider,
-                    memory_context.as_deref(),
-                    &tool_filter,
-                )
-                .await;
+            // install_system_messages. It pushes the tail + CONTEXT_FOOTER as
+            // the last two messages (user- or system-role per vendor), popped
+            // right after the request below.
+            self.install_system_messages(
+                messages,
+                &provider,
+                memory_context.as_deref(),
+                &tool_filter,
+            )
+            .await;
             // The provider request (connection establishment + first byte)
             // is interruptible — see request_stream. The future borrows
             // `messages` immutably, so the pops below run after it returns.
@@ -472,10 +471,8 @@ impl AgentLoop {
                     prep_started,
                 )
                 .await;
-            if !tail_folded {
-                messages.pop(); // CONTEXT_FOOTER (the stable last message)
-                messages.pop(); // volatile tail
-            }
+            messages.pop(); // CONTEXT_FOOTER (the stable last message)
+            messages.pop(); // volatile tail
             // If a hard signal arrived during the provider request, end the
             // turn now — no stream started, so there's no partial output to
             // keep. Emit Finished + carry the stop reason. InterruptWithSteers
@@ -1036,26 +1033,24 @@ impl AgentLoop {
                 for cmd in buffered {
                     match cmd {
                         AgentCommand::Suggestion(payload) => {
-                            // Text-only steer → system message (unchanged
-                            // mid-work guidance semantics). An image-bearing
+                            // Text-only steer → guidance message (unchanged
+                            // mid-work semantics; user-role on
+                            // `tail_as_user_messages` vendors so no trailing
+                            // system block can reach DeepSeek/Ollama — see
+                            // push_suggestion_message). An image-bearing
                             // steer → user message with image blocks (image
                             // content belongs in user messages; the same
                             // multimodal / vision-fallback handling as a
                             // normal prompt).
-                            //
-                            // Residual (accepted, review 2026-09-11 L2): on
-                            // fold_volatile_tail vendors (DeepSeek) a
-                            // text-only suggestion leaves this system message
-                            // as the request's LAST message after a tool call
-                            // — the same echo-trigger class the tail+footer
-                            // fold eliminates, but far narrower (one short
-                            // line vs the large structured tail). Demoting
-                            // suggestions to user messages per-vendor is a
-                            // separate change if it ever matters.
                             let crate::runtime::SteerPayload { text, images } = payload;
+                            // Keyed to the SWAP TARGET, not the provider that
+                            // ran the summary: the requests that follow are
+                            // served by the new vendor (the snapshot is
+                            // refreshed once the swap completes), and a
+                            // user-role suggestion is acceptable to every
+                            // vendor even if the swap ends up interrupted.
                             if images.is_empty() {
-                                messages
-                                    .push(Message::system(format!("User suggestion: {text}")));
+                                Self::push_suggestion_message(messages, &pending.provider, &text);
                             } else {
                                 let content = self
                                     .build_user_content(agent_id, fanin_tx, text, &images)
@@ -2009,7 +2004,7 @@ impl AgentLoop {
                         ))
                         .await;
                     if images.is_empty() {
-                        messages.push(Message::system(format!("User suggestion: {text}")));
+                        Self::push_suggestion_message(messages, &provider, &text);
                     } else {
                         let content = self
                             .build_user_content(agent_id, fanin_tx, text, &images)
@@ -2228,16 +2223,57 @@ impl AgentLoop {
         }
     }
 
-    /// Build and install the system prompt for this iteration: the stable
-    /// head (preamble + constitution + session primer + hidden tool-group
-    /// index) into messages[0], and — for providers that keep the trailing
-    /// placement — the volatile tail (workflow state + recalled memories) +
-    /// the byte-stable CONTEXT_FOOTER as trailing system messages (popped
-    /// right after the request returns). Returns whether the tail was
-    /// FOLDED into the head instead (no trailing pushes): local providers
-    /// (Ollama-style) and `fold_volatile_tail` vendors (DeepSeek — its
+    /// Whether this provider's request must end with USER-role messages instead
+    /// of system ones: Local-kind (Ollama accepts a system message only in
+    /// first position) and `tail_as_user_messages` vendors (DeepSeek — its
     /// models echo trailing system blocks instead of answering the user;
-    /// sentinel-mirror 5cf5469c + the 2027-01-11 exit-note loop).
+    /// sentinel-mirror 5cf5469c + the 2027-01-11 exit-note loop). Those vendors
+    /// get the volatile tail + CONTEXT_FOOTER as trailing user messages, which
+    /// keeps the request ending with a user message while leaving messages[0]
+    /// byte-stable — the prefix a prompt cache keys on.
+    pub(crate) fn tail_is_user_role(provider: &Arc<dyn LlmClient>) -> bool {
+        matches!(
+            provider.kind(),
+            crate::provider::ProviderKind::Local
+        ) || crate::provider::policy::ProviderPolicy::for_kind_and_model(
+            provider.kind(),
+            provider.model(),
+        )
+        .tail_as_user_messages
+    }
+
+    /// Push a text-only user suggestion as mid-work guidance. The role follows
+    /// [`Self::tail_is_user_role`]: on those vendors a trailing system block is
+    /// exactly the echo trigger the tail placement avoids (and Ollama rejects it
+    /// in that position), so the same text rides a user message instead —
+    /// identical mid-work guidance semantics, no trailing system block anywhere
+    /// in the request (closes the review 2026-09-11 L2 residual).
+    pub(crate) fn push_suggestion_message(
+        messages: &mut Vec<Message>,
+        provider: &Arc<dyn LlmClient>,
+        text: &str,
+    ) {
+        if Self::tail_is_user_role(provider) {
+            messages.push(Message::user_text(format!("User suggestion: {text}")));
+        } else {
+            messages.push(Message::system(format!("User suggestion: {text}")));
+        }
+    }
+
+    /// Build and install the system prompt for this iteration: the stable head
+    /// (preamble + constitution + session primer + hidden tool-group index) into
+    /// messages[0], and the volatile tail (workflow state + recalled memories)
+    /// + the byte-stable CONTEXT_FOOTER as the last two messages, popped right
+    /// after the request returns. Their ROLE follows
+    /// [`Self::tail_is_user_role`]: user for DeepSeek-vendor/Local, system
+    /// otherwise — the same two messages either way.
+    ///
+    /// Neither placement touches messages[0], which is what a provider's prompt
+    /// cache keys on: folding the tail into the head (the previous strategy for
+    /// DeepSeek/Local) made every `complete_step` progress bump rewrite the
+    /// leading message, so the cache died at the head and each check-off
+    /// re-billed the whole history (measured 2026-09-14: 5.1-9.0% hit,
+    /// 115-120K tokens re-read — .coding/analysis/cache-hit-6-aggregates.txt).
     /// Extracted from run_turn (quality review HIGH 1).
     async fn install_system_messages(
         &self,
@@ -2245,7 +2281,7 @@ impl AgentLoop {
         provider: &Arc<dyn LlmClient>,
         memory_context: Option<&str>,
         tool_filter: &crate::tool::ToolFilter,
-    ) -> bool {
+    ) {
         // Build the system prompt head + volatile tail. (The workflow
         // tool filter was already read at the top of the iteration —
         // the token accounting consumes it first.)
@@ -2353,63 +2389,44 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             }
         }
 
-        // Whether this is a local (Ollama/vLLM/LM Studio) endpoint. Local
-        // models reject any system message that is not the FIRST message
-        // ("system message must be at the beginning"), so the volatile
-        // tail + CONTEXT_FOOTER must NOT be appended as trailing system
-        // messages for them — the tail is folded into the leading system
-        // message instead (see below).
-        let is_local = matches!(provider.kind(), crate::provider::ProviderKind::Local);
-        // DeepSeek-vendor models echo trailing system blocks instead of
-        // answering the user (sentinel-mirror 5cf5469c + the 2027-01-11
-        // exit-note loop) — fold the tail into the head for them too, so
-        // their requests end with the user/tool message like every other
-        // client. This sacrifices that vendor's prefix-cache reuse (the
-        // trailing placement exists for the empirical cache law); accepted
-        // for a vendor that is otherwise unusable.
-        let fold_tail = is_local
-            || crate::provider::policy::ProviderPolicy::for_kind_and_model(
-                provider.kind(),
-                provider.model(),
-            )
-            .fold_volatile_tail;
+        // Which ROLE the trailing messages carry (see tail_is_user_role):
+        // user for Local (Ollama accepts a system message only in first
+        // position) and DeepSeek-vendor (its models echo trailing system
+        // blocks instead of answering the user — sentinel-mirror 5cf5469c +
+        // the 2027-01-11 exit-note loop). Both classes used to fold the tail
+        // into the leading system message instead, which sacrificed that
+        // vendor's prefix cache: every `complete_step` progress bump rewrote
+        // messages[0] and the provider re-read the whole conversation
+        // (measured 2026-09-14: 5.1-9.0% hit, 115-120K tokens per check-off).
+        let tail_as_user = Self::tail_is_user_role(provider);
 
         // Prepend/replace the system message with the STABLE HEAD only
-        // (preamble + constitution + session primer). For OpenAI-kind
-        // providers the volatile workflow/memories tail is appended after
-        // the conversation history below, so the provider's prompt-cache
-        // prefix survives complete_step progress bumps and new turns. For
-        // fold-tail providers — Local-kind (Ollama: the only position a
-        // system message may occupy) and DeepSeek-vendor (echo-prone) —
-        // the tail is folded into THIS leading system message and the
-        // trailing footer is omitted.
-        let head_content = if fold_tail {
-            let mut h = head_content;
-            h.push_str(&volatile_tail);
-            h
-        } else {
-            head_content
-        };
+        // (preamble + constitution + session primer). The volatile
+        // workflow/memories tail is appended after the conversation history
+        // below on EVERY vendor, so the provider's prompt-cache prefix
+        // survives complete_step progress bumps and new turns. Nothing
+        // vendor-specific belongs in here: this message is the cached prefix.
         if messages.is_empty() || messages[0].role != Role::System {
-            messages.insert(
-                0,
-                Message::system(head_content),
-            );
+            messages.insert(0, Message::system(head_content));
         } else {
             messages[0].content = MessageContent::text(head_content);
         }
 
-        // Append the volatile tail (workflow state + recalled memories) as
-        // a trailing system message AFTER the conversation history, where
-        // the provider's prefix cache is immune — so its per-step/per-turn
-        // changes never invalidate the cached stable head. Then append the
-        // byte-stable CONTEXT_FOOTER as the FINAL message: the provider
-        // reuses the request prefix only when the last message is
-        // byte-identical to the previous request's (empirical cache law,
-        // see .coding/analysis/cache-hit-2-report.md), so a constant last
-        // message makes tail changes (complete_step progress, new turns)
-        // cost only the tail + footer to re-process instead of the whole
-        // cached context.
+        // Append the volatile tail (workflow state + recalled memories) AFTER
+        // the conversation history, where the provider's prefix cache is
+        // immune — so its per-step/per-turn changes never invalidate the
+        // cached stable head. Then append the byte-stable CONTEXT_FOOTER as
+        // the FINAL message: the provider reuses the request prefix only when
+        // the last message is byte-identical to the previous request's
+        // (empirical cache law, see .coding/analysis/cache-hit-2-report.md),
+        // so a constant last message makes tail changes (complete_step
+        // progress, new turns) cost only the tail + footer to re-process
+        // instead of the whole cached context.
+        //
+        // Role per vendor: user for `tail_as_user` (DeepSeek echoes trailing
+        // system blocks instead of answering; Ollama accepts a system message
+        // only in first position) — the request still ends with a user message
+        // the way a normal client turn does — and system for everyone else.
         //
         // Both are transient: pushed here and popped immediately after the
         // request returns, so they never pollute the persistent
@@ -2417,20 +2434,13 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // even on error; this is safe because `complete_with_retry`
         // serializes the messages into the request body and the returned
         // stream borrows `&self` (the provider), not the messages slice.
-        //
-        // Fold-tail providers (Local/Ollama, DeepSeek-vendor) skip BOTH
-        // pushes: the volatile tail was already folded into the leading
-        // system message above, and the CONTEXT_FOOTER has no cache benefit
-        // on a provider with no cache reuse — and a trailing system message
-        // is exactly what Ollama rejects and what DeepSeek echoes.
-        // `volatile_tail` was consumed by the head fold when fold_tail, so
-        // it is only referenced here on the trailing path.
-        if !fold_tail {
+        if tail_as_user {
+            messages.push(Message::user_text(volatile_tail));
+            messages.push(Message::user_text(prompt::CONTEXT_FOOTER));
+        } else {
             messages.push(Message::system(volatile_tail));
             messages.push(Message::system(prompt::CONTEXT_FOOTER));
         }
-
-        fold_tail
     }
 
     /// Build + fire-and-forget-record one request_stats row (R21). The

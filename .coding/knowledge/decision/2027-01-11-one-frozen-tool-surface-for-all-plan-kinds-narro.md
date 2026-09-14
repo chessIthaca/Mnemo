@@ -1,6 +1,7 @@
 +++
 title = "one frozen tool surface for all plan kinds + narrow landing sync tolerance (plan f69317d4)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Two behavior decisions landed in plan f69317d4 (branch `wt/mnemo`, UNMERGED as of 2027-01-11; HEAD e8f5d2a, review PASS in `.coding/reviews/2026-09-14-round6-followups-review-round3.md`). Both reverse earlier documented intent on purpose — do not "restore" the old behavior.

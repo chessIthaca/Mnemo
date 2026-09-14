@@ -1534,11 +1534,17 @@ export async function gitHistory(): Promise<GitHistory> {
 
 /**
  * Enter a skill on the given agent: starts the skill (transitions the
- * workflow to the Skill state with the skill's tool allow-list + prompt) and
- * sends the skill's goal as a prompt so the agent drives toward it. Backs the
- * "Merge to main" button's confirm action (the merge_to_main skill). The
- * agent-driven path is the `skill_start` tool (which goes through the normal
- * approval gate); this is the UI-initiated path.
+ * workflow to the Skill state with the skill's tool allow-list) and sends
+ * `prompt` as the DISPATCH message so the agent drives toward it. Backs the
+ * "Merge to main" button's confirm action (the merge_to_main skill), where the
+ * Git tab passes one line naming the branch to merge.
+ *
+ * That message never replaces the skill's own prompt: the registry prompt from
+ * `.coding/skills/<skill>.toml` is always the overlay injected into the system
+ * prompt every turn the skill runs — the skill file owns the procedure, the
+ * caller only names a target. Omit it to dispatch the registry prompt itself.
+ * The agent-driven path is the `skill_start` tool (which goes through the
+ * normal approval gate); this is the UI-initiated path.
  */
 export async function enterSkill(
   agentId: AgentId,

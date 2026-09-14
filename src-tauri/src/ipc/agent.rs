@@ -796,14 +796,30 @@ pub async fn get_plan(
         .map_err(|e| format!("failed to read plan '{plan_id}': {e}"))
         .map_err(IpcError::from)
 }
+/// Resolve the two prompts of a UI-initiated skill entry: the OVERLAY (what the
+/// system prompt carries every turn the skill runs) and the DISPATCH message
+/// (what the agent is told to do now). The overlay is ALWAYS the registry prompt
+/// — the skill file owns its procedure, so a caller naming a target (the Git tab
+/// picks a branch) can neither rewrite nor drop the steps. A blank argument
+/// falls back to the overlay so the agent always receives the goal.
+fn skill_prompts(spec_prompt: &str, dispatch: Option<String>) -> (String, String) {
+    match dispatch {
+        Some(text) if !text.trim().is_empty() => (spec_prompt.to_string(), text),
+        _ => (spec_prompt.to_string(), spec_prompt.to_string()),
+    }
+}
+
 /// Enter a skill on the given agent: lock its workflow, call `start_skill`,
-/// and send an `AgentCommand::Prompt` to the agent with the skill's goal. This
-/// is the UI-initiated entry path (the "Merge to main" button's confirm
-/// dialog). The agent-driven path is the `skill_start` tool (which goes
+/// and send an `AgentCommand::Prompt` to the agent carrying the dispatch
+/// message. This is the UI-initiated entry path (the "Merge to main" button's
+/// confirm dialog). The agent-driven path is the `skill_start` tool (which goes
 /// through the normal approval gate). Both enter the same skill state.
 ///
-/// `skill` selects the registry entry (tool allow-list + default prompt +
-/// target_state). `prompt` overrides the registry's prompt when given. The
+/// `skill` selects the registry entry (tool allow-list + prompt + target_state).
+/// `prompt` is the DISPATCH message sent to the agent — the Git tab names the
+/// branch to merge there. It never replaces the registry prompt, which stays the
+/// overlay injected into the system prompt every turn while the skill runs (see
+/// [`skill_prompts`]); omitting it dispatches the registry prompt itself. The
 /// skill must be `available_in` the agent's current workflow state.
 ///
 /// After `start_skill` succeeds, a `SkillStarted` event is emitted on the
@@ -847,10 +863,10 @@ pub async fn enter_skill(
     if !registry.is_available_in(&skill, current) {
         return Err(format!("skill '{skill}' is not available in the {current} state").into());
     }
-    let goal = prompt.unwrap_or_else(|| spec.prompt.clone());
+    let (overlay, dispatch) = skill_prompts(&spec.prompt, prompt);
     {
         let mut wf = workflow_arc.lock().await;
-        wf.start_skill(&skill, &goal, spec.target_state, spec.tools.clone())
+        wf.start_skill(&skill, &overlay, spec.target_state, spec.tools.clone())
             .map_err(|e| format!("failed to start skill: {e}"))?;
     }
 
@@ -861,18 +877,18 @@ pub async fn enter_skill(
         agent_id,
         SerializableAgentEvent::SkillStarted {
             name: skill.clone(),
-            prompt: goal.clone(),
+            prompt: dispatch.clone(),
         },
     );
 
-    // Send the goal as a prompt so the agent drives toward it. The skill's
-    // tool allow-list + prompt overlay are now active.
+    // Send the dispatch message so the agent drives toward it. The skill's tool
+    // allow-list + the registry prompt overlay are now active.
     let manager = state.runtime.manager.lock().await;
     manager
         .send(
             agent_id,
             AgentCommand::Prompt {
-                text: goal.clone(),
+                text: dispatch,
                 images: vec![],
             },
         )
@@ -1072,6 +1088,59 @@ mod tests {
             body.contains("get_or_insert_with(") && !body.contains("*latch = Some("),
             "the latch must be merged into (get_or_insert_with), never \
              overwritten"
+        );
+    }
+
+    /// The UI-initiated entry path may name a TARGET but never rewrite the
+    /// skill's procedure: whatever `enter_skill`'s `prompt` argument carries,
+    /// the overlay injected into the system prompt stays the registry prompt.
+    /// Regression against the Git tab's former behavior, which passed its own
+    /// full copy of the merge steps and thereby REPLACED the skill file's prompt
+    /// — together with the standing rules that prompt carries (which tool may
+    /// run the merge, never stash, `.coding/` must land).
+    #[test]
+    fn skill_entry_keeps_the_registry_prompt_as_the_overlay() {
+        let spec = "1. Commit ALL work.\n2. Merge it.";
+        let (overlay, dispatch) = super::skill_prompts(spec, Some("Merge 'wt/x' into main.".into()));
+        assert_eq!(overlay, spec, "the overlay is always the registry prompt");
+        assert_eq!(
+            dispatch, "Merge 'wt/x' into main.",
+            "the argument only supplies the dispatch message"
+        );
+
+        // No argument (the status-bar button) dispatches the registry prompt.
+        let (overlay, dispatch) = super::skill_prompts(spec, None);
+        assert_eq!(overlay, spec);
+        assert_eq!(dispatch, spec);
+
+        // A blank argument cannot blank the turn either.
+        let (overlay, dispatch) = super::skill_prompts(spec, Some("   ".into()));
+        assert_eq!(overlay, spec);
+        assert_eq!(dispatch, spec);
+
+        // Body contract: the command wires the overlay resolved by `skill_prompts`
+        // into `start_skill`, and never the caller's argument. Reverting to
+        // `start_skill(&skill, &prompt.unwrap_or_else(...))` fails here.
+        let src = include_str!("agent.rs");
+        let start = src
+            .find("pub async fn enter_skill(")
+            .expect("enter_skill command present");
+        let end = src[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("let (overlay, dispatch) = skill_prompts(&spec.prompt, prompt);"),
+            "enter_skill must resolve the overlay + dispatch through skill_prompts"
+        );
+        assert!(
+            body.contains("start_skill(&skill, &overlay, spec.target_state"),
+            "the overlay handed to start_skill is the registry prompt, not the argument"
+        );
+        assert!(
+            !body.contains("prompt.unwrap_or_else"),
+            "the prompt argument must never become the overlay"
         );
     }
 }

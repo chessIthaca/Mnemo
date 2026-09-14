@@ -3,46 +3,66 @@
 // See LICENSE in the repository root.
 
 /**
- * GitView merge-prompt contract test.
+ * GitView merge-dispatch contract test.
  *
- * The Git tab's per-branch "Merge to main" action does NOT use the
- * `merge_to_main` skill's own prompt — it overrides it with `mergePrompt`,
- * so the flow lives in two copies (`.coding/skills/merge_to_main.toml` and
- * here) that can drift apart.
+ * The Git tab's per-branch "Merge to main" action enters the `merge_to_main`
+ * skill and sends ONE line naming the target branch (see `mergeDispatch`). The
+ * procedure — commit-all, sync main with origin BEFORE the merge, `--no-ff`
+ * merge, conflict resolution, both builds, branch cleanup — lives only in
+ * `.coding/skills/merge_to_main.toml`, whose content and step order are pinned
+ * by the Rust test
+ * `skill::tests::shipped_skill_files_parse_and_merge_to_main_cleans_up_memories`.
  *
- * Pinned contract: `main` is synced with `origin` BEFORE the branch is
- * merged in. On 2026-09-13 the missing sync cost a separate catch-up
- * session — the branch landed on a stale `main` and the push was rejected
- * until `git fetch origin` + `git pull --no-rebase` ran. Ordering is the
- * point: a pull AFTER `git merge --no-ff` cannot prevent that.
+ * This file supplies the other half of that contract: the UI may name a target,
+ * never restate the steps. The copy that used to live in GitView had already
+ * drifted out of date — it still claimed a shell-invoked `git merge` skips the
+ * approval prompt (false since `ShellTool::never_auto_for`, 2027-01-11), and it
+ * permitted a stash the skill forbids.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { mergePrompt } from "./GitView";
+import { mergeDispatch } from "./GitView";
+import gitViewSource from "./GitView.tsx?raw";
 
-describe("mergePrompt — sync main with origin before the branch merge", () => {
-  it("fetches and pulls origin (no rebase) before merging the branch", () => {
-    const prompt = mergePrompt("wt/demo");
-    const fetchAt = prompt.indexOf("git fetch origin");
-    const pullAt = prompt.indexOf("git pull --no-rebase");
-    const mergeAt = prompt.indexOf("git merge --no-ff wt/demo");
-
-    // Both halves of the sync are present …
-    expect(fetchAt).toBeGreaterThan(-1);
-    expect(pullAt).toBeGreaterThan(-1);
-    // … the branch merge is present …
-    expect(mergeAt).toBeGreaterThan(-1);
-    // … and the sync precedes it (test at -1 would pass a naive compare).
-    expect(fetchAt).toBeLessThan(mergeAt);
-    expect(pullAt).toBeLessThan(mergeAt);
+describe("mergeDispatch — names the target, never the procedure", () => {
+  it("is a single line naming the branch to merge into main", () => {
+    const line = mergeDispatch("wt/demo");
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).toContain("wt/demo");
+    expect(line).toContain("main");
   });
 
-  it("keeps the branch out of its own merge target prompt", () => {
-    // The named branch is interpolated everywhere it is needed, so the
-    // Git tab can merge ANY branch (not just the checked-out one).
-    const prompt = mergePrompt("wt/other");
-    expect(prompt).toContain("git merge --no-ff wt/other");
-    expect(prompt).not.toContain("git merge --no-ff wt/demo");
+  it("carries no step text for any branch", () => {
+    // Every step of the flow must come from the skill file, so a re-introduced
+    // procedure copy fails here rather than silently shadowing it.
+    for (const branch of ["wt/demo", "wt/other"]) {
+      const line = mergeDispatch(branch);
+      for (const step of [
+        "Steps:",
+        "git fetch",
+        "git pull",
+        "git checkout",
+        "git merge",
+        "--no-ff",
+        "git add",
+        "npm run build",
+        "cargo build",
+        "file_edit",
+        "skill_end",
+        "stash",
+      ]) {
+        expect(line).not.toContain(step);
+      }
+    }
+  });
+
+  it("is exactly what the click handler sends (source contract)", () => {
+    // The tab cannot re-author the flow: the handler passes the dispatch line
+    // and nothing else to enterSkill.
+    expect(gitViewSource).toContain(
+      'enterSkill(activeAgent, "merge_to_main", mergeDispatch(mergeTarget))',
+    );
+    expect(gitViewSource).not.toContain("mergePrompt");
   });
 });

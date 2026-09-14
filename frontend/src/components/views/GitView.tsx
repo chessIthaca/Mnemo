@@ -25,12 +25,13 @@
 // - SOLID TIPS: the tip commit of every branch (and main) renders as a
 //   filled solid circle in its lane color.
 //
-// The merge offer reuses the merge_to_main skill: confirming the dialog
-// enters the skill on the active agent with a branch-specific prompt (see
-// [`mergePrompt`]), so the agent itself drives checkout/merge/conflict
-// resolution/build verification/branch cleanup — with git merge staying
-// approval-gated inside the skill. Offered only while the active agent's
-// workflow is Complete or Planning (same gate as the status-bar button).
+// The merge offer reuses the merge_to_main skill: confirming the dialog enters
+// the skill on the active agent with one dispatch line naming the target branch
+// (see [`mergeDispatch`]). The procedure lives in the skill file — never here —
+// so the agent drives checkout/merge/conflict resolution/build
+// verification/branch cleanup with git merge staying approval-gated inside the
+// skill. Offered only while the active agent's workflow is Complete or Planning
+// (same gate as the status-bar button).
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GitBranch, GitMerge, RefreshCw } from "lucide-react";
@@ -68,21 +69,15 @@ const SUBJECT_CAP = 48;
 const DATE_RESERVE = 46;
 
 /**
- * The branch-specific goal sent to the merge_to_main skill via enterSkill —
- * mirrors the skill file's own steps, but names the target branch so the
- * agent can merge ANY branch, not just the current one. Pure (exported for
- * tests): no store, no IPC.
+ * The dispatch line sent to the merge_to_main skill via enterSkill: it names the
+ * TARGET branch so the agent can merge ANY branch, not just the current one. The
+ * procedure itself lives in the skill file (`.coding/skills/merge_to_main.toml`),
+ * which is always the prompt overlay injected every turn — this string must
+ * never restate the steps (the copy that used to live here had already drifted
+ * out of date). Pure (exported for tests): no store, no IPC.
  */
-export function mergePrompt(branch: string): string {
-  return `Merge branch '${branch}' into main and clean up. Steps:
-1. git status — if the working tree is dirty, commit uncommitted work on the current branch with a clear message (stash only if it belongs to another branch).
-2. If the current branch is not '${branch}', git checkout ${branch} first.
-3. git checkout main, then sync main with origin FIRST via shell (the git tool has no fetch/pull): git fetch origin + git pull --no-rebase (nothing new or no remote → continue; conflicts here too: resolve with file_edit taking the UNION of both sides, then git add + git commit to conclude the pull merge — never drop a side's change).
-4. git merge --no-ff ${branch} — use the git tool, never shell: the git tool forces the core-operation approval prompt, shell does not.
-5. If there are merge conflicts, resolve them with file_edit taking the UNION of both sides' fixes, then git add + git commit — never drop a side's change; never use -X ours / -X theirs.
-6. VERIFY THE MERGED TREE BUILDS before cleanup: cd frontend; npm run build AND cd src-tauri; cargo build (the root cargo build never compiles the bin crate). After the merge also run root cargo test and frontend npm test, unpiped, reading $LASTEXITCODE. If anything fails, fix with file_edit and re-run until green.
-7. Once main has the merge commit AND everything is green, delete the branch with git branch -d ${branch} (never -D).
-8. Call skill_end to return to Planning. Do NOT push.`;
+export function mergeDispatch(branch: string): string {
+  return `Merge branch '${branch}' into main and clean up.`;
 }
 
 /** Row Y for the i-th commit (commits are newest-first). */
@@ -151,12 +146,12 @@ export function GitView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- load once on mount
   }, []);
 
-  /** Confirm the dialog → enter the merge skill with the branch prompt. */
+  /** Confirm the dialog → enter the merge skill with the target branch. */
   async function handleMergeConfirm() {
     if (activeAgent === null || mergeTarget === null) return;
     setMerging(true);
     try {
-      await enterSkill(activeAgent, "merge_to_main", mergePrompt(mergeTarget));
+      await enterSkill(activeAgent, "merge_to_main", mergeDispatch(mergeTarget));
       setMergeResult({
         ok: true,
         text: `Merge skill started — the agent is driving the merge of ${mergeTarget}.`,

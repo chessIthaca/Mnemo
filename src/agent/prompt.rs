@@ -450,10 +450,12 @@ pub(crate) fn append_plan_nudge(
     }
 }
 
-/// Byte-stable footer appended by `turn.rs` as the FINAL system message, after
-/// the volatile tail (workflow state + recalled memories) — on the trailing
-/// placement only: fold-tail providers (Local/Ollama, DeepSeek-vendor) omit
-/// it entirely (see `ProviderPolicy::fold_volatile_tail`).
+/// Byte-stable footer appended by `turn.rs` as the FINAL message, after the
+/// volatile tail (workflow state + recalled memories). Its ROLE follows the
+/// vendor: a system message for providers that accept trailing system blocks, a
+/// USER message for Local/Ollama (a system message may only be first) and
+/// DeepSeek-vendor (`ProviderPolicy::tail_as_user_messages` — its models echo
+/// trailing system blocks instead of answering).
 ///
 /// Per the empirically-observed provider cache law (DeepSeek reuses the request
 /// byte prefix only when the request's LAST message is byte-identical to the
@@ -480,17 +482,17 @@ fn push_section(out: &mut String, text: &str) {
 /// blocks + the global + project constitution.
 ///
 /// This block is byte-stable across turns — it changes only when the
-/// `agent.md` files are edited (re-read from disk, mtime-guarded). On
-/// providers that keep the trailing placement it is the only content placed
-/// in `messages[0]`, so the provider's prompt-cache prefix survives
-/// `complete_step` progress bumps, workflow-state transitions, and new turns
-/// (which only change the volatile tail). On fold-tail providers —
-/// Local-kind (Ollama requires the system message to be first) and
-/// DeepSeek-vendor (`ProviderPolicy::fold_volatile_tail`; its models echo
-/// trailing system blocks) — the volatile tail is folded into `messages[0]`
-/// too, so the head alone is no longer byte-stable there (accepted: Local
-/// has no prefix cache to preserve; the DeepSeek cache sacrifice is
-/// documented in the policy).
+/// `agent.md` files are edited (re-read from disk, mtime-guarded). It is the
+/// ONLY content placed in `messages[0]`, on every vendor, so the provider's
+/// prompt-cache prefix survives `complete_step` progress bumps, workflow-state
+/// transitions, and new turns (which only change the volatile tail). That tail
+/// and [`CONTEXT_FOOTER`] ride at the END instead: as user-role messages on
+/// Local/Ollama and DeepSeek-vendor (`ProviderPolicy::tail_as_user_messages` —
+/// those reject or echo trailing *system* blocks) and as system-role ones
+/// elsewhere. Folding the tail in here (the previous strategy for those two
+/// vendor classes) is what made every plan-item check-off re-read the whole
+/// conversation: measured 2026-09-14, 5.1-9.0% cache hit and 115-120K tokens
+/// re-billed per `complete_step`.
 pub fn build_stable_head(constitution: &Constitution) -> String {
     let mut prompt = String::new();
 
@@ -525,19 +527,17 @@ pub fn build_stable_head(constitution: &Constitution) -> String {
 /// interpolated from live workflow state.
 ///
 /// This changes per step/turn (PROGRESS bumps, CURRENT STEP text, recall
-/// results). Production (`turn.rs`) places it in one of two positions: the
-/// *trailing* placement (the cache-optimized default) appends it after the
-/// conversation history, where the provider's prefix cache is immune — so
-/// its volatility never invalidates the cached stable head — and then
-/// appends [`CONTEXT_FOOTER`] as a separate FINAL system message, so the
-/// request's last message stays byte-stable across tail changes (the
-/// provider reuses the prefix only when the last message is byte-identical).
-/// Fold-tail providers (Local/Ollama, DeepSeek-vendor —
-/// `ProviderPolicy::fold_volatile_tail`) instead fold it into the leading
-/// system message and omit the footer. Because the tail is the only
-/// reprocessed part per change on the trailing path, it is kept compact:
-/// CURRENT STEP shows the step header (or a 120-char truncation) and memory
-/// entries cap content at 160 chars.
+/// results). Production (`turn.rs`) appends it AFTER the conversation history,
+/// where the provider's prefix cache is immune — so its volatility never
+/// invalidates the cached stable head — and then appends [`CONTEXT_FOOTER`] as
+/// the FINAL message, so the request's last message stays byte-stable across
+/// tail changes (the provider reuses the prefix only when the last message is
+/// byte-identical). Both ride as USER messages on Local/Ollama and
+/// DeepSeek-vendor (`ProviderPolicy::tail_as_user_messages` — those reject or
+/// echo trailing system blocks) and as system messages elsewhere. Because the
+/// tail is the only reprocessed part per change, it is kept compact: CURRENT
+/// STEP shows the step header (or a 120-char truncation) and memory entries cap
+/// content at 160 chars.
 pub fn build_volatile_tail(
     caps: &Capabilities,
     workflow: &Workflow,

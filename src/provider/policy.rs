@@ -213,15 +213,19 @@ pub struct ProviderPolicy {
     pub signatures_portable_across_models: bool,
     /// The vendor family (Rule 5 cross-vendor detection).
     pub vendor: Vendor,
-    /// `true` when this vendor's models echo trailing system blocks instead
-    /// of answering the user (DeepSeek: sentinel-mirror 5cf5469c + the
-    /// 2027-01-11 exit-note loop). For such vendors the volatile tail +
-    /// CONTEXT_FOOTER are folded into the leading system message — the
-    /// standard request shape every other client sends — at the cost of
-    /// that vendor's prefix-cache reuse (the trailing placement exists for
-    /// the empirical last-message-identical cache law; accepted for a
-    /// vendor that is otherwise unusable).
-    pub fold_volatile_tail: bool,
+    /// `true` when this vendor cannot receive trailing SYSTEM messages: its
+    /// models echo them instead of answering the user (DeepSeek:
+    /// sentinel-mirror 5cf5469c + the 2027-01-11 exit-note loop). Local-kind
+    /// (Ollama) gets the same placement for an analogous reason — its API
+    /// allows a system message only in first position. For such vendors
+    /// `turn.rs` sends the volatile tail + `prompt::CONTEXT_FOOTER` as trailing
+    /// USER messages: the request still ends the way a normal client turn does
+    /// (nothing to mirror), while `messages[0]` stays byte-stable — the prefix a
+    /// prompt cache keys on. Folding the tail into `messages[0]` instead (the
+    /// previous strategy) made every `complete_step` progress bump a full cache
+    /// miss: measured 2026-09-14, 5.1-9.0% hit with 115-120K tokens re-billed
+    /// per check-off (.coding/analysis/cache-hit-6-aggregates.txt).
+    pub tail_as_user_messages: bool,
 }
 
 impl ProviderPolicy {
@@ -338,7 +342,7 @@ fn claude() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: true,
         vendor: Vendor::Anthropic,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -372,7 +376,7 @@ fn gemini() -> ProviderPolicy {
         },
         signatures_portable_across_models: true,
         vendor: Vendor::Google,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -394,17 +398,19 @@ fn openai_responses() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: true,
         vendor: Vendor::OpenAI,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
 /// DeepSeek (thinking mode). Reasoning lives in `reasoning_content` on the
 /// assistant message. Hard 400 in thinking mode if missing.
 ///
-/// **Fold volatile tail:** DeepSeek models echo trailing system blocks
+/// **Tail as user messages:** DeepSeek models echo trailing system blocks
 /// instead of answering the user (sentinel-mirror 5cf5469c + the 2027-01-11
-/// exit-note loop) — `fold_volatile_tail` is `true`, so requests end with
-/// the user/tool message like every other client.
+/// exit-note loop), so `tail_as_user_messages` is `true`: the volatile tail +
+/// CONTEXT_FOOTER are sent as trailing USER messages, which keeps the request
+/// shaped like a normal client turn and leaves messages[0] (the cached prefix)
+/// byte-stable across `complete_step` progress bumps.
 ///
 /// **Historical retention:** the most recent assistant turn must always carry
 /// `reasoning_content`, and every older turn carrying `tool_calls` must carry
@@ -426,7 +432,7 @@ fn deepseek() -> ProviderPolicy {
         },
         signatures_portable_across_models: false,
         vendor: Vendor::DeepSeek,
-        fold_volatile_tail: true,
+        tail_as_user_messages: true,
     }
 }
 
@@ -441,7 +447,7 @@ fn qwen() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: false,
         vendor: Vendor::Alibaba,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -456,7 +462,7 @@ fn kimi() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: false,
         vendor: Vendor::Moonshot,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -471,7 +477,7 @@ fn glm() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: false,
         vendor: Vendor::Zhipu,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -489,7 +495,7 @@ fn vllm_default() -> ProviderPolicy {
         retention: ReasoningRetention::NEVER_STRIP,
         signatures_portable_across_models: false,
         vendor: Vendor::SelfHosted,
-        fold_volatile_tail: false,
+        tail_as_user_messages: false,
     }
 }
 
@@ -506,7 +512,7 @@ mod tests {
         assert_eq!(p.reasoning_field, None);
         assert!(p.signatures_portable_across_models);
         assert!(p.include_params.is_empty());
-        assert!(!p.fold_volatile_tail);
+        assert!(!p.tail_as_user_messages);
     }
 
     #[test]
@@ -528,9 +534,10 @@ mod tests {
         assert!(p.reasoning_required);
         assert_eq!(p.stateful_key, None);
         assert_eq!(p.reasoning_field, Some("reasoning_content"));
-        // DeepSeek echoes trailing system blocks — its requests fold the
-        // volatile tail into the head (2027-01-11 exit-note loop).
-        assert!(p.fold_volatile_tail);
+        // DeepSeek echoes trailing system blocks, so its requests carry the
+        // volatile tail + footer as trailing USER messages (2027-01-11
+        // exit-note loop) and keep messages[0] byte-stable.
+        assert!(p.tail_as_user_messages);
     }
 
     #[test]
@@ -585,7 +592,7 @@ mod tests {
         assert_eq!(p.vendor, Vendor::Zhipu);
         assert_eq!(p.reasoning_field, Some("reasoning_content"));
         // GLM keeps the trailing tail + footer placement (cache law).
-        assert!(!p.fold_volatile_tail);
+        assert!(!p.tail_as_user_messages);
     }
 
     #[test]

@@ -1141,14 +1141,19 @@ impl AgentTask {
                             },
                         ))
                         .await;
-                    // Text-only steer → system message (unchanged mid-work
-                    // guidance semantics). An image-bearing steer → user
-                    // message with image blocks (image content belongs in
-                    // user messages; the same multimodal / vision-fallback
-                    // handling as a normal prompt).
+                    // Text-only steer → guidance message (unchanged mid-work
+                    // semantics; user-role on `tail_as_user_messages` vendors
+                    // so no trailing system block can reach DeepSeek/Ollama —
+                    // see AgentLoop::push_suggestion_message). An image-bearing
+                    // steer → user message with image blocks (image content
+                    // belongs in user messages; the same multimodal /
+                    // vision-fallback handling as a normal prompt).
                     if images.is_empty() {
-                        self.messages
-                            .push(Message::system(format!("User suggestion: {text}")));
+                        crate::agent::AgentLoop::push_suggestion_message(
+                            &mut self.messages,
+                            &turn_provider,
+                            &text,
+                        );
                     } else {
                         let content =
                             self.build_user_content(fanin_tx, text, &images).await;

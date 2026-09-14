@@ -7,7 +7,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import type { AgentState, ActivityEntry } from "../../hooks/useAgentStore";
 import { useAgentStore, RECENT_TIMING_WINDOW, recentOutputTokPerSec } from "../../hooks/useAgentStore";
 import { fmtTokens, fmtRate, fmtDuration, fmtPct } from "../../lib/format";
-import { reasoningActive, reasoningBlockStarted } from "../../lib/reasoningPanel";
+import { readInflightPanelOpen, writeInflightPanelOpen } from "../../lib/inflightPanelPref";
 import { compact } from "../../lib/tauri";
 import type { TurnPhase } from "../../lib/types";
 
@@ -85,26 +85,26 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
   } = state;
   const showTokenUsage = useAgentStore((s) => s.showTokenUsage);
 
-  // Collapsed by default — open it via the chevron (or drag the handle).
-  const [expanded, setExpanded] = useState(false);
+  // Whether the panel is open is the USER's choice ALONE (user report
+  // 2027-01-11): nothing in the app opens it. The effect that used to sit
+  // here auto-expanded the panel on every reasoning-block edge, so each new
+  // turn re-opened a panel the user had deliberately collapsed. The choice
+  // is remembered across restarts via localStorage and defaults to CLOSED.
+  const [expanded, setExpanded] = useState(readInflightPanelOpen);
   const [height, setHeight] = useState(DEFAULT_HEIGHT);
   const panelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
 
-  // Auto-expand the reasoning panel when a reasoning block starts streaming
-  // (user request 2026-08-22: thinking must be visible as the pieces come in,
-  // not only at the end). Fires exactly once per block via the
-  // inactive→active edge — a manual collapse mid-block is respected; the
-  // next block (after the log clears on `started`) auto-opens again.
-  const reasoningNow = reasoningActive(phase, activityLog);
-  const prevReasoningActive = useRef(reasoningNow);
-  useEffect(() => {
-    if (reasoningBlockStarted(prevReasoningActive.current, reasoningNow)) {
-      setExpanded(true);
-    }
-    prevReasoningActive.current = reasoningNow;
-  }, [reasoningNow]);
+  /**
+   * Apply + persist the user's open/closed choice — the ONLY writer of
+   * `expanded` (the chevron click and the drag handle both route through
+   * here). No other code path may expand the panel on its own.
+   */
+  function setPanel(open: boolean) {
+    setExpanded(open);
+    writeInflightPanelOpen(open);
+  }
 
   // Live elapsed timer: tick once a second while a turn is running so the
   // "1m 3s" readout advances. `turnStartedAt` is set by the started event
@@ -195,9 +195,10 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
   }, []);
 
   function startDrag(e: React.MouseEvent) {
-    // Only resize when the panel is expanded; otherwise just expand it.
+    // Only resize when the panel is expanded; a drag on the collapsed bar
+    // expands it first (a user action, so the choice persists too).
     if (!expanded) {
-      setExpanded(true);
+      setPanel(true);
     }
     e.preventDefault();
     dragging.current = true;
@@ -248,7 +249,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
           opened/closed even when the log is still empty (e.g. the agent is
           running but hasn't streamed reasoning text yet). */}
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => setPanel(!expanded)}
         aria-expanded={expanded}
         aria-label="Toggle reasoning panel"
         className="flex w-full items-center gap-3 px-4 py-1.5 text-xs hover:bg-bg-tertiary"

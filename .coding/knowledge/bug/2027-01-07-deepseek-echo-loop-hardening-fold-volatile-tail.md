@@ -1,5 +1,5 @@
 +++
-title = "DeepSeek echo/loop hardening: fold volatile tail for DeepSeek + generalize R10 repetition guard — FIXED, MERGED into main (3a2accd)"
+title = "DeepSeek echo/loop hardening (R10 byte-period guard) — tail placement moved from fold-into-head to trailing user messages, FIXED (bbfd822)"
 supersedes = "a0eab9ca"
 created = "2027-01-07"
 +++

@@ -1,5 +1,5 @@
 +++
-title = "DeepSeek sentinel-mirror (CONTEXT_FOOTER echo) — MITIGATED by fold_volatile_tail, MERGED into main (3a2accd)"
+title = "DeepSeek sentinel-mirror (CONTEXT_FOOTER echo) — fold mitigation SUPERSEDED by the trailing user-role placement (3a2accd, bbfd822)"
 supersedes = "7bb9a608"
 created = "2027-01-07"
 +++

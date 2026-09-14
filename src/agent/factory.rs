@@ -911,7 +911,11 @@ impl AgentLoopFactory {
         registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
         registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
         registry.register(Box::new(
-            ShellTool::new(sandbox.clone()).with_filter_config(Arc::clone(&self.shell_filter)),
+            ShellTool::new(sandbox.clone())
+                .with_filter_config(Arc::clone(&self.shell_filter))
+                // Same handle as GitTool: `shell git merge|push` must raise the
+                // always-on core-operation prompt too (follow-up A, 2027-01-11).
+                .with_core_operations(Arc::clone(&self.core_operations)),
         ));
         let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone());
         let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone());
@@ -1539,6 +1543,18 @@ mod tests {
             git.never_auto_for(&json!({"subcommand": "checkout"})),
             "checkout must be gated after set_core_operations adds it"
         );
+        // Follow-up A (2027-01-11): the SHELL tool shares that same handle, so
+        // `shell git push`/`git merge` raise the always-on approval prompt too —
+        // and it follows the runtime list rather than a hard-coded default.
+        let shell = agent.tools().get("shell").expect("shell tool registered");
+        assert!(shell.never_auto_for(&json!({"command": "git push origin main"})));
+        assert!(shell.never_auto_for(&json!({"command": "cd repo && git merge --no-ff wt/x"})));
+        assert!(
+            shell.never_auto_for(&json!({"command": "git checkout main"})),
+            "the shell guard must observe set_core_operations, not a default list"
+        );
+        assert!(!shell.never_auto_for(&json!({"command": "git status"})));
+        assert!(!shell.never_auto_for(&json!({"command": "echo git-push-note"})));
         assert!(git.never_auto_for(&json!({"subcommand": "merge"})));
         assert!(!git.never_auto_for(&json!({"subcommand": "status"})));
     }

@@ -19,7 +19,7 @@ command.
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
 - Never commit to `main` — commit to the current feature branch.
-- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` (`git fetch` + `git pull --no-rebase`) before it merges the branch — the sync runs on `shell` (the `git` tool has no fetch/pull subcommand), while `git merge`/`git push` MUST go through the approval-gated `git` tool: `ShellTool` does not override `never_auto_for`, so a shell-invoked `git merge`/`push` would run unprompted even in Autonomous mode.
+- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` (`git fetch` + `git pull --no-rebase`) before it merges the branch — the sync runs on `shell` (the `git` tool has no fetch/pull subcommand), while `git` core operations (default `merge`/`push`, `[git] core_operations`) MUST go through the approval-gated `git` tool. Both paths are gated in code: `GitTool::never_auto_for` matches its subcommand argument, and (since 2027-01-11) `ShellTool::never_auto_for` recognises a `git` executable in a command position and matches the subcommand after git's global options — so a shell-invoked `git merge`/`push` raises the same always-on prompt, never an unprompted run in Autonomous mode.
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,

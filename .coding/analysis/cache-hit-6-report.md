@@ -121,3 +121,26 @@ opportunistic.
   cache-named key, so it keeps working across providers.
 - Token counts per message are estimates (chars/4) except where `request_stats.prompt_tokens` is used;
   section B2's calibration exists precisely because chars/4 is not trustworthy at this scale.
+## 7. Post-restart effect check (R6-1 / R6-2 / R6-3) — 2027-01-11
+
+All three fixes are committed on `wt/mnemo`, so this window's traces are PRE-fix and cannot show the
+effect. Run this check on the first real session after the app is rebuilt and restarted:
+
+1. **R6-1 (gate hysteresis).** Re-run the extractor over the post-restart window:
+   `python .coding/analysis/cache-hit-6-extract.py` → compare section B's per-request
+   "results rewritten" column with the pre-fix figure (1 already-sent result rewritten per request).
+   PASS = a request that had nothing truncatable rewrites 0 results, and the rewrite count is `> 0`
+   only when the truncatable set (`tool_result_is_truncatable`) is non-empty; the cache-hit rate over
+   the window should climb from 70-78% toward the 99.0-99.7% the no-rewrite requests already hit.
+2. **R6-2 (frozen tool surface across plan kinds).** Start a research plan and watch the request that
+   crosses the plan-kind boundary: the pre-fix signature was a prompt-token collapse of 6,016 (the
+   shrinking tools array at the head of the body) plus 15.7-17.9 s TTFT on the following request.
+   PASS = no token collapse and no TTFT spike at the transition (the array is byte-identical for both
+   plan kinds; `schema_filter_is_stable_across_plan_kinds` pins it in-tree).
+3. **R6-3 (trace tail).** A live `traces.jsonl` read must never end mid-record: the writer now does
+   temp+rename and drops an unparsable trailing fragment on read, so the extractor should report no
+   dropped-tail warning between requests.
+
+Nothing here is blocking: each fix carries its own in-tree guard
+(`short_results_do_not_hold_the_gate_open`, `schema_filter_is_stable_across_plan_kinds`,
+`mirror_drops_a_crash_truncated_trailing_fragment`), all proven to fail without the fix.

@@ -2959,11 +2959,15 @@ async fn plan_frozen_tools_head_and_footer_byte_stable_across_executing_reviewin
 }
 
 #[tokio::test]
-async fn plan_frozen_tool_set_varies_across_plans_not_within_one() {
-    // The frozen surface is chosen at plan activation by plan kind: a
-    // research plan never advertises the source-mutating file tools, an
-    // implementation plan does — and each stays byte-stable within its own
-    // plan (the transition test asserts that). Same session, two plans.
+async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
+    // The advertised array must be byte-stable both WITHIN a plan and ACROSS a
+    // plan-KIND change: it rides at the head of the request body, so any change
+    // resets the provider's prefix cache. Research plans used to get a narrower
+    // surface (no file_write), which rewrote the head on every plan-kind change
+    // — measured 2027-01-11: the cached prefix collapsed to 6,016 tokens with
+    // 15.7–17.9s TTFT (`.coding/analysis/cache-hit-6-report.md`, cause 2). The
+    // research restriction is a DISPATCH-time gate, not an advertised one.
+    // Same session, two plans of different kinds, three turns.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -3009,8 +3013,16 @@ async fn plan_frozen_tool_set_varies_across_plans_not_within_one() {
         .await
         .unwrap();
 
+    // Turn 2: SAME plan, no plan change — the array must be identical.
+    let mut messages1b = vec![Message::user_text("again")];
+    agent
+        .run_turn(&mut messages1b, &fanin_tx, 2, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
     // Swap the plan scope: abandon the research plan, create an
-    // implementation plan — a NEW plan, so the frozen surface may change.
+    // implementation plan — a KIND change, the case that used to rewrite the
+    // head.
     {
         let mut wf = workflow.lock().await;
         wf.abandon_plan().unwrap();
@@ -3019,24 +3031,28 @@ async fn plan_frozen_tool_set_varies_across_plans_not_within_one() {
 
     let mut messages2 = vec![Message::user_text("again")];
     agent
-        .run_turn(&mut messages2, &fanin_tx, 2, &mut cmd_rx, None)
+        .run_turn(&mut messages2, &fanin_tx, 3, &mut cmd_rx, None)
         .await
         .unwrap();
 
     let tool_sets = captured_tool_sets.lock().await;
-    assert_eq!(tool_sets.len(), 2);
-    // Research: no source-mutating file tools advertised.
-    assert!(
-        !tool_sets[0].contains("\"name\":\"file_write\""),
-        "a research plan must not advertise file_write"
-    );
-    assert!(tool_sets[0].contains("\"name\":\"file_read\""));
-    // Implementation: the mutation tool IS advertised.
-    assert!(tool_sets[1].contains("\"name\":\"file_write\""));
-    // The two plan scopes advertise different arrays.
-    assert_ne!(
+    assert_eq!(tool_sets.len(), 3);
+    // The source-mutating tool is advertised on BOTH plan kinds — enforcement
+    // (which denies it on a research plan) happens at dispatch.
+    for (i, set) in tool_sets.iter().enumerate() {
+        assert!(
+            set.contains("\"name\":\"file_write\""),
+            "turn {i} must advertise the full frozen surface"
+        );
+        assert!(set.contains("\"name\":\"file_read\""));
+    }
+    assert_eq!(
         tool_sets[0], tool_sets[1],
-        "the frozen surface varies across plans (chosen at plan activation)"
+        "the frozen surface must stay byte-identical within one plan"
+    );
+    assert_eq!(
+        tool_sets[1], tool_sets[2],
+        "a plan-kind change must not rewrite the advertised array (prefix cache)"
     );
 }
 

@@ -29,10 +29,10 @@
 #   Syncing first keeps the merge pushable in one pass.
 # - The prompt names the TOOL for every git step (HIGH 1, review 2026-09-14):
 #   the sync runs on `shell` because the git tool has no fetch/pull subcommand,
-#   but the branch merge and the push MUST stay on the git tool — ShellTool
-#   does not override Tool::never_auto_for (only GitTool does), so a
-#   shell-invoked `git merge`/`push` runs with NO approval prompt in Autonomous
-#   mode, breaking the core-operation gate agent.md promises.
+#   but the branch merge and the push MUST stay on the git tool — it is the
+#   structured, subcommand-checked core-operation path. Both tools force the
+#   always-on prompt: ShellTool::never_auto_for was added 2027-01-11, closing
+#   the bypass this comment originally described (agent.md documents both).
 # - Topology (one wt/* working branch per agent directory → protected main)
 #   and the always-on approval gate for git merge/push (Tool::never_auto_for,
 #   even in Autonomous mode) are documented in agent.md — not repeated in
@@ -56,7 +56,7 @@ prompt = """\
 Merge the current working branch into main and clean up. Steps:
 1. Check `git status`; commit ALL uncommitted work on the current branch with a clear message, including `.coding/` (plans, knowledge, reviews, backlog.jsonl must land in the merge). NEVER stash — a stash here is never popped.
 2. SYNC MAIN WITH THE REMOTE FIRST: `git checkout main`, then `git fetch origin` + `git pull --no-rebase` via shell (the git tool has no fetch/pull subcommand; `--no-rebase` never rewrites main); nothing new, or no remote/upstream → continue. Conflicts here too: resolve with file_edit taking the UNION of both sides, then `git add` + `git commit` to conclude the pull merge; never drop a side's change. Merging into a stale main only surfaces later — as a rejected push.
-3. `git merge --no-ff <branch>` — use the **git** tool, NEVER shell: the git tool forces the core-operation approval prompt, shell does not (main receives only these merge commits, never a direct one). Conflicts: resolve with file_edit taking the UNION of both sides, then `git add` + `git commit`; never drop a side's change. `.coding/backlog.jsonl` carries git's union merge driver (concurrent adds concatenate); the rest of `.coding/` is plain text.
+3. `git merge --no-ff <branch>` — use the **git** tool, NEVER shell: both force the core-operation approval prompt, but the git tool is the structured, subcommand-checked path (main receives only these merge commits, never a direct one). Conflicts: resolve with file_edit taking the UNION of both sides, then `git add` + `git commit`; never drop a side's change. `.coding/backlog.jsonl` carries git's union merge driver (concurrent adds concatenate); the rest of `.coding/` is plain text.
 4. VERIFY THE MERGED TREE BUILDS before cleanup — branch verification never compiles the src-tauri bin crate. Run BOTH `npm run build` (frontend tsc + vite) AND `cd src-tauri && cargo build` (bin crate). On failure: fix with file_edit, re-run both until green.
 5. Merge commit in main AND both builds green → delete the merged branch (`git branch -d <branch>`).
 6. Supersede stale branch-status memories (memory tools work inside a skill even though absent from the allow-list): memory_recall the branch name and its pre-merge tip commit, memory_list with prefix "SHIPPED" (finish digests carry an unmerged-branch hint), and working-tier "ACTIVE:"/"STEP MARKER:" crash markers citing the branch or its plan. Supersede each stale match with a short successor recording "MERGED into main at <merge commit sha> (`git rev-parse main`) on <date>" — never records about other branches or genuinely unmerged work; skip cleanly when nothing matches. The memory index re-derives from the files automatically — never hand-edit or re-derive the DB.

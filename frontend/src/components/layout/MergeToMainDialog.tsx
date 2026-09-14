@@ -73,12 +73,11 @@ export function MergeToMainDialog({
             <ul className="mb-3 space-y-1 pl-4 text-slate-400">
               <li>• Commit the branch's work, then merge it into <code className="inline-code">main</code> (the skill never stashes)</li>
               <li>• Sync <code className="inline-code">main</code> with origin first, and resolve any conflicts</li>
-              <li>• Verify both builds, delete the merged branch, return to Planning</li>
+              <li>• Delete the merged branch, return to Planning</li>
             </ul>
             <p className="text-slate-400">
               Core git operations (merge, push) always require approval, even in
-              Autonomous mode. You can interrupt or steer the agent mid-skill to
-              help resolve conflicts.
+              Autonomous mode.
             </p>
           </div>
         </DialogDescription>

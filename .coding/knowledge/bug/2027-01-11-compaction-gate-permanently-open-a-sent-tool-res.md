@@ -13,3 +13,5 @@ ROOT CAUSE 2 — HEAD REWRITE PER PLAN KIND (avoidable, design). `Workflow::sche
 NOT the cause (measured): the 340K cliff (320-360K bin = 96.9% hit), non-reporting models (none here), the round-4 min(prev,curr) heuristic (fixed). Instrument: the trace file is appended while streaming, so its last line is a partial record — consumers must tolerate it (the round-5 extractor crashed).
 
 Related: R12-R17 batch (plan 24b50248) added the hysteresis this bug defeats; bug record `.coding/knowledge/bug/2026-12-31-cache-hit-terrible-at-any-context-size-r14-per-b.md` is the same family (already fixed per se).
+
+Amended 2027-01-11: Update (2027-01-11, merge_to_main skill): this fix is MERGED into main at 4cbc3b0 (4cbc3b0b78bea5d4ab22967d3dd634b4851f9496); branch wt/mnemo deleted (pre-merge tip 4c08077). The regression test `short_results_do_not_hold_the_gate_open`, the round-6 analysis artifacts (.coding/analysis/cache-hit-6-*.*) with the §7 post-restart effect check, and this record all ride the merge — verify the effect on the first real session after the app is rebuilt and restarted.

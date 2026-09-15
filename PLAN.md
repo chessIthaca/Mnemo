@@ -129,7 +129,16 @@ vitest (frontend), `tsc --noEmit` clean.
   `knowledge/` corpus, the `plans/` tree) are refused by the file agent tools,
   as is the `.git` control plane (any path containing a `.git` component -
   planted hooks/`core.fsmonitor`); `keys.toml` is
-  written with user-only permissions (Unix `0600` / Windows DACL).
+  written with user-only permissions (Unix `0600` / Windows DACL). A hardlinked
+  `.coding/**` file is refused as well (canonicalize cannot see a hardlink —
+  there is no link to follow, the path IS the shared inode's file), the refusal
+  is re-run on the CANONICAL form of the path so a Win32 8.3 alias
+  (`.coding/KNOWLE~1/…`) cannot plant a subtree inside a protected tree, and the
+  creation ladder fails closed when the write target resolves through a link —
+  a dangling link leaf included; its one lexical fallback (a parent the call
+  itself just created) is re-checked for link-freedom, so a link planted between
+  the gate and the mkdir is caught too (2027-01-15, plan b4812291; review rounds
+  2-4 §Q5 of plan ee65fd4b).
 - **Structural perf.** Synchronous file-system I/O in the async agent tools'
   `execute` paths (`file_read`/`file_edit`/`file_write`/`file_append`/`search`/
   `describe_image`) runs inside `tokio::task::spawn_blocking` so concurrent
@@ -436,7 +445,11 @@ shot.
   investigation/planning that changes no source code). Its file tools are
   denied by NAME (`ToolFilter::ExecutingResearch`) but pass at dispatch on
   `.coding/**` ARTIFACT paths (2027-01-11) — source, docs, protected side-car
-  files and `..` escapes stay denied, so "no source diff" still holds. A root
+  files, `..` escapes, any link component that leaves the root or cannot be
+  resolved, and any hardlinked `.coding/**` file stay denied (the hardlink rule
+  since plan b4812291, 2027-01-15; the link rule since plan ee65fd4b,
+  2027-01-11) — an in-root link that resolves inside the artifact tree is still
+  a grant, so "no source diff" still holds. A root
   that would skip review still owes one when an `implementation`/`bug_fixing`
   SUB-plan completed OR was abandoned under it (`Workflow::review_required`,
   persisted in the stack sidecar): the write filter keys on the ACTIVE plan

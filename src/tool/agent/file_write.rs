@@ -665,4 +665,34 @@ mod tests {
             "hello\n"
         );
     }
+
+    #[tokio::test]
+    async fn file_write_through_out_of_root_link_is_denied() {
+        // The implementation-plan route end to end: there is no dispatch-level
+        // path filter there — the tool's own ladder is the gate. A link inside
+        // `.coding/` that escapes the root must not let the bytes land outside
+        // it (pre-fix the step-5 fallback returned the lexical path and the
+        // write followed the link; plan b4812291, bypass 3).
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        if !crate::tool::agent::sandbox::link_fixture::plant_dir_link(
+            &outside.path(),
+            &dir.path().join(".coding/link"),
+        ) {
+            eprintln!("SKIP: could not create a directory link for the escape fixture");
+            return;
+        }
+        let tool = FileWriteTool::new(sandbox);
+
+        let r = tool
+            .execute(json!({"path": ".coding/link/x.md", "content": "escaped"}))
+            .await;
+        assert!(!r.success, "the write must be refused: {}", r.output);
+        assert!(
+            !outside.path().join("x.md").exists(),
+            "the bytes must never reach the link's target"
+        );
+    }
 }

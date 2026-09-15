@@ -13,6 +13,7 @@
 //! jittered exponential backoff (equal jitter — see `retry_backoff_ms`) so a
 //! transient gateway error doesn't kill the turn.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -22,7 +23,136 @@ use super::loop_impl::AgentLoop;
 use crate::error::Result;
 use crate::provider::{LlmClient, LlmEvent, Message, ToolCall};
 use crate::runtime::{AgentCommand, AgentEvent, AgentId};
-use crate::tool::{ToolCall as ParsedToolCall, ToolResult};
+use crate::tool::agent::sandbox::Sandbox;
+use crate::tool::{ToolCall as ParsedToolCall, ToolFilter, ToolResult};
+use crate::workflow::WorkflowState;
+
+/// The file tools [`ToolFilter::ExecutingResearch`] denies wholesale — the set
+/// a research plan may nevertheless use on an ARTIFACT target (`.coding/**`).
+const RESEARCH_ARTIFACT_TOOLS: [&str; 4] = [
+    "file_edit",
+    "file_write",
+    "file_append",
+    "convert_line_endings",
+];
+
+/// The verdict for a file-tool call a research plan's filter denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResearchWrite {
+    /// The call IS the artifact carve-out: let it through.
+    Artifact,
+    /// A file tool denied because the target is not an artifact (source, docs,
+    /// config) — the research boundary is the reason.
+    NotAnArtifact,
+    /// A file tool denied because the target is protected in EVERY state
+    /// (plans/reviews/knowledge/backlog/DBs/safety.toml/`.git`). The research
+    /// boundary is not the reason, and no plan kind unlocks it.
+    Protected,
+    /// Not a carve-out candidate: another tool name, or a call without a
+    /// usable `path` argument.
+    NotApplicable,
+}
+
+/// Classify a call the research filter denied: the `.coding/**` artifact
+/// carve-out, a plain non-artifact target, or a protected one?
+///
+/// A research plan's contract is "no SOURCE-code change" — that is what makes
+/// its skipped review honest. Its own analysis artifacts are the opposite of a
+/// source change, and denying them had two bad outcomes: the deliverable landed
+/// through the approval-gated `shell` (bypassing the file tools' diff preview
+/// and path safety), or the plan got misfiled as `implementation` and paid a
+/// review of a diff that does not exist.
+///
+/// The carve-out is deliberately narrow. The raw argument is resolved the way
+/// the file tool's own ladder does — CANONICAL first when the target (or its
+/// parent) already exists, so a symlink or a directory junction planted inside
+/// `.coding/` cannot launder a source path into an artifact grant — then the
+/// lexical creation form for a genuinely new tree, and only when no existing
+/// component of that form is a link (a link that escapes the root must never be
+/// granted from its spelling: the OS would follow it at write time).
+/// [`Sandbox::is_artifact_write_target`] judges the resolved path, fails closed,
+/// and excludes everything [`Sandbox::is_protected_write_target`] refuses.
+/// Source, docs, config, protected targets, `..` escapes and links out of
+/// `.coding/` all stay denied.
+fn research_write_verdict(
+    sandbox: &Sandbox,
+    name: &str,
+    args: &serde_json::Value,
+) -> ResearchWrite {
+    if !RESEARCH_ARTIFACT_TOOLS.contains(&name) {
+        return ResearchWrite::NotApplicable;
+    }
+    let Some(raw) = args.get("path").and_then(|v| v.as_str()) else {
+        return ResearchWrite::NotApplicable;
+    };
+    // Canonical first: `validate` follows links and junctions, so a `.coding/`
+    // path that really lands on source is judged where it lands.
+    if let Ok(canonical) = sandbox.validate(Path::new(raw)) {
+        // …but `validate` is NOT canonical for a reparse point whose target does
+        // not resolve: its parent fallback appends the RAW file name, so a
+        // dangling link LEAF comes back as `<root>/.coding/dangling.md` — inside
+        // the root by string prefix while the OS would follow the link at open
+        // time and land the bytes outside (review HIGH-1, round 3). A genuinely
+        // canonical path has no link component, so the walk is a no-op for it.
+        if sandbox.lexical_path_is_link_free(&canonical) {
+            return judge_research_write(sandbox, &canonical);
+        }
+        return ResearchWrite::NotApplicable;
+    }
+    // Otherwise the lexical creation form is judged — but ONLY when no link
+    // component would be followed at write time. A link inside `.coding/`
+    // pointing out of the root can make `validate` refuse the path outright
+    // (nothing to canonicalize while the link is dangling), and granting the
+    // spelling would hand the OS a write that escapes the sandbox
+    // (review LOW-1). Fail closed instead.
+    match sandbox.validate_for_creation(Path::new(raw)) {
+        Ok(lexical) if sandbox.lexical_path_is_link_free(&lexical) => {
+            judge_research_write(sandbox, &lexical)
+        }
+        _ => ResearchWrite::NotApplicable,
+    }
+}
+
+/// The verdict for an already-resolved path: the artifact carve-out, a plain
+/// non-artifact target, or a protected one. The two denying kinds can never
+/// overlap with `Artifact`: the artifact predicate ends with
+/// `!is_protected_write_target`, so a protected path is never an artifact.
+fn judge_research_write(sandbox: &Sandbox, path: &Path) -> ResearchWrite {
+    if sandbox.is_artifact_write_target(path) {
+        ResearchWrite::Artifact
+    } else if sandbox.is_protected_write_target(path) {
+        ResearchWrite::Protected
+    } else {
+        ResearchWrite::NotAnArtifact
+    }
+}
+
+/// The denial text for a call the workflow filter refused. A research plan
+/// denied on a file tool gets the boundary named explicitly, and a target that
+/// is protected in EVERY state gets THAT reason instead: the two have
+/// different remedies ("push an implementation sub-plan" does not unlock a
+/// protected file), so one shared message would send the model after the wrong
+/// fix.
+fn denial_message(name: &str, state: WorkflowState, verdict: ResearchWrite) -> String {
+    match verdict {
+        ResearchWrite::Protected => format!(
+            "tool '{name}' is not allowed here: the target is a protected, app-owned file \
+             (plans, reviews, knowledge, backlog, the memory/codegraph DBs, safety.toml and \
+             .git are never writable by the file tools, in any workflow state) — use the \
+             dedicated tools (plan/memory/safety/git) instead"
+        ),
+        ResearchWrite::NotAnArtifact => format!(
+            "tool '{name}' is not allowed here: the active plan is a research plan ({state}), \
+             which may write only its own artifacts under .coding/ — source, docs and other \
+             app-owned files stay read-only; push an implementation sub-plan to change source"
+        ),
+        // The carve-out is granted, so this arm is unreachable from the gate —
+        // or the call is not a carve-out candidate at all.
+        ResearchWrite::Artifact | ResearchWrite::NotApplicable => format!(
+            "tool '{name}' is not allowed in the current workflow state ({state})"
+        ),
+    }
+}
 
 impl AgentLoop {
     /// Execute a single tool call, handling approval + retries.
@@ -99,13 +229,19 @@ impl AgentLoop {
         {
             let wf = self.workflow.lock().await;
             let filter = wf.allowed_tools();
-            if !filter.allows(category, safety, &tc.name) {
+            // The one carve-out: a RESEARCH plan may still write its own
+            // artifacts under `.coding/**` with the file tools. The verdict is
+            // computed once — it also picks the denial text below.
+            let research_write = if filter == ToolFilter::ExecutingResearch {
+                research_write_verdict(&self.sandbox, &tc.name, &parsed_call.arguments)
+            } else {
+                ResearchWrite::NotApplicable
+            };
+            if !filter.allows(category, safety, &tc.name)
+                && research_write != ResearchWrite::Artifact
+            {
                 return (
-                    ToolResult::error(format!(
-                        "tool '{}' is not allowed in the current workflow state ({})",
-                        tc.name,
-                        wf.state()
-                    )),
+                    ToolResult::error(denial_message(&tc.name, wf.state(), research_write)),
                     Vec::new(),
                 );
             }
@@ -1717,5 +1853,262 @@ mod tests {
 
         let redirect = symbol_search_redirect(&graph, "search_read", "hello", &stats, 1);
         assert!(redirect.is_some(), "gate should fire for search_read too");
+    }
+
+    /// The research artifact carve-out accepts ALL FOUR file tools on a
+    /// `.coding/**` target, not just the one the dispatch fixture happens to
+    /// register (`file_write`) — AND every name it covers is really denied by
+    /// `ToolFilter::ExecutingResearch`, so a name whose filter denial is dropped
+    /// fails here instead of becoming a file tool allowed by name on EVERY path.
+    /// The opposite direction (a fifth denied file tool silently getting no
+    /// carve-out) fails closed and is pinned by
+    /// `research_filter_hides_source_mutating_file_tools` in
+    /// `src/tool/mod.rs` (review LOW-2, 2027-01-11).
+    #[test]
+    fn research_artifact_write_covers_the_whole_file_tool_set() {
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        for name in RESEARCH_ARTIFACT_TOOLS {
+            assert!(
+                !ToolFilter::ExecutingResearch.allows(
+                    crate::tool::ToolCategory::Agent,
+                    crate::tool::SafetyLevel::NeedsApproval,
+                    name
+                ),
+                "{name} must be denied by the research filter for the carve-out to matter"
+            );
+            let args = serde_json::json!({ "path": ".coding/analysis/notes.md" });
+            assert_eq!(
+                research_write_verdict(&sandbox, name, &args),
+                ResearchWrite::Artifact,
+                "{name} on a .coding/ artifact should pass"
+            );
+        }
+    }
+
+    /// The carve-out is a permission GRANT, so everything it does not name
+    /// explicitly stays denied: source, docs, traversal escapes, non-file
+    /// tools, and calls without a path argument — while protected side-car
+    /// files get their OWN verdict (they are never writable, in any state).
+    #[test]
+    fn research_artifact_write_fails_closed() {
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        for raw in ["src/lib.rs", "docs/FEATURES.md", ".coding/../src/lib.rs"] {
+            let args = serde_json::json!({ "path": raw });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotAnArtifact,
+                "{raw} must not be an artifact write"
+            );
+        }
+        // Protected side-car files are refused in EVERY state, so they are
+        // reported as protected rather than as a research boundary (the
+        // trailing-dot spelling is the Win32 form — see the sandbox tests).
+        for raw in [
+            ".coding/plans/stack.json",
+            ".coding/reviews/2026-04-08-review.md",
+            ".coding/knowledge/spec/x.md",
+            ".coding/backlog.jsonl",
+            ".coding/plans./x.md",
+        ] {
+            let args = serde_json::json!({ "path": raw });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::Protected,
+                "{raw} must be reported as protected"
+            );
+        }
+        // An escaping path is not a carve-out candidate at all.
+        let escaping = serde_json::json!({ "path": "../.coding/x.md" });
+        assert_eq!(
+            research_write_verdict(&sandbox, "file_write", &escaping),
+            ResearchWrite::NotApplicable
+        );
+        let missing = serde_json::json!({ "content": "x" });
+        assert_eq!(
+            research_write_verdict(&sandbox, "file_write", &missing),
+            ResearchWrite::NotApplicable,
+            "a call without a path argument must fail closed"
+        );
+        // A non-file tool never gets the carve-out, even on an artifact path.
+        let args = serde_json::json!({ "path": ".coding/analysis/notes.md" });
+        assert_eq!(
+            research_write_verdict(&sandbox, "shell", &args),
+            ResearchWrite::NotApplicable,
+            "the carve-out is limited to the file tools"
+        );
+    }
+
+    /// A link planted INSIDE `.coding/` must not launder a source path into an
+    /// artifact grant: when the target (or its parent) exists, the verdict is
+    /// made on the CANONICAL path, not on the lexical spelling (review LOW-2a).
+    #[test]
+    fn research_write_verdict_canonicalizes_an_existing_target() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "// source").unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        if !plant_dir_link(&dir.path().join("src"), &dir.path().join(".coding/link")) {
+            // Creating a link needs Developer Mode on Windows (or a junction);
+            // the code path is platform-independent, so this is a no-op only
+            // where the fixture itself cannot exist.
+            return;
+        }
+        for raw in [".coding/link/lib.rs", ".coding/link/new.rs"] {
+            let args = serde_json::json!({ "path": raw });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotAnArtifact,
+                "{raw} resolves (canonically) to source, never to an artifact"
+            );
+        }
+        // A genuine artifact in the same tree still passes.
+        let ok = serde_json::json!({ "path": ".coding/analysis/notes.md" });
+        assert_eq!(
+            research_write_verdict(&sandbox, "file_write", &ok),
+            ResearchWrite::Artifact
+        );
+    }
+
+    /// A link planted INSIDE `.coding/` that points OUT of the root must fail
+    /// CLOSED: `validate` refuses that path, and the lexical fallback is only
+    /// trusted when no link component exists — otherwise the grant would hand
+    /// the OS a write that escapes the sandbox (review LOW-1).
+    #[test]
+    fn research_write_verdict_fails_closed_on_a_link_out_of_the_root() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        if !plant_dir_link(outside.path(), &dir.path().join(".coding/link")) {
+            // No privilege-free spelling worked; the guard is then verified by
+            // the junction fixture on Windows / symlinks on macOS+Linux.
+            eprintln!("SKIP: could not create a directory link for the escape fixture");
+            return;
+        }
+        for raw in [".coding/link/x.md", ".coding/link/nested/x.md"] {
+            let args = serde_json::json!({ "path": raw });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotApplicable,
+                "{raw} resolves outside the root — never a carve-out candidate"
+            );
+        }
+        // A symlink FILE as the leaf component is refused for the same reason,
+        // including while its target is dangling.
+        std::fs::write(outside.path().join("victim.md"), "outside").unwrap();
+        for (target, leaf) in [
+            (outside.path().join("victim.md"), ".coding/f.md"),
+            (outside.path().join("missing.md"), ".coding/dangling.md"),
+        ] {
+            if !plant_file_link(&target, &dir.path().join(leaf)) {
+                eprintln!("SKIP: could not create a file link for {leaf}");
+                continue;
+            }
+            let args = serde_json::json!({ "path": leaf });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotApplicable,
+                "{leaf} is a symlinked leaf — it must not be granted from its spelling"
+            );
+        }
+        // A DANGLING directory link (its target removed) is refused as well:
+        // the parent is missing, so the lexical branch judges it — and the walk
+        // still sees the junction. This is the privilege-free Windows spelling
+        // of the escape, so it is worth pinning where symlinks are unavailable.
+        let gone = outside.path().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        if plant_dir_link(&gone, &dir.path().join(".coding/link2")) {
+            std::fs::remove_dir(&gone).unwrap();
+            let args = serde_json::json!({ "path": ".coding/link2/x.md" });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotApplicable,
+                "a dangling directory link must not be granted"
+            );
+        }
+        // H1's EXACT shape, privilege-free: a dangling link as the LEAF. There
+        // `validate` RETURNS Ok — its parent fallback appends the raw leaf name
+        // while the leaf stays an unresolved reparse point — so the guard must
+        // reject it in the CANONICAL branch, not only in the lexical one.
+        // Pre-fix this verdict was `Artifact`.
+        let gone_leaf = outside.path().join("gone-leaf");
+        std::fs::create_dir_all(&gone_leaf).unwrap();
+        if plant_dir_link(&gone_leaf, &dir.path().join(".coding/dangling-leaf")) {
+            std::fs::remove_dir(&gone_leaf).unwrap();
+            let args = serde_json::json!({ "path": ".coding/dangling-leaf" });
+            assert_eq!(
+                research_write_verdict(&sandbox, "file_write", &args),
+                ResearchWrite::NotApplicable,
+                "a dangling link LEAF must not be granted (review HIGH-1, round 3)"
+            );
+        }
+    }
+
+    /// Create a FILE link (`target` → `link`) for the escaping-link test;
+    /// `false` where the platform or environment refuses.
+    fn plant_file_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    /// Plant a directory link at `link` pointing at `target`, preferring the
+    /// PRIVILEGE-FREE Windows spelling — a junction via `mklink /J`, mirrored by
+    /// a symlink on POSIX — so the link guard is really exercised on Windows
+    /// instead of silently skipped (`symlink_dir` needs Developer Mode; review
+    /// LOW-1, round 3). `false` when no spelling is available.
+    fn plant_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            // `mklink /J` is a cmd BUILTIN and is unreliable when spawned
+            // through std::process::Command's argument quoting (it reported
+            // `Invalid switch - "link"` for a command line PowerShell ran
+            // happily). New-Item's Junction type is the API-level spelling and
+            // needs no elevation either.
+            let script = format!(
+                "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+                link.display(),
+                target.display()
+            );
+            let junction = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+                .output();
+            match junction {
+                Ok(out) if out.status.success() => return true,
+                // Say WHY: a silently skipped guard is how the dangling-leaf
+                // hole survived three review rounds (review LOW-1, round 3).
+                Ok(out) => eprintln!(
+                    "New-Item Junction failed ({}): {}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => eprintln!("powershell could not run: {e}"),
+            }
+            // Developer Mode fallback: a real directory symlink.
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
     }
 }

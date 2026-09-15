@@ -86,8 +86,8 @@ fn resolve_id(view: &GraphView, name_or_id: &str) -> Option<String> {
 
 /// Render the compact inline answer for a delegated symbol hunt — the
 /// `search`/`search_read` auto-delegation (backlog b804012f): instead of the
-/// advisory "prefer the graph tools" note, the search tool resolves the hunt
-/// against the graph and prepends the answer itself, skipping the file walk.
+/// advisory symbol-hunt note, the search tool resolves the hunt against the
+/// graph and prepends the answer itself, skipping the file walk.
 ///
 /// One `def:` line per resolved name (definition, kind, line range); a
 /// single-symbol hunt additionally lists its top callers/callees and the

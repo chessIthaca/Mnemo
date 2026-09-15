@@ -619,8 +619,8 @@ fn alternation_nudge(
     }
     (!resolved.is_empty()).then(|| {
         format!(
-            "from the alternation pattern '{pattern}': {}; prefer the graph tools for \
-             symbol hunts (search is for text)",
+            "from the alternation pattern '{pattern}': {}; use graph_search/graph_context \
+             for symbol hunts — use search only for text",
             resolved.join("; ")
         )
     })
@@ -646,8 +646,10 @@ fn alternation_nudge(
 /// Wording contract: BOTH note variants contain the steering-marker
 /// substring "is an indexed symbol" (`steering_stats::SEARCH_NUDGE_MARK`),
 /// so the metric counts prefixed and bare nudges alike; the
-/// bare-identifier sentence is byte-pinned by the 2026-09-15 steering
-/// spec and must not change.
+/// bare-identifier sentence is byte-pinned by
+/// `bare_identifier_symbol_searches_earn_the_graph_nudge` (wording moved to
+/// imperatives 2027-01-14, plan 987fef4c / backlog 56168c38) and must not
+/// change casually.
 ///
 /// Since the auto-delegation (backlog b804012f), an exact single-name hit is
 /// answered INLINE by `symbol_delegation_block` (codegraph.rs) — the walk is
@@ -675,13 +677,14 @@ pub(crate) fn symbol_nudge(
     let note = if name == pattern {
         format!(
             "'{pattern}' is an indexed symbol — graph_context(id=\"{id}\") gives its definition + \
-             callers in one call; prefer the graph tools for symbol lookups (search is for text)"
+             callers in one call; use graph_search/graph_context for symbol lookups — use \
+             search only for text"
         )
     } else {
         format!(
             "the symbol '{name}' (from pattern '{pattern}') is an indexed symbol — \
-             graph_context(id=\"{id}\") gives its definition + callers in one call; prefer the \
-             graph tools for symbol lookups (search is for text)"
+             graph_context(id=\"{id}\") gives its definition + callers in one call; use \
+             graph_search/graph_context for symbol lookups — use search only for text"
         )
     };
     Some(note)
@@ -1488,7 +1491,7 @@ impl Tool for SearchTool {
                 // unsupported/garbled shape is diagnosable in one call.
                 let glob_hint = if args.glob.is_some() && files_searched == 0 {
                     "; the glob matched no files — if that's unexpected, \
-                     extension-anchored shapes like **/*.rs are safest"
+                     use extension-anchored shapes like **/*.rs"
                 } else {
                     ""
                 };
@@ -2166,8 +2169,8 @@ mod tests {
         assert!(
             r.output.contains(
                 "'hello' is an indexed symbol — graph_context(id=\"a.rs::hello::1\") \
-                 gives its definition + callers in one call; prefer the graph tools \
-                 for symbol lookups (search is for text)"
+                 gives its definition + callers in one call; use graph_search/graph_context \
+                 for symbol lookups — use search only for text"
             ),
             "the byte-pinned bare sentence must match exactly: {}",
             r.output

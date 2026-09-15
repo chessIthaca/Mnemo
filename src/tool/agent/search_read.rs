@@ -350,7 +350,7 @@ impl Tool for SearchReadTool {
                 // matched no content" (same hint as search's walk path).
                 let glob_hint = if args.glob.is_some() && files_searched == 0 {
                     "; the glob matched no files — if that's unexpected, \
-                     extension-anchored shapes like **/*.rs are safest"
+                     use extension-anchored shapes like **/*.rs"
                 } else {
                     ""
                 };

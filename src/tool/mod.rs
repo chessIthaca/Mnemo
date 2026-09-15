@@ -214,10 +214,18 @@ pub enum ToolFilter {
     /// [`Workflow::schema_filter`]: crate::workflow::Workflow::schema_filter
     ///
     /// A research plan is *defined* as work that produces no source-code
-    /// changes (it is the kind that skips review on completion). Hiding
+    /// changes (it is the kind that skips review on completion). Denying
     /// `file_edit`/`file_write`/`file_append`/`convert_line_endings` turns
     /// that from a rule the prompt merely asserts into one the tool gate
     /// enforces.
+    ///
+    /// The ban is PATH-SCOPED, and this filter carries only the name half of
+    /// it: a research plan may still write its own ARTIFACTS under
+    /// `.coding/**` (analysis notes, extractor scripts, run logs — the
+    /// deliverables of an investigation), which the dispatch layer passes
+    /// through via `research_write_verdict`, because only dispatch sees
+    /// the call's `path` argument. Source, docs, config, the protected
+    /// side-car entries and `..` escapes stay denied there.
     ///
     /// NOT a security boundary: `shell` stays visible because investigation
     /// genuinely needs it, and a determined `shell` call can still write a
@@ -417,6 +425,11 @@ impl ToolFilter {
                 // source-code changes, and foreign MCP tools can mutate
                 // anything (they stay NeedsApproval-gated in the states that
                 // do allow them).
+                //
+                // DENIED BY NAME ONLY: this arm cannot see the call's target
+                // path, so the `.coding/**` artifact carve-out for a research
+                // plan is applied one layer down, in dispatch
+                // (`research_write_verdict` + `Sandbox::is_artifact_write_target`).
                 ToolCategory::Agent => {
                     !matches!(
                         name,

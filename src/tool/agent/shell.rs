@@ -48,8 +48,7 @@ const GREP_NUDGE: &str = "TIP: for file-content search use the `search` tool (sa
 /// already caps output for the context budget, so the redirect buys
 /// nothing. Counted as the fired-only `shell-redirect` steering marker.
 const REDIRECT_NOTE: &str = "TIP: output redirection detected — failure details may be \
-     hidden; the tool caps output itself, prefer running the command \
-     unredirected.\n";
+     hidden; the tool caps output itself — run the command unredirected.\n";
 
 /// Whether the command redirects stdout/stderr to a null sink — `>$null`,
 /// `>/dev/null`, or `>nul` (PowerShell / POSIX / cmd forms; `2>$null`,

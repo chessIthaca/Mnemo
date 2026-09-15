@@ -52,7 +52,9 @@ describe("InflightBar empty-reasoning state", () => {
 
   it("bar click always toggles the panel (never gated on activity)", () => {
     // Same bug: the click handler ignored clicks while the log was empty.
-    expect(source).toContain("onClick={() => setExpanded(!expanded)}");
+    // (The toggle now also persists the choice — see the user-controlled
+    // suite below.)
+    expect(source).toContain("onClick={() => setPanel(!expanded)}");
     expect(source).not.toContain("if (expanded || hasActivity) setExpanded(");
   });
 
@@ -150,5 +152,46 @@ describe("InflightBar live phase indicator", () => {
     // estimate so the counter ticks continuously throughout the phase.
     expect(source).toContain("tokenUsage.reasoning > 0 || liveReasoningTokens > 0");
     expect(source).not.toContain("{tokenUsage.reasoning > 0 && (");
+  });
+});
+
+/**
+ * Regression (user report 2027-01-11): the reasoning panel opened ITSELF
+ * "quite often" — an effect expanded it on the inactive→active reasoning
+ * edge, so every turn re-opened a panel the user had deliberately collapsed.
+ * Whether the panel is open is the USER's choice alone (chevron click or the
+ * drag handle), persisted across restarts, defaulting to closed.
+ *
+ * The first case below FAILS against the pre-fix component (which imports
+ * `reasoningActive` / `reasoningBlockStarted` and calls `setExpanded(true)`
+ * on the edge), so this suite reproduces the defect.
+ */
+describe("InflightBar reasoning panel is user-controlled", () => {
+  it("has no auto-open wiring (the old reasoning-block edge is gone)", () => {
+    expect(source).not.toContain("reasoningBlockStarted");
+    expect(source).not.toContain("reasoningActive");
+    expect(source).not.toContain("prevReasoningActive");
+  });
+
+  it("starts from the persisted pref (lazy initializer, no generic arg)", () => {
+    expect(source).toContain("useState(readInflightPanelOpen)");
+  });
+
+  it("persists every user toggle (chevron click and drag handle)", () => {
+    // Pin the CALL SITES, not just the helper: `writeInflightPanelOpen(`
+    // alone is satisfied by the import + the helper body, so a revert of
+    // startDrag's collapsed branch to a bare setExpanded(true) — a real
+    // regression where a drag opens the panel for the session but a restart
+    // silently loses the choice — would leave every test green.
+    expect(source).toContain("onClick={() => setPanel(!expanded)}"); // chevron / bar click
+    expect(source).toContain("setPanel(true)"); // startDrag's collapsed branch
+    expect(source).toContain("writeInflightPanelOpen(");
+
+    // Single-writer invariant: setPanel is the ONLY thing that writes
+    // `expanded`, so no future auto-open can bypass the persistence (a
+    // re-introduced auto-open written as setExpanded(true) would both fail
+    // this and the absence check above).
+    expect(source).not.toContain("setExpanded(true)");
+    expect(source.match(/setExpanded\(/g) ?? []).toHaveLength(1);
   });
 });

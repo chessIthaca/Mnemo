@@ -346,6 +346,105 @@ impl Default for ContextConfig {
     }
 }
 
+/// Per-kind display toggles for the steering notes that ride in tool output
+/// (`[ui.steering_notes]`).
+///
+/// Each field is an OPTIONAL override: `Some(v)` wins, `None` falls back to
+/// the kind's default — resolved by
+/// [`UiConfig::effective_steering_note_visible`]. Absent overrides are not
+/// serialized; when every field is absent the whole table is omitted from
+/// `config.toml`, so a config that never touched a kind stays compact.
+///
+/// This is a GUI-only display filter, the same contract as
+/// [`UiConfig::show_delegation_notes`]: the tool-result TEXT (the model's
+/// context, including a note's re-issue escape hatch) is never modified —
+/// only the chat ToolCard's rendering drops the note's line.
+///
+/// The keys mirror `MarkerKind::label()` (`src/agent/steering_stats.rs`, the
+/// stable kebab labels surfaced on the wire), transcribed to snake_case, plus
+/// `auto_delegated` — the display family covering the two `AUTO-DELEGATED`
+/// blocks (the code-graph delegation and the memory delegation, the latter
+/// carrying no marker substring of its own).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SteeringNotesCfg {
+    /// Show the `AUTO-DELEGATED to the code graph` / `… to memory` block that
+    /// `search` / `search_read` prepend when a query is auto-delegated.
+    /// Defaults to [`UiConfig::show_delegation_notes`] (hidden unless that
+    /// legacy toggle is on); set it explicitly to decouple the two.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_delegated: Option<bool>,
+    /// Show the symbol-nudge line ("… is an indexed symbol …") that steers a
+    /// symbol-shaped `search` to the graph tools. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_nudge: Option<bool>,
+    /// Show the shell TIP ("TIP: for file-content search …") that steers a
+    /// content search away from `shell`. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_tip: Option<bool>,
+    /// Show the graph-miss line ("No symbols matched …") on an empty graph
+    /// lookup. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_miss: Option<bool>,
+    /// Show the auto-recall rider ("RECALLED CONTEXT …") appended to a tool
+    /// result. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_rider: Option<bool>,
+    /// Show the read nudge ("SYMBOL NUDGE: …") after a file read. Default
+    /// true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_nudge: Option<bool>,
+    /// Show the literal-engine TIP ("TIP: pattern has no regex
+    /// metacharacters …"), which points at `literal: true`. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literal_tip: Option<bool>,
+    /// Show the known-memory-hit note ("known memory hit: …") when a pattern
+    /// matches a known backlog id. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub known_memory_hit: Option<bool>,
+    /// Show the consolidation-due note ("working-memory events accumulated
+    /// this session"). Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consolidation_due: Option<bool>,
+    /// Show the shell-redirect TIP ("TIP: output redirection detected …").
+    /// Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_redirect: Option<bool>,
+    /// Show the stale-read note ("Re-read the file …") after a failed
+    /// `file_edit`. Default true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_stale_read: Option<bool>,
+}
+
+impl SteeringNotesCfg {
+    /// True when no kind carries an explicit override (all `None`) — the
+    /// `[ui]` field is then omitted from the serialized config entirely.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for SteeringNotesCfg {
+    /// Every override absent — the effective defaults live in
+    /// [`UiConfig::effective_steering_note_visible`], which also honors the
+    /// legacy `show_delegation_notes` for `auto_delegated`.
+    fn default() -> Self {
+        Self {
+            auto_delegated: None,
+            search_nudge: None,
+            shell_tip: None,
+            graph_miss: None,
+            recall_rider: None,
+            read_nudge: None,
+            literal_tip: None,
+            known_memory_hit: None,
+            consolidation_due: None,
+            shell_redirect: None,
+            edit_stale_read: None,
+        }
+    }
+}
+
 /// UI configuration (`[ui]`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -386,6 +485,13 @@ pub struct UiConfig {
     /// Defaults to `false` (the note is model guidance, not end-user
     /// information); set `true` to show it.
     pub show_delegation_notes: bool,
+    /// Per-kind display toggles for the steering notes that ride in tool
+    /// output (`[ui.steering_notes]`). Each kind defaults to visible except
+    /// `auto_delegated`, which inherits `show_delegation_notes` above — see
+    /// [`SteeringNotesCfg`] and [`Self::effective_steering_note_visible`].
+    /// Omitted from the saved config while no override is set.
+    #[serde(skip_serializing_if = "SteeringNotesCfg::is_empty")]
+    pub steering_notes: SteeringNotesCfg,
     /// Draw a subtle vertical thread line along consecutive activity cards
     /// (tool/memory/vision/skill) in the chat transcript, visually grouping
     /// them under the response that triggered them. GUI-only display filter;
@@ -426,6 +532,7 @@ impl Default for UiConfig {
             show_tool_activity: true,
             show_knowledge_activity: true,
             show_delegation_notes: false,
+            steering_notes: SteeringNotesCfg::default(),
             chat_thread_line: true,
             chat_prose_cap: true,
             chat_turn_tint: true,
@@ -433,6 +540,56 @@ impl Default for UiConfig {
             sound_complete: true,
             sound_input_needed: true,
             sound_stopped_errors: true,
+        }
+    }
+}
+
+impl UiConfig {
+    /// The stable snake_case keys of every steering-note kind, in the order
+    /// the Chat settings section lists them. Mirrors the fields of
+    /// [`SteeringNotesCfg`] (a test pins the two together) and the
+    /// `MarkerKind::label()` set plus `auto_delegated`.
+    pub const STEERING_NOTE_KEYS: [&'static str; 11] = [
+        "auto_delegated",
+        "search_nudge",
+        "shell_tip",
+        "graph_miss",
+        "recall_rider",
+        "read_nudge",
+        "literal_tip",
+        "known_memory_hit",
+        "consolidation_due",
+        "shell_redirect",
+        "edit_stale_read",
+    ];
+
+    /// Resolve one steering-note kind's visibility. An explicit
+    /// `[ui.steering_notes]` override wins; an absent one falls back to the
+    /// kind's default:
+    ///
+    /// - `auto_delegated` → [`Self::show_delegation_notes`] — the legacy
+    ///   toggle keeps working for configs written before the per-kind table
+    ///   existed (default: hidden);
+    /// - every other kind → `true` (visible today, unchanged by this
+    ///   feature).
+    ///
+    /// An unknown key resolves to `true`: an unrecognized name must never
+    /// hide a note by accident.
+    pub fn effective_steering_note_visible(&self, key: &str) -> bool {
+        let notes = &self.steering_notes;
+        match key {
+            "auto_delegated" => notes.auto_delegated.unwrap_or(self.show_delegation_notes),
+            "search_nudge" => notes.search_nudge.unwrap_or(true),
+            "shell_tip" => notes.shell_tip.unwrap_or(true),
+            "graph_miss" => notes.graph_miss.unwrap_or(true),
+            "recall_rider" => notes.recall_rider.unwrap_or(true),
+            "read_nudge" => notes.read_nudge.unwrap_or(true),
+            "literal_tip" => notes.literal_tip.unwrap_or(true),
+            "known_memory_hit" => notes.known_memory_hit.unwrap_or(true),
+            "consolidation_due" => notes.consolidation_due.unwrap_or(true),
+            "shell_redirect" => notes.shell_redirect.unwrap_or(true),
+            "edit_stale_read" => notes.edit_stale_read.unwrap_or(true),
+            _ => true,
         }
     }
 }
@@ -1101,6 +1258,130 @@ show_delegation_notes = true
     }
 
     #[test]
+    fn steering_notes_default_to_visible_except_auto_delegated() {
+        // Every steering-note kind is visible out of the box EXCEPT the
+        // AUTO-DELEGATED family, which inherits the legacy
+        // `show_delegation_notes` default (hidden) — an untouched config
+        // therefore behaves exactly as it did before this table existed.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.ui.effective_steering_note_visible("auto_delegated"));
+        for key in UiConfig::STEERING_NOTE_KEYS {
+            if key != "auto_delegated" {
+                assert!(
+                    cfg.ui.effective_steering_note_visible(key),
+                    "{key} should default to visible"
+                );
+            }
+        }
+        // An unknown key resolves visible — never hide a note by accident.
+        assert!(cfg.ui.effective_steering_note_visible("not-a-kind"));
+    }
+
+    #[test]
+    fn steering_notes_explicit_value_wins() {
+        let text = r#"
+[ui.steering_notes]
+auto_delegated = true
+literal_tip = false
+known_memory_hit = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        // An explicit override beats the legacy-derived default.
+        assert!(cfg.ui.effective_steering_note_visible("auto_delegated"));
+        assert!(!cfg.ui.effective_steering_note_visible("literal_tip"));
+        assert!(!cfg.ui.effective_steering_note_visible("known_memory_hit"));
+        // Untouched kinds keep their defaults.
+        assert!(cfg.ui.effective_steering_note_visible("search_nudge"));
+    }
+
+    #[test]
+    fn steering_notes_legacy_toggle_seeds_auto_delegated() {
+        // A config written before the per-kind table existed keeps working:
+        // `show_delegation_notes = true` shows the AUTO-DELEGATED family...
+        let legacy: GeneralConfig = toml::from_str("[ui]\nshow_delegation_notes = true\n").unwrap();
+        assert!(legacy.ui.effective_steering_note_visible("auto_delegated"));
+        // ...while that legacy key stays the ONLY override (the other kinds
+        // rest on their own defaults, not on the legacy toggle).
+        assert!(legacy.ui.steering_notes.auto_delegated.is_none());
+        assert!(legacy.ui.effective_steering_note_visible("literal_tip"));
+    }
+
+    #[test]
+    fn steering_notes_every_key_maps_to_a_field() {
+        // Pin STEERING_NOTE_KEYS against the struct: each key must address a
+        // real override, and setting it must not disturb any other kind.
+        for key in UiConfig::STEERING_NOTE_KEYS {
+            let mut cfg = UiConfig::default();
+            match key {
+                "auto_delegated" => cfg.steering_notes.auto_delegated = Some(false),
+                "search_nudge" => cfg.steering_notes.search_nudge = Some(false),
+                "shell_tip" => cfg.steering_notes.shell_tip = Some(false),
+                "graph_miss" => cfg.steering_notes.graph_miss = Some(false),
+                "recall_rider" => cfg.steering_notes.recall_rider = Some(false),
+                "read_nudge" => cfg.steering_notes.read_nudge = Some(false),
+                "literal_tip" => cfg.steering_notes.literal_tip = Some(false),
+                "known_memory_hit" => cfg.steering_notes.known_memory_hit = Some(false),
+                "consolidation_due" => cfg.steering_notes.consolidation_due = Some(false),
+                "shell_redirect" => cfg.steering_notes.shell_redirect = Some(false),
+                "edit_stale_read" => cfg.steering_notes.edit_stale_read = Some(false),
+                other => panic!("unknown steering-note key {other}"),
+            }
+            assert!(
+                !cfg.effective_steering_note_visible(key),
+                "{key} override should hide the note"
+            );
+            // Setting one override must not disturb any OTHER kind: compare
+            // each against the untouched default resolution (auto_delegated
+            // is hidden by default, so "unchanged" is not always "visible").
+            let baseline = UiConfig::default();
+            for other in UiConfig::STEERING_NOTE_KEYS {
+                if other != key {
+                    assert_eq!(
+                        cfg.effective_steering_note_visible(other),
+                        baseline.effective_steering_note_visible(other),
+                        "{other} changed by the {key} override"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn steering_notes_round_trips() {
+        let text = r#"
+[ui.steering_notes]
+auto_delegated = true
+search_nudge = false
+literal_tip = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        // Re-serialize: only the overrides that were set appear (no key
+        // noise for the untouched kinds).
+        let back = toml::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("shell_tip"),
+            "an absent override must not be written: {back}"
+        );
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.ui.effective_steering_note_visible("auto_delegated"));
+        assert!(!cfg2.ui.effective_steering_note_visible("search_nudge"));
+        assert!(!cfg2.ui.effective_steering_note_visible("literal_tip"));
+        assert_eq!(cfg2.ui.steering_notes, cfg.ui.steering_notes);
+    }
+
+    #[test]
+    fn steering_notes_table_omitted_while_unset() {
+        // An untouched config must not grow an empty [ui.steering_notes]
+        // table (cosmetic parity with configs written before the feature).
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let back = toml::to_string(&cfg).unwrap();
+        assert!(
+            !back.contains("steering_notes"),
+            "unset table should be omitted: {back}"
+        );
+    }
+
+    #[test]
     fn show_knowledge_activity_defaults_true() {
         // Knowledge-access cards (graph + memory + auto-recall) are visible
         // out of the box (backlog 68c4c9a5): the user wants to see graph +
@@ -1199,6 +1480,10 @@ chat_hover_timestamps = true
                 show_tool_activity: true,
                 show_knowledge_activity: false,
                 show_delegation_notes: true,
+                steering_notes: SteeringNotesCfg {
+                    literal_tip: Some(false),
+                    ..Default::default()
+                },
                 chat_thread_line: false,
                 chat_prose_cap: true,
                 chat_turn_tint: false,
@@ -1243,6 +1528,13 @@ chat_hover_timestamps = true
         assert!(reloaded.ui.show_tool_activity);
         assert!(!reloaded.ui.show_knowledge_activity);
         assert!(reloaded.ui.show_delegation_notes);
+        // The per-kind steering-note table rides the save path too: only the
+        // kind carrying an override is written, and the legacy toggle still
+        // seeds auto_delegated on reload.
+        assert_eq!(reloaded.ui.steering_notes.literal_tip, Some(false));
+        assert_eq!(reloaded.ui.steering_notes.search_nudge, None);
+        assert!(!reloaded.ui.effective_steering_note_visible("literal_tip"));
+        assert!(reloaded.ui.effective_steering_note_visible("auto_delegated"));
         assert!(!reloaded.ui.chat_thread_line);
         assert!(reloaded.ui.chat_prose_cap);
         assert!(!reloaded.ui.chat_turn_tint);

@@ -290,8 +290,8 @@ impl CodeGraph {
     /// Whether any indexed symbol is named exactly `name` (case-sensitive) —
     /// the search tools' symbol nudge: when a bare-identifier pattern names
     /// an indexed symbol, `search`/`search_read` prepend a one-line note
-    /// pointing at graph_search/graph_context (symbol lookups belong to the
-    /// graph tools; `search` is for text). Best-effort by design: `false` on
+    /// pointing at graph_search/graph_context (use the graph tools for symbol
+    /// lookups; `search` is for text). Best-effort by design: `false` on
     /// any store error, a poisoned lock recovery, or an unindexed graph — a
     /// nudge must never fail or slow down a working search. One indexed
     /// SELECT. See [`Store::symbols_named`].

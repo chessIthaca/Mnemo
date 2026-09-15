@@ -21,6 +21,8 @@ import {
 import type { ReconcileEvent, InstanceConflict } from "./lib/tauri";
 import type { WorkflowState } from "./lib/types";
 import { fmtPct } from "./lib/format";
+import { hiddenKeysFromConfig } from "./lib/delegationNotes";
+import { clampRestoredGeometry } from "./lib/windowRestore";
 import { Sidebar } from "./components/layout/Sidebar";
 import { MainPanel } from "./components/layout/MainPanel";
 import { RightPanel } from "./components/layout/RightPanel";
@@ -38,6 +40,11 @@ import { AlertTriangle, RefreshCw } from "lucide-react";
 /** localStorage key for the persisted window geometry (x, y, w, h, maximized). */
 const LS_WINDOW_GEOMETRY = "mh.windowGeometry";
 
+/**
+ * The persisted window geometry, in LOGICAL px. `width`/`height` are the OUTER
+ * frame size (the save path reads `outerSize()`); the restore converts them to
+ * an inner size via the measured chrome — see lib/windowRestore.ts.
+ */
 interface PersistedGeometry {
   x: number;
   y: number;
@@ -331,11 +338,18 @@ export default function App() {
           } catch {
             /* ignore */
           }
-          // AUTO-DELEGATED steering notes: config.toml [ui] is the single
-          // persisted source (no localStorage mirror), so hydration always
-          // applies — an absent field (older configs) reads as OFF (default).
+          // Steering notes: config.toml [ui] is the single persisted source
+          // (no localStorage mirror), so hydration always applies — an absent
+          // field (older configs) reads the registry defaults (only
+          // auto-delegated hidden), seeded by the legacy single toggle so a
+          // `show_delegation_notes = true` preference survives an upgrade.
           try {
-            store.setShowDelegationNotes(!!settings.ui.show_delegation_notes);
+            store.setHiddenSteeringNotes(
+              hiddenKeysFromConfig(
+                settings.ui.steering_notes,
+                settings.ui.show_delegation_notes,
+              ),
+            );
           } catch {
             /* ignore */
           }
@@ -462,10 +476,13 @@ export default function App() {
   }, [refreshGitBranch]);
 
   // Persist + restore the window's size + position across restarts. On mount,
-  // if we saved geometry last time and it wasn't maximized, re-apply the
-  // outer position + size via the Tauri window API. Then listen for the
-  // window's own resize/move events (debounced) and save the current bounds —
-  // but skip saving while maximized so the last *normal* bounds are kept.
+  // if we saved geometry last time and it wasn't maximized, re-apply it via the
+  // Tauri window API — CLAMPED to be usable on the current monitor layout
+  // (lib/windowRestore.ts: minimum size + fully on screen; a save from another
+  // DPI / resolution / monitor set must never come back tiny or off screen).
+  // Then listen for the window's own resize/move events (debounced) and save
+  // the current bounds — but skip saving while maximized so the last *normal*
+  // bounds are kept.
   useEffect(() => {
     const win = getCurrentWindow();
     let restoreDone = false;
@@ -480,48 +497,58 @@ export default function App() {
       try {
         const saved = readWindowGeometry();
         if (saved && !saved.maximized) {
-          // Guard against stale positions: the saved coords come from a
-          // previous session and may not exist on the current monitor
-          // layout (monitor disconnected, resolution/DPI changed). A window
-          // moved to coords that intersect no monitor is invisible but still
-          // shows a taskbar button + live preview — and clicking it cannot
-          // bring it back. Skip the position if it doesn't overlap any
-          // monitor by a usable margin (title bar + a bit), so the window
-          // falls back to the centered default; always restore the size.
-          let applyPosition = true;
-          try {
-            const factor = await win.scaleFactor();
-            const monitors = await availableMonitors();
-            const rect = {
-              x: saved.x * factor,
-              y: saved.y * factor,
-              width: saved.width * factor,
-              height: saved.height * factor,
-            };
-            applyPosition = monitors.some((m) => {
-              const overlapX =
-                Math.min(rect.x + rect.width, m.position.x + m.size.width) -
-                Math.max(rect.x, m.position.x);
-              const overlapY =
-                Math.min(rect.y + rect.height, m.position.y + m.size.height) -
-                Math.max(rect.y, m.position.y);
-              return overlapX >= 80 * factor && overlapY >= 80 * factor;
+          // Guard against stale geometry: the saved coords come from a
+          // previous session and may not exist on the current monitor layout
+          // (monitor disconnected, resolution/DPI changed). Two failure modes,
+          // both handled by clamping instead of trusting the save:
+          //  - size: a save from another DPI/resolution comes back unusably
+          //    small. The Rust-side min_inner_size is no help — it bounds only
+          //    user-driven resizing (tao applies it as a WM_GETMINMAXINFO
+          //    tracking size), while a programmatic setSize goes straight
+          //    through to SetWindowPos unclamped.
+          //  - position: coords that intersect no monitor make the window
+          //    invisible (it still shows a taskbar button + a live preview,
+          //    and clicking that cannot bring it back), and a rect clipping a
+          //    monitor edge shows partly off screen.
+          // clampRestoredGeometry handles both: the size is clamped into
+          // [800×560 … the anchor monitor's work area], and the position is
+          // pulled fully inside that work area — re-centered in it when the
+          // saved rect can't clear the usability gate. Only a total
+          // monitor-enumeration failure leaves the position to the OS default.
+          // Startup only: this never constrains interactive resizing.
+          //
+          // Each probe degrades on its own: an unreadable scale factor reads
+          // as 1 and a failed monitor enumeration as none (the size is then
+          // bounded by the minimum only — never shrunk), so one unavailable
+          // API cannot restore garbage.
+          const factor = await win.scaleFactor().catch((e) => {
+            console.error("failed to read the window scale factor; assuming 1:", e);
+            return 1;
+          });
+          const monitors = await availableMonitors().catch((e) => {
+            console.error("failed to enumerate monitors; bounding the size only:", e);
+            return [];
+          });
+          // Chrome = outer − inner. The save records OUTER bounds while
+          // setSize takes an inner (client) size that tao expands to the frame,
+          // so without this correction the window would GROW by the
+          // title-bar/border height on every restart.
+          const chrome = await Promise.all([win.outerSize(), win.innerSize()])
+            .then(([outer, inner]) => ({
+              width: Math.max(0, outer.width - inner.width),
+              height: Math.max(0, outer.height - inner.height),
+            }))
+            .catch((e) => {
+              console.error("failed to measure the window chrome; assuming none:", e);
+              return { width: 0, height: 0 };
             });
-            if (!applyPosition) {
-              console.warn(
-                "saved window position is off-screen; centering instead",
-                saved,
-              );
-            }
-          } catch (e) {
-            // Monitor enumeration failed — apply the saved position as-is
-            // (previous behavior) rather than refusing to restore.
-            console.error("failed to validate saved window position:", e);
+          const restored = clampRestoredGeometry({ saved, factor, monitors, chrome });
+          if (restored.x !== null && restored.y !== null) {
+            await win.setPosition(new LogicalPosition(restored.x, restored.y));
+          } else {
+            console.warn("no monitors reported; leaving the window at the OS default", saved);
           }
-          if (applyPosition) {
-            await win.setPosition(new LogicalPosition(saved.x, saved.y));
-          }
-          await win.setSize(new LogicalSize(saved.width, saved.height));
+          await win.setSize(new LogicalSize(restored.width, restored.height));
         }
       } catch (e) {
         console.error("failed to restore window geometry:", e);

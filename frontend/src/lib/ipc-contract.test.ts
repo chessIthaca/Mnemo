@@ -433,6 +433,23 @@ describe("IPC contract — DTO fixture field shapes", () => {
     expect(typeof dtoGetSettings.ui.show_knowledge_activity).toBe("boolean");
     expect(typeof dtoGetSettings.ui.show_delegation_notes).toBe("boolean");
     expect(typeof dtoGetSettings.ui.show_tool_images).toBe("boolean");
+    // Per-kind steering-note flags (the per-note toggles): one RESOLVED
+    // boolean per MarkerKind label + the auto_delegated family.
+    expect(Object.keys(dtoGetSettings.ui.steering_notes).sort()).toEqual([
+      "auto_delegated",
+      "consolidation_due",
+      "edit_stale_read",
+      "graph_miss",
+      "known_memory_hit",
+      "literal_tip",
+      "read_nudge",
+      "recall_rider",
+      "search_nudge",
+      "shell_redirect",
+      "shell_tip",
+    ]);
+    expect(dtoGetSettings.ui.steering_notes.auto_delegated).toBe(false);
+    expect(dtoGetSettings.ui.steering_notes.literal_tip).toBe(true);
     // The four chat-readability flags ride the ui object (plan afa81f0a).
     expect(typeof dtoGetSettings.ui.chat_thread_line).toBe("boolean");
     expect(typeof dtoGetSettings.ui.chat_prose_cap).toBe("boolean");

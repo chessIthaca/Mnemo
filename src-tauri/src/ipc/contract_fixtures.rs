@@ -32,8 +32,8 @@ use crate::ipc::agent::{ActiveSkillInfo, AgentInfo, PlanAncestorInfo, WorkflowSt
 use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllProgress};
 use crate::ipc::codegraph_cmds::{CodegraphGraph, CodegraphStatus};
 use crate::ipc::settings::{
-    GetSettingsContext, GetSettingsGeneral, GetSettingsResponse, GetSettingsUi, ModelsConfigWire,
-    ProjectWire, SaveEndpointsResponse, SaveSettingsResponse,
+    GetSettingsContext, GetSettingsGeneral, GetSettingsResponse, GetSettingsSteeringNotes,
+    GetSettingsUi, ModelsConfigWire, ProjectWire, SaveEndpointsResponse, SaveSettingsResponse,
 };
 use mnemo::backlog::{BacklogItem, BacklogStatus};
 
@@ -252,6 +252,19 @@ fn dto_fixtures_match_serde() {
             show_tool_activity: true,
             show_knowledge_activity: true,
             show_delegation_notes: false,
+            steering_notes: GetSettingsSteeringNotes {
+                auto_delegated: false,
+                search_nudge: true,
+                shell_tip: true,
+                graph_miss: true,
+                recall_rider: true,
+                read_nudge: true,
+                literal_tip: true,
+                known_memory_hit: true,
+                consolidation_due: true,
+                shell_redirect: true,
+                edit_stale_read: true,
+            },
             chat_thread_line: true,
             chat_prose_cap: true,
             chat_turn_tint: true,

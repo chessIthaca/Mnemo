@@ -127,6 +127,12 @@ struct StackSidecar {
     /// Defaults to `false` for older sidecars (review pending).
     #[serde(default)]
     reviewed: bool,
+    /// Whether a review-triggering sub-plan (implementation/bug_fixing) has
+    /// completed under the root plan. Defaults to `false` for older sidecars
+    /// (no such sub-plan ran) — the conservative reading, since an old sidecar
+    /// predates the flag and its root is resumed, not re-judged.
+    #[serde(default)]
+    review_required: bool,
 }
 
 /// The workflow, holding a stack of plans and the derived state.
@@ -177,6 +183,16 @@ pub struct Workflow {
     /// fully-checked plan with `reviewed == false` re-derives `Reviewing`
     /// (review still pending); `reviewed == true` re-derives `Complete`.
     reviewed: bool,
+    /// Whether a review-triggering sub-plan (implementation/bug_fixing) has
+    /// completed under the CURRENT root plan. The write filter keys on the
+    /// ACTIVE plan while the review decision keys on the ROOT kind, so without
+    /// this a research root that pushed an implementation sub-plan would reach
+    /// `Complete` with unreviewed source edits on disk. Set when such a
+    /// sub-plan pops, consulted at root completion (a research root then goes
+    /// to `Reviewing` instead of `Complete`), cleared whenever a fresh root
+    /// plan replaces the stack, and persisted in [`StackSidecar`] so a restart
+    /// cannot forget the pending review.
+    review_required: bool,
 }
 
 impl Workflow {
@@ -191,6 +207,7 @@ impl Workflow {
             tool_allowlist: None,
             tool_allowlist_reviewer: false,
             reviewed: false,
+            review_required: false,
         }
     }
 
@@ -416,6 +433,14 @@ impl Workflow {
             // plan (the one being executed), not the root — a research root
             // may push an implementation sub-plan, and that sub-plan does
             // need to write.
+            //
+            // This filter is PATH-BLIND (it classifies by name only). The
+            // path-scoped half of the rule — a research plan MAY write
+            // artifacts under `.coding/**` with those same tools — lives in
+            // the dispatch layer (`execute_tool_call` →
+            // `research_write_verdict`), the only place that sees the
+            // call's target path. A denial here is therefore not the last word
+            // for a research plan, by design.
             (WorkflowState::Executing, _)
                 if self.plan().map(|p| p.kind) == Some(PlanKind::Research) =>
             {
@@ -576,8 +601,12 @@ impl Workflow {
             ));
         }
         // Starting fresh from a non-executing state clears any finished stack.
+        // The review-required flag belongs to that stack, not to this new plan
+        // (a fresh research plan must not inherit a review demand from an
+        // unrelated finished root).
         if self.state != WorkflowState::Executing {
             self.stack.clear();
+            self.review_required = false;
         }
         let uuid_hex = uuid::Uuid::new_v4().simple().to_string();
         let id = unique_plan_id(&self.plans_dir, &uuid_hex);
@@ -807,8 +836,14 @@ impl Workflow {
     ///     — the review→fix→commit closing sequence. [`finish`](Self::finish) is
     ///     the only path onward to `Complete`, gated on a review report.
     ///   - [`PlanKind::Research`] → [`Complete`](WorkflowState::Complete)
-    ///     directly — no review (the plan changed no source code). `reviewed` is
-    ///     set to `true` so a restart re-derives `Complete`.
+    ///     directly — no review (the plan changed no source code), UNLESS a
+    ///     review-triggering sub-plan ran under it (`review_required`): then the
+    ///     root goes to `Reviewing` like an implementation plan, because the
+    ///     sub-plan's source edits are exactly what the skipped review was
+    ///     supposed to cover. (The `.coding/**` artifacts a research plan
+    ///     writes itself stay unreviewed by design — see the dispatch artifact
+    ///     carve-out.) Otherwise `reviewed` is set to `true` so a restart
+    ///     re-derives `Complete`.
     ///
     /// Keeping the finished frame means a restart re-derives the right state
     /// (and the completed plan stays visible in the UI) instead of dropping to
@@ -829,21 +864,35 @@ impl Workflow {
             let kind = frame.plan.kind;
             if self.stack.len() > 1 {
                 // Sub-plan finished — pop it and resume the parent, regardless
-                // of kind (sub-plans never trigger the review sequence).
+                // of kind (sub-plans never trigger the review sequence). An
+                // implementation/bug_fixing sub-plan DID change source though,
+                // so remember that the root still owes a review: the write
+                // filter keys on the ACTIVE plan, but the review decision keys
+                // on the ROOT kind, and a research root would otherwise reach
+                // Complete with unreviewed source edits on disk.
+                if matches!(kind, PlanKind::Implementation | PlanKind::BugFixing) {
+                    self.review_required = true;
+                }
                 self.stack.pop();
                 self.state = WorkflowState::Executing;
             } else {
                 // Root plan finished — keep it. The kind decides whether the
                 // review closing sequence runs (Implementation/BugFixing →
-                // Reviewing) or is skipped (Research → Complete directly).
+                // Reviewing) or is skipped (Research → Complete directly) — and
+                // a research root whose sub-plan wrote source still reviews.
                 match kind {
                     PlanKind::Implementation | PlanKind::BugFixing => {
                         self.state = WorkflowState::Reviewing;
                         self.reviewed = false;
                     }
                     PlanKind::Research => {
-                        self.state = WorkflowState::Complete;
-                        self.reviewed = true;
+                        if self.review_required {
+                            self.state = WorkflowState::Reviewing;
+                            self.reviewed = false;
+                        } else {
+                            self.state = WorkflowState::Complete;
+                            self.reviewed = true;
+                        }
                     }
                 }
             }
@@ -963,11 +1012,29 @@ impl Workflow {
     /// resume the parent (or return to Planning if the stack empties).
     ///
     /// Returns the title of the abandoned plan, or an error if no plan exists.
+    ///
+    /// Abandoning an implementation/bug_fixing SUB-plan marks the root
+    /// review-required exactly like completing it does: that sub-plan's filter
+    /// admits source writes, so "it was abandoned" cannot be read as "nothing
+    /// changed on disk". A reviewer PASS on an (almost) empty diff is cheap; an
+    /// unreviewed source edit under a research root is the leak this flag
+    /// exists to close (review HIGH-1, 2027-01-11). The ROOT's own abandonment
+    /// stays untouched — that is `finish`'s sanctioned escape hatch for an
+    /// un-completable review.
     pub fn abandon_plan(&mut self) -> Result<String> {
         let frame = self
             .stack
             .pop()
             .ok_or_else(|| crate::error::Error::WorkflowNoPlan)?;
+        // The popped frame is still in hand: a review-triggering sub-plan may
+        // already have written source, and a non-empty remaining stack is what
+        // makes the popped frame a sub-plan (a root abandonment is the
+        // sanctioned escape hatch and must not arm the flag).
+        if !self.stack.is_empty()
+            && matches!(frame.plan.kind, PlanKind::Implementation | PlanKind::BugFixing)
+        {
+            self.review_required = true;
+        }
         self.state = if self.stack.is_empty() {
             WorkflowState::Planning
         } else {
@@ -1036,10 +1103,12 @@ impl Workflow {
 
     /// Persist the plan stack + active skill + reviewed flag to a sidecar file
     /// so a restart resumes the full nesting AND an in-flight skill AND the
-    /// review-pending vs review-done distinction. No-op-safe: writes
-    /// `stack.json` next to the plans.
+    /// review-pending vs review-done distinction AND a still-pending review
+    /// demand from a completed sub-plan. No-op-safe: writes `stack.json` next
+    /// to the plans.
     ///
-    /// The sidecar shape is `{"stack":[ids...],"skill":{...}|null,"reviewed":bool}`.
+    /// The sidecar shape is
+    /// `{"stack":[ids...],"skill":{...}|null,"reviewed":bool,"review_required":bool}`.
     /// The legacy bare-array form (`[ids...]`) is still read by
     /// [`load_latest`](Self::load_latest).
     fn persist_stack(&self) -> Result<()> {
@@ -1048,6 +1117,7 @@ impl Workflow {
             stack: self.stack.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
             skill: self.active_skill.clone(),
             reviewed: self.reviewed,
+            review_required: self.review_required,
         })
         .map_err(|e| crate::error::Error::Workflow(format!("serialize stack: {e}")))?;
         std::fs::write(self.plans_dir.join("stack.json"), json)?;
@@ -1079,6 +1149,7 @@ impl Workflow {
         let mut sidecar_present = false;
         let mut persisted_skill: Option<ActiveSkill> = None;
         let mut persisted_reviewed: bool = false;
+        let mut persisted_review_required: bool = false;
         if sidecar.exists() {
             if let Ok(text) = std::fs::read_to_string(&sidecar) {
                 sidecar_present = true;
@@ -1088,6 +1159,7 @@ impl Workflow {
                     ids = sc.stack;
                     persisted_skill = sc.skill;
                     persisted_reviewed = sc.reviewed;
+                    persisted_review_required = sc.review_required;
                 } else {
                     // Legacy bare-array form (`[ids...]`). If this parse also
                     // fails, the sidecar is corrupt — log a warning rather than
@@ -1131,13 +1203,15 @@ impl Workflow {
             }
         }
 
-        // Restore the persisted `reviewed` flag BEFORE the skill early-return
-        // below — otherwise a restart while a skill is active would leave
-        // `reviewed` at its `new()` default (false), and the next persist_stack
-        // (e.g. end_skill) would write that stale false back, corrupting the
-        // sidecar (a closed-out review would re-derive Reviewing on a later
-        // restart).
+        // Restore the persisted `reviewed` / `review_required` flags BEFORE the
+        // skill early-return below — otherwise a restart while a skill is active
+        // would leave them at their `new()` defaults, and the next persist_stack
+        // (e.g. end_skill) would write those stale values back, corrupting the
+        // sidecar: a closed-out review would re-derive Reviewing on a later
+        // restart, and a completed implementation sub-plan under a research root
+        // would silently forget that its root still owes a review.
         self.reviewed = persisted_reviewed;
+        self.review_required = persisted_review_required;
 
         // If a skill was persisted, resume in the Skill state with its overlay.
         if let Some(skill) = persisted_skill {
@@ -1654,6 +1728,278 @@ mod tests {
     }
 
     #[test]
+    fn research_root_with_implementation_subplan_requires_review() {
+        // Regression (2027-01-11 review leak): the WRITE filter keys on the
+        // ACTIVE plan while the review decision keys on the ROOT kind, so a
+        // research root that pushed an implementation sub-plan used to reach
+        // Complete with unreviewed source edits on disk. Completing the
+        // sub-plan must mark the root review-required.
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan(
+            "Fix what the investigation found",
+            "G",
+            "C",
+            vec!["s1".into()],
+        )
+        .unwrap();
+        assert_eq!(wf.plan_depth(), 2);
+        // While the sub-plan is active it is an ordinary implementation plan
+        // and gets the writing filter — that is the whole leak.
+        assert_eq!(wf.allowed_tools(), ToolFilter::Executing);
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.plan_depth(), 1);
+        assert_eq!(wf.state(), WorkflowState::Executing);
+        // The research root now owes a review, so its own completion lands in
+        // Reviewing (where `finish` is gated on a reviewer report) instead of
+        // Complete. Pre-fix this assertion failed: state was Complete.
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Reviewing);
+        assert!(!wf.reviewed);
+    }
+
+    #[test]
+    fn review_required_flag_survives_restart_before_root_completion() {
+        // The pending review demand rides the stack sidecar: a restart while
+        // the research root is still executing must not forget that its
+        // implementation sub-plan already wrote source.
+        let dir = tempdir().unwrap();
+        let plans_dir = dir.path().join("plans");
+        let mut wf1 = Workflow::new(plans_dir.clone());
+        wf1.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf1.create_plan("Fix", "G", "C", vec!["s1".into()]).unwrap();
+        wf1.complete_step(0).unwrap(); // sub-plan pops; root still Executing
+
+        let mut wf2 = Workflow::new(plans_dir);
+        wf2.load_latest().unwrap();
+        assert_eq!(wf2.state(), WorkflowState::Executing);
+        assert_eq!(wf2.plan_depth(), 1);
+        wf2.complete_step(0).unwrap();
+        assert_eq!(wf2.state(), WorkflowState::Reviewing);
+        assert!(!wf2.reviewed);
+    }
+
+    #[test]
+    fn research_subplan_under_research_root_still_skips_review() {
+        // Only a review-triggering sub-plan forces the review: a research
+        // sub-plan changes no source, so the root still completes directly.
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan_with_kind(
+            "Dig deeper",
+            "G",
+            "C",
+            vec!["s1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.plan_depth(), 1);
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Complete);
+        assert!(wf.reviewed);
+    }
+
+    #[test]
+    fn research_root_with_bug_fixing_subplan_requires_review() {
+        // BugFixing counts as review-triggering exactly like Implementation.
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan_with_kind(
+            "Fix the nested bug",
+            "G",
+            "C",
+            vec!["s1".into()],
+            PlanKind::BugFixing,
+            Some("crash on open"),
+        )
+        .unwrap();
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.plan_depth(), 1);
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Reviewing);
+        assert!(!wf.reviewed);
+    }
+
+    #[test]
+    fn review_required_flag_does_not_leak_into_the_next_root_plan() {
+        // A fresh root plan starts with a clean slate: the review demand
+        // belongs to the stack that earned it, not to every later research
+        // plan (otherwise research would silently stop skipping review).
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan("Fix", "G", "C", vec!["s1".into()]).unwrap();
+        wf.complete_step(0).unwrap(); // sub-plan pops → review required
+        wf.complete_step(0).unwrap(); // root → Reviewing
+        wf.finish().unwrap(); // → Complete
+
+        wf.create_plan_with_kind(
+            "Investigate again",
+            "G",
+            "C",
+            vec!["r2".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Complete);
+        assert!(wf.reviewed);
+    }
+
+    #[test]
+    fn abandoned_implementation_subplan_still_forces_review() {
+        // Regression (review HIGH-1, 2027-01-11): the flag was set only on the
+        // sub-plan COMPLETION path, so abandoning the sub-plan after it wrote
+        // source left the research root free to reach Complete unreviewed. The
+        // sub-plan's filter admits source writes, so "abandoned" cannot be read
+        // as "nothing changed".
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan(
+            "Fix what the investigation found",
+            "G",
+            "C",
+            vec!["s1".into()],
+        )
+        .unwrap();
+        assert_eq!(wf.plan_depth(), 2);
+        assert_eq!(
+            wf.abandon_plan().unwrap(),
+            "Fix what the investigation found"
+        );
+        assert_eq!(wf.plan_depth(), 1);
+        assert_eq!(wf.state(), WorkflowState::Executing);
+        // Pre-fix this asserted Complete with `reviewed == true`.
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Reviewing);
+        assert!(!wf.reviewed);
+    }
+
+    #[test]
+    fn abandoned_research_subplan_does_not_force_review() {
+        // The counterpart: a research sub-plan writes no source, so abandoning
+        // it changes nothing — the root still skips the review.
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.create_plan_with_kind(
+            "Dig deeper",
+            "G",
+            "C",
+            vec!["s1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf.abandon_plan().unwrap();
+        assert_eq!(wf.plan_depth(), 1);
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Complete);
+        assert!(wf.reviewed);
+    }
+
+    #[test]
+    fn sidecar_without_review_required_still_loads() {
+        // Backward compatibility, pinned by hand: a sidecar written BEFORE the
+        // field existed (object form, no `review_required`) must still resume
+        // the stack and derive its state from the fields it does carry — the
+        // `#[serde(default)]` claim is otherwise only asserted, never verified.
+        let dir = tempdir().unwrap();
+        let plans_dir = dir.path().join("plans");
+        let mut wf1 = Workflow::new(plans_dir.clone());
+        wf1.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["r1".into()],
+            PlanKind::Research,
+            None,
+        )
+        .unwrap();
+        wf1.complete_step(0).unwrap(); // → Complete (research root, no sub-plan)
+        assert_eq!(wf1.state(), WorkflowState::Complete);
+
+        // Strip the new field, leaving a pre-2027-01-11 sidecar behind.
+        let sidecar = plans_dir.join("stack.json");
+        let raw = std::fs::read_to_string(&sidecar).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            value.get("review_required").is_some(),
+            "the field is written by persist_stack"
+        );
+        value.as_object_mut().unwrap().remove("review_required");
+        std::fs::write(&sidecar, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let mut wf2 = Workflow::new(plans_dir);
+        wf2.load_latest().unwrap();
+        assert_eq!(wf2.state(), WorkflowState::Complete);
+        assert!(wf2.reviewed);
+    }
+
+    #[test]
     fn finish_transitions_to_complete() {
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path().join("plans"));
@@ -1887,7 +2233,11 @@ mod tests {
     #[test]
     fn research_plan_still_cannot_write_despite_the_advertised_surface() {
         // Advertising the full frozen surface must NOT grant write access: the
-        // research restriction lives in the dispatch filter.
+        // research restriction lives in the dispatch filter. That filter stays
+        // path-BLIND by design (it never sees the call arguments), so it keeps
+        // denying these four names wholesale; the path-scoped artifact
+        // carve-out for `.coding/**` lives in `execute_tool_call`, the only
+        // layer that sees the target path.
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path());
         wf.create_plan_with_kind(

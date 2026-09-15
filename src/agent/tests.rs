@@ -5308,6 +5308,264 @@ async fn dispatch_allows_write_tool_in_executing() {
     );
 }
 
+/// A workflow with a single-step RESEARCH plan already active — the kind whose
+/// file tools are denied by name, so only `.coding/**` artifacts pass dispatch.
+async fn research_workflow(dir: &tempfile::TempDir) -> Arc<tokio::sync::Mutex<Workflow>> {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan_with_kind(
+            "Investigate",
+            "G",
+            "C",
+            vec!["step one".into()],
+            crate::workflow::PlanKind::Research,
+            None,
+        )
+        .unwrap();
+    }
+    workflow
+}
+
+#[tokio::test]
+async fn dispatch_allows_research_artifact_write() {
+    // The 2027-01-11 carve-out: a research plan may write its own ARTIFACTS
+    // under `.coding/**` with the file tools. Before it, the deliverable had to
+    // go through `shell` (bypassing the file tools' diff preview and path
+    // safety) or the plan got misfiled as `implementation`.
+    let dir = tempdir().unwrap();
+    let workflow = research_workflow(&dir).await;
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let tc = crate::provider::ToolCall::new(
+        "c1",
+        "file_write",
+        r#"{"path":".coding/analysis/notes.md","content":"findings"}"#,
+    );
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "a research plan must be able to write its own .coding/ artifact, got: {}",
+        result.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".coding/analysis/notes.md")).unwrap(),
+        "findings"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_denies_research_source_write() {
+    // The other half of the carve-out: source is still refused, and the error
+    // names the boundary so the model does not retry blindly.
+    let dir = tempdir().unwrap();
+    let workflow = research_workflow(&dir).await;
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let tc = crate::provider::ToolCall::new(
+        "c1",
+        "file_write",
+        r#"{"path":"src/lib.rs","content":"// sneaky"}"#,
+    );
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        !result.success,
+        "a research plan must not write source: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("research plan") && result.output.contains(".coding/"),
+        "the denial should name the artifact boundary, got: {}",
+        result.output
+    );
+    assert!(!dir.path().join("src/lib.rs").exists(), "side-effect free");
+}
+
+#[tokio::test]
+async fn dispatch_denies_research_traversal_write() {
+    // `.coding/../src/lib.rs` FOLDS to `src/lib.rs` while the raw argument still
+    // starts with `.coding/` — a naive prefix check would have granted it. The
+    // lexical resolution runs before the artifact test, so it stays denied.
+    let dir = tempdir().unwrap();
+    let workflow = research_workflow(&dir).await;
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let tc = crate::provider::ToolCall::new(
+        "c1",
+        "file_write",
+        r#"{"path":".coding/../src/lib.rs","content":"// sneaky"}"#,
+    );
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        !result.success,
+        ".coding/../src/lib.rs must not pass the artifact check: {}",
+        result.output
+    );
+    assert!(!dir.path().join("src/lib.rs").exists(), "side-effect free");
+}
+
+#[tokio::test]
+async fn dispatch_denies_research_protected_write() {
+    // The protected side-car entries stay out of the allowance: the file tools
+    // refuse them anyway, and the carve-out must not become a second door.
+    let dir = tempdir().unwrap();
+    let workflow = research_workflow(&dir).await;
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let tc = crate::provider::ToolCall::new(
+        "c1",
+        "file_write",
+        r#"{"path":".coding/plans/stack.json","content":"{}"}"#,
+    );
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        !result.success,
+        "protected .coding/plans files stay read-only: {}",
+        result.output
+    );
+    // The message must name PROTECTION as the reason: an implementation
+    // sub-plan does not unlock `.coding/plans/**`, so the research-boundary
+    // advice would send the model after a fix that cannot work (review LOW-4).
+    assert!(
+        result.output.contains("protected"),
+        "the denial must name protection, not the research boundary, got: {}",
+        result.output
+    );
+    assert!(!dir.path().join(".coding/plans/stack.json").exists());
+}
+
+#[tokio::test]
+async fn dispatch_denies_research_write_through_an_escaping_link() {
+    // A symlink/junction planted inside `.coding/` that points OUT of the root
+    // must not be granted: the canonical resolution is refused and the lexical
+    // fallback is only trusted when no link component exists (review LOW-1).
+    // Asserted end-to-end — the bytes must never reach the filesystem.
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+    let link = dir.path().join(".coding/link");
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
+    #[cfg(windows)]
+    let linked = {
+        // `mklink /J` is a cmd builtin and mis-parses through Command's
+        // quoting; New-Item's Junction type is the API-level spelling and needs
+        // no elevation (a real symlink would need Developer Mode).
+        let script = format!(
+            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+            link.display(),
+            outside.path().display()
+        );
+        let junction = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+            .output();
+        match junction {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
+                eprintln!(
+                    "junction fixture unavailable ({}): {}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok()
+            }
+            Err(_) => std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok(),
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let linked = false;
+    if !linked {
+        eprintln!("SKIP: could not create a link for the escaping-link fixture");
+        return;
+    }
+    let workflow = research_workflow(&dir).await;
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let tc = crate::provider::ToolCall::new(
+        "c1",
+        "file_write",
+        r#"{"path":".coding/link/x.md","content":"escaped"}"#,
+    );
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        !result.success,
+        "a write through a link out of the root must be denied: {}",
+        result.output
+    );
+    assert!(
+        !outside.path().join("x.md").exists(),
+        "the write must not follow the link out of the sandbox root"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_allows_read_tool_on_skill_allow_list() {
     // Positive Skill case: a tool named on the allow-list still runs.

@@ -78,11 +78,12 @@ pub(crate) fn reset_consolidation_gate() {
 }
 
 /// F11: when the session's working-memory row count crosses
-/// [`CONSOLIDATION_NUDGE_THRESHOLD`], return the fired-only note suggesting
+/// [`CONSOLIDATION_NUDGE_THRESHOLD`], return the fired-only note directing
 /// `memory_consolidate`. The count mirrors consolidation's own session
 /// filter (`source_session_ids` contains the id). Best-effort: no store, no
 /// session id, or any store error yields `None`; the count query stops for
-/// a session once the note has fired (the static gate). Advisory only.
+/// a session once the note has fired (the static gate). The note never blocks
+/// or fails the host call.
 pub(crate) async fn consolidation_due_note(
     store: Option<&Arc<dyn MemoryStoreTrait>>,
     session_id: Option<&str>,
@@ -114,7 +115,7 @@ pub(crate) async fn consolidation_due_note(
         });
     let note = match n {
         Some(n) if n >= CONSOLIDATION_NUDGE_THRESHOLD => Some(format!(
-            "NOTE: {n} working-memory events accumulated this session — consider \
+            "NOTE: {n} working-memory events accumulated this session — run \
              memory_consolidate(session_id) to distill them"
         )),
         _ => None,

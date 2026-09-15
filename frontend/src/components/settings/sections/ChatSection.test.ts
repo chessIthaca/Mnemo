@@ -21,6 +21,7 @@ import {
   serializeChat,
   type ChatDraft,
 } from "../types";
+import { STEERING_NOTES, type SteeringNoteKey } from "../../../lib/delegationNotes";
 
 describe("Chat settings section placement", () => {
   it("registers 'chat' as a valid Settings section id", () => {
@@ -52,7 +53,10 @@ describe("ChatSection owns the chat display toggles", () => {
     expect(chatSource).toContain("Show images from image tools in chat");
     expect(chatSource).toContain("Show tool activity in chat");
     expect(chatSource).toContain("Show knowledge activity in chat (graph, memory, auto-recall)");
-    expect(chatSource).toContain("Show auto-delegation notes in search results");
+    // Per-kind steering-note toggles (registry-driven sub-block).
+    expect(chatSource).toContain("Steering notes in tool results");
+    expect(chatSource).toContain("{STEERING_NOTES.map((def) => (");
+    expect(chatSource).toContain("checked={draft.steeringNotes[def.key]}");
     // The four chat-readability affordances (plan afa81f0a).
     expect(chatSource).toContain("Thread line along activity cards");
     expect(chatSource).toContain("Cap prose width (~100 columns)");
@@ -65,7 +69,7 @@ describe("ChatSection owns the chat display toggles", () => {
     expect(chatSource).toContain("show_tool_images: draft.showToolImages");
     expect(chatSource).toContain("show_tool_activity: draft.showToolActivity");
     expect(chatSource).toContain("show_knowledge_activity: draft.showKnowledgeActivity");
-    expect(chatSource).toContain("show_delegation_notes: draft.showDelegationNotes");
+    expect(chatSource).toContain("steering_notes: draft.steeringNotes");
     expect(chatSource).toContain("chat_thread_line: draft.chatThreadLine");
     expect(chatSource).toContain("chat_prose_cap: draft.chatProseCap");
     expect(chatSource).toContain("chat_turn_tint: draft.chatTurnTint");
@@ -77,7 +81,7 @@ describe("ChatSection owns the chat display toggles", () => {
     expect(chatSource).toContain("setShowToolImages(draft.showToolImages)");
     expect(chatSource).toContain("setShowToolActivity(draft.showToolActivity)");
     expect(chatSource).toContain("setShowKnowledgeActivity(draft.showKnowledgeActivity)");
-    expect(chatSource).toContain("setShowDelegationNotes(draft.showDelegationNotes)");
+    expect(chatSource).toContain("s.setHiddenSteeringNotes(");
     expect(chatSource).toContain("setChatThreadLine(draft.chatThreadLine)");
     expect(chatSource).toContain("setChatProseCap(draft.chatProseCap)");
     expect(chatSource).toContain("setChatTurnTint(draft.chatTurnTint)");
@@ -93,12 +97,16 @@ describe("ChatSection owns the chat display toggles", () => {
 });
 
 describe("serializeChat", () => {
+  /** Every kind visible — the draft's positive form of the store's list. */
+  const allVisible = Object.fromEntries(
+    STEERING_NOTES.map((def) => [def.key, true]),
+  ) as Record<SteeringNoteKey, boolean>;
   const base: ChatDraft = {
     showTokenUsage: true,
     showToolImages: true,
     showToolActivity: true,
     showKnowledgeActivity: true,
-    showDelegationNotes: false,
+    steeringNotes: allVisible,
     chatThreadLine: true,
     chatProseCap: true,
     chatTurnTint: true,
@@ -120,7 +128,7 @@ describe("serializeChat", () => {
       serializeChat({ ...base, showToolActivity: false }),
     );
     expect(serializeChat(base)).not.toBe(
-      serializeChat({ ...base, showDelegationNotes: true }),
+      serializeChat({ ...base, steeringNotes: { ...allVisible, literal_tip: false } }),
     );
     expect(serializeChat(base)).not.toBe(
       serializeChat({ ...base, chatThreadLine: false }),

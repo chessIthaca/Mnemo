@@ -7,6 +7,7 @@ import { useAgentStore } from "../../../hooks/useAgentStore";
 import { saveSettings, errMsg } from "../../../lib/tauri";
 import { type ChatDraft, serializeChat } from "../types";
 import type { SettingsSectionHandle } from "../types";
+import { STEERING_NOTES, type SteeringNoteKey } from "../../../lib/delegationNotes";
 
 export interface ChatSectionProps {
   /** When true, capture a snapshot from the store (dialog open). */
@@ -38,7 +39,9 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
       showToolImages: s.showToolImages,
       showToolActivity: s.showToolActivity,
       showKnowledgeActivity: s.showKnowledgeActivity,
-      showDelegationNotes: s.showDelegationNotes,
+      steeringNotes: Object.fromEntries(
+        STEERING_NOTES.map((def) => [def.key, !s.hiddenSteeringNotes.includes(def.key)]),
+      ) as Record<SteeringNoteKey, boolean>,
       chatThreadLine: s.chatThreadLine,
       chatProseCap: s.chatProseCap,
       chatTurnTint: s.chatTurnTint,
@@ -85,7 +88,9 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
         s.setShowToolImages(draft.showToolImages);
         s.setShowToolActivity(draft.showToolActivity);
         s.setShowKnowledgeActivity(draft.showKnowledgeActivity);
-        s.setShowDelegationNotes(draft.showDelegationNotes);
+        s.setHiddenSteeringNotes(
+          STEERING_NOTES.filter((def) => !draft.steeringNotes[def.key]).map((def) => def.key),
+        );
         s.setChatThreadLine(draft.chatThreadLine);
         s.setChatProseCap(draft.chatProseCap);
         s.setChatTurnTint(draft.chatTurnTint);
@@ -95,7 +100,7 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
           show_tool_images: draft.showToolImages,
           show_tool_activity: draft.showToolActivity,
           show_knowledge_activity: draft.showKnowledgeActivity,
-          show_delegation_notes: draft.showDelegationNotes,
+          steering_notes: draft.steeringNotes,
           chat_thread_line: draft.chatThreadLine,
           chat_prose_cap: draft.chatProseCap,
           chat_turn_tint: draft.chatTurnTint,
@@ -169,15 +174,38 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
           Show knowledge activity in chat (graph, memory, auto-recall)
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
-          <input
-            type="checkbox"
-            checked={draft.showDelegationNotes}
-            onChange={(e) => patch({ showDelegationNotes: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
-          />
-          Show auto-delegation notes in search results
-        </label>
+        <div className="space-y-2 border-t border-[color:var(--border-color)] pt-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+            Steering notes in tool results
+          </div>
+          <p className="text-xs text-[color:var(--text-muted)]">
+            Model guidance that rides in tool output. Unchecking a note hides that line
+            in the chat card only — the tool result the model reads is unchanged.
+          </p>
+          {STEERING_NOTES.map((def) => (
+            <label
+              key={def.key}
+              className="flex items-start gap-2 text-sm text-[color:var(--text-primary)]"
+            >
+              <input
+                type="checkbox"
+                checked={draft.steeringNotes[def.key]}
+                onChange={(e) =>
+                  patch({
+                    steeringNotes: { ...draft.steeringNotes, [def.key]: e.target.checked },
+                  })
+                }
+                className="mt-[0.15em] h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+              />
+              <span>
+                {def.label}
+                <span className="block text-xs text-[color:var(--text-muted)]">
+                  {def.description}
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
 
         <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
           <input

@@ -172,6 +172,50 @@ pub struct MemorySearchDto {
     pub review_budget: Option<usize>,
 }
 
+/// The `[ui.steering_notes]` section patch — every field optional (an omitted
+/// field keeps the existing override).
+///
+/// The kinds + their defaults live in
+/// [`SteeringNotesCfg`](crate::config::general::SteeringNotesCfg) and
+/// `UiConfig::effective_steering_note_visible`; `None` here means "leave the
+/// override as it is", not "reset to the default".
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SteeringNotesDto {
+    /// See `SteeringNotesCfg::auto_delegated`.
+    #[serde(default)]
+    pub auto_delegated: Option<bool>,
+    /// See `SteeringNotesCfg::search_nudge`.
+    #[serde(default)]
+    pub search_nudge: Option<bool>,
+    /// See `SteeringNotesCfg::shell_tip`.
+    #[serde(default)]
+    pub shell_tip: Option<bool>,
+    /// See `SteeringNotesCfg::graph_miss`.
+    #[serde(default)]
+    pub graph_miss: Option<bool>,
+    /// See `SteeringNotesCfg::recall_rider`.
+    #[serde(default)]
+    pub recall_rider: Option<bool>,
+    /// See `SteeringNotesCfg::read_nudge`.
+    #[serde(default)]
+    pub read_nudge: Option<bool>,
+    /// See `SteeringNotesCfg::literal_tip`.
+    #[serde(default)]
+    pub literal_tip: Option<bool>,
+    /// See `SteeringNotesCfg::known_memory_hit`.
+    #[serde(default)]
+    pub known_memory_hit: Option<bool>,
+    /// See `SteeringNotesCfg::consolidation_due`.
+    #[serde(default)]
+    pub consolidation_due: Option<bool>,
+    /// See `SteeringNotesCfg::shell_redirect`.
+    #[serde(default)]
+    pub shell_redirect: Option<bool>,
+    /// See `SteeringNotesCfg::edit_stale_read`.
+    #[serde(default)]
+    pub edit_stale_read: Option<bool>,
+}
+
 /// Patch payload for non-endpoint Settings sections.
 ///
 /// All fields are optional — only present fields are applied. Endpoints and
@@ -226,6 +270,10 @@ pub struct SettingsSaveDto {
     pub show_knowledge_activity: Option<bool>,
     #[serde(default)]
     pub show_delegation_notes: Option<bool>,
+    /// Per-kind steering-note display overrides (`[ui.steering_notes]`) — see
+    /// [`SteeringNotesDto`].
+    #[serde(default)]
+    pub steering_notes: Option<SteeringNotesDto>,
     #[serde(default)]
     pub chat_thread_line: Option<bool>,
     #[serde(default)]
@@ -551,6 +599,42 @@ pub fn validate_and_apply_settings_patch(
     if let Some(show) = patch.show_delegation_notes {
         general.ui.show_delegation_notes = show;
     }
+    if let Some(notes) = &patch.steering_notes {
+        let cur = &mut general.ui.steering_notes;
+        if let Some(v) = notes.auto_delegated {
+            cur.auto_delegated = Some(v);
+        }
+        if let Some(v) = notes.search_nudge {
+            cur.search_nudge = Some(v);
+        }
+        if let Some(v) = notes.shell_tip {
+            cur.shell_tip = Some(v);
+        }
+        if let Some(v) = notes.graph_miss {
+            cur.graph_miss = Some(v);
+        }
+        if let Some(v) = notes.recall_rider {
+            cur.recall_rider = Some(v);
+        }
+        if let Some(v) = notes.read_nudge {
+            cur.read_nudge = Some(v);
+        }
+        if let Some(v) = notes.literal_tip {
+            cur.literal_tip = Some(v);
+        }
+        if let Some(v) = notes.known_memory_hit {
+            cur.known_memory_hit = Some(v);
+        }
+        if let Some(v) = notes.consolidation_due {
+            cur.consolidation_due = Some(v);
+        }
+        if let Some(v) = notes.shell_redirect {
+            cur.shell_redirect = Some(v);
+        }
+        if let Some(v) = notes.edit_stale_read {
+            cur.edit_stale_read = Some(v);
+        }
+    }
     if let Some(on) = patch.chat_thread_line {
         general.ui.chat_thread_line = on;
     }
@@ -682,6 +766,37 @@ mod tests {
         assert!(!next.general.ui.chat_hover_timestamps);
         // Untouched fields keep their defaults.
         assert!(next.general.ui.sound_complete);
+    }
+
+    #[test]
+    fn steering_notes_patch_applies_per_kind() {
+        // The per-kind steering-note overrides ride the save path: Some flips
+        // just that kind's override, None (absent) leaves the other kinds —
+        // and the legacy show_delegation_notes — untouched.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            show_delegation_notes: Some(true),
+            steering_notes: Some(SteeringNotesDto {
+                auto_delegated: Some(false),
+                literal_tip: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(next.general.ui.steering_notes.auto_delegated, Some(false));
+        assert_eq!(next.general.ui.steering_notes.literal_tip, Some(false));
+        // Only the patched kinds gained an override.
+        assert_eq!(next.general.ui.steering_notes.search_nudge, None);
+        // Resolution honors both: the explicit per-kind value beats the legacy
+        // toggle, untouched kinds keep their defaults.
+        assert!(!next.general.ui.effective_steering_note_visible("auto_delegated"));
+        assert!(!next.general.ui.effective_steering_note_visible("literal_tip"));
+        assert!(next.general.ui.effective_steering_note_visible("search_nudge"));
+        // An absent steering_notes patch changes nothing.
+        let patch = SettingsSaveDto::default();
+        let after = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert_eq!(after.general.ui.steering_notes, next.general.ui.steering_notes);
     }
 
     #[test]

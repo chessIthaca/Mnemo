@@ -21,6 +21,7 @@ import {
 import type { ReconcileEvent, InstanceConflict } from "./lib/tauri";
 import type { WorkflowState } from "./lib/types";
 import { fmtPct } from "./lib/format";
+import { hiddenKeysFromConfig } from "./lib/delegationNotes";
 import { clampRestoredGeometry } from "./lib/windowRestore";
 import { Sidebar } from "./components/layout/Sidebar";
 import { MainPanel } from "./components/layout/MainPanel";
@@ -337,11 +338,18 @@ export default function App() {
           } catch {
             /* ignore */
           }
-          // AUTO-DELEGATED steering notes: config.toml [ui] is the single
-          // persisted source (no localStorage mirror), so hydration always
-          // applies — an absent field (older configs) reads as OFF (default).
+          // Steering notes: config.toml [ui] is the single persisted source
+          // (no localStorage mirror), so hydration always applies — an absent
+          // field (older configs) reads the registry defaults (only
+          // auto-delegated hidden), seeded by the legacy single toggle so a
+          // `show_delegation_notes = true` preference survives an upgrade.
           try {
-            store.setShowDelegationNotes(!!settings.ui.show_delegation_notes);
+            store.setHiddenSteeringNotes(
+              hiddenKeysFromConfig(
+                settings.ui.steering_notes,
+                settings.ui.show_delegation_notes,
+              ),
+            );
           } catch {
             /* ignore */
           }

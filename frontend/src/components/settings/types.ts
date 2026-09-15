@@ -6,6 +6,7 @@
 
 import type { EndpointEditable, ModelConfigEditable, VisionModelInfo } from "../../lib/tauri";
 import type { McpServer, McpServerStatus } from "../../lib/types";
+import type { SteeringNoteKey } from "../../lib/delegationNotes";
 
 /** Left-nav section ids for the Settings shell. */
 export type SettingsSectionId =
@@ -381,7 +382,12 @@ export interface ChatDraft {
   showToolImages: boolean;
   showToolActivity: boolean;
   showKnowledgeActivity: boolean;
-  showDelegationNotes: boolean;
+  /**
+   * Per-kind steering-note visibility (config.toml [ui.steering_notes]), one
+   * flag per registry kind — the positive form of the store's hidden list;
+   * the Chat section renders one checkbox per `STEERING_NOTES` entry.
+   */
+  steeringNotes: Record<SteeringNoteKey, boolean>;
   chatThreadLine: boolean;
   chatProseCap: boolean;
   chatTurnTint: boolean;

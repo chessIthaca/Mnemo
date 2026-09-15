@@ -26,6 +26,7 @@ import type {
 } from "../lib/types";
 import type { PricingEntry } from "../lib/tauri";
 import { playSound, soundEnabled } from "../lib/sounds";
+import { DEFAULT_HIDDEN_STEERING_NOTES, type SteeringNoteKey } from "../lib/delegationNotes";
 
 import {
   DEFAULT_ACCENT_COLOR,
@@ -273,14 +274,14 @@ interface AppState extends AppStateLike {
    *  so the user sees graph + memory + auto-recall activity without enabling
    *  the full show_tool_activity toggle. */
   showKnowledgeActivity: boolean;
-  /** Whether the AUTO-DELEGATED steering line renders in
-   *  search/search_read tool results (persisted to config.toml
-   *  [ui].show_delegation_notes, default off). GUI-only display filter:
-   *  the tool result text (the model's context, including the re-issue
-   *  escape-hatch hint) is unaffected — only the chat ToolCard's rendering
-   *  hides the line; the delegated answer (def:/callers:/full 360° lines)
-   *  always stays. */
-  showDelegationNotes: boolean;
+  /** Which steering-note kinds are HIDDEN from the chat ToolCard render
+   *  (persisted to config.toml [ui].steering_notes, one toggle per kind).
+   *  GUI-only display filter: the tool result text (the model's context,
+   *  including a note's re-issue escape-hatch hint) is unaffected — only the
+   *  chat ToolCard's rendering hides the line. Hydrated from the resolved
+   *  IPC flags; an absent field (older configs) falls back to the registry
+   *  defaults — only `auto_delegated` hidden, i.e. the pre-existing behavior. */
+  hiddenSteeringNotes: SteeringNoteKey[];
   /** Whether a vertical thread line is drawn along consecutive activity
    *  cards in the chat transcript (persisted to config.toml
    *  [ui].chat_thread_line, default on). GUI-only display filter. */
@@ -466,7 +467,7 @@ interface AppState extends AppStateLike {
   setShowToolImages: (show: boolean) => void;
   setShowToolActivity: (show: boolean) => void;
   setShowKnowledgeActivity: (show: boolean) => void;
-  setShowDelegationNotes: (show: boolean) => void;
+  setHiddenSteeringNotes: (keys: SteeringNoteKey[]) => void;
   setChatThreadLine: (on: boolean) => void;
   setChatProseCap: (on: boolean) => void;
   setChatTurnTint: (on: boolean) => void;
@@ -652,13 +653,13 @@ export const useAgentStore = create<AppState>((set, get) => ({
   // single persisted source (same pattern as showToolActivity above); the
   // default only covers the brief pre-hydration startup window.
   showKnowledgeActivity: true,
-  // The `note: AUTO-DELEGATED …` steering line in search/search_read tool
-  // results is hidden by default (the note is model guidance, not end-user
-  // information); hydrated from config.toml [ui] by the App bootstrap
-  // (getSettings). No localStorage mirror — config.toml is the single
-  // persisted source (same pattern as the flags above); the default only
-  // covers the brief pre-hydration startup window.
-  showDelegationNotes: false,
+  // Steering notes are model guidance, not end-user information, so the
+  // AUTO-DELEGATED family is hidden by default (the registry supplies the
+  // default set); hydrated from config.toml [ui.steering_notes] by the App
+  // bootstrap (getSettings). No localStorage mirror — config.toml is the
+  // single persisted source (same pattern as the flags above); the default
+  // only covers the brief pre-hydration startup window.
+  hiddenSteeringNotes: [...DEFAULT_HIDDEN_STEERING_NOTES],
   // Chat-readability affordances (thread line, prose cap, turn tint, hover
   // timestamps — plan afa81f0a): default ON, hydrated from config.toml [ui]
   // by the App bootstrap (getSettings). No localStorage mirror — config.toml
@@ -881,7 +882,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   setShowToolImages: (show) => set({ showToolImages: show }),
   setShowToolActivity: (show) => set({ showToolActivity: show }),
   setShowKnowledgeActivity: (show) => set({ showKnowledgeActivity: show }),
-  setShowDelegationNotes: (show) => set({ showDelegationNotes: show }),
+  setHiddenSteeringNotes: (keys) => set({ hiddenSteeringNotes: keys }),
   setChatThreadLine: (on) => set({ chatThreadLine: on }),
   setChatProseCap: (on) => set({ chatProseCap: on }),
   setChatTurnTint: (on) => set({ chatTurnTint: on }),

@@ -1,6 +1,7 @@
 +++
 title = "Steering-note display gating (only AUTO-DELEGATED is toggleable today)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 User report 2027-01-14: steering notes in tool output are only partially controllable. Settings → Chat → "Show auto-delegation notes in search results" = `[ui].show_delegation_notes` (default false, `src/config/general.rs:388`) strips ONLY the `note: AUTO-DELEGATED …` line — the filter is `frontend/src/lib/delegationNotes.ts` (prefix list `["note: AUTO-DELEGATED", "AUTO-DELEGATED"]`), applied at the two ToolCard render sites in `frontend/src/components/chat/Message.tsx` (~line 510, ~line 811). The tool-result text (the model's context) is never modified — display-only filter.

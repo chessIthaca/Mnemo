@@ -15,7 +15,7 @@ import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fil
 import { arePropsEqual, type MessageProps } from "../../lib/messageEquality";
 import { toolImagePaths, ToolImage } from "./ToolImage";
 import { useAgentStore } from "../../hooks/useAgentStore";
-import { isDelegationNote, stripDelegationNotes } from "../../lib/delegationNotes";
+import { filterSteeringNote, stripSteeringNotes } from "../../lib/delegationNotes";
 import type { TranscriptEntry, ToolInvocation } from "../../lib/types";
 
 /** A memory read/write activity line (visible only when the user opted in
@@ -443,16 +443,26 @@ function ToolCard({
   // Inline images from image commands are gated by the Chat settings toggle
   // (config.toml [ui].show_tool_images, default ON).
   const showToolImages = useAgentStore((s) => s.showToolImages);
-  // The `note: AUTO-DELEGATED …` steering line is gated by the Chat settings
-  // toggle (config.toml [ui].show_delegation_notes, default OFF) — a
-  // GUI-only display filter; the tool result text is unaffected.
-  const showDelegationNotes = useAgentStore((s) => s.showDelegationNotes);
+  // Steering notes are gated per kind by the Chat settings toggles
+  // (config.toml [ui].steering_notes) — a GUI-only display filter; the tool
+  // result text is unaffected.
+  const hiddenSteeringNotes = useAgentStore((s) => s.hiddenSteeringNotes);
   const running = calls.some((c) => c.result === null);
   // The card reflects the LAST call's outcome (not "any call failed") so a
   // fail→redo→succeed sequence ends green. Per-call ✓/✗ is still shown in the
   // expanded detail below. While any call is still running, stay neutral.
   const lastCall = calls[calls.length - 1];
   const failed = !running && lastCall.result !== null && !lastCall.result.success;
+  // The failed call's one-line error summary (the first line of the result
+  // output, shown below the header without expanding the card). A steering
+  // note can BE that line — a failed `file_edit`'s drift error carries the
+  // stale-read note — so it passes through the same per-kind filter as the
+  // expanded detail; otherwise a note whose toggle is off would still show
+  // here.
+  const errorSummary =
+    failed && lastCall.result
+      ? (filterSteeringNote(toolErrorSummary(lastCall.result.output), hiddenSteeringNotes) ?? "")
+      : "";
 
   // Header chips: file-path chips come first (deduplicated across all calls so
   // each file appears at most once — same file read in multiple grouped calls
@@ -507,8 +517,10 @@ function ToolCard({
           path: null,
           line: null,
         });
-        if (info.note !== null && (showDelegationNotes || !isDelegationNote(info.note))) {
-          searchNotes.push({ key: `${c.id}:note`, text: info.note });
+        const noteText =
+          info.note === null ? null : filterSteeringNote(info.note, hiddenSteeringNotes);
+        if (noteText !== null && noteText !== "") {
+          searchNotes.push({ key: `${c.id}:note`, text: noteText });
         }
       }
     }
@@ -644,12 +656,12 @@ function ToolCard({
       )}
       {/* A simple one-line error description for a failed call — the first
           line of the result output, shown below the header so the user sees
-          what went wrong at a glance (without expanding the card). Hidden
-          when the summary is empty (empty/whitespace-only output). */}
-      {failed && lastCall.result && toolErrorSummary(lastCall.result.output) !== "" && (
-        <div className="mt-[0.15em] text-red-400/90">
-          {toolErrorSummary(lastCall.result.output)}
-        </div>
+          what went wrong at a glance (without expanding the card). Filtered
+          like the expanded detail; hidden when nothing displayable remains
+          (empty/whitespace-only output, or a note fully hidden by its
+          toggle). */}
+      {errorSummary !== "" && (
+        <div className="mt-[0.15em] text-red-400/90">{errorSummary}</div>
       )}
       {expanded && (
         <div className="mt-[0.25em] space-y-[0.4em]">
@@ -699,8 +711,8 @@ function CallDetail({
   }
   const running = call.result === null;
   // Same Chat-settings gate as the card-level note chip (see ToolCard):
-  // config.toml [ui].show_delegation_notes, default OFF.
-  const showDelegationNotes = useAgentStore((s) => s.showDelegationNotes);
+  // config.toml [ui].steering_notes, one toggle per steering-note kind.
+  const hiddenSteeringNotes = useAgentStore((s) => s.hiddenSteeringNotes);
   // Shell calls render human-readably (backlog 8c1d8a47): the command as a
   // block with its purpose/cwd labels, and the result split into stdout, a
   // labeled stderr section, and an exit-code chip — instead of the raw
@@ -710,6 +722,15 @@ function CallDetail({
   // tool keeps the generic pretty-JSON + raw-output rendering.
   const shellArgs = name === "shell" ? shellCallFromArgs(call.args) : null;
   const shellOut = call.result && name === "shell" ? parseShellOutput(call.result.output) : null;
+  // Steering notes ride the shell output too — the grep TIP and the
+  // null-sink redirection warning are prepended by the tool (shell.rs) — and
+  // this branch renders stdout/stderr directly, so it filters them here; the
+  // generic fallback below filters the whole output the same way.
+  const shellStdout = shellOut ? stripSteeringNotes(shellOut.stdout, hiddenSteeringNotes) : "";
+  const shellStderr =
+    shellOut && shellOut.stderr !== null
+      ? stripSteeringNotes(shellOut.stderr, hiddenSteeringNotes)
+      : null;
   const editDiff = name === "file_edit" ? fileEditDiff(call.result) : null;
   // A read_files result is a wall of numbered file content — the expanded
   // body instead shows just WHAT was read: one row per file with its actual
@@ -792,23 +813,23 @@ function CallDetail({
             </div>
           ) : shellOut ? (
             <>
-              {shellOut.stdout !== "" && (
+              {shellStdout !== "" && (
                 <pre className="max-h-[24em] overflow-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
-                  {shellOut.stdout}
+                  {shellStdout}
                 </pre>
               )}
-              {shellOut.stderr !== null && shellOut.stderr !== "" && (
+              {shellStderr !== null && shellStderr !== "" && (
                 <div className="mt-[0.4em]">
                   <div className="mb-[0.15em] text-[0.75em] text-slate-500">stderr</div>
                   <pre className="max-h-[24em] overflow-auto rounded bg-red-950/40 p-[0.5em] text-[0.75em] text-red-300">
-                    {shellOut.stderr}
+                    {shellStderr}
                   </pre>
                 </div>
               )}
             </>
           ) : (
             <pre className="max-h-[24em] overflow-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
-              {showDelegationNotes ? call.result.output : stripDelegationNotes(call.result.output)}
+              {stripSteeringNotes(call.result.output, hiddenSteeringNotes)}
             </pre>
           )}
         </div>

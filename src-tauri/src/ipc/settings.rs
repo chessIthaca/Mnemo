@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use mnemo::config::general::UiConfig;
 use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
 use mnemo::config::{Endpoint, EndpointKind, SafetyMode};
 use mnemo::memory::embedder::EmbedderStatus;
@@ -597,6 +598,9 @@ pub struct GetSettingsUi {
     /// search/search_read tool results (GUI-only display filter; default
     /// false).
     pub show_delegation_notes: bool,
+    /// Resolved per-kind steering-note display flags (GUI-only display
+    /// filter) — see [`GetSettingsSteeringNotes`].
+    pub steering_notes: GetSettingsSteeringNotes,
     /// Whether a vertical thread line is drawn along consecutive activity
     /// cards in the chat transcript (GUI-only display filter; default true).
     pub chat_thread_line: bool,
@@ -616,6 +620,59 @@ pub struct GetSettingsUi {
     pub sound_input_needed: bool,
     /// Whether the doom tone plays when repeated errors stop an agent.
     pub sound_stopped_errors: bool,
+}
+
+/// The `steering_notes` object inside [`GetSettingsUi`] — the RESOLVED
+/// visibility of every steering-note kind (one flag per kind), so the
+/// frontend never has to re-derive defaults.
+///
+/// The keys mirror `UiConfig::STEERING_NOTE_KEYS`; `auto_delegated` already
+/// folds in the legacy `show_delegation_notes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct GetSettingsSteeringNotes {
+    /// Whether the AUTO-DELEGATED (code-graph / memory) block renders.
+    pub auto_delegated: bool,
+    /// Whether the symbol-nudge line renders.
+    pub search_nudge: bool,
+    /// Whether the shell TIP renders.
+    pub shell_tip: bool,
+    /// Whether the graph-miss line renders.
+    pub graph_miss: bool,
+    /// Whether the auto-recall rider renders.
+    pub recall_rider: bool,
+    /// Whether the read nudge renders.
+    pub read_nudge: bool,
+    /// Whether the literal-engine TIP renders.
+    pub literal_tip: bool,
+    /// Whether the known-memory-hit note renders.
+    pub known_memory_hit: bool,
+    /// Whether the consolidation-due note renders.
+    pub consolidation_due: bool,
+    /// Whether the shell-redirect TIP renders.
+    pub shell_redirect: bool,
+    /// Whether the stale-read note renders.
+    pub edit_stale_read: bool,
+}
+
+impl GetSettingsSteeringNotes {
+    /// Resolve every flag from `ui` — an explicit `[ui.steering_notes]`
+    /// override wins, an absent one falls back to the kind's default (see
+    /// [`UiConfig::effective_steering_note_visible`]).
+    fn resolved(ui: &UiConfig) -> Self {
+        Self {
+            auto_delegated: ui.effective_steering_note_visible("auto_delegated"),
+            search_nudge: ui.effective_steering_note_visible("search_nudge"),
+            shell_tip: ui.effective_steering_note_visible("shell_tip"),
+            graph_miss: ui.effective_steering_note_visible("graph_miss"),
+            recall_rider: ui.effective_steering_note_visible("recall_rider"),
+            read_nudge: ui.effective_steering_note_visible("read_nudge"),
+            literal_tip: ui.effective_steering_note_visible("literal_tip"),
+            known_memory_hit: ui.effective_steering_note_visible("known_memory_hit"),
+            consolidation_due: ui.effective_steering_note_visible("consolidation_due"),
+            shell_redirect: ui.effective_steering_note_visible("shell_redirect"),
+            edit_stale_read: ui.effective_steering_note_visible("edit_stale_read"),
+        }
+    }
 }
 
 /// The `markdown` object inside [`GetSettingsResponse`] — the Markdown
@@ -808,6 +865,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
             show_tool_activity: config.general.ui.show_tool_activity,
             show_knowledge_activity: config.general.ui.show_knowledge_activity,
             show_delegation_notes: config.general.ui.show_delegation_notes,
+            steering_notes: GetSettingsSteeringNotes::resolved(&config.general.ui),
             chat_thread_line: config.general.ui.chat_thread_line,
             chat_prose_cap: config.general.ui.chat_prose_cap,
             chat_turn_tint: config.general.ui.chat_turn_tint,
@@ -1286,6 +1344,7 @@ mod settings_dto_tests {
                 show_tool_activity: true,
                 show_knowledge_activity: true,
                 show_delegation_notes: false,
+                steering_notes: GetSettingsSteeringNotes::resolved(&UiConfig::default()),
                 chat_thread_line: true,
                 chat_prose_cap: false,
                 chat_turn_tint: true,
@@ -1401,6 +1460,7 @@ mod settings_dto_tests {
                 show_tool_activity: true,
                 show_knowledge_activity: true,
                 show_delegation_notes: false,
+                steering_notes: GetSettingsSteeringNotes::resolved(&UiConfig::default()),
                 chat_thread_line: true,
                 chat_prose_cap: true,
                 chat_turn_tint: true,

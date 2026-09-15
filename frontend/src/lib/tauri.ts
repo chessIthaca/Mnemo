@@ -5,6 +5,7 @@
 // Typed wrappers around Tauri invoke() + listen().
 
 import { invoke } from "@tauri-apps/api/core";
+import type { SteeringNoteKey } from "./delegationNotes";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentId,
@@ -463,6 +464,11 @@ export interface AppSettings {
     /** The AUTO-DELEGATED steering line in search/search_read
      *  tool results — GUI-only display filter, default off. */
     show_delegation_notes: boolean;
+    /** Per-kind steering-note display flags — the RESOLVED values of
+     *  config.toml [ui.steering_notes], one per kind (`auto_delegated`
+     *  already folds in the legacy show_delegation_notes above). GUI-only
+     *  display filter: the tool result text is never modified. */
+    steering_notes: Record<SteeringNoteKey, boolean>;
     /** Vertical thread line along consecutive activity cards in the chat
      *  transcript — GUI-only display filter, default on. */
     chat_thread_line: boolean;
@@ -531,6 +537,7 @@ export interface SettingsSavePatch {
   show_tool_activity?: boolean;
   show_knowledge_activity?: boolean;
   show_delegation_notes?: boolean;
+  steering_notes?: Partial<Record<SteeringNoteKey, boolean>>;
   chat_thread_line?: boolean;
   chat_prose_cap?: boolean;
   chat_turn_tint?: boolean;

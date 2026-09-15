@@ -197,7 +197,7 @@ fn large_payload_note(args: &FileEditArgs) -> Option<String> {
         format!(
             "NOTE: large edit payload (old_string ~{o} chars, new_string ~{n} chars) — \
              emission fragility has been observed near this size in long sessions; \
-             prefer smaller fragments or file_write for full-file replacement \
+             use smaller fragments, or file_write for a full-file replacement \
              (backlog e8b39d72 H5)"
         )
     })

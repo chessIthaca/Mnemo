@@ -16,8 +16,8 @@
 //! `create_plan` is `AutoRun` — creating a plan document is non-destructive and
 //! is the prerequisite for all further work, so it must never block on approval.
 //! `update_plan` is `AutoRun` for the same reason — it edits the active plan in
-//! place (preserving completed steps), the preferred, non-destructive way to
-//! adjust scope. `complete_step` and `abandon_plan` are also `AutoRun` — they
+//! place (preserving completed steps) and is the non-destructive way to adjust
+//! scope. `complete_step` and `abandon_plan` are also `AutoRun` — they
 //! only rewrite the project's own `.coding/plans/` bookkeeping (sandboxed,
 //! non-destructive to user code), so they never block on approval either. All
 //! four are gated by workflow state.
@@ -824,14 +824,14 @@ impl Tool for CreatePlanTool {
                     // payload looks like a bug-triggered FEATURE, which
                     // belongs in kind=implementation with the bug as
                     // motivation (the locked skeleton + BUG: auto-capture
-                    // mislabel features). Advisory: the caller judges.
+                    // mislabel features). Non-gating: the caller judges.
                     output.push_str(
                         " — NOTE (backlog 51ee41c1): this bug_fixing payload looks \
                          FEATURE-SCALE (more detailed steps than the locked skeleton, \
                          spanning multiple modules — new capabilities/dependencies?): \
-                         consider re-filing as kind=implementation with the bug \
-                         documented as motivation in goal/context — bug_fixing is for \
-                         contained defect fixes. Advisory: your call.",
+                         re-file it as kind=implementation with the bug documented as \
+                         motivation in goal/context — bug_fixing is for contained \
+                         defect fixes. This is a NOTE, not a gate.",
                     );
                 }
                 ToolResult {
@@ -922,8 +922,8 @@ impl Tool for UpdatePlanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "update_plan",
-            "Edit the active plan in place WITHOUT abandoning it — the preferred way to \
-             adjust a plan whose scope changed, and the right choice whenever the plan is \
+            "Edit the active plan in place WITHOUT abandoning it — use this to \
+             adjust a plan whose scope changed, and use it whenever the plan is \
              still broadly correct (abandon_plan is a destructive last resort). Completed \
              steps are preserved verbatim; only the remaining steps can be replaced or \
              appended to. Omit a field to leave it unchanged. Executing and Reviewing \
@@ -1511,7 +1511,7 @@ impl Tool for AbandonPlanTool {
             "abandon_plan",
             "Abandon the active plan WITHOUT completing it: pop it off the plan stack and \
              resume the parent plan (or return to Planning if none remains). DESTRUCTIVE LAST \
-             RESORT. Prefer update_plan whenever the plan is still broadly \
+             RESORT. Use update_plan whenever the plan is still broadly \
              correct (it edits the active plan in place, preserving completed steps). Only use \
              abandon_plan when the plan is fundamentally wrong or stale and can't be salvaged \
              by editing. The plan file stays on disk for reference.",

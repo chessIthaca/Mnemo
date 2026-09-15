@@ -799,7 +799,7 @@ mod tests {
             MarkerKind::ShellRedirect,
             "read_files",
             "TIP: output redirection detected — failure details may be hidden; the tool \
-             caps output itself, prefer running the command unredirected.\nsome stdout\n[exit code: 0]",
+             caps output itself — run the command unredirected.\nsome stdout\n[exit code: 0]",
         ),
     ];
 
@@ -1093,7 +1093,7 @@ mod tests {
             "search",
             "note: 'hello' is an indexed symbol — graph_context(id=\"a.rs::hello::1\") …\n\n\
              a.rs:1: hello\nNOTE: 15 working-memory events accumulated this session — \
-             consider memory_consolidate(session_id) to distill them",
+             run memory_consolidate(session_id) to distill them",
         );
         let snap = stats.snapshot();
         assert_eq!(count_of(&snap, "search-nudge").0, 1);

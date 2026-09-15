@@ -78,7 +78,7 @@ impl Tool for FileWriteTool {
              needed); mode=\"append\" adds to the end, creating the file if absent. To \
              write a large file, overwrite the first section then append the rest in \
              chunks of under ~4000 characters (large single calls risk truncation). For \
-             a targeted change to an existing file, prefer file_edit.",
+             a targeted change to an existing file, use file_edit.",
             json!({
                 "type": "object",
                 "properties": {

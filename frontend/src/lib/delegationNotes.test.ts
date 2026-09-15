@@ -48,7 +48,7 @@ const LINES: Record<SteeringNoteKey, string> = {
     "note: TIP: pattern has no regex metacharacters — literal:true would use the content-index engine (one indexed lookup instead of a tree walk)",
   known_memory_hit: "note: known memory hit: backlog 1a5bffcf — 'sandbox bypass'",
   consolidation_due:
-    "NOTE: 15 working-memory events accumulated this session — consider memory_consolidate",
+    "NOTE: 15 working-memory events accumulated this session — run memory_consolidate",
   shell_redirect:
     "TIP: output redirection detected — results are in out.txt, read it with read_files",
   edit_stale_read:
@@ -142,9 +142,9 @@ describe("stripSteeringNotes", () => {
     // `note: …` by `with_note`; the `AUTO-DELEGATED` prefix alone never
     // matched these, so they ride the registry's linePatterns.
     const note =
-      "note: 'hello' is an indexed symbol — graph_context(id=\"src/lib.rs::hello::12\") gives its definition + callers in one call; prefer the graph tools for symbol lookups (search is for text)";
+      "note: 'hello' is an indexed symbol — graph_context(id=\"src/lib.rs::hello::12\") gives its definition + callers in one call; use graph_search/graph_context for symbol lookups — use search only for text";
     const fuzzy =
-      "note: the symbol 'hello' (from pattern 'hel*') is an indexed symbol — graph_context(id=\"src/lib.rs::hello::12\") gives its definition + callers in one call; prefer the graph tools for symbol lookups (search is for text)";
+      "note: the symbol 'hello' (from pattern 'hel*') is an indexed symbol — graph_context(id=\"src/lib.rs::hello::12\") gives its definition + callers in one call; use graph_search/graph_context for symbol lookups — use search only for text";
     expect(stripSteeringNotes(note, ["search_nudge"]).trim()).toBe("");
     expect(stripSteeringNotes(fuzzy, ["search_nudge"]).trim()).toBe("");
   });
@@ -155,9 +155,9 @@ describe("stripSteeringNotes", () => {
     // name equals its branch is emitted UNQUOTED — so the phrase, not the
     // per-entry quoting, is what the registry matches.
     const quoted =
-      'note: from the alternation pattern \'steering_notes|SteeringNotesPatch\': \'steering_notes\' resolves to \'steering_notes_round_trips\', an indexed symbol — graph_context(id="src/config/general.rs::steering_notes_round_trips::1350"); prefer the graph tools for symbol hunts (search is for text)';
+      'note: from the alternation pattern \'steering_notes|SteeringNotesPatch\': \'steering_notes\' resolves to \'steering_notes_round_trips\', an indexed symbol — graph_context(id="src/config/general.rs::steering_notes_round_trips::1350"); use graph_search/graph_context for symbol hunts — use search only for text';
     const unquoted =
-      'note: from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); prefer the graph tools for symbol hunts (search is for text)';
+      'note: from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); use graph_search/graph_context for symbol hunts — use search only for text';
     expect(stripSteeringNotes(quoted, ["search_nudge"]).trim()).toBe("");
     expect(stripSteeringNotes(unquoted, ["search_nudge"]).trim()).toBe("");
     // The per-entry "; " is not a recognized component start, so hiding
@@ -189,9 +189,9 @@ describe("stripSteeringNotes", () => {
     // prefix doubles as `isComponentStart`, so a merged alternation
     // component is droppable on its own without touching its sibling.
     const merged =
-      'note: TIP: pattern has no regex metacharacters — literal:true would use the content-index engine (one indexed lookup instead of a tree walk); from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); prefer the graph tools for symbol hunts (search is for text)';
+      'note: TIP: pattern has no regex metacharacters — literal:true would use the content-index engine (one indexed lookup instead of a tree walk); from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); use graph_search/graph_context for symbol hunts — use search only for text';
     expect(stripSteeringNotes(merged, ["literal_tip"])).toBe(
-      'note: from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); prefer the graph tools for symbol hunts (search is for text)',
+      'note: from the alternation pattern \'Strip|stripping\': Strip is an indexed symbol — graph_context(id="a.rs::Strip::1"); use graph_search/graph_context for symbol hunts — use search only for text',
     );
   });
 

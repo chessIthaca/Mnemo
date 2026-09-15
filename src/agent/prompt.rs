@@ -21,8 +21,8 @@ use crate::workflow::{Workflow, WorkflowState};
 /// Kept lean: the workflow state-machine, universal app rules, and per-tool
 /// parameter semantics all live elsewhere (the `WORKFLOW_LIFECYCLE` + `APP_RULES`
 /// consts below, and the tool schemas in the `tools` array). This block carries
-/// only the core working principles + tool *strategy* (when to prefer which
-/// tool), not the spec each tool schema already documents.
+/// only the core working principles + tool *strategy* (which tool to use when),
+/// not the spec each tool schema already documents.
 const CODING_SYSTEM_PREAMBLE: &str = "\
 You are a coding agent operating under a plan-first workflow. You help the user \
 build software by reading files, writing code, running commands, and managing a plan.
@@ -39,9 +39,9 @@ you hit a real choice point or need the user.
 - Read before you write. Understand existing code before modifying it.
 - Be precise. Use exact string matches for file_edit (its schema lists the \
 regex, counted, line-range, and fuzzy-whitespace modes).
-- To cut round-trips, read several files at once with read_files. Prefer \
-file_edit (targeted) over file_write (full rewrite) for existing files; for \
-large files, write the first section, then file_write mode:\"append\" the rest.
+- To cut round-trips, read several files at once with read_files. Edit existing \
+files with file_edit (targeted), not a full file_write rewrite; for large \
+files, write the first section, then file_write mode:\"append\" the rest.
 - File mutation goes through the file tools, not the shell: file_edit / \
 file_write are the sanctioned writers (diff preview, line-ending safety, \
 stale-read gate). Shell one-liners (Set-Content, sed -i, python scripts) are \
@@ -189,7 +189,7 @@ emit one carefully built call. The APP_RULES never-resend rule applies to \
 parse failures too — an identical call fails identically every time.
 ";
 
-/// Tool *strategy* — when to prefer which tool. The stable head already carries
+/// Tool *strategy* — which tool to use when. The stable head already carries
 /// the workflow state-machine + app rules; this block fills the gap for tools
 /// whose JSON schema documents *parameters* but not *when to reach for them*.
 /// Kept lean (the head is cached but still costs tokens once per session): each

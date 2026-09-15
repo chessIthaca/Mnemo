@@ -232,7 +232,7 @@ export const STEERING_NOTES: readonly SteeringNoteDef[] = [
     key: "consolidation_due",
     marker: "working-memory events accumulated this session",
     // Dispatcher-appended (steering.rs): `NOTE: {n} working-memory events
-    // accumulated this session — consider memory_consolidate(session_id) to
+    // accumulated this session — run memory_consolidate(session_id) to
     // distill them`. The event count is a digit run, so this kind is pinned
     // by an anchored pattern rather than a prefix.
     linePatterns: [/^NOTE: \d+ working-memory events accumulated this session/],

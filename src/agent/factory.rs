@@ -1726,7 +1726,15 @@ mod tests {
             // passes (~15_946 < 16_000), which is why plain `cargo test`
             // stayed green while `cargo test --workspace` failed. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::Planning, 16_700),
+            // 16_700 → 18_200 (2027-01-15): measures Planning at 17_871
+            // chars (workspace-unified; standalone 17_387) — +1_494 over the
+            // 16_377 workspace baseline recorded at the 2027-01-10 pass. The
+            // growth is this change's memory_update schema (the
+            // find/replace_with targeted-repair mode) + memory_amend's
+            // heading-strip documentation (backlog 488248ce) plus schema
+            // drift from plans landed since that pass. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Planning, 18_200),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -1778,7 +1786,13 @@ mod tests {
             // the schema ~+584; measures Executing at 29_037 chars
             // (workspace-unified). Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::Executing, 29_500),
+            // 29_500 → 31_150 (2027-01-15): measures Executing at 30_813
+            // chars (workspace-unified; standalone 30_329) — +1_776 over the
+            // 29_037 workspace baseline recorded at the 2027-01-10 pass. Same
+            // cause as Planning above (backlog 488248ce's memory_update/amend
+            // schema growth, plus drift since that pass). Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Executing, 31_150),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1791,7 +1805,12 @@ mod tests {
             // ride PlanFrozen with the rest of Executing; measures
             // PlanFrozen at 30_149 chars (workspace-unified). Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 30_600),
+            // 30_600 → 32_400 (2027-01-15): measures PlanFrozen at 32_043
+            // chars (workspace-unified; standalone 31_559) — the same
+            // 2027-01-15 pass and cause as Executing above (PlanFrozen =
+            // Executing ∪ finish). Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::PlanFrozen, 32_400),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1821,7 +1840,12 @@ mod tests {
             // ride the research filters with create_plan; measures
             // ExecutingResearch at 23_826 chars (workspace-unified).
             // Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 24_300),
+            // 24_300 → 25_950 (2027-01-15): measures ExecutingResearch at
+            // 25_605 chars (workspace-unified; standalone 25_121) — the same
+            // 2027-01-15 pass and cause as Planning above (it carries
+            // memory_update + memory_amend too). Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::ExecutingResearch, 25_950),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -1853,7 +1877,12 @@ mod tests {
             // commit 077d375 (update_plan's schema docs; update_plan rides
             // Reviewing while create_plan does not — matching the smaller
             // delta). Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 25_200),
+            // 25_200 → 26_600 (2027-01-15): measures Reviewing at 26_279
+            // chars (workspace-unified; standalone 25_795) — the same
+            // 2027-01-15 pass and cause as Planning (memory_update/amend ride
+            // Reviewing too). Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::Reviewing, 26_600),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -1868,7 +1897,11 @@ mod tests {
             // same +626 growth from the plan resumability-gate commit
             // 077d375 (create_plan's schema docs; create_plan rides
             // Complete). Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Complete, 16_700),
+            // 16_700 → 18_200 (2027-01-15): measures Complete at 17_871
+            // chars — the same tool set, figures and cause as Planning
+            // (create_plan rides Complete). Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Complete, 18_200),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(

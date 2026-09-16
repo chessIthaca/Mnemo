@@ -1372,6 +1372,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    use crate::tool::agent::sandbox::link_fixture::{plant_dir_link, plant_file_link};
+
     #[test]
     fn shell_mutation_pattern_matches_the_mutation_vehicles() {
         assert!(shell_command_mutates_files(
@@ -2047,68 +2049,4 @@ mod tests {
         }
     }
 
-    /// Create a FILE link (`target` → `link`) for the escaping-link test;
-    /// `false` where the platform or environment refuses.
-    fn plant_file_link(target: &std::path::Path, link: &std::path::Path) -> bool {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
-        #[cfg(windows)]
-        {
-            std::os::windows::fs::symlink_file(target, link).is_ok()
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (target, link);
-            false
-        }
-    }
-
-    /// Plant a directory link at `link` pointing at `target`, preferring the
-    /// PRIVILEGE-FREE Windows spelling — a junction via `mklink /J`, mirrored by
-    /// a symlink on POSIX — so the link guard is really exercised on Windows
-    /// instead of silently skipped (`symlink_dir` needs Developer Mode; review
-    /// LOW-1, round 3). `false` when no spelling is available.
-    fn plant_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
-        #[cfg(windows)]
-        {
-            // `mklink /J` is a cmd BUILTIN and is unreliable when spawned
-            // through std::process::Command's argument quoting (it reported
-            // `Invalid switch - "link"` for a command line PowerShell ran
-            // happily). New-Item's Junction type is the API-level spelling and
-            // needs no elevation either.
-            let script = format!(
-                "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
-                link.display(),
-                target.display()
-            );
-            let junction = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
-                .output();
-            match junction {
-                Ok(out) if out.status.success() => return true,
-                // Say WHY: a silently skipped guard is how the dangling-leaf
-                // hole survived three review rounds (review LOW-1, round 3).
-                Ok(out) => eprintln!(
-                    "New-Item Junction failed ({}): {}{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stdout).trim(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                Err(e) => eprintln!("powershell could not run: {e}"),
-            }
-            // Developer Mode fallback: a real directory symlink.
-            std::os::windows::fs::symlink_dir(target, link).is_ok()
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = (target, link);
-            false
-        }
-    }
 }

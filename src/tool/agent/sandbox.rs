@@ -52,6 +52,16 @@
 //!   their own `execute` paths ARE wrapped, so the hook is the exception rather
 //!   than the rule.
 //!
+//! The creation ladder ([`Sandbox::validate_for_write`], used by `file_write` /
+//! `file_append`) added three bounded syscalls on 2027-01-15 (plan b4812291): a
+//! depth-bounded `symlink_metadata` walk
+//! ([`Sandbox::lexical_path_is_link_free`]) plus one `canonicalize` of the
+//! deepest existing ancestor on the creation path, one `metadata` per
+//! `.coding/**` protection check (the hardlink guard), and one final
+//! `symlink_metadata` on the resolved write target. All three are per-write and
+//! run inside the tools' existing `spawn_blocking` closure, so the async-runtime
+//! contract above is unchanged.
+//!
 //! Keeping `validate` sync preserves the clean `pub fn` API the tools + tests
 //! call directly; the heavy FS work (whole-file reads/writes, the search scan)
 //! is what gets offloaded, which is where H1's multi-agent scalability risk
@@ -197,6 +207,18 @@ impl Sandbox {
     ///   `git status` (2027-01-09 security review HIGH-1). Component
     ///   equality only: `.gitignore`/`.gitattributes` stay writable.
     ///
+    /// A `.coding/**` path is ALSO protected when it is a hardlink (link count
+    /// > 1, plan b4812291): canonicalize cannot see a hardlink — there is no
+    /// link to follow, the path IS the file — so `.coding/x.toml` hardlinked to
+    /// `.coding/safety.toml` would otherwise truncate the protected file's
+    /// shared inode through an innocent-looking name. The guard is fail-closed
+    /// (which file it shares its inode with does not change the refusal) and
+    /// scoped to `.coding/`, where the by-name protection lives; the mirror
+    /// image (a hardlink outside `.coding/` pointing at a protected file) is not
+    /// detectable here — it would need an inode walk of the protected trees.
+    /// Directories are exempt: their link count is structural (POSIX counts
+    /// subdirectories), not a sign of sharing.
+    ///
     /// The dedicated workflow tools (`create_plan`/`complete_step`/
     /// `update_plan`/`abandon_plan`) write `.coding/plans/` through their own
     /// paths and do **not** route through this check, so expanding the set here
@@ -263,6 +285,22 @@ impl Sandbox {
         // write into them is the same refusal).
         if !comps.first().is_some_and(|c| c == ".coding") {
             return false;
+        }
+        // HARDLINK GUARD (2027-01-15, plan b4812291): a hardlink inside
+        // `.coding/` shares its inode with the file it was linked from, and
+        // canonicalize cannot see it — there is no link to follow: the path IS
+        // the file. `.coding/x.toml` hardlinked to `.coding/safety.toml` is not
+        // protected by NAME, so without this check any plan kind could truncate
+        // the protected file's inode through the innocent-looking alias (review
+        // round-4 §Q5 item 1). Fail closed: a `.coding/**` file whose link count
+        // exceeds 1 is refused — WHICH protected file it shares its inode with
+        // does not change the answer. Scoped to `.coding/`, where the by-name
+        // protection lives: the mirror image (a hardlink OUTSIDE `.coding/`
+        // pointing at a protected file) cannot be seen here — it needs an inode
+        // walk of the protected trees, which this predicate deliberately does
+        // not do.
+        if link_count(&self.root.join(rel)).is_some_and(|n| n > 1) {
+            return true;
         }
         match comps.get(1).map(String::as_str) {
             // The memory DB + codegraph DB, each with its SQLite sidecar files,
@@ -372,19 +410,56 @@ impl Sandbox {
     /// 1. [`validate`](Self::validate) — canonicalize an existing path.
     /// 2. If that fails (file doesn't exist yet), fall back to
     ///    [`validate_for_creation`](Self::validate_for_creation) (lexical
-    ///    normalize + `starts_with(root)`).
+    ///    normalize + `starts_with(root)`) — but trust the lexical spelling
+    ///    ONLY when [`lexical_path_is_link_free`](Self::lexical_path_is_link_free)
+    ///    agrees: the OS follows a link at write time, so a grant inferred from
+    ///    the spelling must not survive one (2027-01-15, plan b4812291).
+    /// 2b. Re-run the protection check on the CANONICAL form of the deepest
+    ///    existing ancestor, so a spelling the lexical walk cannot see — a Win32
+    ///    8.3 alias like `.coding/KNOWLE~1/…` is not a symlink — cannot get a
+    ///    subtree planted inside a protected tree.
     /// 3. Check [`is_protected_write_target`](Self::is_protected_write_target)
     ///    — refuse BEFORE creating any dirs (a protected path must never be
     ///    touched, even to mkdir its parents).
     /// 4. Create parent dirs if they don't exist (so `file_append` can write to
     ///    a new nested path, matching `file_write`).
     /// 5. Revalidate (canonicalize now that the parent exists) so the returned
-    ///    path is fully canonical.
+    ///    path is fully canonical, re-run the protection check on THAT canonical
+    ///    result, and refuse a leaf that is itself a link (a dangling one comes
+    ///    back as its own path and the OS would follow it). The lexical fallback
+    ///    survives only for the "we just created the parent" case AND only when
+    ///    the path is still link-free at that point (a link planted after the
+    ///    step-2 gate is caught by that re-check); every other revalidation
+    ///    failure fails closed.
     pub fn validate_for_write(&self, path: &Path) -> Result<PathBuf> {
-        // Steps 1-2: validate, falling back to creation validation.
+        // Steps 1-2: validate, falling back to creation validation. The lexical
+        // spelling is trusted ONLY when no existing component is a link: the OS
+        // follows links at write time, so a path granted from its spelling must
+        // never survive one (the research carve-out's rule, now applied to the
+        // ladder itself — bypass 3, 2027-01-15, plan b4812291).
         let validated = match self.validate(path) {
             Ok(p) => p,
-            Err(_) => self.validate_for_creation(path)?,
+            Err(_) => {
+                let lexical = self.validate_for_creation(path)?;
+                if !self.lexical_path_is_link_free(&lexical) {
+                    return Err(Error::InvalidInput(format!(
+                        "refused: '{}' traverses a symbolic link or junction — name the \
+                         resolved path instead",
+                        path.display()
+                    )));
+                }
+                // Step 2b: the CANONICAL form of the deepest existing ancestor.
+                // A Win32 8.3 alias is not a symlink, so the walk above cannot
+                // see `.coding/KNOWLE~1/…` — and mkdir through it would plant a
+                // subtree inside the protected `.coding/knowledge/`. Refuse
+                // BEFORE create_dir_all so nothing is even planted (bypass 2).
+                if let Some(ancestor) = canonical_existing_ancestor(&lexical) {
+                    if self.is_protected_write_target(&ancestor) {
+                        return Err(protected_refusal(path));
+                    }
+                }
+                lexical
+            }
         };
         // Step 3: refuse protected targets BEFORE any filesystem mutation.
         if self.is_protected_write_target(&validated) {
@@ -392,18 +467,57 @@ impl Sandbox {
         }
         // Step 4: create parent dirs if missing (consistency — file_append now
         // creates parents like file_write).
+        let mut created_parent = false;
         if let Some(parent) = validated.parent() {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)?;
+                created_parent = true;
             }
         }
         // Step 5: revalidate so the returned path is fully canonical (the
         // parent now exists, so canonicalize resolves the full path).
         match self.validate(path) {
-            Ok(p) => Ok(p),
-            // If revalidation fails (shouldn't — we just created the parent),
-            // fall back to the creation-validated path.
-            Err(_) => Ok(validated),
+            Ok(canonical) => {
+                // The canonical result can differ from the spelling checked in
+                // step 3 — re-run the protection check on IT (bypass 2's stated
+                // fix direction: `KNOWLE~1` resolves to `knowledge`).
+                if self.is_protected_write_target(&canonical) {
+                    return Err(protected_refusal(path));
+                }
+                // The leaf must not be a link either: `validate` resolves an
+                // EXISTING link, but a DANGLING one comes back as its own path
+                // and the OS would follow it at write time — outside the root,
+                // or into a protected tree (the shape review round 3 named for
+                // the research route).
+                if std::fs::symlink_metadata(&canonical).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "refused: '{}' is a symbolic link — write to its target instead",
+                        path.display()
+                    )));
+                }
+                Ok(canonical)
+            }
+            // The lexical fallback is allowed ONLY when we just created the
+            // parent, and only after re-checking link-freedom: the step-2 gate ran
+            // BEFORE `create_dir_all`, so a link planted in the meantime — a
+            // concurrent writer; the app's own approval-gated `shell` residual can
+            // plant one on a timer — would have been created THROUGH and
+            // `validate` then fails on the escaping parent. Re-checking makes this
+            // arm fail closed in that race (review round 1, LOW 2); any other
+            // revalidation failure propagates the error instead of handing the OS
+            // a lexical path that resolves outside the sandbox (bypass 3).
+            Err(_) if created_parent => {
+                if !self.lexical_path_is_link_free(&validated) {
+                    return Err(Error::InvalidInput(format!(
+                        "refused: '{}' traverses a symbolic link or junction — name the \
+                         resolved path instead",
+                        path.display()
+                    )));
+                }
+                Ok(validated)
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -452,6 +566,178 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     out.iter().collect()
+}
+
+/// The link count (hardlink count) of `path`, or `None` when it does not exist,
+/// is not a regular file, or the platform cannot report it.
+///
+/// `std::fs::metadata` follows symlinks, which is what the hardlink guard in
+/// [`Sandbox::is_protected_write_target`] wants: the count belongs to the file
+/// the write would actually touch. Directories are excluded on purpose — their
+/// link count is structural (POSIX counts each subdirectory's `..` entry, so any
+/// directory with subdirectories reads as > 1), not a sign of inode sharing,
+/// and a hardlinked directory cannot be created in the first place. The
+/// exclusion matters because the guard is also run against a deepest-existing
+/// ANCESTOR, which is a directory by construction.
+fn link_count(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    platform_link_count(path, &meta)
+}
+
+/// The platform half of [`link_count`] for POSIX systems.
+#[cfg(unix)]
+fn platform_link_count(_path: &Path, meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.nlink())
+}
+
+/// The platform half of [`link_count`] for Windows.
+///
+/// `MetadataExt::number_of_links()` is still unstable (`windows_by_handle`,
+/// rust-lang/rust#63010), so the count comes straight from the Win32 API —
+/// `windows-sys` is already a dependency and `src/config/keys.rs` uses the same
+/// pattern for the `keys.toml` DACL.
+#[cfg(windows)]
+fn platform_link_count(path: &Path, _meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Desired access 0 queries attributes without reading data; sharing all
+    // three modes keeps the count readable while another handle holds the file.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe { CloseHandle(handle) };
+    (ok != 0).then(|| u64::from(info.nNumberOfLinks))
+}
+
+/// The platform half of [`link_count`] where neither POSIX nor Win32 APIs are
+/// available: there is no count to read, so the guard stays quiet.
+#[cfg(not(any(unix, windows)))]
+fn platform_link_count(_path: &Path, _meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Canonicalize the deepest ancestor of `path` that exists, or `None` when the
+/// chain is missing all the way up (or canonicalization fails).
+///
+/// [`Sandbox::validate_for_write`] uses this to re-run the protection check in
+/// CANONICAL form before it creates anything: a Win32 8.3 alias
+/// (`.coding/KNOWLE~1/…`) is not a symlink, so only the resolved name reveals
+/// that the write would land inside a protected tree (`knowledge`, `plans`,
+/// `reviews`) — and refusing there means the alias cannot even get a subtree
+/// planted (plan b4812291, bypass 2). A canonicalization failure skips the
+/// check rather than refusing: step 5 of the ladder re-derives the canonical
+/// path anyway, and it fails closed whenever it cannot — the one exception
+/// being a parent this call itself just created, which is re-checked for
+/// link-freedom before the lexical fallback is used.
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        if candidate.exists() {
+            return candidate.canonicalize().ok();
+        }
+        ancestor = candidate.parent();
+    }
+    None
+}
+
+/// Link fixtures shared by the escaping-link tests in this crate.
+///
+/// ONE canonical spelling of "plant a directory/file link, preferring the
+/// privilege-free Windows one" — previously duplicated in `agent::dispatch` and
+/// `agent::tests`. It lives here (test-only) so the sandbox tests, the file-tool
+/// tests and the dispatch-layer tests all exercise the SAME fixture: a fixture
+/// that silently gives up (no Developer Mode, no junction) is how the
+/// dangling-leaf hole survived three review rounds (review LOW-1, round 3), so
+/// every caller can see — and must say — when it could not plant the link.
+#[cfg(test)]
+pub(crate) mod link_fixture {
+    /// Create a FILE link (`target` → `link`) for the escaping-link test;
+    /// `false` where the platform or environment refuses.
+    pub(crate) fn plant_file_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    /// Plant a directory link at `link` pointing at `target`, preferring the
+    /// PRIVILEGE-FREE Windows spelling — a junction via `mklink /J`, mirrored by
+    /// a symlink on POSIX — so the link guard is really exercised on Windows
+    /// instead of silently skipped (`symlink_dir` needs Developer Mode; review
+    /// LOW-1, round 3). `false` when no spelling is available.
+    pub(crate) fn plant_dir_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            // `mklink /J` is a cmd BUILTIN and is unreliable when spawned
+            // through std::process::Command's argument quoting (it reported
+            // `Invalid switch - "link"` for a command line PowerShell ran
+            // happily). New-Item's Junction type is the API-level spelling and
+            // needs no elevation either.
+            let script = format!(
+                "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
+                link.display(),
+                target.display()
+            );
+            let junction = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+                .output();
+            match junction {
+                Ok(out) if out.status.success() => return true,
+                // Say WHY: a silently skipped guard is how the dangling-leaf
+                // hole survived three review rounds (review LOW-1, round 3).
+                Ok(out) => eprintln!(
+                    "New-Item Junction failed ({}): {}{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => eprintln!("powershell could not run: {e}"),
+            }
+            // Developer Mode fallback: a real directory symlink.
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1122,5 +1408,248 @@ mod tests {
                 "{rel} must stay writable"
             );
         }
+    }
+
+    #[test]
+    fn canonical_existing_ancestor_pins_the_alias_layer() {
+        // Step 2b is the layer that stops a Win32 8.3 alias from planting a
+        // subtree inside a protected tree BEFORE any mkdir — but an alias
+        // spelling cannot be built on a volume that generates none, so the LAYER
+        // is pinned here through its helper: the deepest existing ancestor is
+        // canonicalized (exactly the resolution an alias spelling relies on) and
+        // the protection check then refuses it. Without this, deleting step 2b
+        // would keep the suite green wherever the 8.3 test skips (round-1 review
+        // LOW 4; plan b4812291, bypass 2).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/analysis")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+
+        let protected = canonical_existing_ancestor(&dir.path().join(".coding/knowledge/deep/x.md"))
+            .expect("`.coding/knowledge` exists, so an ancestor resolves");
+        assert!(
+            sandbox.is_protected_write_target(&protected),
+            "the canonical ancestor of a to-be-created file inside knowledge is protected: {}",
+            protected.display()
+        );
+        assert!(
+            protected.ends_with("knowledge"),
+            "and it is the DEEPEST existing ancestor — refusing before create_dir_all depends on it: {}",
+            protected.display()
+        );
+
+        let artifact = canonical_existing_ancestor(&dir.path().join(".coding/analysis/deep/x.md"))
+            .expect("`.coding/analysis` exists, so an ancestor resolves");
+        assert!(
+            !sandbox.is_protected_write_target(&artifact),
+            "an artifact ancestor stays writable: {}",
+            artifact.display()
+        );
+    }
+
+    /// (2) Windows-only: a Win32 8.3 short-name alias of a protected directory
+    /// is not a symlink, so the per-component case/trailing-dot trim can never
+    /// see it — the refusal has to come from the canonical form of the path
+    /// (review round-4 §Q5 item 2, plan b4812291).
+    #[cfg(windows)]
+    #[test]
+    fn protected_win32_8dot3_alias_refused() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        let long = dir.path().join(".coding/knowledge");
+
+        // The OS's own 8.3 spelling for the directory. `knowledge` is longer
+        // than 8 characters, so an alias-enabled volume always shortens it.
+        let wide: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 512];
+        let written = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        };
+        if written == 0 || written as usize >= buf.len() {
+            eprintln!("SKIP: GetShortPathNameW did not resolve the alias fixture");
+            return;
+        }
+        buf.truncate(written as usize);
+        let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf));
+        let alias = short
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if alias.is_empty() || alias.eq_ignore_ascii_case("knowledge") {
+            eprintln!(
+                "SKIP: this volume generates no 8.3 alias for 'knowledge' \
+                 (8dot3name disabled) — the alias assertion is not exercised"
+            );
+            return;
+        }
+
+        let rel = format!(".coding/{alias}/new/x.md");
+        assert!(
+            dir.path().join(".coding").join(&alias).is_dir(),
+            "the alias fixture must resolve to the protected directory"
+        );
+        let result = sandbox.validate_for_write(Path::new(&rel));
+        assert!(
+            result.is_err(),
+            "the 8.3 spelling must be refused as protected: {rel}"
+        );
+        assert!(
+            !dir.path().join(".coding/knowledge/new").exists(),
+            "no subtree may be planted inside the protected tree"
+        );
+    }
+
+    #[test]
+    fn validate_for_write_fails_closed_on_out_of_root_link() {
+        // (3) A link inside `.coding/` pointing OUT of the root: `validate`
+        // refuses the canonical resolution, and the ladder's step-5 fallback
+        // used to hand the OS the lexical path — which resolves outside the
+        // sandbox (create_dir_all ran through the link too). Every spelling
+        // must fail closed, and nothing may be created outside. The dangling
+        // LEAF is the same family one step further: `validate` returns Ok for
+        // it, so the refusal has to come from the ladder's canonical branch
+        // (review LOW-1, round 3, named that shape for the research route).
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        if !link_fixture::plant_dir_link(&outside.path(), &dir.path().join(".coding/link")) {
+            eprintln!("SKIP: could not create a directory link out of the root");
+            return;
+        }
+
+        for rel in [".coding/link/x.md", ".coding/link/nested/x.md"] {
+            let result = sandbox.validate_for_write(Path::new(rel));
+            assert!(result.is_err(), "{rel} resolves outside the root — refused");
+        }
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "nothing may be created through the escaping link"
+        );
+
+        // The dangling LEAF: `validate` returns `Ok` for it (its parent+file-name
+        // fallback appends the raw leaf name), so the refusal has to come from
+        // the ladder's own leaf check. A file symlink needs Developer Mode on
+        // Windows, so a dangling DIRECTORY link (a privilege-free junction) is
+        // the fallback spelling — either one reaches the same branch, and when
+        // neither can be planted the skip is SAID, never silent (round-1 review
+        // LOW 3).
+        let (file_leaf, dir_leaf) = (".coding/dangling.md", ".coding/dangling");
+        let leaf = if link_fixture::plant_file_link(
+            &outside.path().join("missing.md"),
+            &dir.path().join(file_leaf),
+        ) {
+            Some(file_leaf)
+        } else if link_fixture::plant_dir_link(
+            &outside.path().join("missing-dir"),
+            &dir.path().join(dir_leaf),
+        ) {
+            Some(dir_leaf)
+        } else {
+            None
+        };
+        match leaf {
+            Some(leaf) => {
+                let result = sandbox.validate_for_write(Path::new(leaf));
+                assert!(
+                    result.is_err(),
+                    "a dangling link leaf must be refused too: {leaf}"
+                );
+                assert_eq!(
+                    std::fs::read_dir(outside.path()).unwrap().count(),
+                    0,
+                    "the dangling target must not be created"
+                );
+            }
+            None => eprintln!(
+                "SKIP: could not create a dangling link leaf (file symlink or junction) for the ladder fixture"
+            ),
+        }
+    }
+
+    #[test]
+    fn protected_hardlink_inside_coding_refused() {
+        // (1) A hardlink inside `.coding/` shares its inode with a protected
+        // file, and canonicalize cannot see it — there is no link to follow:
+        // the path IS the file. Without an inode check any plan kind could
+        // truncate the protected file through the innocent-looking alias name
+        // (review round-4 §Q5 item 1, plan b4812291).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/analysis")).unwrap();
+        std::fs::write(dir.path().join(".coding/safety.toml"), "[safety]\n").unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+
+        if std::fs::hard_link(
+            dir.path().join(".coding/safety.toml"),
+            dir.path().join(".coding/x.toml"),
+        )
+        .is_err()
+        {
+            eprintln!("SKIP: this volume cannot create a hardlink (no shared inode to test)");
+            return;
+        }
+
+        let validated = sandbox.validate(Path::new(".coding/x.toml")).unwrap();
+        assert!(
+            sandbox.is_protected_write_target(&validated),
+            "a hardlinked alias under .coding/ is a protected write target"
+        );
+        let result = sandbox.validate_for_write(Path::new(".coding/x.toml"));
+        assert!(result.is_err(), "the hardlink must not be writable");
+        assert!(format!("{}", result.unwrap_err()).contains("protected"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".coding/safety.toml")).unwrap(),
+            "[safety]\n",
+            "the shared inode stays untouched"
+        );
+
+        // A plain (link count 1) artifact under .coding/ still goes through:
+        // the refusal is about inode sharing, not about `.coding/` as such.
+        assert!(
+            sandbox
+                .validate_for_write(Path::new(".coding/analysis/notes.md"))
+                .is_ok(),
+            "ordinary artifacts stay writable"
+        );
+    }
+
+    #[test]
+    fn validate_for_write_refuses_in_root_link_into_protected_tree() {
+        // (2) The cross-platform twin of the Win32 8.3 alias: `.coding/link` is
+        // a real link to the protected `.coding/knowledge/`. The ladder's
+        // lexical branch trusted the spelling, ran create_dir_all THROUGH the
+        // link (planting a subtree inside the protected tree) and returned a
+        // path under `.coding/knowledge/`. The layer that refuses it is the
+        // step-2 link-free GATE — the canonical-ancestor check (2b) and the
+        // step-5 canonical re-check are the backstops for spellings the gate
+        // cannot see (a Win32 8.3 alias is not a link, so the gate passes it):
+        // `canonical_existing_ancestor_pins_the_alias_layer` pins the 2b helper
+        // contract cross-platform (review round-4 §Q5 item 2, plan b4812291;
+        // round-1 review LOW 4).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        if !link_fixture::plant_dir_link(
+            &dir.path().join(".coding/knowledge"),
+            &dir.path().join(".coding/link"),
+        ) {
+            eprintln!("SKIP: could not create a directory link into the protected tree");
+            return;
+        }
+
+        let result = sandbox.validate_for_write(Path::new(".coding/link/new/x.md"));
+        assert!(result.is_err(), "a write through the link must be refused");
+        assert!(
+            !dir.path().join(".coding/knowledge/new").exists(),
+            "no subtree may be planted inside the protected tree"
+        );
     }
 }

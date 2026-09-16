@@ -73,9 +73,10 @@ command.
   that.
 - Shell-based mutation is a last resort, permitted only for (a) paths the
   file tools refuse by design (`.coding/knowledge/**` — use `memory_amend`
-  for amendments) or (b) a verified file-tool freeze (repeated drift errors
-  on verified-identical text after a genuine fresh read). State the
-  justification when you fall back to it.
+  for amendments, or `memory_update`'s `find`/`replace_with` targeted repair
+  to fix stray text in a record body) or (b) a verified file-tool freeze
+  (repeated drift errors on verified-identical text after a genuine fresh
+  read). State the justification when you fall back to it.
 - `file_edit` batch mode (`edits`) applies several edits to one file
   atomically — one write, one combined diff; prefer it over N separate calls.
 

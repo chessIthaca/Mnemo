@@ -13,7 +13,10 @@ use crate::provider::{
 };
 use crate::runtime::{AgentEvent, PhaseKind};
 use crate::tool::agent::sandbox::Sandbox;
-use crate::tool::agent::{file_read::FileReadTool, file_write::FileWriteTool, git::GitTool};
+use crate::tool::agent::{
+    file_read::FileReadTool, file_write::FileWriteTool, git::GitTool,
+    sandbox::link_fixture::plant_dir_link,
+};
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::MemoryWriteTool;
 use crate::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
@@ -5498,38 +5501,7 @@ async fn dispatch_denies_research_write_through_an_escaping_link() {
     let outside = tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
     let link = dir.path().join(".coding/link");
-    #[cfg(unix)]
-    let linked = std::os::unix::fs::symlink(outside.path(), &link).is_ok();
-    #[cfg(windows)]
-    let linked = {
-        // `mklink /J` is a cmd builtin and mis-parses through Command's
-        // quoting; New-Item's Junction type is the API-level spelling and needs
-        // no elevation (a real symlink would need Developer Mode).
-        let script = format!(
-            "New-Item -ItemType Junction -Path '{}' -Target '{}' | Out-Null",
-            link.display(),
-            outside.path().display()
-        );
-        let junction = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
-            .output();
-        match junction {
-            Ok(out) if out.status.success() => true,
-            Ok(out) => {
-                eprintln!(
-                    "junction fixture unavailable ({}): {}{}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stdout).trim(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok()
-            }
-            Err(_) => std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok(),
-        }
-    };
-    #[cfg(not(any(unix, windows)))]
-    let linked = false;
-    if !linked {
+    if !plant_dir_link(outside.path(), &link) {
         eprintln!("SKIP: could not create a link for the escaping-link fixture");
         return;
     }

@@ -464,6 +464,39 @@ fn valid_floor_date(date: &str, ceiling: &str) -> bool {
 
 // ── File-backed writer ─────────────────────────────────────────────────────
 
+/// Apply a targeted, unambiguous repair to a record body (backlog 488248ce):
+/// the in-tool way to fix stray text in a knowledge record — the file tools
+/// refuse `.coding/knowledge/**` by design, and a full-body rewrite
+/// ([`KnowledgeStore::update`]) is transcription-risky for long records.
+///
+/// Refuses an empty `find`, a `find` that is absent, a `find` that occurs
+/// more than once (the repair must be unambiguous — widen the substring), and
+/// a replacement that would leave the body empty. Returns the repaired body.
+pub fn replace_unique(body: &str, find: &str, replace_with: &str) -> Result<String> {
+    if find.trim().is_empty() {
+        return Err(Error::Memory(
+            "replace: the find text is empty — pass the exact text to replace".into(),
+        ));
+    }
+    match body.matches(find).count() {
+        0 => Err(Error::Memory(format!(
+            "replace: the find text {find:?} is not present in the record body — nothing changed"
+        ))),
+        1 => {
+            let repaired = body.replacen(find, replace_with, 1);
+            if repaired.trim().is_empty() {
+                return Err(Error::Memory(
+                    "replace: refused — the replacement would empty the record body".into(),
+                ));
+            }
+            Ok(repaired)
+        }
+        n => Err(Error::Memory(format!(
+            "replace: the find text occurs {n} times — widen it to a unique substring"
+        ))),
+    }
+}
+
 /// Front matter rendered back to TOML for file rewrites. Only the fields
 /// that apply are emitted, in a stable order (title, supersedes, created,
 /// then status — the status default `live` is omitted since the parser
@@ -756,6 +789,160 @@ impl KnowledgeStore {
         Ok(rel_path.to_string())
     }
 
+    /// Repair stray text in a record body in place (backlog 488248ce): the
+    /// unique-substring rule of [`replace_unique`] is enforced, then the file
+    /// is rewritten with its front matter re-rendered exactly as
+    /// [`Self::update`] does. Returns the number of replacements (always 1).
+    ///
+    /// Body-only — `find` is matched against the record body, never the
+    /// machine-rendered front matter. Refuses unknown rel paths, non-records
+    /// and superseded records (history is never edited, as in [`Self::amend`]).
+    ///
+    /// Deliberately not behind [`Self::looks_like_row_digest`], the guard
+    /// [`Self::update`] consults: that guard stops a condensed row digest from
+    /// REPLACING a body, while a unique-substring replacement cannot do so
+    /// *silently* — the caller must spell out the exact text it removes (a
+    /// paraphrase matches nothing) — and a repair that SHRINKS a record
+    /// (collapsing a doubled amendment heading, the 2027-01-14 incident) would
+    /// otherwise be refused whenever the body ends in a `.coding/knowledge/…md`
+    /// pointer tail.
+    pub fn replace_in_body(&self, rel_path: &str, find: &str, replace_with: &str) -> Result<u64> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| Error::Memory("knowledge lock poisoned".into()))?;
+        let path = self.knowledge_dir.join(rel_path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Memory(format!("knowledge replace: {}: {e}", rel_path)))?;
+        let record = parse_file(rel_path, &text).ok_or_else(|| {
+            Error::Memory(format!(
+                "knowledge replace: {}: not a knowledge record",
+                rel_path
+            ))
+        })?;
+        if record.status == KnowledgeStatus::Superseded {
+            return Err(Error::Memory(format!(
+                "knowledge replace: {}: record is superseded — history is never edited",
+                rel_path
+            )));
+        }
+        let body = replace_unique(&record.body, find, replace_with)?;
+        let file = format!(
+            "{}\n{}\n",
+            render_front_matter(
+                &record.title,
+                record.status,
+                record.supersedes.as_deref(),
+                record.created.as_deref()
+            ),
+            body.trim_end()
+        );
+        std::fs::write(&path, file)
+            .map_err(|e| Error::Memory(format!("knowledge replace: {}: {e}", rel_path)))?;
+        Ok(1)
+    }
+
+    /// One stripping step for [`Self::strip_self_headings`]: the paragraph
+    /// with one leading amendment heading removed (every line kept), or
+    /// `None` when it does not open with a stamp-shaped heading.
+    fn leading_self_heading(paragraph: &str) -> Option<&str> {
+        let line = paragraph.lines().next()?;
+        let bytes = line.as_bytes();
+        let word_len = if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"amended") {
+            7
+        } else if bytes.len() >= 9 && bytes[..9].eq_ignore_ascii_case(b"amendment") {
+            9
+        } else {
+            return None;
+        };
+        // Word boundary — "amendedness"/"amendmental" are not the stamp word.
+        match line[word_len..].chars().next() {
+            Some(' ' | '\t' | '(' | ':') => {}
+            _ => return None,
+        }
+        // The head ends at the heading's colon — but a colon INSIDE a
+        // parenthesized attribution group ("(review L1: the message was
+        // wrong)") does not close it, and a heading may carry no colon at all
+        // (the text follows on the next line). So try every colon on the line,
+        // then the whole line itself, and strip at the first candidate whose
+        // head reads as a stamp. Since the line starts at offset 0, an index
+        // into it is also an index into the paragraph.
+        let candidates = line
+            .match_indices(':')
+            .map(|(i, _)| i)
+            .filter(|i| *i >= word_len)
+            .chain(std::iter::once(line.len()));
+        for colon in candidates {
+            let head = line[word_len..colon].trim();
+            if head.is_empty() || head.chars().count() > 120 || !Self::stamp_shaped(head) {
+                continue;
+            }
+            let remainder = if colon == line.len() {
+                // The whole line was the heading: the remainder starts on the
+                // next line, past its newline.
+                let rest = &paragraph[line.len()..];
+                rest.strip_prefix('\n').unwrap_or(rest)
+            } else {
+                &paragraph[colon + 1..]
+            };
+            return Some(remainder);
+        }
+        None
+    }
+
+    /// Whether `head` — the text between the `amended`/`amendment` word and the
+    /// heading's colon — reads as a self-supplied stamp rather than prose.
+    /// Stamp shapes: a parenthesized attribution group ("(plan 987fef4c)"), or
+    /// a leading four-digit year with a date-shaped tail ("2027-01-14",
+    /// "2027-01-14 (plan 987fef4c, backlog 56168c38)").
+    fn stamp_shaped(head: &str) -> bool {
+        if head.starts_with('(') {
+            return head.ends_with(')');
+        }
+        if head.len() < 4 || !head.as_bytes()[..4].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        // Anything between the year and a closing attribution group may only be
+        // the rest of the date (the group's own content is free-form).
+        let date_char =
+            |b: u8| b.is_ascii_digit() || matches!(b, b'-' | b'/' | b'.' | b':' | b',' | b' ');
+        let tail = head[4..].trim();
+        match tail.find('(') {
+            Some(open) => tail[open..].ends_with(')') && tail[..open].bytes().all(date_char),
+            None => tail.bytes().all(date_char),
+        }
+    }
+
+    /// Strip a leading self-supplied amendment heading from `paragraph` and
+    /// return the text plus the number of headings removed (backlog 488248ce).
+    ///
+    /// [`Self::amend`] prefixes its own dated `Amended <date>: ` heading, so a
+    /// caller-supplied one would double it — and its date could contradict the
+    /// stamp the tool wrote. A heading is recognized only on the FIRST LINE,
+    /// and only in stamp shapes: `amended`/`amendment` (any case, at a word
+    /// boundary) followed by a head of at most 120 chars that is either a
+    /// parenthesized group (`Amendment (plan 987fef4c): …`) or a leading
+    /// four-digit year with a date-shaped tail (`2027-01-14: …`,
+    /// `2027-01-14 (plan 987fef4c, backlog 56168c38): …`). The head ends at
+    /// the first colon yielding such a shape — a colon inside the group
+    /// (`(review L1: the message was wrong)`) cannot end it — and a first line
+    /// that is all heading with no colon at all is stripped likewise, its text
+    /// taken from the following line. Stripping repeats until the text no
+    /// longer opens with a heading, so `Amended A: Amended B: text` collapses
+    /// to `text`; every other line is preserved. Prose that merely opens with
+    /// the word is returned verbatim, and a heading with no text after it
+    /// strips to the empty string — the caller's emptiness check reports that
+    /// as nothing to amend.
+    pub fn strip_self_headings(paragraph: &str) -> (String, usize) {
+        let mut rest = paragraph.trim();
+        let mut stripped = 0;
+        while let Some(remainder) = Self::leading_self_heading(rest) {
+            rest = remainder.trim_start();
+            stripped += 1;
+        }
+        (rest.to_string(), stripped)
+    }
+
     /// Append a dated amendment paragraph to a record's body (plan be16ea36
     /// step 7): the sanctioned way to ADD information to a knowledge record
     /// without replacing it — `memory_amend`'s backing. Append-only: the
@@ -787,6 +974,18 @@ impl KnowledgeStore {
         if paragraph.is_empty() {
             return Err(Error::Memory(
                 "nothing to amend: the paragraph is empty".into(),
+            ));
+        }
+        // A caller-supplied amendment heading is stripped (backlog 488248ce):
+        // the stamp below is then the only heading, and its date is
+        // authoritative — a caller's own date can never contradict the line
+        // it heads.
+        let (paragraph, _) = Self::strip_self_headings(paragraph);
+        if paragraph.is_empty() {
+            return Err(Error::Memory(
+                "nothing to amend: the paragraph is only an 'Amended …' heading — pass the \
+                 amendment text itself (the tool stamps the heading)"
+                    .into(),
             ));
         }
         let body = format!(
@@ -1292,6 +1491,239 @@ mod tests {
         let succ = ks.supersede(&rel, "storage engine v2", "new body").unwrap();
         assert!(ks.amend(&rel, "x").is_err());
         ks.amend(&succ, "amend the successor").unwrap();
+    }
+
+    #[test]
+    fn amend_strips_self_supplied_heading_and_stamps_its_own_date() {
+        // Regression (backlog 488248ce / reviewer finding LOW 1 in
+        // .coding/reviews/2026-09-15-imperative-steering-phrasing-review.md):
+        // amend prefixes its own "Amended <date>: " stamp, so a paragraph that
+        // already opens with a heading produced "Amended 2027-01-11: Amended
+        // 2027-01-14: …" — a doubled heading whose dates disagree. The
+        // supplied heading is stripped and the tool's stamp stays
+        // authoritative: exactly ONE heading ever lands.
+        let (dir, ks) = make_store();
+        // Every stamped heading — "Amended" or "Amendment", any case.
+        let headings = |body: &str| {
+            let lower = body.to_lowercase();
+            lower.matches("amended").count() + lower.matches("amendment").count()
+        };
+        let amended = |paragraph: &str| {
+            let rel = ks
+                .write(
+                    MemoryRecordType::Decision,
+                    "storage engine",
+                    "the store is sqlite",
+                )
+                .unwrap();
+            ks.amend(&rel, paragraph).unwrap();
+            let text = read_file(&format!(".coding/knowledge/{rel}"), &dir);
+            parse_file(&rel, &text).unwrap().body
+        };
+
+        // The reported shape: a date-headed paragraph.
+        let body = amended("Amended 2027-01-14: the zero-file hint's wording changed");
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(
+            body.contains("Amended 2026-02-01: the zero-file hint's wording changed"),
+            "{body}"
+        );
+
+        // The parenthetical variant that hit the second record.
+        let body = amended(
+            "Amended 2027-01-14 (plan 987fef4c, backlog 56168c38 — notes): \
+             the nudge tails are imperatives",
+        );
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(
+            body.contains("Amended 2026-02-01: the nudge tails are imperatives"),
+            "{body}"
+        );
+
+        // Uppercase + review-attributed variant (a shape already on disk).
+        let body = amended("AMENDED 2027-01-11 (review L1, plan 9441d776): x");
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(body.contains("Amended 2026-02-01: x"), "{body}");
+
+        // "Amendment (…)" — the other named form.
+        let body = amended("Amendment (plan 987fef4c): y");
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(body.contains("Amended 2026-02-01: y"), "{body}");
+
+        // A colon inside the attribution group does not fool the strip (review
+        // LOW 1).
+        let body = amended(
+            "Amended 2027-01-14 (review L1: the message was wrong): the wording changed",
+        );
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(
+            body.contains("Amended 2026-02-01: the wording changed"),
+            "{body}"
+        );
+
+        // A doubled chain collapses to one heading in a single amend.
+        let body = amended("Amended 2027-01-11: Amended 2027-01-14: z");
+        assert_eq!(headings(&body), 1, "{body}");
+        assert!(body.contains("Amended 2026-02-01: z"), "{body}");
+
+        // Prose that merely OPENS with the word is not a heading — it must
+        // survive verbatim (no content swallowed by a greedy strip).
+        let prose = "Amended the readme and the changelog: both now mention the flag";
+        let body = amended(prose);
+        assert!(body.contains(prose), "prose must survive verbatim: {body}");
+        let prose = "Landed outcome (2027-01-14): the clamp is in place";
+        let body = amended(prose);
+        assert!(body.contains(prose), "prose must survive verbatim: {body}");
+
+        // A bare heading is not a paragraph — nothing left to amend.
+        let rel = ks
+            .write(MemoryRecordType::Decision, "bare heading", "body")
+            .unwrap();
+        assert!(ks.amend(&rel, "Amended 2027-01-14:").is_err());
+    }
+
+    #[test]
+    fn strip_self_headings_matches_stamp_shapes_only() {
+        let strip = KnowledgeStore::strip_self_headings;
+        assert_eq!(strip("Amended 2027-01-14: x"), ("x".to_string(), 1));
+        assert_eq!(
+            strip("Amended 2027-01-14 (plan 987fef4c, backlog 56168c38 — notes): x"),
+            ("x".to_string(), 1)
+        );
+        assert_eq!(
+            strip("AMENDED 2027-01-11 (review L1, plan 9441d776): x"),
+            ("x".to_string(), 1)
+        );
+        assert_eq!(strip("Amendment (plan 987fef4c): y"), ("y".to_string(), 1));
+        assert_eq!(strip("amended 2026-02-01: y"), ("y".to_string(), 1));
+        // A doubled chain collapses in one call.
+        assert_eq!(
+            strip("Amended 2027-01-11: Amended 2027-01-14: z"),
+            ("z".to_string(), 2)
+        );
+        // Lines after the heading survive; a bare heading strips to nothing.
+        assert_eq!(
+            strip("Amended 2027-01-14: first\n\nsecond"),
+            ("first\n\nsecond".to_string(), 1)
+        );
+        assert_eq!(
+            strip("Amended 2027-01-14:\nSecond line."),
+            ("Second line.".to_string(), 1)
+        );
+        assert_eq!(strip("Amended 2027-01-14:"), (String::new(), 1));
+        // An over-long head is prose, not a stamp.
+        let wide = format!("Amended 2027-01-14 ({}): x", "notes,".repeat(24));
+        assert_eq!(strip(&wide), (wide.clone(), 0));
+        // A colon INSIDE the attribution group does not end the head (review
+        // LOW 1): the strip still fires, and the group is never emitted as the
+        // paragraph's text.
+        assert_eq!(
+            strip("Amended 2027-01-14 (review L1: the message was wrong): the wording changed"),
+            ("the wording changed".to_string(), 1)
+        );
+        assert_eq!(
+            strip("Amendment (plan 987fef4c: the nudge fix): x"),
+            ("x".to_string(), 1)
+        );
+        // A heading line with no colon at all: the whole first line is the
+        // heading and the text follows on the next line.
+        assert_eq!(
+            strip("Amended 2027-01-14\n\nBody text"),
+            ("Body text".to_string(), 1)
+        );
+        assert_eq!(
+            strip("Amended 2027-01-14\nBody text"),
+            ("Body text".to_string(), 1)
+        );
+        assert_eq!(
+            strip("Amendment (plan 987fef4c)\nBody text"),
+            ("Body text".to_string(), 1)
+        );
+        assert_eq!(strip("Amended 2027-01-14"), (String::new(), 1));
+        // Not headings: prose that merely opens with the word, a longer word,
+        // a year inside a sentence, an unrelated parenthetical, or a prose line
+        // with interior colons — all must survive verbatim.
+        for prose in [
+            "Amended the readme and the changelog: both now mention the flag",
+            "Landed outcome (2027-01-14): the clamp is in place",
+            "Amendedness: not a stamp",
+            "Amended 2027 was the year the store moved: really",
+        ] {
+            assert_eq!(strip(prose), (prose.to_string(), 0), "{prose}");
+        }
+    }
+
+    #[test]
+    fn replace_unique_requires_exactly_one_match() {
+        let body = "alpha beta gamma";
+        assert_eq!(
+            replace_unique(body, "beta", "BETA").unwrap(),
+            "alpha BETA gamma"
+        );
+        // Absent, ambiguous, blank and body-emptying finds are all refused.
+        assert!(replace_unique(body, "delta", "x").is_err());
+        assert!(replace_unique("a a", "a", "b").is_err());
+        assert!(replace_unique(body, "   ", "x").is_err());
+        assert!(replace_unique("only", "only", "").is_err());
+        assert!(replace_unique(body, "alpha beta gamma", " ").is_err());
+        // A deletion (empty replacement) is a legitimate repair: this is the
+        // collapse the doubled-heading incident needed on disk.
+        let stray = "x\n\nAmended 2027-01-11: Amended 2027-01-14: y";
+        assert_eq!(
+            replace_unique(stray, "Amended 2027-01-14: ", "").unwrap(),
+            "x\n\nAmended 2027-01-11: y"
+        );
+    }
+
+    #[test]
+    fn replace_in_body_repairs_record_text_without_digest_guard_interference() {
+        let (dir, ks) = make_store();
+        let body = "the clamp lives here\n\nAmended 2026-01-01: Amended 2026-02-02: stale\n\n\
+                    full detail: .coding/knowledge/spec/2026-02-01-clamp.md";
+        let rel = ks.write(MemoryRecordType::Spec, "clamp", body).unwrap();
+        let path = format!(".coding/knowledge/{rel}");
+        let before = parse_file(&rel, &read_file(&path, &dir)).unwrap();
+
+        // The doubled heading collapses onto the one the tool stamped first.
+        assert_eq!(
+            ks.replace_in_body(&rel, "Amended 2026-02-02: ", "")
+                .unwrap(),
+            1
+        );
+        let after = parse_file(&rel, &read_file(&path, &dir)).unwrap();
+        assert!(
+            after.body.contains("Amended 2026-01-01: stale"),
+            "{}",
+            after.body
+        );
+        assert!(!after.body.contains("2026-02-02"), "{}", after.body);
+        assert!(after
+            .body
+            .ends_with(".coding/knowledge/spec/2026-02-01-clamp.md"));
+        assert!(after.body.contains("the clamp lives here"));
+        // Front matter survives intact: the repair is body-only.
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.created, before.created);
+        assert_eq!(after.supersedes, before.supersedes);
+        assert_eq!(after.record_type, before.record_type);
+
+        // This repair SHRINKS the body while it still ends in a pointer tail —
+        // exactly the shape update()'s row-digest guard refuses, which is why
+        // the repair path deliberately does not consult it.
+        assert!(ks
+            .update(
+                &rel,
+                None,
+                Some("see .coding/knowledge/spec/2026-02-01-clamp.md")
+            )
+            .is_err());
+
+        // Ambiguous, unknown-path and superseded targets are refused.
+        assert!(ks.replace_in_body(&rel, "e", "E").is_err());
+        assert!(ks.replace_in_body("spec/nope.md", "a", "b").is_err());
+        ks.supersede(&rel, "clamp v2", "see the successor").unwrap();
+        assert!(ks.replace_in_body(&rel, "Amended", "X").is_err());
     }
 
     #[test]

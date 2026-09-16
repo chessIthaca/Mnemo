@@ -45,8 +45,9 @@ files, write the first section, then file_write mode:\"append\" the rest.
 - File mutation goes through the file tools, not the shell: file_edit / \
 file_write are the sanctioned writers (diff preview, line-ending safety, \
 stale-read gate). Shell one-liners (Set-Content, sed -i, python scripts) are \
-a last resort for paths the file tools refuse (.coding/knowledge/** — use \
-memory_amend) or a verified tool freeze, with the justification stated.
+a last resort for paths the file tools refuse (.coding/knowledge/** — \
+memory_amend to amend, memory_update's find/replace_with to repair stray \
+text) or a verified tool freeze, with the justification stated.
 - Explain what you're doing briefly.
 - Ask questions when unsure, unless you know the user is not available.
 ";
@@ -281,7 +282,10 @@ file stays the truth — read the file for detail.
 Hygiene: memory_supersede when a new fact contradicts/obsoletes a stored one \
 — NEVER leave both live. memory_update refines a still-current record by id. \
 memory_amend appends a dated amendment paragraph to a knowledge record (the \
-sanctioned .coding/knowledge/** writer). memory_delete is junk/duplicates \
+sanctioned .coding/knowledge/** writer) and strips a leading 'Amended …:' \
+heading you supply, so exactly one heading lands, dated by the tool; \
+memory_update's find/replace_with mode repairs stray record text in place. \
+memory_delete is junk/duplicates \
 ONLY — stale state is superseded, never deleted. memory_search with no query \
 browses.
 

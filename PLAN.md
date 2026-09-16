@@ -289,9 +289,13 @@ vitest (frontend), `tsc --noEmit` clean.
   (`tool/workflow/skill.rs`). Enter/exit a skill overlay (tool allow-list +
   target state). Omitted when no skill registry is configured.
 - **Memory tools** — `memory_write`, `memory_search`, `memory_consolidate`
-  plus the hygiene tools (`memory_update`, `memory_amend` — appends a dated
-  amendment paragraph to a knowledge record's file, `memory_supersede`,
-  `memory_delete`), and the read-only git bridge (`git_log`, `git_show` in
+  plus the hygiene tools (`memory_update` — refines a record by id, or
+  carries the `find`/`replace_with` targeted-repair mode that fixes stray
+  text in a record body in place, `memory_amend` — appends a dated amendment
+  paragraph to a knowledge record's file, stripping any leading `Amended …:`
+  heading the caller supplies so exactly one heading lands, dated by the
+  tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
+  (`git_log`, `git_show` in
   `tool/agent/git_read.rs`). `memory_search` is the single read path — one
   tool replaced the six former per-purpose read tools (they differed only by
   a record-type constant, a tier, or the presence of a query); its

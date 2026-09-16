@@ -651,9 +651,18 @@ struct MemoryUpdateArgs {
     title: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// Targeted-repair mode (backlog 488248ce): the exact text to replace. It
+    /// must occur exactly once in the record body.
+    #[serde(default)]
+    find: Option<String>,
+    /// Targeted-repair mode: what `find` is replaced with (empty deletes it).
+    #[serde(default)]
+    replace_with: Option<String>,
 }
 
-/// The `memory_update` tool — refine an existing memory in place by id.
+/// The `memory_update` tool — refine an existing memory in place by id, or
+/// repair stray text in a record body via its `find` / `replace_with` mode
+/// (backlog 488248ce).
 pub struct MemoryUpdateTool {
     store: Arc<dyn MemoryStoreTrait>,
     /// The knowledge-file backing — `None` keeps the historical DB-only
@@ -666,6 +675,65 @@ impl MemoryUpdateTool {
         Self {
             store,
             knowledge: None,
+        }
+    }
+
+    /// `memory_update`'s targeted-repair mode (backlog 488248ce): a
+    /// knowledge-backed id rewrites the record FILE (the truth) + a targeted
+    /// reindex, so stray text is repairable in-tool while the file tools keep
+    /// refusing `.coding/knowledge/**`; a DB-only id repairs the stored
+    /// content directly.
+    async fn repair_by_id(&self, id: &str, find: &str, replace_with: &str) -> ToolResult {
+        let rel = match &self.knowledge {
+            Some(support) => support.knowledge_for_id(id).await.map(|kr| kr.rel),
+            None => None,
+        };
+        if let Some(rel) = rel {
+            let Some(support) = &self.knowledge else {
+                return ToolResult::error(format!(
+                    "knowledge record {id} exists but the file backing is not wired"
+                ));
+            };
+            if let Err(e) = support.knowledge.replace_in_body(&rel, find, replace_with) {
+                return ToolResult::error(format!("failed to repair knowledge record: {e}"));
+            }
+            return match support.reindex(&[rel.clone()]).await {
+                Ok(()) => ToolResult::success(format!(
+                    "Repaired knowledge record {id} — replaced 1 occurrence in \
+                     .coding/knowledge/{rel}; the memory row re-indexed"
+                ))
+                .with_data(json!({ "id": id, "knowledge": format!(".coding/knowledge/{rel}") })),
+                Err(e) => ToolResult::error(format!("failed to index knowledge record: {e}")),
+            };
+        }
+        let current = match self.store.get_memory(id).await {
+            Ok(Some(m)) => m.content,
+            Ok(None) => {
+                return ToolResult::error(format!(
+                    "no memory with id '{id}' — nothing was updated (find ids via \
+                     memory_list / memory_recall)"
+                ))
+            }
+            Err(e) => return ToolResult::error(format!("failed to read memory: {e}")),
+        };
+        let repaired = match knowledge::replace_unique(&current, find, replace_with) {
+            Ok(body) => body,
+            Err(e) => return ToolResult::error(format!("failed to repair memory: {e}")),
+        };
+        match self
+            .store
+            .update_memory(id, None, Some(repaired.as_str()))
+            .await
+        {
+            Ok(true) => ToolResult::success(format!(
+                "Repaired memory {id} — replaced 1 occurrence of the find text"
+            ))
+            .with_data(json!({ "id": id })),
+            Ok(false) => ToolResult::error(format!(
+                "no memory with id '{id}' — nothing was updated (find ids via \
+                 memory_list / memory_recall)"
+            )),
+            Err(e) => ToolResult::error(format!("failed to update memory: {e}")),
         }
     }
 
@@ -704,7 +772,11 @@ impl Tool for MemoryUpdateTool {
              correct or tighten a fact that is still CURRENT — when a memory is obsolete or \
              contradicted, supersede it instead (memory_supersede); never edit history. A \
              content change re-embeds; a title change re-classifies typed prefixes. Ids come \
-             from memory_recall / memory_list output.",
+             from memory_recall / memory_list output. Targeted repair: pass find + \
+             replace_with instead (alone, no title/content) to replace ONE occurrence of \
+             stray text in the record body — find must match exactly once (widen it if it \
+             repeats). That is the in-tool repair for .coding/knowledge/** text, which the \
+             file tools refuse by design.",
             json!({
                 "type": "object",
                 "properties": {
@@ -713,7 +785,13 @@ impl Tool for MemoryUpdateTool {
                     "content": {"type": "string", "description": "Optional new content — re-embeds the memory. For \
                      knowledge-backed records this replaces the truth file's FULL body: pass the complete corrected \
                      body (or full body + a dated amendment paragraph); digest-shaped content (shorter + a \
-                     knowledge-path pointer tail) is refused."}
+                     knowledge-path pointer tail) is refused."},
+                    "find": {"type": "string", "description": "Targeted repair: the exact text to \
+                     replace — it must occur EXACTLY ONCE in the record body (front matter is never \
+                     matched). Pass with replace_with, and nothing else."},
+                    "replace_with": {"type": "string", "description": "Targeted repair: what find is \
+                     replaced with; an empty string deletes it. The result must not leave the body \
+                     empty."}
                 },
                 "required": ["id"]
             }),
@@ -731,17 +809,41 @@ impl Tool for MemoryUpdateTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
         };
-        if args.title.is_none() && args.content.is_none() {
-            return ToolResult::error("nothing to update: pass title and/or content");
+        let repair = match (&args.find, &args.replace_with) {
+            (Some(find), Some(replace_with)) => Some((find.as_str(), replace_with.as_str())),
+            (None, None) => None,
+            _ => {
+                return ToolResult::error(
+                    "pass find and replace_with together — find says what to replace, \
+                     replace_with says what to put there (an empty replace_with deletes it)",
+                )
+            }
+        };
+        if repair.is_some() && (args.title.is_some() || args.content.is_some()) {
+            return ToolResult::error(
+                "find/replace_with is a targeted repair — pass it alone, with no title or \
+                 content: one call, one intent",
+            );
+        }
+        if repair.is_none() && args.title.is_none() && args.content.is_none() {
+            return ToolResult::error(
+                "nothing to update: pass title and/or content, or find + replace_with",
+            );
         }
         let changed: Vec<&str> = [
             args.title.as_ref().map(|_| "title"),
             args.content.as_ref().map(|_| "content"),
+            repair.map(|_| "find + replace_with"),
         ]
         .into_iter()
         .flatten()
         .collect();
         let id = args.id;
+        // Targeted repair (backlog 488248ce): knowledge-backed ids rewrite the
+        // file (the truth), DB-only ids the stored content.
+        if let Some((find, replace_with)) = repair {
+            return self.repair_by_id(&id, find, replace_with).await;
+        }
         // Knowledge-backed update: the id is the deterministic row id of a
         // knowledge record — edit the FILE (the truth) + targeted reindex.
         let rel = match &self.knowledge {
@@ -805,7 +907,10 @@ struct MemoryAmendArgs {
 /// ADDING information to `.coding/knowledge/**` records. Append-only — the
 /// existing body is preserved verbatim, so the row-digest guard can never
 /// fire. Requires the knowledge-file backing (registered only when it is
-/// wired); refuses unknown ids and superseded records.
+/// wired); refuses unknown ids and superseded records. A leading
+/// self-supplied heading ("Amended …:" / "Amendment (…):") inside the
+/// paragraph is stripped before the tool's own dated stamp (backlog 488248ce),
+/// so exactly one heading ever lands and the tool's date is authoritative.
 pub struct MemoryAmendTool {
     support: KnowledgeSupport,
 }
@@ -844,14 +949,18 @@ impl Tool for MemoryAmendTool {
             "Append a dated amendment paragraph to a knowledge record's file \
              (.coding/knowledge/**) by id — the sanctioned way to ADD information to a \
              knowledge-backed memory without replacing it. Append-only: the existing body \
-             is preserved verbatim, so the digest guard can never fire. For corrections \
-             or contradictions use memory_update (full body) or memory_supersede \
-             (successor) instead. Refuses unknown ids and superseded records.",
+             is preserved verbatim, so the digest guard can never fire. A leading \
+             'Amended …:' / 'Amendment (…):' heading inside the paragraph is stripped before \
+             the tool's own dated stamp — exactly one heading ever lands, dated by the tool \
+             (a date you supply is dropped). For corrections or contradictions use \
+             memory_update (full body, or its find/replace_with repair mode) or \
+             memory_supersede (successor) instead. Refuses unknown ids and superseded \
+             records.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": {"type": "string", "description": "The memory id to amend (from recall/list output)."},
-                    "paragraph": {"type": "string", "description": "The amendment paragraph — appended to the record's file body with today's date."}
+                    "paragraph": {"type": "string", "description": "The amendment paragraph — appended to the record's file body under the tool's own dated 'Amended <date>:' heading. A leading heading you supply is stripped; the tool's date is authoritative."}
                 },
                 "required": ["id", "paragraph"]
             }),
@@ -883,11 +992,23 @@ impl Tool for MemoryAmendTool {
                 ))
             }
         };
+        // A self-supplied "Amended …" heading inside the paragraph is stripped
+        // by the store (backlog 488248ce) — say so, so the caller knows the
+        // text it wrote is not byte-for-byte what landed.
+        let (_, stripped) = KnowledgeStore::strip_self_headings(&args.paragraph);
+        let note = if stripped > 0 {
+            format!(
+                "; NOTE: stripped {stripped} self-supplied amendment heading(s) ('Amended …' / \
+                 'Amendment (…)') from the paragraph — the tool stamps its own date"
+            )
+        } else {
+            String::new()
+        };
         match self.support.knowledge.amend(&record.rel, &args.paragraph) {
             Ok(_) => match self.support.reindex(&[record.rel.clone()]).await {
                 Ok(()) => ToolResult::success(format!(
                     "Amended [{}] '{}' (id {id}) — dated paragraph appended to \
-                     .coding/knowledge/{}; the memory row re-indexed",
+                     .coding/knowledge/{}; the memory row re-indexed{note}",
                     record.tier.as_str(),
                     record.title,
                     record.rel
@@ -1691,6 +1812,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_targeted_replace_repairs_a_knowledge_record() {
+        // Regression (backlog 488248ce): the in-tool repair path. The file
+        // tools refuse .coding/knowledge/** by design, so memory_update must
+        // fix stray text — here a doubled amendment heading — in place, with
+        // no full-body rewrite (transcription-risky on long records, and the
+        // row-digest guard refuses the shrink).
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, update, _supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: storage",
+                "content": "the store is sqlite\n\nAmended 2027-01-11: Amended 2027-01-14: stale\n\nfull detail: .coding/knowledge/spec/2027-01-11-spec-storage.md",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.expect("structured data");
+        let id = data["id"].as_str().unwrap().to_string();
+        let rel = data["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+
+        let result = update
+            .execute(json!({
+                "id": id,
+                "find": "Amended 2027-01-14: ",
+                "replace_with": "",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Repaired knowledge record"),
+            "{}",
+            result.output
+        );
+
+        // The FILE (the truth) collapsed the doubled heading; the rest stayed
+        // — including the pointer tail the shrink left in place.
+        let text =
+            std::fs::read_to_string(dir.path().join(".coding/knowledge").join(&rel)).unwrap();
+        assert!(text.contains("Amended 2027-01-11: stale"), "{text}");
+        assert!(!text.contains("Amended 2027-01-14:"), "{text}");
+        assert!(text.contains("the store is sqlite"), "{text}");
+        assert!(
+            text.contains("full detail: .coding/knowledge/spec/2027-01-11-spec-storage.md"),
+            "{text}"
+        );
+
+        // The derived row re-indexed from the repaired file (its content is a
+        // first-line digest by design — assert the pointer, as amend's test
+        // does).
+        let row = store
+            .get_memory(&id)
+            .await
+            .unwrap()
+            .expect("repaired row exists");
+        assert_eq!(
+            row.data.get("rel_path").and_then(|v| v.as_str()),
+            Some(rel.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn update_targeted_replace_argument_rules() {
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, update, _supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: storage",
+                "content": "the store is sqlite and sqlite is fast",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let id = result.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        // find without replace_with, and replace_with without find.
+        for args in [
+            json!({"id": id, "find": "sqlite"}),
+            json!({"id": id, "replace_with": "postgres"}),
+        ] {
+            let result = update.execute(args).await;
+            assert!(!result.success);
+            assert!(
+                result.output.contains("pass find and replace_with together"),
+                "{}",
+                result.output
+            );
+        }
+        // A targeted repair is one call, one intent — no title/content.
+        let result = update
+            .execute(json!({
+                "id": id,
+                "title": "SPEC: x",
+                "find": "sqlite",
+                "replace_with": "postgres",
+            }))
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("pass it alone"), "{}", result.output);
+        // Nothing at all still errors.
+        let result = update.execute(json!({"id": id})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("nothing to update"),
+            "{}",
+            result.output
+        );
+        // An ambiguous find names the count and changes nothing.
+        let result = update
+            .execute(json!({"id": id, "find": "sqlite", "replace_with": "postgres"}))
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("occurs 2 times"),
+            "{}",
+            result.output
+        );
+        // An absent find says so.
+        let result = update
+            .execute(json!({"id": id, "find": "mysql", "replace_with": "postgres"}))
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("not present"), "{}", result.output);
+        // Unknown id (no knowledge record, no DB row).
+        let result = update
+            .execute(json!({"id": "nope", "find": "a", "replace_with": "b"}))
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("no memory with id 'nope'"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn update_targeted_replace_works_on_db_only_records() {
+        let store = make_store();
+        let write = MemoryWriteTool::new(store.clone());
+        let update = MemoryUpdateTool::new(store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "auth fact",
+                "content": "we use jose for JWT",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let id = result.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        // The same repair mode against a row with no file backing.
+        let result = update
+            .execute(json!({"id": id, "find": "jose", "replace_with": "jsonwebtoken"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Repaired memory"),
+            "{}",
+            result.output
+        );
+        let m = store.get_memory(&id).await.unwrap().unwrap();
+        assert_eq!(m.content, "we use jsonwebtoken for JWT");
+
+        // A repair that would empty the body is refused — nothing is written.
+        let result = update
+            .execute(json!({
+                "id": id,
+                "find": "we use jsonwebtoken for JWT",
+                "replace_with": "",
+            }))
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("would empty the record body"),
+            "{}",
+            result.output
+        );
+        let m = store.get_memory(&id).await.unwrap().unwrap();
+        assert_eq!(m.content, "we use jsonwebtoken for JWT");
+    }
+
+    #[tokio::test]
     async fn db_only_typed_write_accepts_long_content() {
         // With the hard budget reject removed, a DB-only (no knowledge backing)
         // typed write accepts unbounded content — the file is the truth, and
@@ -2155,6 +2466,65 @@ mod tests {
         assert_eq!(
             row.data.get("rel_path").and_then(|v| v.as_str()),
             Some(rel.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn amend_result_reports_a_stripped_self_heading() {
+        // Backlog 488248ce: the store strips a self-supplied heading, and the
+        // result says so — a silent strip would be a silent content change
+        // (the caller's date is dropped for the tool's stamp).
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (knowledge, write, _update, _supersede, _delete) =
+            make_knowledge_tools(&dir, store.clone());
+        let plans_dir = dir.path().join(".coding/plans");
+        let amend = MemoryAmendTool::new(store.clone(), knowledge, &plans_dir);
+
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: steering",
+                "content": "the store is sqlite",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let id = result.data.unwrap()["id"].as_str().unwrap().to_string();
+
+        let result = amend
+            .execute(json!({
+                "id": id,
+                "paragraph": "Amended 2027-01-14: the tails are imperatives",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("NOTE: stripped 1 self-supplied"),
+            "{}",
+            result.output
+        );
+        // Exactly one heading landed, and the caller's date is gone (the tool
+        // stamps its own — asserted date-independently).
+        let rel = result.data.unwrap()["knowledge"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches(".coding/knowledge/")
+            .to_string();
+        let text =
+            std::fs::read_to_string(dir.path().join(".coding/knowledge").join(&rel)).unwrap();
+        assert_eq!(text.matches("Amended ").count(), 1, "{text}");
+        assert!(text.contains(": the tails are imperatives"), "{text}");
+        assert!(!text.contains("Amended 2027-01-14"), "{text}");
+
+        // A plain paragraph reports no strip.
+        let result = amend
+            .execute(json!({"id": id, "paragraph": "a plain paragraph"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("NOTE: stripped"),
+            "{}",
+            result.output
         );
     }
 

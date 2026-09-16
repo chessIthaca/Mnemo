@@ -1,0 +1,18 @@
++++
+title = "Sandbox write protection — hardlink / 8.3-alias / ladder-fail-closed rules (plan b4812291, commit 78d8329, wt/mnemo unmerged)"
+created = "2027-01-11"
++++
+
+Plan b4812291, commit 78d8329 on branch wt/mnemo (NOT yet merged into main). Three new refusal rules in the Sandbox write path, all in src/tool/agent/sandbox.rs, with docs in PLAN.md:132-141 / PLAN.md:445-455 / docs/FEATURES.md:22 and these memories' reviews.
+
+RULES
+1. Hardlink — `is_protected_write_target` refuses any `.coding/**` FILE whose link count > 1 (fail-closed; it does not matter which file shares the inode). `link_count` = std::fs::metadata (follows links) + an `is_file()` gate + a cfg-split platform half: unix `MetadataExt::nlink()`; windows `CreateFileW(access 0, all three share modes)` → `GetFileInformationByHandle().nNumberOfLinks` → `CloseHandle` — because `std::os::windows::fs::MetadataExt::number_of_links()` is still UNSTABLE (windows_by_handle, rust-lang/rust#63010). Residual (documented): a hardlink OUTSIDE `.coding/` pointing at a protected file is NOT detected; it would need an inode walk of the protected trees.
+2. Win32 8.3 alias — `validate_for_write` canonicalizes the deepest EXISTING ancestor (`canonical_existing_ancestor`, walking up from `path.parent()` so a file is never its own ancestor) and refuses when `is_protected_write_target` fires on it, BEFORE create_dir_all. This is the layer that stops `.coding/KNOWLE~1/new/x.md` (the real alias this volume generates for `knowledge`; the alias is not a symlink, so a component walk cannot see it). Step 5 re-runs the protection check on its canonical result as a backstop.
+3. Ladder fail-closed — the step-2 lexical branch requires `lexical_path_is_link_free` (refuses escaping links AND dangling components before create_dir_all); step 5's `Ok(canonical)` refuses a leaf that is itself a symlink (the dangling-leaf shape: `validate` returns Ok for it via its parent+file-name fallback); and the lexical fallback survives ONLY for `Err(_) if created_parent` AND a re-run of `lexical_path_is_link_free` on the returned path — any other revalidation failure propagates (the old `Err(_) => Ok(validated)` was the escape).
+
+INVARIANTS TO PRESERVE
+- `is_protected_write_target` must stay the single choke point: file_edit, convert_line_endings, the src-tauri IPC mirror (write_sandboxed) and both approval previews inherit the hardlink guard through `refuse_if_protected` — do not add a second, divergent predicate.
+- `link_count`'s `is_file()` exemption is LOAD-BEARING, not cosmetic: a POSIX directory's nlink is structural (2 + subdirectories), and the guard is also run against the deepest-existing ANCESTOR, which is a directory by construction — removing the exemption would refuse every legitimate `.coding/analysis/**` creation on macOS. A build on macOS is the regression check for it.
+- `validate_for_write`'s ONLY lexical return path is the re-checked created-parent case (src/tool/agent/sandbox.rs, step 5). Any new `Ok(lexical)` arm re-opens bypass 3.
+
+TESTS (all fail pre-fix; the pre-fix outcomes were recorded): protected_hardlink_inside_coding_refused, validate_for_write_refuses_in_root_link_into_protected_tree, validate_for_write_fails_closed_on_out_of_root_link (dangling leaf via a file symlink or a privilege-free dangling junction), protected_win32_8dot3_alias_refused (#[cfg(windows)], GetShortPathNameW, visible SKIP where the volume generates no alias), file_write_through_out_of_root_link_is_denied, canonical_existing_ancestor_pins_the_alias_layer (cross-platform pin for rule 2). Fixtures: one shared `#[cfg(test)] pub(crate) mod link_fixture` in sandbox.rs (dispatch.rs + agent/tests.rs repointed).

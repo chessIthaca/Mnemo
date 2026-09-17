@@ -62,7 +62,7 @@ describe("argPaths", () => {
     expect(argPaths('{"path":"sub/report.md"}', "write_review_report")).toEqual(["sub/report.md"]);
   });
 
-  it("returns [] for label-only tools (shell purpose, git subcommand, git_read op, search pattern, spawn name)", () => {
+  it("returns [] for label-only tools (shell purpose, git subcommand, git_read op, search pattern, spawn name, skill name)", () => {
     expect(argPaths('{"purpose":"running tests"}', "shell")).toEqual([]);
     expect(argPaths('{"subcommand":"status"}', "git")).toEqual([]);
     // git_read's path is a log/diff FILTER, not an openable file — the op
@@ -70,6 +70,15 @@ describe("argPaths", () => {
     expect(argPaths('{"op":"log","path":"src/lib"}', "git_read")).toEqual([]);
     expect(argPaths('{"pattern":"WorkflowState","glob":"**/*.rs"}', "search")).toEqual([]);
     expect(argPaths('{"name":"reviewer"}', "spawn_agent")).toEqual([]);
+    // Skill tools: skill_start's `skill` and skill_create's `name` are skill
+    // names (file stems under .coding/skills/), never files to open.
+    expect(argPaths('{"skill":"merge_to_main"}', "skill_start")).toEqual([]);
+    expect(
+      argPaths(
+        '{"name":"deploy_checklist","tools":["git"],"prompt":"Run the deploy checklist"}',
+        "skill_create",
+      ),
+    ).toEqual([]);
   });
 
   it("returns [] for malformed JSON or no path field", () => {
@@ -102,6 +111,14 @@ describe("argPaths", () => {
     // must still win (regression: the salvage ran before the toolName check).
     expect(argPaths('{"op":"log","path":"src/lib.rs","limit":20', "git_read")).toEqual([]);
     expect(argPaths('{"purpose":"run tests","path":"x.rs"', "shell")).toEqual([]);
+    // A skill_create fragment carrying a COMPLETE path literal must not
+    // salvage one either: `name`/`prompt` are label data, not files.
+    expect(
+      argPaths(
+        '{"name":"deploy_checklist","prompt":"see .coding/plans/x.md","path":"x.rs"',
+        "skill_create",
+      ),
+    ).toEqual([]);
   });
 
   it("still returns [] when truncated args contain no path/file literal", () => {
@@ -1063,6 +1080,15 @@ describe("argLabel — remaining branches", () => {
   it("skill_start: shows the skill name", () => {
     expect(argLabel('{"skill":"merge_to_main"}', "skill_start")).toBe("merge_to_main");
     expect(argLabel('{"prompt":"x"}', "skill_start")).toBeNull();
+  });
+
+  it("skill_create: shows the skill being authored", () => {
+    expect(argLabel('{"name":"deploy_checklist"}', "skill_create")).toBe("deploy_checklist");
+    expect(argLabel('{"name":"  deploy_checklist  "}', "skill_create")).toBe("deploy_checklist");
+    expect(argLabel('{"prompt":"x"}', "skill_create")).toBeNull();
+    expect(argLabel("{bad json", "skill_create")).toBeNull();
+    // skill_reload takes no arguments — its card stays bare by design.
+    expect(argLabel("{}", "skill_reload")).toBeNull();
   });
 
   it("search / search_read: quoted pattern, optional glob", () => {

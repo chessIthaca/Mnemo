@@ -13,12 +13,15 @@
 //! `abandon_skill` (→ the pre-skill state).
 //!
 //! Skills are defined as TOML files in `.coding/skills/<name>.toml` and loaded
-//! at startup into a [`SkillRegistry`]. Adding a skill is dropping a file — no
-//! recompile. Normal security controls (the approval gate, per safety mode)
-//! apply to every tool call inside a skill exactly as outside it.
+//! into a [`SkillLibrary`] — the skills dir plus the LIVE registry. Adding a
+//! skill is dropping a file (or authoring one with the `skill_create` tool)
+//! and calling `skill_reload`: no recompile, no app restart. Normal security
+//! controls (the approval gate, per safety mode) apply to every tool call
+//! inside a skill exactly as outside it.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +154,123 @@ impl SkillRegistry {
     }
 }
 
+/// What a [`SkillLibrary::reload`] found on disk.
+///
+/// The name lists are SORTED, so the report — the `skill_reload` tool result
+/// the agent reads, and the tests — is deterministic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReloadReport {
+    /// How many skills the registry holds after the reload.
+    pub total: usize,
+    /// Names the reload ADDED (on disk, absent from the registry).
+    pub added: Vec<String>,
+    /// Names the reload REMOVED (in the registry, gone from disk — including
+    /// files that stopped parsing or lost a lifecycle `target_state`).
+    pub removed: Vec<String>,
+    /// Every loaded skill name, sorted.
+    pub names: Vec<String>,
+}
+
+/// A loaded skill library: the skills directory plus the LIVE registry.
+///
+/// The registry sits behind an [`RwLock`] so it can be swapped while every
+/// reader keeps working — the `skill_start` tool, the UI's `enter_skill`
+/// path, and the `skill_reload` / `skill_create` tools all read through
+/// [`read`](Self::read). Without this the registry was loaded once at startup
+/// into an immutable `Arc<SkillRegistry>`, so a skill file created or edited
+/// mid-session stayed invisible until the app was restarted.
+///
+/// `dir` is the tree the registry was loaded from (`.coding/skills/` for the
+/// main installation). `skill_create` writes there and [`reload`](Self::reload)
+/// re-reads it, so authoring and loading can never disagree about where a
+/// skill lives.
+#[derive(Debug)]
+pub struct SkillLibrary {
+    dir: PathBuf,
+    registry: RwLock<SkillRegistry>,
+}
+
+impl SkillLibrary {
+    /// Load `dir` into a new library. A missing directory yields an empty
+    /// registry (no skills available) — not an error.
+    pub fn load(dir: PathBuf) -> Self {
+        Self {
+            registry: RwLock::new(SkillRegistry::load_dir(&dir)),
+            dir,
+        }
+    }
+
+    /// The skills directory this library was loaded from (`.coding/skills/`).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Run `f` against the loaded registry under a read lock.
+    ///
+    /// The guard never escapes the closure, so a caller cannot hold it across
+    /// an `.await` (a `std` guard held over a suspension point deadlocks
+    /// against a writer). A POISONED lock is recovered rather than panicking:
+    /// the registry is plain data, so the worst case is a stale-but-valid
+    /// snapshot.
+    pub fn read<R>(&self, f: impl FnOnce(&SkillRegistry) -> R) -> R {
+        let guard = self.registry.read().unwrap_or_else(|e| e.into_inner());
+        f(&guard)
+    }
+
+    /// Re-read the skills directory into the live registry, replacing its
+    /// contents, and report what changed.
+    ///
+    /// The fresh registry is built BEFORE the write lock is taken (a slow disk
+    /// never blocks readers) and the swap is a single assignment — a reader
+    /// sees the old registry or the new one, never a half-loaded mix. Files
+    /// that fail to parse, or that carry a non-lifecycle `target_state`, are
+    /// logged and skipped by [`SkillRegistry::load_dir`]; a skill lost that way
+    /// lands in `removed` rather than `names`.
+    pub fn reload(&self) -> SkillReloadReport {
+        let fresh = SkillRegistry::load_dir(&self.dir);
+        let mut guard = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        let mut added: Vec<String> = fresh
+            .iter()
+            .filter(|s| guard.get(&s.name).is_none())
+            .map(|s| s.name.clone())
+            .collect();
+        let mut removed: Vec<String> = guard
+            .iter()
+            .filter(|s| fresh.get(&s.name).is_none())
+            .map(|s| s.name.clone())
+            .collect();
+        let mut names: Vec<String> = fresh.iter().map(|s| s.name.clone()).collect();
+        let total = names.len();
+        added.sort();
+        removed.sort();
+        names.sort();
+        *guard = fresh;
+        SkillReloadReport {
+            total,
+            added,
+            removed,
+            names,
+        }
+    }
+
+    /// Insert (or replace) one spec in the live registry — the hot-add path
+    /// `skill_create` uses, so a freshly authored skill is startable without a
+    /// full reload.
+    pub fn insert(&self, spec: SkillSpec) {
+        let mut guard = self.registry.write().unwrap_or_else(|e| e.into_inner());
+        guard.skills.insert(spec.name.clone(), spec);
+    }
+
+    /// Build a library around an in-memory registry (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_registry(dir: PathBuf, registry: SkillRegistry) -> Self {
+        Self {
+            dir,
+            registry: RwLock::new(registry),
+        }
+    }
+}
+
 /// The skills shipped with the app, compiled into the binary as
 /// `(name, toml_text)` pairs via `include_str!`. [`crate::project::Project::init`]
 /// seeds each into a project's `.coding/skills/` directory (write-if-missing),
@@ -165,6 +285,18 @@ pub const SHIPPED_SKILLS: &[(&str, &str)] = &[(
     "merge_to_main",
     include_str!("../../.coding/skills/merge_to_main.toml"),
 )];
+
+/// Is `name` one of the skills shipped with the app ([`SHIPPED_SKILLS`])?
+///
+/// `skill_create` refuses these names. A shipped file is the source of truth
+/// for its procedure (e.g. `merge_to_main`), it is re-seeded only while the
+/// file is MISSING, and `skill_create` is AutoRun — so an overwrite would
+/// silently and permanently replace one with no approval prompt. Editing a
+/// shipped skill stays possible through the approval-gated file tools, which is
+/// the deliberate path (review LOW 2, 2027-01-16).
+pub fn is_shipped_skill(name: &str) -> bool {
+    SHIPPED_SKILLS.iter().any(|(n, _)| *n == name)
+}
 
 /// Seed the [`SHIPPED_SKILLS`] into `skills_dir` (a project's
 /// `.coding/skills/`): the directory is created when missing and each shipped
@@ -399,5 +531,115 @@ prompt = "Merge."
             SHIPPED_SKILLS.iter().any(|(n, _)| *n == "merge_to_main"),
             "merge_to_main must be embedded in SHIPPED_SKILLS"
         );
+    }
+
+    /// A one-skill TOML body for the library tests (`prompt` is the dial that
+    /// proves a reload picked up EDITED content, not just a file count).
+    fn skill_toml(name: &str, prompt: &str) -> String {
+        format!(
+            "name = \"{name}\"\navailable_in = [\"complete\"]\ntarget_state = \"planning\"\n\
+             tools = [\"git\"]\nprompt = \"{prompt}\"\n"
+        )
+    }
+
+    #[test]
+    fn shipped_skill_names_are_recognized() {
+        assert!(is_shipped_skill("merge_to_main"));
+        assert!(!is_shipped_skill("merge_to_main_v2"));
+        assert!(!is_shipped_skill(""));
+    }
+
+    #[test]
+    fn library_reload_reports_added_removed_and_changes() {
+        let dir = tempdir().unwrap();
+        write_skill(dir.path(), "alpha", &skill_toml("alpha", "Do alpha."));
+        write_skill(dir.path(), "beta", &skill_toml("beta", "Do beta."));
+        let lib = SkillLibrary::load(dir.path().to_path_buf());
+
+        // An unchanged directory: nothing added, nothing removed.
+        let r = lib.reload();
+        assert_eq!(r.total, 2, "both skills stay loaded");
+        assert!(r.added.is_empty(), "nothing added: {:?}", r.added);
+        assert!(r.removed.is_empty(), "nothing removed: {:?}", r.removed);
+        assert_eq!(r.names, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // Add one, edit one, delete one — all three must be reported.
+        write_skill(dir.path(), "gamma", &skill_toml("gamma", "Do gamma."));
+        write_skill(dir.path(), "alpha", &skill_toml("alpha", "Do alpha, revised."));
+        std::fs::remove_file(dir.path().join("beta.toml")).unwrap();
+
+        let r = lib.reload();
+        assert_eq!(r.total, 2);
+        assert_eq!(r.added, vec!["gamma".to_string()]);
+        assert_eq!(r.removed, vec!["beta".to_string()]);
+        assert_eq!(r.names, vec!["alpha".to_string(), "gamma".to_string()]);
+        // The EDITED file's new content is live, not just its name.
+        assert_eq!(
+            lib.read(|reg| reg.get("alpha").map(|s| s.prompt.clone())),
+            Some("Do alpha, revised.".to_string())
+        );
+        assert!(lib.read(|reg| reg.get("beta").is_none()));
+    }
+
+    #[test]
+    fn library_reload_drops_a_file_that_stops_parsing() {
+        // A file that goes bad (malformed TOML) is logged + skipped by
+        // load_dir, so the reload must report it as removed — a skill that
+        // silently stays callable after its file broke would be worse.
+        let dir = tempdir().unwrap();
+        write_skill(dir.path(), "good", &skill_toml("good", "Do good."));
+        let lib = SkillLibrary::load(dir.path().to_path_buf());
+        assert!(lib.read(|reg| reg.get("good").is_some()));
+
+        std::fs::write(dir.path().join("good.toml"), "name = \"good\"\n").unwrap();
+        let r = lib.reload();
+        assert_eq!(r.removed, vec!["good".to_string()]);
+        assert_eq!(r.total, 0);
+        assert!(lib.read(|reg| reg.get("good").is_none()));
+    }
+
+    #[test]
+    fn library_read_sees_a_hot_added_spec() {
+        let dir = tempdir().unwrap();
+        let lib = SkillLibrary::load(dir.path().to_path_buf());
+        assert!(lib.read(|reg| reg.get("hot").is_none()));
+        lib.insert(SkillSpec {
+            name: "hot".into(),
+            available_in: vec![WorkflowState::Complete],
+            target_state: WorkflowState::Planning,
+            tools: vec!["git".into()],
+            prompt: "Do hot.".into(),
+        });
+        assert!(
+            lib.read(|reg| reg.get("hot").is_some()),
+            "an inserted spec is visible to readers immediately"
+        );
+    }
+
+    #[test]
+    fn library_from_registry_exposes_an_in_memory_spec() {
+        // The test-only constructor (used by the factory + tool tests) must
+        // behave like a loaded library: no disk I/O, same read path.
+        let dir = tempdir().unwrap();
+        let mut reg = SkillRegistry::new();
+        reg.insert(SkillSpec {
+            name: "in_memory".into(),
+            available_in: vec![WorkflowState::Executing],
+            target_state: WorkflowState::Complete,
+            tools: vec!["file_read".into()],
+            prompt: "Do it.".into(),
+        });
+        let lib = SkillLibrary::from_registry(dir.path().to_path_buf(), reg);
+        assert!(lib.read(|r| r.is_available_in("in_memory", WorkflowState::Executing)));
+        assert_eq!(lib.read(|r| r.iter().count()), 1);
+    }
+
+    #[test]
+    fn library_reload_on_missing_dir_is_empty() {
+        let lib = SkillLibrary::load(PathBuf::from("C:/nonexistent/skills/dir"));
+        let r = lib.reload();
+        assert_eq!(r.total, 0);
+        assert!(r.names.is_empty());
+        assert_eq!(lib.dir(), Path::new("C:/nonexistent/skills/dir"));
     }
 }

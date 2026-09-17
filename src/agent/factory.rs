@@ -48,7 +48,7 @@ use crate::provider::vision::{ImageDescriber, SwappableVision};
 use crate::provider::{LlmClient, SwappableProvider};
 use crate::runtime::AgentSpawner;
 use crate::safety_rules::SafetyRules;
-use crate::skill::SkillRegistry;
+use crate::skill::SkillLibrary;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::agent::{
     convert_line_endings::ConvertLineEndingsTool,
@@ -78,7 +78,9 @@ use crate::tool::workflow::ask_user::AskUserTool;
 use crate::tool::workflow::plan::{
     AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
 };
-use crate::tool::workflow::skill::{AbandonSkillTool, SkillEndTool, SkillStartTool};
+use crate::tool::workflow::skill::{
+    AbandonSkillTool, SkillCreateTool, SkillEndTool, SkillReloadTool, SkillStartTool,
+};
 use crate::tool::ToolRegistry;
 use crate::workflow::Workflow;
 
@@ -191,11 +193,13 @@ pub struct AgentLoopFactory {
     /// [`set_backlog`](Self::set_backlog); until then the `backlog_add` tool
     /// is omitted from every registry.
     backlog: RwLock<Option<BacklogWiring>>,
-    /// The skill registry — loaded from `.coding/skills/*.toml` at startup.
-    /// Shared across all agents (read-only after construction). The
-    /// `skill_start` tool consults it to validate + look up a skill's tool
-    /// allow-list + prompt. `None` when no skills dir was configured (tests).
-    skills: Option<Arc<SkillRegistry>>,
+    /// The skill library — the `.coding/skills/` dir plus the LIVE registry it
+    /// holds. Shared across all agents, and reloadable in place: a skill file
+    /// authored mid-session (`skill_create`) or edited by hand + `skill_reload`
+    /// is picked up without rebuilding anything. The skill tools consult it to
+    /// validate + look up a skill's tool allow-list + prompt. `None` when no
+    /// skills dir was configured (tests).
+    skills: Option<Arc<SkillLibrary>>,
     /// An optional per-context model resolver. When present, every built agent
     /// gets it wired in so the turn driver can pick a model per workflow state
     /// / skill / subagent. `None` in tests / when no `[models]` section is
@@ -357,12 +361,12 @@ impl AgentLoopFactory {
         self.mcp.clone()
     }
 
-    /// Wire in the [`SkillRegistry`] (loaded from `.coding/skills/*.toml`).
-    /// Called once by the IPC layer at startup. Affects agents built **after**
-    /// this call (the registry is read per `build`), so the IPC layer sets it
-    /// before building the main agent. When `None`, the `skill_start` tool is
-    /// omitted (no skills available).
-    pub fn with_skills(mut self, skills: Arc<SkillRegistry>) -> Self {
+    /// Wire in the [`SkillLibrary`] (the `.coding/skills/` dir + the registry
+    /// loaded from it). Called once by the IPC layer at startup. Affects agents
+    /// built **after** this call (the library is read per `build`), so the IPC
+    /// layer sets it before building the main agent. When `None`, the skill
+    /// tools are omitted (no skills available).
+    pub fn with_skills(mut self, skills: Arc<SkillLibrary>) -> Self {
         self.skills = Some(skills);
         self
     }
@@ -599,10 +603,10 @@ impl AgentLoopFactory {
         self.memory.clone()
     }
 
-    /// A handle to the shared skill registry (if any). The IPC layer's
+    /// A handle to the shared skill library (if any). The IPC layer's
     /// `enter_skill` command uses this to validate + look up a skill when the
     /// UI button starts a skill.
-    pub fn skills_handle(&self) -> Option<Arc<SkillRegistry>> {
+    pub fn skills_handle(&self) -> Option<Arc<SkillLibrary>> {
         self.skills.clone()
     }
 
@@ -842,7 +846,7 @@ impl AgentLoopFactory {
             ToolRegistry::with_groups(crate::tool::LoadedGroups::new(), mcp_table.clone());
         self.register_agent_tools(&mut registry, &sandbox, root);
         self.register_workflow_tools(&mut registry, workflow, root, plans_dir);
-        self.register_skill_tools(&mut registry, workflow);
+        self.register_skill_tools(&mut registry, workflow, &sandbox);
         self.register_vision_tool(&mut registry, &sandbox);
         self.register_memory_tools(&mut registry, root);
         self.register_codegraph_tools(&mut registry, root);
@@ -1049,13 +1053,20 @@ impl AgentLoopFactory {
         }
     }
 
-    /// Register the skill lifecycle tools — `skill_start` (gated to Complete +
-    /// Planning by ToolFilter), `skill_end` + `abandon_skill` (only meaningful
-    /// while a skill is active; exposed via the Skill filter's allow-list). All
-    /// AutoRun — protection is on the operations inside the skill (e.g. git
-    /// merge/push are never_auto_for), not the entry. Omitted entirely when no
-    /// skill registry is configured (tests).
-    fn register_skill_tools(&self, registry: &mut ToolRegistry, workflow: &Arc<Mutex<Workflow>>) {
+    /// Register the skill tools — `skill_start` (gated to Complete + Planning
+    /// by ToolFilter), `skill_end` + `abandon_skill` (only meaningful while a
+    /// skill is active; exposed via the Skill filter's allow-list),
+    /// `skill_reload` (every workflow state, an active skill included) and
+    /// `skill_create` (Executing only). All AutoRun — protection is on the
+    /// operations inside the skill (e.g. git merge/push are never_auto_for),
+    /// not the entry or the authoring. Omitted entirely when no skill library
+    /// is configured (tests).
+    fn register_skill_tools(
+        &self,
+        registry: &mut ToolRegistry,
+        workflow: &Arc<Mutex<Workflow>>,
+        sandbox: &Sandbox,
+    ) {
         if let Some(skills) = &self.skills {
             registry.register(Box::new(SkillStartTool::new(
                 workflow.clone(),
@@ -1063,6 +1074,17 @@ impl AgentLoopFactory {
             )));
             registry.register(Box::new(SkillEndTool::new(workflow.clone())));
             registry.register(Box::new(AbandonSkillTool::new(workflow.clone())));
+            registry.register(Box::new(SkillReloadTool::new(Arc::clone(skills))));
+            // The authoring tool gets the AGENT's sandbox (a root-spec agent
+            // gets its worktree's), so skill_create obeys the same path policy
+            // the file tools do: the link-free creation ladder + the `.coding/`
+            // hardlink guard. A worktree agent therefore cannot author into
+            // another tree's skills dir — by design, mirroring every other
+            // write (review HIGH 1, 2027-01-16).
+            registry.register(Box::new(SkillCreateTool::new(
+                Arc::clone(skills),
+                sandbox.clone(),
+            )));
         }
     }
 
@@ -2229,7 +2251,10 @@ mod tests {
         // edited.
         let dir = tempdir().unwrap();
         let mut factory = make_factory(dir.path());
-        factory = factory.with_skills(Arc::new(SkillRegistry::new()));
+        factory = factory.with_skills(Arc::new(SkillLibrary::from_registry(
+            dir.path().join(".coding/skills"),
+            crate::skill::SkillRegistry::new(),
+        )));
         factory.set_spawner(Arc::new(MockSpawner));
         // Fully wired = backlog store too (the IPC layer always wires it in
         // the Ready path before building the main agent).
@@ -2279,6 +2304,9 @@ mod tests {
             "skill_start",
             "skill_end",
             "abandon_skill",
+            // skill library tools (reload: every state; create: Executing only)
+            "skill_reload",
+            "skill_create",
             // vision (always) — the 7 image_* tools (replacing describe_image)
             "image_analysis",
             "image_analyze_chart",

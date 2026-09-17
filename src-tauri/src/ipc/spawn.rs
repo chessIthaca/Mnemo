@@ -1050,6 +1050,8 @@ mod tests {
             "skill_start",
             "skill_end",
             "abandon_skill",
+            "skill_create",
+            "skill_reload",
             "spawn_agent",
             "file_edit",
             "shell",

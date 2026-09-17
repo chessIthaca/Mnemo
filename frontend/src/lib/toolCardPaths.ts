@@ -62,6 +62,12 @@ export function argPaths(args: string, toolName?: string): string[] {
     toolName === "shell" ||
     toolName === "spawn_agent" ||
     toolName === "skill_start" ||
+    // skill_create's `name` is a SKILL name (the file stem under
+    // .coding/skills/) and its `prompt` carries free text — never an openable
+    // file. Excluded like skill_start above, so the truncated-args salvage can
+    // never hand the card a bogus link chip. (skill_reload takes no arguments,
+    // so it needs no entry: its args object is always empty.)
+    toolName === "skill_create" ||
     toolName === "git" ||
     // git_read's `path` param is a log/diff FILTER (often a directory),
     // not an openable file — the op chip (`log -8`, `show d31b606`) is the
@@ -838,6 +844,18 @@ export function argLabel(args: string, toolName?: string): string | null {
   if (toolName === "skill_start") {
     if (typeof parsed.skill === "string" && parsed.skill.trim()) {
       return parsed.skill.trim();
+    }
+    return null;
+  }
+  // For skill_create calls, the `name` field is the skill being AUTHORED (e.g.
+  // "deploy_checklist"). Show it so the card reads
+  // "skill_create (deploy_checklist)" instead of a bare "skill_create" —
+  // mirroring the skill_start branch above and the toolbar's
+  // `▶ skill "…" start` announcement. (skill_reload takes no arguments, so its
+  // card stays bare by design.)
+  if (toolName === "skill_create") {
+    if (typeof parsed.name === "string" && parsed.name.trim()) {
+      return parsed.name.trim();
     }
     return null;
   }

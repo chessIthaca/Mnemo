@@ -42,7 +42,11 @@ vitest (frontend), `tsc --noEmit` clean.
   Planning → Executing → Complete, with a `Skill` overlay) persists plans
   to `.coding/plans/<id>.md` + a `stack.json` sidecar supporting a
   sub-plan stack. Skills (`skill_start`/`skill_end`/`abandon_skill`) overlay
-  a tool allow-list + target state and persist across restart.
+  a tool allow-list + target state and persist across restart. The library is
+  a live `SkillLibrary` (the `.coding/skills/` dir + the registry loaded from
+  it): `skill_reload` re-reads it into the running app (every workflow state,
+  an active skill included) and `skill_create` authors a validated skill file
+  (Executing only), hot-adding it so it is startable immediately.
 - **Backlog + Run-All.** A persistent prompt backlog (`.coding/backlog.jsonl` —
   one JSON item per line, UUID string ids, git union merge driver for
   concurrent multi-instance adds) feeds the main agent one item at a time.
@@ -285,9 +289,19 @@ vitest (frontend), `tsc --noEmit` clean.
   structural enforcement
   of the "memory_search before planning" rule: prior knowledge arrives
   WITH the plan.
-- **Skill tools** — `skill_start`, `skill_end`, `abandon_skill`
-  (`tool/workflow/skill.rs`). Enter/exit a skill overlay (tool allow-list +
-  target state). Omitted when no skill registry is configured.
+- **Skill tools** — `skill_start`, `skill_end`, `abandon_skill` plus the
+  library tools: `skill_reload` (re-read `.coding/skills/*.toml` into the live
+  `SkillLibrary`; allowed in every workflow state, an active skill included,
+  and inside a skill's always-available set) and `skill_create` (author +
+  validate a new skill file, hot-added to the registry; Executing only —
+  PlanFrozen advertises it, and the constructor-granted allow-lists deny it by
+  name so a skill file cannot widen the rule; its write is sandbox-mediated —
+  a planted symlink or hardlink at the target is refused, and a link at the
+  skills dir itself is refused when it leaves the project or resolves into a
+  protected tree, and a skill shipped with the app such as `merge_to_main` is
+  never rewritten even with `overwrite: true`) (`tool/workflow/skill.rs`).
+  Enter/exit a skill overlay (tool allow-list + target state). Omitted when no
+  skill library is configured.
 - **Memory tools** — `memory_write`, `memory_search`, `memory_consolidate`
   plus the hygiene tools (`memory_update` — refines a record by id, or
   carries the `find`/`replace_with` targeted-repair mode that fixes stray

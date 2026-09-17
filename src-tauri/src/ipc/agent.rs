@@ -841,12 +841,12 @@ pub async fn enter_skill(
         .factory
         .as_ref()
         .ok_or_else(|| "agent factory unavailable (brain failed to start)".to_string())?;
-    // Look up the skill in the registry held by the factory.
-    let registry = factory
+    // Look up the skill in the library held by the factory.
+    let library = factory
         .skills_handle()
-        .ok_or_else(|| "no skill registry configured".to_string())?;
-    let spec = registry
-        .get(&skill)
+        .ok_or_else(|| "no skill library configured".to_string())?;
+    let spec = library
+        .read(|r| r.get(&skill).cloned())
         .ok_or_else(|| format!("unknown skill '{skill}'"))?;
 
     let agent_loops = state.runtime.agent_loops.lock().await;
@@ -860,7 +860,7 @@ pub async fn enter_skill(
         let wf = workflow_arc.lock().await;
         wf.state()
     };
-    if !registry.is_available_in(&skill, current) {
+    if !library.read(|r| r.is_available_in(&skill, current)) {
         return Err(format!("skill '{skill}' is not available in the {current} state").into());
     }
     let (overlay, dispatch) = skill_prompts(&spec.prompt, prompt);

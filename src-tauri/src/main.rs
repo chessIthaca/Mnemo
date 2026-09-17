@@ -1759,11 +1759,12 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         project.plans_dir.clone(),
         vision,
     )
-    // Load the skill registry from `.coding/skills/*.toml` so the
-    // `skill_start` tool can validate + look up skills. A missing dir yields
-    // an empty registry (no skills available) — not an error.
-    .with_skills(Arc::new(mnemo::skill::SkillRegistry::load_dir(
-        &project.skills_dir,
+    // Load the skill library from `.coding/skills/*.toml` so the skill tools
+    // can validate + look up skills, and `skill_reload` can re-read the dir
+    // live (a hand-edited skill file never needs an app restart). A missing dir
+    // yields an empty registry (no skills available) — not an error.
+    .with_skills(Arc::new(mnemo::skill::SkillLibrary::load(
+        project.skills_dir.clone(),
     )))
     // Wire the per-context model resolver so `[models]` overrides take effect
     // at turn time (skill > subagent > state > default).

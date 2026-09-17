@@ -190,7 +190,8 @@ pub enum ToolFilter {
     /// Planning: read agent tools + `create_plan` + all memory tools.
     Planning,
     /// Executing: all agent tools + `complete_step`/`create_plan`/`update_plan`/
-    /// `abandon_plan` + all memory tools.
+    /// `abandon_plan` + all memory tools. `skill_create` (authoring a skill
+    /// file) is Executing-only; `skill_reload` is available in every state.
     Executing,
     /// Reviewing: all agent tools (so the closing sequence — spawn_agent,
     /// git, file_edit, file_append, shell — can run) + `finish`/`ask_user`/
@@ -251,6 +252,8 @@ pub enum ToolFilter {
     /// Executing are rejected at dispatch with the state named in the error.
     /// The state discipline (no step/new-plan work mid-review, no finishing
     /// mid-execution) is unchanged — only the schema bytes are frozen.
+    /// `skill_create` rides along for the same reason: it is Executing-only in
+    /// practice, but the surface DURING Executing is this filter.
     ///
     /// Since 2027-01-11 this is the advertised surface for EVERY active plan,
     /// research plans included: a per-kind array changed the request head on
@@ -263,7 +266,10 @@ pub enum ToolFilter {
     Complete,
     /// A skill is active — only the named tools in the allow-list are visible
     /// (plus all memory tools, which are always available). Seeded from the
-    /// active skill's `tools` field at `start_skill` time.
+    /// active skill's `tools` field at `start_skill` time. The always-available
+    /// set (`skill_reload`, ask_user, current_plan and the backlog tools) is
+    /// visible regardless of the list; `skill_create` is denied here by name —
+    /// a skill file must not widen the Executing-only authoring rule.
     Skill(Vec<String>),
     /// A read-only reviewer sub-agent — a STRICT allow-list: only the named
     /// tools (+ `current_plan`, a read-only orientation query on the shared
@@ -334,6 +340,17 @@ impl ToolFilter {
         if name == "write_review_report" && !matches!(self, ToolFilter::Reviewer(_)) {
             return false;
         }
+        // `skill_create` is EXECUTING-ONLY (the authoring gate). The base-state
+        // arms below allow it in Executing / ExecutingResearch / PlanFrozen;
+        // the constructor-granted allow-lists (Skill, Reviewer) deny it by name
+        // so a skill file listing it — or a subagent allow-list carrying it —
+        // can never become a back door around that. Same shape as the
+        // reviewer-only rule above, mirrored.
+        if name == "skill_create"
+            && matches!(self, ToolFilter::Skill(_) | ToolFilter::Reviewer(_))
+        {
+            return false;
+        }
         match self {
             ToolFilter::Planning => match category {
                 // HARD RULE: no changes without a plan. Only read (AutoRun)
@@ -359,6 +376,12 @@ impl ToolFilter {
                 ToolCategory::Workflow => {
                     name == "create_plan"
                         || name == "skill_start"
+                        // skill_reload re-reads the project's own skills dir
+                        // into the live library — a read plus an in-memory
+                        // swap, never a plan/workflow mutation — so it is
+                        // available in EVERY state (and inside skills: see the
+                        // Skill arm's always-available set).
+                        || name == "skill_reload"
                         || name == "ask_user"
                         || name == "current_plan"
                         // backlog_add queues a benign, AutoRun, user-visible
@@ -400,6 +423,14 @@ impl ToolFilter {
                         || name == "create_plan"
                         || name == "update_plan"
                         || name == "abandon_plan"
+                        // skill_reload: every state (see the Planning arm).
+                        // skill_create: EXECUTING ONLY — authoring a skill file
+                        // is executing work. It is in PlanFrozen too, because
+                        // that is the advertised surface while a plan is
+                        // active; a call during Reviewing is rejected at
+                        // dispatch with the state named.
+                        || name == "skill_reload"
+                        || name == "skill_create"
                         || name == "ask_user"
                         || name == "current_plan"
                         // backlog_add stays available mid-execution: the user
@@ -436,12 +467,16 @@ impl ToolFilter {
                         "file_edit" | "file_write" | "file_append" | "convert_line_endings"
                     ) && !name.starts_with("mcp__")
                 }
-                // Unchanged from Executing.
+                // Same surface as Executing, skill_create included: a skill
+                // file is a `.coding/**` artifact, not source — a research
+                // plan's restriction is about source-code changes.
                 ToolCategory::Workflow => {
                     name == "complete_step"
                         || name == "create_plan"
                         || name == "update_plan"
                         || name == "abandon_plan"
+                        || name == "skill_reload"
+                        || name == "skill_create"
                         || name == "ask_user"
                         || name == "current_plan"
                         || name == "backlog_add"
@@ -468,6 +503,12 @@ impl ToolFilter {
                         || name == "create_plan"
                         || name == "update_plan"
                         || name == "abandon_plan"
+                        // Carried here because PlanFrozen IS the advertised
+                        // surface during Executing; the per-state arms above
+                        // decide whether a call actually runs (skill_create is
+                        // Executing-only, skill_reload is in every state).
+                        || name == "skill_reload"
+                        || name == "skill_create"
                         || name == "finish"
                         || name == "ask_user"
                         || name == "current_plan"
@@ -514,6 +555,10 @@ impl ToolFilter {
                 ToolCategory::Workflow => {
                     name == "finish"
                         || name == "abandon_plan"
+                        // skill_reload: every state, the closing sequence
+                        // included — swapping the registry touches no plan
+                        // state. (skill_create is denied here.)
+                        || name == "skill_reload"
                         || name == "ask_user"
                         || name == "current_plan"
                         || name == "update_plan"
@@ -564,6 +609,10 @@ impl ToolFilter {
                 ToolCategory::Workflow => {
                     name == "create_plan"
                         || name == "skill_start"
+                        // skill_reload: every state (see the Planning arm) —
+                        // between tasks is exactly when a skill file may have
+                        // been hand-edited.
+                        || name == "skill_reload"
                         || name == "ask_user"
                         || name == "current_plan"
                         // backlog_add stays available in Complete — capturing
@@ -592,6 +641,14 @@ impl ToolFilter {
                 _ => {
                     name == "ask_user"
                         || name == "current_plan"
+                        // skill_reload rides the always-available set: a reload
+                        // is a read + in-memory swap, and mid-skill is exactly
+                        // when a hand-edited skill file may need picking up
+                        // (e.g. a run-all item in merge_to_main). skill_create
+                        // deliberately does NOT — the guard at the top of
+                        // `allows` denies it under every allow-list, so a skill
+                        // file naming it cannot widen the Executing-only rule.
+                        || name == "skill_reload"
                         || name == "backlog_add"
                         || name == "backlog_status"
                         || name == "backlog_list"
@@ -1897,6 +1954,78 @@ mod tests {
         assert!(visible(ToolFilter::Planning), "visible in Planning");
         assert!(!visible(ToolFilter::Executing), "hidden in Executing");
         assert!(visible(ToolFilter::Complete), "visible in Complete");
+    }
+
+    /// `skill_reload` must be ALLOWED in every workflow state AND inside
+    /// skills: a skill file can be hand-edited at any moment, and the registry
+    /// is otherwise loaded only once, at app startup. The arms are explicit
+    /// name allow-lists, so forgetting one silently hides the tool from the
+    /// model — this is the regression for that failure mode.
+    ///
+    /// Asserted against [`ToolFilter::allows`] (the gate itself) rather than a
+    /// schema listing from the test `registry()`: that helper holds hand-written
+    /// stubs for the skill lifecycle tools, so a schema assertion would test the
+    /// stub instead of the arm. Registration is pinned separately, by the
+    /// factory's expected-tool-name set.
+    #[test]
+    fn skill_reload_allowed_in_every_state_and_inside_skills() {
+        let v = |f: ToolFilter| {
+            f.allows(ToolCategory::Workflow, SafetyLevel::AutoRun, "skill_reload")
+        };
+        assert!(v(ToolFilter::Planning), "allowed in Planning");
+        assert!(v(ToolFilter::Executing), "allowed in Executing");
+        assert!(
+            v(ToolFilter::ExecutingResearch),
+            "allowed in ExecutingResearch"
+        );
+        assert!(
+            v(ToolFilter::PlanFrozen),
+            "allowed on the frozen surface — this IS the surface during Executing"
+        );
+        assert!(v(ToolFilter::Reviewing), "allowed in Reviewing");
+        assert!(v(ToolFilter::Complete), "allowed in Complete");
+        assert!(
+            v(ToolFilter::Skill(vec![])),
+            "allowed inside a skill (always-available set, empty allow-list)"
+        );
+        assert!(
+            !v(ToolFilter::Reviewer(vec!["file_read".into()])),
+            "a reviewer must not get skill_reload implicitly — its arm is a literal allow-list"
+        );
+    }
+
+    /// `skill_create` — authoring a skill file — is EXECUTING ONLY (the user's
+    /// requirement). PlanFrozen carries it because that IS the advertised
+    /// surface while a plan is active; the per-state arms are what decide (a
+    /// call during Reviewing is rejected at dispatch with the state named).
+    /// The constructor-granted allow-lists deny it by name, so a skill file (or
+    /// a subagent list) naming it cannot widen the rule.
+    #[test]
+    fn skill_create_allowed_only_in_the_executing_surfaces() {
+        let v = |f: ToolFilter| {
+            f.allows(ToolCategory::Workflow, SafetyLevel::AutoRun, "skill_create")
+        };
+        assert!(v(ToolFilter::Executing), "allowed in Executing");
+        assert!(
+            v(ToolFilter::ExecutingResearch),
+            "allowed in ExecutingResearch — a skill file is a .coding artifact, not source"
+        );
+        assert!(v(ToolFilter::PlanFrozen), "advertised on the frozen surface");
+        assert!(!v(ToolFilter::Planning), "hidden in Planning");
+        assert!(!v(ToolFilter::Reviewing), "hidden in Reviewing");
+        assert!(!v(ToolFilter::Complete), "hidden in Complete");
+        assert!(
+            !v(ToolFilter::Skill(vec![])),
+            "hidden inside a skill — an overlay is not the Executing state"
+        );
+        assert!(
+            !v(ToolFilter::Skill(vec!["skill_create".into()])),
+            "naming it in a skill allow-list must NOT grant it (the Executing-only guard)"
+        );
+        assert!(
+            !v(ToolFilter::Reviewer(vec!["skill_create".into()])),
+            "the reviewer never authors skills"
+        );
     }
 
     /// backlog_add must be VISIBLE in every workflow state (it is a benign,

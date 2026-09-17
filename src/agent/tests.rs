@@ -9735,7 +9735,7 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
     let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let mut registry = ToolRegistry::new();
-    // The skill registry with a skill available from Planning.
+    // The skill library with a skill available from Planning.
     let mut skills = SkillRegistry::new();
     skills.insert(SkillSpec {
         name: "merge_to_main".into(),
@@ -9744,7 +9744,10 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
         tools: vec!["skill_end".into(), "file_read".into()],
         prompt: "Merge the branch into main.".into(),
     });
-    let skills = Arc::new(skills);
+    let skills = Arc::new(crate::skill::SkillLibrary::from_registry(
+        dir.path().join("skills"),
+        skills,
+    ));
     registry.register(Box::new(SkillStartTool::new(workflow.clone(), skills)));
     let registry = Arc::new(registry);
 
@@ -9934,7 +9937,10 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
         tools: vec!["skill_end".into(), "file_read".into()],
         prompt: "Merge the branch into main.".into(),
     });
-    let skills = Arc::new(skills);
+    let skills = Arc::new(crate::skill::SkillLibrary::from_registry(
+        dir.path().join("skills"),
+        skills,
+    ));
     registry.register(Box::new(SkillStartTool::new(workflow.clone(), skills)));
     registry.register(Box::new(SkillEndTool::new(workflow.clone())));
     let registry = Arc::new(registry);

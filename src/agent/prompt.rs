@@ -769,7 +769,8 @@ fn workflow_section(caps: &Capabilities, workflow: &Workflow) -> String {
                 s.push_str(&format!(
                     "Goal achieved → skill_end (exits to {target}); rollback → \
                      abandon_skill. Security controls still apply to every tool \
-                     call.\n",
+                     call. If the user hand-edits a skill file mid-run, \
+                     skill_reload re-reads the library (no restart).\n",
                     target = skill.target_state
                 ));
             } else {

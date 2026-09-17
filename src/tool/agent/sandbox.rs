@@ -168,6 +168,69 @@ impl Sandbox {
         }
     }
 
+    /// Validate a DIRECTORY a caller is about to `create_dir_all` itself.
+    ///
+    /// [`validate_for_write`](Self::validate_for_write) runs its link-free gate
+    /// (step 2) and its canonical-ancestor protection check (step 2b) BEFORE it
+    /// creates parent dirs (step 4), so a file write can never `mkdir` through a
+    /// link. A tool that creates its own directory FIRST — `skill_create` must,
+    /// because the ladder's lexical fallback cannot spell a path that does not
+    /// exist yet — would issue that one `mkdir` outside the gate: with `.coding`
+    /// planted as a link to an existing directory `D`,
+    /// `create_dir_all(root/.coding/skills)` puts the directory at `D/skills`,
+    /// and pointed at a protected tree it plants a `skills` subtree inside it.
+    /// This applies the ladder's step-2/2b judgement to the directory itself.
+    ///
+    /// A directory that already exists is returned canonicalized (and refused
+    /// when its canonical form is a protected target — e.g. a `.coding/skills`
+    /// link resolving to `.coding/knowledge`). One that does not exist yet is
+    /// judged through its DEEPEST EXISTING ANCESTOR, canonicalized: outside the
+    /// root → refused (the mkdir would leave the project), inside a protected
+    /// tree → refused. Everything below that ancestor is absent, so no component
+    /// there can be a link.
+    ///
+    /// Judging the ancestor rather than walking every component of the caller's
+    /// spelling is what keeps a link ABOVE the project from refusing a valid dir:
+    /// macOS spells `/tmp` and `/var` as links into `/private`, so a spelled walk
+    /// that starts at the filesystem root refused a scratch project's ordinary
+    /// "skills dir does not exist yet" case (round-3 HIGH 1). Canonicalization
+    /// resolves exactly those OS-level links, while a link INSIDE the tree that
+    /// leaves the project still shows up — as an ancestor outside the root, or as
+    /// `validate`'s own canonical result. The ancestor form also decides the
+    /// out-of-root case whose parent chain is entirely missing, which the
+    /// `validate` error alone cannot tell apart from "merely absent" (round-3
+    /// LOW 2).
+    pub fn validate_dir_creation(&self, dir: &Path) -> Result<PathBuf> {
+        match self.validate(dir) {
+            Ok(canonical) => {
+                self.refuse_if_protected(&canonical)?;
+                Ok(canonical)
+            }
+            Err(e) => {
+                if let Some(ancestor) = canonical_existing_ancestor(dir) {
+                    if !ancestor.starts_with(&self.root) {
+                        return Err(Error::PathOutsideRoot(ancestor));
+                    }
+                    // `validate` can resolve the DIR itself outside the root even
+                    // when its deepest existing ancestor is inside it: the dir is a
+                    // link whose destination exists elsewhere. Keep that refusal —
+                    // it is the same escape the ancestor walk just cleared.
+                    if matches!(&e, Error::PathOutsideRoot(_)) {
+                        return Err(e);
+                    }
+                    // Inside the root: the ladder's step 2b — an ancestor that
+                    // resolves into a protected tree (`.coding/skills` →
+                    // `.coding/knowledge`) must not get a subtree planted.
+                    self.refuse_if_protected(&ancestor)?;
+                }
+                // Absent, with no link and no root escape in the way: the mkdir is
+                // the whole point. A `None` ancestor means nothing on the chain
+                // exists at all, so there is nothing to traverse.
+                Ok(dir.to_path_buf())
+            }
+        }
+    }
+
     /// Check that a canonical path is inside the root.
     fn check_inside(&self, canonical: &Path) -> Result<PathBuf> {
         if canonical.starts_with(&self.root) {
@@ -1573,6 +1636,105 @@ mod tests {
                 "SKIP: could not create a dangling link leaf (file symlink or junction) for the ladder fixture"
             ),
         }
+    }
+
+    #[test]
+    fn dir_creation_gate_refuses_a_link_component() {
+        // A tool that must `create_dir_all` for itself runs that mkdir BEFORE
+        // validate_for_write for the file, so the ladder's step-2 link gate has
+        // to be applied to the DIRECTORY too — otherwise the mkdir lands at the
+        // link's destination (review round-2 LOW 1, 2027-01-17).
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
+
+        // The plain case: a not-yet-existing dir with no link in its path is
+        // exactly what the gate is for.
+        assert!(
+            sandbox
+                .validate_dir_creation(&dir.path().join(".coding/skills"))
+                .is_ok(),
+            "a link-free, not-yet-existing dir is allowed"
+        );
+
+        // A link component: refused before the mkdir. The fixture prefers the
+        // privilege-free junction spelling on Windows, and when neither
+        // spelling can be planted the skip is SAID, never silent.
+        let outside_link = dir.path().join(".coding/skills_outside");
+        if link_fixture::plant_dir_link(outside.path(), &outside_link) {
+            assert!(
+                sandbox.validate_dir_creation(&outside_link).is_err(),
+                "a dir link escaping the root must be refused before the mkdir"
+            );
+        } else {
+            eprintln!("SKIP: could not plant a directory link for the dir-creation gate fixture");
+        }
+
+        // A link resolving INSIDE the root into a protected tree is refused by
+        // the canonical protection re-check, not merely by the link walk.
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        let protected_link = dir.path().join(".coding/skills_knowledge");
+        if link_fixture::plant_dir_link(&dir.path().join(".coding/knowledge"), &protected_link) {
+            assert!(
+                sandbox.validate_dir_creation(&protected_link).is_err(),
+                "a dir link into a protected tree must be refused"
+            );
+        } else {
+            eprintln!("SKIP: could not plant a second directory link for the gate fixture");
+        }
+    }
+
+    #[test]
+    fn dir_creation_gate_allows_a_link_above_the_root() {
+        // Round-3 HIGH 1: the gate must judge the CANONICAL ANCESTOR, not every
+        // component of the caller's spelling. macOS spells `/tmp` and `/var` as
+        // links into `/private`, so a spelled walk that started at the filesystem
+        // root refused the ordinary "skills dir does not exist yet" case — the
+        // three `skill_create` happy-path tests fail there. A link ABOVE the root
+        // is not this sandbox's business: the root is canonicalized, so the alias
+        // resolves to the same tree the mkdir lands in.
+        let real = tempdir().unwrap();
+        let holder = tempdir().unwrap();
+        let alias = holder.path().join("alias");
+        if !link_fixture::plant_dir_link(real.path(), &alias) {
+            eprintln!("SKIP: could not plant a directory link for the ancestor fixture");
+            return;
+        }
+        let sandbox = Sandbox::new(&alias).unwrap();
+        let target = alias.join(".coding/skills");
+        assert!(
+            sandbox.validate_dir_creation(&target).is_ok(),
+            "a link above the root must not refuse a not-yet-existing dir"
+        );
+        // …and the mkdir really lands inside the root the sandbox named.
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(
+            real.path().join(".coding/skills").is_dir(),
+            "the directory is created through the alias, inside the root"
+        );
+    }
+
+    #[test]
+    fn dir_creation_gate_refuses_an_out_of_root_dir_without_any_link() {
+        // No link anywhere: the escape is invisible to `validate` (the parent
+        // chain is missing entirely), so only the canonical-ancestor CONTAINMENT
+        // check can see it (round-3 LOW 2, pinned here — the round-4 review found
+        // the arm deletable with a green suite). Assert the VARIANT, not a bare
+        // `is_err()`: pre-fix this returned `Ok(dir)` on Windows and the spelled
+        // walk's link refusal on macOS, so only the error kind fails pre-fix on
+        // both platforms.
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        let target = outside.path().join("missing/sub/skills");
+        assert!(
+            matches!(
+                sandbox.validate_dir_creation(&target),
+                Err(Error::PathOutsideRoot(_))
+            ),
+            "an out-of-root mkdir must be refused by containment, not by a link walk"
+        );
     }
 
     #[test]

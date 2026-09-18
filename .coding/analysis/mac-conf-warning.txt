@@ -1,0 +1,41 @@
+node.exe : npm notice run mnemo@0.1.0 npx
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Users\carst\AppData\Roaming\ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (npm notice run mnemo@0.1.0 npx:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+npm notice run tauri build --no-bundle
+        Info Looking up installed tauri packages to check mismatched versions...
+        Warn The bundle identifier "com.mnemo.app" set in `"tauri.conf.json" identifier` ends with `.app`. This is not 
+recommended because it conflicts with the application bundle extension on macOS.
+     Running beforeBuildCommand `npm run build`
+npm notice run mnemo@0.1.0 build
+npm notice run npm run build --workspace frontend
+npm notice run mnemo-frontend@0.1.0 build
+npm notice run tsc && vite build
+[36mvite v8.2.1 [32mbuilding client environment for production...[36m[39m
+[2K
+transforming...Γ£ô 2230 modules transformed.
+rendering chunks...
+computing gzip size...
+../target/frontend-dist/index.html                         2.19 kB Γöé gzip:   1.13 kB
+../target/frontend-dist/assets/index-D6TozIVn.css         63.01 kB Γöé gzip:  11.74 kB
+../target/frontend-dist/assets/MarkdownImpl-C4mbOVMv.js  319.05 kB Γöé gzip:  98.09 kB
+../target/frontend-dist/assets/index-CCJFb-En.js         708.64 kB Γöé gzip: 196.76 kB
+
+[32mΓ£ô built in 1.71s[39m
+[33m[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: 
+https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.[39m
+   Compiling mnemo v0.1.0 (C:\Mnemo)
+   Compiling mnemo-app v0.1.0 (C:\Mnemo\src-tauri)
+error: failed to remove file `C:\Mnemo\target\release\mnemo-app.exe`
+
+Caused by:
+  Access is denied. (os error 5)
+failed to build app: failed to build app
+       Error failed to build app: failed to build app

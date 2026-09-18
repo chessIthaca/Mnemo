@@ -626,7 +626,7 @@ impl Tool for GitTool {
 
         let args: GitArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
 
         // Free-form `args` are only forwarded for read queries (status, diff,
@@ -1161,7 +1161,15 @@ mod tests {
             .execute(json!({"subcommand": "status", "branch": 42}))
             .await;
         assert!(!result.success);
-        assert!(result.output.contains("invalid arguments"));
+        // Sanitized (plan 21118961): the instructive form — never
+        // serde's raw "invalid type:" vocabulary.
+        assert!(
+            result.output.starts_with("Error: The tool 'git' failed"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("must be a string, not an integer"));
+        assert!(!result.output.contains("invalid type:"));
     }
 
     #[tokio::test]

@@ -236,7 +236,7 @@ impl Tool for ImageUiToArtifactTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: UiToArtifactArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(t) = &args.target {
@@ -316,7 +316,7 @@ impl Tool for ImageExtractTextTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: ExtractTextArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(l) = &args.lang_hint {
@@ -393,7 +393,7 @@ impl Tool for ImageDiagnoseErrorTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: DiagnoseErrorArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(c) = &args.code_context {
@@ -458,7 +458,7 @@ impl Tool for ImageUnderstandDiagramTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: UnderstandDiagramArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_single(
             &self.0,
@@ -518,7 +518,7 @@ impl Tool for ImageAnalyzeChartTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: AnalyzeChartArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_single(
             &self.0,
@@ -627,7 +627,7 @@ impl Tool for ImageUiDiffTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: UiDiffArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Load both images to data URLs. Both are sent to the vision model in
         // ONE call (via describe_images) so the model actually sees both
@@ -721,7 +721,7 @@ impl Tool for ImageAnalysisTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: ImageAnalysisArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_single(
             &self.0,
@@ -872,7 +872,15 @@ mod tests {
         let tool = ImageAnalysisTool::new(sandbox, vision);
         let result = tool.execute(json!({"nope": 1})).await;
         assert!(!result.success);
-        assert!(result.output.contains("invalid arguments"));
+        // Sanitized (plan 21118961): names the tool, no raw serde text.
+        assert!(
+            result
+                .output
+                .starts_with("Error: The tool 'image_analysis' failed"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("missing field"));
     }
 
     #[tokio::test]

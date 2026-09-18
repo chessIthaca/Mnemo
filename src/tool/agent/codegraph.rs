@@ -296,7 +296,7 @@ impl Tool for GraphSearchTool {
         }
         let args: Args = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Freshness-aware query (backlog 95f21af0 — the F10 pattern for the
         // symbol index): a TOTAL miss may be staleness, not absence — the
@@ -437,7 +437,7 @@ impl Tool for GraphContextTool {
     async fn execute(&self, args: Value) -> ToolResult {
         let args: SymbolArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_query(self.graph.clone(), move |view| {
             let key = args
@@ -529,7 +529,7 @@ impl Tool for GraphImpactTool {
         }
         let args: Args = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_query(self.graph.clone(), move |view| {
             let key = args
@@ -614,7 +614,7 @@ impl Tool for GraphPathTool {
         }
         let args: Args = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         run_query(self.graph.clone(), move |view| {
             let Some(from_id) = resolve_id(view, &args.from) else {

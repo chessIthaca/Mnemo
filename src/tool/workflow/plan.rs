@@ -75,7 +75,7 @@ const BUG_FIXING_SKELETON: [&str; 4] = [
 struct CreatePlanArgs {
     title: String,
     goal: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     context: String,
     /// Optional for `kind = bug_fixing` (the locked skeleton is forced;
     /// provided steps persist as checkable `## Detailed steps` sub-items —
@@ -91,7 +91,7 @@ struct CreatePlanArgs {
     /// SUB-plan completing under a research root forces that root through
     /// Reviewing — see `Workflow::review_required` and
     /// `research_write_verdict`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     kind: PlanKind,
     /// The bug symptom for `kind = bug_fixing` plans — REQUIRED (the tool
     /// errors without it). Ignored for other kinds.
@@ -133,9 +133,11 @@ enum StepInput {
         /// are added automatically; an already-bold header is unwrapped to a
         /// single layer). The punchline shown in the executing toolbar.
         header: String,
-        /// The body recipe (self-contained instructions). May be empty.
+        /// The body recipe (self-contained instructions). May be empty —
+        /// or null (strict mode's representation of "no body", plan
+        /// 21118961 review HIGH 1).
         #[serde(default)]
-        body: String,
+        body: Option<String>,
     },
 }
 
@@ -155,6 +157,7 @@ impl StepInput {
             StepInput::Text(s) => s,
             StepInput::Map { header, body } => {
                 let header = unwrap_bold(&header);
+                let body = body.unwrap_or_default();
                 if body.is_empty() {
                     format!("**{header}**")
                 } else {
@@ -447,7 +450,7 @@ struct UpdatePlanArgs {
     /// APPENDED to the existing context instead of replacing it — the
     /// chunked-write protocol for very long plans (backlog 0085ccc0): create
     /// with the first few steps, then extend per chunk without resending.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     append: bool,
     /// The regression test name recorded by a bug_fixing plan's verify step —
     /// `finish` is blocked without it (and the name is validated against the
@@ -574,7 +577,7 @@ impl Tool for CreatePlanTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: CreatePlanArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Non-blank content guard: serde enforces PRESENCE of title/goal but a
         // whitespace-only string deserializes fine — and a blank title/goal is
@@ -980,7 +983,7 @@ impl Tool for UpdatePlanTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: UpdatePlanArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Normalize map steps into the stored string form (same as create_plan).
         let steps = args.steps.map(steps_to_text);
@@ -1225,7 +1228,7 @@ impl Tool for CompleteStepTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: CompleteStepArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Exactly one of step_index / detailed_step_index (backlog
         // 9441d776): the skeleton-step tick or the detailed sub-step tick.
@@ -1766,7 +1769,7 @@ impl Tool for FinishTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: FinishArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Snapshot-and-drop: the workflow lock is held ONLY for the state
         // check + the plan snapshot — never across the capture awaits below
@@ -2274,6 +2277,50 @@ mod tests {
 
     fn make_workflow(dir: &std::path::Path) -> Arc<Mutex<Workflow>> {
         Arc::new(Mutex::new(Workflow::new(dir.join("plans"))))
+    }
+
+    #[test]
+    fn strict_mode_shape_all_keys_null_optionals_deserializes() {
+        // Plan 21118961 regression (review HIGH 1): strict mode forces
+        // every schema key present with null as "no value" — the
+        // non-Option optional fields (context, kind, append, and a map
+        // step's body) must accept it.
+        let args: CreatePlanArgs = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "goal": "g",
+            "context": null,
+            "steps": [{"header": "h", "body": null}],
+            "kind": null,
+            "bug": null,
+            "branch": null,
+            "base": null
+        }))
+        .expect("create_plan strict-mode shape must deserialize");
+        assert_eq!(args.title, "t");
+        assert_eq!(args.context, "");
+        assert_eq!(args.kind, PlanKind::Implementation);
+        assert!(args.bug.is_none());
+        match &args.steps[0] {
+            StepInput::Map { header, body } => {
+                assert_eq!(header, "h");
+                assert!(body.is_none());
+            }
+            other => panic!("expected a Map step, got {other:?}"),
+        }
+
+        let upd: UpdatePlanArgs = serde_json::from_value(serde_json::json!({
+            "title": null,
+            "goal": null,
+            "context": null,
+            "steps": null,
+            "append": null,
+            "regression_test": null,
+            "landed_design": null
+        }))
+        .expect("update_plan strict-mode shape must deserialize");
+        assert!(!upd.append);
+        assert!(upd.title.is_none());
+        assert!(upd.steps.is_none());
     }
 
     fn make_store() -> Arc<MemoryStore> {

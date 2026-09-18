@@ -345,6 +345,24 @@ impl OpenAiClient {
         tool_choice: Option<ToolChoice>,
         omit_effort: bool,
     ) -> Result<String> {
+        // Strict-mode flag (plan 21118961): the REGISTRY owns the
+        // normalization + flagging decision (ToolRegistry::schemas); the
+        // builder only enforces the capability gate defensively — a
+        // schema carrying `strict` must never reach an endpoint whose
+        // caps say it doesn't support the field (litellm/vertex reject
+        // it), e.g. after a mid-turn 429 fallback to a different
+        // endpoint.
+        let tools: Vec<ToolSchema> = tools
+            .iter()
+            .cloned()
+            .map(|mut t| {
+                if !self.caps.supports_strict_schema {
+                    t.strict = None;
+                }
+                t
+            })
+            .collect();
+        let tools: &[ToolSchema] = &tools;
         // Local endpoints (Ollama/vLLM/LM Studio) render prompts with a Jinja
         // chat template that hard-fails when any `system` message is not the
         // FIRST message ("System message must be at the beginning"). Upstream
@@ -900,6 +918,21 @@ impl OpenAiClient {
         tools: &[ToolSchema],
         tool_choice: Option<ToolChoice>,
     ) -> Result<serde_json::Value> {
+        // Strict-mode flag (plan 21118961): same defensive capability
+        // gate as the chat-completions builder above — the registry owns
+        // normalization + flagging; the builder only strips the flag on
+        // endpoints that don't support it.
+        let tools: Vec<ToolSchema> = tools
+            .iter()
+            .cloned()
+            .map(|mut t| {
+                if !self.caps.supports_strict_schema {
+                    t.strict = None;
+                }
+                t
+            })
+            .collect();
+        let tools: &[ToolSchema] = &tools;
         // Find the last assistant turn with a response_id (stateful anchor).
         let anchor_idx: Option<usize> = messages
             .iter()

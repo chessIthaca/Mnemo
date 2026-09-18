@@ -16,6 +16,7 @@
 pub mod agent;
 #[cfg(feature = "browser")]
 pub mod browser;
+pub mod error_message;
 pub mod memory;
 pub mod steering;
 pub mod workflow;
@@ -158,6 +159,28 @@ impl OutputSink {
     pub fn is_active(&self) -> bool {
         self.0.is_some()
     }
+}
+
+/// Deserialize a field that strict-mode schemas advertise as nullable:
+/// `null` — the strict-mode representation of "no value" — maps to
+/// `Default::default()`, a present value deserializes normally, and
+/// absence still falls back to `#[serde(default)]`.
+///
+/// Strict-mode normalization (plan 21118961) widens every schema-optional
+/// property to `type: ["T", "null"]` and marks it required, so the
+/// provider emits the key on EVERY call — with `null` when the model has
+/// no value for it. A bare `#[serde(default)]` only fires on ABSENCE, so
+/// a non-`Option` field would reject the very `null` strict mode forces
+/// (review HIGH 1). Pair this with
+/// `#[serde(default, deserialize_with = "null_to_default")]` on such
+/// fields — the STRICT_TOOLS' optional `String`/`bool`/enum fields.
+pub(crate) fn null_to_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    let opt = Option::<T>::deserialize(de)?;
+    Ok(opt.unwrap_or_default())
 }
 
 /// The trait every tool implements.
@@ -1014,7 +1037,12 @@ impl ToolRegistry {
     /// tools: most arms admit all of them, but a strict allow-list (e.g. a
     /// read-only reviewer) only includes the named ones, so a reviewer is
     /// never even *advertised* memory-mutation tools. Strict schema
-    /// enforcement is only set when `caps.supports_strict_schema`.
+    /// enforcement (`strict: true` + strict-legal normalization, plan
+    /// 21118961) is applied ONLY to the mutation/plan tools
+    /// ([`strict::STRICT_TOOLS`](crate::provider::strict::STRICT_TOOLS)) and
+    /// only when `caps.supports_strict_schema` — this is the single decision
+    /// point, so the advertised array, the token estimate, and the
+    /// circuit-breaker's corrective schema all agree.
     pub fn schemas(&self, caps: &Capabilities, filter: &ToolFilter) -> Vec<ToolSchema> {
         let mut out = Vec::new();
         for tool in self.iter() {
@@ -1054,11 +1082,14 @@ impl ToolRegistry {
                 continue;
             }
             let mut schema = tool.schema();
-            if caps.supports_strict_schema {
-                schema.strict = Some(true);
-            } else {
-                schema.strict = None;
-            }
+            // Strict-mode schemas (plan 21118961): the mutation/plan
+            // tools are normalized to strict-legal form and flagged
+            // `strict: true` — but only on endpoints that support
+            // strict. Everything else stays verbatim with no flag: an
+            // un-normalized schema claiming strict is rejected by
+            // providers that enforce it, and read-only tools buy
+            // nothing from the constraint.
+            crate::provider::strict::apply(&mut schema, caps.supports_strict_schema);
             out.push(schema);
         }
         // Deterministic ordering for provider prompt-cache prefix stability:
@@ -2411,12 +2442,29 @@ mod tests {
 
     #[test]
     fn strict_only_when_caps_allow() {
+        // Plan 21118961: strict is scoped to the mutation/plan tools
+        // (strict::STRICT_TOOLS) — flagged on strict-capable endpoints,
+        // absent everywhere else. Read-only tools never carry the flag:
+        // their schemas are not normalized, and an un-normalized schema
+        // claiming strict is rejected by providers that enforce it.
+        // (The normalization itself is unit-tested in provider::strict.)
         let r = registry();
         let caps_openai = Capabilities::openai();
         let caps_local = Capabilities::local();
         let openai_schemas = r.schemas(&caps_openai, &ToolFilter::Executing);
         let local_schemas = r.schemas(&caps_local, &ToolFilter::Executing);
-        assert!(openai_schemas.iter().all(|s| s.strict == Some(true)));
+        for s in &openai_schemas {
+            if crate::provider::strict::wants_strict(&s.name) {
+                assert_eq!(s.strict, Some(true), "{}", s.name);
+            } else {
+                assert!(s.strict.is_none(), "{}", s.name);
+            }
+        }
+        // At least one listed tool is present under Executing, so the
+        // Some(true) branch above is actually exercised.
+        assert!(openai_schemas
+            .iter()
+            .any(|s| crate::provider::strict::wants_strict(&s.name)));
         assert!(local_schemas.iter().all(|s| s.strict.is_none()));
     }
 

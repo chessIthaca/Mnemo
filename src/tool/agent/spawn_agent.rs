@@ -207,7 +207,7 @@ impl Tool for SpawnAgentTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: SpawnAgentArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
 
         if args.name.trim().is_empty() {
@@ -386,7 +386,15 @@ mod tests {
         let tool = SpawnAgentTool::new(Arc::new(MockSpawner::ok(1)));
         let result = tool.execute(json!({})).await;
         assert!(!result.success);
-        assert!(result.output.contains("invalid arguments"));
+        // Sanitized (plan 21118961): names the tool, no raw serde text.
+        assert!(
+            result
+                .output
+                .starts_with("Error: The tool 'spawn_agent' failed"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("missing field"));
     }
 
     #[tokio::test]

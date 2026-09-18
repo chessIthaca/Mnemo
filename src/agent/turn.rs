@@ -1643,8 +1643,17 @@ impl AgentLoop {
         // treats it like any user turn.
         if let Some((tool_name, failed_content)) = pending_correction.take() {
             if let Some(tool) = self.tools.get(&tool_name) {
-                let correction =
-                    tool_call_correction(&tool_name, &failed_content, &tool.schema());
+                // Render the SAME schema the request carries (plan
+                // 21118961): on a strict endpoint the advertised form is
+                // the normalized one, and a correction quoting the raw
+                // registry schema would disagree with what actually
+                // constrains decoding.
+                let mut schema = tool.schema();
+                crate::provider::strict::apply(
+                    &mut schema,
+                    provider.capabilities().supports_strict_schema,
+                );
+                let correction = tool_call_correction(&tool_name, &failed_content, &schema);
                 messages.push(Message::user_text(correction));
                 let _ = fanin_tx
                     .send((

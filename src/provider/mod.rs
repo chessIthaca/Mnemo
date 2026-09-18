@@ -21,6 +21,7 @@ pub mod models;
 pub mod openai;
 pub mod policy;
 pub mod sse_util;
+pub mod strict;
 pub mod stream;
 pub mod trace;
 pub mod vision;
@@ -155,13 +156,18 @@ impl ProviderKind {
     /// The capability set, with optional overrides from the endpoint config.
     /// `max_context` overrides the context window; `max_output_tokens` overrides
     /// the per-request completion budget; `multimodal` overrides whether the
-    /// model accepts image inputs. Use these when the endpoint proxies a
-    /// model with different limits than the kind implies.
+    /// model accepts image inputs; `strict_schema` overrides whether the
+    /// endpoint enforces strict tool schemas (`None` = the kind's default).
+    /// Use these when the endpoint proxies a model with different limits or
+    /// capabilities than the kind implies — e.g. an OpenAI-kind endpoint
+    /// behind a litellm/vertex proxy that rejects the `strict` field sets
+    /// `strict_schema = Some(false)`.
     pub fn capabilities_with_overrides(
         &self,
         max_context: Option<usize>,
         max_output_tokens: Option<usize>,
         multimodal: bool,
+        strict_schema: Option<bool>,
     ) -> Capabilities {
         let mut caps = self.capabilities();
         if let Some(mc) = max_context {
@@ -171,6 +177,9 @@ impl ProviderKind {
             caps.max_output_tokens = mo;
         }
         caps.multimodal = multimodal;
+        if let Some(ss) = strict_schema {
+            caps.supports_strict_schema = ss;
+        }
         caps
     }
 }
@@ -692,7 +701,16 @@ pub struct ToolSchema {
     pub description: String,
     /// The JSON Schema for the parameters object.
     pub parameters: Value,
-    /// Whether to request strict schema enforcement (OpenAI only).
+    /// Whether to request strict schema enforcement on this tool.
+    ///
+    /// Set (with the parameters normalized to strict-legal form — see
+    /// [`strict`](crate::provider::strict)) only for the mutation/plan
+    /// tools on endpoints whose [`Capabilities`] report
+    /// `supports_strict_schema`; `None` otherwise. The per-endpoint
+    /// `supports_strict_schema` key in `endpoints.toml` overrides the
+    /// provider-kind default (an OpenAI-kind endpoint behind a
+    /// litellm/vertex proxy that rejects the field sets it `false`).
+    /// The request builders omit the field entirely when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
@@ -1204,8 +1222,12 @@ mod tests {
 
     #[test]
     fn capabilities_with_overrides() {
-        let caps =
-            ProviderKind::OpenAI.capabilities_with_overrides(Some(64_000), Some(8_192), true);
+        let caps = ProviderKind::OpenAI.capabilities_with_overrides(
+            Some(64_000),
+            Some(8_192),
+            true,
+            None,
+        );
         assert_eq!(caps.max_context, 64_000);
         assert_eq!(caps.max_output_tokens, 8_192);
         assert!(caps.multimodal);
@@ -1214,7 +1236,7 @@ mod tests {
 
     #[test]
     fn capabilities_without_overrides_uses_defaults() {
-        let caps = ProviderKind::OpenAI.capabilities_with_overrides(None, None, false);
+        let caps = ProviderKind::OpenAI.capabilities_with_overrides(None, None, false, None);
         assert_eq!(caps.max_context, 128_000);
         assert_eq!(caps.max_output_tokens, 32_000);
         assert!(!caps.multimodal);
@@ -1222,12 +1244,31 @@ mod tests {
 
     #[test]
     fn local_capabilities_with_overrides() {
-        let caps =
-            ProviderKind::Local.capabilities_with_overrides(Some(128_000), Some(32_000), true);
+        let caps = ProviderKind::Local.capabilities_with_overrides(
+            Some(128_000),
+            Some(32_000),
+            true,
+            None,
+        );
         assert_eq!(caps.max_context, 128_000);
         assert_eq!(caps.max_output_tokens, 32_000);
         assert!(caps.multimodal);
         assert!(!caps.supports_tool_choice); // still degraded
+    }
+
+    #[test]
+    fn strict_schema_override_flips_the_kind_default() {
+        // The per-endpoint escape hatch: an OpenAI-kind endpoint behind a
+        // proxy that rejects `strict` (litellm/vertex) opts out, and a
+        // Local-kind endpoint that does enforce schemas opts in. `None`
+        // keeps the kind default.
+        let off =
+            ProviderKind::OpenAI.capabilities_with_overrides(None, None, false, Some(false));
+        assert!(!off.supports_strict_schema);
+        let on = ProviderKind::Local.capabilities_with_overrides(None, None, false, Some(true));
+        assert!(on.supports_strict_schema);
+        let dflt = ProviderKind::OpenAI.capabilities_with_overrides(None, None, false, None);
+        assert!(dflt.supports_strict_schema);
     }
 
 

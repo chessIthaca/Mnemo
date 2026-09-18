@@ -820,6 +820,40 @@ fn build_request_json_includes_strict_when_some() {
 }
 
 #[test]
+fn non_strict_endpoint_strips_the_strict_flag() {
+    // The defensive gate (plan 21118961): the REGISTRY owns the strict
+    // decision (normalization + flagging, ToolRegistry::schemas); the
+    // builder only enforces the capability gate — a schema carrying
+    // `strict` must never reach an endpoint whose caps reject the field
+    // (litellm/vertex), e.g. after a mid-turn 429 fallback. The flag is
+    // stripped; the parameters are serialized verbatim.
+    let client = OpenAiClient::new(OpenAiClientConfig {
+        kind: ProviderKind::Local,
+        ..OpenAiClientConfig::test_default()
+    });
+    let params = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "old_string": {"type": "string"}
+        },
+        "required": ["path"]
+    });
+    let mut tool = ToolSchema::new("file_edit", "edit a file", params.clone());
+    tool.strict = Some(true); // as a strict-capable registry would have set it
+    let body = client
+        .build_request_json(&[Message::user_text("hi")], &[tool], None)
+        .unwrap();
+    let function = &body["tools"][0]["function"];
+    assert!(
+        function.get("strict").is_none(),
+        "strict must be stripped on a non-strict endpoint, got: {:?}",
+        function.get("strict")
+    );
+    assert_eq!(function["parameters"], params);
+}
+
+#[test]
 fn estimate_prompt_tokens_counts_content_and_tools() {
     let msgs = vec![Message::user_text("hello world")]; // 11 chars
     // 1 message * 4 overhead + 11 chars / 4 = 4 + 2 = 6.

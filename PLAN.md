@@ -377,7 +377,7 @@ not lowest-common-denominator.
 ```rust
 struct Capabilities {
     supports_tool_choice: bool,   // OpenAI: true, Ollama: false
-    supports_strict_schema: bool,  // OpenAI: true, Ollama: false (accepted but not enforced)
+    supports_strict_schema: bool,  // strict mode for the mutation/plan tools (normalized schemas); per-endpoint override in endpoints.toml
     supports_parallel_tools: bool,
     reliable_finish_reason: bool,  // OpenAI: true, Ollama: false
     max_context: usize,
@@ -385,6 +385,17 @@ struct Capabilities {
 ```
 
 The agent loop queries `provider.capabilities()` and adapts its requests.
+Strict schemas (2027-01-24): when `supports_strict_schema` is true,
+`ToolRegistry::schemas` normalizes the mutation/plan tools' schemas to
+strict-legal form (every property required, optionals widened to nullable
+type-arrays, `additionalProperties: false`) and flags them `"strict": true`
+— the single decision point, so the advertised array, the token estimate,
+and the circuit-breaker's corrective schema all agree. The per-endpoint
+`supports_strict_schema` key in `endpoints.toml` overrides the kind default
+(litellm/vertex-class proxies reject the field outright). Tool-argument
+errors are sanitized (`src/tool/error_message.rs`): the model receives a
+clean message naming the tool, the offending parameter, and the expected
+type — never raw serde vocabulary or the raw arguments blob.
 A `Provider` enum carries the base URL + which capability set applies:
 ```rust
 enum ProviderKind { OpenAI, Local, Anthropic }   // Local = Ollama/vLLM/LM Studio/llama.cpp; Anthropic = native Messages API

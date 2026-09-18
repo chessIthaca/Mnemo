@@ -96,6 +96,7 @@ pub fn openai_client_config(
         max_context: endpoint.max_context_for(model),
         max_output_tokens: endpoint.max_output_tokens_for(model),
         multimodal,
+        strict_schema: endpoint.supports_strict_schema,
         reasoning_effort,
         reasoning_effort_off_wire: endpoint.reasoning_effort_off_wire_for(model),
         use_responses_api: false,
@@ -485,6 +486,22 @@ mod tests {
         assert_eq!(client.model(), "claude-sonnet-4-5");
         assert!(client.capabilities().supports_tool_choice);
         assert!(!client.capabilities().supports_strict_schema);
+    }
+
+    #[test]
+    fn strict_schema_override_flows_into_client_caps() {
+        // The per-endpoint override reaches the built client's capabilities:
+        // an OpenAI-kind endpoint behind a litellm/vertex proxy opts out of
+        // strict schemas; unset keeps the kind default (enforced).
+        let config = Config::default();
+        let mut ep = endpoint(EndpointKind::OpenAI);
+        ep.supports_strict_schema = Some(false);
+        let client = build_client(&config, &ep, "gpt-4o", false, None, None);
+        assert!(!client.capabilities().supports_strict_schema);
+
+        let ep = endpoint(EndpointKind::OpenAI);
+        let client = build_client(&config, &ep, "gpt-4o", false, None, None);
+        assert!(client.capabilities().supports_strict_schema);
     }
 
     #[test]

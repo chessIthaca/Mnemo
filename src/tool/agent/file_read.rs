@@ -105,7 +105,7 @@ impl Tool for FileReadTool {
                 } else {
                     ""
                 };
-                return ToolResult::error(invalid_args_error(&e, &args, hint));
+                return ToolResult::error(invalid_args_error("file_read", &e, &args, hint));
             }
         };
 
@@ -272,7 +272,15 @@ mod tests {
         // Missing required "path" field.
         let result = tool.execute(json!({})).await;
         assert!(!result.success);
-        assert!(result.output.contains("invalid arguments"));
+        // Sanitized (plan 21118961): the instructive form, not serde's
+        // raw vocabulary.
+        assert!(
+            result.output.starts_with("Error: The tool 'file_read' failed"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("parameter 'path' is required"));
+        assert!(!result.output.contains("missing field"));
     }
 
     #[tokio::test]
@@ -291,7 +299,7 @@ mod tests {
             .await;
         assert!(!result.success, "expected arg error, got success");
         assert!(
-            result.output.contains("invalid arguments"),
+            result.output.starts_with("Error: The tool 'file_read' failed"),
             "{}",
             result.output
         );

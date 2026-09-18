@@ -170,6 +170,9 @@ impl AnthropicClient {
             config.max_context,
             config.max_output_tokens,
             config.multimodal,
+            // The Messages API has no strict schema enforcement (input
+            // schemas are advisory) and no endpoint override exists for it.
+            None,
         );
         let http_client = reqwest::Client::builder()
             // Connect-only timeout (handshake). We deliberately do NOT set a

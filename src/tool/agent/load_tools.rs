@@ -145,7 +145,7 @@ impl Tool for LoadToolsTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: LoadToolsArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let group = args.group.trim();
         if !self.table.iter().any(|(g, _)| g == group) {

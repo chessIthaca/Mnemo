@@ -1580,6 +1580,122 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
 }
 
 #[tokio::test]
+async fn correction_schema_matches_the_advertised_strict_schema() {
+    // Plan 21118961 consistency: on a strict-capable endpoint the
+    // advertised tools array carries the NORMALIZED schema for the
+    // mutation/plan tools (ToolRegistry::schemas applies
+    // provider::strict). The circuit breaker's corrective message must
+    // render the SAME normalized form — a correction quoting the raw
+    // registry schema would disagree with what actually constrains
+    // decoding (it would list optional parameters the strict decoder
+    // requires as present-or-null).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // Two identical failing create_plan calls (missing required `goal` —
+    // the sanitized error text is identical both times), then a clean
+    // text response. create_plan is a bookkeeping tool (AutoRun), so no
+    // approval wait.
+    let fail_call = |n: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "create_plan".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"title":"t"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        fail_call(1),
+        fail_call(2),
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry.clone(), workflow.clone(), sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("make a plan")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // The correction fired after the two identical failures.
+    let correction = messages
+        .iter()
+        .find(|m| {
+            m.role == Role::User
+                && m.content.as_text().contains("[harness tool-call correction")
+        })
+        .expect("correction present after two identical failures")
+        .content
+        .as_text();
+    // The correction renders the NORMALIZED schema. create_plan's
+    // parameters exceed CORRECTION_SCHEMA_CAP, so the render degrades
+    // to the summary — whose `required` list is the discriminator: the
+    // RAW schema requires only [title, goal, steps] (plan.rs), while
+    // the normalized one requires EVERY property. Assert the correction
+    // carries the advertised (normalized) required list verbatim, so
+    // the corrective schema and the request's schema cannot disagree.
+    let advertised = registry
+        .schemas(
+            &Capabilities::openai(),
+            &workflow.lock().await.allowed_tools(),
+        )
+        .into_iter()
+        .find(|s| s.name == "create_plan")
+        .expect("create_plan advertised under the workflow filter");
+    assert_eq!(advertised.strict, Some(true));
+    assert_eq!(
+        advertised.parameters["additionalProperties"],
+        serde_json::json!(false)
+    );
+    let normalized_required: Vec<String> = advertised.parameters["required"]
+        .as_array()
+        .expect("normalized required list")
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    // Sanity: the advertised list really is the widened one — `kind` is
+    // optional in the raw schema but required after normalization.
+    assert!(
+        normalized_required.iter().any(|r| r == "kind"),
+        "the advertised schema must be the normalized one"
+    );
+    assert!(
+        correction.contains(&format!(
+            "required [{}]",
+            normalized_required.join(", ")
+        )),
+        "the correction must carry the same (normalized) required list as \
+         the advertised schema:\n{correction}"
+    );
+}
+
+#[tokio::test]
 async fn distinct_tool_errors_do_not_fire_the_correction() {
     // Two DIFFERENT failures of the same tool are not the repeat-loop
     // signature — the breaker must stay silent (the schema injection is

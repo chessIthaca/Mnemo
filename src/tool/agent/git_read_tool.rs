@@ -101,7 +101,7 @@ impl Tool for GitReadTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let op = match serde_json::from_value::<GitReadArgs>(args.clone()) {
             Ok(a) => a.op,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         match op.trim().to_ascii_lowercase().as_str() {
             "diff" => self.diff.execute(args).await,

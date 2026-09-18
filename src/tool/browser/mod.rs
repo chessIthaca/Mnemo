@@ -51,7 +51,7 @@ macro_rules! parse_args {
     ($t:ty, $args:expr) => {
         match serde_json::from_value::<$t>($args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         }
     };
 }

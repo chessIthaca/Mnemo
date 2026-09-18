@@ -35,6 +35,7 @@ use super::REVIEW_REPORT_MAX_FAILURES;
 use crate::memory::{Memory, MemoryTier};
 use crate::provider::{
     DeltaAccumulator, FinishReason, LlmClient, LlmEvent, Message, MessageContent, Role, ToolCall,
+    ToolSchema,
 };
 use crate::runtime::{AgentCommand, AgentEvent, AgentId, PhaseKind};
 use crate::tool::agent::git::resolve_git_subcommand;
@@ -90,6 +91,23 @@ const KEEP_RECENT_ON_SWAP: usize = 6;
 /// finite regardless: 10 leaves room for a long legitimate turn crossing the
 /// fill rate several times, while stopping a loop that is not making progress.
 pub(crate) const MAX_COMPACTIONS_PER_TURN: u32 = 10;
+
+/// How many recent messages the repeat-failure circuit breaker scans for a
+/// prior identical failure of the same tool. Bounded so the scan stays
+/// cheap; compaction replaces old tool-result text with markers anyway,
+/// so matches decay naturally at the compaction boundary.
+pub(crate) const REPEAT_FAILURE_SCAN_WINDOW: usize = 50;
+
+/// Cap on the parameters JSON rendered inside a corrective message
+/// (repeat-failure circuit breaker). Larger schemas degrade to a
+/// summary (property names + required list) so the correction stays
+/// compact.
+pub(crate) const CORRECTION_SCHEMA_CAP: usize = 1536;
+
+/// Prefix marking a harness-attributed corrective message (repeat-failure
+/// circuit breaker). Shared by the correction builder and the auto-recall
+/// query lookup so the correction never hijacks the recall query.
+pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correction";
 
 /// Loop-carried state for one [`AgentLoop::run_turn`] call: the counters,
 /// signals, and per-turn caches that survive across loop iterations. The
@@ -1304,6 +1322,11 @@ impl AgentLoop {
         // TurnOutcome.stop_reason and acts: Cancel terminates the agent,
         // Interrupt returns to idle, Steer runs a follow-up turn.
         let mut stop_signal: Option<StopReason> = None;
+        // Repeat-failure circuit breaker (tool-call robustness): queued by
+        // the per-call loop below when a failed tool result repeats a
+        // PRIOR identical failure of the same tool; pushed after the
+        // batch. (tool name, failed tool-result content).
+        let mut pending_correction: Option<(String, String)> = None;
         // Add the assistant message with tool calls.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
@@ -1539,6 +1562,29 @@ impl AgentLoop {
             } else {
                 format!("[tool error] {capped}")
             };
+
+            // Repeat-failure circuit breaker (tool-call robustness): when
+            // this failure's (tool, error text) matches a PRIOR identical
+            // failure in recent history, the model is pattern-matching off
+            // its own previous malformed call instead of the schema
+            // (live incident: 15 consecutive `git` commit calls missing
+            // `message`, re-emitted verbatim while the error repeated
+            // identically; only a fresh corrective user turn broke the
+            // loop). Queue ONE corrective message — pushed after the
+            // batch below — carrying the tool's actual schema. The scan
+            // runs BEFORE this result is pushed, so a match is always
+            // against a prior failure (a same-batch duplicate counts).
+            // User denials / interrupts are deliberate safety choices,
+            // not a stuck model — excluded, mirroring the MAX_RETRIES
+            // rule at the top of this loop.
+            if !result.success
+                && !is_user_denial_tool_output(&result.output)
+                && pending_correction.is_none()
+                && repeated_tool_failure(messages, &tc.name, &tool_content)
+            {
+                pending_correction = Some((tc.name.clone(), tool_content.clone()));
+            }
+
             let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), tool_content);
             messages.push(tool_message);
 
@@ -1581,6 +1627,37 @@ impl AgentLoop {
                 )
                 .await;
                 break;
+            }
+        }
+
+        // Repeat-failure circuit breaker: push the queued corrective
+        // message AFTER the batch — every tool result precedes it, so the
+        // Anthropic tool_result-immediately-after-tool_use ordering
+        // holds (the request builder coalesces adjacent tool messages
+        // only; a user text message after them is a separate turn). One
+        // correction per batch (the first repeat-failure wins); a model
+        // that keeps failing identically re-fires next batch. The message
+        // is harness-attributed so the transcript never masquerades as
+        // human input, and it is a plain user-role tail message:
+        // cache-stable (the stable head is untouched) and compaction
+        // treats it like any user turn.
+        if let Some((tool_name, failed_content)) = pending_correction.take() {
+            if let Some(tool) = self.tools.get(&tool_name) {
+                let correction =
+                    tool_call_correction(&tool_name, &failed_content, &tool.schema());
+                messages.push(Message::user_text(correction));
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Error {
+                            error: format!(
+                                "tool-call correction: repeated identical `{tool_name}` \
+                                 failure — schema reminder injected into the next request"
+                            ),
+                            retrying: true,
+                        },
+                    ))
+                    .await;
             }
         }
 
@@ -2133,16 +2210,14 @@ impl AgentLoop {
         // store. The cache is scoped to the turn loop and is invalidated
         // only on summarization (the summarizer can rewrite the latest
         // user message). Tool-result appends never touch the query — it
-        // reads User-role messages only — so they must NOT invalidate:
+        // reads User-role messages only, and harness-attributed corrections
+        // are skipped in the lookup below — so tool results must NOT
+        // invalidate:
         // doing so re-ran an identical recall and emitted duplicate
         // MemoryRecalled lines after every >4 KiB tool output (defect
         // fixed 2026-08-20).
         if let Some(store) = &self.memory {
-            let query = messages
-                .iter()
-                .rev()
-                .find(|m| m.role == Role::User)
-                .map(|m| m.content.as_text());
+            let query = last_user_query(messages);
             if let Some(q_text) = query {
                 let q: &str = &q_text;
                 let filter = crate::memory::MemoryFilter::new().limit(5);
@@ -3375,6 +3450,101 @@ pub(crate) fn is_user_denial_tool_output(output: &str) -> bool {
         || output.contains("cancelled while awaiting approval")
         || output.contains("approval channel closed")
         || output.contains("interrupted: not run")
+}
+
+/// Whether a failed tool result repeats a PRIOR identical failure of the
+/// same tool — the signature of the self-reinforcing malformed-call loop
+/// (live incident: 15 consecutive `git` commit calls missing `message`,
+/// re-emitted verbatim while the error text repeated identically; the
+/// loop was only broken by a fresh corrective user turn). Scans the recent
+/// window of the conversation history; the caller runs this BEFORE
+/// pushing the current result, so a match is always against a prior
+/// failure — across turn boundaries too, since `messages` is the
+/// session history. Compacted tool results no longer carry the verbatim
+/// error text, so matches decay naturally at the compaction boundary.
+fn repeated_tool_failure(messages: &[Message], tool_name: &str, failed_content: &str) -> bool {
+    messages
+        .iter()
+        .rev()
+        .take(REPEAT_FAILURE_SCAN_WINDOW)
+        .any(|m| {
+            m.role == Role::Tool
+                && m.name.as_deref() == Some(tool_name)
+                && match &m.content {
+                    MessageContent::Text(s) => s == failed_content,
+                    MessageContent::Parts(_) => false,
+                }
+        })
+}
+
+/// The auto-recall query: the latest User-role message text, skipping
+/// harness-attributed corrective messages (repeat-failure circuit
+/// breaker) so a correction never hijacks the recall query for the
+/// remainder of the turn.
+pub(crate) fn last_user_query(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == Role::User
+                && !m.content.as_text().starts_with(HARNESS_CORRECTION_PREFIX)
+        })
+        .map(|m| m.content.as_text())
+}
+
+/// Build the harness-attributed corrective message for a repeated
+/// identical tool failure: the error verbatim, the rewrite instruction,
+/// and the tool's actual parameter schema (size-capped). This is the
+/// mechanism that empirically broke the live loop — a fresh corrective
+/// turn — delivered automatically on the second identical failure
+/// instead of the user's attempt-15 hint.
+fn tool_call_correction(tool_name: &str, failed_content: &str, schema: &ToolSchema) -> String {
+    format!(
+        "{HARNESS_CORRECTION_PREFIX} — not the user]\n\
+         Your last two calls to `{tool_name}` failed with the identical error:\n\
+         {failed_content}\n\
+         A repeated identical failure means the earlier malformed call is \
+         still steering your output — you are re-emitting the previous \
+         arguments instead of re-reading the schema. Break the pattern: \
+         re-emit the COMPLETE call with every required field present, and \
+         do not resend the previous arguments unchanged.\n\
+         The `{tool_name}` tool's schema:\n{}",
+        render_correction_schema(schema)
+    )
+}
+
+/// Render a tool's schema for a corrective message, size-capped: the
+/// description (truncated) plus the full parameters JSON when it fits
+/// the cap, otherwise a degraded summary (property names + required
+/// list) so the correction stays compact even for large schemas.
+fn render_correction_schema(schema: &ToolSchema) -> String {
+    let description = crate::provider::sse_util::truncate_for_display(&schema.description, 400);
+    let params = serde_json::to_string_pretty(&schema.parameters).unwrap_or_default();
+    if params.len() <= CORRECTION_SCHEMA_CAP {
+        format!("  description: {description}\n  parameters: {params}")
+    } else {
+        let props = schema
+            .parameters
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let required = schema
+            .parameters
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        format!(
+            "  description: {description}\n  parameters (summary — full schema \
+             too large): properties [{props}], required [{required}]"
+        )
+    }
 }
 
 /// Whether a tool call is "durable" — worth recording as a working-memory

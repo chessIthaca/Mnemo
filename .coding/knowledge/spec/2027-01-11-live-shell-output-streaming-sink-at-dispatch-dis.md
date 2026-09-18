@@ -1,6 +1,7 @@
 +++
 title = "live shell output streaming — sink at dispatch, display-only ToolOutputDelta, rolling card tail (plan 0d2c1221)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Plan 0d2c1221 / backlog 7e6385b3 — landed on branch wt/mnemo, 2027-01-16 (worktree C:/Mnemo).

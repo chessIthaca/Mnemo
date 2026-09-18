@@ -1,0 +1,9 @@
++++
+title = "Plan panel pins at its 80% cap on startup — persisted px width never re-normalized — MERGED into main (dcc7a93)"
+supersedes = "2027-01-11-plan-panel-pins-at-its-80-cap-on-startup-persist"
+created = "2027-01-11"
++++
+
+MERGED into main at dcc7a93 (dcc7a93ff84f7dc59934087c773ea7b052623b9b) on 2027-01-16 via the merge_to_main skill; branch wt/mnemo deleted (pre-merge tip 21c6c13) — supersedes this record's earlier "plan 38b0e2eb on wt/mnemo" hint. Symptom: on app open the right panel (Plan tab — the startup default) filled as much of the app as it can — the persisted absolute-px width (831px on the reporting box) pinned at the render clamp's 80% ceiling on small restored windows, and window resizes never re-scaled the panel (the flex-1 chat column absorbed every delta). Root cause + landed fix (window-fraction width, inline CSS band caps, legacy px seed): knowledge file .coding/knowledge/bug/2027-01-11-plan-panel-pins-at-its-80-cap-on-startup-persist.md.
+
+Amended 2027-01-11: Follow-up (2027-01-16, plan 4347c8a3): the fraction band shipped with a flat 50% ceiling (PANEL_MAX_FRAC = 0.5) that made every hand drag stop dead at half the window — the user reported it as too aggressive. Retuned: PANEL_MAX_FRAC 0.5 → 0.75, CHAT_MIN_PX 480 → 360; the two ceilings cross at 1440px (below it the chat floor binds, above it the flat cap binds). The original pinning protection is unchanged — the chat column still keeps its guaranteed minimum via the inline calc(100% - 360px) cap re-clamped by the CSS engine at every viewport. Regression tests: RightPanel.width.test.tsx "lets a hand drag exceed the old 50% ceiling" (0.9 @1920 → 0.75, red against the old constants) plus the 1440px crossover pin; appearance.test.ts band assertions updated to 0.55/0.75. Verified: vitest 1221 green, tsc clean, cargo test 2410+16 green.

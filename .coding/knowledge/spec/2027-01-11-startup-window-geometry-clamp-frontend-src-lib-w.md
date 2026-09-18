@@ -1,6 +1,7 @@
 +++
 title = "Startup window-geometry clamp (frontend/src/lib/windowRestore.ts)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed 2027-01-14, plan 9ff59133 (branch wt/mnemo), user report: "when starting mnemo it remember the size it was at ... the app start for this one was a tiny small window top left on the screen".

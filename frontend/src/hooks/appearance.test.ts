@@ -51,12 +51,12 @@ describe("clampPanelFraction", () => {
   it("clamps a too-wide fraction to the chat-column minimum", () => {
     // The reporting box's real case: 831px legacy on an 800px window. The
     // old [300, 0.8×innerWidth] px clamp pinned the panel at 640px (80% of
-    // the app); the band caps at (800−480)/800 = 0.4.
-    expect(clampPanelFraction(831 / 800, 800)).toBe(0.4);
+    // the app); the band caps at (800−360)/800 = 0.55.
+    expect(clampPanelFraction(831 / 800, 800)).toBe(0.55);
   });
 
-  it("never exceeds half the window", () => {
-    expect(clampPanelFraction(0.9, 2000)).toBe(0.5);
+  it("never exceeds 75% of the window", () => {
+    expect(clampPanelFraction(0.9, 2000)).toBe(0.75);
   });
 
   it("floors at the 300px panel minimum", () => {
@@ -79,7 +79,7 @@ describe("readRightPanelWidthFrac", () => {
   it("seeds from the legacy px key against the current viewport", () => {
     stubStorage({ "mh.rightPanelWidth": "831" }, 800);
     try {
-      expect(readRightPanelWidthFrac()).toBe(0.4);
+      expect(readRightPanelWidthFrac()).toBe(0.55);
     } finally {
       vi.unstubAllGlobals();
     }

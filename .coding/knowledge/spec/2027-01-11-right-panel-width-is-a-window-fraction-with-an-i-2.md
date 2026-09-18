@@ -1,0 +1,9 @@
++++
+title = "Right-panel width is a window fraction with an inline-CSS band — MERGED into main (dcc7a93)"
+supersedes = "2027-01-11-right-panel-width-is-a-window-fraction-with-an-i"
+created = "2027-01-11"
++++
+
+MERGED into main at dcc7a93 (dcc7a93ff84f7dc59934087c773ea7b052623b9b) on 2027-01-16 via the merge_to_main skill; branch wt/mnemo deleted (pre-merge tip 21c6c13) — supersedes this record's earlier "commit 1e9f8d4 on wt/mnemo" hint. The right-panel width is a FRACTION of the window width, never absolute px: persisted as mh.rightPanelWidthFrac (legacy px seed, no migration write), rendered as min(pct%, 50%, calc(100% - 480px)) so the CSS engine re-clamps at every viewport, dragged as a fraction via clampPanelFraction (CHAT_MIN_PX 480 / PANEL_MAX_FRAC 0.5 shared). Full detail: .coding/knowledge/spec/2027-01-11-right-panel-width-is-a-window-fraction-with-an-i.md.
+
+Amended 2027-01-11: Band retune (2027-01-16, plan 4347c8a3 — user report: the 50% cap made hand-resizing stop dead at half the window, "I want to resize bigger if I do so by hand"): PANEL_MAX_FRAC 0.5 → 0.75 and CHAT_MIN_PX 480 → 360 in frontend/src/hooks/appearance.ts. The rendered caps are now min(pct%, 75%, calc(100% - 360px)); clampPanelFraction's shape is unchanged — only the constants moved. The two ceilings CROSS AT w = CHAT_MIN_PX / (1 − PANEL_MAX_FRAC) = 1440px: below it the chat floor governs ((w−360)/w < 0.75), at/above it the flat 75% does and the chat keeps ≥ 25% of the window (360px at exactly 1440). Worked maxima: w=800 → 0.55, w=1000 → 0.64, w=1440+ → 0.75. The original 831px-pinning protection is unchanged (the inline calc cap still re-clamps at every viewport). Regression tests: RightPanel.width.test.tsx (drag to 0.9 @1920 → 0.75; chat floor 0.55 @800; the 1440px crossover pin) and appearance.test.ts (assertions updated to 0.55/0.75).

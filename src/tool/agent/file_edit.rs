@@ -494,7 +494,10 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         (Some(s), Some(e)) => (s, e),
         _ => {
             return Err(crate::error::Error::InvalidInput(
-                "start_line and end_line must both be set (line-range mode)".into(),
+                "start_line and end_line must both be set (line-range mode). Expected \
+                 arguments: {\"path\": \"<file>\", \"start_line\": <1-indexed N>, \
+                 \"end_line\": <1-indexed M>, \"new_string\": \"<replacement>\"} — \
+                 or use string mode (old_string + new_string) instead".into(),
             ));
         }
     };
@@ -2129,6 +2132,23 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("end_line"), "msg: {msg}");
+    }
+
+    #[test]
+    fn prepare_edit_lines_one_bound_only_errors() {
+        // Setting only one of the two line-range bounds is the observed
+        // malformed-call shape (start_line without end_line — live incident:
+        // 5 consecutive identical failures); the error must carry the exact
+        // expected arguments so the model can self-correct on the first
+        // attempt.
+        let mut args = line_args("a.txt", 2, 3, "X");
+        args.end_line = None;
+        let result = prepare_edit(&args, "a\nb\nc\n");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("must both be set"), "msg: {msg}");
+        assert!(msg.contains("Expected arguments"), "msg: {msg}");
+        assert!(msg.contains("\"end_line\""), "msg: {msg}");
     }
 
     #[test]

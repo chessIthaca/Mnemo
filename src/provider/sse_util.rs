@@ -114,7 +114,7 @@ pub(crate) fn parse_data_url(url: &str) -> Option<(String, String)> {
 }
 
 /// Truncate a string to `max` chars, appending an ellipsis if it was cut.
-fn truncate_for_display(s: &str, max: usize) -> String {
+pub(crate) fn truncate_for_display(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {

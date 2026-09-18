@@ -555,6 +555,17 @@ error the model can recover from. Provider errors retry with jittered
 exponential backoff (equal jitter via `retry_backoff_ms`: ~0.5–1s, ~1–2s) so
 concurrent agents retrying the same recovering endpoint don't stay in lockstep.
 
+A repeat-failure circuit breaker covers the self-reinforcing shape
+(valid-JSON-wrong-fields): when a failed result's (tool, error text) matches a
+prior identical failure in recent history, the loop pushes one
+harness-attributed user-role corrective message after the batch — the
+error verbatim plus the tool's actual parameter schema — because the
+empirically proven loop-breaker is a fresh corrective turn, not the error
+string (a live incident re-emitted the same missing-`message` git commit
+15 times while the error text repeated identically). The scan is
+history-based, so it works across turn boundaries and decays naturally at
+the compaction boundary; `MAX_RETRIES` semantics are unchanged.
+
 ### Path safety (sandbox)
 
 All file agent tools route their path through `Sandbox::validate()` before any

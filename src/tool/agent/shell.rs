@@ -23,7 +23,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -32,9 +32,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::config::ShellFilterConfig;
 use crate::provider::ToolSchema;
+use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
@@ -54,9 +56,10 @@ const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(60);
 /// invisible behind the timer.
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
-/// Live-view byte cap PER CALL (stdout + stderr together). Past it the live
-/// view is truncated with one note; the final [`ToolResult`] is unaffected —
-/// it always carries the complete output.
+/// Live-view byte cap PER CALL (stdout + stderr together). Past it further
+/// chunks are clamped to what still fits and the call's live view gets ONE
+/// truncation note (both readers share the flag); the final [`ToolResult`] is
+/// unaffected — it always carries the complete output.
 const STREAM_CAP: usize = 256 * 1024;
 
 /// The one-time note appended to the live view when [`STREAM_CAP`] is reached.
@@ -358,18 +361,32 @@ impl Tool for ShellTool {
         let stdout_pipe = child.stdout.take().expect("stdout was piped");
         let stderr_pipe = child.stderr.take().expect("stderr was piped");
         let streamed = Arc::new(AtomicUsize::new(0));
+        // ONE truncation note per CALL, not per stream: both readers share this
+        // flag and the card renders a single merged tail, so a call whose stdout
+        // and stderr both reach the budget still says it once.
+        let noted = Arc::new(AtomicBool::new(false));
         let out_task = tokio::spawn(pump_stream(
             stdout_pipe,
             ToolOutputStream::Stdout,
             sink.clone(),
             Arc::clone(&streamed),
+            Arc::clone(&noted),
         ));
         let err_task = tokio::spawn(pump_stream(
             stderr_pipe,
             ToolOutputStream::Stderr,
             sink,
             Arc::clone(&streamed),
+            Arc::clone(&noted),
         ));
+        // Abort the readers if this call never reaches the join below: an agent
+        // interrupt DROPS this future, and dropping a `JoinHandle` does not
+        // cancel its task — an orphaned reader would otherwise keep emitting
+        // into a card whose synthetic result already landed.
+        let mut readers = ReaderGuard {
+            out: out_task,
+            err: err_task,
+        };
 
         // Bound the wait. The child is MOVED INTO the future: on timeout the
         // future is dropped, which drops the Child, and `kill_on_drop(true)`
@@ -380,12 +397,17 @@ impl Tool for ShellTool {
             match tokio::time::timeout(self.timeout, async move { child.wait().await }).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
-                    // Nothing may keep streaming after the call has returned:
-                    // the readers would otherwise emit into a card that already
-                    // has its result (the reducer drops those, but aborting
-                    // makes the contract explicit rather than relying on it).
-                    out_task.abort();
-                    err_task.abort();
+                    // Nothing may keep streaming after this call returns: abort
+                    // BOTH readers and WAIT for the cancellation to land — a
+                    // reader mid-poll on another worker can otherwise still emit
+                    // a chunk after the error result. `abort` takes effect at
+                    // the reader's next await point, so these awaits return
+                    // promptly; the guard's Drop then re-aborts the finished
+                    // tasks, which is a no-op.
+                    readers.out.abort();
+                    readers.err.abort();
+                    let _ = (&mut readers.out).await;
+                    let _ = (&mut readers.err).await;
                     let label = format_duration(self.timeout);
                     return ToolResult::error(format!(
                         "command timed out after {label} and was killed"
@@ -393,10 +415,16 @@ impl Tool for ShellTool {
                 }
             };
 
-        // Join both readers BEFORE returning the result, so every delta lands
-        // on the fan-in channel ahead of the ToolResult (same FIFO channel).
-        let stdout_bytes = out_task.await.unwrap_or_default();
-        let stderr_bytes = err_task.await.unwrap_or_default();
+        // Join both readers BEFORE returning the result, so on this path every
+        // delta lands on the fan-in channel ahead of the ToolResult (same FIFO
+        // channel). That ordering is a property of a call that COMPLETES here: a
+        // timed-out call awaits the aborted readers above, but a dropped
+        // (interrupted) call can still leave a reader emitting after its
+        // synthetic result — which is why every consumer ALSO gates on the call
+        // having no result yet (the frontend reducers drop such a chunk) instead
+        // of trusting arrival order alone.
+        let stdout_bytes = (&mut readers.out).await.unwrap_or_default();
+        let stderr_bytes = (&mut readers.err).await.unwrap_or_default();
 
         match status {
             Ok(status) => {
@@ -463,20 +491,40 @@ impl Tool for ShellTool {
     }
 }
 
+/// Owns both reader tasks and ABORTS them when dropped, so a call that never
+/// reaches the join — the tool future is dropped by an agent interrupt — still
+/// stops streaming into a card whose synthetic result already landed. Aborting
+/// an already-finished task is a no-op, so the success and timeout paths can
+/// hold this guard while awaiting the handles through `&mut`.
+struct ReaderGuard {
+    out: JoinHandle<Vec<u8>>,
+    err: JoinHandle<Vec<u8>>,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.out.abort();
+        self.err.abort();
+    }
+}
+
 /// Pump one child pipe to EOF: every byte lands in the returned `Vec` (the
 /// final result's source of truth), while the live view receives throttled,
 /// UTF-8-safe chunks through `sink`.
 ///
 /// Throttle: emit when [`STREAM_FLUSH_INTERVAL`] has passed since the last
 /// emit, or the pending buffer reached [`STREAM_FLUSH_BYTES`], or the pipe hit
-/// EOF — a short command must not wait the timer out. Only complete UTF-8
-/// sequences are emitted, so a multi-byte character split across two reads
-/// never surfaces as a replacement char in the live view.
+/// EOF — a short command must not wait the timer out. The interval is enforced
+/// by a TIMER arm, not merely checked when bytes arrive, so a command that
+/// prints one line and then works quietly still shows that line promptly.
+/// Only complete UTF-8 sequences are emitted, so a multi-byte character split
+/// across two reads never surfaces as a replacement char in the live view.
 async fn pump_stream<R>(
     mut pipe: R,
     stream: ToolOutputStream,
     sink: OutputSink,
     streamed: Arc<AtomicUsize>,
+    noted: Arc<AtomicBool>,
 ) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -484,32 +532,51 @@ where
     let mut all: Vec<u8> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
     let mut last_emit = Instant::now();
-    let mut noted = false;
     let live = sink.is_active();
     let mut buf = [0u8; 4096];
     loop {
-        let n = match pipe.read(&mut buf).await {
-            // EOF — or a read error on a killed child's pipe: either way the
-            // bytes already read stand, and the result is what it would have
-            // been for a short read.
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        all.extend_from_slice(&buf[..n]);
-        if !live {
-            continue;
-        }
-        pending.extend_from_slice(&buf[..n]);
-        if last_emit.elapsed() >= STREAM_FLUSH_INTERVAL || pending.len() >= STREAM_FLUSH_BYTES {
-            emit_pending(&mut pending, false, stream, &sink, &streamed, &mut noted);
-            last_emit = Instant::now();
+        tokio::select! {
+            read = pipe.read(&mut buf) => {
+                let n = match read {
+                    // EOF — or a read error on a killed child's pipe: either way
+                    // the bytes already read stand, and the result is what it
+                    // would have been for a short read.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                all.extend_from_slice(&buf[..n]);
+                if !live {
+                    continue;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                if last_emit.elapsed() >= STREAM_FLUSH_INTERVAL
+                    || pending.len() >= STREAM_FLUSH_BYTES
+                {
+                    emit_pending(&mut pending, false, stream, &sink, &streamed, &noted);
+                    last_emit = Instant::now();
+                }
+            }
+            // TIMER arm: flush a pending chunk once the interval has elapsed
+            // with no further bytes. Without it the throttle would only be
+            // EVALUATED when data arrives, so a line printed just before a quiet
+            // stretch — or a sub-interval burst, which `last_emit.elapsed()` is
+            // still too young to flush — would sit invisible until the next
+            // output or EOF, the very "looks like a hang" gap this feature
+            // removes. Guarded on `live` + pending so an idle read costs no
+            // wakeups, and re-armed from `last_emit` so a flush resets it.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                last_emit + STREAM_FLUSH_INTERVAL,
+            )), if live && !pending.is_empty() => {
+                emit_pending(&mut pending, false, stream, &sink, &streamed, &noted);
+                last_emit = Instant::now();
+            }
         }
     }
     if live {
         // Final flush: decode the whole remainder (nothing follows it, so an
         // incomplete trailing sequence may decode lossily here — the result
         // lossy-decodes those same bytes identically).
-        emit_pending(&mut pending, true, stream, &sink, &streamed, &mut noted);
+        emit_pending(&mut pending, true, stream, &sink, &streamed, &noted);
     }
     all
 }
@@ -518,16 +585,17 @@ where
 /// carrying an incomplete trailing sequence over to the next flush (unless
 /// `force`, which decodes the whole remainder).
 ///
-/// Enforces the per-call budget: once [`STREAM_CAP`] is reached this stream's
-/// live view is truncated with a one-time note and emits nothing more, while
-/// [`pump_stream`]'s accumulator keeps capturing — the result stays complete.
+/// Enforces the per-call budget: past [`STREAM_CAP`] a chunk is CLAMPED to what
+/// still fits, ONE note goes to the live view for the whole call (both readers
+/// share `noted`), and nothing more is emitted — while [`pump_stream`]'s
+/// accumulator keeps capturing, so the result stays complete.
 fn emit_pending(
     pending: &mut Vec<u8>,
     force: bool,
     stream: ToolOutputStream,
     sink: &OutputSink,
     streamed: &AtomicUsize,
-    noted: &mut bool,
+    noted: &AtomicBool,
 ) {
     if pending.is_empty() {
         return;
@@ -542,16 +610,42 @@ fn emit_pending(
     }
     let text = String::from_utf8_lossy(&pending[..cut]).to_string();
     pending.drain(..cut);
-    let used = streamed.load(Ordering::Relaxed);
-    if used + text.len() > STREAM_CAP {
-        if !*noted {
-            *noted = true;
-            sink.emit(stream, STREAM_TRUNCATION_NOTE);
+    // RESERVE the budget, then clamp to what was reserved. A plain load + add
+    // would let two racing readers both spend the SAME room and overshoot
+    // [`STREAM_CAP`] together; the CAS makes the cap a real bound, because the
+    // reservation always equals what is emitted and a retry can only shrink. The
+    // note's own bytes are not counted — this is a display budget, not a wire
+    // limit.
+    let mut emit_text = text;
+    let mut used = streamed.load(Ordering::Relaxed);
+    let mut clamped = false;
+    loop {
+        let room = STREAM_CAP.saturating_sub(used);
+        if emit_text.len() > room {
+            truncate_to_boundary(&mut emit_text, room);
+            clamped = true;
         }
-        return;
+        if emit_text.is_empty() {
+            break;
+        }
+        match streamed.compare_exchange_weak(
+            used,
+            used + emit_text.len(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => used = actual,
+        }
     }
-    streamed.fetch_add(text.len(), Ordering::Relaxed);
-    sink.emit(stream, &text);
+    if !emit_text.is_empty() {
+        sink.emit(stream, &emit_text);
+    }
+    if clamped && !noted.swap(true, Ordering::Relaxed) {
+        // The FIRST stream to be truncated says it — once for the CALL, so a
+        // card whose stdout and stderr both cross the cap still notes it once.
+        sink.emit(stream, STREAM_TRUNCATION_NOTE);
+    }
 }
 
 /// Human-readable duration for timeout error messages.
@@ -900,8 +994,8 @@ mod tests {
             "expected a collapse note, got: {}",
             result.output
         );
-        // The raw data field is untouched — the frontend Output tab still
-        // sees all four lines.
+        // The raw data field is untouched — all four lines stay in
+        // data.stdout (the card renders the filtered text).
         let raw_stdout = result.data.unwrap()["stdout"]
             .as_str()
             .expect("data.stdout")
@@ -1052,6 +1146,55 @@ mod tests {
         );
     }
 
+    /// Past `STREAM_CAP` the note is ONE per CALL, not one per stream: a call
+    /// whose stdout AND stderr both cross the budget says it once (the card
+    /// renders a single merged tail), the clamped emissions stay within the cap,
+    /// and the result keeps both streams complete.
+    #[tokio::test]
+    async fn stream_cap_note_is_once_per_call_across_both_streams() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        // ~400 KiB on stdout AND ~400 KiB on stderr — each past the 256 KiB cap.
+        let cmd = if cfg!(target_os = "windows") {
+            "$line = 'x' * 100; 1..4000 | ForEach-Object { [Console]::Out.WriteLine($line); [Console]::Error.WriteLine($line) }"
+        } else {
+            "yes | head -c 400000; yes | head -c 400000 1>&2"
+        };
+        let (sink, mut rx) = recording_sink();
+        let result = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "cap test (both streams)"}), sink)
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let mut live = String::new();
+        while let Ok((_, text)) = rx.try_recv() {
+            live.push_str(&text);
+        }
+        // The WHOLE note (newlines included): the clamped tail fills the cap
+        // exactly, so a trimmed pattern would leave 2 bytes behind.
+        let note = STREAM_TRUNCATION_NOTE;
+        assert_eq!(
+            live.matches(note).count(),
+            1,
+            "one note per CALL even when both streams cross the cap (live view: {} KiB)",
+            live.len() / 1024
+        );
+        let emitted = live.replace(note, "");
+        assert!(
+            emitted.len() <= STREAM_CAP,
+            "the live view must stay within the cap, got {} bytes",
+            emitted.len()
+        );
+        let data = result.data.as_ref().expect("data");
+        assert!(
+            data["stdout"].as_str().unwrap_or_default().len() >= 400_000,
+            "the result still carries the full stdout"
+        );
+        assert!(
+            data["stderr"].as_str().unwrap_or_default().len() >= 400_000,
+            "the result still carries the full stderr"
+        );
+    }
+
     /// Past `STREAM_CAP` the live view is truncated once, with a note — while
     /// the RESULT keeps the complete output.
     #[tokio::test]
@@ -1073,7 +1216,10 @@ mod tests {
         while let Ok((_, text)) = rx.try_recv() {
             live.push_str(&text);
         }
-        let note = STREAM_TRUNCATION_NOTE.trim();
+        // Compare and strip the WHOLE note, surrounding newlines included: the
+        // live view now fills the cap EXACTLY (chunks past it are clamped), so
+        // leaving those two newline bytes behind would read as an overrun.
+        let note = STREAM_TRUNCATION_NOTE;
         assert_eq!(
             live.matches(note).count(),
             1,

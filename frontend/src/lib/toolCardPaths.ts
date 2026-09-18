@@ -1039,3 +1039,21 @@ export function displayName(name: string): string {
       return name;
   }
 }
+
+/**
+ * The visible preview of a running call's live output tail (backlog 7e6385b3):
+ * the LAST `maxLines` lines, further capped to `maxChars` counted from the end
+ * (newest-first trimming), so a chatty command's newest lines stay on screen
+ * without re-rendering kilobytes per chunk.
+ *
+ * The reducer retains far more (16 KiB per running call, head-dropped) — that
+ * window is what makes a scroll-back possible, while this only bounds the DOM
+ * node. A trailing newline is preserved, so a partially printed line still
+ * reads as one.
+ */
+export function liveTailPreview(text: string, maxLines = 6, maxChars = 400): string {
+  const lines = text.split("\n");
+  const tail = lines.length > maxLines ? lines.slice(-maxLines) : lines;
+  const joined = tail.join("\n");
+  return joined.length > maxChars ? joined.slice(-maxChars) : joined;
+}

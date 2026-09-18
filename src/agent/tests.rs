@@ -4435,6 +4435,181 @@ fn make_dispatch_fixture(
     (agent, fanin_tx, cmd_rx)
 }
 
+/// Integration pin for the live shell view (plan 0d2c1221, backlog 7e6385b3):
+/// the sink built at the DISPATCH site must land `ToolOutputDelta` events on
+/// the agent's fan-in channel WHILE the command runs — tagged with the call's
+/// id — instead of leaving the card blind until exit.
+///
+/// Ordering is proven, not raced: the child prints `one`, then BLOCKS until
+/// `marker.txt` appears, then prints `two`. The marker is created only AFTER
+/// the observer has received the first delta, and `execute_tool_call` cannot
+/// return before the child exits — so that delta provably arrived while the
+/// call was still running, i.e. ahead of the result. The turn loop emits the
+/// call's `ToolResult` after this funnel returns, on this same FIFO channel,
+/// so on this SUCCESS path every delta necessarily precedes it (a timed-out or
+/// dropped/interrupted call can leave a reader emitting after its result, which
+/// is why every consumer also gates on the call having no result — the sink's
+/// `ReaderGuard` narrows that window but cannot close it); the tail of the test
+/// re-asserts the ordering by emulating that emission.
+#[tokio::test]
+async fn dispatch_streams_shell_output_deltas_before_the_result() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    // `shell` is an Executing-state tool (hidden in Planning), so the dispatch
+    // filter needs a live plan before it lets the call through.
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("T", "G", "C", vec!["s".to_string()])
+            .expect("create_plan starts the plan (Planning -> Executing)");
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // The shared test registry carries no shell tool; register only what this
+    // pin needs — the funnel is what is under test, not the tool surface.
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(crate::tool::agent::shell::ShellTool::new(
+        (*sandbox).clone(),
+    )));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    // Deep enough for the deltas plus the emulated result event below.
+    let (fanin_tx, mut fanin_rx) = mpsc::channel::<(crate::runtime::AgentId, AgentEvent)>(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel::<crate::runtime::AgentCommand>(8);
+
+    let command = if cfg!(target_os = "windows") {
+        // `[Console]::Out` writes straight to the pipe: PowerShell's formatter
+        // buffers `Write-Output` when stdout is redirected, which would defeat
+        // the incremental check.
+        "[Console]::Out.WriteLine('one'); while (-not (Test-Path marker.txt)) { \
+         Start-Sleep -Milliseconds 25 }; [Console]::Out.WriteLine('two')"
+    } else {
+        "echo one; while [ ! -f marker.txt ]; do sleep 0.05; done; echo two"
+    };
+    let tc = crate::provider::ToolCall::new(
+        "call-live",
+        "shell",
+        serde_json::json!({"command": command, "purpose": "dispatch streaming pin"})
+            .to_string(),
+    );
+
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let call = agent.execute_tool_call(
+        &tc,
+        &fanin_tx,
+        1,
+        &mut cmd_rx,
+        &mut deny_all_latched,
+        &mut stop_signal,
+    );
+    // Watch the channel concurrently with the call: the child cannot finish
+    // until this observer has seen the first delta and unblocked it.
+    let mut unexpected: Option<String> = None;
+    let watch = async {
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                match fanin_rx.recv().await {
+                    Some((
+                        _,
+                        AgentEvent::ToolOutputDelta {
+                            tool_call_id,
+                            stream,
+                            text,
+                        },
+                    )) => break (tool_call_id, stream, text),
+                    // Nothing else belongs this early (an ApprovalRequest here
+                    // would mean the Autonomous fixture is wrong, not the
+                    // sink); record it and keep waiting.
+                    Some((_, other)) => {
+                        if unexpected.is_none() {
+                            unexpected = Some(format!("{other:?}"));
+                        }
+                        continue;
+                    }
+                    None => panic!("fan-in channel closed before any delta"),
+                }
+            }
+        })
+        .await;
+        // Unblock the child either way, so a failure cannot hang the test.
+        std::fs::write(dir.path().join("marker.txt"), "go").expect("write marker");
+        observed
+    };
+    let ((result, _buffered), observed) = tokio::join!(call, watch);
+
+    // Nothing but a live delta belongs before the first one on this channel: an
+    // approval request would mean the call took a path this pin cannot drive (it
+    // would wait forever on the unanswered oneshot), so fail loudly rather than
+    // time out.
+    assert!(
+        unexpected.is_none(),
+        "no other event may precede the first delta, got: {unexpected:?}"
+    );
+    let (tool_call_id, stream, first) = observed.unwrap_or_else(|_| {
+        panic!(
+            "no ToolOutputDelta reached the fan-in channel while the command ran \
+             (first non-delta event: {unexpected:?})"
+        )
+    });
+    assert_eq!(tool_call_id, "call-live", "the delta must carry the call's id");
+    assert_eq!(stream, crate::tool::ToolOutputStream::Stdout);
+    assert!(first.contains("one"), "first delta: {first:?}");
+    assert!(result.success, "result: {}", result.output);
+    assert!(
+        result.output.contains("one") && result.output.contains("two"),
+        "the final result stays complete: {}",
+        result.output
+    );
+
+    // What the turn loop does next: emit the call's ToolResult on the same
+    // channel. It can only come last — every delta was already queued when
+    // `execute_tool_call` returned (the tool joins its readers first).
+    fanin_tx
+        .send((
+            1,
+            AgentEvent::ToolResult {
+                tool_call_id: tc.id.clone(),
+                result,
+            },
+        ))
+        .await
+        .expect("emulate the turn loop's ToolResult emission");
+    let mut streamed = first;
+    // The observer already consumed one delta — that IS `first` — so seed the
+    // ordering record with it: the tally below then covers both lines.
+    let mut order: Vec<&str> = vec!["delta"];
+    while let Ok((_, event)) = fanin_rx.try_recv() {
+        match event {
+            AgentEvent::ToolOutputDelta { text, .. } => {
+                streamed.push_str(&text);
+                order.push("delta");
+            }
+            AgentEvent::ToolResult { .. } => order.push("result"),
+            _ => {}
+        }
+    }
+    assert!(streamed.contains("two"), "streamed tail: {streamed:?}");
+    assert_eq!(
+        order.last(),
+        Some(&"result"),
+        "the result must be the LAST event for the call, got: {order:?}"
+    );
+    assert_eq!(
+        order.iter().filter(|kind| **kind == "delta").count(),
+        2,
+        "both lines must reach the live view, got: {order:?}"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_denies_write_tool_in_planning() {
     // Quality H1: ToolFilter is re-checked at dispatch. In Planning, write

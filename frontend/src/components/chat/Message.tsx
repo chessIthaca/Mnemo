@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-import { useState, memo } from "react";
+import { useState, useEffect, useRef, memo } from "react";
 import { ChevronDown, ChevronRight, Compass, ExternalLink, Image as ImageIcon } from "lucide-react";
 import { Markdown } from "./Markdown";
 import { InlineMarkdown } from "./InlineMarkdown";
@@ -11,7 +11,7 @@ import { CodeBlock } from "./CodeBlock";
 import { UnifiedDiffView } from "./DiffView";
 import { openDiffInViewer, openFileInViewer } from "../../lib/openFile";
 import { openExternal } from "../../lib/openExternal";
-import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
+import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
 import { arePropsEqual, type MessageProps } from "../../lib/messageEquality";
 import { toolImagePaths, ToolImage } from "./ToolImage";
 import { useAgentStore } from "../../hooks/useAgentStore";
@@ -543,6 +543,27 @@ function ToolCard({
       ? "text-red-400"
       : "text-slate-400";
 
+  // Live output tail (backlog 7e6385b3): while a call is still RUNNING, show
+  // what the command has printed so far instead of leaving the user blind
+  // until it exits. Only a running call may contribute — the result replaces
+  // the tail (the reducer clears it on tool_result), so a finished card can
+  // never show a stale preview, and a chunk that lost the race against its own
+  // result is dropped reducer-side. At most one call per card carries a tail
+  // in practice (only `shell` streams, and shell never merges — the reducer's
+  // neverGroups); the `find` keeps the render total regardless.
+  const liveOutput = calls.find((c) => c.result === null && c.liveOutput)?.liveOutput ?? "";
+  // Only the newest lines reach the DOM (the reducer's 16 KiB window is what
+  // makes a scroll-back possible; this bounds the node re-rendered per chunk).
+  const liveTail = liveTailPreview(liveOutput);
+  const liveTailRef = useRef<HTMLPreElement | null>(null);
+  // Follow the tail as chunks arrive: the retained window is capped (16 KiB in
+  // the reducer, 12em here), so the NEWEST lines are the point — the same
+  // stick-to-bottom idiom as InflightBar's reasoning panel.
+  useEffect(() => {
+    const el = liveTailRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [liveTail]);
+
   return (
     <div className="py-[0.125em]">
       {/* span (role=button) instead of <button> so the nested file-link chips
@@ -645,6 +666,21 @@ function ToolCard({
           </span>
         )}
       </span>
+      {/* The live tail sits under the header (above the collapsed detail) and
+          announces itself politely: a multi-minute build shows progress
+          without expanding the card, and screen readers hear the newest lines
+          instead of a silent gap. Only the newest lines are rendered; the FULL
+          text (byte-identical — what the model consumes) still arrives with
+          the result. This block is display-only. */}
+      {liveTail !== "" && (
+        <pre
+          ref={liveTailRef}
+          aria-live="polite"
+          className="mt-[0.15em] max-h-[12em] overflow-auto whitespace-pre-wrap break-words rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-400"
+        >
+          {liveTail}
+        </pre>
+      )}
       {searchNotes.length > 0 && (
         <div className="mt-[0.15em] space-y-[0.15em]">
           {searchNotes.map((n) => (

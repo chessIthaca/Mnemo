@@ -170,6 +170,33 @@ describe("arePropsEqual", () => {
     expect(arePropsEqual({ entry: base }, { entry: { ...base, index: 2 } })).toBe(false);
   });
 
+  it("tool: a replaced calls array re-renders — the live-output append path", () => {
+    // The reducer/store build a NEW calls array on every mutation; that (and
+    // nothing else) is what makes a streaming tool card re-render as its live
+    // output tail grows (tool_output_delta) while a finalized card stays put.
+    const call: ToolInvocation = { id: "c1", index: 0, args: "{}", result: null };
+    const entry: TranscriptEntry = { kind: "tool", name: "shell", calls: [call] };
+    expect(arePropsEqual({ entry }, { entry })).toBe(true);
+
+    // A chunk arrives: the tail is appended into a fresh invocation + array.
+    const grown: TranscriptEntry = {
+      kind: "tool",
+      name: "shell",
+      calls: [{ ...call, liveOutput: "one\n" }],
+    };
+    expect(arePropsEqual({ entry }, { entry: grown })).toBe(false);
+
+    // The result lands: same discipline (fresh array), tail cleared.
+    const done: TranscriptEntry = {
+      kind: "tool",
+      name: "shell",
+      calls: [
+        { ...call, liveOutput: undefined, result: { success: true, output: "one\ntwo\n" } },
+      ],
+    };
+    expect(arePropsEqual({ entry: grown }, { entry: done })).toBe(false);
+  });
+
   it("unknown kind re-renders (default case)", () => {
     expect(
       arePropsEqual(

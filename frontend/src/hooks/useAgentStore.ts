@@ -107,6 +107,7 @@ import {
   MAX_CALLS_PER_TOOL_CARD,
   MAX_PLAN_DIFFS,
   appendAnswerEntry,
+  appendLiveOutputTail,
   applyAgentEvent,
   type AppStateLike,
   type Effects,
@@ -526,6 +527,18 @@ interface AppState extends AppStateLike {
   applyToolCallArgDeltas: (
     id: AgentId,
     deltas: Array<{ index: number; fragment: string }>,
+  ) => void;
+  /**
+   * Apply one or more `tool_output_delta` chunks for an agent in a *single*
+   * store update (the batched equivalent of repeated `reduceToolOutputDelta`
+   * calls): clones the transcript once, then appends every chunk to its
+   * running call's `liveOutput` tail under the same head-drop cap. This is a
+   * DISPLAY-ONLY live view — the complete text still arrives with the call's
+   * result, which is what the model consumes.
+   */
+  applyToolOutputDeltas: (
+    id: AgentId,
+    deltas: Array<{ tool_call_id: string; text: string }>,
   ) => void;
   /**
    * Clear an agent's conversation: wipe the transcript, streaming text,
@@ -1104,6 +1117,46 @@ export const useAgentStore = create<AppState>((set, get) => ({
         },
       };
     }),
+
+  applyToolOutputDeltas: (id, deltas) => {
+    if (deltas.length === 0) return;
+    set((s) => {
+      const agent = getOrCreate(s.agents, id);
+      // Clone transcript once for the whole batch.
+      const transcript = [...agent.transcript];
+      let matched = false;
+      for (const delta of deltas) {
+        for (let i = transcript.length - 1; i >= 0; i--) {
+          const entry = transcript[i];
+          if (entry.kind !== "tool") continue;
+          const callIdx = entry.calls.findIndex(
+            (c) => c.id === delta.tool_call_id && c.result === null,
+          );
+          if (callIdx === -1) continue;
+          const calls = [...entry.calls];
+          calls[callIdx] = {
+            ...calls[callIdx],
+            liveOutput: appendLiveOutputTail(calls[callIdx].liveOutput, delta.text),
+          };
+          transcript[i] = { ...entry, calls };
+          matched = true;
+          break;
+        }
+      }
+      // Nothing matched — a chunk for an unknown or already-finished call, the
+      // routine case for a batch the dispatcher flushed just ahead of its
+      // `tool_result`. Return the CURRENT state object: zustand treats it as
+      // "no change" and skips notifying subscribers, so a stray chunk costs no
+      // render. The reducer path carries the same no-op contract.
+      if (!matched) return s;
+      return {
+        agents: {
+          ...s.agents,
+          [id]: { ...agent, transcript },
+        },
+      };
+    });
+  },
 
   applyToolCallArgDeltas: (id, deltas) =>
     set((s) => {

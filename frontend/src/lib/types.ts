@@ -179,6 +179,18 @@ export type SerializableAgentEvent =
   | { kind: "tool_call_start"; index: number; id: string; name: string }
   | { kind: "tool_call_arg_delta"; index: number; fragment: string }
   | {
+      /** Live output from a RUNNING tool (today only `shell`), one chunk per
+       *  throttle window (>= 60 ms or >= 8 KiB, so <= ~16 chunks/s per
+       *  stream). DISPLAY-ONLY: the complete text still arrives on the call's
+       *  `tool_result`, which is what the model consumes — the reducer
+       *  therefore drops a chunk whose call already has a result (a
+       *  timed-out/cancelled reader can emit one after the fact). */
+      kind: "tool_output_delta";
+      tool_call_id: string;
+      stream: "stdout" | "stderr";
+      text: string;
+    }
+  | {
       kind: "approval_request";
       tool_call_id: string;
       tool_name: string;
@@ -403,6 +415,13 @@ export interface ToolInvocation {
   index: number; // correlates arg-delta fragments during streaming
   args: string;
   result: ToolResult | null; // null = still running
+  /**
+   * Live output tail while the call is running — appended by
+   * `tool_output_delta` chunks (the reducer keeps only the last
+   * `LIVE_OUTPUT_CAP` chars) and cleared the moment `result` lands. Rendered
+   * as the card's live preview; the expanded body still shows the full result.
+   */
+  liveOutput?: string;
 }
 
 // Transcript entry types (for the chat view).

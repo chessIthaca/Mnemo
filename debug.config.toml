@@ -48,8 +48,8 @@ show_token_usage = true
 # Command-aware filtering of shell tool output before it reaches the
 # transcript. Defaults to enabled with no overrides — known commands
 # (cargo build/test, npm test/build, git status) are filtered out of the box;
-# error-marked lines are never dropped and the raw output stays in the
-# Output tab.
+# error-marked lines are never dropped and the raw unfiltered output stays
+# in the tool result's `data` field.
 # enabled = true
 #
 # [[shell_filter.override]]

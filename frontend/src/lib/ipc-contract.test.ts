@@ -38,6 +38,7 @@ import textDelta from "./ipc-fixtures/event-text-delta.json";
 import reasoningDelta from "./ipc-fixtures/event-reasoning-delta.json";
 import toolCallStart from "./ipc-fixtures/event-tool-call-start.json";
 import toolCallArgDelta from "./ipc-fixtures/event-tool-call-arg-delta.json";
+import toolOutputDelta from "./ipc-fixtures/event-tool-output-delta.json";
 import approvalRequest from "./ipc-fixtures/event-approval-request.json";
 import approvalRequestNewFile from "./ipc-fixtures/event-approval-request-new-file.json";
 import approvalRequestNullPreview from "./ipc-fixtures/event-approval-request-null-preview.json";
@@ -162,6 +163,20 @@ describe("IPC contract — event fixtures dispatch through the reducer", () => {
     useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: toolCallArgDelta }));
     const tool = agent(ID).transcript.find((e) => e.kind === "tool");
     if (tool && tool.kind === "tool") expect(tool.calls[0].args).toBe('{"cmd":');
+  });
+
+  it("event-tool-output-delta: appends the live tail to the RUNNING call", () => {
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: toolCallStart }));
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: toolOutputDelta }));
+    const tool = agent(ID).transcript.find((e) => e.kind === "tool");
+    if (!tool || tool.kind !== "tool") {
+      throw new Error("the start fixture must have pushed a tool card — a guard would pass vacuously");
+    }
+    // The fixture pair IS the contract: the delta's tool_call_id ("call-1")
+    // matches the start fixture's id, so it lands on that running call as the
+    // live tail — and the call stays result-less (display-only).
+    expect(tool.calls[0].liveOutput).toBe("line\n");
+    expect(tool.calls[0].result).toBeNull();
   });
 
   it("event-approval-request: records a pending approval with a diff preview", () => {

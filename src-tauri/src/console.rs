@@ -251,6 +251,10 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         },
         AgentEvent::ToolCallStart { name, .. } => Rendered::Lines(vec![format!("→ {name}")]),
         AgentEvent::ToolCallArgDelta { .. } => Rendered::Silent,
+        // Live partial output is a UI affordance, not console text: the console
+        // prints the FULL result when the call finishes, so streaming chunks
+        // here would duplicate every line (and interleave two calls' output).
+        AgentEvent::ToolOutputDelta { .. } => Rendered::Silent,
         AgentEvent::ToolResult { result, .. } => Rendered::Lines(render_tool_result(result)),
         AgentEvent::Usage {
             prompt_tokens,

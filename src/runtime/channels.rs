@@ -194,6 +194,21 @@ pub enum AgentEvent {
     },
     /// A fragment of a tool-call's arguments.
     ToolCallArgDelta { index: u32, fragment: String },
+    /// A chunk of a running tool call's output — the LIVE VIEW of a call that
+    /// has not finished yet (user request 2027-01-16: `shell` used to show
+    /// nothing until the child exited).
+    ///
+    /// DISPLAY-ONLY: what the model consumes is the final
+    /// [`AgentEvent::ToolResult`], which carries the complete output. Chunks
+    /// arrive in per-stream order and always precede the matching `ToolResult`
+    /// (the tool joins its readers before returning). A consumer must ignore a
+    /// delta whose call already has a result — a timed-out or cancelled call can
+    /// leave a reader emitting after its result was sent.
+    ToolOutputDelta {
+        tool_call_id: String,
+        stream: crate::tool::ToolOutputStream,
+        text: String,
+    },
     /// The agent requests approval for a mutating action.
     ///
     /// `core_operation` is true when the call is a core operation (e.g.
@@ -523,6 +538,14 @@ pub enum SerializableAgentEvent {
         index: u32,
         fragment: String,
     },
+    /// A chunk of a running tool call's output. See
+    /// [`AgentEvent::ToolOutputDelta`] — display-only, stream-ordered, and
+    /// always ahead of the matching `ToolResult`.
+    ToolOutputDelta {
+        tool_call_id: String,
+        stream: crate::tool::ToolOutputStream,
+        text: String,
+    },
     ApprovalRequest {
         tool_call_id: String,
         tool_name: String,
@@ -723,6 +746,19 @@ impl AgentEvent {
             },
             AgentEvent::ToolCallArgDelta { index, fragment } => SerializedEvent {
                 event: SerializableAgentEvent::ToolCallArgDelta { index, fragment },
+                approval_sender: None,
+                question_sender: None,
+            },
+            AgentEvent::ToolOutputDelta {
+                tool_call_id,
+                stream,
+                text,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::ToolOutputDelta {
+                    tool_call_id,
+                    stream,
+                    text,
+                },
                 approval_sender: None,
                 question_sender: None,
             },

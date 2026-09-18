@@ -153,6 +153,10 @@ struct DeltaBucket {
 /// - A flush is triggered by (a) a non-delta event for the same agent
 ///   (structural flush — order is preserved: the deltas are emitted before the
 ///   structural event), (b) a 16 ms timer, or (c) a per-bucket 64 KiB cap.
+/// - `ToolOutputDelta` (a running tool's live output) is deliberately NOT
+///   bucketed: the tool that owns the child already throttles its own stream
+///   (>= 60 ms between chunks, ~16/s), so it rides the structural pass-through
+///   below — in order, behind any pending text deltas for that agent.
 /// - Deltas for OTHER agents are never flushed by an unrelated event — each
 ///   agent's stream stays independent.
 /// - `flush` returns the events to emit; it never emits itself (pure, so the

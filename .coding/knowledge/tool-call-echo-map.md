@@ -37,8 +37,8 @@ suppression; see "Why graph/search cards are rare" below.
 5. **Console REPL — every call printed.** `src-tauri/src/console.rs:241`
    (`render_event`): `ToolCallStart` renders `-> {name}` for every tool (line
    252); `ToolResult` renders via `render_tool_result` (line 254). The Silent
-   set is exactly `{Started, ToolCallArgDelta, ContextUsage, PromptDispatched,
-   Phase}` — no tool call is Silent. `handle_event` (lines 1175-1181) routes
+   set is exactly `{Started, ToolCallArgDelta, ToolOutputDelta, ContextUsage,
+   PromptDispatched, Phase}` — no tool call is Silent. `handle_event` (lines 1175-1181) routes
    every fanned-in event through `render_event`.
 6. **GUI result text — the ToolCard is the only surface.** (Corrected
    2027-01-05: this entry previously claimed an "Output tab" logged every

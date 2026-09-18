@@ -67,6 +67,7 @@ export default defineConfig({
       "src/lib/mdEdit.test.ts",
       "src/lib/messageEquality.test.ts",
       "src/lib/openFile.test.ts",
+      "src/lib/openChatLink.test.ts",
       "src/lib/markdownRendering.test.ts",
       "src/lib/planSteps.test.ts",
       "src/lib/promptHistory.test.ts",

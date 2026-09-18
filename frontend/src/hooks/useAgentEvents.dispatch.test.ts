@@ -86,6 +86,12 @@ function makeTimers() {
 interface Recorder {
   text: Array<[AgentId, string]>;
   reasoning: Array<[AgentId, string]>;
+  /** Flushed live-output batches, in flush order. */
+  output: Array<[AgentId, Array<{ tool_call_id: string; text: string }>]>;
+  /** Non-delta events handed to the store, in dispatch order. */
+  structural: AgentEventPayload[];
+  /** Interleaved log of output flushes and structural dispatches. */
+  order: string[];
   dispatcher: ReturnType<typeof createAgentEventDispatcher>;
   rafTools: ReturnType<typeof makeRaf>;
   timerTools: ReturnType<typeof makeTimers>;
@@ -104,10 +110,14 @@ function makeDispatcher(): Recorder {
   const now = () => clock;
   const text: Array<[AgentId, string]> = [];
   const reasoning: Array<[AgentId, string]> = [];
+  const output: Array<[AgentId, Array<{ tool_call_id: string; text: string }>]> = [];
+  const structural: AgentEventPayload[] = [];
+  const order: string[] = [];
   const dispatcher = createAgentEventDispatcher({
     textBuffers: new Map(),
     reasoningBuffers: new Map(),
     argBuffers: new Map(),
+    outputBuffers: new Map(),
     rafId: { current: 0 },
     timerId: { current: null },
     raf: rafTools.raf,
@@ -122,9 +132,26 @@ function makeDispatcher(): Recorder {
       reasoning.push([id, t]);
     },
     applyToolCallArgDeltas: () => {},
-    handleAgentEvent: () => {},
+    applyToolOutputDeltas: (id, deltas) => {
+      output.push([id, deltas]);
+      for (const d of deltas) order.push(`output:${id}:${d.tool_call_id}:${d.text}`);
+    },
+    handleAgentEvent: (payload) => {
+      structural.push(payload);
+      order.push(`event:${payload.event.kind}`);
+    },
   });
-  return { text, reasoning, dispatcher, rafTools, timerTools, advance: (ms) => (clock += ms) };
+  return {
+    text,
+    reasoning,
+    output,
+    structural,
+    order,
+    dispatcher,
+    rafTools,
+    timerTools,
+    advance: (ms) => (clock += ms),
+  };
 }
 
 function textDelta(id: AgentId, text: string): AgentEventPayload {
@@ -133,6 +160,27 @@ function textDelta(id: AgentId, text: string): AgentEventPayload {
 
 function reasoningDelta(id: AgentId, text: string): AgentEventPayload {
   return { agent_id: id, event: { kind: "reasoning_delta", text } };
+}
+
+/** A live-output chunk for one running call. */
+function outputDelta(id: AgentId, toolCallId: string, text: string): AgentEventPayload {
+  return {
+    agent_id: id,
+    event: { kind: "tool_output_delta", tool_call_id: toolCallId, stream: "stdout", text },
+  };
+}
+
+/** The result that ends `toolCallId` — the structural event whose ordering
+ *  against a buffered live chunk is pinned below. */
+function toolResult(id: AgentId, toolCallId: string): AgentEventPayload {
+  return {
+    agent_id: id,
+    event: {
+      kind: "tool_result",
+      tool_call_id: toolCallId,
+      result: { success: true, output: "done" },
+    },
+  };
 }
 
 describe("createAgentEventDispatcher delta buffering (hybrid flush policy)", () => {
@@ -249,28 +297,70 @@ describe("createAgentEventDispatcher delta buffering (hybrid flush policy)", () 
     expect(timerTools.count()).toBe(0);
   });
 
+  it("live tool output coalesces per flush, one store write per running call", () => {
+    const { output, dispatcher, rafTools } = makeDispatcher();
+    // The first chunk flushes immediately (same hybrid policy as the other
+    // deltas) — the card shows the first line without waiting for a frame.
+    dispatcher.dispatch(outputDelta(1, "call-1", "one\n"));
+    expect(output).toEqual([[1, [{ tool_call_id: "call-1", text: "one\n" }]]]);
+    // Dense follow-ups (a chatty command's 8 KiB chunks) buffer instead of
+    // re-rendering the transcript per chunk, and coalesce per call.
+    dispatcher.dispatch(outputDelta(1, "call-1", "two\n"));
+    dispatcher.dispatch(outputDelta(1, "call-1", "three\n"));
+    dispatcher.dispatch(outputDelta(1, "call-2", "other\n"));
+    expect(output.length).toBe(1);
+    rafTools.fire();
+    expect(output[1]).toEqual([
+      1,
+      [
+        { tool_call_id: "call-1", text: "two\nthree\n" },
+        { tool_call_id: "call-2", text: "other\n" },
+      ],
+    ]);
+  });
+
+  it("a buffered live chunk flushes BEFORE the structural event that follows it — never after the result", () => {
+    const { order, dispatcher } = makeDispatcher();
+    dispatcher.dispatch(outputDelta(1, "call-1", "one\n")); // immediate flush
+    dispatcher.dispatch(outputDelta(1, "call-1", "two\n")); // buffered
+    dispatcher.dispatch(toolResult(1, "call-1"));
+    // The pending chunk reaches the store as its own write BEFORE the result
+    // is dispatched, so a live tail can never land in a card whose result has
+    // already replaced it (the reducer's own guard is the second line of
+    // defence, for chunks that lose the race on the Rust side).
+    expect(order).toEqual([
+      "output:1:call-1:one\n",
+      "output:1:call-1:two\n",
+      "event:tool_result",
+    ]);
+  });
+
   it("clearStreamingBuffer drains buffers AND cancels the pending frame + fallback timer", () => {
     const textBuffers = new Map<AgentId, string>([[1, "pending text"]]);
     const reasoningBuffers = new Map<AgentId, string>([[1, "pending reasoning"]]);
     const argBuffers = new Map<AgentId, Map<number, string>>([
       [1, new Map([[0, "frag"]])],
     ]);
+    const outputBuffers = new Map<AgentId, Map<string, string>>([
+      [1, new Map([["call-1", "live output"]])],
+    ]);
     const rafIdRef = { current: 7 };
     const timerIdRef: { current: ReturnType<typeof setTimeout> | null } = { current: 42 };
     const cancelledFrames: number[] = [];
     const cancelledTimers: Array<ReturnType<typeof setTimeout>> = [];
     drainStreamingBuffer(
-      { textBuffers, reasoningBuffers, argBuffers, rafIdRef, timerIdRef },
+      { textBuffers, reasoningBuffers, argBuffers, outputBuffers, rafIdRef, timerIdRef },
       1,
       {
         cancelFrame: (id) => cancelledFrames.push(id),
         cancelTimer: (id) => cancelledTimers.push(id),
       },
     );
-    // All three buffers for the cleared agent are drained…
+    // Every buffer for the cleared agent is drained…
     expect(textBuffers.size).toBe(0);
     expect(reasoningBuffers.size).toBe(0);
     expect(argBuffers.size).toBe(0);
+    expect(outputBuffers.size).toBe(0);
     // …and the pending frame + fallback timer are cancelled and zeroed, so a
     // later frame/timer fire cannot repopulate the just-cleared conversation.
     expect(cancelledFrames).toEqual([7]);
@@ -283,12 +373,13 @@ describe("createAgentEventDispatcher delta buffering (hybrid flush policy)", () 
     const textBuffers = new Map<AgentId, string>([[2, "other agent's text"]]);
     const reasoningBuffers = new Map<AgentId, string>();
     const argBuffers = new Map<AgentId, Map<number, string>>();
+    const outputBuffers = new Map<AgentId, Map<string, string>>();
     const rafIdRef = { current: 9 };
     const timerIdRef: { current: ReturnType<typeof setTimeout> | null } = { current: 43 };
     const cancelledFrames: number[] = [];
     const cancelledTimers: Array<ReturnType<typeof setTimeout>> = [];
     drainStreamingBuffer(
-      { textBuffers, reasoningBuffers, argBuffers, rafIdRef, timerIdRef },
+      { textBuffers, reasoningBuffers, argBuffers, outputBuffers, rafIdRef, timerIdRef },
       1, // agent 1 had nothing buffered; agent 2 still does
       {
         cancelFrame: (id) => cancelledFrames.push(id),

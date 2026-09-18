@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use mnemo::provider::{ApprovalPreview, FinishReason};
 use mnemo::runtime::channels::{RecallHit, SerializableAgentEvent};
-use mnemo::tool::ToolResult;
+use mnemo::tool::{ToolOutputStream, ToolResult};
 use mnemo::workflow::WorkflowState;
 
 use serde_json::{json, Value};
@@ -106,6 +106,14 @@ fn event_fixtures_match_serde() {
             SerializableAgentEvent::ToolCallArgDelta {
                 index: 0,
                 fragment: "{\"cmd\":".into(),
+            },
+        ),
+        (
+            "event-tool-output-delta",
+            SerializableAgentEvent::ToolOutputDelta {
+                tool_call_id: "call-1".into(),
+                stream: ToolOutputStream::Stdout,
+                text: "line\n".into(),
             },
         ),
         (

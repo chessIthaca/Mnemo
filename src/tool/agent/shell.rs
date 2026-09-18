@@ -8,6 +8,13 @@
 //! Working directory is confined to the project sandbox. Commands are bounded
 //! by a default timeout; on expiry the child is killed (`kill_on_drop`).
 //!
+//! LIVE OUTPUT (user request 2027-01-16): both pipes are read incrementally by
+//! two reader tasks while the child runs, and throttled, UTF-8-safe chunks go
+//! to the call's [`OutputSink`] so the tool card shows progress live instead of
+//! one wall of text at exit. The live view is display-only and capped; the
+//! returned [`ToolResult`] is byte-for-byte what the non-streaming path
+//! produced and carries the FULL output.
+//!
 //! GREP NUDGE: results of grep-family commands (grep/rg/git grep/findstr/
 //! Select-String, including piped segments) carry a one-line advisory
 //! pointing at the cheaper dedicated tools — `search` for file-content
@@ -16,23 +23,48 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::config::ShellFilterConfig;
 use crate::provider::ToolSchema;
+use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
-use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
+use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
 /// Default maximum wall-clock time a shell command may run before it is
 /// killed. Five minutes covers typical builds/tests without hanging the agent
 /// forever on a stuck process.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Live-view flush cadence: a stream emits at most every 60 ms (~16 emits/s),
+/// far below the per-token chatter that once drove the WebView2 inbound-SEND
+/// backlog (AppHangB1, 2026-08-20) and coarse enough that the forwarder needs
+/// no special batching for these events.
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(60);
+
+/// Live-view flush size: emit early once this much is pending, so a burst of
+/// newline-free output (a progress bar, a minified bundle dump) is not held
+/// invisible behind the timer.
+const STREAM_FLUSH_BYTES: usize = 8 * 1024;
+
+/// Live-view byte cap PER CALL (stdout + stderr together). Past it further
+/// chunks are clamped to what still fits and the call's live view gets ONE
+/// truncation note (both readers share the flag); the final [`ToolResult`] is
+/// unaffected — it always carries the complete output.
+const STREAM_CAP: usize = 256 * 1024;
+
+/// The one-time note appended to the live view when [`STREAM_CAP`] is reached.
+const STREAM_TRUNCATION_NOTE: &str =
+    "\n[live output truncated — the full text is in the result]\n";
 
 /// The one-line advisory prepended to results of grep-family commands.
 /// Steering: `search` is the sandboxed, content-indexed text-search tool;
@@ -238,10 +270,12 @@ impl Tool for ShellTool {
             "shell",
             "Execute a shell command — PowerShell on Windows, sh on Unix. Requires \
              approval. A result is 'successful' when the command RAN: check the exit code \
-             to see whether it failed. Output is capped (~100 KiB) with a truncation note, \
-             and well-known commands (cargo build/test, npm test/build, git status) are \
+             to see whether it failed. Output streams live into the tool card while the \
+             command runs; the RESULT is capped (~100 KiB) with a truncation note, and \
+             well-known commands (cargo build/test, npm test/build, git status) are \
              noise-filtered — errors, warnings and summaries always survive, and the raw \
-             output stays in the Output tab. Commands exceeding the timeout are killed.",
+             stdout/stderr ride the result's data field. Commands exceeding the timeout \
+             are killed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -275,6 +309,16 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        // ONE capture path: the live view observes the plain path, it never
+        // forks it — the same code produces both results, and the
+        // byte-identical-result test below pins that.
+        self.execute_streaming(args, OutputSink::none()).await
+    }
+
+    /// Execute with a live partial-output sink. See the module docs: the sink
+    /// receives throttled, UTF-8-safe chunks while the child runs, while the
+    /// returned result is exactly what [`Tool::execute`] returns.
+    async fn execute_streaming(&self, args: serde_json::Value, sink: OutputSink) -> ToolResult {
         let args: ShellArgs = match serde_json::from_value(args) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
@@ -307,29 +351,86 @@ impl Tool for ShellTool {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to execute command: {e}")),
         };
 
-        // Bound the wait. On timeout the `wait_with_output` future is dropped,
-        // which drops the Child; `kill_on_drop(true)` then kills the process.
-        // The same path covers agent-interrupt cancellation of this future.
-        let output = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                let label = format_duration(self.timeout);
-                return ToolResult::error(format!(
-                    "command timed out after {label} and was killed"
-                ));
-            }
+        // Take both pipes so two reader tasks can stream them while the child
+        // runs — they are `Some` because both were piped just above.
+        let stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let streamed = Arc::new(AtomicUsize::new(0));
+        // ONE truncation note per CALL, not per stream: both readers share this
+        // flag and the card renders a single merged tail, so a call whose stdout
+        // and stderr both reach the budget still says it once.
+        let noted = Arc::new(AtomicBool::new(false));
+        let out_task = tokio::spawn(pump_stream(
+            stdout_pipe,
+            ToolOutputStream::Stdout,
+            sink.clone(),
+            Arc::clone(&streamed),
+            Arc::clone(&noted),
+        ));
+        let err_task = tokio::spawn(pump_stream(
+            stderr_pipe,
+            ToolOutputStream::Stderr,
+            sink,
+            Arc::clone(&streamed),
+            Arc::clone(&noted),
+        ));
+        // Abort the readers if this call never reaches the join below: an agent
+        // interrupt DROPS this future, and dropping a `JoinHandle` does not
+        // cancel its task — an orphaned reader would otherwise keep emitting
+        // into a card whose synthetic result already landed.
+        let mut readers = ReaderGuard {
+            out: out_task,
+            err: err_task,
         };
 
-        match output {
-            Ok(output) => {
-                let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let code = output.status.code().unwrap_or(-1);
+        // Bound the wait. The child is MOVED INTO the future: on timeout the
+        // future is dropped, which drops the Child, and `kill_on_drop(true)`
+        // then kills the process — the guarantee `wait_with_output` gave by
+        // consuming it. The same path covers agent-interrupt cancellation of
+        // this future.
+        let status =
+            match tokio::time::timeout(self.timeout, async move { child.wait().await }).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    // Nothing may keep streaming after this call returns: abort
+                    // BOTH readers and WAIT for the cancellation to land — a
+                    // reader mid-poll on another worker can otherwise still emit
+                    // a chunk after the error result. `abort` takes effect at
+                    // the reader's next await point, so these awaits return
+                    // promptly; the guard's Drop then re-aborts the finished
+                    // tasks, which is a no-op.
+                    readers.out.abort();
+                    readers.err.abort();
+                    let _ = (&mut readers.out).await;
+                    let _ = (&mut readers.err).await;
+                    let label = format_duration(self.timeout);
+                    return ToolResult::error(format!(
+                        "command timed out after {label} and was killed"
+                    ));
+                }
+            };
+
+        // Join both readers BEFORE returning the result, so on this path every
+        // delta lands on the fan-in channel ahead of the ToolResult (same FIFO
+        // channel). That ordering is a property of a call that COMPLETES here: a
+        // timed-out call awaits the aborted readers above, but a dropped
+        // (interrupted) call can still leave a reader emitting after its
+        // synthetic result — which is why every consumer ALSO gates on the call
+        // having no result yet (the frontend reducers drop such a chunk) instead
+        // of trusting arrival order alone.
+        let stdout_bytes = (&mut readers.out).await.unwrap_or_default();
+        let stderr_bytes = (&mut readers.err).await.unwrap_or_default();
+
+        match status {
+            Ok(status) => {
+                let raw_stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+                let raw_stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+                let code = status.code().unwrap_or(-1);
                 // Command-aware noise filtering (PandaFilter idea, in-process).
                 // Shapes ONLY the `output` field shown to the LLM — the raw
                 // stdout/stderr (kept separately below) stay untouched in
@@ -387,6 +488,163 @@ impl Tool for ShellTool {
             }
             Err(e) => ToolResult::error(format!("failed to execute command: {e}")),
         }
+    }
+}
+
+/// Owns both reader tasks and ABORTS them when dropped, so a call that never
+/// reaches the join — the tool future is dropped by an agent interrupt — still
+/// stops streaming into a card whose synthetic result already landed. Aborting
+/// an already-finished task is a no-op, so the success and timeout paths can
+/// hold this guard while awaiting the handles through `&mut`.
+struct ReaderGuard {
+    out: JoinHandle<Vec<u8>>,
+    err: JoinHandle<Vec<u8>>,
+}
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.out.abort();
+        self.err.abort();
+    }
+}
+
+/// Pump one child pipe to EOF: every byte lands in the returned `Vec` (the
+/// final result's source of truth), while the live view receives throttled,
+/// UTF-8-safe chunks through `sink`.
+///
+/// Throttle: emit when [`STREAM_FLUSH_INTERVAL`] has passed since the last
+/// emit, or the pending buffer reached [`STREAM_FLUSH_BYTES`], or the pipe hit
+/// EOF — a short command must not wait the timer out. The interval is enforced
+/// by a TIMER arm, not merely checked when bytes arrive, so a command that
+/// prints one line and then works quietly still shows that line promptly.
+/// Only complete UTF-8 sequences are emitted, so a multi-byte character split
+/// across two reads never surfaces as a replacement char in the live view.
+async fn pump_stream<R>(
+    mut pipe: R,
+    stream: ToolOutputStream,
+    sink: OutputSink,
+    streamed: Arc<AtomicUsize>,
+    noted: Arc<AtomicBool>,
+) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut all: Vec<u8> = Vec::new();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut last_emit = Instant::now();
+    let live = sink.is_active();
+    let mut buf = [0u8; 4096];
+    loop {
+        tokio::select! {
+            read = pipe.read(&mut buf) => {
+                let n = match read {
+                    // EOF — or a read error on a killed child's pipe: either way
+                    // the bytes already read stand, and the result is what it
+                    // would have been for a short read.
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                all.extend_from_slice(&buf[..n]);
+                if !live {
+                    continue;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                if last_emit.elapsed() >= STREAM_FLUSH_INTERVAL
+                    || pending.len() >= STREAM_FLUSH_BYTES
+                {
+                    emit_pending(&mut pending, false, stream, &sink, &streamed, &noted);
+                    last_emit = Instant::now();
+                }
+            }
+            // TIMER arm: flush a pending chunk once the interval has elapsed
+            // with no further bytes. Without it the throttle would only be
+            // EVALUATED when data arrives, so a line printed just before a quiet
+            // stretch — or a sub-interval burst, which `last_emit.elapsed()` is
+            // still too young to flush — would sit invisible until the next
+            // output or EOF, the very "looks like a hang" gap this feature
+            // removes. Guarded on `live` + pending so an idle read costs no
+            // wakeups, and re-armed from `last_emit` so a flush resets it.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                last_emit + STREAM_FLUSH_INTERVAL,
+            )), if live && !pending.is_empty() => {
+                emit_pending(&mut pending, false, stream, &sink, &streamed, &noted);
+                last_emit = Instant::now();
+            }
+        }
+    }
+    if live {
+        // Final flush: decode the whole remainder (nothing follows it, so an
+        // incomplete trailing sequence may decode lossily here — the result
+        // lossy-decodes those same bytes identically).
+        emit_pending(&mut pending, true, stream, &sink, &streamed, &noted);
+    }
+    all
+}
+
+/// Emit the longest UTF-8-complete prefix of `pending` to the live view,
+/// carrying an incomplete trailing sequence over to the next flush (unless
+/// `force`, which decodes the whole remainder).
+///
+/// Enforces the per-call budget: past [`STREAM_CAP`] a chunk is CLAMPED to what
+/// still fits, ONE note goes to the live view for the whole call (both readers
+/// share `noted`), and nothing more is emitted — while [`pump_stream`]'s
+/// accumulator keeps capturing, so the result stays complete.
+fn emit_pending(
+    pending: &mut Vec<u8>,
+    force: bool,
+    stream: ToolOutputStream,
+    sink: &OutputSink,
+    streamed: &AtomicUsize,
+    noted: &AtomicBool,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let cut = if force {
+        pending.len()
+    } else {
+        std::str::from_utf8(pending).map_or_else(|e| e.valid_up_to(), |_| pending.len())
+    };
+    if cut == 0 {
+        return;
+    }
+    let text = String::from_utf8_lossy(&pending[..cut]).to_string();
+    pending.drain(..cut);
+    // RESERVE the budget, then clamp to what was reserved. A plain load + add
+    // would let two racing readers both spend the SAME room and overshoot
+    // [`STREAM_CAP`] together; the CAS makes the cap a real bound, because the
+    // reservation always equals what is emitted and a retry can only shrink. The
+    // note's own bytes are not counted — this is a display budget, not a wire
+    // limit.
+    let mut emit_text = text;
+    let mut used = streamed.load(Ordering::Relaxed);
+    let mut clamped = false;
+    loop {
+        let room = STREAM_CAP.saturating_sub(used);
+        if emit_text.len() > room {
+            truncate_to_boundary(&mut emit_text, room);
+            clamped = true;
+        }
+        if emit_text.is_empty() {
+            break;
+        }
+        match streamed.compare_exchange_weak(
+            used,
+            used + emit_text.len(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => used = actual,
+        }
+    }
+    if !emit_text.is_empty() {
+        sink.emit(stream, &emit_text);
+    }
+    if clamped && !noted.swap(true, Ordering::Relaxed) {
+        // The FIRST stream to be truncated says it — once for the CALL, so a
+        // card whose stdout and stderr both cross the cap still notes it once.
+        sink.emit(stream, STREAM_TRUNCATION_NOTE);
     }
 }
 
@@ -736,8 +994,8 @@ mod tests {
             "expected a collapse note, got: {}",
             result.output
         );
-        // The raw data field is untouched — the frontend Output tab still
-        // sees all four lines.
+        // The raw data field is untouched — all four lines stay in
+        // data.stdout (the card renders the filtered text).
         let raw_stdout = result.data.unwrap()["stdout"]
             .as_str()
             .expect("data.stdout")
@@ -774,5 +1032,321 @@ mod tests {
             result.output
         );
         assert!(!result.output.contains("collapsed"));
+    }
+
+    /// A sink that forwards `(stream, text)` pairs into an unbounded channel so
+    /// a test can watch the live view while — and after — the child runs.
+    fn recording_sink() -> (
+        OutputSink,
+        tokio::sync::mpsc::UnboundedReceiver<(ToolOutputStream, String)>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(move |stream, text| {
+            let _ = tx.send((stream, text.to_string()));
+        });
+        (sink, rx)
+    }
+
+    /// Platform-aware printer of `count` identical lines on stdout. On Windows
+    /// the write goes straight to the pipe via `[Console]::Out` — PowerShell's
+    /// formatter buffers `Write-Output` when stdout is redirected, which would
+    /// defeat an incremental-streaming test.
+    fn print_lines(word: &str, count: usize) -> String {
+        if cfg!(target_os = "windows") {
+            format!("1..{count} | ForEach-Object {{ [Console]::Out.WriteLine('{word}') }}")
+        } else {
+            format!("for i in $(seq 1 {count}); do echo {word}; done")
+        }
+    }
+
+    /// User request 2027-01-16: a long command must show output WHILE it runs.
+    ///
+    /// The child prints `one`, then BLOCKS until the test creates `marker.txt`,
+    /// then prints `two`. The first delta is observed before the marker exists,
+    /// and the child cannot exit before the marker exists — so the delta
+    /// provably arrived while the child was still alive. No wall-clock race:
+    /// the timeouts only bound a hang.
+    #[tokio::test]
+    async fn streams_incremental_deltas_before_the_child_exits() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "[Console]::Out.WriteLine('one'); while (-not (Test-Path marker.txt)) { \
+             Start-Sleep -Milliseconds 25 }; [Console]::Out.WriteLine('two')"
+        } else {
+            "echo one; while [ ! -f marker.txt ]; do sleep 0.05; done; echo two"
+        };
+        let (sink, mut rx) = recording_sink();
+        let call = tokio::spawn(async move {
+            tool.execute_streaming(
+                json!({"command": cmd, "purpose": "incremental streaming test"}),
+                sink,
+            )
+            .await
+        });
+        let (stream, first) = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the child never produced its first line")
+            .expect("the sink must emit at least one chunk");
+        assert_eq!(stream, ToolOutputStream::Stdout);
+        assert!(first.contains("one"), "first chunk: {first:?}");
+        // Unblock the child: its second line can only be produced after this
+        // point, and the delta above can only have been produced before it.
+        std::fs::write(dir.path().join("marker.txt"), "go").expect("write marker");
+
+        let result = tokio::time::timeout(Duration::from_secs(30), call)
+            .await
+            .expect("the call finished")
+            .expect("the call task joined");
+        assert!(result.success, "output: {}", result.output);
+        let mut streamed = first;
+        while let Ok((_, text)) = rx.try_recv() {
+            streamed.push_str(&text);
+        }
+        assert!(streamed.contains("two"), "streamed: {streamed:?}");
+        assert!(
+            result.output.contains("one") && result.output.contains("two"),
+            "result: {}",
+            result.output
+        );
+    }
+
+    /// The live view is an observer, never a second source of truth: the same
+    /// command through both paths must produce an identical result.
+    #[tokio::test]
+    async fn streaming_result_is_byte_identical_to_the_plain_path() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "[Console]::Out.WriteLine('alpha'); [Console]::Out.WriteLine('beta'); \
+             [Console]::Error.WriteLine('err-line')"
+        } else {
+            "echo alpha; echo beta; echo err-line 1>&2"
+        };
+        let plain = tool
+            .execute(json!({"command": cmd, "purpose": "byte parity"}))
+            .await;
+        let (sink, mut rx) = recording_sink();
+        let streamed = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "byte parity"}), sink)
+            .await;
+        assert!(plain.success && streamed.success, "{}", streamed.output);
+        assert_eq!(
+            plain.output, streamed.output,
+            "the LLM-facing output must be unchanged"
+        );
+        assert_eq!(plain.data, streamed.data, "raw data must be unchanged");
+        let mut live = String::new();
+        while let Ok((_, text)) = rx.try_recv() {
+            live.push_str(&text);
+        }
+        assert!(
+            live.contains("alpha") && live.contains("err-line"),
+            "the live view really carried the text: {live:?}"
+        );
+    }
+
+    /// Past `STREAM_CAP` the note is ONE per CALL, not one per stream: a call
+    /// whose stdout AND stderr both cross the budget says it once (the card
+    /// renders a single merged tail), the clamped emissions stay within the cap,
+    /// and the result keeps both streams complete.
+    #[tokio::test]
+    async fn stream_cap_note_is_once_per_call_across_both_streams() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        // ~400 KiB on stdout AND ~400 KiB on stderr — each past the 256 KiB cap.
+        let cmd = if cfg!(target_os = "windows") {
+            "$line = 'x' * 100; 1..4000 | ForEach-Object { [Console]::Out.WriteLine($line); [Console]::Error.WriteLine($line) }"
+        } else {
+            "yes | head -c 400000; yes | head -c 400000 1>&2"
+        };
+        let (sink, mut rx) = recording_sink();
+        let result = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "cap test (both streams)"}), sink)
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let mut live = String::new();
+        while let Ok((_, text)) = rx.try_recv() {
+            live.push_str(&text);
+        }
+        // The WHOLE note (newlines included): the clamped tail fills the cap
+        // exactly, so a trimmed pattern would leave 2 bytes behind.
+        let note = STREAM_TRUNCATION_NOTE;
+        assert_eq!(
+            live.matches(note).count(),
+            1,
+            "one note per CALL even when both streams cross the cap (live view: {} KiB)",
+            live.len() / 1024
+        );
+        let emitted = live.replace(note, "");
+        assert!(
+            emitted.len() <= STREAM_CAP,
+            "the live view must stay within the cap, got {} bytes",
+            emitted.len()
+        );
+        let data = result.data.as_ref().expect("data");
+        assert!(
+            data["stdout"].as_str().unwrap_or_default().len() >= 400_000,
+            "the result still carries the full stdout"
+        );
+        assert!(
+            data["stderr"].as_str().unwrap_or_default().len() >= 400_000,
+            "the result still carries the full stderr"
+        );
+    }
+
+    /// Past `STREAM_CAP` the live view is truncated once, with a note — while
+    /// the RESULT keeps the complete output.
+    #[tokio::test]
+    async fn stream_cap_emits_one_truncation_note_and_keeps_the_full_result() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        // ~400 KiB of stdout, comfortably past the 256 KiB live cap.
+        let cmd = if cfg!(target_os = "windows") {
+            "$line = 'x' * 100; 1..4000 | ForEach-Object { [Console]::Out.WriteLine($line) }"
+        } else {
+            "yes | head -c 400000"
+        };
+        let (sink, mut rx) = recording_sink();
+        let result = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "cap test"}), sink)
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let mut live = String::new();
+        while let Ok((_, text)) = rx.try_recv() {
+            live.push_str(&text);
+        }
+        // Compare and strip the WHOLE note, surrounding newlines included: the
+        // live view now fills the cap EXACTLY (chunks past it are clamped), so
+        // leaving those two newline bytes behind would read as an overrun.
+        let note = STREAM_TRUNCATION_NOTE;
+        assert_eq!(
+            live.matches(note).count(),
+            1,
+            "exactly one truncation note (live view: {} KiB)",
+            live.len() / 1024
+        );
+        let emitted = live.replace(note, "");
+        assert!(
+            emitted.len() <= STREAM_CAP,
+            "the live view must stay within the cap, got {} bytes",
+            emitted.len()
+        );
+        assert!(
+            emitted.len() > STREAM_CAP / 2,
+            "the live view should fill most of the cap, got {} bytes",
+            emitted.len()
+        );
+        let raw = result.data.as_ref().expect("data")["stdout"]
+            .as_str()
+            .expect("data.stdout");
+        assert!(
+            raw.len() >= 400_000,
+            "the RESULT must carry the full output, got {} bytes",
+            raw.len()
+        );
+    }
+
+    /// Non-UTF-8 bytes are lossy-decoded on both the live view and the result —
+    /// and never panic.
+    #[tokio::test]
+    async fn non_utf8_output_streams_lossily_without_panicking() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "$s = [Console]::OpenStandardOutput(); $s.Write([byte[]](0xFF, 0x0A), 0, 2); $s.Flush()"
+        } else {
+            "printf '\\377\\n'"
+        };
+        let (sink, mut rx) = recording_sink();
+        let result = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "lossy decode"}), sink)
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let mut live = String::new();
+        while let Ok((_, text)) = rx.try_recv() {
+            live.push_str(&text);
+        }
+        assert!(
+            live.contains('\u{FFFD}'),
+            "the live view lossy-decodes the byte, got: {live:?}"
+        );
+        let raw = result.data.as_ref().expect("data")["stdout"]
+            .as_str()
+            .expect("data.stdout");
+        assert!(raw.contains('\u{FFFD}'), "raw data: {raw:?}");
+    }
+
+    /// stderr is a separate stream on the wire, so the card can label it.
+    #[tokio::test]
+    async fn stderr_text_is_tagged_stderr() {
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let cmd = if cfg!(target_os = "windows") {
+            "[Console]::Error.WriteLine('boom-stderr')"
+        } else {
+            "echo boom-stderr 1>&2"
+        };
+        let (sink, mut rx) = recording_sink();
+        let result = tool
+            .execute_streaming(json!({"command": cmd, "purpose": "stderr tag"}), sink)
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        assert!(
+            chunks
+                .iter()
+                .any(|(s, t)| *s == ToolOutputStream::Stderr && t.contains("boom-stderr")),
+            "expected a Stderr-tagged chunk, got: {chunks:?}"
+        );
+        assert!(
+            !chunks.iter().any(|(s, _)| *s == ToolOutputStream::Stdout),
+            "nothing streamed on stdout: {chunks:?}"
+        );
+    }
+
+    /// Concurrent calls each stream to their OWN sink — the routing key is the
+    /// call, not the tool instance.
+    #[tokio::test]
+    async fn concurrent_calls_route_to_their_own_sinks() {
+        let dir = tempdir().unwrap();
+        let cmd_a = print_lines("alpha-only", 5);
+        let cmd_b = print_lines("beta-only", 5);
+        let (sink_a, mut rx_a) = recording_sink();
+        let (sink_b, mut rx_b) = recording_sink();
+        let tool_a = tool_in(dir.path());
+        let tool_b = tool_in(dir.path());
+        let call_a = tokio::spawn(async move {
+            tool_a
+                .execute_streaming(json!({"command": cmd_a, "purpose": "route a"}), sink_a)
+                .await
+        });
+        let call_b = tokio::spawn(async move {
+            tool_b
+                .execute_streaming(json!({"command": cmd_b, "purpose": "route b"}), sink_b)
+                .await
+        });
+        let (a, b) = tokio::join!(call_a, call_b);
+        assert!(a.expect("call a joined").success);
+        assert!(b.expect("call b joined").success);
+        let mut live_a = String::new();
+        while let Ok((_, text)) = rx_a.try_recv() {
+            live_a.push_str(&text);
+        }
+        let mut live_b = String::new();
+        while let Ok((_, text)) = rx_b.try_recv() {
+            live_b.push_str(&text);
+        }
+        assert!(
+            live_a.contains("alpha-only") && !live_a.contains("beta-only"),
+            "sink a: {live_a:?}"
+        );
+        assert!(
+            live_b.contains("beta-only") && !live_b.contains("alpha-only"),
+            "sink b: {live_b:?}"
+        );
     }
 }

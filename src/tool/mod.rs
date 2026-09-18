@@ -102,6 +102,64 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Which child stream a partial-output chunk came from.
+///
+/// Carried by [`OutputSink`] emissions and by the
+/// `AgentEvent::ToolOutputDelta` / `SerializableAgentEvent::ToolOutputDelta`
+/// wire form, so the UI can label stdout separately from stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// Per-call sink for PARTIAL tool output — the live view of a call that is
+/// still running (user request 2027-01-16: a long `shell` command showed
+/// nothing until it exited).
+///
+/// DISPLAY-ONLY by construction: what the sink carries never reaches the
+/// model, and it never replaces the [`ToolResult`]. A tool must return exactly
+/// the result it would return with [`OutputSink::none`] — the dispatch
+/// layer's byte-identical-result contract. A sink backed by a bounded channel
+/// may DROP a chunk when its consumer is behind; that costs live-view pixels,
+/// never correctness.
+///
+/// Shared by reference across a call's reader tasks, hence `Arc<dyn Fn>` +
+/// `Clone` rather than an `FnMut` trait object.
+#[derive(Clone)]
+pub struct OutputSink(Option<std::sync::Arc<dyn Fn(ToolOutputStream, &str) + Send + Sync>>);
+
+impl OutputSink {
+    /// A sink that discards everything — for a call nobody is watching
+    /// (direct [`Tool::execute`], unit tests, a headless sub-agent).
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Wrap `emit` as a live sink.
+    pub fn new(emit: impl Fn(ToolOutputStream, &str) + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(emit)))
+    }
+
+    /// Forward one partial chunk. Chunks arrive in per-stream order; the sink
+    /// does not coalesce — throttling belongs to the tool that owns the child.
+    pub fn emit(&self, stream: ToolOutputStream, text: &str) {
+        if let Some(emit) = &self.0 {
+            emit(stream, text);
+        }
+    }
+
+    /// Whether anyone is listening. Callers should NOT branch on this to
+    /// change what they return — one code path keeps the streamed and
+    /// non-streamed results identical.
+    pub fn is_active(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// The trait every tool implements.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -182,6 +240,22 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with parsed arguments.
     async fn execute(&self, args: Value) -> ToolResult;
+
+    /// Execute with a live partial-output sink.
+    ///
+    /// Default: ignore the sink and run [`Tool::execute`] — most tools produce
+    /// nothing worth streaming. Only a tool that owns a long-running child
+    /// process (currently `shell`) overrides this; the dispatch layer builds
+    /// one sink per call out of the agent's event channel and the tool-call id,
+    /// so concurrent calls route to their own cards.
+    ///
+    /// The returned [`ToolResult`] must be IDENTICAL to the one [`Tool::execute`]
+    /// would have produced for the same arguments: streaming is a view, never a
+    /// second source of truth.
+    async fn execute_streaming(&self, args: Value, sink: OutputSink) -> ToolResult {
+        let _ = sink;
+        self.execute(args).await
+    }
 }
 
 /// Which tools the LLM is allowed to see this turn, derived from workflow state.
@@ -1002,11 +1076,20 @@ impl ToolRegistry {
 
     /// Dispatch a tool call. Returns an error result if the tool is unknown.
     pub async fn dispatch(&self, call: &ToolCall) -> ToolResult {
+        self.dispatch_streaming(call, OutputSink::none()).await
+    }
+
+    /// Dispatch a tool call with a live partial-output sink.
+    ///
+    /// The sink is display-only ([`OutputSink`]): the returned result is
+    /// identical to [`ToolRegistry::dispatch`]'s for the same call — streaming
+    /// is a view of the call, never a second source of truth.
+    pub async fn dispatch_streaming(&self, call: &ToolCall, sink: OutputSink) -> ToolResult {
         match self.get(&call.name) {
             // The tool is an owned Arc clone (the registry's get snapshots
-            // its maps): `execute` takes `serde_json::Value` by value and
-            // runs across awaits with no borrow of the registry.
-            Some(tool) => tool.execute(call.arguments.clone()).await,
+            // its maps): `execute_streaming` takes `serde_json::Value` by value
+            // and runs across awaits with no borrow of the registry.
+            Some(tool) => tool.execute_streaming(call.arguments.clone(), sink).await,
             None => ToolResult::error(format!(
                 "unknown tool '{}'. Available: {}",
                 call.name,

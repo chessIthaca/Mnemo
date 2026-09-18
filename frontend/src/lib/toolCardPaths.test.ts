@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
-import { argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, dedupePaths, displayName, fileEditDiff, graphCallLabel, isBrowserToolName, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
+import { argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, dedupePaths, displayName, fileEditDiff, graphCallLabel, isBrowserToolName, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
 
 describe("basename", () => {
   it("returns the last path segment (forward + back slashes)", () => {
@@ -1132,5 +1132,68 @@ describe("displayName", () => {
   it("falls back to the raw name", () => {
     expect(displayName("shell")).toBe("shell");
     expect(displayName("read_files")).toBe("read_files");
+  });
+});
+
+/**
+ * Source-contract tests for the live shell output tail (backlog 7e6385b3,
+ * plan 0d2c1221): while a shell call is still running, its ToolCard shows the
+ * command's output as it is produced instead of leaving the user blind until
+ * exit. Node-env suite (no DOM renderer), so the render site is pinned against
+ * the component source — the same pattern as the card contracts above: a
+ * regression that shows the tail on a FINISHED card, drops the running gate,
+ * or un-caps the block fails loudly here.
+ */
+describe("live shell output tail (backlog 7e6385b3)", () => {
+  const readSrc = (rel: string): string =>
+    readFileSync(new URL(rel, import.meta.url), "utf8");
+
+  it("liveTailPreview keeps the newest lines and caps from the END", () => {
+    // Everything fits: returned verbatim (a trailing newline included, so a
+    // half-printed line still reads as one).
+    expect(liveTailPreview("a\nb\nc")).toBe("a\nb\nc");
+    expect(liveTailPreview("done\n")).toBe("done\n");
+    // More lines than fit → the LAST maxLines survive (progress, not history).
+    expect(liveTailPreview("1\n2\n3\n4\n5\n6\n7\n8")).toBe("3\n4\n5\n6\n7\n8");
+    // One huge line is trimmed from the FRONT — the newest chars win.
+    expect(liveTailPreview("x".repeat(500))).toBe("x".repeat(400));
+    expect(liveTailPreview("old\n" + "y".repeat(500))).toBe("y".repeat(400));
+  });
+
+  it("ToolCard shows the tail of the RUNNING call, under the header", () => {
+    const src = readSrc("../components/chat/Message.tsx");
+    // The gate keys off the running call itself (`result === null`), so a
+    // result always replaces the preview; the reducer clears liveOutput on
+    // tool_result as the second line of defence.
+    expect(src).toContain("calls.find((c) => c.result === null && c.liveOutput)");
+    expect(src).toContain('{liveTail !== "" && (');
+    // Follow the newest output (a chatty command prints far more than fits).
+    expect(src).toContain("el.scrollTop = el.scrollHeight");
+    expect(src).toContain("max-h-[12em]");
+    // Only the newest lines are rendered (the retained window is the
+    // scroll-back source, not the DOM), and the block announces itself.
+    expect(src).toContain("liveTailPreview(liveOutput)");
+    expect(src).toContain('aria-live="polite"');
+  });
+
+  it("the reducer caps the tail and clears it the moment the result lands", () => {
+    const src = readSrc("../hooks/agentEventReducer.ts");
+    // 16 KiB head-drop per running call (the card renders a tail; the FULL
+    // text arrives with the result).
+    expect(src).toContain("export const LIVE_OUTPUT_CAP = 16 * 1024;");
+    expect(src).toContain("liveOutput: appendLiveOutputTail(");
+    // tool_result clears the preview — and only a call with `result === null`
+    // is ever appended to (the late-chunk guard).
+    expect(src).toContain("liveOutput: undefined");
+    expect(src).toContain("c.id === event.tool_call_id && c.result === null");
+  });
+
+  it("the dispatcher coalesces live chunks per call instead of writing per chunk", () => {
+    const src = readSrc("../hooks/useAgentEvents.ts");
+    expect(src).toContain('payload.event.kind === "tool_output_delta"');
+    expect(src).toContain("outputBuffers");
+    // The buffers are drained on /clear like the other delta buffers, so a
+    // stale chunk cannot repopulate a cleared conversation.
+    expect(src).toContain("handle.outputBuffers.delete(id);");
   });
 });

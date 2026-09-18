@@ -15,7 +15,7 @@
 import { describe, expect, it, beforeEach } from "vitest";
 
 import { useAgentStore, aggregateTokPerSec, didMainTurnEnd, emptyAgentState, MAX_ACTIVITY_ENTRIES, MAX_TRANSCRIPT_ENTRIES, MAX_CALLS_PER_TOOL_CARD, MAX_PLAN_DIFFS, recentOutputTokPerSec } from "./useAgentStore";
-import { applyAgentEvent, DOOM_ERROR_STREAK, isUserDenialToolOutput } from "./agentEventReducer";
+import { applyAgentEvent, DOOM_ERROR_STREAK, isUserDenialToolOutput, LIVE_OUTPUT_CAP } from "./agentEventReducer";
 import type { AgentId, TranscriptEntry } from "../lib/types";
 import type { MainRunningSnapshot } from "./agentState";
 import { allocEntryId, stampEntryIds } from "./agentState";
@@ -799,6 +799,134 @@ describe("agent event reducers (table-driven)", () => {
       expect(tool.calls[0].result).toEqual({ success: true, output: "ok" });
     }
     expect(a.pendingApproval).toBeNull();
+  });
+
+  it("tool_output_delta: appends the live tail to the RUNNING call", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stdout", text: "one\n" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stderr", text: "warn\n" },
+    });
+    const tool = agent(ID).transcript.find((e) => e.kind === "tool");
+    if (!tool || tool.kind !== "tool") {
+      throw new Error("the tool card is missing — a guard that skips the assertions would pass vacuously");
+    }
+    // stdout and stderr interleave into ONE tail, in arrival order: the card
+    // shows progress, and the stream tag stays a property of the event.
+    expect(tool.calls[0].liveOutput).toBe("one\nwarn\n");
+    expect(tool.calls[0].result).toBeNull();
+  });
+
+  it("tool_output_delta: unknown id is a no-op and a chunk after the result is ignored", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stdout", text: "live" },
+    });
+    const before = agent(ID);
+    // Unknown call id → the agent state comes back untouched (not even a
+    // cloned transcript, so a stray chunk cannot cost a re-render).
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "ghost", stream: "stdout", text: "boo" },
+    });
+    expect(agent(ID).transcript).toBe(before.transcript);
+
+    // The result lands, then a late chunk arrives (a timed-out or cancelled
+    // reader on the Rust side can emit one after the fact): it must be dropped
+    // rather than resurrecting the tail of a finished card.
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_result", tool_call_id: "call-1", result: { success: true, output: "one\ntwo\n" } },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stdout", text: "LATE" },
+    });
+    const tool = agent(ID).transcript.find((e) => e.kind === "tool");
+    if (!tool || tool.kind !== "tool") {
+      throw new Error("the tool card is missing — a guard that skips the assertions would pass vacuously");
+    }
+    expect(tool.calls[0].result).toEqual({ success: true, output: "one\ntwo\n" });
+    expect(tool.calls[0].liveOutput).toBeUndefined();
+  });
+
+  it("tool_output_delta: keeps only the last LIVE_OUTPUT_CAP chars of a chatty command", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stdout", text: "A".repeat(LIVE_OUTPUT_CAP) },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_output_delta", tool_call_id: "call-1", stream: "stdout", text: "B".repeat(10) },
+    });
+    const tool = agent(ID).transcript.find((e) => e.kind === "tool");
+    if (!tool || tool.kind !== "tool") {
+      throw new Error("the tool card is missing — a guard that skips the assertions would pass vacuously");
+    }
+    const live = tool.calls[0].liveOutput ?? "";
+    expect(live.length).toBe(LIVE_OUTPUT_CAP);
+    // The newest text is kept (the tail)…
+    expect(live.endsWith("B".repeat(10))).toBe(true);
+    // …and exactly 10 head chars were dropped: the cap counts CHARS (UTF-16
+    // code units), so the surviving A-run is CAP-10 long, not CAP.
+    expect(live.split("B")[0].length).toBe(LIVE_OUTPUT_CAP - 10);
+  });
+
+  it("applyToolOutputDeltas: one batched write appends every flushed chunk", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "shell" },
+    });
+    useAgentStore.getState().applyToolOutputDeltas(ID, [
+      { tool_call_id: "call-1", text: "a" },
+      { tool_call_id: "call-2", text: "b" },
+      { tool_call_id: "call-1", text: "c" }, // second chunk for the same call
+      { tool_call_id: "ghost", text: "x" }, // unknown call → dropped
+    ]);
+    // Shell calls never merge into one card (neverGroups), so the two running
+    // calls live in two entries — and ONE batched write updated both.
+    const tools = agent(ID).transcript.filter((e) => e.kind === "tool");
+    expect(tools.length).toBe(2);
+    const first = tools[0];
+    const second = tools[1];
+    if (!first || first.kind !== "tool" || !second || second.kind !== "tool") {
+      throw new Error("both shell cards must exist — a guard would skip the assertions below");
+    }
+    expect(first.calls.length).toBe(1);
+    expect(first.calls[0].id).toBe("call-1");
+    expect(first.calls[0].liveOutput).toBe("ac");
+    expect(second.calls[0].id).toBe("call-2");
+    expect(second.calls[0].liveOutput).toBe("b");
+
+    // A batch that matches NOTHING must not write state at all: the dispatcher
+    // flushes buffered chunks just ahead of a structural event, so a batch whose
+    // calls already finished is routine, not a corner case. Returning the
+    // current state object makes zustand skip the update (no subscriber runs) —
+    // the reducer path pins the same no-op.
+    const before = agent(ID);
+    useAgentStore.getState().applyToolOutputDeltas(ID, [
+      { tool_call_id: "ghost", text: "x" },
+    ]);
+    expect(agent(ID)).toBe(before);
   });
 
   it("tool_result: captures a lastDiff snapshot for file_edit", () => {
@@ -2422,16 +2550,18 @@ describe("didMainTurnEnd (F1b turn-end edge, review L3)", () => {
 describe("revealRightPanelTab + requestFileOpen", () => {
   /** Set the tab slices to a known state for each test. */
   function setTabs(partial: {
-    rightPanelTab?: "plan" | "files" | "diff";
-    disabledTabs?: ("plan" | "files" | "diff")[];
+    rightPanelTab?: "plan" | "files" | "diff" | "browser";
+    disabledTabs?: ("plan" | "files" | "diff" | "browser")[];
     rightPanelVisible?: boolean;
     pendingFileOpen?: { path: string; line: number | null } | null;
+    pendingBrowserUrl?: string | null;
   }) {
     useAgentStore.setState({
       rightPanelTab: "plan",
       disabledTabs: [],
       rightPanelVisible: true,
       pendingFileOpen: null,
+      pendingBrowserUrl: null,
       ...partial,
     });
   }
@@ -2477,5 +2607,24 @@ describe("revealRightPanelTab + requestFileOpen", () => {
     setTabs({ pendingFileOpen: { path: "src/main.rs", line: 42 } });
     useAgentStore.getState().clearPendingFileOpen();
     expect(useAgentStore.getState().pendingFileOpen).toBeNull();
+  });
+
+  it("requestBrowserOpen reveals + selects the Browser tab and holds the URL", () => {
+    // A chat link click may arrive while the Browser tab is disabled and the
+    // panel hidden — the deep-link must enable it, select it, reveal the panel
+    // and hand the URL to BrowserView (which owns the child webview's rect).
+    setTabs({ rightPanelTab: "plan", disabledTabs: ["browser"], rightPanelVisible: false });
+    useAgentStore.getState().requestBrowserOpen("https://example.com/docs");
+    const s = useAgentStore.getState();
+    expect(s.rightPanelTab).toBe("browser");
+    expect(s.disabledTabs).not.toContain("browser");
+    expect(s.rightPanelVisible).toBe(true);
+    expect(s.pendingBrowserUrl).toBe("https://example.com/docs");
+  });
+
+  it("clearPendingBrowserUrl clears the pending URL (single-shot consume)", () => {
+    setTabs({ pendingBrowserUrl: "https://example.com/docs" });
+    useAgentStore.getState().clearPendingBrowserUrl();
+    expect(useAgentStore.getState().pendingBrowserUrl).toBeNull();
   });
 });

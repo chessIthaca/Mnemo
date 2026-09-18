@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::provider::{LlmClient, LlmEvent, Message, ToolCall};
 use crate::runtime::{AgentCommand, AgentEvent, AgentId};
 use crate::tool::agent::sandbox::Sandbox;
-use crate::tool::{ToolCall as ParsedToolCall, ToolFilter, ToolResult};
+use crate::tool::{OutputSink, ToolCall as ParsedToolCall, ToolFilter, ToolResult};
 use crate::workflow::WorkflowState;
 
 /// The file tools [`ToolFilter::ExecutingResearch`] denies wholesale — the set
@@ -473,6 +473,12 @@ impl AgentLoop {
         // on: landing commits on main / pushing to a remote always requires a
         // contemporaneous user approval.
         let force_prompt = tool.never_auto_for(&parsed_call.arguments);
+        // Live-output sink for this call: throttled partial output from a
+        // running tool is forwarded to the UI as ToolOutputDelta events tagged
+        // with this call's id, so concurrent calls land in their own cards. The
+        // sink is inert until the tool actually runs — a denied call emits
+        // nothing — and it never affects the result.
+        let output_sink = self.output_sink(fanin_tx, agent_id, &parsed_call.id);
         if force_prompt
             || approval::needs_approval(
                 safety,
@@ -501,6 +507,7 @@ impl AgentLoop {
                         cmd_rx,
                         stop_signal,
                         &mut buffered,
+                        output_sink.clone(),
                     )
                     .await;
                 return (result, buffered);
@@ -576,7 +583,14 @@ impl AgentLoop {
 
             // Approved — execute the tool, returning any buffered commands.
             let result = self
-                .dispatch_with_interrupt(&parsed_call, agent_id, cmd_rx, stop_signal, &mut buffered)
+                .dispatch_with_interrupt(
+                    &parsed_call,
+                    agent_id,
+                    cmd_rx,
+                    stop_signal,
+                    &mut buffered,
+                    output_sink.clone(),
+                )
                 .await;
             return (result, buffered);
         }
@@ -591,9 +605,44 @@ impl AgentLoop {
         // run_turn's retry tracking.
         let mut buffered = Vec::new();
         let result = self
-            .dispatch_with_interrupt(&parsed_call, agent_id, cmd_rx, stop_signal, &mut buffered)
+            .dispatch_with_interrupt(
+                &parsed_call,
+                agent_id,
+                cmd_rx,
+                stop_signal,
+                &mut buffered,
+                output_sink.clone(),
+            )
             .await;
         (result, buffered)
+    }
+
+    /// Build the live-output sink for one tool call: partial chunks are
+    /// forwarded to the UI as [`AgentEvent::ToolOutputDelta`], tagged with the
+    /// call's id so concurrent calls render in their own cards.
+    ///
+    /// `try_send` on purpose: a chunk that cannot enter the fan-in channel
+    /// (full) is DROPPED. The live view is pixels — a tool's reader task must
+    /// never block behind UI backpressure — and the call's final result carries
+    /// the complete output regardless.
+    fn output_sink(
+        &self,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        agent_id: AgentId,
+        tool_call_id: &str,
+    ) -> OutputSink {
+        let tx = fanin_tx.clone();
+        let id = tool_call_id.to_string();
+        OutputSink::new(move |stream, text| {
+            let _ = tx.try_send((
+                agent_id,
+                AgentEvent::ToolOutputDelta {
+                    tool_call_id: id.clone(),
+                    stream,
+                    text: text.to_string(),
+                },
+            ));
+        })
     }
 
     /// Grace window (milliseconds) a hard stop (Interrupt/Cancel) grants the
@@ -649,10 +698,11 @@ impl AgentLoop {
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         stop_signal: &mut Option<crate::agent::StopReason>,
         buffered: &mut Vec<AgentCommand>,
+        sink: OutputSink,
     ) -> ToolResult {
         let steering = crate::agent::steering_stats::SteeringStats::shared();
         steering.observe_call(agent_id, &parsed_call.name);
-        let tool_fut = self.tools.dispatch(parsed_call);
+        let tool_fut = self.tools.dispatch_streaming(parsed_call, sink);
         tokio::pin!(tool_fut);
         loop {
             tokio::select! {

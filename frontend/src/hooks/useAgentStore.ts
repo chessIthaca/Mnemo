@@ -107,6 +107,7 @@ import {
   MAX_CALLS_PER_TOOL_CARD,
   MAX_PLAN_DIFFS,
   appendAnswerEntry,
+  appendLiveOutputTail,
   applyAgentEvent,
   type AppStateLike,
   type Effects,
@@ -247,6 +248,15 @@ interface AppState extends AppStateLike {
    * started at; null = top of file).
    */
   pendingFileOpen: { path: string; line: number | null } | null;
+  /**
+   * The http(s) URL a chat link asked the Browser tab to load, held in the
+   * store so BrowserView can consume it on mount/change. It travels through
+   * the store because the CHILD WEBVIEW'S RECT lives in BrowserView: the chat
+   * has no rect to hand `browserWebviewEnsure`, and calling ensure with a
+   * guessed one would MOVE an already-created child to the wrong place.
+   * `null` when there is no pending open.
+   */
+  pendingBrowserUrl: string | null;
   safetyMode: SafetyMode;
   fontFamily: string;
   fontSize: number;
@@ -460,6 +470,15 @@ interface AppState extends AppStateLike {
   requestFileOpen: (path: string, line?: number | null) => void;
   /** Clear the pending file-open path (called by the FileViewer once loaded). */
   clearPendingFileOpen: () => void;
+  /**
+   * Request that the Browser tab load `url` (http(s)): reveal + select that
+   * tab and record the URL in `pendingBrowserUrl` for BrowserView to consume.
+   * Race-free (no event) — the view reads the pending URL whenever it is
+   * mounted, so it works even when the Browser tab was disabled/unmounted.
+   */
+  requestBrowserOpen: (url: string) => void;
+  /** Clear the pending browser URL (called by BrowserView once loaded). */
+  clearPendingBrowserUrl: () => void;
   /** True if a right-panel tool tab is currently enabled (not in disabledTabs). */
   isTabEnabled: (tab: RightPanelTab) => boolean;
   setSafetyMode: (m: SafetyMode) => void;
@@ -526,6 +545,18 @@ interface AppState extends AppStateLike {
   applyToolCallArgDeltas: (
     id: AgentId,
     deltas: Array<{ index: number; fragment: string }>,
+  ) => void;
+  /**
+   * Apply one or more `tool_output_delta` chunks for an agent in a *single*
+   * store update (the batched equivalent of repeated `reduceToolOutputDelta`
+   * calls): clones the transcript once, then appends every chunk to its
+   * running call's `liveOutput` tail under the same head-drop cap. This is a
+   * DISPLAY-ONLY live view — the complete text still arrives with the call's
+   * result, which is what the model consumes.
+   */
+  applyToolOutputDeltas: (
+    id: AgentId,
+    deltas: Array<{ tool_call_id: string; text: string }>,
   ) => void;
   /**
    * Clear an agent's conversation: wipe the transcript, streaming text,
@@ -634,6 +665,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   rightPanelTab: "plan",
   disabledTabs: ALL_RIGHT_PANEL_TABS.filter((t) => t !== "plan"),
   pendingFileOpen: null,
+  pendingBrowserUrl: null,
   safetyMode: "approve-each-action",
   fontFamily: readLs(LS_FONT_FAMILY, DEFAULT_FONT_FAMILY),
   fontSize: readLsNumber(LS_FONT_SIZE, DEFAULT_FONT_SIZE),
@@ -859,6 +891,17 @@ export const useAgentStore = create<AppState>((set, get) => ({
       pendingFileOpen: { path, line: line ?? null },
     })),
   clearPendingFileOpen: () => set({ pendingFileOpen: null }),
+  requestBrowserOpen: (url) =>
+    set((s) => ({
+      // Reveal + select the Browser tab (mirrors requestFileOpen) and hold the
+      // URL so BrowserView consumes it on mount/change — that view owns the
+      // child webview's rect, so ensure + navigate must happen there.
+      disabledTabs: s.disabledTabs.filter((t) => t !== "browser"),
+      rightPanelTab: "browser",
+      rightPanelVisible: true,
+      pendingBrowserUrl: url,
+    })),
+  clearPendingBrowserUrl: () => set({ pendingBrowserUrl: null }),
   autoRevealPlan: () =>
     set((s) => {
       // Only auto-reveal when the panel is currently hidden AND the Plan tab
@@ -1104,6 +1147,46 @@ export const useAgentStore = create<AppState>((set, get) => ({
         },
       };
     }),
+
+  applyToolOutputDeltas: (id, deltas) => {
+    if (deltas.length === 0) return;
+    set((s) => {
+      const agent = getOrCreate(s.agents, id);
+      // Clone transcript once for the whole batch.
+      const transcript = [...agent.transcript];
+      let matched = false;
+      for (const delta of deltas) {
+        for (let i = transcript.length - 1; i >= 0; i--) {
+          const entry = transcript[i];
+          if (entry.kind !== "tool") continue;
+          const callIdx = entry.calls.findIndex(
+            (c) => c.id === delta.tool_call_id && c.result === null,
+          );
+          if (callIdx === -1) continue;
+          const calls = [...entry.calls];
+          calls[callIdx] = {
+            ...calls[callIdx],
+            liveOutput: appendLiveOutputTail(calls[callIdx].liveOutput, delta.text),
+          };
+          transcript[i] = { ...entry, calls };
+          matched = true;
+          break;
+        }
+      }
+      // Nothing matched — a chunk for an unknown or already-finished call, the
+      // routine case for a batch the dispatcher flushed just ahead of its
+      // `tool_result`. Return the CURRENT state object: zustand treats it as
+      // "no change" and skips notifying subscribers, so a stray chunk costs no
+      // render. The reducer path carries the same no-op contract.
+      if (!matched) return s;
+      return {
+        agents: {
+          ...s.agents,
+          [id]: { ...agent, transcript },
+        },
+      };
+    });
+  },
 
   applyToolCallArgDeltas: (id, deltas) =>
     set((s) => {

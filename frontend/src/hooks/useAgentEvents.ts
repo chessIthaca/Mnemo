@@ -157,9 +157,9 @@ const nameResolutionInFlight = new Set<AgentId>();
 /**
  * Module-level handle to the mounted hook's rAF delta buffers, so callers
  * outside the hook (e.g. the `/clear` slash command) can drain them. Without
- * this, a `text_delta` / `reasoning_delta` / `tool_call_arg_delta` buffered
- * before a clear would flush on the next animation frame and repopulate the
- * just-cleared streaming state.
+ * this, a `text_delta` / `reasoning_delta` / `tool_call_arg_delta` /
+ * `tool_output_delta` buffered before a clear would flush on the next
+ * animation frame and repopulate the just-cleared streaming state.
  *
  * Registered by the hook's effect; `null` when no hook is mounted.
  */
@@ -170,6 +170,8 @@ export interface BufferHandle {
   reasoningBuffers: Map<AgentId, string>;
   /** Per-agent, per-call-index arg fragment buffers (mutated in place). */
   argBuffers: Map<AgentId, Map<number, string>>;
+  /** Per-agent, per-tool-call-id live output buffers (mutated in place). */
+  outputBuffers: Map<AgentId, Map<string, string>>;
   /** The pending rAF id ref (0 = no frame scheduled). */
   rafIdRef: { current: number };
   /** The pending fallback-flush timer ref (null = no timer armed). */
@@ -187,9 +189,10 @@ export interface StreamCancelDeps {
 }
 
 /**
- * Drain any buffered delta fragments for `id` (text, reasoning, arg deltas)
- * from `handle`, and — once nothing remains buffered for ANY agent — cancel
- * the pending rAF flush + fallback timer via `cancel`, so a just-cleared
+ * Drain any buffered delta fragments for `id` (text, reasoning, arg and live
+ * output deltas) from `handle`, and — once nothing remains buffered for ANY
+ * agent — cancel the pending rAF flush + fallback timer via `cancel`, so a
+ * just-cleared
  * conversation isn't repopulated by stale buffered deltas on the next
  * animation frame (or timer tick). When other agents still have buffered
  * deltas, the pending flush is left alone (it must still fire for them).
@@ -203,12 +206,14 @@ export function drainStreamingBuffer(
   handle.textBuffers.delete(id);
   handle.reasoningBuffers.delete(id);
   handle.argBuffers.delete(id);
+  handle.outputBuffers.delete(id);
   // If nothing remains buffered for any agent, cancel the pending flush so it
   // doesn't fire on the next frame with an empty batch (harmless, but tidy).
   const empty =
     handle.textBuffers.size === 0 &&
     handle.reasoningBuffers.size === 0 &&
-    handle.argBuffers.size === 0;
+    handle.argBuffers.size === 0 &&
+    handle.outputBuffers.size === 0;
   if (empty) {
     if (handle.rafIdRef.current !== 0) {
       cancel.cancelFrame(handle.rafIdRef.current);
@@ -312,6 +317,8 @@ export interface DispatcherDeps {
   reasoningBuffers: Map<AgentId, string>;
   /** Per-agent, per-call-index arg fragment buffers (mutated in place). */
   argBuffers: Map<AgentId, Map<number, string>>;
+  /** Per-agent, per-tool-call-id live output buffers (mutated in place). */
+  outputBuffers: Map<AgentId, Map<string, string>>;
   /** The pending rAF id holder (0 = no frame scheduled). */
   rafId: { current: number };
   /** The pending fallback-flush timer holder (null = no timer armed). */
@@ -336,14 +343,20 @@ export interface DispatcherDeps {
     id: AgentId,
     deltas: Array<{ index: number; fragment: string }>,
   ) => void;
+  /** Store action: apply flushed `tool_output_delta` chunks for `id`. */
+  applyToolOutputDeltas: (
+    id: AgentId,
+    deltas: Array<{ tool_call_id: string; text: string }>,
+  ) => void;
   /** Store action: handle a non-delta event. */
   handleAgentEvent: (payload: AgentEventPayload) => void;
 }
 
 /** A dispatcher built by [`createAgentEventDispatcher`]. */
 export interface AgentEventDispatcher {
-  /** Dispatch one agent event: deltas buffer (flushed per frame / per
-   *  64 KiB cap), everything else goes straight to the store. */
+  /** Dispatch one agent event: deltas (text, reasoning, tool-arg, live tool
+   *  output) buffer until flushed per frame / per 64 KiB cap, everything else
+   *  goes straight to the store. */
   dispatch: (payload: AgentEventPayload) => void;
   /** Flush all buffered deltas synchronously. Non-delta events flush
    *  automatically before dispatching; the hook also calls this on
@@ -353,7 +366,8 @@ export interface AgentEventDispatcher {
 
 /**
  * Build the agent-event dispatcher: buffers `text_delta` / `reasoning_delta`
- * / `tool_call_arg_delta` fragments per agent and flushes them to the store
+ * / `tool_call_arg_delta` / `tool_output_delta` fragments per agent and flushes
+ * them to the store
  * once per animation frame (dense bursts), or immediately when a delta
  * arrives >= [`MAX_FLUSH_INTERVAL_MS`] after the last flush (sparse tokens —
  * the display streams per-token, independent of the frame loop), or
@@ -383,7 +397,7 @@ export function createAgentEventDispatcher(deps: DispatcherDeps): AgentEventDisp
     }
   };
 
-  /** Flush all buffered deltas (text, reasoning, arg) to the store in a single batch. */
+  /** Flush all buffered deltas (text, reasoning, tool-arg, live output) to the store in a single batch. */
   const flush = () => {
     cancelPending();
     lastFlushAt = deps.now();
@@ -422,6 +436,27 @@ export function createAgentEventDispatcher(deps: DispatcherDeps): AgentEventDisp
       // Drop any agent maps that became empty
       for (const [id, idxMap] of Array.from(argBuffers.entries())) {
         if (idxMap.size === 0) argBuffers.delete(id);
+      }
+    }
+    // Live tool output (per agent, per tool-call id). Coalesced per call so a
+    // chatty command's chunks cost one store write per frame instead of one
+    // per chunk — the same treatment the tool-arg deltas get.
+    const outputBuffers = deps.outputBuffers;
+    if (outputBuffers.size > 0) {
+      for (const [id, callMap] of Array.from(outputBuffers.entries())) {
+        if (callMap.size === 0) continue;
+        const deltas: Array<{ tool_call_id: string; text: string }> = [];
+        for (const [callId, text] of callMap.entries()) {
+          if (text.length > 0) deltas.push({ tool_call_id: callId, text });
+        }
+        callMap.clear();
+        if (deltas.length > 0) {
+          deps.applyToolOutputDeltas(id, deltas);
+        }
+      }
+      // Drop any agent maps that became empty
+      for (const [id, callMap] of Array.from(outputBuffers.entries())) {
+        if (callMap.size === 0) outputBuffers.delete(id);
       }
     }
   };
@@ -504,6 +539,24 @@ export function createAgentEventDispatcher(deps: DispatcherDeps): AgentEventDisp
       const next = prev + payload.event.fragment;
       idxMap.set(payload.event.index, next);
       routeFlush(next.length);
+    } else if (payload.event.kind === "tool_output_delta") {
+      // Live tool output buffers like the other deltas: a chatty command can
+      // emit 8 KiB chunks far faster than the shell's 60 ms throttle implies,
+      // and every store write re-renders the transcript. Keyed by tool-call id
+      // so one card's chunks coalesce into a single append per flush — and
+      // since a `tool_result` flushes BEFORE it is dispatched, a buffered live
+      // chunk can never land after the result it belongs to.
+      const agentMap = deps.outputBuffers;
+      const id = payload.agent_id;
+      let callMap = agentMap.get(id);
+      if (!callMap) {
+        callMap = new Map<string, string>();
+        agentMap.set(id, callMap);
+      }
+      const prev = callMap.get(payload.event.tool_call_id) ?? "";
+      const next = prev + payload.event.text;
+      callMap.set(payload.event.tool_call_id, next);
+      routeFlush(next.length);
     } else {
       // Flush any pending deltas (text/reasoning/arg) synchronously before a
       // non-delta event so the store sees all accumulated content before the
@@ -570,6 +623,7 @@ export function useAgentEvents() {
   const appendStreamingText = useAgentStore((s) => s.appendStreamingText);
   const appendStreamingReasoning = useAgentStore((s) => s.appendStreamingReasoning);
   const applyToolCallArgDeltas = useAgentStore((s) => s.applyToolCallArgDeltas);
+  const applyToolOutputDeltas = useAgentStore((s) => s.applyToolOutputDeltas);
 
   // Per-agent text-delta buffer. Keyed by agent id so multiple agents don't
   // clobber each other's buffered text.
@@ -578,6 +632,8 @@ export function useAgentEvents() {
   const reasoningBuffersRef = useRef<Map<AgentId, string>>(new Map());
   // Per-agent, per-call-index arg-delta buffers: agent -> (index -> fragment)
   const argBuffersRef = useRef<Map<AgentId, Map<number, string>>>(new Map());
+  // Per-agent, per-call-id live output buffers: agent -> (call id -> text)
+  const outputBuffersRef = useRef<Map<AgentId, Map<string, string>>>(new Map());
   // The pending rAF id (0 = no frame scheduled).
   const rafIdRef = useRef<number>(0);
   // The pending fallback-flush timer (null = no timer armed).
@@ -590,6 +646,7 @@ export function useAgentEvents() {
       textBuffers: textBuffersRef.current,
       reasoningBuffers: reasoningBuffersRef.current,
       argBuffers: argBuffersRef.current,
+      outputBuffers: outputBuffersRef.current,
       rafId: rafIdRef,
       timerId: timerIdRef,
       raf: requestAnimationFrame,
@@ -600,6 +657,7 @@ export function useAgentEvents() {
       appendStreamingText,
       appendStreamingReasoning,
       applyToolCallArgDeltas,
+      applyToolOutputDeltas,
       handleAgentEvent,
     });
 
@@ -617,6 +675,7 @@ export function useAgentEvents() {
       textBuffers: textBuffersRef.current,
       reasoningBuffers: reasoningBuffersRef.current,
       argBuffers: argBuffersRef.current,
+      outputBuffers: outputBuffersRef.current,
       rafIdRef,
       timerIdRef,
     };
@@ -639,7 +698,8 @@ export function useAgentEvents() {
       if (
         activeBuffer?.textBuffers === textBuffersRef.current &&
         activeBuffer?.reasoningBuffers === reasoningBuffersRef.current &&
-        activeBuffer?.argBuffers === argBuffersRef.current
+        activeBuffer?.argBuffers === argBuffersRef.current &&
+        activeBuffer?.outputBuffers === outputBuffersRef.current
       ) {
         activeBuffer = null;
       }
@@ -647,5 +707,11 @@ export function useAgentEvents() {
       // it cancels any pending frame and fallback timer itself.
       dispatcher.flush();
     };
-  }, [handleAgentEvent, appendStreamingText, appendStreamingReasoning, applyToolCallArgDeltas]);
+  }, [
+    handleAgentEvent,
+    appendStreamingText,
+    appendStreamingReasoning,
+    applyToolCallArgDeltas,
+    applyToolOutputDeltas,
+  ]);
 }

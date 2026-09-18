@@ -623,10 +623,67 @@ export const reduceToolCallArgDelta: Reducer<Ev<"tool_call_arg_delta">> = (
 };
 
 /**
- * tool_result: update the matching call's result in place, clear the pending
- * approval, append to the Output-tab log, and (for file_edit/file_write)
- * capture a diff snapshot so the DiffViewer keeps showing the diff after the
- * approval resolves.
+ * Cap on the live output tail kept per running tool call, in chars. The card
+ * renders only the last few lines and the FULL text arrives with the result,
+ * so this bounds the per-call footprint of a very chatty command (`cargo
+ * build` can emit megabytes) without affecting what the model receives.
+ */
+export const LIVE_OUTPUT_CAP = 16 * 1024;
+
+/**
+ * Append a live output chunk to the kept tail, dropping the head past
+ * [`LIVE_OUTPUT_CAP`]. Exported so the batched store action
+ * (`applyToolOutputDeltas`) applies the identical policy.
+ *
+ * The head-drop cuts on a UTF-16 code-unit boundary, which can split an astral
+ * char (an emoji in compiler output) into a lone surrogate — that renders as a
+ * replacement glyph, so a leading orphan half is dropped too.
+ */
+export function appendLiveOutputTail(prev: string | undefined, text: string): string {
+  const joined = (prev ?? "") + text;
+  if (joined.length <= LIVE_OUTPUT_CAP) return joined;
+  const kept = joined.slice(-LIVE_OUTPUT_CAP);
+  const first = kept.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? kept.slice(1) : kept;
+}
+
+/**
+ * tool_output_delta: append a live output chunk to the RUNNING call with this
+ * id, keeping only the tail ([`LIVE_OUTPUT_CAP`]).
+ *
+ * Returns the agent UNCHANGED when no running call carries the id: a chunk can
+ * lose the race against its own result (a timed-out or cancelled reader emits
+ * after the fact), and such a late chunk must be ignored rather than
+ * resurrecting — or writing into — a card that already has its result.
+ */
+export const reduceToolOutputDelta: Reducer<Ev<"tool_output_delta">> = (
+  agent,
+  event,
+) => {
+  const transcript = [...agent.transcript];
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const entry = transcript[i];
+    if (entry.kind !== "tool") continue;
+    const callIdx = entry.calls.findIndex(
+      (c) => c.id === event.tool_call_id && c.result === null,
+    );
+    if (callIdx === -1) continue;
+    const calls = [...entry.calls];
+    calls[callIdx] = {
+      ...calls[callIdx],
+      liveOutput: appendLiveOutputTail(calls[callIdx].liveOutput, event.text),
+    };
+    transcript[i] = { ...entry, calls };
+    return { agent: { ...agent, transcript } };
+  }
+  return { agent };
+};
+
+/**
+ * tool_result: update the matching call's result in place (which also clears
+ * that call's `liveOutput` live tail), clear the pending approval, and (for
+ * file_edit/file_write) capture a diff snapshot so the DiffViewer keeps
+ * showing the diff after the approval resolves.
  */
 export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
   const next = { ...agent };
@@ -679,7 +736,13 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
       const callIdx = entry.calls.findIndex((c) => c.id === event.tool_call_id);
       if (callIdx !== -1) {
         const calls = [...entry.calls];
-        calls[callIdx] = { ...calls[callIdx], result: event.result };
+        // The result is the complete truth: drop the live tail so the card
+        // stops rendering the streaming preview.
+        calls[callIdx] = {
+          ...calls[callIdx],
+          result: event.result,
+          liveOutput: undefined,
+        };
         transcript[i] = { ...entry, calls };
         completedCall = calls[callIdx];
         completedToolName = entry.name;
@@ -1454,6 +1517,7 @@ export function applyAgentEvent(
     case "reasoning_delta": result = reduceReasoningDelta(agent, event); break;
     case "tool_call_start": result = reduceToolCallStart(agent, event); break;
     case "tool_call_arg_delta": result = reduceToolCallArgDelta(agent, event); break;
+    case "tool_output_delta": result = reduceToolOutputDelta(agent, event); break;
     case "tool_result": result = reduceToolResult(agent, event); break;
     case "usage": result = reduceUsage(agent, event); break;
     case "context_usage": result = reduceContextUsage(agent, event); break;

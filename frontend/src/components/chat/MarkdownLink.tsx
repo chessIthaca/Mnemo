@@ -8,29 +8,38 @@
  * webview's CSP). Passed as the `a` component override to react-markdown
  * (Message.tsx): local file hrefs deep-link into the Files tab via
  * openFileInViewer (the same sanctioned path the write_review_report
- * tool-card chip uses), external http(s) hrefs open via openExternal
- * (the webfetch URL chip's shell-open pattern), and non-openable schemes
- * (mailto:, fragments) render as plain text with no dead affordance.
+ * tool-card chip uses), external http(s) hrefs load in the app's OWN Browser
+ * tab via openChatLink (user request 2027-01-16 — no more OS-browser launch;
+ * ctrl/cmd-click and middle-click keep the old shell open), and non-openable
+ * schemes (mailto:, fragments) render as plain text with no dead affordance.
  */
 
 import type { ReactNode } from "react";
 import { normalizeLocalFileHref } from "../../lib/markdownLink";
-import { openExternal } from "../../lib/openExternal";
+import { openChatLink } from "../../lib/openChatLink";
 import { openFileInViewer } from "../../lib/openFile";
 
 /**
  * Route a markdown link click to the sanctioned opener. Extracted from
  * the component so the regression test can drive it without a DOM (the
  * node-env harness cannot fire events).
+ *
+ * `opts.osBrowser` forces the OS default browser for an http(s) target (the
+ * ctrl/cmd-click and middle-click escape hatch) — without it the link goes to
+ * the app's Browser tab, falling back to the OS browser only where that tab
+ * cannot exist (see `openChatLink`).
  */
-export function openMarkdownTarget(href: string | undefined): void {
+export function openMarkdownTarget(
+  href: string | undefined,
+  opts?: { osBrowser?: boolean },
+): void {
   if (!href) return;
   const trimmed = href.trim();
   if (trimmed === "") return;
-  // External http(s) → the shell open (CSP blocks anchors; the webfetch
-  // URL chip's established pattern).
+  // External http(s) → the app's Browser tab (or the OS browser when asked).
+  // The CSP blocks plain anchor navigation, so an explicit opener is required.
   if (/^https?:\/\//i.test(trimmed)) {
-    void openExternal(trimmed);
+    void openChatLink(trimmed, opts);
     return;
   }
   // Local file path → the Files-tab deep-link.
@@ -66,11 +75,24 @@ export function MarkdownLink({
     return (
       <a
         href={trimmed}
-        title={title ? `${title} (opens in your browser)` : "Opens in your browser"}
+        title={
+          title
+            ? `${title} (opens in the Browser tab — ctrl-click for your browser)`
+            : "Opens in the Browser tab — ctrl-click for your browser"
+        }
         className="cursor-pointer underline underline-offset-2"
         onClick={(e) => {
           e.preventDefault();
-          openMarkdownTarget(trimmed);
+          // The click modifiers keep the pre-2027-01-16 behavior: the OS
+          // default browser, instead of the app's own Browser tab.
+          openMarkdownTarget(trimmed, { osBrowser: e.ctrlKey || e.metaKey });
+        }}
+        onAuxClick={(e) => {
+          // Middle-click is the same escape hatch (it never fires `click`).
+          if (e.button === 1) {
+            e.preventDefault();
+            openMarkdownTarget(trimmed, { osBrowser: true });
+          }
         }}
       >
         {children}

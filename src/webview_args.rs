@@ -240,12 +240,12 @@ mod tests {
 
     #[test]
     fn secondary_udf_is_per_pid_under_webview2() {
-        let base = std::path::Path::new(r"C:\Users\carst\AppData\Local\com.mnemo.app");
+        let base = std::path::Path::new(r"C:\Users\carst\AppData\Local\com.mnemo.desktop");
         let dir = secondary_webview_data_dir(base, 4242);
         assert_eq!(
             dir,
             std::path::PathBuf::from(
-                r"C:\Users\carst\AppData\Local\com.mnemo.app\WebView2\mnemo-4242"
+                r"C:\Users\carst\AppData\Local\com.mnemo.desktop\WebView2\mnemo-4242"
             )
         );
         // Distinct pids get distinct folders.

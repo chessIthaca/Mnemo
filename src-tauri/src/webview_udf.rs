@@ -6,7 +6,7 @@
 //!
 //! Every webview in mnemo is built as a plain `WebviewBuilder::new(...)`
 //! with no data directory, so WebView2 resolves the SAME default user data
-//! folder (`%LOCALAPPDATA%\com.mnemo.app\EBWebView`) for every process. One
+//! folder (`%LOCALAPPDATA%\com.mnemo.desktop\EBWebView`) for every process. One
 //! user data folder supports one live browser process, so a second mnemo
 //! instance's session never initializes — its window comes up as a blank
 //! white frame (user report 2027-01-13, evidence

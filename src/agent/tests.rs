@@ -1416,7 +1416,339 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
         "expected exactly 3 tool-error messages before the cap fired, got {}",
         tool_msgs.len()
     );
+    // The repeat-failure circuit breaker is ADDITIVE to the cap: it fires
+    // on EVERY batch whose failure repeats a prior identical one (the
+    // reminder is cheap and the model needs it each time), so the 2nd
+    // AND 3rd batches each push one harness-attributed corrective user
+    // message — the 3rd's lands in history for the next turn even though
+    // the cap aborts this one.
+    let correction_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m.role == Role::User
+                && m.content.as_text().contains("[harness tool-call correction")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        correction_positions.len(),
+        2,
+        "the breaker must fire once per repeat-failure batch (after the 2nd \
+         and 3rd identical failures) even when the cap aborts on the 3rd"
+    );
+    let tool_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::Tool)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(tool_positions.len(), 3);
+    assert!(
+        correction_positions[0] > tool_positions[1]
+            && correction_positions[0] < tool_positions[2],
+        "the first correction must follow the 2nd tool result and precede the 3rd"
+    );
+    assert!(
+        correction_positions[1] > tool_positions[2],
+        "the second correction must follow the 3rd tool result"
+    );
     let _ = outcome;
+}
+
+#[tokio::test]
+async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
+    // Tool-call robustness (live incident: 15 consecutive `git` commit calls
+    // missing `message`, re-emitted verbatim while the error text repeated
+    // identically — only a fresh corrective user turn broke the loop): when
+    // a failed tool result's (tool, error text) matches a PRIOR identical
+    // failure, the harness must inject ONE harness-attributed user-role
+    // corrective message carrying the tool's actual schema, pushed after
+    // the batch (Anthropic requires tool results to immediately follow the
+    // tool_use message). Two identical failures, then a clean text response
+    // (below the MAX_RETRIES cap of 3, so the turn ends normally).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let fail_call = |n: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "file_read".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"path":"does_not_exist.txt"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        fail_call(1),
+        fail_call(2),
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read a file")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // Exactly one corrective user-role message, harness-attributed, naming
+    // the tool and carrying its schema.
+    let corrections: Vec<&Message> = messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.as_text().contains("[harness tool-call correction")
+        })
+        .collect();
+    assert_eq!(
+        corrections.len(),
+        1,
+        "expected exactly one corrective message after the second identical failure"
+    );
+    let correction = corrections[0].content.as_text();
+    assert!(
+        correction.contains("file_read"),
+        "the correction must name the failing tool"
+    );
+    assert!(
+        correction.contains("[tool error]"),
+        "the correction must quote the identical error verbatim"
+    );
+    assert!(
+        correction.contains("parameters"),
+        "the correction must carry the tool's parameter schema"
+    );
+    // It must sit AFTER the last tool result of the batch (never wedged
+    // between one batch's tool results).
+    let last_tool_idx = messages
+        .iter()
+        .rposition(|m| m.role == Role::Tool)
+        .expect("two tool results");
+    let correction_idx = messages
+        .iter()
+        .position(|m| m.content.as_text().contains("[harness tool-call correction"))
+        .expect("correction present");
+    assert!(
+        correction_idx > last_tool_idx,
+        "the correction must follow the batch's tool results"
+    );
+    // The UI note is a transient (retrying) error, not a terminal one.
+    let mut saw_retrying_note = false;
+    while let Ok(Some((_id, event))) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), fanin_rx.recv()).await
+    {
+        if let AgentEvent::Error {
+            error,
+            retrying: true,
+        } = event
+        {
+            if error.contains("tool-call correction") {
+                saw_retrying_note = true;
+            }
+        }
+    }
+    assert!(
+        saw_retrying_note,
+        "the correction must surface as a retrying error event for the UI"
+    );
+}
+
+#[tokio::test]
+async fn distinct_tool_errors_do_not_fire_the_correction() {
+    // Two DIFFERENT failures of the same tool are not the repeat-loop
+    // signature — the breaker must stay silent (the schema injection is
+    // for IDENTICAL repeats only; distinct errors get the ordinary error
+    // feedback and the model's own recovery).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let read_call = |n: usize, path: &str| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "file_read".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: format!(r#"{{"path":"{path}"}}"#),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        read_call(1, "missing_one.txt"),
+        read_call(2, "missing_two.txt"),
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read a file")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert!(
+        messages
+            .iter()
+            .all(|m| !m.content.as_text().contains("[harness tool-call correction")),
+        "distinct errors must not fire the schema correction"
+    );
+}
+
+#[tokio::test]
+async fn repeat_failure_across_an_intervening_success_still_fires() {
+    // The history-scan design deliberately does NOT reset on a successful
+    // call: the pattern-poison (the earlier identical failure) stays in
+    // context, so the corrective schema injection is still the right
+    // medicine — the live loop interleaved successful calls between the
+    // identical malformed git calls and still re-emitted them 15 times.
+    // (This is the deliberate difference from tool_error_count, which any
+    // success resets.)
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("exists.txt"), "contents").unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let read_call = |n: usize, path: &str| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "file_read".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: format!(r#"{{"path":"{path}"}}"#),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        read_call(1, "missing.txt"),
+        read_call(2, "exists.txt"),
+        read_call(3, "missing.txt"),
+        vec![
+            LlmEvent::TextDelta {
+                text: "done".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read a file")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let corrections: Vec<&Message> = messages
+        .iter()
+        .filter(|m| {
+            m.role == Role::User
+                && m.content.as_text().contains("[harness tool-call correction")
+        })
+        .collect();
+    assert_eq!(
+        corrections.len(),
+        1,
+        "a failure repeating an older identical failure (across an \
+         intervening success) must still fire the correction"
+    );
+    // Sanity: the interleaved success really ran (3 tool results total).
+    let tool_count = messages.iter().filter(|m| m.role == Role::Tool).count();
+    assert_eq!(tool_count, 3, "two failures + one interleaved success");
+}
+
+#[test]
+fn last_user_query_skips_harness_corrections() {
+    // Review finding LOW-1 (repeat-failure circuit breaker): the
+    // corrective message is a User-role append; without the skip it
+    // would hijack the auto-recall query for the remainder of the turn
+    // (spurious fresh recall + irrelevant memory context).
+    let messages = vec![
+        Message::user_text("fix the login bug"),
+        Message::assistant_text("on it"),
+        Message::user_text(
+            "[harness tool-call correction — not the user]\nYour last two calls to `git` failed...",
+        ),
+    ];
+    assert_eq!(
+        crate::agent::turn::last_user_query(&messages).as_deref(),
+        Some("fix the login bug"),
+        "the recall query must skip harness-attributed corrections"
+    );
+    // Without a correction present, the latest user message wins.
+    let messages = vec![
+        Message::user_text("first prompt"),
+        Message::user_text("second prompt"),
+    ];
+    assert_eq!(
+        crate::agent::turn::last_user_query(&messages).as_deref(),
+        Some("second prompt")
+    );
 }
 
 #[tokio::test]

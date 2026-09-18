@@ -47,8 +47,9 @@
 //! (e.g. `subcommand: "delete"` = branch delete, `subcommand: "pop"` = stash
 //! pop). A call repeating the subcommand name in `action` (`action: "branch"`
 //! with `subcommand: "branch"`) falls back to the default action (list for
-//! branch, push for stash). `subcommand` is not required — `action` alone can
-//! name the subcommand. Error messages list the valid values.
+//! branch, push for stash). The schema marks `subcommand` required, but the
+//! runtime still forgives an `action`-only call. Error messages list the
+//! valid values.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -462,7 +463,9 @@ impl Tool for GitTool {
              push ALWAYS require approval, even in Autonomous mode. `restore` \
              restores files from a ref and DISCARDS uncommitted/staged \
              changes (structured fields only: paths/source/target). Output is \
-             capped ~100 KiB except `diff`, which is never truncated.",
+             capped ~100 KiB except `diff`, which is never truncated. \
+             Required fields per subcommand: commit→message, merge/checkout→branch, \
+             restore→paths, branch delete/create→branch.",
             json!({
                 "type": "object",
                 "properties": {
@@ -499,7 +502,8 @@ impl Tool for GitTool {
                         "items": {"type": "string"},
                         "description": "Extra flags/refs/paths for READ queries only (status, diff, log, branch list), appended after the built-in defaults (e.g. [\"--stat\"], [\"-5\"], [\"main..feat\", \"--\", \"src/\"]). Refused for write subcommands; --output/-o/--exec/--no-index/--ext-diff/--textconv rejected as unsafe. branch list: read-only listing flags only (positionals refused — they create branches); split combined short flags (use [\"-a\",\"-v\"] not \"-av\")."
                     }
-                }
+                },
+                "required": ["subcommand"],
             }),
         )
     }
@@ -564,7 +568,9 @@ impl Tool for GitTool {
                     None => ToolResult::error(format!(
                         "git requires a 'subcommand' field (status, diff, log, commit, merge, \
                          checkout, stash, branch, push, restore) — or an 'action' naming one \
-                         of them"
+                         of them. Per-subcommand required fields: commit→message, \
+                         merge/checkout→branch, restore→paths, branch \
+                         delete/create→branch"
                     )),
                 };
             }
@@ -669,7 +675,14 @@ impl Tool for GitTool {
             "commit" => {
                 let message = match args.message {
                     Some(m) if !m.is_empty() => m,
-                    _ => return ToolResult::error("commit requires a 'message' field"),
+                    _ => {
+                        return ToolResult::error(
+                            "commit requires a 'message' field. Expected arguments: \
+                             {\"subcommand\": \"commit\", \"message\": \"<commit message>\"} — \
+                             commit takes no other fields (branch is merge/checkout-only, \
+                             paths/source/target are restore-only)",
+                        )
+                    }
                 };
                 // Stage all changes first so a commit call succeeds without a
                 // separate staging step — BUT only when nothing is already
@@ -704,7 +717,10 @@ impl Tool for GitTool {
                     Some(b) if !b.is_empty() => b,
                     _ => {
                         return ToolResult::error(
-                            "merge requires a 'branch' field (the branch to merge)",
+                            "merge requires a 'branch' field (the branch to merge). \
+                             Expected arguments: {\"subcommand\": \"merge\", \
+                             \"branch\": \"<branch>\", \"message\": \"<optional \
+                             merge-commit message>\"}",
                         )
                     }
                 };
@@ -725,7 +741,10 @@ impl Tool for GitTool {
                     Some(b) if !b.is_empty() => b,
                     _ => {
                         return ToolResult::error(
-                            "checkout requires a 'branch' field (the branch to switch to)",
+                            "checkout requires a 'branch' field (the branch to switch \
+                             to). Expected arguments: {\"subcommand\": \
+                             \"checkout\", \"branch\": \"<branch>\"} — checkout \
+                             takes no other fields",
                         )
                     }
                 };
@@ -747,7 +766,11 @@ impl Tool for GitTool {
                     Some(p) if !p.is_empty() => p,
                     _ => {
                         return ToolResult::error(
-                            "restore requires a 'paths' field (the files/dirs to restore)",
+                            "restore requires a 'paths' field (the files/dirs to \
+                             restore). Expected arguments: {\"subcommand\": \
+                             \"restore\", \"paths\": [\"<path>\"], \
+                             \"source\": \"<optional ref>\", \"target\": \
+                             \"<optional worktree|staged>\"}",
                         )
                     }
                 };
@@ -834,7 +857,10 @@ impl Tool for GitTool {
                             match args.branch {
                                 Some(n) if !n.is_empty() => n,
                                 _ => return ToolResult::error(
-                                    "branch delete requires a 'branch' field (the name to delete)",
+                                    "branch delete requires a 'branch' field (the name \
+                                     to delete). Expected arguments: {\"subcommand\": \
+                                     \"branch\", \"action\": \"delete\", \
+                                     \"branch\": \"<name>\"}",
                                 ),
                             };
                         if !valid_branch_name(&name) {
@@ -849,7 +875,10 @@ impl Tool for GitTool {
                             match args.branch {
                                 Some(n) if !n.is_empty() => n,
                                 _ => return ToolResult::error(
-                                    "branch create requires a 'branch' field (the name to create)",
+                                    "branch create requires a 'branch' field (the name \
+                                     to create). Expected arguments: {\"subcommand\": \
+                                     \"branch\", \"action\": \"create\", \
+                                     \"branch\": \"<name>\"}",
                                 ),
                             };
                         if !valid_branch_name(&name) {
@@ -1094,6 +1123,33 @@ mod tests {
         assert!(result.output.contains("requires a 'subcommand'"));
         assert!(result.output.contains("status"));
         assert!(result.output.contains("push"));
+        // The error also carries the per-subcommand required-fields map so
+        // the model knows what each subcommand needs without re-reading the
+        // full schema.
+        assert!(result.output.contains("commit→message"));
+        assert!(result.output.contains("restore→paths"));
+    }
+
+    #[test]
+    fn schema_requires_subcommand_and_maps_required_fields() {
+        // Tool-call robustness: the parameters schema carries
+        // `required: ["subcommand"]` (uniformly true — every call needs a
+        // subcommand; the runtime resolves it first and errors helpfully,
+        // so nothing breaks, and strict-schema providers gain one
+        // unambiguous required field), and the description carries the
+        // per-subcommand required-fields map.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let schema = tool.schema();
+        let required = schema
+            .parameters
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("required array present");
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].as_str(), Some("subcommand"));
+        assert!(schema.description.contains("commit→message"));
+        assert!(schema.description.contains("restore→paths"));
     }
 
     #[tokio::test]
@@ -1128,6 +1184,12 @@ mod tests {
         let result = tool.execute(json!({"subcommand": "commit"})).await;
         assert!(!result.success);
         assert!(result.output.contains("requires a 'message'"));
+        // Expected-shape enrichment: the error carries the exact expected
+        // arguments plus the sibling-field rejection note (the live incident
+        // conflated a restore-only `target` into a commit call).
+        assert!(result.output.contains("Expected arguments"));
+        assert!(result.output.contains("\"message\""));
+        assert!(result.output.contains("restore-only"));
     }
 
     // ---- never_auto_for: core operations (merge/push) force the prompt ----
@@ -1253,6 +1315,10 @@ mod tests {
         let result = tool.execute(json!({"subcommand": "merge"})).await;
         assert!(!result.success);
         assert!(result.output.contains("requires a 'branch'"));
+        // Expected-shape enrichment: the error carries the exact expected
+        // arguments for the subcommand.
+        assert!(result.output.contains("Expected arguments"));
+        assert!(result.output.contains("\"branch\""));
     }
 
     #[tokio::test]

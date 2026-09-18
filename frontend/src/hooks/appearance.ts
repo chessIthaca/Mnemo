@@ -240,18 +240,28 @@ export function writeLs(key: string, value: string): void {
  * ceiling reserves this much of the window. Shared by clampPanelFraction
  * and the RightPanel render (the caps ride inline in the width style so
  * the layout engine re-clamps at every viewport — review L1).
+ *
+ * 360px (lowered from 480, 2027-01-16 band retune): the binding ceiling
+ * on windows narrower than the PANEL_MAX_FRAC crossover at 1440px.
  */
-export const CHAT_MIN_PX = 480;
+export const CHAT_MIN_PX = 360;
 /**
  * The right panel's maximum share of the window width (the band ceiling).
  * Shared by clampPanelFraction and the RightPanel inline style caps.
+ *
+ * 0.75 (raised from 0.5, 2027-01-16 band retune — user report: the 50%
+ * cap made hand-resizing stop dead at half the window). The two ceilings
+ * cross at w = CHAT_MIN_PX / (1 − PANEL_MAX_FRAC) = 1440px: below it the
+ * chat floor governs, at/above it this flat cap does.
  */
-export const PANEL_MAX_FRAC = 0.5;
+export const PANEL_MAX_FRAC = 0.75;
 
 /**
  * Clamp a right-panel width FRACTION into the sane band for a viewport:
- * at least the 300px panel floor, at most half the window, and never so
- * wide that the chat column drops below a ~480px guaranteed minimum.
+ * at least the 300px panel floor, at most 75% of the window, and never
+ * so wide that the chat column drops below its 360px guaranteed minimum.
+ * The flat cap and the chat floor cross at 1440px — below it the floor
+ * binds ((w − 360)/w < 0.75), above it the flat cap does.
  * Replaces the old [300, 0.8×innerWidth] px clamp, whose 80% ceiling let
  * a px width persisted from a larger monitor fill the whole app on a
  * small restored window (the chat column was squeezed to a sliver).

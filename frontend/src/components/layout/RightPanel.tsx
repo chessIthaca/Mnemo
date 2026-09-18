@@ -27,8 +27,8 @@ export function RightPanel() {
 
   // Re-clamp the persisted fraction against the current viewport so the
   // panel can never crowd the chat column below its guaranteed minimum.
-  // The rendered width carries the band caps inline — min(pct%, 50%,
-  // calc(100% - 480px)) — so the layout engine re-clamps at EVERY
+  // The rendered width carries the band caps inline — min(pct%, 75%,
+  // calc(100% - 360px)) — so the layout engine re-clamps at EVERY
   // viewport: a plain percentage tracks resizes, but its render-time
   // clamp would go stale between renders (review L1). Falls back to
   // flex-grow (undefined style) when no explicit width is set.

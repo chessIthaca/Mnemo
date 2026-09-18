@@ -2550,16 +2550,18 @@ describe("didMainTurnEnd (F1b turn-end edge, review L3)", () => {
 describe("revealRightPanelTab + requestFileOpen", () => {
   /** Set the tab slices to a known state for each test. */
   function setTabs(partial: {
-    rightPanelTab?: "plan" | "files" | "diff";
-    disabledTabs?: ("plan" | "files" | "diff")[];
+    rightPanelTab?: "plan" | "files" | "diff" | "browser";
+    disabledTabs?: ("plan" | "files" | "diff" | "browser")[];
     rightPanelVisible?: boolean;
     pendingFileOpen?: { path: string; line: number | null } | null;
+    pendingBrowserUrl?: string | null;
   }) {
     useAgentStore.setState({
       rightPanelTab: "plan",
       disabledTabs: [],
       rightPanelVisible: true,
       pendingFileOpen: null,
+      pendingBrowserUrl: null,
       ...partial,
     });
   }
@@ -2605,5 +2607,24 @@ describe("revealRightPanelTab + requestFileOpen", () => {
     setTabs({ pendingFileOpen: { path: "src/main.rs", line: 42 } });
     useAgentStore.getState().clearPendingFileOpen();
     expect(useAgentStore.getState().pendingFileOpen).toBeNull();
+  });
+
+  it("requestBrowserOpen reveals + selects the Browser tab and holds the URL", () => {
+    // A chat link click may arrive while the Browser tab is disabled and the
+    // panel hidden — the deep-link must enable it, select it, reveal the panel
+    // and hand the URL to BrowserView (which owns the child webview's rect).
+    setTabs({ rightPanelTab: "plan", disabledTabs: ["browser"], rightPanelVisible: false });
+    useAgentStore.getState().requestBrowserOpen("https://example.com/docs");
+    const s = useAgentStore.getState();
+    expect(s.rightPanelTab).toBe("browser");
+    expect(s.disabledTabs).not.toContain("browser");
+    expect(s.rightPanelVisible).toBe(true);
+    expect(s.pendingBrowserUrl).toBe("https://example.com/docs");
+  });
+
+  it("clearPendingBrowserUrl clears the pending URL (single-shot consume)", () => {
+    setTabs({ pendingBrowserUrl: "https://example.com/docs" });
+    useAgentStore.getState().clearPendingBrowserUrl();
+    expect(useAgentStore.getState().pendingBrowserUrl).toBeNull();
   });
 });

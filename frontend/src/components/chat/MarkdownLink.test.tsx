@@ -28,9 +28,23 @@ import { normalizeLocalFileHref } from "../../lib/markdownLink";
 // The shell open never runs in tests — the factory mock replaces the
 // module (so @tauri-apps/plugin-shell is never even loaded in node).
 vi.mock("../../lib/openExternal", () => ({ openExternal: vi.fn() }));
+// The router's platform probe is stubbed; the real module is spread so every
+// other ./tauri export still resolves for the store's import graph.
+vi.mock("../../lib/tauri", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/tauri")>()),
+  browserWebviewSupported: vi.fn(),
+}));
 import { openExternal } from "../../lib/openExternal";
+import { browserWebviewSupported } from "../../lib/tauri";
 import { MarkdownLink, openMarkdownTarget } from "./MarkdownLink";
 import messageSource from "./Message.tsx?raw";
+
+/**
+ * The router awaits the (mocked) platform probe before touching the store, so
+ * a test that asserts the store must let that microtask chain settle.
+ */
+const flushRouter = (): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("normalizeLocalFileHref", () => {
   it("passes canonical project-relative paths through", () => {
@@ -97,10 +111,14 @@ describe("openMarkdownTarget — the click router", () => {
     useAgentStore.setState({
       rightPanelTab: "plan",
       disabledTabs: [],
-      rightPanelVisible: true,
+      rightPanelVisible: false,
       pendingFileOpen: null,
+      pendingBrowserUrl: null,
     });
     vi.mocked(openExternal).mockReset();
+    vi.mocked(openExternal).mockResolvedValue(true);
+    vi.mocked(browserWebviewSupported).mockReset();
+    vi.mocked(browserWebviewSupported).mockResolvedValue(true);
   });
 
   /**
@@ -133,17 +151,67 @@ describe("openMarkdownTarget — the click router", () => {
     });
   });
 
-  it("routes external http(s) hrefs through openExternal (the shell open)", () => {
+  it("routes external http(s) hrefs into the app's BROWSER TAB (no OS-browser launch)", async () => {
+    // User request 2027-01-16: the link must load in the right-panel Browser
+    // tab, and the OS browser must NOT be launched.
     openMarkdownTarget("https://example.com/docs");
+    await flushRouter();
+    const s = useAgentStore.getState();
+    expect(s.pendingBrowserUrl).toBe("https://example.com/docs");
+    expect(s.rightPanelTab).toBe("browser");
+    expect(s.rightPanelVisible).toBe(true);
+    expect(s.pendingFileOpen).toBeNull();
+    expect(vi.mocked(openExternal)).not.toHaveBeenCalled();
+  });
+
+  it("keeps the OS default browser for the ctrl/cmd-click escape hatch", async () => {
+    openMarkdownTarget("https://example.com/docs", { osBrowser: true });
+    await flushRouter();
     expect(vi.mocked(openExternal)).toHaveBeenCalledWith(
       "https://example.com/docs",
     );
-    expect(useAgentStore.getState().pendingFileOpen).toBeNull();
+    expect(useAgentStore.getState().pendingBrowserUrl).toBeNull();
   });
 
-  it("ignores non-openable schemes (no dead-link side effects)", () => {
+  it("falls back to the OS browser where the Browser tab cannot exist", async () => {
+    // macOS/Linux: no child webview, so the link goes to the OS browser.
+    vi.mocked(browserWebviewSupported).mockResolvedValue(false);
+    openMarkdownTarget("https://example.com/docs");
+    await flushRouter();
+    expect(vi.mocked(openExternal)).toHaveBeenCalledWith(
+      "https://example.com/docs",
+    );
+    expect(useAgentStore.getState().pendingBrowserUrl).toBeNull();
+  });
+
+  it("ignores non-openable schemes (no dead-link side effects)", async () => {
+    // Awaited: the http(s) path settles in a microtask (the router awaits the
+    // platform probe first), so without the flush a wrongly-routed mailto
+    // would still read as "nothing happened" below.
     openMarkdownTarget("mailto:a@b.c");
-    expect(useAgentStore.getState().pendingFileOpen).toBeNull();
+    await flushRouter();
+    const s = useAgentStore.getState();
+    expect(s.pendingFileOpen).toBeNull();
+    // The TAB channel too (round-2 review): a wrongly-accepted scheme routes to
+    // the app's Browser tab — not to the OS browser — so the two assertions
+    // below would stay green while the click had already revealed the panel.
+    expect(s.pendingBrowserUrl).toBeNull();
+    expect(s.rightPanelTab).toBe("plan");
+    expect(vi.mocked(openExternal)).not.toHaveBeenCalled();
+  });
+
+  it("does NOT widen the schemes chat can open (data:/file: stay inert)", async () => {
+    // The Browser tab's normalize_url also accepts data:/file: — the router
+    // must not hand those to it just because the tab could load them. Awaited
+    // for the same reason as above: the store write happens only after the
+    // router's `await browserWebviewSupported()`, so a widened allow-list
+    // would otherwise be invisible to these assertions.
+    openMarkdownTarget("data:text/html,<b>x</b>");
+    openMarkdownTarget("file:///C:/notes.html");
+    await flushRouter();
+    const s = useAgentStore.getState();
+    expect(s.pendingBrowserUrl).toBeNull();
+    expect(s.pendingFileOpen).toBeNull();
     expect(vi.mocked(openExternal)).not.toHaveBeenCalled();
   });
 });
@@ -192,12 +260,22 @@ describe("MarkdownLink — the rendered affordance", () => {
         site
       </MarkdownLink>,
     );
-    expect(external).toContain('title="the site (opens in your browser)"');
+    expect(external).toContain(
+      'title="the site (opens in the Browser tab — ctrl-click for your browser)"',
+    );
   });
 });
 
 describe("Message.tsx wiring (source contract)", () => {
   it("the chat's Markdown components override `a` with MarkdownLink", () => {
     expect(messageSource).toContain("a: MarkdownLink");
+  });
+
+  it("the web_fetch URL chip routes through openChatLink, never a bare shell open", () => {
+    // User request 2027-01-16: the chip must load the page in the app's own
+    // Browser tab (with the router's OS-browser fallback), not always shell
+    // out — so no direct openExternal call may survive in this file.
+    expect(messageSource).toContain("openChatLink(url");
+    expect(messageSource).not.toContain("openExternal");
   });
 });

@@ -182,9 +182,10 @@ export interface ToolCardChip {
    *  only on backlog_add's argLabel chip, which carries the queued item's
    *  title (plan 2026-12). Every other pathless chip stays plain text. */
   md?: boolean;
-  /** An external http(s) URL the chip opens in the user's default browser —
-   *  set only on web_fetch's argLabel chip (via `webFetchUrl`), whose label
-   *  is the fetched page's URL. null/undefined = no external link. */
+  /** An external http(s) URL the chip loads in the app's own Browser tab
+   *  (lib/openChatLink.ts — ctrl/cmd-click keeps the OS browser) — set only on
+   *  web_fetch's argLabel chip (via `webFetchUrl`), whose label is the fetched
+   *  page's URL. null/undefined = no external link. */
   url?: string | null;
 }
 

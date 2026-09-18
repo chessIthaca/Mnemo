@@ -3,14 +3,14 @@
 // See LICENSE in the repository root.
 
 import { useState, useEffect, useRef, memo } from "react";
-import { ChevronDown, ChevronRight, Compass, ExternalLink, Image as ImageIcon } from "lucide-react";
+import { ChevronDown, ChevronRight, Compass, Globe, Image as ImageIcon } from "lucide-react";
 import { Markdown } from "./Markdown";
 import { InlineMarkdown } from "./InlineMarkdown";
 import { MarkdownLink } from "./MarkdownLink";
 import { CodeBlock } from "./CodeBlock";
 import { UnifiedDiffView } from "./DiffView";
 import { openDiffInViewer, openFileInViewer } from "../../lib/openFile";
-import { openExternal } from "../../lib/openExternal";
+import { openChatLink } from "../../lib/openChatLink";
 import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
 import { arePropsEqual, type MessageProps } from "../../lib/messageEquality";
 import { toolImagePaths, ToolImage } from "./ToolImage";
@@ -617,11 +617,13 @@ function ToolCard({
             );
           }
           // A chip carrying an external url (web_fetch's fetched page) is a
-          // link that opens it in the user's default browser (shell open —
-          // the production CSP blocks plain anchors). stopPropagation so the
-          // click doesn't toggle the card's expand, mirroring the file-link
-          // chips above; the ExternalLink icon signals it opens OUTSIDE the
-          // app, unlike the file chips.
+          // link that loads that page in the app's OWN Browser tab (user
+          // request 2027-01-16) — the production CSP blocks plain anchors, so
+          // the click routes through openChatLink, which falls back to the OS
+          // browser where the tab cannot exist. ctrl/cmd-click keeps the old
+          // OS-browser behavior. stopPropagation so the click doesn't toggle
+          // the card's expand, mirroring the file-link chips above; the Globe
+          // icon signals it opens INSIDE the app (unlike an OS-browser launch).
           if (chip.url != null) {
             const url = chip.url;
             return (
@@ -630,13 +632,13 @@ function ToolCard({
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  void openExternal(url);
+                  void openChatLink(url, { osBrowser: e.ctrlKey || e.metaKey });
                 }}
-                title={`Open ${url} in your browser`}
+                title={`Open ${url} in the Browser tab — ctrl-click for your browser`}
                 className="flex items-center gap-[0.15em] text-cyan-400 underline-offset-2 hover:underline"
               >
                 {chip.text}
-                <ExternalLink className="h-[0.75em] w-[0.75em] shrink-0" />
+                <Globe className="h-[0.75em] w-[0.75em] shrink-0" />
               </button>
             );
           }

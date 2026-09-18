@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Globe, ExternalLink, RotateCw, X } from "lucide-react";
 import {
   browserNormalizeUrl,
@@ -15,6 +15,7 @@ import {
   errMsg,
 } from "../../lib/tauri";
 import { useBrowserRect } from "../../hooks/useBrowserRect";
+import { useAgentStore } from "../../hooks/useAgentStore";
 
 /**
  * Right-panel Browser view — a native child WebView2 embedded in the "main"
@@ -32,7 +33,10 @@ import { useBrowserRect } from "../../hooks/useBrowserRect";
  * This component renders a placeholder `<div>` (the child webview renders
  * above this rect as a native HWND). It reports the rect to the backend on
  * mount + resize (via `useBrowserRect`) so Rust can position/size the child,
- * and on Open it ensures the child exists + navigates it. Stop and Reload
+ * and on Open it ensures the child exists + navigates it. A chat link click
+ * (see `lib/openChatLink.ts`) reaches the same path through the store-held
+ * `pendingBrowserUrl`, because this component owns the rect that ensure needs.
+ * Stop and Reload
  * buttons halt the in-flight load and re-issue the current page (both safe
  * no-ops before the first Open). The child is shown
  * when the tab is active and hidden when a modal overlay opens (see
@@ -52,6 +56,9 @@ export function BrowserView() {
   // unsupported panel once the backend answers on mount.
   const [supported, setSupported] = useState(true);
   const areaRef = useRef<HTMLDivElement>(null);
+  // Generation counter for loadIntoChild: two links clicked inside one IPC
+  // round-trip can settle out of order, so only the newest chain may act.
+  const loadToken = useRef(0);
 
   // Ask the backend once whether the native child webview exists on this
   // platform (Windows-only: WebView2 + CDP; see ipc/browser_webview.rs).
@@ -85,12 +92,30 @@ export function BrowserView() {
     };
   }, [supported]);
 
-  /** Commit the typed URL to the child webview (called on Open or Enter). */
-  async function openUrl() {
-    const target = url.trim();
+  /**
+   * Load `target` into the child webview through the rect-aware path:
+   * normalize it (the shared `normalize_url` allow-list), ensure the child
+   * exists at THIS component's current placeholder rect (created on first call,
+   * moved/resized after), then navigate. Shared by the URL bar's Open/Enter and
+   * the store-held chat-link request below — the rect lives here, so both must
+   * route through this rather than navigating directly (a rect-less ensure
+   * would move an already-created child).
+   *
+   * Memoized (`useCallback([])`) so it is a STABLE dependency of the consume
+   * effect below — it touches only state setters, the areaRef and module
+   * imports, so its identity never needs to change. Every call takes a
+   * generation token: a superseded chain bails after each await instead of
+   * navigating or writing the URL bar, so the child can never come to rest on
+   * an older link than the one the user last clicked.
+   */
+  const loadIntoChild = useCallback(async (target: string) => {
     if (!target) return;
+    const token = ++loadToken.current;
+    // Echo the target into the URL bar so a chat link shows where it went.
+    setUrl(target);
     try {
       const normalized = await browserNormalizeUrl(target);
+      if (token !== loadToken.current) return;
       // Ensure the child webview exists (created on first call) + navigate it.
       // The rect is reported continuously by useBrowserRect; pass the current
       // rect so the child is positioned correctly on creation.
@@ -105,14 +130,44 @@ export function BrowserView() {
           Math.round(r.height * dpr),
           normalized,
         );
+        if (token !== loadToken.current) return;
       }
       await browserWebviewNavigate(normalized);
+      if (token !== loadToken.current) return;
       setLoadedUrl(normalized);
       setError(null);
     } catch (e) {
+      // A superseded chain's failure is not the current page's problem.
+      if (token !== loadToken.current) return;
       setError(errMsg(e));
     }
+  }, []);
+
+  /** Commit the typed URL to the child webview (called on Open or Enter). */
+  async function openUrl() {
+    await loadIntoChild(url.trim());
   }
+
+  // Consume a pending browser-open request from the store (set by a chat link
+  // click: lib/openChatLink.ts → requestBrowserOpen). The URL travels through
+  // the store rather than being navigated by the clicker because the child
+  // webview's RECT lives here — and because a store-held request survives the
+  // click landing while this view is unmounted/disabled (revealing the tab is
+  // what mounts it). Clearing right after the load makes it single-shot, so a
+  // re-render can never replay it.
+  const pendingBrowserUrl = useAgentStore((s) => s.pendingBrowserUrl);
+  useEffect(() => {
+    if (pendingBrowserUrl === null) return;
+    // A platform without the child webview never receives a request (the
+    // router falls back to the OS browser first); drop one anyway rather than
+    // leaving it to fire on a later mount.
+    if (!supported) {
+      useAgentStore.getState().clearPendingBrowserUrl();
+      return;
+    }
+    void loadIntoChild(pendingBrowserUrl);
+    useAgentStore.getState().clearPendingBrowserUrl();
+  }, [pendingBrowserUrl, supported, loadIntoChild]);
 
   /** Halt the child webview's in-flight page load (no-op when nothing loads). */
   async function stopLoad() {

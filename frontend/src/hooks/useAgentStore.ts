@@ -248,6 +248,15 @@ interface AppState extends AppStateLike {
    * started at; null = top of file).
    */
   pendingFileOpen: { path: string; line: number | null } | null;
+  /**
+   * The http(s) URL a chat link asked the Browser tab to load, held in the
+   * store so BrowserView can consume it on mount/change. It travels through
+   * the store because the CHILD WEBVIEW'S RECT lives in BrowserView: the chat
+   * has no rect to hand `browserWebviewEnsure`, and calling ensure with a
+   * guessed one would MOVE an already-created child to the wrong place.
+   * `null` when there is no pending open.
+   */
+  pendingBrowserUrl: string | null;
   safetyMode: SafetyMode;
   fontFamily: string;
   fontSize: number;
@@ -461,6 +470,15 @@ interface AppState extends AppStateLike {
   requestFileOpen: (path: string, line?: number | null) => void;
   /** Clear the pending file-open path (called by the FileViewer once loaded). */
   clearPendingFileOpen: () => void;
+  /**
+   * Request that the Browser tab load `url` (http(s)): reveal + select that
+   * tab and record the URL in `pendingBrowserUrl` for BrowserView to consume.
+   * Race-free (no event) — the view reads the pending URL whenever it is
+   * mounted, so it works even when the Browser tab was disabled/unmounted.
+   */
+  requestBrowserOpen: (url: string) => void;
+  /** Clear the pending browser URL (called by BrowserView once loaded). */
+  clearPendingBrowserUrl: () => void;
   /** True if a right-panel tool tab is currently enabled (not in disabledTabs). */
   isTabEnabled: (tab: RightPanelTab) => boolean;
   setSafetyMode: (m: SafetyMode) => void;
@@ -647,6 +665,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   rightPanelTab: "plan",
   disabledTabs: ALL_RIGHT_PANEL_TABS.filter((t) => t !== "plan"),
   pendingFileOpen: null,
+  pendingBrowserUrl: null,
   safetyMode: "approve-each-action",
   fontFamily: readLs(LS_FONT_FAMILY, DEFAULT_FONT_FAMILY),
   fontSize: readLsNumber(LS_FONT_SIZE, DEFAULT_FONT_SIZE),
@@ -872,6 +891,17 @@ export const useAgentStore = create<AppState>((set, get) => ({
       pendingFileOpen: { path, line: line ?? null },
     })),
   clearPendingFileOpen: () => set({ pendingFileOpen: null }),
+  requestBrowserOpen: (url) =>
+    set((s) => ({
+      // Reveal + select the Browser tab (mirrors requestFileOpen) and hold the
+      // URL so BrowserView consumes it on mount/change — that view owns the
+      // child webview's rect, so ensure + navigate must happen there.
+      disabledTabs: s.disabledTabs.filter((t) => t !== "browser"),
+      rightPanelTab: "browser",
+      rightPanelVisible: true,
+      pendingBrowserUrl: url,
+    })),
+  clearPendingBrowserUrl: () => set({ pendingBrowserUrl: null }),
   autoRevealPlan: () =>
     set((s) => {
       // Only auto-reveal when the panel is currently hidden AND the Plan tab

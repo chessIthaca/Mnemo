@@ -22,6 +22,8 @@ export default defineConfig({
       "src/components/chat/InflightBar.test.ts",
       "src/components/chat/InlineMarkdown.test.ts",
       "src/components/chat/MarkdownLink.test.tsx",
+      "src/components/chat/Message.preview.off.test.tsx",
+      "src/components/chat/Message.preview.test.tsx",
       "src/components/chat/messageArgLabel.test.ts",
       "src/components/common/BootSplash.test.tsx",
       "src/components/common/JsonView.test.ts",

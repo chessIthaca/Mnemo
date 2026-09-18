@@ -443,6 +443,9 @@ function ToolCard({
   // Inline images from image commands are gated by the Chat settings toggle
   // (config.toml [ui].show_tool_images, default ON).
   const showToolImages = useAgentStore((s) => s.showToolImages);
+  // The live shell-output preview is gated by the Chat settings toggle
+  // (localStorage mh.showShellPreview, default ON — backlog 6f25fb7e).
+  const showShellPreview = useAgentStore((s) => s.showShellPreview);
   // Steering notes are gated per kind by the Chat settings toggles
   // (config.toml [ui].steering_notes) — a GUI-only display filter; the tool
   // result text is unaffected.
@@ -557,7 +560,7 @@ function ToolCard({
   const liveTail = liveTailPreview(liveOutput);
   const liveTailRef = useRef<HTMLPreElement | null>(null);
   // Follow the tail as chunks arrive: the retained window is capped (16 KiB in
-  // the reducer, 12em here), so the NEWEST lines are the point — the same
+  // the reducer, 10em here), so the NEWEST lines are the point — the same
   // stick-to-bottom idiom as InflightBar's reasoning panel.
   useEffect(() => {
     const el = liveTailRef.current;
@@ -673,12 +676,22 @@ function ToolCard({
           without expanding the card, and screen readers hear the newest lines
           instead of a silent gap. Only the newest lines are rendered; the FULL
           text (byte-identical — what the model consumes) still arrives with
-          the result. This block is display-only. */}
-      {liveTail !== "" && (
+          the result. This block is display-only.
+          FIXED HEIGHT, reserved from the first paint of a running shell card
+          (backlog 6f25fb7e): the block occupies h-[10em] — six lines at the
+          element's own em (6 × 1.5em line-height + 2 × 0.5em padding; the
+          pre's text-[0.75em] makes every em below font-size element-relative),
+          fitting the liveTailPreview window — whether empty or full, so
+          streaming chunks can never change the card's height or jump the chat
+          column. Only `shell` emits ToolOutputDelta (the shell.rs sink), and
+          shell never merges (the reducer's neverGroups), so the reservation
+          is shell-only; the Chat-settings toggle turns the preview off
+          entirely. */}
+      {showShellPreview && name === "shell" && running && (
         <pre
           ref={liveTailRef}
           aria-live="polite"
-          className="mt-[0.15em] max-h-[12em] overflow-auto whitespace-pre-wrap break-words rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-400"
+          className="mt-[0.15em] h-[10em] overflow-auto whitespace-pre-wrap break-words rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-400"
         >
           {liveTail}
         </pre>

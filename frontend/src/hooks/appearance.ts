@@ -15,6 +15,7 @@ export const LS_FONT_FAMILY = "mh.fontFamily";
 export const LS_FONT_SIZE = "mh.fontSize";
 export const LS_THEME = "mh.theme";
 export const LS_SHOW_TOKEN_USAGE = "mh.showTokenUsage";
+export const LS_SHOW_SHELL_PREVIEW = "mh.showShellPreview";
 export const LS_ACCENT_COLOR = "mh.accentColor";
 export const LS_BORDER_COLOR = "mh.borderColor";
 export const LS_TEXT_PRIMARY_COLOR = "mh.textPrimaryColor";
@@ -360,6 +361,13 @@ export function readTheme(): Theme {
 /** Read show-token-usage preference (default true). */
 export function readShowTokenUsage(): boolean {
   const raw = readLs(LS_SHOW_TOKEN_USAGE, "true");
+  return raw !== "false" && raw !== "0";
+}
+
+/** Read show-shell-preview preference (default true) — the live
+ *  shell-output preview in running tool cards (backlog 6f25fb7e). */
+export function readShowShellPreview(): boolean {
+  const raw = readLs(LS_SHOW_SHELL_PREVIEW, "true");
   return raw !== "false" && raw !== "0";
 }
 

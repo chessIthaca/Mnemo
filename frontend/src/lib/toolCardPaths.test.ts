@@ -1166,10 +1166,15 @@ describe("live shell output tail (backlog 7e6385b3)", () => {
     // result always replaces the preview; the reducer clears liveOutput on
     // tool_result as the second line of defence.
     expect(src).toContain("calls.find((c) => c.result === null && c.liveOutput)");
-    expect(src).toContain('{liveTail !== "" && (');
+    // FIXED height, reserved from the first paint of a running SHELL card
+    // (backlog 6f25fb7e): the block renders whether or not output has
+    // arrived yet, gated by the Chat-settings toggle — streaming chunks can
+    // never change the card's height or jump the chat column.
+    expect(src).toContain('{showShellPreview && name === "shell" && running && (');
+    expect(src).toContain("h-[10em]");
+    expect(src).not.toContain("max-h-[12em]");
     // Follow the newest output (a chatty command prints far more than fits).
     expect(src).toContain("el.scrollTop = el.scrollHeight");
-    expect(src).toContain("max-h-[12em]");
     // Only the newest lines are rendered (the retained window is the
     // scroll-back source, not the DOM), and the block announces itself.
     expect(src).toContain("liveTailPreview(liveOutput)");

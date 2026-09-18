@@ -57,6 +57,7 @@ import {
   LS_FONT_SIZE,
   LS_RIGHT_PANEL_WIDTH,
   LS_RIGHT_PANEL_WIDTH_FRAC,
+  LS_SHOW_SHELL_PREVIEW,
   LS_SHOW_TOKEN_USAGE,
   LS_THEME,
   applyCodeColors,
@@ -69,6 +70,7 @@ import {
   readLsNumber,
   readLsNumberOrNull,
   readRightPanelWidthFrac,
+  readShowShellPreview,
   readShowTokenUsage,
   readTheme,
   resolveTheme,
@@ -159,6 +161,7 @@ export {
   LS_FONT_SIZE,
   LS_RIGHT_PANEL_WIDTH,
   LS_RIGHT_PANEL_WIDTH_FRAC,
+  LS_SHOW_SHELL_PREVIEW,
   LS_SHOW_TOKEN_USAGE,
   LS_THEME,
   MAX_ACTIVITY_ENTRIES,
@@ -179,6 +182,7 @@ export {
   readLsNumber,
   readLsNumberOrNull,
   readRightPanelWidthFrac,
+  readShowShellPreview,
   readShowTokenUsage,
   readTheme,
   recentOutputTokPerSec,
@@ -269,6 +273,9 @@ interface AppState extends AppStateLike {
   theme: Theme;
   /** Whether InflightBar shows token counts (also persisted to config.toml [ui]). */
   showTokenUsage: boolean;
+  /** Whether the live shell-output preview renders in running tool cards
+   *  (persisted to localStorage mh.showShellPreview — backlog 6f25fb7e). */
+  showShellPreview: boolean;
   /** Whether images from image commands (the image_* vision tools and the
    *  browser screenshot tools) render inline below their tool results in the
    *  agent chat (persisted to config.toml [ui].show_tool_images). */
@@ -489,6 +496,7 @@ interface AppState extends AppStateLike {
   isTabEnabled: (tab: RightPanelTab) => boolean;
   setSafetyMode: (m: SafetyMode) => void;
   setShowTokenUsage: (show: boolean) => void;
+  setShowShellPreview: (show: boolean) => void;
   setShowToolImages: (show: boolean) => void;
   setShowToolActivity: (show: boolean) => void;
   setShowKnowledgeActivity: (show: boolean) => void;
@@ -677,6 +685,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   fontSize: readLsNumber(LS_FONT_SIZE, DEFAULT_FONT_SIZE),
   theme: readTheme(),
   showTokenUsage: readShowTokenUsage(),
+  showShellPreview: readShowShellPreview(),
   showToolImages: true,
   // Agent-activity cards are shown by default (backlog 57687857 — user
   // request 2027-01-13: tool results visible out of the box); hydrated from
@@ -927,6 +936,10 @@ export const useAgentStore = create<AppState>((set, get) => ({
   setShowTokenUsage: (show) => {
     writeLs(LS_SHOW_TOKEN_USAGE, show ? "true" : "false");
     set({ showTokenUsage: show });
+  },
+  setShowShellPreview: (show) => {
+    writeLs(LS_SHOW_SHELL_PREVIEW, show ? "true" : "false");
+    set({ showShellPreview: show });
   },
   setShowToolImages: (show) => set({ showToolImages: show }),
   setShowToolActivity: (show) => set({ showToolActivity: show }),

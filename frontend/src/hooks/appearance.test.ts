@@ -17,6 +17,7 @@ import {
   clampPanelFraction,
   effectiveAccentFor,
   readRightPanelWidthFrac,
+  readShowShellPreview,
 } from "./appearance";
 
 describe("effectiveAccentFor", () => {
@@ -100,6 +101,36 @@ describe("readRightPanelWidthFrac", () => {
     stubStorage({}, 800);
     try {
       expect(readRightPanelWidthFrac()).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("readShowShellPreview", () => {
+  /** Stub `window` with a fake localStorage (node env has none). */
+  function stubStorage(entries: Record<string, string>) {
+    vi.stubGlobal("window", {
+      localStorage: {
+        getItem: (key: string) => entries[key] ?? null,
+        setItem: () => {},
+      },
+    });
+  }
+
+  it("defaults to true when nothing is persisted", () => {
+    stubStorage({});
+    try {
+      expect(readShowShellPreview()).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("reads an explicit false", () => {
+    stubStorage({ "mh.showShellPreview": "false" });
+    try {
+      expect(readShowShellPreview()).toBe(false);
     } finally {
       vi.unstubAllGlobals();
     }

@@ -383,6 +383,12 @@ export interface ChatDraft {
   showToolActivity: boolean;
   showKnowledgeActivity: boolean;
   /**
+   * Whether the live shell-output preview renders in running tool cards.
+   * Persisted to localStorage (mh.showShellPreview) — NOT config.toml, per
+   * backlog 6f25fb7e; the store setter writes localStorage directly.
+   */
+  showShellPreview: boolean;
+  /**
    * Per-kind steering-note visibility (config.toml [ui.steering_notes]), one
    * flag per registry kind — the positive form of the store's hidden list;
    * the Chat section renders one checkbox per `STEERING_NOTES` entry.

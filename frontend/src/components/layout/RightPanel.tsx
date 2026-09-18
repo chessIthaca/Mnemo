@@ -3,6 +3,7 @@
 // See LICENSE in the repository root.
 
 import { X } from "lucide-react";
+import { CHAT_MIN_PX, PANEL_MAX_FRAC, clampPanelFraction } from "../../hooks/appearance";
 import { useAgentStore } from "../../hooks/useAgentStore";
 import type { RightPanelTab } from "../../hooks/useAgentStore";
 import { RIGHT_PANEL_VIEWS } from "../../hooks/rightPanelViews";
@@ -14,7 +15,7 @@ export function RightPanel() {
   const toggleRightPanel = useAgentStore((s) => s.toggleRightPanel);
   const toggleTabAndReveal = useAgentStore((s) => s.toggleTabAndReveal);
   const disabledTabs = useAgentStore((s) => s.disabledTabs);
-  const rightPanelWidth = useAgentStore((s) => s.rightPanelWidth);
+  const rightPanelWidthFrac = useAgentStore((s) => s.rightPanelWidthFrac);
 
   // Only enabled tools render as tabs. If the active tab was disabled, fall
   // back to the first enabled tab so a disabled tool can't render.
@@ -24,19 +25,30 @@ export function RightPanel() {
     ? activeTab
     : enabledViews[0]?.id;
 
-  // Re-clamp the persisted width against the current viewport so a stored
-  // width from a larger monitor (or a smaller restore) can't push the main
-  // column toward zero width. Falls back to flex-grow (undefined style) when
-  // no explicit width is set.
-  const clampedWidth =
-    rightPanelWidth !== null
-      ? Math.max(300, Math.min(window.innerWidth * 0.8, rightPanelWidth))
+  // Re-clamp the persisted fraction against the current viewport so the
+  // panel can never crowd the chat column below its guaranteed minimum.
+  // The rendered width carries the band caps inline — min(pct%, 50%,
+  // calc(100% - 480px)) — so the layout engine re-clamps at EVERY
+  // viewport: a plain percentage tracks resizes, but its render-time
+  // clamp would go stale between renders (review L1). Falls back to
+  // flex-grow (undefined style) when no explicit width is set.
+  const clampedFrac =
+    rightPanelWidthFrac !== null
+      ? clampPanelFraction(rightPanelWidthFrac, window.innerWidth)
       : null;
 
   return (
     <div
       className="flex min-w-[300px] flex-col bg-bg-secondary"
-      style={clampedWidth !== null ? { width: `${clampedWidth}px` } : undefined}
+      style={
+        clampedFrac !== null
+          ? {
+              width: `min(${Math.round(clampedFrac * 1000) / 10}%, ${
+                PANEL_MAX_FRAC * 100
+              }%, calc(100% - ${CHAT_MIN_PX}px))`,
+            }
+          : undefined
+      }
     >
       {/* Tab bar — Radix Tabs gives role="tablist"/"tab", aria-selected, and
           arrow-key navigation. The X close button stays outside the tablist. */}

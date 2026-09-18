@@ -106,6 +106,7 @@ describe("serializeChat", () => {
     showToolImages: true,
     showToolActivity: true,
     showKnowledgeActivity: true,
+    showShellPreview: true,
     steeringNotes: allVisible,
     chatThreadLine: true,
     chatProseCap: true,
@@ -126,6 +127,9 @@ describe("serializeChat", () => {
     );
     expect(serializeChat(base)).not.toBe(
       serializeChat({ ...base, showToolActivity: false }),
+    );
+    expect(serializeChat(base)).not.toBe(
+      serializeChat({ ...base, showShellPreview: false }),
     );
     expect(serializeChat(base)).not.toBe(
       serializeChat({ ...base, steeringNotes: { ...allVisible, literal_tip: false } }),

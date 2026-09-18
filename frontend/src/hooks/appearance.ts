@@ -15,6 +15,7 @@ export const LS_FONT_FAMILY = "mh.fontFamily";
 export const LS_FONT_SIZE = "mh.fontSize";
 export const LS_THEME = "mh.theme";
 export const LS_SHOW_TOKEN_USAGE = "mh.showTokenUsage";
+export const LS_SHOW_SHELL_PREVIEW = "mh.showShellPreview";
 export const LS_ACCENT_COLOR = "mh.accentColor";
 export const LS_BORDER_COLOR = "mh.borderColor";
 export const LS_TEXT_PRIMARY_COLOR = "mh.textPrimaryColor";
@@ -26,8 +27,18 @@ export const LS_CODE_STRING_COLOR = "mh.codeStringColor";
 export const LS_CODE_NUMBER_COLOR = "mh.codeNumberColor";
 export const LS_CODE_TITLE_COLOR = "mh.codeTitleColor";
 export const LS_CODE_VARIABLE_COLOR = "mh.codeVariableColor";
-/** Persisted right-panel width in px (null = use the default flex-grow width). */
+/**
+ * Legacy persisted right-panel width in px (pre-fraction versions). Read
+ * once as a seed by readRightPanelWidthFrac; no longer written.
+ */
 export const LS_RIGHT_PANEL_WIDTH = "mh.rightPanelWidth";
+/**
+ * Persisted right-panel width as a FRACTION of the window width
+ * (null = use the default flex-grow width). A fraction tracks window
+ * resizes for free and can never pin at a render cap on a small restored
+ * window — the legacy px value's failure mode.
+ */
+export const LS_RIGHT_PANEL_WIDTH_FRAC = "mh.rightPanelWidthFrac";
 
 /** Default font family — a safe system stack. */
 export const DEFAULT_FONT_FAMILY = "system-ui";
@@ -224,6 +235,51 @@ export function writeLs(key: string, value: string): void {
   }
 }
 
+/**
+ * The chat column's guaranteed minimum width in px — the right-panel band
+ * ceiling reserves this much of the window. Shared by clampPanelFraction
+ * and the RightPanel render (the caps ride inline in the width style so
+ * the layout engine re-clamps at every viewport — review L1).
+ */
+export const CHAT_MIN_PX = 480;
+/**
+ * The right panel's maximum share of the window width (the band ceiling).
+ * Shared by clampPanelFraction and the RightPanel inline style caps.
+ */
+export const PANEL_MAX_FRAC = 0.5;
+
+/**
+ * Clamp a right-panel width FRACTION into the sane band for a viewport:
+ * at least the 300px panel floor, at most half the window, and never so
+ * wide that the chat column drops below a ~480px guaranteed minimum.
+ * Replaces the old [300, 0.8×innerWidth] px clamp, whose 80% ceiling let
+ * a px width persisted from a larger monitor fill the whole app on a
+ * small restored window (the chat column was squeezed to a sliver).
+ * Pure — used by the panel render, the resize handle, and tests.
+ */
+export function clampPanelFraction(frac: number, innerWidth: number): number {
+  const w = Math.max(1, innerWidth);
+  const min = Math.max(300 / w, 0.15);
+  const max = Math.max(min, Math.min(PANEL_MAX_FRAC, (w - CHAT_MIN_PX) / w));
+  return Math.min(Math.max(frac, min), max);
+}
+
+/**
+ * Read the persisted right-panel width fraction. When the fraction key is
+ * unset, seeds from the legacy absolute-px key (mh.rightPanelWidth,
+ * pre-fraction versions) by reinterpreting it against the current
+ * viewport, clamped into the band — no migration write. Returns null when
+ * neither key is set (the panel then uses its default flex-grow width).
+ */
+export function readRightPanelWidthFrac(): number | null {
+  const frac = readLsNumberOrNull(LS_RIGHT_PANEL_WIDTH_FRAC);
+  if (frac !== null) return frac;
+  if (typeof window === "undefined") return null;
+  const legacyPx = readLsNumberOrNull(LS_RIGHT_PANEL_WIDTH);
+  if (legacyPx === null) return null;
+  return clampPanelFraction(legacyPx / window.innerWidth, window.innerWidth);
+}
+
 // ── Color preferences table (D4 dedup) ──────────────────────────────────
 // One table drives the 11 color prefs (4 UI + 7 code) so the store's 11
 // hand-written setters + resetColors/resetAppearance collapse to thin
@@ -305,6 +361,13 @@ export function readTheme(): Theme {
 /** Read show-token-usage preference (default true). */
 export function readShowTokenUsage(): boolean {
   const raw = readLs(LS_SHOW_TOKEN_USAGE, "true");
+  return raw !== "false" && raw !== "0";
+}
+
+/** Read show-shell-preview preference (default true) — the live
+ *  shell-output preview in running tool cards (backlog 6f25fb7e). */
+export function readShowShellPreview(): boolean {
+  const raw = readLs(LS_SHOW_SHELL_PREVIEW, "true");
   return raw !== "false" && raw !== "0";
 }
 

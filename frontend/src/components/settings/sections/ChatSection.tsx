@@ -18,8 +18,9 @@ export interface ChatSectionProps {
 
 /**
  * Chat section — chat display toggles (token usage in the activity bar,
- * tool activity cards in the transcript). These were moved out of
- * Appearance: they gate what the chat surface shows, not visual styling.
+ * tool activity cards in the transcript, the live shell-output preview).
+ * These were moved out of Appearance: they gate what the chat surface
+ * shows, not visual styling.
  *
  * Draft model like Appearance, but with no live CSS preview — the toggles
  * write localStorage / config.toml only on Save, so discarding is a no-op.
@@ -39,6 +40,7 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
       showToolImages: s.showToolImages,
       showToolActivity: s.showToolActivity,
       showKnowledgeActivity: s.showKnowledgeActivity,
+      showShellPreview: s.showShellPreview,
       steeringNotes: Object.fromEntries(
         STEERING_NOTES.map((def) => [def.key, !s.hiddenSteeringNotes.includes(def.key)]),
       ) as Record<SteeringNoteKey, boolean>,
@@ -88,6 +90,10 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
         s.setShowToolImages(draft.showToolImages);
         s.setShowToolActivity(draft.showToolActivity);
         s.setShowKnowledgeActivity(draft.showKnowledgeActivity);
+        // localStorage-only persistence (backlog 6f25fb7e) — deliberately
+        // NOT in the saveSettings config.toml payload below, unlike the
+        // siblings above.
+        s.setShowShellPreview(draft.showShellPreview);
         s.setHiddenSteeringNotes(
           STEERING_NOTES.filter((def) => !draft.steeringNotes[def.key]).map((def) => def.key),
         );
@@ -172,6 +178,16 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
             className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
           />
           Show knowledge activity in chat (graph, memory, auto-recall)
+        </label>
+
+        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+          <input
+            type="checkbox"
+            checked={draft.showShellPreview}
+            onChange={(e) => patch({ showShellPreview: e.target.checked })}
+            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          />
+          Stream shell output live in the tool card
         </label>
 
         <div className="space-y-2 border-t border-[color:var(--border-color)] pt-3">

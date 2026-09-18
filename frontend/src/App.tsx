@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow, availableMonitors } from "@tauri-apps/api/window";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { clampPanelFraction } from "./hooks/appearance";
 import { useAgentEvents } from "./hooks/useAgentEvents";
 import { useAgentStore, applyFontVars, applyTheme, applyColors, applyCodeColors, didMainTurnEnd } from "./hooks/useAgentStore";
 import {
@@ -94,9 +95,13 @@ export default function App() {
   useAgentEvents();
   const activeAgent = useAgentStore((s) => s.activeAgent);
   const rightPanelVisible = useAgentStore((s) => s.rightPanelVisible);
-  const rightPanelWidth = useAgentStore((s) => s.rightPanelWidth);
-  const setRightPanelWidth = useAgentStore((s) => s.setRightPanelWidth);
-  const setRightPanelWidthLive = useAgentStore((s) => s.setRightPanelWidthLive);
+  const rightPanelWidthFrac = useAgentStore((s) => s.rightPanelWidthFrac);
+  const setRightPanelWidthFrac = useAgentStore(
+    (s) => s.setRightPanelWidthFrac,
+  );
+  const setRightPanelWidthFracLive = useAgentStore(
+    (s) => s.setRightPanelWidthFracLive,
+  );
   const setGitBranch = useAgentStore((s) => s.setGitBranch);
   const setActiveAgent = useAgentStore((s) => s.setActiveAgent);
   const setModel = useAgentStore((s) => s.setModel);
@@ -791,9 +796,9 @@ export default function App() {
       {rightPanelVisible && (
         <>
           <ResizeHandle
-            width={rightPanelWidth}
-            onWidthChangeLive={setRightPanelWidthLive}
-            onWidthCommit={setRightPanelWidth}
+            frac={rightPanelWidthFrac}
+            onFracChangeLive={setRightPanelWidthFracLive}
+            onFracCommit={setRightPanelWidthFrac}
           />
           <RightPanel />
         </>
@@ -804,12 +809,14 @@ export default function App() {
 
 /**
  * A vertical drag handle between the main column and the right tools panel.
- * Dragging left/right resizes the panel; the width is clamped to
- * [300, window.innerWidth * 0.8]. The store state updates live during the
- * drag (so the panel follows the cursor), but localStorage is only written on
- * drag-end (via the store setter) to avoid a synchronous write per
- * pointermove. A `useEffect` cleans up any in-flight drag listeners if the
- * component unmounts mid-drag (e.g. the panel is hidden).
+ * Dragging left/right resizes the panel; the width lives as a FRACTION of
+ * the window (clamped to the panel band — see clampPanelFraction), so it
+ * tracks window resizes and can never pin at a cap on a small window. The
+ * store state updates live during the drag (so the panel follows the
+ * cursor), but localStorage is only written on drag-end (via the store
+ * setter) to avoid a synchronous write per pointermove. A `useEffect`
+ * cleans up any in-flight drag listeners if the component unmounts
+ * mid-drag (e.g. the panel is hidden).
  *
  * The handle shows the app's standard resize-affordance motif — a centered
  * grip pill plus a subtle cyan hover wash — matching the InflightBar and
@@ -821,15 +828,15 @@ export default function App() {
  * to grab.
  */
 function ResizeHandle({
-  width,
-  onWidthChangeLive,
-  onWidthCommit,
+  frac,
+  onFracChangeLive,
+  onFracCommit,
 }: {
-  width: number | null;
-  /** Live (in-memory only) width update — called on every pointermove. */
-  onWidthChangeLive: (w: number) => void;
-  /** Persist the final width (writes localStorage) — called on drag-end. */
-  onWidthCommit: (w: number | null) => void;
+  frac: number | null;
+  /** Live (in-memory only) fraction update — called on every pointermove. */
+  onFracChangeLive: (f: number) => void;
+  /** Persist the final fraction (writes localStorage) — called on drag-end. */
+  onFracCommit: (f: number | null) => void;
 }) {
   // Track the active drag's window listeners so a `useEffect` cleanup can
   // tear them down if the component unmounts mid-drag.
@@ -849,19 +856,22 @@ function ResizeHandle({
     // The panel's current pixel width (fall back to measuring it from the DOM
     // when the user hasn't set an explicit width yet).
     const panel = (e.currentTarget.nextElementSibling as HTMLElement) ?? null;
-    const startWidth = width ?? panel?.getBoundingClientRect().width ?? 480;
+    const startWidth =
+      frac !== null
+        ? clampPanelFraction(frac, window.innerWidth) * window.innerWidth
+        : panel?.getBoundingClientRect().width ?? 480;
     const handle = e.currentTarget;
     handle.setPointerCapture(e.pointerId);
 
-    const clamp = (px: number) => {
-      const max = window.innerWidth * 0.8;
-      return Math.max(300, Math.min(max, px));
-    };
+    // Pointer deltas are px; each update converts to the window fraction,
+    // clamped to the panel band (see clampPanelFraction).
+    const fracFromPx = (px: number) =>
+      clampPanelFraction(px / window.innerWidth, window.innerWidth);
 
     const onMove = (ev: PointerEvent) => {
       // Dragging left grows the panel (the panel is on the right edge).
       const delta = startX - ev.clientX;
-      onWidthChangeLive(Math.round(clamp(startWidth + delta)));
+      onFracChangeLive(fracFromPx(startWidth + delta));
     };
     const endDrag = (ev: PointerEvent) => {
       try {
@@ -873,9 +883,9 @@ function ResizeHandle({
       window.removeEventListener("pointerup", endDrag);
       window.removeEventListener("pointercancel", endDrag);
       cleanupRef.current = null;
-      // Persist the final width (the store setter writes to localStorage).
+      // Persist the final fraction (the store setter writes to localStorage).
       const delta = startX - ev.clientX;
-      onWidthCommit(Math.round(clamp(startWidth + delta)));
+      onFracCommit(fracFromPx(startWidth + delta));
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", endDrag);

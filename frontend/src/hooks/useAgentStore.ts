@@ -56,6 +56,7 @@ import {
   LS_FONT_FAMILY,
   LS_FONT_SIZE,
   LS_RIGHT_PANEL_WIDTH,
+  LS_RIGHT_PANEL_WIDTH_FRAC,
   LS_SHOW_TOKEN_USAGE,
   LS_THEME,
   applyCodeColors,
@@ -67,6 +68,7 @@ import {
   readLs,
   readLsNumber,
   readLsNumberOrNull,
+  readRightPanelWidthFrac,
   readShowTokenUsage,
   readTheme,
   resolveTheme,
@@ -156,6 +158,7 @@ export {
   LS_FONT_FAMILY,
   LS_FONT_SIZE,
   LS_RIGHT_PANEL_WIDTH,
+  LS_RIGHT_PANEL_WIDTH_FRAC,
   LS_SHOW_TOKEN_USAGE,
   LS_THEME,
   MAX_ACTIVITY_ENTRIES,
@@ -175,6 +178,7 @@ export {
   readLs,
   readLsNumber,
   readLsNumberOrNull,
+  readRightPanelWidthFrac,
   readShowTokenUsage,
   readTheme,
   recentOutputTokPerSec,
@@ -231,11 +235,13 @@ interface AppState extends AppStateLike {
   gitBranch: string;
   rightPanelVisible: boolean;
   /**
-   * Right-panel width in px, or null to use the default flex-grow width
-   * (40% of the window). Set by dragging the divider between the main column
-   * and the right panel; persisted to localStorage.
+   * Right-panel width as a fraction of the window width (0–1), or null to
+   * use the default flex-grow width. Set by dragging the divider between
+   * the main column and the right panel; persisted to localStorage as a
+   * fraction so it tracks window resizes and can never pin at a cap on a
+   * small restored window.
    */
-  rightPanelWidth: number | null;
+  rightPanelWidthFrac: number | null;
   rightPanelTab: RightPanelTab;
   /** Right-panel tool tabs the user has toggled off (per-tool on/off in the left sidebar). */
   disabledTabs: RightPanelTab[];
@@ -424,14 +430,14 @@ interface AppState extends AppStateLike {
   setPricing: (p: PricingEntry[]) => void;
   setGitBranch: (b: string) => void;
   toggleRightPanel: () => void;
-  /** Set the right-panel width (px). Pass null to restore the default flex-grow width. */
-  setRightPanelWidth: (w: number | null) => void;
+  /** Set the right-panel width fraction. Pass null to restore the default flex-grow width. */
+  setRightPanelWidthFrac: (f: number | null) => void;
   /**
-   * Update the right-panel width in-memory only (no localStorage write).
-   * Used during an active drag so the panel follows the cursor without a
-   * synchronous localStorage write per pointermove.
+   * Update the right-panel width fraction in-memory only (no localStorage
+   * write). Used during an active drag so the panel follows the cursor
+   * without a synchronous localStorage write per pointermove.
    */
-  setRightPanelWidthLive: (w: number) => void;
+  setRightPanelWidthFracLive: (f: number) => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
   /**
    * Set the user's explicit Diff-tab dropdown pick (a path from `planDiffs`).
@@ -661,7 +667,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   // enabled by default (all others start disabled; turn them on from the
   // left toolbar).
   rightPanelVisible: true,
-  rightPanelWidth: readLsNumberOrNull(LS_RIGHT_PANEL_WIDTH),
+  rightPanelWidthFrac: readRightPanelWidthFrac(),
   rightPanelTab: "plan",
   disabledTabs: ALL_RIGHT_PANEL_TABS.filter((t) => t !== "plan"),
   pendingFileOpen: null,
@@ -811,21 +817,21 @@ export const useAgentStore = create<AppState>((set, get) => ({
   setGitBranch: (b) => set({ gitBranch: b }),
   toggleRightPanel: () =>
     set((s) => ({ rightPanelVisible: !s.rightPanelVisible })),
-  setRightPanelWidth: (w) => {
-    if (w === null) {
-      writeLs(LS_RIGHT_PANEL_WIDTH, "");
+  setRightPanelWidthFrac: (f) => {
+    if (f === null) {
+      writeLs(LS_RIGHT_PANEL_WIDTH_FRAC, "");
     } else {
-      writeLs(LS_RIGHT_PANEL_WIDTH, String(w));
+      writeLs(LS_RIGHT_PANEL_WIDTH_FRAC, String(f));
     }
-    set({ rightPanelWidth: w });
+    set({ rightPanelWidthFrac: f });
   },
   /**
-   * Update the right-panel width in-memory only (no localStorage write).
-   * Used during an active drag so the panel follows the cursor at 60+ Hz
-   * without a synchronous localStorage write per pointermove. The final
-   * width is persisted via `setRightPanelWidth` on drag-end.
+   * Update the right-panel width fraction in-memory only (no localStorage
+   * write). Used during an active drag so the panel follows the cursor at
+   * 60+ Hz without a synchronous localStorage write per pointermove. The
+   * final fraction is persisted via `setRightPanelWidthFrac` on drag-end.
    */
-  setRightPanelWidthLive: (w) => set({ rightPanelWidth: w }),
+  setRightPanelWidthFracLive: (f) => set({ rightPanelWidthFrac: f }),
   setRightPanelTab: (tab) =>
     set((s) =>
       // Ignore attempts to select a disabled tab — the content switch falls

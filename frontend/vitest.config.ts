@@ -84,6 +84,7 @@ export default defineConfig({
       "src/components/layout/MainPanel.tabStyle.test.ts",
       "src/components/layout/ExecutingStepPopup.test.tsx",
       "src/components/layout/StatusBar.truncate.test.ts",
+      "src/components/layout/RightPanel.width.test.tsx",
       "src/components/projects/indexingOverlay.test.ts",
       "src/components/projects/projectPickerPhases.test.ts",
       "src/components/resizeHandleMotif.test.ts",

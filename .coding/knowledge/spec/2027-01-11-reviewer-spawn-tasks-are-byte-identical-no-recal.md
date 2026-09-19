@@ -1,0 +1,6 @@
++++
+title = "reviewer spawn tasks are byte-identical — no recalled-context rider (backlog 1d0332ca)"
+created = "2027-01-11"
++++
+
+SPEC: Reviewer spawn tasks are CLEAN — byte-identical to the `task` argument, no RECALLED CONTEXT rider (landed 2027-01-24, plan 660fdedc, commit cd93eac on wt/mnemo, backlog 1d0332ca). The rider (spawn_agent's execute, seeding a spawned agent's first prompt with passively-recalled prior knowledge) now runs only for unrestricted sub-agents; role:"reviewer" spawns skip it entirely (no store round-trip). Rationale: the reviewer protocol hands the spawned reviewer a self-contained task — the rider would pollute it with parent-project memories (noise at best, review bias at worst: the reviewer must judge the diff/plan, not be steered by recalled context) plus prompt bloat on every review. The skip is role-based ONLY, not an exposed spawn option (the reviewer protocol is the one consumer needing a clean prompt; an opt-out knob would grow the schema for no current consumer). Scope: only the spawn_agent rider path — create_plan's result rider and the run-all dispatch rider (src-tauri/src/ipc/run_all.rs) are unchanged (workers, the rider's intended purpose). Regression test: reviewer_task_skips_the_recalled_context_rider (byte-identical assert_eq! + normal-spawn rider assertion on the same store).

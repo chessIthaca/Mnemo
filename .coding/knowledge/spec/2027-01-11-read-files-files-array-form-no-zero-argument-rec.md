@@ -1,0 +1,10 @@
++++
+title = "read_files files-array form — no zero-argument, recovery hint, unadvertised path absorption"
+created = "2027-01-11"
++++
+
+The read_files advertised schema collapsed to the single files-array form (plan 9e0b266a, backlog 26cdbaf8, 2027-01-24, wt/mnemo): "required": ["files"], the path/start_line/max_lines shorthand params REMOVED from the advertisement, and the description carries the no-zero-argument-form note, the recovery rule ("On a 'files is required' error, rewrite the full call from the path(s) you meant — do not resend the empty shape"), and an inline example of the exact call shape. The recovery hint also rides the invalid-args error path (via the hint param) so the FIRST retry succeeds. The execute() path-shorthand absorption is KEPT as unadvertised compat — harness steering (read_files_paths in src/agent/dispatch.rs parses BOTH forms from raw args) and habit-shaped calls keep working; no dispatch.rs parser change.
+
+The EDIT INTERCEPTED message (src/agent/dispatch.rs file_edit_redirect) was reworded in the same plan's review round 1: "EDIT INTERCEPTED: your last {fired} file_edit attempts failed because the old_string did not match — the file has drifted from your last read. Do not retry blind. First re-read the file with read_files (this exact path: {path}), then retry the edit with the exact current text." — the path is still named (the freshness contract; the pinning test asserts it) but no call shape is spelled; a repo-wide `read_files path=` sweep over *.rs returns 0 matches, so no model-facing surface teaches the shorthand form.
+
+History note: the superseded 2026-12-23 SPEC record "file_edit stale-read steering — fresh-read nudge + third-attempt interception gate" (.coding/knowledge/spec/2026-12-23-file-edit-stale-read-steering-fresh-read-nudge-t.md) quotes the PRE-rewording message shape ("read_files path=\"...\"") — dated history, excluded from recall; THIS record carries the current truth. The gate arms after 1 drift failure (e8b39d72 H3) and its state is per-(agent, path) (be16ea36 step 3).

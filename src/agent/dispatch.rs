@@ -1320,8 +1320,8 @@ pub(crate) fn file_edit_redirect(
     Some(ToolResult::error(format!(
         "EDIT INTERCEPTED: your last {fired} file_edit attempts failed because the \
          old_string did not match — the file has drifted from your last read. Do not \
-         retry blind. First re-read the file (read_files path=\"{path}\"), then retry the \
-         edit with the exact current text."
+         retry blind. First re-read the file with read_files (this exact path: {path}), \
+         then retry the edit with the exact current text."
     )))
 }
 

@@ -1,0 +1,6 @@
++++
+title = "git branch --show-current refused by the branch-list allowlist"
+created = "2027-01-11"
++++
+
+BUG: `git branch --show-current` — the canonical way to print the checked-out branch — was refused by the git tool's branch-list allowlist; agents had to run `git branch -v` and parse the `*` marker. Root cause: `validate_branch_list_args` (src/tool/agent/git.rs) allowlisted only listing/format flags — `--show-current` was missing from `safe_exact` and `--points-at=` from `safe_prefix`. Fix (plan 29baa080, backlog 41cd5ad0, wt/mnemo): `--show-current` added to safe_exact (exact flag, read-only — prints the branch name, exactly as read-only as --list); `--points-at=<object>` added to safe_prefix (read-only listing filter; the `=` form keeps the value off the positional path — the bare two-arg form stays doubly refused). Audited exclusions documented in the doc comment: `--column`/`--no-column`/`--omit-empty` (display-only formatting) and `-l` (deprecated synonym of --list); every mutating flag stays refused. Doc comment + rejection message kept in sync with the allowlist (message also names -q/--quiet). Regression test: `branch_list_allowlist_accepts_show_current` (validate + argv end-to-end, confirmed failing pre-fix).

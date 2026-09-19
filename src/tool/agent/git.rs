@@ -272,9 +272,15 @@ fn read_argv<'a>(base: &[&'a str], extra: &'a [String]) -> Result<Vec<&'a str>, 
 /// - any flag not on the safe-read allowlist below.
 ///
 /// Allowed (read-only listing flags): `-v`/`-vv`/`--verbose`, `-a`/`--all`,
-/// `-r`/`--remotes`, `--list`, `-q`/`--quiet`, `--no-color`, `--color=…`,
-/// `--format=…`, `--sort=…`, `--merged`/`--no-merged`/`--contains`/
-/// `--no-contains` (default to HEAD with no positional), `-i`/`--ignore-case`.
+/// `-r`/`--remotes`, `--list`, `--show-current` (prints the checked-out
+/// branch's name — exactly as read-only as --list), `-q`/`--quiet`,
+/// `--no-color`, `--color=…`, `--format=…`, `--sort=…`, `--points-at=…`
+/// (a read-only listing filter; the `=` form keeps the value off the
+/// positional path), `--merged`/`--no-merged`/`--contains`/`--no-contains`
+/// (default to HEAD with no positional), `-i`/`--ignore-case`. Audited and
+/// staying excluded: `--column`/`--no-column`/`--omit-empty` (display-only
+/// formatting, no listing value beyond defaults) and `-l` (deprecated
+/// synonym of `--list`); every mutating flag stays refused.
 fn validate_branch_list_args(args: &[String]) -> Result<(), String> {
     let safe_exact: &[&str] = &[
         "-v",
@@ -285,6 +291,7 @@ fn validate_branch_list_args(args: &[String]) -> Result<(), String> {
         "-r",
         "--remotes",
         "--list",
+        "--show-current",
         "-q",
         "--quiet",
         "--no-color",
@@ -295,7 +302,7 @@ fn validate_branch_list_args(args: &[String]) -> Result<(), String> {
         "-i",
         "--ignore-case",
     ];
-    let safe_prefix: &[&str] = &["--format=", "--sort=", "--color="];
+    let safe_prefix: &[&str] = &["--format=", "--sort=", "--color=", "--points-at="];
     for a in args {
         if !a.starts_with('-') {
             return Err(format!(
@@ -308,9 +315,9 @@ fn validate_branch_list_args(args: &[String]) -> Result<(), String> {
         if !exact && !prefix {
             return Err(format!(
                 "flag '{a}' is not allowed for `git branch list` — only read-only listing flags \
-                 are accepted: -v/-vv/--verbose, -a/--all, -r/--remotes, --list, --format=, \
-                 --sort=, --color=/--no-color, --merged/--no-merged/--contains/--no-contains, \
-                 -i/--ignore-case"
+                 are accepted: -v/-vv/--verbose, -a/--all, -r/--remotes, --list, --show-current, \
+                 -q/--quiet, --points-at=, --format=, --sort=, --color=/--no-color, \
+                 --merged/--no-merged/--contains/--no-contains, -i/--ignore-case"
             ));
         }
     }
@@ -1472,6 +1479,7 @@ mod tests {
             "-r",
             "--remotes",
             "--list",
+            "--show-current",
             "-q",
             "--quiet",
             "--no-color",
@@ -1487,12 +1495,36 @@ mod tests {
                 "{ok} should be allowed"
             );
         }
-        // Prefix matches: --format=/--sort=/--color= with a value.
+        // Prefix matches: --format=/--sort=/--color=/--points-at= with a value.
         assert!(validate_branch_list_args(&["--format=%(refname:short)".into()]).is_ok());
         assert!(validate_branch_list_args(&["--sort=-committerdate".into()]).is_ok());
         assert!(validate_branch_list_args(&["--color=always".into()]).is_ok());
+        assert!(validate_branch_list_args(&["--points-at=HEAD".into()]).is_ok());
         // Multiple flags at once.
         assert!(validate_branch_list_args(&["-vv".into(), "-a".into()]).is_ok());
+    }
+
+    #[test]
+    fn branch_list_allowlist_accepts_show_current() {
+        // Backlog 41cd5ad0 (live 2026-09-19, plan 995436c2's closing
+        // sequence): `git branch --show-current` — a purely read-only flag
+        // that prints the current branch's name — was refused by the
+        // allowlist, forcing the fallback `git branch -v` + parsing the
+        // `*` marker just to learn the current branch. It is exactly as
+        // read-only as --list.
+        assert!(validate_branch_list_args(&["--show-current".into()]).is_ok());
+        // And it reaches git: the argv builder passes it through.
+        assert_eq!(
+            branch_list_argv(&["--show-current".into()]).unwrap(),
+            vec!["branch", "--show-current"]
+        );
+        // Message/allowlist sync (review finding 2): the refusal message
+        // for an unknown flag names the allowlisted flags — a future edit
+        // that drops one from the message breaks this pin.
+        let err = validate_branch_list_args(&["--bogus".into()]).unwrap_err();
+        assert!(err.contains("--show-current"), "{err}");
+        assert!(err.contains("--points-at="), "{err}");
+        assert!(err.contains("-q/--quiet"), "{err}");
     }
 
     #[test]

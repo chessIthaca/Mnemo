@@ -229,7 +229,7 @@ impl Tool for WriteReviewReportTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: WriteReviewReportArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         if args.path.trim().is_empty() {
             return ToolResult::error("write_review_report requires a non-empty 'path'");

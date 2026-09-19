@@ -73,6 +73,7 @@ pub(crate) fn truncate_to_boundary(s: &mut String, max: usize) {
 /// the call actually sent plus a `hint` pointing at the sibling tool, so the
 /// model can self-correct on the next attempt.
 pub(crate) fn invalid_args_error(
+    tool: &str,
     e: &serde_json::Error,
     args: &serde_json::Value,
     hint: &str,
@@ -92,7 +93,13 @@ pub(crate) fn invalid_args_error(
     } else {
         format!(" {hint}")
     };
-    format!("invalid arguments: {e} (received keys: {keys}).{hint}")
+    // The sanitized base (plan 21118961) names the offending
+    // parameter/type in plain words instead of serde vocabulary;
+    // the received-keys + hint context rides on top of it.
+    format!(
+        "{} (received keys: {keys}).{hint}",
+        crate::tool::error_message::sanitize_arguments_error(tool, e)
+    )
 }
 
 /// A single file-read spec within a `read_files` call.
@@ -209,7 +216,7 @@ impl Tool for ReadFilesTool {
         };
         let args: ReadFilesArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(invalid_args_error(&e, &args, "")),
+            Err(e) => return ToolResult::error(invalid_args_error("read_files", &e, &args, "")),
         };
         if args.files.is_empty() {
             return ToolResult::error("files array is empty — provide at least one file spec");

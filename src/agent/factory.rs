@@ -1814,7 +1814,14 @@ mod tests {
             // cause as Planning above (backlog 488248ce's memory_update/amend
             // schema growth, plus drift since that pass). Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Executing, 31_150),
+            // 31_150 → 32_100 (2027-01-24): strict-schema normalization
+            // (plan 21118961) rewrites the STRICT_TOOLS schemas to
+            // strict-legal form on strict-capable endpoints — optional
+            // properties widen to nullable type-arrays, every object
+            // gains additionalProperties/required keys; measures Executing
+            // at 31_471 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::Executing, 32_100),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1832,7 +1839,12 @@ mod tests {
             // 2027-01-15 pass and cause as Executing above (PlanFrozen =
             // Executing ∪ finish). Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::PlanFrozen, 32_400),
+            // 32_400 → 33_400 (2027-01-24): strict-schema normalization
+            // (plan 21118961) — same cause and figure as the Executing
+            // raise above (PlanFrozen = Executing ∪ finish, and finish is
+            // a STRICT_TOOLS member); measures PlanFrozen at 32_757
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 33_400),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1904,7 +1916,12 @@ mod tests {
             // 2027-01-15 pass and cause as Planning (memory_update/amend ride
             // Reviewing too). Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::Reviewing, 26_600),
+            // 26_600 → 27_300 (2027-01-24): strict-schema normalization
+            // (plan 21118961) — Reviewing carries several STRICT_TOOLS
+            // members (file_edit, update_plan, memory_update/amend);
+            // measures Reviewing at 26_735 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Reviewing, 27_300),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

@@ -128,6 +128,7 @@ pub fn validate_endpoint(
         max_context,
         max_output_tokens,
         multimodal,
+        supports_strict_schema: None,
         supports_reasoning_effort,
         reasoning_effort,
         reasoning_effort_off_wire: None,

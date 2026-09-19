@@ -170,7 +170,7 @@ impl Tool for GitLogTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: GitLogArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let limit = args.limit.unwrap_or(20);
         if !(1..=100).contains(&limit) {
@@ -251,7 +251,7 @@ impl Tool for GitShowTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: GitShowArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         if let Err(e) = validate_commitish(&args.commit) {
             return ToolResult::error(e);

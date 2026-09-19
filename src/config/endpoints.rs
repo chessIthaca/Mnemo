@@ -75,6 +75,16 @@ pub struct Endpoint {
     /// model (if configured) is used for image-to-text instead.
     #[serde(default)]
     pub multimodal: bool,
+    /// Whether this endpoint enforces strict tool schemas (the OpenAI
+    /// `strict` field on function tools). `None` (unset) = the provider
+    /// kind's default applies (openai: enforced, local: not). Set `false` for
+    /// an OpenAI-kind endpoint behind a proxy that rejects the field
+    /// (litellm/vertex return "Input should be a valid boolean"); set
+    /// `true` for a local endpoint that does enforce schemas. When the
+    /// effective value is `true`, the harness normalizes the mutation/plan
+    /// tool schemas to be strict-legal and sends `"strict": true` on them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_strict_schema: Option<bool>,
     /// Whether models at this endpoint accept the OpenAI-compatible
     /// `reasoning_effort` request field. Defaults to `true` (existing
     /// behaviour). Set to `false` for chat / non-reasoning models that
@@ -149,6 +159,7 @@ impl Default for Endpoint {
             max_context: None,
             max_output_tokens: None,
             multimodal: false,
+            supports_strict_schema: None,
             supports_reasoning_effort: true,
             reasoning_effort: None,
             reasoning_effort_off_wire: None,

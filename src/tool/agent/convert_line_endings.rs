@@ -101,7 +101,7 @@ impl Tool for ConvertLineEndingsTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: ConvertLineEndingsArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let target = match parse_target(&args.to) {
             Ok(t) => t,

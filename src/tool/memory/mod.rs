@@ -155,7 +155,7 @@ impl Tool for MemoryWriteTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryWriteArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let tier = match MemoryTier::from_str(&args.tier) {
             Some(t) => t,
@@ -460,7 +460,7 @@ impl Tool for MemoryRecallTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryRecallArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let mut filter = MemoryFilter::new();
         if let Some(tier_str) = &args.tier {
@@ -593,7 +593,7 @@ impl Tool for MemoryConsolidateTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryConsolidateArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Snapshot the provider (if a swappable handle was wired in) so manual
         // consolidation runs the full extraction pipeline — matching the
@@ -807,7 +807,7 @@ impl Tool for MemoryUpdateTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryUpdateArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let repair = match (&args.find, &args.replace_with) {
             (Some(find), Some(replace_with)) => Some((find.as_str(), replace_with.as_str())),
@@ -976,7 +976,7 @@ impl Tool for MemoryAmendTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryAmendArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let id = args.id;
         // The id is the deterministic row id of a knowledge record — resolve
@@ -1154,7 +1154,7 @@ impl Tool for MemorySupersedeTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemorySupersedeArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         let tier = match MemoryTier::from_str(&args.tier) {
             Some(t) => t,
@@ -1325,7 +1325,7 @@ impl Tool for MemoryDeleteTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemoryDeleteArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // Knowledge-backed delete: the id is the deterministic row id of a
         // knowledge record — remove the FILE (the truth dies) + targeted

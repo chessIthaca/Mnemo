@@ -321,7 +321,7 @@ impl Tool for ShellTool {
     async fn execute_streaming(&self, args: serde_json::Value, sink: OutputSink) -> ToolResult {
         let args: ShellArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
 
         let cwd = match self.resolve_cwd(args.cwd.as_deref()) {
@@ -860,7 +860,13 @@ mod tests {
         let tool = tool_in(dir.path());
         let result = tool.execute(json!({})).await;
         assert!(!result.success);
-        assert!(result.output.contains("invalid arguments"));
+        // Sanitized (plan 21118961): the instructive form.
+        assert!(
+            result.output.starts_with("Error: The tool 'shell' failed"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("parameter 'command' is required"));
     }
 
     #[tokio::test]

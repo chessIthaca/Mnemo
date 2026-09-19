@@ -45,19 +45,19 @@ pub struct FileEditArgs {
     /// The exact text to find (or a regex when `use_regex=true`). Required for
     /// string-matching mode; ignored when `start_line` + `end_line` are set
     /// (line-range mode). Defaults to empty so line-range calls can omit it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub old_string: String,
     /// The replacement text. Defaults to empty so multi-edit batch calls
     /// (`edits`) can omit it — the items carry their own replacements. An
     /// empty `new_string` in single mode deletes `old_string`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub new_string: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub replace_all: bool,
     /// Treat `old_string` as a Rust regular expression (default: false).
     /// Capture groups from the pattern can be referenced in `new_string`
     /// with `$1`, `$2`, … or `${name}` (regex-crate `Replacer` semantics).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub use_regex: bool,
     /// Replace at most N matches (vi-style `:s/…/…/` with a count). When
     /// `None`: `replace_all=false` replaces the first match only and
@@ -82,7 +82,7 @@ pub struct FileEditArgs {
     /// mismatches still match. The replacement is spliced into the original
     /// content verbatim (surrounding whitespace preserved). Ignored in regex
     /// and line-range modes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub fuzzy_whitespace: bool,
     /// Atomic multi-edit batch (plan be16ea36 step 4): every item is applied
     /// to the in-memory content IN ORDER and the result is written ONCE — any
@@ -104,7 +104,7 @@ pub struct FileEditArgs {
     /// with `edits`, line-range mode, `old_string`, and the matching knobs
     /// (`use_regex`/`replace_all`/`count`/`fuzzy_whitespace`). Errors when
     /// the file is missing — use `file_write` to create it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub append: bool,
 }
 
@@ -1304,7 +1304,7 @@ impl Tool for FileEditTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: FileEditArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
         // (backlog 1db26c95) Restore boundary-token markers to the raw
         // tokens in BOTH edit strings: the agent reconstructs old_string
@@ -1446,6 +1446,41 @@ mod tests {
 
     fn make_tool(dir: &Path) -> FileEditTool {
         FileEditTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    #[test]
+    fn strict_mode_shape_all_keys_null_optionals_deserializes() {
+        // Plan 21118961 regression (review HIGH 1): strict mode forces
+        // EVERY schema key present, with `null` as the sanctioned "no
+        // value" for the optional ones. The non-Option optional fields
+        // must accept null (null_to_default), not just absence —
+        // line-range mode (old_string/new_string null) and batch mode
+        // are the advertised primary paths that would otherwise break.
+        let args: FileEditArgs = serde_json::from_value(serde_json::json!({
+            "path": "a.txt",
+            "old_string": null,
+            "new_string": null,
+            "replace_all": null,
+            "use_regex": null,
+            "fuzzy_whitespace": null,
+            "count": null,
+            "start_line": 1,
+            "end_line": 2,
+            "edits": null,
+            "append": null
+        }))
+        .expect("the strict-mode shape must deserialize");
+        assert_eq!(args.path, "a.txt");
+        assert_eq!(args.old_string, "");
+        assert_eq!(args.new_string, "");
+        assert!(!args.replace_all);
+        assert!(!args.use_regex);
+        assert!(!args.fuzzy_whitespace);
+        assert!(!args.append);
+        assert_eq!(args.count, None);
+        assert!(args.edits.is_none());
+        assert_eq!(args.start_line, Some(1));
+        assert_eq!(args.end_line, Some(2));
     }
 
     /// Build literal-mode args (the common case for existing tests).

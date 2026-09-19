@@ -185,14 +185,17 @@ impl AgentLoop {
             );
         }
 
-        // Parse the arguments.
+        // Parse the arguments. A malformed-JSON failure is sanitized
+        // (tool::error_message): the model gets a clean, instructive
+        // message naming the tool — never the raw serde text, never the
+        // raw arguments blob echoed back into the conversation.
         let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
                 return (
-                    ToolResult::error(format!(
-                        "malformed arguments JSON: {e} (raw: {})",
-                        tc.arguments
+                    ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
+                        &tc.name,
+                        &e,
                     )),
                     Vec::new(),
                 );

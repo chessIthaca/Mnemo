@@ -143,7 +143,7 @@ impl Tool for MemorySearchTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let args: MemorySearchArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
 
         let mut filter = MemoryFilter::new();

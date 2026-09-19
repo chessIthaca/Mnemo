@@ -74,6 +74,14 @@ pub struct OpenAiClientConfig {
     /// Flows into the capability set so the agent loop can decide whether to
     /// send image blocks or fall back to a separate vision model.
     pub multimodal: bool,
+    /// Whether this endpoint enforces strict tool schemas (the `strict` field
+    /// on function tools). `None` = the provider kind's default (OpenAI:
+    /// true, Local: false). Set `Some(false)` for an OpenAI-kind endpoint
+    /// behind a proxy that rejects the field (litellm/vertex), or
+    /// `Some(true)` for a local endpoint that enforces it. Flows into the
+    /// capability set so the request builder can gate strict-mode schemas on
+    /// it.
+    pub strict_schema: Option<bool>,
     /// The `reasoning_effort` to send in the request body (e.g. `max`, `high`,
     /// `medium`, `low`, `minimal`). `None` omits the field entirely (endpoints
     /// that don't accept it, or the toolbar's "off" choice). Values pass
@@ -130,6 +138,7 @@ impl Default for OpenAiClientConfig {
             max_context: None,
             max_output_tokens: None,
             multimodal: false,
+            strict_schema: None,
             reasoning_effort: None,
             reasoning_effort_off_wire: None,
             use_responses_api: false,
@@ -249,6 +258,7 @@ impl OpenAiClient {
             config.max_context,
             config.max_output_tokens,
             config.multimodal,
+            config.strict_schema,
         );
         let http_client = reqwest::Client::builder()
             // Connect-only timeout (handshake). We deliberately do NOT set a

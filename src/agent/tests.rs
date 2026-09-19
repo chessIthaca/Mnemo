@@ -1558,25 +1558,21 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
         correction_idx > last_tool_idx,
         "the correction must follow the batch's tool results"
     );
-    // The UI note is a transient (retrying) error, not a terminal one.
-    let mut saw_retrying_note = false;
+    // Context-only by design (user report 2027-01-24): the correction
+    // rides the provider-facing messages — good in the LLM context, NOT in
+    // the output. NO error event may surface it in the transcript or the
+    // activity log (it used to render as a red "error: tool-call
+    // correction: …" box and extend the UI doom streak).
     while let Ok(Some((_id, event))) =
         tokio::time::timeout(std::time::Duration::from_millis(200), fanin_rx.recv()).await
     {
-        if let AgentEvent::Error {
-            error,
-            retrying: true,
-        } = event
-        {
-            if error.contains("tool-call correction") {
-                saw_retrying_note = true;
-            }
+        if let AgentEvent::Error { error, .. } = event {
+            assert!(
+                !error.contains("tool-call correction"),
+                "the correction must NOT surface as an error event: {error}"
+            );
         }
     }
-    assert!(
-        saw_retrying_note,
-        "the correction must surface as a retrying error event for the UI"
-    );
 }
 
 #[tokio::test]
@@ -5362,6 +5358,68 @@ async fn dispatch_denies_ad_hoc_reviewer_model_pick() {
     assert!(
         !result.success && result.output.contains("must OMIT the model parameter"),
         "the sanction does not persist past one spawn, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn dispatch_treats_null_model_as_absent_for_reviewer_spawns() {
+    // Backlog 3e6f7887 (live incident 2027-01-24): a transport that
+    // stringifies JSON null for non-nullable string properties delivers
+    // model:"null" — the reviewer gate must treat it as ABSENT, not as
+    // an ad-hoc pick (eight identical refusals looped the main agent in
+    // Reviewing). JSON null was already absent (as_str() → None); this
+    // pins both shapes end-to-end through execute_tool_call.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
+
+    let call = |id: &str, model: &str| {
+        crate::provider::ToolCall::new(
+            id,
+            "spawn_agent",
+            format!(
+                r#"{{"name":"reviewer","task":"review the diff","role":"reviewer","model":{model}}}"#
+            ),
+        )
+    };
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    // JSON null → absent (as_str() → None): passes the gate.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c1", "null"),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        !result.output.contains("must OMIT the model parameter"),
+        "JSON null model must pass the reviewer gate, got: {}",
+        result.output
+    );
+
+    // The stringified artifact "null" → absent too: passes the gate.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c2", "\"null\""),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        !result.output.contains("must OMIT the model parameter"),
+        "the stringified 'null' artifact must pass the reviewer gate, got: {}",
         result.output
     );
 }

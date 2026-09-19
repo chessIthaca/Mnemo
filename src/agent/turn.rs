@@ -1655,18 +1655,14 @@ impl AgentLoop {
                 );
                 let correction = tool_call_correction(&tool_name, &failed_content, &schema);
                 messages.push(Message::user_text(correction));
-                let _ = fanin_tx
-                    .send((
-                        agent_id,
-                        AgentEvent::Error {
-                            error: format!(
-                                "tool-call correction: repeated identical `{tool_name}` \
-                                 failure — schema reminder injected into the next request"
-                            ),
-                            retrying: true,
-                        },
-                    ))
-                    .await;
+                // Context-only by design (user report 2027-01-24): the
+                // correction rides the provider-facing messages — good in
+                // the LLM context, NOT in the output. No event is
+                // emitted: an Error here rendered a red "error: tool-call
+                // correction: …" box in the chat transcript, an
+                // activity-log row, and extended the UI doom streak
+                // (reduceError counts every error event), none of which
+                // the user wants.
             }
         }
 

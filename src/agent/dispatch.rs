@@ -1400,8 +1400,15 @@ fn reviewer_spawn_gate(
     }
     // Gate 2 (backlog c8e48f81): an explicit model is ad-hoc unless the
     // failed-reviewer retry is sanctioned. Whitespace-only counts as absent
-    // (matching the tool's own model-arg semantics).
-    let has_model = model.map(|m| !m.trim().is_empty()).unwrap_or(false);
+    // (matching the tool's own model-arg semantics), and so does the
+    // literal string "null": a transport that stringifies JSON null for
+    // non-nullable string properties manufactures exactly that artifact
+    // (live incident 2027-01-24, backlog 3e6f7887: eight identical
+    // reviewer-spawn refusals looped the main agent in Reviewing), and no
+    // configured model is ever named "null" — it is never a real pick.
+    let has_model = model
+        .map(|m| !m.trim().is_empty() && m.trim() != "null")
+        .unwrap_or(false);
     if has_model && !retry_sanctioned {
         return (
             Some(ToolResult::error(

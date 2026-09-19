@@ -174,12 +174,13 @@ impl Tool for SpawnAgentTool {
                         "description": "The self-contained task, sent as the agent's first prompt."
                     },
                     "model": {
-                        "type": "string",
-                        "description": "Model id (from list_models); omit for the default \
-                                         subagent model. For role:\"reviewer\" spawns OMIT \
-                                         this — the configured reviewing model is \
-                                         authoritative; an explicit model is denied unless \
-                                         it is the user-sanctioned failed-reviewer retry."
+                        "type": ["string", "null"],
+                        "description": "Model id (from list_models); omit or pass null \
+                                         for the default subagent model. For role:\"reviewer\" \
+                                         spawns OMIT this — the configured reviewing model \
+                                         is authoritative; an explicit model is denied \
+                                         unless it is the user-sanctioned failed-reviewer \
+                                         retry."
                     },
                     "role": {
                         "type": "string",
@@ -238,8 +239,17 @@ impl Tool for SpawnAgentTool {
         // (overriding the subagent/state/skill resolution chain). A bare model
         // id (e.g. "deepseek-v4-flash-gcp") is resolved via the model resolver
         // to the endpoint that serves it.
+        // The literal string "null" counts as unset here too (mirroring the
+        // dispatch reviewer gate): a transport that stringifies JSON null
+        // manufactures it, and no configured model is ever named "null"
+        // (backlog 3e6f7887). The drop is never silent (review L1):
+        // `null_model_note` makes the success output name it, so a user
+        // who genuinely configured a model id "null" sees the override
+        // was ignored. JSON null needs no note — it is an explicit
+        // unset (the schema says "omit or pass null"), not a dropped pick.
+        let mut null_model_note = false;
         let forced_model = match args.model.as_deref().map(str::trim) {
-            Some(model_id) if !model_id.is_empty() => {
+            Some(model_id) if !model_id.is_empty() && model_id != "null" => {
                 let Some(resolver) = self.model_resolver.as_ref() else {
                     return ToolResult::error(
                         "model selection unavailable (no model resolver configured)",
@@ -252,7 +262,13 @@ impl Tool for SpawnAgentTool {
                 };
                 Some(model_ref)
             }
-            _ => None,
+            // Empty string stays silently unset (long-standing
+            // semantics); only the "null" artifact is surfaced (review L1).
+            Some(model_id) => {
+                null_model_note = model_id == "null";
+                None
+            }
+            None => None,
         };
 
         // A spawned reviewer with no explicit model is pinned at spawn time
@@ -339,12 +355,23 @@ impl Tool for SpawnAgentTool {
         };
 
         match spawned {
-            Ok(id) => ToolResult::success(format!(
-                "Spawned background agent '{}' (id {id}) and started it on the task. \
-                 Its events appear under that agent in the sidebar; you'll be notified \
-                 when it finishes.",
-                args.name
-            )),
+            Ok(id) => {
+                let mut output = format!(
+                    "Spawned background agent '{}' (id {id}) and started it on the task. \
+                     Its events appear under that agent in the sidebar; you'll be notified \
+                     when it finishes.",
+                    args.name
+                );
+                if null_model_note {
+                    output.push_str(
+                        " Note: model \"null\" ignored — reserved sentinel for a \
+                         stringified JSON null (backlog 3e6f7887), never a \
+                         configured model id; the spawn uses its default model \
+                         resolution.",
+                    );
+                }
+                ToolResult::success(output)
+            }
             Err(e) => ToolResult::error(format!("failed to spawn agent: {e}")),
         }
     }
@@ -423,6 +450,42 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "reviewer");
         assert_eq!(calls[0].1, "review the last commit");
+    }
+
+    #[tokio::test]
+    async fn null_model_string_counts_as_unset() {
+        // Backlog 3e6f7887 (live incident 2027-01-24): a transport that
+        // stringifies JSON null for non-nullable string properties delivers
+        // model:"null" — the tool must treat it as unset (no configured
+        // model is ever named "null"), not fail resolution. JSON null was
+        // already unset via serde; this pins both shapes.
+        let spawner = Arc::new(MockSpawner::ok(3));
+        let tool = SpawnAgentTool::new(spawner);
+        let result = tool
+            .execute(json!({"name": "x", "task": "y", "model": "null"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(result.output.contains("id 3"));
+        // The dropped stringified artifact is surfaced (review L1) —
+        // never silently ignored.
+        assert!(
+            result.output.contains("model \"null\" ignored"),
+            "the drop must be named in the output: {}",
+            result.output
+        );
+
+        let result = tool
+            .execute(json!({"name": "x", "task": "y", "model": null}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(result.output.contains("id 3"));
+        // JSON null is an explicit unset (the schema says "omit or pass
+        // null") — no note.
+        assert!(
+            !result.output.contains("ignored"),
+            "an explicit unset needs no note: {}",
+            result.output
+        );
     }
 
     #[tokio::test]

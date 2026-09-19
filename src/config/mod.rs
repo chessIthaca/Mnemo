@@ -575,6 +575,33 @@ fn consume_marker_at(file: &Path) -> Option<PathBuf> {
     let _ = fs::remove_file(file);
     Some(PathBuf::from(trimmed))
 }
+/// Peek at the pending-project marker WITHOUT consuming it: `Some(path)`
+/// when the marker exists and holds a non-empty path, `None` otherwise.
+///
+/// Used at window creation to detect the reload half of a switch restart
+/// (so the relaunched window can be focused like the one it replaced) — the
+/// marker itself is still consumed later by [`take_pending_project`] in
+/// `build_brain`.
+pub fn peek_pending_project() -> Option<PathBuf> {
+    read_marker_at(&pending_project_path())
+}
+
+/// Read a marker at an explicit `file` path without consuming it. Mirrors
+/// [`consume_marker_at`] (same read + trim semantics) but never removes the
+/// file. Split out from [`peek_pending_project`] for unit testing.
+fn read_marker_at(file: &Path) -> Option<PathBuf> {
+    let text = match fs::read_to_string(file) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,6 +1134,44 @@ api_key = "sk-x"
             None,
             "second consume must be None"
         );
+    }
+
+    #[test]
+    fn pending_marker_peek_does_not_consume() {
+        // The switch-restart focus path peeks the marker before the window
+        // exists; build_brain's take must still see it afterwards.
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join(".pending_project");
+        write_marker_at(&marker, Path::new("/some/project")).unwrap();
+
+        assert_eq!(
+            read_marker_at(&marker),
+            Some(PathBuf::from("/some/project"))
+        );
+        assert!(marker.exists(), "peek must leave the marker in place");
+        // A peek-then-take sequence still consumes exactly once.
+        assert_eq!(
+            consume_marker_at(&marker),
+            Some(PathBuf::from("/some/project"))
+        );
+        assert_eq!(read_marker_at(&marker), None);
+    }
+
+    #[test]
+    fn pending_marker_peek_on_missing_or_empty_file_returns_none() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join(".pending_project");
+        assert_eq!(read_marker_at(&marker), None);
+
+        fs::write(&marker, "   \n  ").unwrap();
+        assert_eq!(
+            read_marker_at(&marker),
+            None,
+            "empty marker must peek as None"
+        );
+        // Unlike consume, peek never mutates: an empty marker file is left
+        // for consume_marker_at to clean up.
+        assert!(marker.exists());
     }
 
     // ── save_all rollback failure collection (quality review LOW 6) ────────

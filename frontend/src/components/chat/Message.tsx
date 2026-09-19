@@ -12,6 +12,7 @@ import { UnifiedDiffView } from "./DiffView";
 import { openDiffInViewer, openFileInViewer } from "../../lib/openFile";
 import { openChatLink } from "../../lib/openChatLink";
 import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
+import { fmtToolDuration, fmtTs } from "../../lib/timeFormat";
 import { arePropsEqual, type MessageProps } from "../../lib/messageEquality";
 import { toolImagePaths, ToolImage } from "./ToolImage";
 import { useAgentStore } from "../../hooks/useAgentStore";
@@ -668,6 +669,16 @@ function ToolCard({
           <span className="text-[0.75em] text-slate-500">
             {failed ? "✗" : "✓"}
             {calls.length > 1 && ` ×${calls.length}`}
+            {/* Timing (user request 2027-01-24): the LAST call's duration
+                (the card reflects the last call's outcome — same rule) and
+                the FIRST call's wall-clock start (the card's timeline
+                anchor — consecutive cards' start times show the gaps
+                between tools). Legacy invocations without stamps render
+                exactly as before. */}
+            {lastCall.startedAt !== undefined &&
+              lastCall.endedAt !== undefined &&
+              ` · ${fmtToolDuration(lastCall.endedAt - lastCall.startedAt)}`}
+            {calls[0].startedAt !== undefined && ` · ${fmtTs(calls[0].startedAt)}`}
           </span>
         )}
       </span>
@@ -796,6 +807,12 @@ function CallDetail({
       {showIndex && (
         <div className="text-[0.75em] text-slate-500">
           #{index + 1} {argLabel(call.args, name) ? `— ${argLabel(call.args, name)}` : ""}
+          {/* Per-call timing (grouped cards): same order as the card header —
+              duration, then the call's wall-clock start. */}
+          {call.startedAt !== undefined &&
+            call.endedAt !== undefined &&
+            ` · ${fmtToolDuration(call.endedAt - call.startedAt)}`}
+          {call.startedAt !== undefined && ` · ${fmtTs(call.startedAt)}`}
         </div>
       )}
       {shellArgs ? (

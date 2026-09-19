@@ -24,6 +24,7 @@ import type { WorkflowState } from "./lib/types";
 import { fmtPct } from "./lib/format";
 import { hiddenKeysFromConfig } from "./lib/delegationNotes";
 import { clampRestoredGeometry } from "./lib/windowRestore";
+import { registerWindowGeometryFlusher } from "./lib/windowGeometryFlush";
 import { Sidebar } from "./components/layout/Sidebar";
 import { MainPanel } from "./components/layout/MainPanel";
 import { RightPanel } from "./components/layout/RightPanel";
@@ -481,13 +482,14 @@ export default function App() {
   }, [refreshGitBranch]);
 
   // Persist + restore the window's size + position across restarts. On mount,
-  // if we saved geometry last time and it wasn't maximized, re-apply it via the
-  // Tauri window API — CLAMPED to be usable on the current monitor layout
-  // (lib/windowRestore.ts: minimum size + fully on screen; a save from another
-  // DPI / resolution / monitor set must never come back tiny or off screen).
-  // Then listen for the window's own resize/move events (debounced) and save
-  // the current bounds — but skip saving while maximized so the last *normal*
-  // bounds are kept.
+  // if we saved geometry last time, re-apply it via the Tauri window API —
+  // CLAMPED to be usable on the current monitor layout (lib/windowRestore.ts:
+  // minimum size + fully on screen; a save from another DPI / resolution /
+  // monitor set must never come back tiny or off screen) — and re-maximize
+  // when it was saved maximized. Then listen for the window's own resize/move
+  // events (debounced) and save the current bounds, persisting the maximized
+  // flag on the last *normal* bounds so a restart reopens exactly like the
+  // window that closed.
   useEffect(() => {
     const win = getCurrentWindow();
     let restoreDone = false;
@@ -496,12 +498,15 @@ export default function App() {
     // won't wait for the promise), so we write these cached bounds
     // synchronously on close instead of re-querying the window.
     let lastBounds: PersistedGeometry | null = null;
+    // Whether the window was maximized at the last save — rides on the
+    // persisted record so a restart re-maximizes (see the save path below).
+    let lastMaximized = false;
 
     // Restore saved geometry once on mount.
     (async () => {
       try {
         const saved = readWindowGeometry();
-        if (saved && !saved.maximized) {
+        if (saved) {
           // Guard against stale geometry: the saved coords come from a
           // previous session and may not exist on the current monitor layout
           // (monitor disconnected, resolution/DPI changed). Two failure modes,
@@ -554,6 +559,12 @@ export default function App() {
             console.warn("no monitors reported; leaving the window at the OS default", saved);
           }
           await win.setSize(new LogicalSize(restored.width, restored.height));
+          // Re-maximize when the closed window was maximized: the bounds
+          // above are the last NORMAL ones, so un-maximizing returns to them
+          // — the restart reopens exactly like the window it replaced.
+          if (saved.maximized) {
+            await win.maximize();
+          }
         }
       } catch (e) {
         console.error("failed to restore window geometry:", e);
@@ -563,24 +574,38 @@ export default function App() {
     })();
 
     let saveTimer: number | null = null;
+    // Snapshot the current bounds as a PersistedGeometry (physical → logical).
+    const snapshotBounds = async (): Promise<PersistedGeometry> => {
+      const pos = await win.outerPosition();
+      const size = await win.outerSize();
+      // outerPosition/outerSize are physical pixels; convert to logical so
+      // they round-trip correctly across DPI changes.
+      const factor = await win.scaleFactor();
+      return {
+        x: pos.x / factor,
+        y: pos.y / factor,
+        width: size.width / factor,
+        height: size.height / factor,
+        maximized: false,
+      };
+    };
     const save = async () => {
       if (!restoreDone) return;
       try {
         const maximized = await win.isMaximized();
-        // Keep the last normal bounds when maximized — don't overwrite them.
-        if (maximized) return;
-        const pos = await win.outerPosition();
-        const size = await win.outerSize();
-        // outerPosition/outerSize are physical pixels; convert to logical so
-        // they round-trip correctly across DPI changes.
-        const factor = await win.scaleFactor();
-        const bounds: PersistedGeometry = {
-          x: pos.x / factor,
-          y: pos.y / factor,
-          width: size.width / factor,
-          height: size.height / factor,
-          maximized: false,
-        };
+        lastMaximized = maximized;
+        if (maximized) {
+          // Persist the maximized FLAG on the last known NORMAL bounds so a
+          // restart re-maximizes — the maximized rect itself is monitor-sized
+          // and useless as a restore target. With no normal bounds known yet
+          // (fresh profile, maximized before any save), the current bounds
+          // stand in; the restore clamp keeps them usable.
+          const base = lastBounds ?? (await snapshotBounds());
+          lastBounds = base;
+          writeWindowGeometry({ ...base, maximized: true });
+          return;
+        }
+        const bounds = await snapshotBounds();
         lastBounds = bounds;
         writeWindowGeometry(bounds);
       } catch (e) {
@@ -590,7 +615,25 @@ export default function App() {
     const debouncedSave = () => {
       if (saveTimer !== null) window.clearTimeout(saveTimer);
       saveTimer = window.setTimeout(save, 400);
+      // Keep the maximized flag fresh for beforeunload (which can't await an
+      // IPC round-trip): a maximize followed by a close within the 400 ms
+      // debounce would otherwise persist a stale `maximized: false`.
+      void win.isMaximized().then(
+        (m) => {
+          lastMaximized = m;
+        },
+        () => {},
+      );
     };
+
+    // Flush handle for the switch-restart path: the project picker awaits
+    // flushWindowGeometry() right before switchProject, because the restart
+    // is a hard process exit that never runs beforeunload — the 400 ms
+    // debounce would otherwise swallow a just-made move/resize.
+    registerWindowGeometryFlusher(() => {
+      if (saveTimer !== null) window.clearTimeout(saveTimer);
+      return save();
+    });
 
     // Tauri emits `tauri://resize` and `tauri://move` on the window. Use a
     // `cancelled` flag so that if the effect cleanup runs before a
@@ -620,11 +663,14 @@ export default function App() {
     // final position/size even when the close happens within the 400 ms
     // debounce window.
     const onBeforeUnload = () => {
-      if (lastBounds) writeWindowGeometry(lastBounds);
+      if (lastBounds) {
+        writeWindowGeometry({ ...lastBounds, maximized: lastMaximized });
+      }
     };
     window.addEventListener("beforeunload", onBeforeUnload);
 
     return () => {
+      registerWindowGeometryFlusher(null);
       cancelled = true;
       if (saveTimer !== null) window.clearTimeout(saveTimer);
       if (unlistenResize) unlistenResize();

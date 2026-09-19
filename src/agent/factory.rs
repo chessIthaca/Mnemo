@@ -1055,7 +1055,7 @@ impl AgentLoopFactory {
 
     /// Register the skill tools — `skill_start` (gated to Complete + Planning
     /// by ToolFilter), `skill_end` + `abandon_skill` (only meaningful while a
-    /// skill is active; exposed via the Skill filter's allow-list),
+    /// skill is active; exposed by the Skill filter unconditionally),
     /// `skill_reload` (every workflow state, an active skill included) and
     /// `skill_create` (Executing only). All AutoRun — protection is on the
     /// operations inside the skill (e.g. git merge/push are never_auto_for),

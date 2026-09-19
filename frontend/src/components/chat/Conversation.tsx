@@ -7,6 +7,7 @@ import { useAgentStore } from "../../hooks/useAgentStore";
 import { isActivityEntry, isKnowledgeActivityEntry } from "../../hooks/agentState";
 import type { AgentState } from "../../hooks/useAgentStore";
 import type { TranscriptEntry } from "../../lib/types";
+import { fmtTs } from "../../lib/timeFormat";
 import { Message } from "./Message";
 import { ApprovalPrompt } from "./ApprovalPrompt";
 import { QuestionPrompt } from "./QuestionPrompt";
@@ -15,14 +16,6 @@ import { QuestionPrompt } from "./QuestionPrompt";
  *  wrapper in the transcript (the run wrapper owns their indent; Message
  *  renders them bare). Mirrors the isActivityEntry kind set. */
 const ACTIVITY = new Set(["tool", "memory", "vision", "skill"]);
-
-/** Hover timestamp: time-only for today's entries, date+time otherwise. */
-function fmtTs(ts: number): string {
-  const d = new Date(ts);
-  return d.toDateString() === new Date().toDateString()
-    ? d.toLocaleTimeString()
-    : d.toLocaleString();
-}
 
 /** Split a turn's entries into chunks: maximal runs of consecutive
  *  activity entries (the thread-line groups) and single non-activity

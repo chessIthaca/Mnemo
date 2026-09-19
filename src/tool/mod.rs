@@ -468,9 +468,11 @@ pub enum ToolFilter {
     /// A skill is active — only the named tools in the allow-list are visible
     /// (plus all memory tools, which are always available). Seeded from the
     /// active skill's `tools` field at `start_skill` time. The always-available
-    /// set (`skill_reload`, ask_user, current_plan and the backlog tools) is
-    /// visible regardless of the list; `skill_create` is denied here by name —
-    /// a skill file must not widen the Executing-only authoring rule.
+    /// set (`skill_reload`, ask_user, current_plan, the backlog tools, and the
+    /// skill's exits `skill_end`/`abandon_skill` — a skill file that forgets
+    /// to list them must never trap the agent) is visible regardless of the
+    /// list; `skill_create` is denied here by name — a skill file must not
+    /// widen the Executing-only authoring rule.
     Skill(Vec<String>),
     /// A read-only reviewer sub-agent — a STRICT allow-list: only the named
     /// tools (+ `current_plan`, a read-only orientation query on the shared
@@ -804,8 +806,8 @@ impl ToolFilter {
                 // (the previous plan is already done). skill_start IS available
                 // — a finished plan is exactly when the user may want to run a
                 // skill (e.g. merge_to_main). skill_end/abandon_skill are only
-                // meaningful while a skill is active (the Skill filter exposes
-                // them via the allow-list), so they're hidden here.
+                // meaningful while a skill is active (the Skill filter always
+                // exposes them), so they're hidden here.
                 // ask_user + current_plan are always available.
                 ToolCategory::Workflow => {
                     name == "create_plan"
@@ -850,6 +852,13 @@ impl ToolFilter {
                         // `allows` denies it under every allow-list, so a skill
                         // file naming it cannot widen the Executing-only rule.
                         || name == "skill_reload"
+                        // The skill's exits are ALWAYS available — a skill
+                        // file that forgets to list them must never trap the
+                        // agent mid-skill (the same never-stuck rule the
+                        // Reviewing arm documents for abandon_plan). skill_end
+                        // lands in target_state; abandon_skill rolls back.
+                        || name == "skill_end"
+                        || name == "abandon_skill"
                         || name == "backlog_add"
                         || name == "backlog_status"
                         || name == "backlog_list"
@@ -2373,6 +2382,37 @@ mod tests {
             !v(ToolFilter::Reviewer(vec!["skill_create".into()])),
             "the reviewer never authors skills"
         );
+    }
+
+    /// The skill's exits — skill_end + abandon_skill — are ALWAYS available
+    /// while a skill is active (user report 2027-01-24: "skill_end is always
+    /// allowed during a skill. Not having that is silly"). A skill file that
+    /// forgets to list them must never trap the agent mid-skill: pre-fix the
+    /// Skill arm fell through to the allow-list, so an allow-list without the
+    /// exits hid the only way out (while the injected skill prompt still
+    /// advertised both). Base states keep them hidden (only meaningful
+    /// mid-skill) and the reviewer arm stays a strict allow-list.
+    #[test]
+    fn skill_exits_are_always_available_inside_a_skill() {
+        for name in ["skill_end", "abandon_skill"] {
+            let v =
+                |f: ToolFilter| f.allows(ToolCategory::Workflow, SafetyLevel::AutoRun, name);
+            assert!(
+                v(ToolFilter::Skill(vec![])),
+                "{name} must be allowed inside a skill even with an EMPTY allow-list"
+            );
+            assert!(
+                !v(ToolFilter::Planning),
+                "{name} is only meaningful mid-skill — hidden in Planning"
+            );
+            assert!(!v(ToolFilter::Executing), "{name} hidden in Executing");
+            assert!(!v(ToolFilter::Reviewing), "{name} hidden in Reviewing");
+            assert!(!v(ToolFilter::Complete), "{name} hidden in Complete");
+            assert!(
+                !v(ToolFilter::Reviewer(vec![])),
+                "{name} must not be implicitly granted to a reviewer"
+            );
+        }
     }
 
     /// backlog_add must be VISIBLE in every workflow state (it is a benign,

@@ -317,11 +317,13 @@ fn context_issue(
 /// The step-side resumability issue — a step that names no file path (or
 /// no-code marker). Shared by create_plan (via
 /// [`validate_plan_resumability`]) and update_plan (which validates only
-/// the steps being written). `bug_fixing` plans are exempt: the forced
-/// skeleton is path-free by design (the locked checklist). Returns the
-/// first violation, if any.
-fn step_issue(steps: &[String], kind: PlanKind) -> Option<String> {
-    if kind == PlanKind::BugFixing {
+/// the steps being written). `bug_fixing` plans pass `bug_skeleton_exempt =
+/// true` for the forced skeleton (path-free by design — the locked
+/// checklist); update_plan's Reviewing append window (backlog 37f8631a)
+/// passes false so appended follow-on steps meet the same bar as every
+/// other step. Returns the first violation, if any.
+fn step_issue(steps: &[String], bug_skeleton_exempt: bool) -> Option<String> {
+    if bug_skeleton_exempt {
         return None;
     }
     let path_free: Vec<usize> = steps
@@ -364,7 +366,7 @@ fn validate_plan_resumability(
     if let Some(issue) = context_issue(context, kind, detailed_steps) {
         issues.push(issue);
     }
-    if let Some(issue) = step_issue(steps, kind) {
+    if let Some(issue) = step_issue(steps, kind == PlanKind::BugFixing) {
         issues.push(issue);
     }
     issues
@@ -933,7 +935,8 @@ impl Tool for UpdatePlanTool {
              (full field set in both for the main agent — the reviewer never sees this \
              tool; complete_step stays hidden mid-review, so appended steps stay \
              unchecked through the exit). bug_fixing \
-             plans have a LOCKED skeleton (steps cannot be replaced or appended) — record \
+             plans have a LOCKED skeleton (steps cannot be replaced; appends are allowed \
+             only in the Reviewing state — follow-on fix work in the closing sequence) — record \
              the verify step's test name via regression_test, and landed_design=true when \
              the fix turned out feature-scale (the finish gate then requires a 'Landed \
              design' context amendment).",
@@ -965,7 +968,7 @@ impl Tool for UpdatePlanTool {
                     },
                     "append": {
                         "type": "boolean",
-                        "description": "Default false. When true, steps are appended after the remaining ones (not replacing them) and context is appended (not replaced). Refused for bug_fixing plans (locked skeleton)."
+                        "description": "Default false. When true, steps are appended after the remaining ones (not replacing them) and context is appended (not replaced). For bug_fixing plans, appends are allowed only in the Reviewing state (follow-on fix work in the closing sequence); steps replacement is always refused (locked skeleton)."
                     }
                 }
             }),
@@ -996,7 +999,9 @@ impl Tool for UpdatePlanTool {
         // Plan resumability gate (2027-01-09): the same bar as create_plan,
         // applied to what this call writes. New steps are checked per-step
         // (bug_fixing plans are exempt — the engine's locked-skeleton
-        // refusal owns that path); a context write is checked as the
+        // refusal owns that path — EXCEPT appended follow-on steps in the
+        // Reviewing window, backlog 37f8631a, which are checked like any
+        // other step); a context write is checked as the
         // EFFECTIVE post-update text (replace → the new text; append → the
         // existing context plus the new text), so a short hardening chunk
         // appended onto a substantive context passes while a thin
@@ -1004,9 +1009,18 @@ impl Tool for UpdatePlanTool {
         // ungated.
         let active = wf.plan();
         let kind = active.map(|p| p.kind).unwrap_or(PlanKind::Implementation);
+        // The bug-skeleton exemption flips off in the Reviewing append
+        // window (backlog 37f8631a): appended follow-on steps are real
+        // checklist items (they surface as the active step after a crash),
+        // so they meet the same path-or-marker resumability bar as every
+        // other step. Everywhere else the engine's lock refuses bug-plan
+        // steps anyway — the exemption stands.
+        let reviewing_append = args.append && wf.state() == WorkflowState::Reviewing;
         let mut issues = Vec::new();
         if let Some(new_steps) = &steps {
-            if let Some(issue) = step_issue(new_steps, kind) {
+            if let Some(issue) =
+                step_issue(new_steps, kind == PlanKind::BugFixing && !reviewing_append)
+            {
                 issues.push(issue);
             }
         }
@@ -4742,6 +4756,97 @@ mod tests {
             "{}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn update_plan_tool_appends_follow_on_in_reviewing_for_bug_fixing() {
+        // Backlog 37f8631a: the skeleton lock's follow-on window, through the
+        // tool — after the forced 4-step skeleton completes (state
+        // Reviewing), update_plan(append=true) succeeds; the appended step
+        // lands after the done skeleton, unchecked.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        create
+            .execute(json!({
+                "title": "Fix",
+                "goal": "G",
+                "context": "The app crashes on open; root cause: unguarded unwrap in src/app.rs:42. Regression test: app_crash_on_open in src/app/tests.rs fails without the fix.",
+                "bug": "crash on open",
+                "kind": "bug_fixing",
+                "steps": []
+            }))
+            .await;
+        let complete = CompleteStepTool::new(wf.clone());
+        for i in 1..=4 {
+            let res = complete.execute(json!({"step_index": i})).await;
+            assert!(res.success, "step {i}: {}", res.output);
+        }
+        {
+            let w = wf.lock().await;
+            assert_eq!(w.state(), WorkflowState::Reviewing);
+        }
+        let update = UpdatePlanTool::new(wf.clone());
+        let result = update
+            .execute(json!({"steps": ["fix the reviewer finding in src/widget.rs"], "append": true}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let w = wf.lock().await;
+        assert_eq!(w.state(), WorkflowState::Reviewing);
+        let plan = w.plan().unwrap();
+        assert_eq!(plan.steps.len(), 5);
+        for step in &plan.steps[..4] {
+            assert!(step.done);
+        }
+        assert!(!plan.steps[4].done);
+        assert_eq!(plan.steps[4].text, "fix the reviewer finding in src/widget.rs");
+    }
+
+    #[tokio::test]
+    async fn update_plan_tool_gates_appended_bug_steps_for_resumability() {
+        // Backlog 37f8631a: appended follow-on steps meet the same
+        // path-or-marker resumability bar as every other step — the
+        // bug-skeleton exemption flips off inside the Reviewing append
+        // window (a path-free step is rejected with the actionable error;
+        // a path-bearing one lands).
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        create
+            .execute(json!({
+                "title": "Fix",
+                "goal": "G",
+                "context": "The app crashes on open; root cause: unguarded unwrap in src/app.rs:42. Regression test: app_crash_on_open in src/app/tests.rs fails without the fix.",
+                "bug": "crash on open",
+                "kind": "bug_fixing",
+                "steps": []
+            }))
+            .await;
+        let complete = CompleteStepTool::new(wf.clone());
+        for i in 1..=4 {
+            let res = complete.execute(json!({"step_index": i})).await;
+            assert!(res.success, "step {i}: {}", res.output);
+        }
+        let update = UpdatePlanTool::new(wf.clone());
+        let result = update
+            .execute(json!({"steps": ["re-run the suite"], "append": true}))
+            .await;
+        assert!(
+            !result.success,
+            "path-free step must be rejected: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("names no file path"),
+            "{}",
+            result.output
+        );
+        let result = update
+            .execute(json!({"steps": ["fix the finding in src/widget.rs"], "append": true}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let w = wf.lock().await;
+        assert_eq!(w.plan().unwrap().steps.len(), 5);
     }
 
     #[tokio::test]

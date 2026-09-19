@@ -492,7 +492,10 @@ shot.
   (2027-01-11, backlog 51ee41c1 — cf. plan c87093c1). The
   4-step skeleton is **locked** (reproduce with a failing regression test →
   document root cause → minimal fix → verify; `update_plan` refuses steps
-  replacement AND steps append), provided steps persist as CHECKABLE
+  replacement, and steps append except in Reviewing — the follow-on
+  window, backlog 37f8631a: a review-surfaced fix becomes a checkable
+  appended step, unchecked through the review, and a crash mid-follow-on
+  resumes with it as the active step), provided steps persist as CHECKABLE
   sub-items under `## Detailed steps` (the crash-resumption detail; text
   immutable like the skeleton, each sub-step's checkbox ticked via
   `complete_step detailed_step_index` so a restart shows exactly what

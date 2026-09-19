@@ -10,6 +10,14 @@
 //! several old/new pairs atomically — in order, one write, one combined
 //! diff; any failing item aborts with the file untouched.
 //!
+//! Byte-exactness (backlog 838b6f4e): `old_string` matches byte-exact —
+//! JS-escaped apostrophes (`\'`), backslashes (`\\`), and line endings are
+//! literal. On a miss, the escape-normalization fallbacks (unescaped/
+//! escaped variants, whitespace normalization) absorb the apostrophe trap
+//! and say so in a success NOTE; a genuine miss reports the first
+//! difference. If the anchor contains a quote, a backslash, or is >3
+//! lines, prefer line-range mode (`lines`).
+//!
 //! Hardening (backlog e8b39d72, completing 714196da's freshness contract):
 //! every drift-class failure carries the fresh-read nudge
 //! (`EDIT_STALE_READ_MARK`) and — per-agent — arms the gate that intercepts
@@ -43,8 +51,8 @@ use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 pub struct FileEditArgs {
     pub path: String,
     /// The exact text to find (or a regex when `use_regex=true`). Required for
-    /// string-matching mode; ignored when `start_line` + `end_line` are set
-    /// (line-range mode). Defaults to empty so line-range calls can omit it.
+    /// string-matching mode; ignored when `lines` is set (line-range mode).
+    /// Defaults to empty so line-range calls can omit it.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub old_string: String,
     /// The replacement text. Defaults to empty so multi-edit batch calls
@@ -65,17 +73,16 @@ pub struct FileEditArgs {
     /// over `replace_all`.
     #[serde(default)]
     pub count: Option<usize>,
-    /// 1-indexed inclusive start line for line-range edit mode. When both
-    /// `start_line` and `end_line` are set, those lines are replaced by
-    /// `new_string` — no `old_string` matching is needed (an alternative to
-    /// string matching that avoids whitespace-mismatch failures). Mutually
-    /// exclusive with `old_string`/`use_regex`/`replace_all`/`count`.
+    /// Line-range edit mode (backlog 838b6f4e): `lines` is exactly
+    /// `[start, end]` — 1-indexed, inclusive — and that range is replaced
+    /// by `new_string`. No `old_string` matching is needed (an alternative
+    /// to string matching that avoids whitespace-mismatch failures). One
+    /// tuple parameter instead of a start/end pair: two independent
+    /// optionals could be half-filled ("must both be set" — the observed
+    /// failure class); a single array cannot. Mutually exclusive with
+    /// `old_string`/`use_regex`/`replace_all`/`count`.
     #[serde(default)]
-    pub start_line: Option<usize>,
-    /// 1-indexed inclusive end line for line-range edit mode (see
-    /// `start_line`). Both must be set together; setting only one is an error.
-    #[serde(default)]
-    pub end_line: Option<usize>,
+    pub lines: Option<Vec<usize>>,
     /// When true (literal mode only), locate `old_string` by normalizing
     /// whitespace — collapse runs of spaces/tabs to a single space and ignore
     /// trailing whitespace per line — so tab-vs-space or off-by-one-space
@@ -91,8 +98,7 @@ pub struct FileEditArgs {
     /// content as left by the preceding items unless the item sets `count`.
     /// Mutually exclusive with the single-edit fields: leave `old_string`/
     /// `new_string` empty and do not set `use_regex`/`replace_all`/`count`/
-    /// `start_line`/`end_line` (the batch-level `fuzzy_whitespace` is each
-    /// item's default).
+    /// `lines` (the batch-level `fuzzy_whitespace` is each item's default).
     #[serde(default)]
     pub edits: Option<Vec<EditItem>>,
     /// Append mode (plan be16ea36 step 5): when true, `new_string` is added
@@ -145,6 +151,11 @@ pub struct PreparedEdit {
     pub path: String,
     pub diff: String,
     pub new_content: String,
+    /// Success-output notes (backlog 838b6f4e C): match-origin fallback
+    /// notes ("matched via escape-normalization") — `execute` appends them
+    /// to the result output so a fallback is never silent; the approval
+    /// path ignores them.
+    pub notes: Vec<String>,
 }
 
 /// Compute the unified diff between old and new content.
@@ -452,14 +463,14 @@ fn rust_brace_deficit(source: &str) -> usize {
 /// Dispatches to the multi-edit batch, line-range, regex, or literal
 /// implementation depending on the args. The batch (`edits`) takes
 /// precedence (it is mutually exclusive with the single-edit fields);
-/// line-range mode (`start_line` + `end_line`) requires no `old_string`;
-/// otherwise the `use_regex`/literal path runs.
+/// line-range mode (`lines`) requires no `old_string`; otherwise the
+/// `use_regex`/literal path runs.
 pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
     if args.edits.is_some() {
         prepare_edit_batch(args, content)
     } else if args.append {
         prepare_edit_append(args, content)
-    } else if args.start_line.is_some() || args.end_line.is_some() {
+    } else if args.lines.is_some() {
         prepare_edit_lines(args, content)
     } else {
         // String-matching mode (literal or regex) requires a non-empty
@@ -470,7 +481,7 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
         if args.old_string.is_empty() {
             return Err(crate::error::Error::InvalidInput(
                 "old_string is empty — provide old_string (string matching) or \
-                 start_line + end_line (line range)"
+                 lines: [start, end] (line range)"
                     .into(),
             ));
         }
@@ -482,36 +493,37 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
     }
 }
 
-/// Line-range edit path: replace lines `[start_line, end_line]` (1-indexed,
-/// inclusive) with `new_string`. No `old_string` matching is needed — the
-/// caller identifies the region by line number (as shown by `file_read`'s
-/// 1-indexed line prefixes), so whitespace/indentation mismatch cannot cause
-/// a failure. The file's line-ending style is preserved: `new_string` is
-/// normalized to the file's detected style before insertion.
+/// Line-range edit path: replace the `lines` range — `[start, end]`
+/// (1-indexed, inclusive) — with `new_string`. No `old_string` matching is
+/// needed — the caller identifies the region by line number (as shown by
+/// `file_read`'s 1-indexed line prefixes), so whitespace/indentation
+/// mismatch cannot cause a failure. The file's line-ending style is
+/// preserved: `new_string` is normalized to the file's detected style
+/// before insertion.
 fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
-    // Both bounds must be set together — setting only one is a caller error.
-    let start_line = match (args.start_line, args.end_line) {
-        (Some(s), Some(e)) => (s, e),
-        _ => {
-            return Err(crate::error::Error::InvalidInput(
-                "start_line and end_line must both be set (line-range mode). Expected \
-                 arguments: {\"path\": \"<file>\", \"start_line\": <1-indexed N>, \
-                 \"end_line\": <1-indexed M>, \"new_string\": \"<replacement>\"} — \
-                 or use string mode (old_string + new_string) instead".into(),
-            ));
-        }
-    };
-    let (start, end) = start_line;
+    // Exactly [start, end] (backlog 838b6f4e): one tuple parameter — the
+    // half-filled start/end pair ("must both be set") is unrepresentable.
+    let bounds = args.lines.as_deref().unwrap_or(&[]);
+    if bounds.len() != 2 {
+        return Err(crate::error::Error::InvalidInput(format!(
+            "lines must be exactly [start, end] — got {} element(s). Expected \
+             arguments: {{\"path\": \"<file>\", \"lines\": [<1-indexed N>, \
+             <1-indexed M>], \"new_string\": \"<replacement>\"}} — or use string \
+             mode (old_string + new_string) instead",
+            bounds.len()
+        )));
+    }
+    let (start, end) = (bounds[0], bounds[1]);
 
-    // 1-indexed: start_line must be >= 1, and end_line >= start_line.
+    // 1-indexed: start must be >= 1, and end >= start.
     if start == 0 {
         return Err(crate::error::Error::InvalidInput(
-            "start_line must be >= 1 (1-indexed)".into(),
+            "lines[0] (start) must be >= 1 (1-indexed)".into(),
         ));
     }
     if end < start {
         return Err(crate::error::Error::InvalidInput(format!(
-            "end_line ({end}) must be >= start_line ({start})"
+            "lines[1] (end, {end}) must be >= lines[0] (start, {start})"
         )));
     }
 
@@ -530,7 +542,7 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
     let end_idx = (end - 1).min(lines.len() - 1);
     if start_idx >= lines.len() {
         return Err(with_fresh_read_nudge(format!(
-            "start_line {start} is past the end of the file ({} lines)",
+            "lines[0] (start) {start} is past the end of the file ({} lines)",
             lines.len()
         )));
     }
@@ -575,6 +587,7 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         path: args.path.clone(),
         diff,
         new_content,
+        notes: Vec::new(),
     })
 }
 
@@ -687,14 +700,193 @@ fn fuzzy_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     Some((orig_start, orig_end))
 }
 
+/// How a literal anchor was matched (backlog 838b6f4e C): exactly, or via
+/// one of the fallbacks that absorb the observed apostrophe trap — a
+/// transport that JS-escapes quotes in the agent's view of the file (or
+/// the reverse) used to hard-fail byte-exact matching. The non-Exact
+/// origins ride the success output as a NOTE so a fallback is never
+/// silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchOrigin {
+    Exact,
+    /// The needle carried JS escapes (\' → ') the file does not.
+    Unescaped,
+    /// The file carries JS escapes the needle does not (' → \').
+    Escaped,
+    /// Whitespace runs differ — fuzzy semantics applied automatically.
+    WhitespaceNormalized,
+}
+
+impl MatchOrigin {
+    /// The success-output NOTE for this origin (None for Exact — an exact
+    /// match is the silent default).
+    fn note(self) -> Option<&'static str> {
+        match self {
+            MatchOrigin::Exact => None,
+            MatchOrigin::Unescaped => Some(
+                "NOTE: matched via escape-normalization — old_string carried \
+                 JS-escaped quotes (\\') the file does not; the unescaped \
+                 variant was applied",
+            ),
+            MatchOrigin::Escaped => Some(
+                "NOTE: matched via escape-normalization — the file carries \
+                 JS-escaped quotes (\\') where old_string has plain ones; the \
+                 escaped variant was applied",
+            ),
+            MatchOrigin::WhitespaceNormalized => Some(
+                "NOTE: matched via whitespace normalization — runs of \
+                 spaces/tabs differ between old_string and the file; fuzzy \
+                 semantics were applied automatically",
+            ),
+        }
+    }
+}
+
+/// Unescape the JS quote escapes (backlog 838b6f4e C): `\'` → `'` and
+/// `\\` → `\`. Conservative — any other backslash sequence passes through
+/// untouched (a literal `\d` stays `\d`).
+fn unescape_js(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('\'') | Some('\\') => {
+                    out.push(chars.next().expect("peeked"));
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The mirror direction: `'` → `\'` and `\` → `\\`.
+fn escape_js(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a short display snippet for the near-miss diagnostic (backlog
+/// 838b6f4e D): newlines, tabs, and carriage returns become their escapes
+/// so the message stays on one line.
+fn escape_display(s: &str) -> String {
+    s.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
+}
+
+/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
+/// literal miss, find the position in the LF-projected content sharing the
+/// longest common prefix with the needle (>= 8 chars) and report how far it
+/// matched and where the two diverge — turning a blind retry loop into a
+/// one-shot fix. Returns None when no position shares the threshold prefix
+/// (nothing useful to say). Char-based (not bytes) so the reported position
+/// and snippets are display-accurate.
+fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
+    const MIN_PREFIX: usize = 8;
+    let (content_lf, _) = normalize_lf_with_offsets(content);
+    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
+    let hay: Vec<char> = content_lf.chars().collect();
+    if needle.len() < MIN_PREFIX {
+        return None;
+    }
+    // Work budget (review L3): bound the worst case — long runs of the
+    // needle's first char (minified/generated content) times a long
+    // needle would otherwise degrade to unbounded O(n·m) on the blocking
+    // pool. Bail past the budget and report the best found so far.
+    const MAX_COMPARED: usize = 10_000_000;
+    let mut compared = 0usize;
+    let mut best_start = usize::MAX;
+    let mut best_len = 0usize;
+    'scan: for start in 0..hay.len() {
+        if hay[start] != needle[0] {
+            continue;
+        }
+        let mut len = 0usize;
+        while start + len < hay.len() && len < needle.len() && hay[start + len] == needle[len] {
+            len += 1;
+            compared += 1;
+            if compared > MAX_COMPARED {
+                break 'scan;
+            }
+        }
+        if len > best_len {
+            best_len = len;
+            best_start = start;
+        }
+    }
+    if best_len < MIN_PREFIX {
+        return None;
+    }
+    let file_next: String = hay[best_start + best_len..].iter().take(4).collect();
+    let sent_next: String = needle[best_len..].iter().take(4).collect();
+    Some(format!(
+        "near-miss: matched {}/{} chars; first difference at char {}: file \
+         has '{}', you sent '{}'",
+        best_len,
+        needle.len(),
+        best_len + 1,
+        escape_display(&file_next),
+        escape_display(&sent_next)
+    ))
+}
+
+/// Resolve the effective needle for a literal match (backlog 838b6f4e C):
+/// the exact LF-normalized needle when it occurs in the content; on a
+/// miss, the unescaped variant, then the escaped variant, then
+/// whitespace-normalized matching (when not already fuzzy). Returns the
+/// needle to splice with and how it was chosen — a miss everywhere
+/// returns the original needle with `Exact` (the callers report the miss;
+/// `Exact`'s absent NOTE keeps that path unchanged).
+fn resolve_match_variant(
+    content_lf: &str,
+    old_lf: &str,
+    fuzzy: bool,
+) -> (String, MatchOrigin) {
+    if content_lf.contains(old_lf) {
+        return (old_lf.to_string(), MatchOrigin::Exact);
+    }
+    let unescaped = unescape_js(old_lf);
+    if unescaped != old_lf && content_lf.contains(&unescaped) {
+        return (unescaped, MatchOrigin::Unescaped);
+    }
+    let escaped = escape_js(old_lf);
+    if escaped != old_lf && content_lf.contains(&escaped) {
+        return (escaped, MatchOrigin::Escaped);
+    }
+    if !fuzzy && fuzzy_find(content_lf, old_lf).is_some() {
+        return (old_lf.to_string(), MatchOrigin::WhitespaceNormalized);
+    }
+    (old_lf.to_string(), MatchOrigin::Exact)
+}
+
+/// The literal splice's outcome (backlog 838b6f4e C): the new content plus
+/// how the anchor was matched — the non-Exact origins become success-output
+/// NOTEs.
+struct SpliceOutcome {
+    new_content: String,
+    origin: MatchOrigin,
+}
+
 /// The literal edit's matching+splicing core, shared by the single-edit path
 /// and the multi-edit batch (plan be16ea36 step 4): EOL-agnostic matching on
 /// BOTH sides (the content is projected to LF with a byte-offset map back to
 /// the original; the needle is normalized to LF), then `new_string` —
 /// re-emitted in the file's detected (majority) ending style — is spliced
 /// into the ORIGINAL bytes at the mapped offsets, at most `limit`
-/// non-overlapping matches (fuzzy-whitespace matching when `fuzzy`).
-/// Returns `None` when the anchor matches nothing. Deliberately NO emission
+/// non-overlapping matches (fuzzy-whitespace matching when `fuzzy`). On an
+/// exact miss, the escape-normalization fallbacks are tried first
+/// (backlog 838b6f4e C — see [`resolve_match_variant`]); the chosen
+/// origin rides the outcome for the success NOTE. Returns `None` when the
+/// anchor matches nothing (after the fallbacks). Deliberately NO emission
 /// validation and NO diff here: the single path adds both for its one edit,
 /// while the batch path validates the COMBINED result once (a legitimate
 /// two-step batch can be temporarily unbalanced mid-batch) and emits one
@@ -705,7 +897,7 @@ fn literal_splice(
     new_string: &str,
     fuzzy: bool,
     limit: usize,
-) -> Result<Option<String>> {
+) -> Result<Option<SpliceOutcome>> {
     let le = detect_line_ending(content);
     let new_string = denormalize_literal_newlines(&normalize_line_endings(new_string, le));
     // Matching happens in LF space on BOTH sides — an ending-style difference
@@ -731,6 +923,11 @@ fn literal_splice(
     // original: matches are found in EOL-agnostic space, then spliced into
     // the original bytes so untouched regions keep their exact endings.
     let (content_lf, lf_offsets) = normalize_lf_with_offsets(content);
+    // Variant resolution (backlog 838b6f4e C): on an exact miss, the
+    // escape-normalized variants and whitespace-normalized matching absorb
+    // the apostrophe trap before the loop gives up.
+    let (old_lf, origin) = resolve_match_variant(&content_lf, &old_lf, fuzzy);
+    let fuzzy = fuzzy || origin == MatchOrigin::WhitespaceNormalized;
     let mut out = String::with_capacity(content.len());
     let mut lf_pos = 0usize; // cursor in the LF projection
     let mut orig_pos = 0usize; // cursor in the original content
@@ -757,7 +954,10 @@ fn literal_splice(
         return Ok(None);
     }
     out.push_str(&content[orig_pos..]);
-    Ok(Some(out))
+    Ok(Some(SpliceOutcome {
+        new_content: out,
+        origin,
+    }))
 }
 
 /// Literal (exact-string) edit path — EOL-agnostic matching (plan be16ea36
@@ -775,27 +975,46 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
     } else {
         args.count.unwrap_or(1).max(1)
     };
-    let new_content = match literal_splice(
+    let SpliceOutcome {
+        new_content,
+        origin,
+    } = match literal_splice(
         content,
         &args.old_string,
         &args.new_string,
         args.fuzzy_whitespace,
         limit,
     )? {
-        Some(nc) => nc,
+        Some(outcome) => outcome,
         None => {
-            return Err(with_fresh_read_nudge(if args.fuzzy_whitespace {
+            // First-difference pointer (backlog 838b6f4e D): append the
+            // near-miss diagnostic so a retry can be corrected in one
+            // shot. The drift nudge (and its steering marker) stays the
+            // error's backbone — appended, never replaced.
+            let base = if args.fuzzy_whitespace {
                 "old_string not found in file (fuzzy_whitespace)"
             } else {
                 "old_string not found in file"
-            }))
+            };
+            let detail = near_miss_diagnostic(content, &args.old_string)
+                .map(|d| format!(" — {d}"))
+                .unwrap_or_default();
+            return Err(with_fresh_read_nudge(format!("{base}{detail}")));
         }
     };
 
     if new_content == content {
-        return Err(crate::error::Error::NotFound(
-            "old_string not found in file".into(),
-        ));
+        // Review L5: reachable with a VARIANT match whose replacement
+        // equals the matched text (old=`it's`, new=`it\'s`, file=`it\'s`)
+        // — the anchor WAS found; say so instead of "not found".
+        let reason = if origin == MatchOrigin::Exact {
+            "old_string not found in file"
+        } else {
+            "the anchor matched via a fallback variant but the edit produced \
+             no change — old_string and new_string are equivalent for the \
+             matched text"
+        };
+        return Err(crate::error::Error::NotFound(reason.into()));
     }
     // The spliced replacement, re-emitted in the file's detected style —
     // recomputed here for the emission validator (literal_splice owns the
@@ -804,10 +1023,15 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
     let new_string = denormalize_literal_newlines(&normalize_line_endings(&args.new_string, le));
     validate_emission_artifacts(&args.path, content, &new_string, &new_content)?;
     let diff = compute_diff(&args.path, content, &new_content);
+    let notes = origin
+        .note()
+        .map(|n| vec![n.to_string()])
+        .unwrap_or_default();
     Ok(PreparedEdit {
         path: args.path.clone(),
         diff,
         new_content,
+        notes,
     })
 }
 
@@ -825,6 +1049,7 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
 fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
     let items = validate_batch_args(args)?;
     let mut current = content.to_string();
+    let mut notes: Vec<String> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let fuzzy = item.fuzzy_whitespace.unwrap_or(args.fuzzy_whitespace);
         // Ambiguity guard: without an explicit count the anchor must match
@@ -844,7 +1069,15 @@ fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         }
         let limit = item.count.unwrap_or(1).max(1);
         match literal_splice(&current, &item.old_string, &item.new_string, fuzzy, limit)? {
-            Some(next) if next != current => current = next,
+            Some(SpliceOutcome {
+                new_content: next,
+                origin,
+            }) if next != current => {
+                if let Some(note) = origin.note() {
+                    notes.push(format!("edit {}/{}: {note}", idx + 1, items.len()));
+                }
+                current = next;
+            }
             Some(_) => {
                 return Err(batch_item_error(
                     idx,
@@ -858,11 +1091,16 @@ fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
                 ))
             }
             None => {
+                // First-difference pointer (backlog 838b6f4e D), scoped to
+                // the content as left by the preceding items.
+                let detail = near_miss_diagnostic(&current, &item.old_string)
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
                 return Err(batch_item_error(
                     idx,
                     items.len(),
                     &item.old_string,
-                    with_fresh_read_nudge("old_string not found in file"),
+                    with_fresh_read_nudge(format!("old_string not found in file{detail}")),
                 ))
             }
         }
@@ -883,6 +1121,7 @@ fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         path: args.path.clone(),
         diff,
         new_content: current,
+        notes,
     })
 }
 
@@ -902,10 +1141,9 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
             "append is mutually exclusive with edits".into(),
         ));
     }
-    if args.start_line.is_some() || args.end_line.is_some() {
+    if args.lines.is_some() {
         return Err(crate::error::Error::InvalidInput(
-            "append is mutually exclusive with line-range mode (start_line/end_line)"
-                .into(),
+            "append is mutually exclusive with line-range mode (lines)".into(),
         ));
     }
     if !args.old_string.is_empty() {
@@ -974,6 +1212,7 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
         path: args.path.clone(),
         diff,
         new_content,
+        notes: Vec::new(),
     })
 }
 
@@ -1024,10 +1263,9 @@ fn validate_batch_args(args: &FileEditArgs) -> Result<&[EditItem]> {
                 .into(),
         ));
     }
-    if args.start_line.is_some() || args.end_line.is_some() {
+    if args.lines.is_some() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with line-range mode (start_line/end_line)"
-                .into(),
+            "edits is mutually exclusive with line-range mode (lines)".into(),
         ));
     }
     if args.append {
@@ -1050,6 +1288,20 @@ fn validate_batch_args(args: &FileEditArgs) -> Result<&[EditItem]> {
                 items.len()
             )));
         }
+        // No-op items (review L2, backlog 838b6f4e cause 3): the observed
+        // incident shape was a BATCH item with old_string == new_string —
+        // reject it here, pre-write (validate_batch_args runs after the
+        // file read inside the blocking closure; the file is never
+        // touched), with the same exact message the single-mode guard
+        // uses, naming the item.
+        if item.old_string == item.new_string {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "no-op edit: edit {}/{} has old_string == new_string — nothing \
+                 to change",
+                idx + 1,
+                items.len()
+            )));
+        }
     }
     Ok(items)
 }
@@ -1063,6 +1315,11 @@ fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
     if needle_lf.is_empty() {
         return 0;
     }
+    // Variant-aware (backlog 838b6f4e C): count with the same effective
+    // needle the splice will use, so a variant-matched anchor's ambiguity
+    // is still caught.
+    let (needle_lf, origin) = resolve_match_variant(&content_lf, &needle_lf, fuzzy);
+    let fuzzy = fuzzy || origin == MatchOrigin::WhitespaceNormalized;
     let mut count = 0usize;
     let mut pos = 0usize;
     while pos <= content_lf.len() {
@@ -1243,6 +1500,7 @@ fn prepare_edit_regex_with_le(
         path: args.path.clone(),
         diff,
         new_content,
+        notes: Vec::new(),
     })
 }
 
@@ -1260,10 +1518,14 @@ impl Tool for FileEditTool {
         ToolSchema::new(
             "file_edit",
             "Replace old_string with new_string in a file; generates a unified diff for \
-             approval. Read the file first (read_files) — old_string must match the file's \
-             exact content or the edit fails. Six modes: LITERAL (default, first \
-             occurrence), REGEX (use_regex), LINE-RANGE (start_line + end_line — no \
-             old_string needed, so whitespace mismatches cannot bite), FUZZY \
+              approval. Read the file first (read_files) — old_string must match the file's \
+               exact content or the edit fails (escape/whitespace differences are \
+               auto-absorbed with a NOTE): JS-escaped apostrophes (\\'), backslashes \
+               (\\\\), and line endings are literal. If the anchor contains a quote, a \
+               backslash, or is >3 lines, prefer line-range mode (lines). Six modes: \
+              LITERAL (default, first \
+              occurrence), REGEX (use_regex), LINE-RANGE (lines: [start, end] — no \
+              old_string needed, so whitespace mismatches cannot bite), FUZZY \
              (fuzzy_whitespace, literal only), BATCH (edits — an atomic multi-edit \
              array applied in order with ONE write; any failing item aborts the whole \
              batch with the file untouched on disk), and APPEND (append — add \
@@ -1281,10 +1543,9 @@ impl Tool for FileEditTool {
                     "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)."},
                     "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In the replacement (new_string), use real newlines — a literal backslash-n is inserted as-is, not converted to a newline."},
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
-                    "start_line": {"type": "integer", "description": "1-indexed inclusive start line; use the numbers shown by file_read. Set with end_line to replace that range with new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. Both must be set together."},
-                    "end_line": {"type": "integer", "description": "1-indexed inclusive end line (see start_line); clamped to the file length."},
+                    "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
                     "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
-                    "edits": {"type": "array", "description": "Atomic multi-edit batch: every item is applied IN ORDER and the result is written ONCE — any failing item aborts the whole batch with the file untouched. Each item: {old_string, new_string, count?, fuzzy_whitespace?}; an item's anchor must match exactly once in the content as left by the preceding items unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/start_line/end_line.", "items": {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the batch-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}},
+                    "edits": {"type": "array", "description": "Atomic multi-edit batch: every item is applied IN ORDER and the result is written ONCE — any failing item aborts the whole batch with the file untouched. Each item: {old_string, new_string, count?, fuzzy_whitespace?}; an item's anchor must match exactly once in the content as left by the preceding items unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the batch-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}},
                     "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with edits/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."}
                 },
                 "required": ["path"]
@@ -1327,6 +1588,26 @@ impl Tool for FileEditTool {
             new_string: crate::provider::boundary::restore_boundary_tokens(&args.new_string),
             ..args
         };
+
+        // No-op guard (backlog 838b6f4e D): a single-mode LITERAL edit whose
+        // old_string equals new_string replaces text with itself — reject it
+        // BEFORE any file I/O with the exact message, instead of the generic
+        // identical-strings error from deep inside the splice. Regex mode is
+        // exempt (a pattern can equal its replacement text while still
+        // changing the content); the normalized-equal guards (whitespace/
+        // EOL) stay in the splice — only the byte-identical case is
+        // knowable pre-read.
+        if args.edits.is_none()
+            && !args.append
+            && args.lines.is_none()
+            && !args.use_regex
+            && !args.old_string.is_empty()
+            && args.old_string == args.new_string
+        {
+            return ToolResult::error(
+                "no-op edit: old_string equals new_string — nothing to change",
+            );
+        }
 
         // Offload the blocking validate + read + write onto the blocking pool
         // (Perf H1). The pure work (`prepare_edit`, `is_protected_write_target`)
@@ -1389,6 +1670,10 @@ impl Tool for FileEditTool {
             if let Some(note) = large_payload_note(&args) {
                 output.push('\n');
                 output.push_str(&note);
+            }
+            for note in &prepared.notes {
+                output.push('\n');
+                output.push_str(note);
             }
             ToolResult {
                 success: true,
@@ -1464,8 +1749,7 @@ mod tests {
             "use_regex": null,
             "fuzzy_whitespace": null,
             "count": null,
-            "start_line": 1,
-            "end_line": 2,
+            "lines": [1, 2],
             "edits": null,
             "append": null
         }))
@@ -1479,8 +1763,7 @@ mod tests {
         assert!(!args.append);
         assert_eq!(args.count, None);
         assert!(args.edits.is_none());
-        assert_eq!(args.start_line, Some(1));
-        assert_eq!(args.end_line, Some(2));
+        assert_eq!(args.lines, Some(vec![1, 2]));
     }
 
     /// Build literal-mode args (the common case for existing tests).
@@ -1492,8 +1775,7 @@ mod tests {
             replace_all,
             use_regex: false,
             count: None,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: false,
             edits: None,
             append: false,
@@ -1515,8 +1797,7 @@ mod tests {
             replace_all,
             use_regex: true,
             count,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: false,
             edits: None,
             append: false,
@@ -1532,8 +1813,7 @@ mod tests {
             replace_all: false,
             use_regex: false,
             count: None,
-            start_line: Some(start),
-            end_line: Some(end),
+            lines: Some(vec![start, end]),
             fuzzy_whitespace: false,
             edits: None,
             append: false,
@@ -1838,9 +2118,52 @@ mod tests {
 
     #[test]
     fn prepare_edit_identical_strings_error() {
+        // The in-splice guard still rejects direct prepare_edit calls (the
+        // approval-preview path bypasses execute's early no-op check).
         let args = lit_args("a.txt", "same", "same", false);
         let result = prepare_edit(&args, "same content");
         assert!(result.is_err());
+    }
+
+    /// Backlog 838b6f4e D: a single-mode literal edit whose old_string
+    /// equals new_string is rejected BEFORE any file I/O with the exact
+    /// message — not the generic identical-strings error from deep inside
+    /// the splice. Regex mode is exempt: a pattern can equal its
+    /// replacement text while still changing the content (a capture-free
+    /// replacement of a capture-bearing match).
+    #[tokio::test]
+    async fn no_op_edit_rejected_early_with_clear_message() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "same content\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "old_string": "same",
+                "new_string": "same",
+            }))
+            .await;
+        assert!(!result.success, "expected error, got: {}", result.output);
+        assert!(
+            result.output.contains("no-op edit: old_string equals new_string"),
+            "must carry the exact message: {}",
+            result.output
+        );
+        // The rejection happens pre-read — the file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "same content\n"
+        );
+    }
+
+    /// Regex mode is exempt from the no-op guard (backlog 838b6f4e D): a
+    /// pattern can equal its replacement text while still changing the
+    /// content — a capture-free replacement of a capture-bearing match.
+    #[test]
+    fn regex_equal_pattern_and_replacement_is_not_a_no_op() {
+        let args = re_args("a.txt", "(a)", "(a)", false, None);
+        let prepared = prepare_edit(&args, "a\n").unwrap();
+        assert_eq!(prepared.new_content, "(a)\n");
     }
 
     #[test]
@@ -1875,14 +2198,12 @@ mod tests {
         assert!(err.contains(EDIT_STALE_READ_MARK), "regex miss: {err}");
         // Line-range past EOF.
         let mut args = lit_args("a.txt", "", "x", false);
-        args.start_line = Some(9);
-        args.end_line = Some(9);
+        args.lines = Some(vec![9, 9]);
         let err = prepare_edit(&args, "a\nb\nc\n").unwrap_err().to_string();
         assert!(err.contains(EDIT_STALE_READ_MARK), "past EOF: {err}");
         // Empty file.
         let mut args = lit_args("a.txt", "", "x", false);
-        args.start_line = Some(1);
-        args.end_line = Some(1);
+        args.lines = Some(vec![1, 1]);
         let err = prepare_edit(&args, "").unwrap_err().to_string();
         assert!(err.contains(EDIT_STALE_READ_MARK), "empty file: {err}");
     }
@@ -2125,7 +2446,7 @@ mod tests {
         assert!(!result.success);
     }
 
-    // ---- line-range mode (start_line + end_line) ----
+    // ---- line-range mode (lines: [start, end]) ----
 
     #[test]
     fn prepare_edit_lines_replaces_range() {
@@ -2166,24 +2487,24 @@ mod tests {
         let result = prepare_edit(&args, "a\nb\nc\n");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("end_line"), "msg: {msg}");
+        assert!(msg.contains("lines[1]"), "msg: {msg}");
     }
 
     #[test]
-    fn prepare_edit_lines_one_bound_only_errors() {
-        // Setting only one of the two line-range bounds is the observed
-        // malformed-call shape (start_line without end_line — live incident:
-        // 5 consecutive identical failures); the error must carry the exact
-        // expected arguments so the model can self-correct on the first
-        // attempt.
+    fn prepare_edit_lines_one_element_array_errors() {
+        // A 1-element `lines` array is the new shape of the observed
+        // malformed-call class (the old start_line-without-end_line — live
+        // incident: 5 consecutive identical failures); the error must carry
+        // the exact expected arguments so the model can self-correct on the
+        // first attempt.
         let mut args = line_args("a.txt", 2, 3, "X");
-        args.end_line = None;
+        args.lines = Some(vec![2]);
         let result = prepare_edit(&args, "a\nb\nc\n");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("must both be set"), "msg: {msg}");
+        assert!(msg.contains("exactly [start, end]"), "msg: {msg}");
         assert!(msg.contains("Expected arguments"), "msg: {msg}");
-        assert!(msg.contains("\"end_line\""), "msg: {msg}");
+        assert!(msg.contains("\"lines\""), "msg: {msg}");
     }
 
     #[test]
@@ -2192,7 +2513,7 @@ mod tests {
         let result = prepare_edit(&args, "a\nb\nc\n");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("start_line"), "msg: {msg}");
+        assert!(msg.contains("lines[0]"), "msg: {msg}");
     }
 
     #[test]
@@ -2211,14 +2532,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_edit_lines_only_one_bound_errors() {
-        // Setting only start_line (not end_line) is an error.
+    fn prepare_edit_lines_three_element_array_errors() {
+        // A 3-element `lines` array is likewise rejected — exactly two.
         let mut args = line_args("a.txt", 1, 1, "X");
-        args.end_line = None;
+        args.lines = Some(vec![1, 2, 3]);
         let result = prepare_edit(&args, "a\nb\n");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("both"), "msg: {msg}");
+        assert!(msg.contains("exactly [start, end]"), "msg: {msg}");
     }
 
     #[test]
@@ -2295,8 +2616,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "path": "a.txt",
-                "start_line": 2,
-                "end_line": 3,
+                "lines": [2, 3],
                 "new_string": "X",
             }))
             .await;
@@ -2323,8 +2643,7 @@ mod tests {
             replace_all,
             use_regex: false,
             count: None,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: true,
             edits: None,
             append: false,
@@ -2415,8 +2734,7 @@ mod tests {
             replace_all: false,
             use_regex: true,
             count: None,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: true, // ignored in regex mode
             edits: None,
             append: false,
@@ -2496,8 +2814,7 @@ mod tests {
             replace_all: false,
             use_regex: false,
             count: None,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: false,
             edits: Some(items),
             append: false,
@@ -2654,8 +2971,7 @@ mod tests {
                 fuzzy_whitespace: None,
             }],
         );
-        args.start_line = Some(1);
-        args.end_line = Some(1);
+        args.lines = Some(vec![1, 1]);
         assert!(prepare_edit(&args, "x\n").is_err());
     }
 
@@ -2670,8 +2986,7 @@ mod tests {
             replace_all: false,
             use_regex: false,
             count: None,
-            start_line: None,
-            end_line: None,
+            lines: None,
             fuzzy_whitespace: false,
             edits: None,
             append: true,
@@ -2739,8 +3054,7 @@ mod tests {
         assert!(prepare_edit(&args, "x\n").is_err());
 
         let mut args = append_args("a.txt", "tail");
-        args.start_line = Some(1);
-        args.end_line = Some(1);
+        args.lines = Some(vec![1, 1]);
         assert!(prepare_edit(&args, "x\n").is_err());
 
         let mut args = append_args("a.txt", "tail");
@@ -2843,6 +3157,224 @@ mod tests {
                 .contains("/// foo\nfn b() {}\n/// foo"),
             "{}",
             prepared.new_content
+        );
+    }
+
+    // ---- escape-normalization fallback (backlog 838b6f4e C) ----
+
+    /// The apostrophe trap: the file holds a JS-escaped \' where the needle
+    /// has a plain ' — the escaped variant matches and the success output
+    /// carries the NOTE (never silent).
+    #[test]
+    fn escape_fallback_file_escaped_needle_plain_matches_with_note() {
+        let args = lit_args("a.txt", "it's here", "it was here", false);
+        let prepared = prepare_edit(&args, "line\nit\\'s here\n").unwrap();
+        assert_eq!(prepared.new_content, "line\nit was here\n");
+        assert_eq!(prepared.notes.len(), 1, "notes: {:?}", prepared.notes);
+        assert!(
+            prepared.notes[0].contains("escape-normalization"),
+            "note: {}",
+            prepared.notes[0]
+        );
+    }
+
+    /// The mirror direction: the needle carries the JS escape, the file is
+    /// plain — the unescaped variant matches.
+    #[test]
+    fn escape_fallback_needle_escaped_file_plain_matches_with_note() {
+        let args = lit_args("a.txt", "it\\'s here", "it was here", false);
+        let prepared = prepare_edit(&args, "line\nit's here\n").unwrap();
+        assert_eq!(prepared.new_content, "line\nit was here\n");
+        assert_eq!(prepared.notes.len(), 1, "notes: {:?}", prepared.notes);
+        assert!(
+            prepared.notes[0].contains("escape-normalization"),
+            "note: {}",
+            prepared.notes[0]
+        );
+    }
+
+    /// A whitespace-run difference matches automatically (fuzzy semantics
+    /// applied on miss) with the NOTE — the opt-in flag is no longer the
+    /// only route.
+    #[test]
+    fn whitespace_fallback_matches_with_note() {
+        let args = lit_args("a.txt", "fn  foo()", "fn bar()", false);
+        let prepared = prepare_edit(&args, "fn\tfoo()\n").unwrap();
+        assert_eq!(prepared.new_content, "fn bar()\n");
+        assert_eq!(prepared.notes.len(), 1, "notes: {:?}", prepared.notes);
+        assert!(
+            prepared.notes[0].contains("whitespace normalization"),
+            "note: {}",
+            prepared.notes[0]
+        );
+    }
+
+    /// An exact match stays silent — the NOTE fires only on fallbacks.
+    #[test]
+    fn exact_match_carries_no_fallback_note() {
+        let args = lit_args("a.txt", "it's here", "it was here", false);
+        let prepared = prepare_edit(&args, "line\nit's here\n").unwrap();
+        assert_eq!(prepared.new_content, "line\nit was here\n");
+        assert!(prepared.notes.is_empty(), "notes: {:?}", prepared.notes);
+    }
+
+    /// A batch item's escape fallback gets a per-item NOTE naming the
+    /// item's index.
+    #[test]
+    fn batch_item_escape_fallback_gets_per_item_note() {
+        let args = batch_args(
+            "a.txt",
+            vec![
+                EditItem {
+                    old_string: "it's here".into(),
+                    new_string: "it was here".into(),
+                    count: None,
+                    fuzzy_whitespace: None,
+                },
+                EditItem {
+                    old_string: "plain".into(),
+                    new_string: "PLAIN".into(),
+                    count: None,
+                    fuzzy_whitespace: None,
+                },
+            ],
+        );
+        let prepared = prepare_edit(&args, "it\\'s here\nplain\n").unwrap();
+        assert_eq!(prepared.new_content, "it was here\nPLAIN\n");
+        assert_eq!(prepared.notes.len(), 1, "notes: {:?}", prepared.notes);
+        assert!(
+            prepared.notes[0].contains("edit 1/2"),
+            "note: {}",
+            prepared.notes[0]
+        );
+        assert!(
+            prepared.notes[0].contains("escape-normalization"),
+            "note: {}",
+            prepared.notes[0]
+        );
+    }
+
+    /// End to end: the fallback NOTE rides the tool's success output.
+    #[tokio::test]
+    async fn escape_fallback_note_rides_the_success_output() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "it\\'s here\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "old_string": "it's here",
+                "new_string": "it was here",
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(
+            result.output.contains("escape-normalization"),
+            "the fallback must be visible: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "it was here\n"
+        );
+    }
+
+    /// The miss error carries the first-difference pointer (backlog
+    /// 838b6f4e D): a near-miss anchor reports how far it matched and
+    /// where the file diverges — appended to the drift nudge, never
+    /// replacing it.
+    #[test]
+    fn miss_error_carries_first_difference_pointer() {
+        let args = lit_args("a.txt", "let placeholder_count = 1;", "X", false);
+        let err = prepare_edit(&args, "let placeholder_count = 2;\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Re-read the file"), "nudge intact: {err}");
+        assert!(err.contains("matched 24/26 chars"), "pointer: {err}");
+        assert!(err.contains("first difference at char 25"), "position: {err}");
+        assert!(err.contains("file has '2"), "file side: {err}");
+        assert!(err.contains("you sent '1"), "needle side: {err}");
+    }
+
+    /// HIGH 1 (review 2026-09-19, plan 04a195de): OpenAI's strict-mode
+    /// JSON-Schema subset rejects `minItems`/`maxItems` outright — a 400
+    /// on the whole tools array — and file_edit is a STRICT_TOOLS member
+    /// whose schema `normalize_for_strict` passes through verbatim (it
+    /// only widens types and forces required/additionalProperties). The
+    /// advertised schema must therefore stay inside the supported set.
+    #[test]
+    fn advertised_schema_carries_no_strict_unsupported_keywords() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let schema = serde_json::to_value(tool.schema()).unwrap();
+        assert_no_unsupported_keywords(&schema);
+    }
+
+    /// Recursive walker for the strict-legality check: no `minItems`/
+    /// `maxItems` object keys anywhere in the schema (description strings
+    /// may mention them; only keys are checked).
+    fn assert_no_unsupported_keywords(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in map.keys() {
+                    assert!(
+                        key != "minItems" && key != "maxItems",
+                        "strict-mode-unsupported keyword '{key}' in the advertised schema"
+                    );
+                }
+                for v in map.values() {
+                    assert_no_unsupported_keywords(v);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    assert_no_unsupported_keywords(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// LOW 2 (review 2026-09-19): a batch item with old_string ==
+    /// new_string — the observed incident shape — is rejected pre-write
+    /// (the file is never touched) with the exact no-op message naming
+    /// the item.
+    #[test]
+    fn batch_no_op_item_rejected_with_clear_message() {
+        let args = batch_args(
+            "a.txt",
+            vec![
+                EditItem {
+                    old_string: "keep".into(),
+                    new_string: "KEEP".into(),
+                    count: None,
+                    fuzzy_whitespace: None,
+                },
+                EditItem {
+                    old_string: "same".into(),
+                    new_string: "same".into(),
+                    count: None,
+                    fuzzy_whitespace: None,
+                },
+            ],
+        );
+        let err = prepare_edit(&args, "keep\nsame\n").unwrap_err().to_string();
+        assert!(
+            err.contains("no-op edit: edit 2/2 has old_string == new_string"),
+            "msg: {err}"
+        );
+    }
+
+    /// LOW 5 (review 2026-09-19): a variant match whose replacement equals
+    /// the matched text reports "produced no change", not "not found".
+    #[test]
+    fn variant_match_no_change_reports_no_change_not_not_found() {
+        let args = lit_args("a.txt", "it's", "it\\'s", false);
+        let err = prepare_edit(&args, "it\\'s\n").unwrap_err().to_string();
+        assert!(err.contains("produced no change"), "msg: {err}");
+        assert!(
+            !err.contains("old_string not found in file"),
+            "the anchor WAS found (via the escaped variant): {err}"
         );
     }
 }

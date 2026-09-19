@@ -1,6 +1,7 @@
 +++
 title = "read_files files-array form — no zero-argument, recovery hint, unadvertised path absorption"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 The read_files advertised schema collapsed to the single files-array form (plan 9e0b266a, backlog 26cdbaf8, 2027-01-24, wt/mnemo): "required": ["files"], the path/start_line/max_lines shorthand params REMOVED from the advertisement, and the description carries the no-zero-argument-form note, the recovery rule ("On a 'files is required' error, rewrite the full call from the path(s) you meant — do not resend the empty shape"), and an inline example of the exact call shape. The recovery hint also rides the invalid-args error path (via the hint param) so the FIRST retry succeeds. The execute() path-shorthand absorption is KEPT as unadvertised compat — harness steering (read_files_paths in src/agent/dispatch.rs parses BOTH forms from raw args) and habit-shaped calls keep working; no dispatch.rs parser change.

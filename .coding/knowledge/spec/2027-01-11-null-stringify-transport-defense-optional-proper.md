@@ -1,6 +1,7 @@
 +++
 title = "null-stringify transport defense — optional-property drop at the dispatch seam"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 The transport stringifies JSON null for string/enum params (and auto-fills omitted optional properties with it) into the literal string "null" — the model's "no value" arrived as a value. Since plan 50f36b1e (commit 1ea2940 on wt/mnemo, 2027-01-24, backlog 9118714a) the harness defends centrally:

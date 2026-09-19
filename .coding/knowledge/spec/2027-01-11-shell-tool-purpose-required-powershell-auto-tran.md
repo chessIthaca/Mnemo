@@ -1,6 +1,7 @@
 +++
 title = "shell tool — purpose required, PowerShell && / || auto-translate"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 The shell tool (src/tool/agent/shell.rs) enforces two calling contracts since plan 358656a1 (commit d136026 on wt/mnemo, 2027-01-24, backlog 79a2755d):

@@ -6087,6 +6087,76 @@ async fn dispatch_denies_tool_outside_skill_allow_list() {
 }
 
 #[tokio::test]
+async fn dispatch_allows_skill_end_even_when_the_allow_list_omits_it() {
+    // Regression (user report 2027-01-24): the skill exits are ALWAYS
+    // available mid-skill — a skill file that forgets to list skill_end must
+    // never trap the agent. Pre-fix, the ToolFilter::Skill arm fell through
+    // to the allow-list and dispatch denied the call ("not allowed ... Skill")
+    // even though the injected skill prompt advertises skill_end as THE exit.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    {
+        let mut wf = workflow.lock().await;
+        wf.start_skill(
+            "narrow",
+            "do the skill",
+            crate::workflow::WorkflowState::Planning,
+            // The allow-list deliberately OMITS skill_end — the defect shape.
+            vec!["file_read".into()],
+        )
+        .unwrap();
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // A minimal registry carrying ONLY the exit tool: the allow-list gate
+    // (not an unknown-tool error) is what this test exercises. The shared
+    // make_dispatch_fixture registry carries no skill tools.
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(
+        crate::tool::workflow::skill::SkillEndTool::new(workflow.clone()),
+    ));
+    let registry = Arc::new(registry);
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow.clone(), sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+
+    let tc = crate::provider::ToolCall::new("c1", "skill_end", "{}");
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+    let (result, _) = agent
+        .execute_tool_call(
+            &tc,
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+
+    assert!(
+        result.success,
+        "skill_end must be allowed mid-skill even when the allow-list omits it, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("skill ended"),
+        "the exit must actually have run, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
 async fn dispatch_allows_write_tool_in_executing() {
     // Executing still permits normal write tools (approval is separate; this
     // fixture uses Autonomous so the call runs without a prompt).

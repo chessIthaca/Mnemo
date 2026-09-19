@@ -404,7 +404,7 @@ impl Workflow {
         // where the list came from: a `role: "reviewer"` spawn sets
         // tool_allowlist_reviewer → ToolFilter::Reviewer (strict allow-list,
         // nothing auto-granted); any other allow-list is ToolFilter::Skill
-        // (permissive: memory/ask/backlog auto-granted, as before).
+        // (permissive: memory/ask/backlog and the skill exits auto-granted).
         if let Some(list) = &self.tool_allowlist {
             if self.tool_allowlist_reviewer {
                 return ToolFilter::Reviewer(list.clone());

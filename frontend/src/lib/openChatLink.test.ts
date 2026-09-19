@@ -149,4 +149,16 @@ describe("BrowserView consumes the pending browser URL", () => {
     expect(browserViewSource).toContain("areaRef.current");
     expect(browserViewSource).toContain("getBoundingClientRect");
   });
+
+  it("syncs the URL box from the child webview's current URL (store.browserUrl)", () => {
+    // Backlog 3f838ea1: agent-steered CDP navigations and in-child link
+    // clicks never route through loadIntoChild — the view must subscribe to
+    // the store's browserUrl (written by the module-scope
+    // browser://url-changed listener) and mirror it into the URL box +
+    // loadedUrl, so the box shows the current URL on change AND on mount
+    // (the store tracks it even while the tab is hidden).
+    expect(browserViewSource).toContain("s.browserUrl");
+    expect(browserViewSource).toContain("setUrl(browserUrl)");
+    expect(browserViewSource).toContain("setLoadedUrl(browserUrl)");
+  });
 });

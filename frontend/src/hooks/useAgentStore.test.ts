@@ -2628,3 +2628,14 @@ describe("revealRightPanelTab + requestFileOpen", () => {
     expect(useAgentStore.getState().pendingBrowserUrl).toBeNull();
   });
 });
+
+describe("browserUrl (the child webview's current URL)", () => {
+  it("setBrowserUrl records the child webview's current URL", () => {
+    // Backlog 3f838ea1: the module-scope browser://url-changed listener
+    // writes the child's current URL here, so BrowserView's URL box can
+    // track agent-steered navigations (and catch up on mount).
+    useAgentStore.setState({ browserUrl: "" });
+    useAgentStore.getState().setBrowserUrl("https://example.com/page");
+    expect(useAgentStore.getState().browserUrl).toBe("https://example.com/page");
+  });
+});

@@ -53,9 +53,10 @@
 // (review F6, 2026-08-18).
 
 import { useEffect, useRef } from "react";
-import { onAgentEvent, onBacklogChanged, onBrowserReveal, backlogList, listAgents, uiDiag } from "../lib/tauri";
+import { onAgentEvent, onBacklogChanged, onBrowserReveal, onBrowserUrlChanged, backlogList, listAgents, uiDiag } from "../lib/tauri";
 import { useAgentStore } from "./useAgentStore";
 import { handleBrowserReveal } from "./browserReveal";
+import { handleBrowserUrlChanged } from "./browserUrl";
 import { shouldFlushSync, shouldFlushNow, MAX_FLUSH_INTERVAL_MS } from "./deltaFlush";
 import type { AgentId, AgentEventPayload } from "../lib/types";
 
@@ -150,6 +151,8 @@ let listenerStarted = false;
 let backlogListenerStarted = false;
 /** Whether the module-level browser-reveal listener has been started. */
 let browserRevealListenerStarted = false;
+/** Whether the module-level browser-url listener has been started. */
+let browserUrlListenerStarted = false;
 /** Agent ids with an in-flight name-resolution `listAgents()` call — prevents
  *  one IPC per streamed token while the first round-trip is still pending. */
 const nameResolutionInFlight = new Set<AgentId>();
@@ -303,6 +306,23 @@ function ensureBrowserRevealListenerStarted(): void {
     handleBrowserReveal();
   }).catch((e) => {
     console.error("browser-reveal listener failed to register:", e);
+  });
+}
+
+/**
+ * Start the single browser-url listener (idempotent). Routes
+ * `browser://url-changed` events (every child-webview page load) into the
+ * store via `handleBrowserUrlChanged` — the URL box tracks agent-steered
+ * navigations and in-child link clicks. Lives at module scope for the same
+ * StrictMode reason as the listeners above.
+ */
+function ensureBrowserUrlListenerStarted(): void {
+  if (browserUrlListenerStarted) return;
+  browserUrlListenerStarted = true;
+  onBrowserUrlChanged((payload) => {
+    handleBrowserUrlChanged(payload.url);
+  }).catch((e) => {
+    console.error("browser-url listener failed to register:", e);
   });
 }
 
@@ -682,6 +702,7 @@ export function useAgentEvents() {
     ensureListenerStarted();
     ensureBacklogListenerStarted();
     ensureBrowserRevealListenerStarted();
+    ensureBrowserUrlListenerStarted();
 
     // Initial backlog fetch (populates the store before the first
     // `backlog://changed` event arrives).

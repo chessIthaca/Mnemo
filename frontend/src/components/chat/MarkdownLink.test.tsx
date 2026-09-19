@@ -38,6 +38,7 @@ import { openExternal } from "../../lib/openExternal";
 import { browserWebviewSupported } from "../../lib/tauri";
 import { MarkdownLink, openMarkdownTarget } from "./MarkdownLink";
 import messageSource from "./Message.tsx?raw";
+import markdownImplSource from "./MarkdownImpl.tsx?raw";
 
 /**
  * The router awaits the (mocked) platform probe before touching the store, so
@@ -277,5 +278,16 @@ describe("Message.tsx wiring (source contract)", () => {
     // out — so no direct openExternal call may survive in this file.
     expect(messageSource).toContain("openChatLink(url");
     expect(messageSource).not.toContain("openExternal");
+  });
+});
+
+describe("MarkdownImpl default link override (source contract)", () => {
+  it("every markdown surface gets `a: MarkdownLink` by default — no raw anchors anywhere", () => {
+    // User report 2027-01-24, backlog 3f838ea1: plan goals, backlog bodies and
+    // the editor preview render <Markdown> with no components override, so
+    // their links were raw <a href> anchors whose default navigation
+    // replaced the whole app UI. The override now defaults INSIDE the single
+    // ReactMarkdown renderer (a caller's own `a` still wins — spread after).
+    expect(markdownImplSource).toContain("a: MarkdownLink, ...components");
   });
 });

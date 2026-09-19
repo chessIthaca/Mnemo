@@ -51,6 +51,7 @@ export default defineConfig({
       "src/hooks/useAgentEvents.dispatch.test.ts",
       "src/hooks/useAgentEvents.registration.test.ts",
       "src/hooks/browserReveal.test.ts",
+      "src/hooks/browserUrl.test.ts",
       "src/hooks/deltaFlush.test.ts",
       "src/hooks/agentEventReducer.memory.test.ts",
       "src/hooks/agentState.images.test.ts",

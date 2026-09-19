@@ -1,0 +1,10 @@
++++
+title = "Tool-card timing — duration + wall-clock next to the check"
+created = "2027-01-11"
++++
+
+SPEC: Tool-card timing — completed tool cards render `✓ <duration> · <wall-clock>` next to the check (user request 2027-01-24: "a time so we can see how long it took between tools"). Landed on wt/mnemo commit 4466223 (plan 850862a7, review PASS 0 findings; unmerged at write time).
+
+Mechanics: ToolInvocation (frontend/src/lib/types.ts) carries optional `startedAt`/`endedAt` (epoch ms) — stamped by reduceToolCall on the invocation in BOTH branches (merge + new entry) and by reduceToolResult on the matched call (correlated by c.id === event.tool_call_id) in frontend/src/hooks/agentEventReducer.ts. Optional so persisted legacy transcripts deserialize unchanged and render without timing. Message.tsx ToolCard header: duration = LAST call's endedAt−startedAt (the card's last-call-outcome rule), wall-clock = FIRST call's startedAt (the card's timeline anchor — consecutive cards' start times show the between-tools gaps); each segment renders only when its data exists; running cards keep the thinking dots (no live timer by design). CallDetail appends per-call timing to the `#N — label` row for grouped cards. Formatters live in frontend/src/lib/timeFormat.ts: fmtTs (moved verbatim from Conversation.tsx — time-only for today, date+time otherwise; the hover tooltip usage is unchanged) and fmtToolDuration (<1s → "412ms", <60s → one-decimal "2.3s", else "1m 12s" with a 60s carry so 1m 59.999s renders "2m 0s").
+
+Invariants to preserve: (1) the reducer stamps must not alter merge semantics (neverGroups, failed-call chain break, MAX_CALLS_PER_TOOL_CARD); (2) render gating is per-segment on data presence — never require the stamps (legacy transcripts); (3) new test files must be registered in frontend/vitest.config.ts test.include (the vitestInclude guard fails the suite otherwise). Tests: timeFormat.test.ts (boundaries), useAgentStore.test.ts (stamping, both branches, per-call distinctness), Message.preview.test.tsx (stamped/legacy/running).

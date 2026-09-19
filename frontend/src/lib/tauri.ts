@@ -33,6 +33,7 @@ import type {
 const AGENT_EVENT_CHANNEL = "agent://event";
 const BACKLOG_CHANGED_CHANNEL = "backlog://changed";
 const BROWSER_REVEAL_CHANNEL = "browser://reveal";
+const BROWSER_URL_CHANNEL = "browser://url-changed";
 
 // Commands (frontend → Rust).
 
@@ -1842,6 +1843,21 @@ export function onBrowserReveal(
   handler: (payload: BrowserRevealPayload) => void
 ): Promise<UnlistenFn> {
   return listen<BrowserRevealPayload>(BROWSER_REVEAL_CHANNEL, (event) => {
+    handler(event.payload);
+  });
+}
+
+/** Payload of `browser://url-changed` — the child webview's current URL. */
+export interface BrowserUrlPayload {
+  url: string;
+}
+
+/** Subscribe to `browser://url-changed` (emitted on every child-webview page
+ * load — agent-steered CDP navigations and in-child link clicks alike). */
+export function onBrowserUrlChanged(
+  handler: (payload: BrowserUrlPayload) => void
+): Promise<UnlistenFn> {
+  return listen<BrowserUrlPayload>(BROWSER_URL_CHANNEL, (event) => {
     handler(event.payload);
   });
 }

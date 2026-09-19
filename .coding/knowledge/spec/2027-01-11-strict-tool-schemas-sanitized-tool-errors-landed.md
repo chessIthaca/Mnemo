@@ -2,6 +2,7 @@
 title = "Strict tool schemas + sanitized tool errors — landed design (plan 21118961)"
 supersedes = "2027-01-11-strict-tool-schemas-sanitized-tool-errors-code-a"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed 2027-01-24, plan 21118961, branch wt/mnemo (commits b7a7ba8 + 49008bc), round-2 review PASS.

@@ -327,22 +327,10 @@ pub async fn browser_webview_ensure(
         let window = app
             .get_window("main")
             .ok_or_else(|| IpcError::msg("main window not found"))?;
-        // Per-instance WebView2 user data folder (webview_udf.rs): the
-        // child webview must share the instance's per-pid profile — a plain
-        // builder would re-resolve the default UDF and collide with the first
-        // instance (blank white window, 2027-01-13). A no-op for the first
-        // instance and on non-Windows platforms.
-        let builder = crate::webview_udf::apply(
-            WebviewBuilder::new(
-                CHILD_WEBVIEW_LABEL,
-                WebviewUrl::External(
-                    normalized
-                        .parse()
-                        .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
-                ),
-            ),
-            CHILD_WEBVIEW_LABEL,
-        );
+        // The shared child builder: per-instance WebView2 user data folder
+        // (webview_udf.rs) + the page-load hook emitting BROWSER_URL_CHANNEL
+        // (see [`child_webview_builder`]).
+        let builder = child_webview_builder(&normalized, &app)?;
         let webview = window
             .add_child(
                 builder,
@@ -372,6 +360,55 @@ pub async fn browser_webview_ensure(
 /// ([`browser_webview_ensure_for_agent`]) so the human sees the navigation
 /// the agent initiated instead of a hidden webview loading invisibly.
 pub const BROWSER_REVEAL_CHANNEL: &str = "browser://reveal";
+
+/// The Tauri event channel carrying the child webview's current URL —
+/// emitted on every page load (Started AND Finished) by the
+/// [`child_webview_builder`] hook, so the Browser tab's URL box tracks the
+/// current URL for agent-steered CDP navigations and in-child link clicks
+/// alike (the frontend's own `loadIntoChild` already syncs its navigations;
+/// the agent's CDP path was invisible to it — user report 2027-01-24,
+/// backlog 3f838ea1). Payload: [`browser_url_payload`] — an object with a
+/// `url` field (never a bare string: the frontend's typed listener reads
+/// `payload.url`).
+pub const BROWSER_URL_CHANNEL: &str = "browser://url-changed";
+
+/// The payload both browser channels ([`BROWSER_URL_CHANNEL`] and
+/// [`BROWSER_REVEAL_CHANNEL`]) carry — an object with a `url` field, never a
+/// bare string: the frontend's typed listeners read `payload.url` (tauri.ts
+/// `BrowserUrlPayload` / `BrowserRevealPayload`), and a bare-string emit
+/// leaves that field `undefined` at runtime (round-1 review HIGH-1, plan
+/// 47735e3c: the URL box never synced).
+fn browser_url_payload(url: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "url": url.into() })
+}
+
+/// Build the child-webview [`WebviewBuilder`] shared by both creation sites
+/// ([`browser_webview_ensure`] and [`ensure_for_agent_impl`]): the
+/// per-instance WebView2 user data folder ([`crate::webview_udf::apply`] —
+/// the child must share the instance's per-pid profile; a plain builder
+/// would re-resolve the default UDF and collide with the first instance,
+/// blank white window, 2027-01-13) plus the page-load hook that emits
+/// [`BROWSER_URL_CHANNEL`] on every navigation (Started AND Finished — the
+/// URL box shows the target immediately and the committed URL after
+/// redirects). Best-effort: an emit failure never fails the load.
+fn child_webview_builder(
+    url: &str,
+    app: &AppHandle,
+) -> Result<WebviewBuilder<tauri::Wry>, IpcError> {
+    let parsed = url
+        .parse()
+        .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?;
+    let app_for_loads = app.clone();
+    Ok(crate::webview_udf::apply(
+        WebviewBuilder::new(CHILD_WEBVIEW_LABEL, WebviewUrl::External(parsed)),
+        CHILD_WEBVIEW_LABEL,
+    )
+    .on_page_load(move |url, _event| {
+        // Best-effort: a failed emit must not fail the page load.
+        let _ =
+            app_for_loads.emit(BROWSER_URL_CHANNEL, browser_url_payload(url.to_string()));
+    }))
+}
 
 /// The shared core of [`browser_webview_ensure_for_agent`]: ensure the child
 /// webview exists (created at the last frontend-reported rect, or a default
@@ -416,22 +453,10 @@ pub(crate) async fn ensure_for_agent_impl(
         let window = app
             .get_window("main")
             .ok_or_else(|| IpcError::msg("main window not found"))?;
-        // Per-instance WebView2 user data folder (webview_udf.rs): the
-        // child webview must share the instance's per-pid profile — a plain
-        // builder would re-resolve the default UDF and collide with the first
-        // instance (blank white window, 2027-01-13). A no-op for the first
-        // instance and on non-Windows platforms.
-        let builder = crate::webview_udf::apply(
-            WebviewBuilder::new(
-                CHILD_WEBVIEW_LABEL,
-                WebviewUrl::External(
-                    normalized
-                        .parse()
-                        .map_err(|e| IpcError::msg(format!("invalid url: {e}")))?,
-                ),
-            ),
-            CHILD_WEBVIEW_LABEL,
-        );
+        // The shared child builder: per-instance WebView2 user data folder
+        // (webview_udf.rs) + the page-load hook emitting BROWSER_URL_CHANNEL
+        // (see [`child_webview_builder`]).
+        let builder = child_webview_builder(&normalized, app)?;
         // Created via add_child (visible by default — WebviewBuilder has no
         // visibility builder flag); `apply_visibility` below immediately
         // reconciles: hidden when the Browser tab is inactive (the agent must
@@ -458,7 +483,7 @@ pub(crate) async fn ensure_for_agent_impl(
         // Ask the frontend to reveal + select the Browser tab so the human
         // sees the page the agent just opened. Best-effort: a failure to
         // emit must not fail the navigation.
-        let _ = app.emit(BROWSER_REVEAL_CHANNEL, normalized.clone());
+        let _ = app.emit(BROWSER_REVEAL_CHANNEL, browser_url_payload(normalized.clone()));
     }
     // The ensure report is the newest layout fact — supersede, don't heal,
     // anything parked earlier (a fresh create also invalidates it).
@@ -1003,6 +1028,20 @@ mod tests {
         assert!(
             main_src.contains("ipc::browser_webview::browser_webview_reload"),
             "browser_webview_reload must be registered in main.rs invoke_handler"
+        );
+    }
+
+    /// Both browser channels (`browser://url-changed`, `browser://reveal`)
+    /// must carry an OBJECT with a `url` field — the frontend's typed
+    /// listeners read `payload.url`, and a bare-string emit leaves that
+    /// `undefined` at runtime (round-1 review HIGH-1, plan 47735e3c: the
+    /// URL box never synced). Pins the payload shape at the constructing
+    /// helper both emits share.
+    #[test]
+    fn browser_url_payload_is_url_keyed() {
+        assert_eq!(
+            browser_url_payload("https://example.com/page").to_string(),
+            r#"{"url":"https://example.com/page"}"#
         );
     }
 }

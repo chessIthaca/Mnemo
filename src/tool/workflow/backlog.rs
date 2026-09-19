@@ -325,8 +325,10 @@ impl Tool for BacklogStatusTool {
              (the item stays pending and visible; only Run-All selection skips \
              it). Pass deferred alone, without status, to park/un-park a \
              queued item without a status change — e.g. a run-all session \
-             deferring an item it cannot resolve instead of failing it. At \
-             least one of status or deferred is required.",
+              deferring an item it cannot resolve instead of failing it. \
+              note alone (no status, no deferred) amends the item's note \
+              without touching anything else. At least one of status, \
+              deferred, or note is required.",
             json!({
                 "type": "object",
                 "properties": {
@@ -335,12 +337,12 @@ impl Tool for BacklogStatusTool {
                         "description": "The backlog item id (a UUID string from backlog_add's output or the Backlog tab)."
                     },
                     "status": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "enum": ["pending", "in_flight", "done", "failed", "cant_resolve"],
                         "description": "The destination status. Required unless the call only toggles `deferred`."
                     },
                     "note": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Optional note (e.g. why the item failed)."
                     },
                     "deferred": {
@@ -362,10 +364,10 @@ impl Tool for BacklogStatusTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
-        if args.status.is_none() && args.deferred.is_none() {
+        if args.status.is_none() && args.deferred.is_none() && args.note.is_none() {
             return ToolResult::error(
-                "either 'status' (a status transition) or 'deferred' (set/clear the \
-                 skip-Run-All flag) is required",
+                "either 'status' (a status transition), 'deferred' (set/clear the \
+                 skip-Run-All flag), or 'note' (amend the item's note) is required",
             );
         }
         let mut store = self.store.lock().await;
@@ -381,7 +383,7 @@ impl Tool for BacklogStatusTool {
         // status+deferred call must not leave the flag set when the
         // transition is refused.
         if let Some(status) = args.status {
-            if !store.transition(&args.id, status, args.note) {
+            if !store.transition(&args.id, status, args.note.clone()) {
                 let allowed = current
                     .status
                     .allowed_destinations()
@@ -405,6 +407,18 @@ impl Tool for BacklogStatusTool {
         if let Some(deferred) = args.deferred {
             store.set_deferred(&args.id, deferred);
         }
+        // Note-only (backlog 9118714a): a status-less call with a note
+        // amends the note. The transport used to stringify a null status
+        // into "null" (enum rejection), forcing a done→pending→done
+        // requeue dance just to attach a note; with the dispatch seam
+        // dropping the artifact, the note-only call is the natural shape.
+        // A deferred+note call lands the note here too (previously the
+        // note was silently dropped on that path).
+        if args.status.is_none() {
+            if let Some(note) = args.note.clone() {
+                store.set_note(&args.id, Some(note));
+            }
+        }
         drop(store);
         if let Some(f) = &self.on_changed {
             f();
@@ -416,6 +430,9 @@ impl Tool for BacklogStatusTool {
         }
         if let Some(deferred) = args.deferred {
             msg.push_str(&format!(" deferred (skip Run-All) = {deferred}"));
+        }
+        if args.status.is_none() && args.note.is_some() {
+            msg.push_str(" note amended");
         }
         let mut data = json!({"id": args.id});
         if let Some(status) = args.status {
@@ -1220,10 +1237,75 @@ mod tests {
         assert!(
             result
                 .output
-                .contains("either 'status' (a status transition) or 'deferred'"),
+                .contains("either 'status' (a status transition), 'deferred'"),
             "output: {}",
             result.output
         );
+        assert!(
+            result.output.contains("'note' (amend the item's note)"),
+            "the error names the note-only shape (review LOW-1): {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn status_tool_stringified_null_status_updates_note_only() {
+        // Backlog 9118714a: the transport stringifies JSON null for string/
+        // enum params into the literal string "null" — a note-only update
+        // arrived as status:"null" and was rejected by the enum guard,
+        // forcing the done→pending→done requeue dance. The dispatch seam
+        // drops the artifact from OPTIONAL properties; composed here with
+        // the tool exactly as the seam composes them, the note-only update
+        // succeeds and the status is untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, path, id) = status_tool_with_item(&dir).await;
+
+        let mut args = json!({"id": id, "status": "null", "note": "amended"});
+        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+        let result = tool.execute(args).await;
+        assert!(result.success, "note-only update: {}", result.output);
+        assert!(
+            result.output.contains("note amended"),
+            "output: {}",
+            result.output
+        );
+
+        let reopened = BacklogStore::open(path);
+        assert_eq!(
+            reopened.items()[0].status,
+            crate::backlog::BacklogStatus::Pending,
+            "the dropped status leaves the item untouched"
+        );
+        assert!(
+            reopened.items()[0]
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("amended")),
+            "the note persisted"
+        );
+    }
+
+    #[test]
+    fn status_tool_optional_string_params_advertise_nullable() {
+        // Backlog 9118714a: optional string/enum params advertise
+        // ["string", "null"] so explicit JSON null is legal end-to-end —
+        // the spawn_agent.model precedent mirrored onto this tool.
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BacklogStatusTool::new(
+            Arc::new(tokio::sync::Mutex::new(BacklogStore::open(
+                dir.path().join("backlog.jsonl"),
+            ))),
+            None,
+        );
+        let params = tool.schema().parameters;
+        for field in ["status", "note"] {
+            let ty = &params["properties"][field]["type"];
+            assert!(
+                ty.as_array().is_some_and(|t| t.contains(&json!("string"))
+                    && t.contains(&json!("null"))),
+                "{field} must advertise [\"string\", \"null\"], got: {ty}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -183,6 +183,110 @@ where
     Ok(opt.unwrap_or_default())
 }
 
+/// Drop the literal string `"null"` from OPTIONAL properties of a tool
+/// call's arguments (backlog 9118714a).
+///
+/// Some transports stringify an explicit JSON `null` for a string- or
+/// enum-typed parameter into the literal string `"null"` — the model's "no
+/// value" arrives as a value, breaking enum validation, tripping
+/// mutual-exclusion checks, and silently corrupting data (a plan `title`
+/// literally set to "null"; `git checkout null`). Integer/array/boolean
+/// parameters pass `null` through cleanly; the stringification is specific
+/// to string/enum fields. The same artifact appears when an omitted
+/// optional property is auto-filled with `null` and then stringified.
+///
+/// The defense is keyed on OPTIONALITY, not on advertised nullability: a
+/// property absent from the schema's `required` list gets its `"null"`
+/// string dropped — absence is the canonical unset, and `Option<T>` fields
+/// and `#[serde(default, deserialize_with = "null_to_default")]` fields map
+/// absence and `null` to the same "not provided". A REQUIRED property keeps
+/// the string: the model must supply a real value there, and `"null"` is a
+/// genuine error the repeat-failure circuit breaker can correct. No tool
+/// parameter legitimately wants the literal string `"null"` — the
+/// `spawn_agent` model fix (backlog 3e6f7887) established the same
+/// precedent: no configured model is ever named "null". One accepted
+/// exception (review LOW-2): `file_edit` anchors — file content can
+/// legitimately be exactly `null` (e.g. a JS→C++ port). The dropped
+/// anchor surfaces as the tool's empty-old_string error, which names the
+/// batch-mode and use_regex workarounds — a self-correcting trap, not
+/// silent corruption. The mirror case (round-2 LOW-1): a genuine
+/// `new_string` of exactly `"null"` is dropped too, and an empty
+/// `new_string` deletes the anchor — a wrong write with no error signal,
+/// visible only in the returned diff; use batch mode (per-item
+/// `new_string` is required, never dropped) or include surrounding
+/// context in the replacement.
+///
+/// JSON `null` is deliberately NOT touched: every optional field in the
+/// tool surface deserializes it natively (`Option<T>`) or via
+/// [`null_to_default`]; only the stringified form needs repair.
+///
+/// The walk mirrors `normalize_in_place` (`src/provider/strict.rs`): it
+/// recurses into `anyOf`/`oneOf`/`allOf` branches, `items` (single schema
+/// or draft-04 tuple), and nested `properties`, so batch items
+/// (`file_edit.edits[]`) and step objects (`create_plan.steps[]`) get the
+/// same treatment. Properties the schema does not know are left alone.
+pub(crate) fn drop_stringified_nulls(schema: &Value, args: &mut Value) {
+    sanitize_stringified_nulls(schema, args);
+}
+
+/// The recursive worker behind [`drop_stringified_nulls`].
+fn sanitize_stringified_nulls(schema: &Value, args: &mut Value) {
+    // Union branches: recurse into each — a drop only fires when SOME branch
+    // declares the property optional, and a property optional in one branch
+    // is unset-able for the value as a whole.
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(branches)) = schema.get(key) {
+            for branch in branches {
+                sanitize_stringified_nulls(branch, args);
+            }
+        }
+    }
+    // Array items: a single schema, or (draft-04 style) a tuple of them.
+    if let Some(items) = schema.get("items") {
+        match items {
+            Value::Array(schemas) => {
+                if let Value::Array(arr) = args {
+                    for (s, a) in schemas.iter().zip(arr.iter_mut()) {
+                        sanitize_stringified_nulls(s, a);
+                    }
+                }
+            }
+            single => {
+                if let Value::Array(arr) = args {
+                    for a in arr.iter_mut() {
+                        sanitize_stringified_nulls(single, a);
+                    }
+                }
+            }
+        }
+    }
+    let Some(Value::Object(props)) = schema.get("properties") else {
+        return;
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let Some(args_obj) = args.as_object_mut() else {
+        return;
+    };
+    let mut drops: Vec<String> = Vec::new();
+    for (name, value) in args_obj.iter_mut() {
+        let Some(prop_schema) = props.get(name) else {
+            continue;
+        };
+        if !required.contains(name.as_str()) && value.as_str() == Some("null") {
+            drops.push(name.clone());
+        } else {
+            sanitize_stringified_nulls(prop_schema, value);
+        }
+    }
+    for name in drops {
+        args_obj.remove(&name);
+    }
+}
+
 /// The trait every tool implements.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -1194,6 +1298,135 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stringified_null_dropped_from_optional_properties() {
+        // Backlog 9118714a: the transport stringifies JSON null for string/
+        // enum params into the literal string "null". For an OPTIONAL
+        // property that string means "unset" — drop it, so the tool's
+        // Option<T> deserializes to None exactly as an omitted key would.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "label": {"type": "string"},
+                "note": {"type": ["string", "null"]}
+            },
+            "required": ["path"]
+        });
+        let mut args = serde_json::json!({
+            "path": "src/main.rs",
+            "label": "null",
+            "note": "null"
+        });
+        drop_stringified_nulls(&schema, &mut args);
+        assert_eq!(args["path"], serde_json::json!("src/main.rs"));
+        assert!(args.get("label").is_none(), "optional \"null\" dropped");
+        assert!(args.get("note").is_none(), "nullable-advertised \"null\" dropped");
+        // Real values, JSON null, and absent keys are untouched — only the
+        // exact string "null" on an optional property is the artifact.
+        let mut args = serde_json::json!({
+            "path": "src/main.rs",
+            "label": "real value",
+            "note": serde_json::Value::Null
+        });
+        drop_stringified_nulls(&schema, &mut args);
+        assert_eq!(args["label"], serde_json::json!("real value"));
+        assert!(args["note"].is_null(), "JSON null left for serde");
+    }
+
+    #[test]
+    fn stringified_null_kept_for_required_properties() {
+        // A REQUIRED property carrying "null" is a genuine error (the model
+        // must supply a real value) — the defense must not mask it; the
+        // repeat-failure circuit breaker corrects the retry.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        });
+        let mut args = serde_json::json!({"command": "null"});
+        drop_stringified_nulls(&schema, &mut args);
+        assert_eq!(args["command"], serde_json::json!("null"));
+    }
+
+    #[test]
+    fn stringified_null_dropped_in_nested_array_items() {
+        // file_edit's `edits` shape: an array of objects whose own optional
+        // properties (count, fuzzy_whitespace) get the same treatment.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "count": {"type": "integer"}
+                        },
+                        "required": ["old_string"]
+                    }
+                }
+            },
+            "required": ["edits"]
+        });
+        let mut args = serde_json::json!({
+            "edits": [
+                {"old_string": "a", "count": "null"},
+                {"old_string": "b"}
+            ]
+        });
+        drop_stringified_nulls(&schema, &mut args);
+        assert!(args["edits"][0].get("count").is_none(), "nested optional dropped");
+        assert_eq!(args["edits"][0]["old_string"], serde_json::json!("a"));
+        assert_eq!(args["edits"][1]["old_string"], serde_json::json!("b"));
+    }
+
+    #[test]
+    fn stringified_null_dropped_through_union_branches() {
+        // create_plan's `steps` shape: oneOf [string, {header, body}] — the
+        // object branch's optional `body` is unset-able via "null" too.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
+                        ]
+                    }
+                }
+            },
+            "required": ["steps"]
+        });
+        let mut args = serde_json::json!({
+            "steps": [
+                {"header": "h", "body": "null"},
+                "plain string step"
+            ]
+        });
+        drop_stringified_nulls(&schema, &mut args);
+        assert!(args["steps"][0].get("body").is_none(), "union-branch optional dropped");
+        assert_eq!(args["steps"][0]["header"], serde_json::json!("h"));
+        assert_eq!(args["steps"][1], serde_json::json!("plain string step"));
+    }
+
+    #[test]
+    fn stringified_null_unknown_properties_untouched() {
+        // A property the schema does not know is the tool's business (serde
+        // ignores unknown fields) — the defense does not invent knowledge.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let mut args = serde_json::json!({"path": "x", "mystery": "null"});
+        drop_stringified_nulls(&schema, &mut args);
+        assert_eq!(args["mystery"], serde_json::json!("null"));
+    }
 
     // A pair of test tools to exercise the registry + filter.
     struct ReadTool;

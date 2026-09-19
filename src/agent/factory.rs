@@ -1598,7 +1598,7 @@ mod tests {
         };
 
         // Default config (enabled) → the repeated line is deduped.
-        let result = shell.execute(json!({"command": cmd})).await;
+        let result = shell.execute(json!({"command": cmd, "purpose": "filter dedup"})).await;
         assert!(result.success);
         assert_eq!(
             result.output.matches("same").count(),
@@ -1614,7 +1614,7 @@ mod tests {
             enabled: false,
             overrides: vec![],
         });
-        let result = shell.execute(json!({"command": cmd})).await;
+        let result = shell.execute(json!({"command": cmd, "purpose": "filter passthrough"})).await;
         assert!(result.success);
         assert_eq!(
             result.output.matches("same").count(),
@@ -1821,7 +1821,19 @@ mod tests {
             // gains additionalProperties/required keys; measures Executing
             // at 31_471 chars. Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::Executing, 32_100),
+            // 32_100 → 32_300 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — the null-stringify defense round: optional
+            // string/enum params widen to ["string","null"] across the
+            // victim tools (~+100) and file_edit's new_string description
+            // gains the literal-'null' trap note (~+150); measures
+            // Executing at 32_118 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            // 32_300 → 32_500 (2027-01-24): backlog 37f8631a (plan
+            // 5f6e593d) — update_plan's schema description and append
+            // param description gain the Reviewing append-window wording
+            // (~+194); measures Executing at 32_312 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 32_500),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1844,7 +1856,18 @@ mod tests {
             // raise above (PlanFrozen = Executing ∪ finish, and finish is
             // a STRICT_TOOLS member); measures PlanFrozen at 32_757
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 33_400),
+            // 33_400 → 33_600 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — same cause as the Executing raise above
+            // (nullable victim schemas + file_edit's new_string trap
+            // note); measures PlanFrozen at 33_404 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            // 33_600 → 33_800 (2027-01-24): backlog 37f8631a (plan
+            // 5f6e593d) — same cause as the Executing raise above
+            // (update_plan's append-window wording, ~+194; PlanFrozen =
+            // Executing ∪ finish); measures PlanFrozen at 33_598 chars —
+            // 2 under the old ceiling, raised for real headroom.
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 33_800),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1879,7 +1902,13 @@ mod tests {
             // 2027-01-15 pass and cause as Planning above (it carries
             // memory_update + memory_amend too). Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 25_950),
+            // 25_950 → 26_800 (2027-01-24): the shell tool's description
+            // gains the calling-trap notes (backlog 79a2755d — the
+            // empty-argument trap and the PowerShell 5.1 && / ||
+            // auto-translate advisory, ~+350); measures ExecutingResearch
+            // at 26_243 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::ExecutingResearch, 26_800),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -1921,7 +1950,17 @@ mod tests {
             // members (file_edit, update_plan, memory_update/amend);
             // measures Reviewing at 26_735 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Reviewing, 27_300),
+            // 27_300 → 27_500 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — same cause as the Executing raise above
+            // (nullable victim schemas + file_edit's new_string trap
+            // note); measures Reviewing at 27_382 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            // 27_500 → 27_800 (2027-01-24): backlog 37f8631a (plan
+            // 5f6e593d) — same cause as the Executing raise above
+            // (update_plan's append-window wording rides Reviewing,
+            // ~+194); measures Reviewing at 27_576 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 27_800),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

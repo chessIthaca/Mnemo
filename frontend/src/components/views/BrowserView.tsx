@@ -169,6 +169,22 @@ export function BrowserView() {
     useAgentStore.getState().clearPendingBrowserUrl();
   }, [pendingBrowserUrl, supported, loadIntoChild]);
 
+  // Sync the URL box from the child webview's CURRENT URL (store.browserUrl,
+  // written by the module-scope `browser://url-changed` listener from the
+  // child's page-load events — see hooks/browserUrl.ts). Covers
+  // agent-steered CDP navigations and in-child link clicks, which never
+  // route through loadIntoChild; the effect's initial run also catches up
+  // on mount (the agent may have navigated while this tab was hidden — the
+  // store tracked it the whole time). loadIntoChild's own echo stays: the
+  // store round-trip is idempotent for the same URL.
+  const browserUrl = useAgentStore((s) => s.browserUrl);
+  useEffect(() => {
+    if (!browserUrl) return;
+    setUrl(browserUrl);
+    setLoadedUrl(browserUrl);
+    setError(null);
+  }, [browserUrl]);
+
   /** Halt the child webview's in-flight page load (no-op when nothing loads). */
   async function stopLoad() {
     try {

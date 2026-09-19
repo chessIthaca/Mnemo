@@ -663,9 +663,13 @@ impl Workflow {
     /// `Reviewing`); the on-disk plan file is rewritten in place (same id).
     ///
     /// **BugFixing skeleton lock:** for `kind = BugFixing` plans the 4-step
-    /// skeleton is locked — `steps` replacement AND `steps` append are refused
-    /// (the reproduce → root-cause → fix → verify order is the bug protocol);
-    /// title/goal/context/regression_test/landed_design updates are allowed.
+    /// skeleton is locked — `steps` replacement is refused in every state, and
+    /// `steps` append is refused except in `Reviewing` (backlog 37f8631a: the
+    /// follow-on window — a review-surfaced fix becomes a checkable appended
+    /// step; it stays unchecked through the review, and a crash mid-follow-on
+    /// resumes with it as the active step);
+    /// title/goal/context/regression_test/landed_design updates are always
+    /// allowed.
     pub fn update_plan(
         &mut self,
         title: Option<&str>,
@@ -682,7 +686,8 @@ impl Workflow {
         // fixing review findings, re-running tests — and may legitimately need
         // to adjust title/goal/context or append steps for follow-on fix work
         // (backlog 24e1c98e: update_plan callable in Reviewing, main agent
-        // only). Two invariants hold: complete_step stays hidden in Reviewing
+        // only; bug plans included — the Reviewing append window, backlog
+        // 37f8631a). Two invariants hold: complete_step stays hidden in Reviewing
         // (steps can't be checked off mid-review; finish still gates the exit
         // on the review report), and the reviewer subagent never sees the tool
         // at all (ToolFilter::Reviewer strict allow-list never names
@@ -703,14 +708,29 @@ impl Workflow {
             .stack
             .last_mut()
             .ok_or_else(|| crate::error::Error::WorkflowNoPlan)?;
-        // The BugFixing skeleton lock: steps replacement AND steps append are
-        // refused for bug plans — the locked skeleton is the bug protocol,
-        // and growing it would let the reproduce/verify discipline slip.
-        if frame.plan.kind == PlanKind::BugFixing && steps.is_some() {
+        // The BugFixing skeleton lock: steps replacement is refused for bug
+        // plans in every state, and steps append is refused while Executing —
+        // the locked skeleton is the bug protocol, and growing it mid-flight
+        // would let the reproduce/verify discipline slip. The ONE window
+        // (backlog 37f8631a): in Reviewing, append=true is allowed — a
+        // follow-on fix surfaced by the review (the fix-findings scope) becomes
+        // a checkable step instead of a bare context amendment, so a crash
+        // mid-follow-on resumes with the step as the active item (the reload
+        // derives Executing from the unchecked step; completing it returns to
+        // Reviewing). Appended steps stay unchecked through the review
+        // (complete_step is hidden mid-review); finish does not gate on them.
+        if frame.plan.kind == PlanKind::BugFixing
+            && steps.is_some()
+            && !(self.state == WorkflowState::Reviewing && append)
+        {
             return Err(crate::error::Error::InvalidInput(
                 "bug_fixing plans have a locked 4-step skeleton — steps cannot be \
-                 replaced or appended; title/goal/context/regression_test/landed_design \
-                 updates are allowed"
+                 replaced, and appends are allowed only in the Reviewing state \
+                 (follow-on fix work in the closing sequence; mid-Executing, record \
+                 follow-on detail as a context amendment via update_plan append=true \
+                 with context, or push a sub-plan via create_plan). \
+                 title/goal/context/regression_test/landed_design updates are always \
+                 allowed"
                     .into(),
             ));
         }
@@ -2719,8 +2739,9 @@ mod tests {
 
     #[test]
     fn update_plan_append_refused_for_bug_fixing_skeleton() {
-        // The skeleton lock is total: append must not grow the locked 4-step
-        // bug protocol either.
+        // The skeleton lock refuses append while Executing — the Reviewing
+        // append window (backlog 37f8631a) is the one exception — and the
+        // refusal names the sanctioned alternatives.
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path().join("plans"));
         wf.create_plan_with_kind(
@@ -2735,7 +2756,13 @@ mod tests {
         let err = wf
             .update_plan(None, None, None, Some(vec!["extra".into()]), true, None, None)
             .unwrap_err();
-        assert!(err.to_string().contains("locked 4-step skeleton"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("locked 4-step skeleton"), "{msg}");
+        // The refusal names the sanctioned alternatives (backlog 37f8631a):
+        // the Reviewing append window and the mid-Executing context
+        // amendment / sub-plan paths.
+        assert!(msg.contains("Reviewing"), "{msg}");
+        assert!(msg.contains("context amendment"), "{msg}");
         assert_eq!(wf.plan().unwrap().steps.len(), 1);
         // Context-only append still works on a bug plan (title/goal/context
         // updates remain allowed).
@@ -2843,8 +2870,9 @@ mod tests {
         // in Reviewing for implementation plans (the closing sequence may
         // surface extra fix work). The steps stay unchecked — complete_step
         // is hidden mid-review; finish still gates the exit on the review
-        // report. The BugFixing skeleton lock keeps refusing steps for bug
-        // plans in Reviewing too (kind-based lock, orthogonal to state).
+        // report. Backlog 37f8631a (2027-01-24): bug plans get the same
+        // append window in Reviewing (the follow-on window); only steps
+        // REPLACEMENT stays refused for them (the skeleton lock).
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path().join("plans"));
         wf.create_plan("P", "G", "C", vec!["a".into()]).unwrap();
@@ -2861,7 +2889,8 @@ mod tests {
         )
         .expect("steps append must be allowed in Reviewing for implementation plans");
         assert_eq!(wf.plan().unwrap().steps.len(), 2);
-        // The skeleton lock still holds for bug plans in Reviewing.
+        // The follow-on window (backlog 37f8631a): append in Reviewing now
+        // succeeds for bug plans too; only replacement stays refused.
         let mut bug = Workflow::new(dir.path().join("plans-bug"));
         bug.create_plan_with_kind(
             "Fix crash",
@@ -2874,10 +2903,129 @@ mod tests {
         .unwrap();
         bug.complete_step(0).unwrap();
         assert_eq!(bug.state(), WorkflowState::Reviewing);
+        bug.update_plan(None, None, None, Some(vec!["extra".into()]), true, None, None)
+            .expect("append must be allowed in Reviewing for bug plans (the follow-on window)");
+        let bug_plan = bug.plan().unwrap();
+        assert_eq!(bug_plan.steps.len(), 2);
+        assert!(bug_plan.steps[0].done);
+        assert!(!bug_plan.steps[1].done);
         let err = bug
-            .update_plan(None, None, None, Some(vec!["extra".into()]), true, None, None)
+            .update_plan(None, None, None, Some(vec!["replacement".into()]), false, None, None)
             .unwrap_err();
         assert!(err.to_string().contains("locked 4-step skeleton"), "{err}");
+    }
+
+    #[test]
+    fn update_plan_appends_follow_on_steps_in_reviewing_for_bug_fixing() {
+        // Backlog 37f8631a (2027-01-24): the skeleton lock's follow-on
+        // window — in Reviewing, append=true succeeds for bug plans (a
+        // review-surfaced fix becomes a checkable step instead of a bare
+        // context amendment). The skeleton steps stay verbatim and done;
+        // appended steps stay unchecked (complete_step is hidden
+        // mid-review); a second append stacks; replacement is refused
+        // with the sanctioned alternatives named.
+        let dir = tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan_with_kind(
+            "Fix crash",
+            "G",
+            "C",
+            vec!["a".into()],
+            PlanKind::BugFixing,
+            Some("crash"),
+        )
+        .unwrap();
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), WorkflowState::Reviewing);
+        wf.update_plan(
+            None,
+            None,
+            None,
+            Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
+            true,
+            None,
+            None,
+        )
+        .expect("append must be allowed in Reviewing for bug plans");
+        let plan = wf.plan().unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].text, "a");
+        assert!(plan.steps[0].done);
+        assert_eq!(plan.steps[1].text, "fix the reviewer finding in src/widget.rs");
+        assert!(!plan.steps[1].done);
+        // The appended step does not reopen Executing in-session.
+        assert_eq!(wf.state(), WorkflowState::Reviewing);
+        // A second append stacks after the first.
+        wf.update_plan(
+            None,
+            None,
+            None,
+            Some(vec!["re-run cargo test".into()]),
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(wf.plan().unwrap().steps.len(), 3);
+        // Replacement is refused with the sanctioned alternatives named.
+        let err = wf
+            .update_plan(None, None, None, Some(vec!["replacement".into()]), false, None, None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("locked 4-step skeleton"), "{msg}");
+        assert!(msg.contains("Reviewing"), "{msg}");
+        assert!(msg.contains("context amendment"), "{msg}");
+    }
+
+    #[test]
+    fn appended_follow_on_step_survives_restart() {
+        // Backlog 37f8631a (2027-01-24): the crash-resumption property of
+        // the Reviewing append window — a plan with unchecked appended
+        // steps reloads as Executing (load_latest derives state from
+        // is_complete), so the appended step becomes the ACTIVE step a
+        // resumed session sees; completing it returns the plan to
+        // Reviewing (the self-healing loop — the review is never
+        // skipped, finish still gates the exit).
+        let dir = tempdir().unwrap();
+        {
+            let mut wf = Workflow::new(dir.path().join("plans"));
+            wf.create_plan_with_kind(
+                "Fix crash",
+                "G",
+                "C",
+                vec!["a".into()],
+                PlanKind::BugFixing,
+                Some("crash"),
+            )
+            .unwrap();
+            wf.complete_step(0).unwrap();
+            assert_eq!(wf.state(), WorkflowState::Reviewing);
+            wf.update_plan(
+                None,
+                None,
+                None,
+                Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // "Crash": a fresh workflow reloads the plan from disk.
+        let mut resumed = Workflow::new(dir.path().join("plans"));
+        resumed.load_latest().unwrap();
+        assert_eq!(resumed.state(), WorkflowState::Executing);
+        let plan = resumed.plan().unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.steps[0].done);
+        assert!(!plan.steps[1].done);
+        assert_eq!(plan.steps[1].text, "fix the reviewer finding in src/widget.rs");
+        // Completing the follow-on step returns the plan to Reviewing, and
+        // finish still gates the exit.
+        resumed.complete_step(1).unwrap();
+        assert_eq!(resumed.state(), WorkflowState::Reviewing);
+        resumed.finish().unwrap();
+        assert_eq!(resumed.state(), WorkflowState::Complete);
     }
 
     #[test]

@@ -202,13 +202,9 @@ impl AgentLoop {
             }
         };
 
-        let parsed_call = ParsedToolCall {
-            id: tc.id.clone(),
-            name: tc.name.clone(),
-            arguments: args,
-        };
-
-        // Check if the tool exists + needs approval.
+        // Check if the tool exists + needs approval. (Looked up BEFORE the
+        // parsed call is built so the null-stringify defense below can key
+        // on the tool's advertised schema.)
         let tool = match self.tools.get(&tc.name) {
             Some(t) => t,
             None => {
@@ -221,6 +217,22 @@ impl AgentLoop {
                     Vec::new(),
                 );
             }
+        };
+
+        // Backlog 9118714a: the transport stringifies JSON null for string/
+        // enum params into the literal string "null" (and auto-fills omitted
+        // optional properties with it). Drop the artifact from OPTIONAL
+        // properties here — the single seam every model-generated call
+        // flows through — so approval, safety rules, previews, and the
+        // tool's own deserialization all see clean args. The raw
+        // tc.arguments string is untouched (the UI keeps fidelity).
+        let mut args = args;
+        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+
+        let parsed_call = ParsedToolCall {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: args,
         };
 
         // Re-enforce the workflow ToolFilter at dispatch time. Schema filtering
@@ -1308,8 +1320,8 @@ pub(crate) fn file_edit_redirect(
     Some(ToolResult::error(format!(
         "EDIT INTERCEPTED: your last {fired} file_edit attempts failed because the \
          old_string did not match — the file has drifted from your last read. Do not \
-         retry blind. First re-read the file (read_files path=\"{path}\"), then retry the \
-         edit with the exact current text."
+         retry blind. First re-read the file with read_files (this exact path: {path}), \
+         then retry the edit with the exact current text."
     )))
 }
 
@@ -1400,8 +1412,15 @@ fn reviewer_spawn_gate(
     }
     // Gate 2 (backlog c8e48f81): an explicit model is ad-hoc unless the
     // failed-reviewer retry is sanctioned. Whitespace-only counts as absent
-    // (matching the tool's own model-arg semantics).
-    let has_model = model.map(|m| !m.trim().is_empty()).unwrap_or(false);
+    // (matching the tool's own model-arg semantics), and so does the
+    // literal string "null": a transport that stringifies JSON null for
+    // non-nullable string properties manufactures exactly that artifact
+    // (live incident 2027-01-24, backlog 3e6f7887: eight identical
+    // reviewer-spawn refusals looped the main agent in Reviewing), and no
+    // configured model is ever named "null" — it is never a real pick.
+    let has_model = model
+        .map(|m| !m.trim().is_empty() && m.trim() != "null")
+        .unwrap_or(false);
     if has_model && !retry_sanctioned {
         return (
             Some(ToolResult::error(

@@ -161,17 +161,21 @@ impl Tool for ReadFilesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "read_files",
-            "Read files — one or many. Pass `files` (up to 10 specs) to read a batch in \
-             one call instead of N round-trips, or just a top-level `path` for a single \
-             file. Each file comes back under a header with line numbers; start_line + \
-             max_lines read only the relevant slice. A directory path returns a sorted \
-             listing. Per-file errors are reported inline, never fatal.",
+            "Read files — one or many, in one call instead of N round-trips. Always \
+             pass `files` (an array of up to 10 {path, start_line?, max_lines?} specs) \
+             — e.g. {\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}. \
+             There is no zero-argument form: a read_files call with no files is always \
+             an error. On a 'files is required' error, rewrite the full call from the \
+             path(s) you meant — do not resend the empty shape. Each file comes back \
+             under a header with line numbers; start_line + max_lines read only the \
+             relevant slice. A directory path returns a sorted listing. Per-file errors \
+             are reported inline, never fatal.",
             json!({
                 "type": "object",
                 "properties": {
                     "files": {
                         "type": "array",
-                        "description": "Read specs (max 10). Omit when using the single-file `path` shorthand.",
+                        "description": "Read specs (max 10): {path, start_line?, max_lines?} per file.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -181,11 +185,9 @@ impl Tool for ReadFilesTool {
                             },
                             "required": ["path"]
                         }
-                    },
-                    "path": {"type": "string", "description": "Single-path shorthand: read a file or list a directory (use instead of `files`)."},
-                    "start_line": {"type": "integer", "description": "With `path`: 1-indexed start line."},
-                    "max_lines": {"type": "integer", "description": "With `path`: max lines to read."}
-                }
+                    }
+                },
+                "required": ["files"]
             }),
         )
     }
@@ -201,6 +203,12 @@ impl Tool for ReadFilesTool {
         // rather than erroring on it is why that tool no longer needs to
         // exist, and it means the shape a model most naturally reaches for
         // simply works instead of costing a failed call plus a retry.
+        // (Backlog 26cdbaf8: the shorthand is now UNADVERTISED — the schema
+        // steers the model to the files-array form only, the dual optional
+        // forms being the ambiguity behind the empty-argument failures —
+        // but the absorption stays: harness steering (read_files_paths
+        // parses both forms from raw args) and habit-shaped calls keep
+        // working.)
         let args = match args.get("path").and_then(|p| p.as_str()) {
             Some(path) if args.get("files").is_none() => {
                 let mut spec = serde_json::Map::new();
@@ -216,7 +224,20 @@ impl Tool for ReadFilesTool {
         };
         let args: ReadFilesArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(invalid_args_error("read_files", &e, &args, "")),
+            Err(e) => {
+                // Backlog 26cdbaf8: the recovery rule rides the error itself —
+                // the model reads this at retry time (the description note
+                // only helps before the first failure, and the circuit
+                // breaker only fires after two identical failures).
+                return ToolResult::error(invalid_args_error(
+                    "read_files",
+                    &e,
+                    &args,
+                    "Always pass files (an array of {path, start_line?, max_lines?} \
+                     specs) — there is no zero-argument form; rewrite the full call, \
+                     do not resend the empty shape.",
+                ));
+            }
         };
         if args.files.is_empty() {
             return ToolResult::error("files array is empty — provide at least one file spec");
@@ -481,6 +502,73 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, src).unwrap();
+    }
+
+    #[test]
+    fn schema_collapses_to_the_files_form() {
+        // Backlog 26cdbaf8: the dual input forms (files array + path
+        // shorthand, neither required) were the ambiguity behind the
+        // empty-argument failures — the advertised schema now offers ONE
+        // form, required, with the recovery rule and example in the
+        // description. The path shorthand stays as unadvertised compat
+        // absorption in execute().
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        let props = &schema.parameters["properties"];
+        assert!(
+            props.get("path").is_none()
+                && props.get("start_line").is_none()
+                && props.get("max_lines").is_none(),
+            "the shorthand params are no longer advertised: {props}"
+        );
+        assert_eq!(schema.parameters["required"], json!(["files"]));
+        assert!(
+            schema.description.contains("Always pass `files`"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("no zero-argument form"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("rewrite the full call"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("\"files\":[{\"path\":\"a.js\""),
+            "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_call_error_carries_the_recovery_hint() {
+        // Backlog 26cdbaf8: the empty-argument call (the observed failure —
+        // a well-formed call followed by a drained one) errors with the
+        // recovery rule riding the error itself, so the FIRST retry
+        // succeeds instead of waiting for the circuit breaker.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("files"),
+            "the error names the missing parameter: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("rewrite the full call"),
+            "the recovery hint rides the error: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not resend the empty shape"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]

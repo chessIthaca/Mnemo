@@ -267,6 +267,15 @@ interface AppState extends AppStateLike {
    * `null` when there is no pending open.
    */
   pendingBrowserUrl: string | null;
+  /**
+   * The child webview's CURRENT URL, written by the module-scope
+   * `browser://url-changed` listener (useAgentEvents) from the child's
+   * page-load events — agent-steered CDP navigations and in-child link
+   * clicks alike. BrowserView's URL box syncs from it (on change AND on
+   * mount — the store tracks the URL even while the Browser tab is
+   * hidden, so there is no mount-timing gap). `""` when no URL is known.
+   */
+  browserUrl: string;
   safetyMode: SafetyMode;
   fontFamily: string;
   fontSize: number;
@@ -492,6 +501,9 @@ interface AppState extends AppStateLike {
   requestBrowserOpen: (url: string) => void;
   /** Clear the pending browser URL (called by BrowserView once loaded). */
   clearPendingBrowserUrl: () => void;
+  /** Record the child webview's current URL (called by the module-scope
+   * `browser://url-changed` listener — see `browserUrl`). */
+  setBrowserUrl: (url: string) => void;
   /** True if a right-panel tool tab is currently enabled (not in disabledTabs). */
   isTabEnabled: (tab: RightPanelTab) => boolean;
   setSafetyMode: (m: SafetyMode) => void;
@@ -680,6 +692,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
   disabledTabs: ALL_RIGHT_PANEL_TABS.filter((t) => t !== "plan"),
   pendingFileOpen: null,
   pendingBrowserUrl: null,
+  browserUrl: "",
   safetyMode: "approve-each-action",
   fontFamily: readLs(LS_FONT_FAMILY, DEFAULT_FONT_FAMILY),
   fontSize: readLsNumber(LS_FONT_SIZE, DEFAULT_FONT_SIZE),
@@ -917,6 +930,7 @@ export const useAgentStore = create<AppState>((set, get) => ({
       pendingBrowserUrl: url,
     })),
   clearPendingBrowserUrl: () => set({ pendingBrowserUrl: null }),
+  setBrowserUrl: (url) => set({ browserUrl: url }),
   autoRevealPlan: () =>
     set((s) => {
       // Only auto-reveal when the panel is currently hidden AND the Plan tab

@@ -72,12 +72,34 @@ fn agent_chat_builder_uses_per_instance_data_dir() {
 
 /// Both child-webview creation sites (human ensure + agent ensure) must run
 /// their builders through the same helper — otherwise a second instance that
-/// opens the Browser tab gets a webview on the shared default UDF.
+/// opens the Browser tab gets a webview on the shared default UDF. Since the
+/// 2027-01-24 consolidation (backlog 3f838ea1) both sites share ONE choke
+/// point: the `child_webview_builder` helper (which also attaches the
+/// page-load hook emitting `browser://url-changed`), so the UDF wrap lives
+/// inside it exactly once and each site must call the helper.
 #[test]
 fn child_webview_builders_use_per_instance_data_dir() {
     let bw = read_app("src/ipc/browser_webview.rs");
-    let first = bw.find("webview_udf::apply(");
-    let second = first.and_then(|i| bw[i + 1..].find("webview_udf::apply(").map(|j| i + 1 + j));
+    // The UDF wrap lives inside the shared helper — exactly once.
+    let (Some(apply), Some(helper)) = (
+        bw.find("webview_udf::apply("),
+        bw.find("fn child_webview_builder("),
+    ) else {
+        panic!(
+            "browser_webview.rs must wrap the child WebviewBuilder with \
+             webview_udf::apply(...) inside the shared child_webview_builder \
+             helper — the plain builder leaves WebView2 on the shared default \
+             UDF, which is the blank-white second instance (2027-01-13)"
+        );
+    };
+    assert!(
+        apply > helper,
+        "the webview_udf::apply wrap must live inside the child_webview_builder helper"
+    );
+    // BOTH creation sites must route through the helper.
+    let first = bw.find("child_webview_builder(&normalized");
+    let second = first
+        .and_then(|i| bw[i + 1..].find("child_webview_builder(&normalized").map(|j| i + 1 + j));
     let (Some(first), Some(second)) = (first, second) else {
         let found = match (first, second) {
             (None, _) => 0,
@@ -85,15 +107,15 @@ fn child_webview_builders_use_per_instance_data_dir() {
             _ => 2,
         };
         panic!(
-            "browser_webview.rs must wrap BOTH child WebviewBuilders \
-             (browser_webview_ensure + ensure_for_agent_impl) with \
-             webview_udf::apply(...) — two occurrences; found {found} \
-             occurrence(s)"
+            "browser_webview.rs must route BOTH child-webview creation sites \
+             (browser_webview_ensure + ensure_for_agent_impl) through the \
+             shared child_webview_builder helper — two call sites; found \
+             {found} occurrence(s)"
         );
     };
     assert!(
         first < second,
-        "both child builder sites must be wrapped (apply calls in order)"
+        "both creation sites must call the helper (calls in order)"
     );
 }
 

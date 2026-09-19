@@ -403,10 +403,12 @@ fn child_webview_builder(
         WebviewBuilder::new(CHILD_WEBVIEW_LABEL, WebviewUrl::External(parsed)),
         CHILD_WEBVIEW_LABEL,
     )
-    .on_page_load(move |url, _event| {
+    .on_page_load(move |_webview, payload| {
         // Best-effort: a failed emit must not fail the page load.
-        let _ =
-            app_for_loads.emit(BROWSER_URL_CHANNEL, browser_url_payload(url.to_string()));
+        let _ = app_for_loads.emit(
+            BROWSER_URL_CHANNEL,
+            browser_url_payload(payload.url().to_string()),
+        );
     }))
 }
 

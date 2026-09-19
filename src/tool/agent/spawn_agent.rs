@@ -13,6 +13,10 @@
 //! best-effort seeded with a passive RECALLED CONTEXT rider — prior knowledge
 //! matched to the task — so the spawned agent starts with relevant memory in
 //! its first prompt (see [`crate::tool::steering::recalled_context_block`]).
+//! Reviewer spawns are exempt (backlog 1d0332ca): the reviewer protocol
+//! hands the spawned reviewer a self-contained task, and the rider would
+//! pollute it with parent-project memories — their task passes through
+//! byte-identical.
 //!
 //! Goes through approval — spawning an agent consumes model tokens and starts
 //! a concurrent actor, so it should be a deliberate, user-visible action.
@@ -102,7 +106,9 @@ pub struct SpawnAgentTool {
     /// The memory store, when one is wired. Seeds the spawned agent's task
     /// (its FIRST PROMPT) with the passive RECALLED CONTEXT rider — matched
     /// prior knowledge, `recall_peek` only. `None` in tests / store-less
-    /// setups: the rider stays silent.
+    /// setups: the rider stays silent. Reviewer spawns skip the rider
+    /// (backlog 1d0332ca): their task must stay clean — byte-identical to
+    /// the `task` argument.
     memory: Option<Arc<dyn MemoryStoreTrait>>,
 }
 
@@ -136,9 +142,10 @@ impl SpawnAgentTool {
 
     /// Wire in the memory store so the spawned agent's task is seeded with
     /// the passive RECALLED CONTEXT rider (best-effort: no store, no hits,
-    /// or any store error leaves the task unchanged). Returns `self` for
-    /// chaining — the factory calls this right after construction (when a
-    /// store is wired).
+    /// or any store error leaves the task unchanged; reviewer spawns skip
+    /// the rider — backlog 1d0332ca — their task stays byte-identical).
+    /// Returns `self` for chaining — the factory calls this right after
+    /// construction (when a store is wired).
     pub fn with_memory(mut self, memory: Arc<dyn MemoryStoreTrait>) -> Self {
         self.memory = Some(memory);
         self
@@ -313,16 +320,31 @@ impl Tool for SpawnAgentTool {
         // check above) so a rejected spawn never pays for a store round-trip
         // — the child's memory_search-before-work rule is then structurally
         // enforced the same way create_plan's rider does for plans.
-        let task = match crate::tool::steering::recalled_context_block(
-            self.memory.as_ref(),
-            None,
-            &args.task,
-            None,
-        )
-        .await
-        {
-            Some(rider) => format!("{}{rider}", args.task),
-            None => args.task,
+        // Reviewer spawns are EXEMPT (backlog 1d0332ca, user report
+        // 2026-09-19): the reviewer protocol hands the spawned reviewer a
+        // self-contained task, and the rider would pollute it with
+        // parent-project memories — noise at best, review bias at worst
+        // (the reviewer must judge the diff/plan, not be steered by
+        // recalled context), plus prompt bloat on every review. The skip
+        // is role-based ONLY, not an exposed spawn option: the reviewer
+        // protocol is the one consumer that needs a clean prompt, and an
+        // opt-out knob would grow the schema for no current consumer;
+        // unrestricted sub-agents keep the rider (its original purpose:
+        // seed a worker's task with prior knowledge).
+        let task = if role.as_deref() == Some("reviewer") {
+            args.task
+        } else {
+            match crate::tool::steering::recalled_context_block(
+                self.memory.as_ref(),
+                None,
+                &args.task,
+                None,
+            )
+            .await
+            {
+                Some(rider) => format!("{}{rider}", args.task),
+                None => args.task,
+            }
         };
 
         // Prefer the parent-aware spawn when the concrete spawner supports it
@@ -1157,6 +1179,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows[0].access_count, 0, "rider is passive (no access bump)");
+    }
+
+    #[tokio::test]
+    async fn reviewer_task_skips_the_recalled_context_rider() {
+        // Backlog 1d0332ca (user report 2026-09-19): reviewer prompts must
+        // be CLEAN — the reviewer protocol hands the spawned reviewer a
+        // self-contained task, and the rider would pollute it with
+        // parent-project memories (noise at best, review bias at worst:
+        // the reviewer must judge the diff/plan, not be steered by recalled
+        // context) plus prompt bloat on every review. With matching hits
+        // in the store, a role:"reviewer" spawn's task reaches the spawner
+        // BYTE-IDENTICAL to the task argument, while a normal spawn on
+        // the same store still carries the rider.
+        let embedder: Arc<dyn crate::memory::Embedder> =
+            Arc::new(crate::memory::embedder::HashEmbedder::new());
+        let store = Arc::new(crate::memory::MemoryStore::open_in_memory(embedder).unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        store
+            .write(crate::memory::Memory::new(
+                crate::memory::MemoryTier::Semantic,
+                "SPEC: the kettle safety valve opens above 2 bar",
+                "The kettle safety valve opens above 2 bar; boiler plate documents the spec.",
+                now,
+            ))
+            .await
+            .unwrap();
+        let spawner = Arc::new(MockSpawner::ok(3));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_memory(store.clone());
+        // The reviewer spawn: the task must pass through byte-identical.
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "work on the kettle safety valve",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        // A normal spawn on the same store: the rider still rides.
+        let result = tool
+            .execute(json!({
+                "name": "researcher",
+                "task": "work on the kettle safety valve"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let calls = spawner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].1, "work on the kettle safety valve",
+            "reviewer task must be byte-identical (no rider): {:?}",
+            calls[0].1
+        );
+        assert_eq!(calls[0].2.as_deref(), Some("reviewer"));
+        assert!(
+            calls[1].1.contains("RECALLED CONTEXT"),
+            "normal spawns keep the rider: {:?}",
+            calls[1].1
+        );
+        assert!(
+            calls[1].1.contains("SPEC: the kettle safety valve"),
+            "the matched hit rides the normal spawn's task: {:?}",
+            calls[1].1
+        );
     }
 
     #[tokio::test]

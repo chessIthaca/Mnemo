@@ -20,6 +20,16 @@
 //! pointing at the cheaper dedicated tools — `search` for file-content
 //! search, graph_* for symbol wiring. Advisory only; the command itself is
 //! never modified and the raw `data` fields stay nudge-free.
+//!
+//! CHAIN TRANSLATION (backlog 79a2755d): PowerShell 5.1 has no
+//! pipeline-chain operators — bash-style `a && b` fails with "not a valid
+//! statement separator". Top-level `&&` / `||` are auto-translated to
+//! `if ($?)` gates before the child spawns (the ORIGINAL command is what
+//! approval and classification saw; the translated string is only what
+//! runs), and the result carries a note so the model can prefer `;` or
+//! separate calls next time. `purpose` is required at deserialization — the
+//! schema always advertised it, and a call without it is rejected with a
+//! clear error.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -81,6 +91,15 @@ const GREP_NUDGE: &str = "TIP: for file-content search use the `search` tool (sa
 /// nothing. Counted as the fired-only `shell-redirect` steering marker.
 const REDIRECT_NOTE: &str = "TIP: output redirection detected — failure details may be \
      hidden; the tool caps output itself — run the command unredirected.\n";
+
+/// Backlog 79a2755d: the note prepended to a result whose command was
+/// auto-translated — PowerShell 5.1 rejects bash-style && / || chaining, and
+/// the model is told so it can prefer ; or separate calls next time. Like the
+/// grep nudge it shapes only the displayed `output`; the raw stdout/stderr in
+/// `data` stay note-free.
+const CHAIN_TRANSLATION_NOTE: &str = "NOTE: the command's && / || chaining was \
+     auto-translated to PowerShell 5.1 if ($?) gates (PowerShell 5.1 rejects \
+     bash-style chaining) — prefer ; or separate calls.\n";
 
 /// Whether the command redirects stdout/stderr to a null sink — `>$null`,
 /// `>/dev/null`, or `>nul` (PowerShell / POSIX / cmd forms; `2>$null`,
@@ -162,6 +181,106 @@ fn is_grep_family(command: &str) -> bool {
     })
 }
 
+/// Rewrite bash-style `&&` / `||` chaining into PowerShell 5.1-compatible
+/// `if ($?)` gates (backlog 79a2755d). PowerShell 5.1 has no pipeline-chain
+/// operators — `a && b` fails with "The token '&&' is not a valid statement
+/// separator" — so the most common Windows trip-up is absorbed mechanically.
+///
+/// Only TOP-LEVEL operators are translated: the scan tracks single/double
+/// quote state, so `echo "a && b"` is left alone. Single `&` / `|` (the call
+/// operator, pipelines, `2>&1`) and `;` separators are valid PowerShell and
+/// never touched. Backslash/backtick-escaped quotes are NOT modelled (the
+/// scanner has no escape state): a backslash-escaped quote flips the quote
+/// state, but the only consequence is a MISSED translation of a command that
+/// was already invalid PowerShell 5.1 — the original then runs and errors
+/// visibly, which is the same outcome as before this fix.
+///
+/// A degenerate chain (a leading/trailing operator, or an empty segment
+/// between two) returns `None`: the input is invalid PowerShell either way,
+/// and leaving it untranslated surfaces the original parser error instead of
+/// a partially rewritten command.
+///
+/// The rewrite preserves short-circuit semantics: each gate checks `$?` of
+/// the last executed statement, which is exactly how left-to-right `&&` /
+/// `||` evaluation behaves — `a && b || c` becomes
+/// `a; if ($?) { b }; if (-not $?) { c }` (b runs iff a succeeded; c runs
+/// iff the statement before it failed). Returns `None` when there is no
+/// top-level `&&` / `||` to translate.
+fn translate_powershell_chaining(command: &str) -> Option<String> {
+    // Top-level operator positions: (byte index, is_and).
+    let mut splits: Vec<(usize, bool)> = Vec::new();
+    let bytes = command.as_bytes();
+    let (mut in_single, mut in_double) = (false, false);
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'&' if !in_single && !in_double => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    splits.push((i, true));
+                    i += 1; // consume the second '&'
+                }
+            }
+            b'|' if !in_single && !in_double => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                    splits.push((i, false));
+                    i += 1; // consume the second '|'
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if splits.is_empty() {
+        return None;
+    }
+    // L2: a degenerate chain (leading/trailing operator or an empty segment)
+    // is invalid PowerShell either way — leave it untranslated so the
+    // original parser error surfaces instead of a partially rewritten
+    // command with empty gates.
+    let mut prev_end = 0;
+    for &(pos, _) in &splits {
+        if command[prev_end..pos].trim().is_empty() {
+            return None;
+        }
+        prev_end = pos + 2;
+    }
+    if command[prev_end..].trim().is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(command.len() + splits.len() * 24);
+    // The first segment runs unconditionally; every later segment is gated
+    // by the operator BEFORE it, and the trailing segment by the last one.
+    let mut prev_end = 0;
+    let mut prev_is_and = true;
+    for (idx, &(pos, is_and)) in splits.iter().enumerate() {
+        let segment = command[prev_end..pos].trim();
+        if idx == 0 {
+            out.push_str(segment);
+        } else {
+            out.push_str(if prev_is_and {
+                "; if ($?) { "
+            } else {
+                "; if (-not $?) { "
+            });
+            out.push_str(segment);
+            out.push_str(" }");
+        }
+        prev_end = pos + 2;
+        prev_is_and = is_and;
+    }
+    let tail = command[prev_end..].trim();
+    out.push_str(if prev_is_and {
+        "; if ($?) { "
+    } else {
+        "; if (-not $?) { "
+    });
+    out.push_str(tail);
+    out.push_str(" }");
+    Some(out)
+}
+
 /// Arguments for `shell`.
 #[derive(Debug, Deserialize)]
 struct ShellArgs {
@@ -174,12 +293,17 @@ struct ShellArgs {
     /// show it in the tool card header — `shell (running tests)` instead of
     /// just `shell`.
     ///
+    /// REQUIRED (backlog 79a2755d): the schema always listed it in
+    /// `required`, but `Option<String>` + `#[serde(default)]` let calls
+    /// through without it — it was the first field dropped when a call went
+    /// malformed, so the deserialization now enforces what the schema
+    /// advertises.
+    ///
     /// Consumed by the frontend from the raw tool-call args
     /// (`frontend/src/components/chat/Message.tsx` `argLabel`), so it's never
     /// read in Rust — it's kept here so serde parses/validates it.
-    #[serde(default)]
     #[expect(dead_code, reason = "consumed by the frontend from raw tool-call args")]
-    purpose: Option<String>,
+    purpose: String,
 }
 
 /// The `shell` tool.
@@ -268,8 +392,13 @@ impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "shell",
-            "Execute a shell command — PowerShell on Windows, sh on Unix. Requires \
-             approval. A result is 'successful' when the command RAN: check the exit code \
+            "Execute a shell command — PowerShell 5.1 on Windows, sh on Unix. Requires \
+             approval. command is required on every call — there is no zero-argument \
+             form; an empty shell call is always an error (if you just made a shell \
+             call, the next one needs its own command). On Windows chain with ; not \
+             && / || — PowerShell 5.1 rejects bash-style chaining; it is auto-translated \
+             to if ($?) gates with a note in the result, but prefer ; or separate \
+             calls. A result is 'successful' when the command RAN: check the exit code \
              to see whether it failed. Output streams live into the tool card while the \
              command runs; the RESULT is capped (~100 KiB) with a truncation note, and \
              well-known commands (cargo build/test, npm test/build, git status) are \
@@ -281,7 +410,7 @@ impl Tool for ShellTool {
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute."},
                     "cwd": {"type": "string", "description": "Working directory relative to project root (optional)."},
-                    "purpose": {"type": "string", "description": "Short label of what the command does (e.g. 'running tests'). Always provide this."}
+                    "purpose": {"type": "string", "description": "Short label of what the command does (e.g. 'running tests'). Required on every call."}
                 },
                 "required": ["command", "purpose"]
             }),
@@ -335,9 +464,22 @@ impl Tool for ShellTool {
             ("sh", "-c")
         };
 
+        // Backlog 79a2755d: PowerShell 5.1 rejects bash-style && / || —
+        // auto-translate top-level chains to if ($?) gates. The ORIGINAL
+        // command is what approval and classification saw; the translated
+        // string is only what runs.
+        let (command, translated) = if cfg!(target_os = "windows") {
+            match translate_powershell_chaining(&args.command) {
+                Some(translated) => (translated, true),
+                None => (args.command.clone(), false),
+            }
+        } else {
+            (args.command.clone(), false)
+        };
+
         let mut cmd = Command::new(program);
         cmd.arg(flag)
-            .arg(&args.command)
+            .arg(&command)
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -467,6 +609,11 @@ impl Tool for ShellTool {
                 // separate leading lines.
                 if has_blinding_redirection(&args.command) {
                     combined.insert_str(0, REDIRECT_NOTE);
+                }
+                // Backlog 79a2755d: the && / || auto-translate note — rides
+                // even a failing command, like the nudges above.
+                if translated {
+                    combined.insert_str(0, CHAIN_TRANSLATION_NOTE);
                 }
                 // Cap the displayed output to prevent unbounded context (M3).
                 // Preserve full raw data for the LLM's structured `data` field.
@@ -735,6 +882,81 @@ mod tests {
         assert!(!is_grep_family("echo rg grep findstr"));
     }
 
+    #[test]
+    fn powershell_chain_translation_rewrites_both_operators() {
+        // Backlog 79a2755d: PowerShell 5.1 rejects bash-style && / || — the
+        // rewrite gates each segment on $? of the last executed statement,
+        // which is exactly left-to-right short-circuit semantics.
+        assert_eq!(
+            translate_powershell_chaining("a && b"),
+            Some("a; if ($?) { b }".to_string())
+        );
+        assert_eq!(
+            translate_powershell_chaining("a || b"),
+            Some("a; if (-not $?) { b }".to_string())
+        );
+        assert_eq!(
+            translate_powershell_chaining("a && b && c"),
+            Some("a; if ($?) { b }; if ($?) { c }".to_string())
+        );
+        assert_eq!(
+            translate_powershell_chaining("a && b || c"),
+            Some("a; if ($?) { b }; if (-not $?) { c }".to_string())
+        );
+    }
+
+    #[test]
+    fn powershell_chain_translation_leaves_valid_commands_alone() {
+        // Quoted operators, single & / |, 2>&1, and ; separators are all
+        // valid PowerShell — no translation, no note.
+        assert_eq!(translate_powershell_chaining("echo \"a && b\""), None);
+        assert_eq!(translate_powershell_chaining("echo 'a || b'"), None);
+        assert_eq!(translate_powershell_chaining("a | b"), None);
+        assert_eq!(translate_powershell_chaining("a & b"), None);
+        assert_eq!(translate_powershell_chaining("cargo test 2>&1"), None);
+        assert_eq!(translate_powershell_chaining("a; b"), None);
+        assert_eq!(translate_powershell_chaining("echo hi"), None);
+        // L2 (review round 1): degenerate chains stay untranslated so the
+        // original PowerShell error surfaces instead of empty gates.
+        assert_eq!(translate_powershell_chaining("&& b"), None);
+        assert_eq!(translate_powershell_chaining("a &&"), None);
+        assert_eq!(translate_powershell_chaining("a && && b"), None);
+        assert_eq!(translate_powershell_chaining("a ||"), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_chain_translation_runs_and_notes() {
+        // Backlog 79a2755d: `a && b` would be rejected by PowerShell 5.1 —
+        // the auto-translate runs both commands and the result carries the
+        // note; a clean command carries no note.
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let r = tool
+            .execute(json!({
+                "command": "Write-Output one && Write-Output two",
+                "purpose": "chain translation smoke test"
+            }))
+            .await;
+        assert!(r.success, "command executed: {}", r.output);
+        assert!(r.output.contains("one"), "{}", r.output);
+        assert!(r.output.contains("two"), "{}", r.output);
+        assert!(
+            r.output.contains("auto-translated to PowerShell 5.1"),
+            "{}",
+            r.output
+        );
+        let r = tool
+            .execute(json!({"command": "Write-Output three", "purpose": "chain control"}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            !r.output.contains("auto-translated"),
+            "no note without chaining: {}",
+            r.output
+        );
+    }
+
     #[tokio::test]
     async fn grep_family_results_carry_the_nudge() {
         let dir = tempdir().unwrap();
@@ -818,7 +1040,7 @@ mod tests {
         } else {
             "echo hello"
         };
-        let result = tool.execute(json!({"command": cmd})).await;
+        let result = tool.execute(json!({"command": cmd, "purpose": "simple command"})).await;
         assert!(result.success, "output: {}", result.output);
         assert!(result.output.contains("hello"));
     }
@@ -832,7 +1054,7 @@ mod tests {
         } else {
             "exit 42"
         };
-        let result = tool.execute(json!({"command": cmd})).await;
+        let result = tool.execute(json!({"command": cmd, "purpose": "exit code capture"})).await;
         // Shell always reports success when the command ran — the exit code
         // is data for the LLM, not a tool failure.
         assert!(result.success, "shell should report success when it ran");
@@ -849,7 +1071,7 @@ mod tests {
         } else {
             "echo oops 1>&2"
         };
-        let result = tool.execute(json!({"command": cmd})).await;
+        let result = tool.execute(json!({"command": cmd, "purpose": "stderr capture"})).await;
         // The stderr text should appear somewhere in the output.
         assert!(result.output.to_lowercase().contains("oops"));
     }
@@ -871,8 +1093,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_purpose_field() {
-        // The shell tool accepts an optional `purpose` field. It's not used
-        // during execution (it's for the UI), but it must parse without error.
+        // `purpose` is required (backlog 79a2755d). It's not used during
+        // execution (it's for the UI), but it must parse without error.
         let dir = tempdir().unwrap();
         let tool = tool_in(dir.path());
         let cmd = if cfg!(target_os = "windows") {
@@ -887,6 +1109,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_purpose_is_rejected() {
+        // Backlog 79a2755d: `purpose` is required at deserialization — the
+        // schema always listed it in `required`, but `Option<String>` +
+        // `#[serde(default)]` let calls through without it, so it was the
+        // first field dropped when a call went malformed. The error now
+        // names the missing parameter.
+        let dir = tempdir().unwrap();
+        let tool = tool_in(dir.path());
+        let result = tool.execute(json!({"command": "echo hi"})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("parameter 'purpose' is required"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn schema_description_names_the_calling_traps() {
+        // Backlog 79a2755d: the description must warn about the two observed
+        // failure classes — the empty-argument trap and PowerShell chaining.
+        let tool = tool_in(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("no zero-argument form"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("chain with ; not && / ||"),
+            "{}",
+            schema.description
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_cwd_path_traversal() {
         let dir = tempdir().unwrap();
         let tool = tool_in(dir.path());
@@ -895,7 +1153,7 @@ mod tests {
         } else {
             "echo hi"
         };
-        let result = tool.execute(json!({"command": cmd, "cwd": ".."})).await;
+        let result = tool.execute(json!({"command": cmd, "cwd": "..", "purpose": "traversal probe"})).await;
         assert!(!result.success, "traversal cwd must be rejected");
         assert!(
             result.output.contains("cwd validation failed"),
@@ -918,7 +1176,7 @@ mod tests {
         } else {
             "/tmp"
         };
-        let result = tool.execute(json!({"command": cmd, "cwd": outside})).await;
+        let result = tool.execute(json!({"command": cmd, "cwd": outside, "purpose": "outside probe"})).await;
         assert!(!result.success, "outside absolute cwd must be rejected");
         assert!(
             result.output.contains("cwd validation failed"),

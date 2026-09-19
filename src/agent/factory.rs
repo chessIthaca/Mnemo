@@ -1598,7 +1598,7 @@ mod tests {
         };
 
         // Default config (enabled) → the repeated line is deduped.
-        let result = shell.execute(json!({"command": cmd})).await;
+        let result = shell.execute(json!({"command": cmd, "purpose": "filter dedup"})).await;
         assert!(result.success);
         assert_eq!(
             result.output.matches("same").count(),
@@ -1614,7 +1614,7 @@ mod tests {
             enabled: false,
             overrides: vec![],
         });
-        let result = shell.execute(json!({"command": cmd})).await;
+        let result = shell.execute(json!({"command": cmd, "purpose": "filter passthrough"})).await;
         assert!(result.success);
         assert_eq!(
             result.output.matches("same").count(),
@@ -1879,7 +1879,13 @@ mod tests {
             // 2027-01-15 pass and cause as Planning above (it carries
             // memory_update + memory_amend too). Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 25_950),
+            // 25_950 → 26_800 (2027-01-24): the shell tool's description
+            // gains the calling-trap notes (backlog 79a2755d — the
+            // empty-argument trap and the PowerShell 5.1 && / ||
+            // auto-translate advisory, ~+350); measures ExecutingResearch
+            // at 26_243 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::ExecutingResearch, 26_800),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate

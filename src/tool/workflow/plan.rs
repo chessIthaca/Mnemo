@@ -532,7 +532,7 @@ impl Tool for CreatePlanTool {
                 "properties": {
                     "title": {"type": "string", "description": "A short title for the plan. MUST be non-blank (whitespace-only is rejected) — write the full title/goal/steps content in your reply FIRST, then emit the call carrying it; the call body is never where content gets drafted."},
                     "goal": {"type": "string", "description": "What we're building. MUST be non-blank (whitespace-only is rejected)."},
-                    "context": {"type": "string", "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands."},
+                    "context": {"type": ["string", "null"], "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands."},
                     "steps": {
                         "type": "array",
                         "items": {
@@ -544,20 +544,20 @@ impl Tool for CreatePlanTool {
                         "description": "Ordered steps. Each is a plain string ('**bold header** — body') or an object {header, body}, normalized to that same form; an object's header is PLAIN text (** markers are stripped, leaving exactly one bold layer). The header is the one-liner shown in the executing toolbar. The body is a self-contained recipe a less-powerful model executes alone: explicit file paths (not 'the relevant file'), explicit actions (not 'handle the case'), and any context it needs — never assume it remembers an earlier step. Keep it to a few lines. Example: '**Add ask_user tool** — create src/tool/workflow/ask_user.rs with schema {question, options:[{label,description?}]}, SafetyLevel::AutoRun, category Workflow. Register it in factory.rs register_workflow_tools.' For kind=bug_fixing the locked skeleton is the checklist; provided steps persist as CHECKABLE '## Detailed steps' sub-items (tick each via complete_step detailed_step_index as it ships — the crash-resumption detail). Resumability gate: every step names file path(s) or a no-code marker."
                     },
                     "kind": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "enum": ["implementation", "research", "bug_fixing"],
                         "description": "Decides what happens when the ROOT plan's last step completes. 'implementation' (default) enters Reviewing — a code review before Complete. 'research' skips review, straight to Complete — only for work producing no source-code changes (its own .coding/ artifacts stay writable with the file tools; source writes are dispatch-denied, and a completed implementation/bug_fixing sub-plan forces this root's review). 'bug_fixing' is for CONTAINED bug fixes — never 'implementation' for a contained defect: locked reproduce→root-cause→fix→verify skeleton, requires `bug`, auto-captures a BUG: memory at finish; context must name the regression-test design; provided steps persist as checkable '## Detailed steps' sub-items (the crash-resumption detail). A bug-triggered FEATURE (the fix adds capabilities, new dependencies, or spans multiple modules) belongs in kind=implementation with the bug documented as motivation in goal/context."
                     },
                     "bug": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "The bug symptom — REQUIRED when kind=bug_fixing (errors without it). Ignored for other kinds."
                     },
                     "branch": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Optional git working branch — pass this ONLY when the user explicitly requests a specific branch name. With NO `branch` arg, create_plan auto-forks/reuses a single per-directory wt/* working branch (forked from main when on main, reused when already on one) so work never lands on main; the agent never passes `branch` automatically. An existing branch is reused (resume flow); only a new name forks from `base`. Skipped with a note when the tree has changes outside .coding/ or the workflow is mid-executing."
                     },
                     "base": {
-                        "type": "string",
+                        "type": ["string", "null"],
                         "description": "Optional branch to fork `branch` from. Default 'main'."
                     }
                 },
@@ -940,10 +940,10 @@ impl Tool for UpdatePlanTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "New title (omit or empty to keep current)."},
-                    "goal": {"type": "string", "description": "New goal (omit or empty to keep current)."},
-                    "context": {"type": "string", "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars)."},
-                    "regression_test": {"type": "string", "description": "The regression test name recorded by a bug_fixing plan's verify step (finish is blocked without it; validated against the code graph)."},
+                    "title": {"type": ["string", "null"], "description": "New title (omit or empty to keep current)."},
+                    "goal": {"type": ["string", "null"], "description": "New goal (omit or empty to keep current)."},
+                    "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars)."},
+                    "regression_test": {"type": ["string", "null"], "description": "The regression test name recorded by a bug_fixing plan's verify step (finish is blocked without it; validated against the code graph)."},
                     "landed_design": {"type": "boolean", "description": "Set true when a bug_fixing fix turned out feature-scale (new pub types / cross-module surface) — the finish gate then requires a 'Landed design' context amendment (agent.md 'Documentation expectations')."},
                     "steps": {
                         "type": "array",
@@ -3743,6 +3743,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_plan_stringified_null_branch_skips_branch_prep() {
+        // Backlog 9118714a: the transport stringifies JSON null (and
+        // auto-fills omitted optional properties with it) — create_plan
+        // ran "git checkout null" and failed. The dispatch seam drops the
+        // artifact from OPTIONAL properties; composed here with the tool
+        // exactly as the seam composes them, the dropped branch means the
+        // default auto-fork/reuse flow and no checkout of "null" happens.
+        let (_dir, wf, git) = mock_git_project();
+        let tool = CreatePlanTool::new(wf.clone()).with_git(git.clone());
+        let mut args = json!({
+            "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"],
+            "branch": "null"
+        });
+        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+        let result = tool.execute(args).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            !result.output.contains("git checkout null"),
+            "no checkout of the stringified artifact: {}",
+            result.output
+        );
+        // The mock starts on feat/prev (not main): the default flow reuses
+        // the current branch — no checkout ran at all.
+        assert_eq!(git.current_branch(), "feat/prev");
+        assert_eq!(wf.lock().await.state(), WorkflowState::Executing);
+    }
+
+    #[tokio::test]
     async fn create_plan_with_branch_skips_when_source_is_dirty() {
         let (dir, wf, git) = mock_git_project();
         let root = dir.path().to_path_buf();
@@ -4733,6 +4761,59 @@ mod tests {
         let plan = w.plan().unwrap();
         assert_eq!(plan.title, "New");
         assert_eq!(plan.goal, "New goal");
+    }
+
+    #[tokio::test]
+    async fn update_plan_stringified_null_fields_leave_them_unchanged() {
+        // Backlog 9118714a: the transport stringifies JSON null for string
+        // params into the literal string "null" — update_plan(title:"null",
+        // goal:"null") REPLACED the plan's title and goal with the string
+        // "null" (data corruption, repaired manually). The dispatch seam
+        // drops the artifact from OPTIONAL properties; composed here with
+        // the tool exactly as the seam composes them, a dropped field means
+        // "leave unchanged" while a real field still applies.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        create
+            .execute(json!({"title": "Old", "goal": "Old goal", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]}))
+            .await;
+        let update = UpdatePlanTool::new(wf.clone());
+        let mut args = json!({"title": "null", "goal": "New goal"});
+        crate::tool::drop_stringified_nulls(&update.schema().parameters, &mut args);
+        let result = update.execute(args).await;
+        assert!(result.success, "output: {}", result.output);
+        let w = wf.lock().await;
+        let plan = w.plan().unwrap();
+        assert_eq!(plan.title, "Old", "the dropped title means unchanged");
+        assert_eq!(plan.goal, "New goal", "the real goal still applies");
+    }
+
+    #[test]
+    fn plan_tools_optional_string_params_advertise_nullable() {
+        // Backlog 9118714a: optional string/enum params advertise
+        // ["string", "null"] so explicit JSON null is legal end-to-end —
+        // the spawn_agent.model precedent mirrored onto the plan tools.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        for field in ["bug", "branch", "base", "context", "kind"] {
+            let ty = &create.schema().parameters["properties"][field]["type"];
+            assert!(
+                ty.as_array()
+                    .is_some_and(|t| t.contains(&json!("string")) && t.contains(&json!("null"))),
+                "create_plan.{field} must advertise [\"string\", \"null\"], got: {ty}"
+            );
+        }
+        let update = UpdatePlanTool::new(wf);
+        for field in ["title", "goal", "context", "regression_test"] {
+            let ty = &update.schema().parameters["properties"][field]["type"];
+            assert!(
+                ty.as_array()
+                    .is_some_and(|t| t.contains(&json!("string")) && t.contains(&json!("null"))),
+                "update_plan.{field} must advertise [\"string\", \"null\"], got: {ty}"
+            );
+        }
     }
 
     #[tokio::test]

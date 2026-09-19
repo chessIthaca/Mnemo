@@ -202,13 +202,9 @@ impl AgentLoop {
             }
         };
 
-        let parsed_call = ParsedToolCall {
-            id: tc.id.clone(),
-            name: tc.name.clone(),
-            arguments: args,
-        };
-
-        // Check if the tool exists + needs approval.
+        // Check if the tool exists + needs approval. (Looked up BEFORE the
+        // parsed call is built so the null-stringify defense below can key
+        // on the tool's advertised schema.)
         let tool = match self.tools.get(&tc.name) {
             Some(t) => t,
             None => {
@@ -221,6 +217,22 @@ impl AgentLoop {
                     Vec::new(),
                 );
             }
+        };
+
+        // Backlog 9118714a: the transport stringifies JSON null for string/
+        // enum params into the literal string "null" (and auto-fills omitted
+        // optional properties with it). Drop the artifact from OPTIONAL
+        // properties here — the single seam every model-generated call
+        // flows through — so approval, safety rules, previews, and the
+        // tool's own deserialization all see clean args. The raw
+        // tc.arguments string is untouched (the UI keeps fidelity).
+        let mut args = args;
+        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+
+        let parsed_call = ParsedToolCall {
+            id: tc.id.clone(),
+            name: tc.name.clone(),
+            arguments: args,
         };
 
         // Re-enforce the workflow ToolFilter at dispatch time. Schema filtering

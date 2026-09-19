@@ -1821,7 +1821,14 @@ mod tests {
             // gains additionalProperties/required keys; measures Executing
             // at 31_471 chars. Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::Executing, 32_100),
+            // 32_100 → 32_300 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — the null-stringify defense round: optional
+            // string/enum params widen to ["string","null"] across the
+            // victim tools (~+100) and file_edit's new_string description
+            // gains the literal-'null' trap note (~+150); measures
+            // Executing at 32_118 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Executing, 32_300),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1844,7 +1851,12 @@ mod tests {
             // raise above (PlanFrozen = Executing ∪ finish, and finish is
             // a STRICT_TOOLS member); measures PlanFrozen at 32_757
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 33_400),
+            // 33_400 → 33_600 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — same cause as the Executing raise above
+            // (nullable victim schemas + file_edit's new_string trap
+            // note); measures PlanFrozen at 33_404 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 33_600),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1927,7 +1939,12 @@ mod tests {
             // members (file_edit, update_plan, memory_update/amend);
             // measures Reviewing at 26_735 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Reviewing, 27_300),
+            // 27_300 → 27_500 (2027-01-24): backlog 9118714a (plan
+            // 50f36b1e) — same cause as the Executing raise above
+            // (nullable victim schemas + file_edit's new_string trap
+            // note); measures Reviewing at 27_382 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 27_500),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

@@ -481,7 +481,10 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
         if args.old_string.is_empty() {
             return Err(crate::error::Error::InvalidInput(
                 "old_string is empty — provide old_string (string matching) or \
-                 lines: [start, end] (line range)"
+                 lines: [start, end] (line range). If you meant the literal text \
+                 'null' (dropped by the null-stringify defense), use batch mode \
+                 (an edits item's old_string is required, never dropped) or \
+                 use_regex (e.g. nul[l])"
                     .into(),
             ));
         }
@@ -1538,8 +1541,8 @@ impl Tool for FileEditTool {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                    "old_string": {"type": "string", "description": "The exact text to find, or a regex when use_regex=true."},
-                    "new_string": {"type": "string", "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); omit in batch mode — the edits items carry their own replacements."},
+                    "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true."},
+                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); omit in batch mode — the edits items carry their own replacements. A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
                     "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)."},
                     "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In the replacement (new_string), use real newlines — a literal backslash-n is inserted as-is, not converted to a newline."},
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
@@ -2878,6 +2881,56 @@ mod tests {
         );
         assert!(result.output.contains("edit 2/2"), "{}", result.output);
         assert!(result.output.contains("fn missing()"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn batch_mode_with_stringified_null_old_new_applies_the_batch() {
+        // Backlog 9118714a: the transport stringifies JSON null for string
+        // params into the literal string "null" — a batch call carrying
+        // old_string:"null"/new_string:"null" tripped the false
+        // "edits is mutually exclusive with old_string" error, making batch
+        // mode unusable through the transport. The dispatch seam drops the
+        // artifact from OPTIONAL properties; composed here with the tool
+        // exactly as the seam composes them, the batch applies. The per-item
+        // old_string/new_string are REQUIRED inside the item schema, so the
+        // defense never touches them.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let tool = make_tool(dir.path());
+        let mut args = json!({
+            "path": "a.rs",
+            "edits": [
+                {"old_string": "fn a() {}", "new_string": "fn a2() {}"},
+                {"old_string": "fn b() {}", "new_string": "fn b2() {}"}
+            ],
+            "old_string": "null",
+            "new_string": "null"
+        });
+        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+        let result = tool.execute(args).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "fn a2() {}\nfn b2() {}\n"
+        );
+    }
+
+    #[test]
+    fn file_edit_optional_string_params_advertise_nullable() {
+        // Backlog 9118714a: optional string params advertise
+        // ["string", "null"] so explicit JSON null is legal end-to-end —
+        // the spawn_agent.model precedent mirrored onto this tool.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let params = tool.schema().parameters;
+        for field in ["old_string", "new_string"] {
+            let ty = &params["properties"][field]["type"];
+            assert!(
+                ty.as_array()
+                    .is_some_and(|t| t.contains(&json!("string")) && t.contains(&json!("null"))),
+                "{field} must advertise [\"string\", \"null\"], got: {ty}"
+            );
+        }
     }
 
     #[test]

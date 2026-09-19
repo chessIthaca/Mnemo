@@ -5424,6 +5424,141 @@ async fn dispatch_treats_null_model_as_absent_for_reviewer_spawns() {
     );
 }
 
+/// Backlog 9118714a: the transport stringifies JSON null for string/enum
+/// params into the literal string "null" (and auto-fills omitted optional
+/// properties with it). The dispatch seam drops the artifact from OPTIONAL
+/// properties before the tool sees the args — pinned end-to-end through
+/// execute_tool_call with an echo tool whose result IS the args it received.
+/// A REQUIRED property keeps the string (a genuine error the circuit
+/// breaker corrects); real values pass through untouched.
+#[tokio::test]
+async fn dispatch_drops_stringified_nulls_from_optional_params() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // A purpose-built echo tool: the assertion pins the SEAM (what crossed
+    // execute_tool_call), not any one tool's internals. Memory category =
+    // available in every workflow state, so the filter admits it in
+    // Planning without a live plan.
+    struct NullEchoTool;
+    #[async_trait]
+    impl crate::tool::Tool for NullEchoTool {
+        fn name(&self) -> &str {
+            "null_echo"
+        }
+        fn category(&self) -> crate::tool::ToolCategory {
+            crate::tool::ToolCategory::Memory
+        }
+        fn schema(&self) -> crate::provider::ToolSchema {
+            crate::provider::ToolSchema::new(
+                "null_echo",
+                "echo the args it received",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "required_field": {"type": "string"},
+                        "optional_field": {"type": "string"}
+                    },
+                    "required": ["required_field"]
+                }),
+            )
+        }
+        fn safety(&self) -> crate::tool::SafetyLevel {
+            crate::tool::SafetyLevel::AutoRun
+        }
+        async fn execute(&self, args: serde_json::Value) -> crate::tool::ToolResult {
+            crate::tool::ToolResult::success(args.to_string())
+        }
+    }
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(NullEchoTool));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    let call = |id: &str, args: &str| {
+        crate::provider::ToolCall::new(id, "null_echo", args.to_string())
+    };
+
+    // The stringified artifact on an OPTIONAL property → dropped: the tool
+    // receives the call without it (absence = the canonical unset).
+    let (result, _) = agent
+        .execute_tool_call(
+            &call(
+                "c1",
+                r#"{"required_field":"x","optional_field":"null"}"#,
+            ),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "echo call ran: {}", result.output);
+    assert!(
+        !result.output.contains("optional_field"),
+        "optional \"null\" must be dropped at the seam, tool saw: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("required_field"),
+        "required field survives, tool saw: {}",
+        result.output
+    );
+
+    // A real value passes through untouched.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call(
+                "c2",
+                r#"{"required_field":"x","optional_field":"real value"}"#,
+            ),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        result.output.contains("real value"),
+        "real optional value passes through, tool saw: {}",
+        result.output
+    );
+
+    // A REQUIRED property keeps the string — the model must supply a real
+    // value there; masking it would break the circuit breaker's correction.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c3", r#"{"required_field":"null"}"#),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        result.output.contains("\"required_field\":\"null\""),
+        "required \"null\" is kept for the tool to reject, tool saw: {}",
+        result.output
+    );
+}
+
 /// A mock descendant tracker whose "running descendants" answer is fixed at
 /// construction. Used to exercise the dispatch state-transition gate.
 struct FixedDescendantTracker {

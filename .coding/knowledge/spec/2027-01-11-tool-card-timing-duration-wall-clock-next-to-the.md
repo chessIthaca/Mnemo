@@ -1,6 +1,7 @@
 +++
 title = "Tool-card timing — duration + wall-clock next to the check"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 SPEC: Tool-card timing — completed tool cards render `✓ <duration> · <wall-clock>` next to the check (user request 2027-01-24: "a time so we can see how long it took between tools"). Landed on wt/mnemo commit 4466223 (plan 850862a7, review PASS 0 findings; unmerged at write time).

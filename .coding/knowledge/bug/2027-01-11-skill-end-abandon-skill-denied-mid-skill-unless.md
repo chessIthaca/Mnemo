@@ -1,6 +1,7 @@
 +++
 title = "skill_end/abandon_skill denied mid-skill unless the allow-list named them — FIXED (plan dff6780f)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Symptom (user report 2027-01-24): "skill_end is always allowed during a skill. Not having that is silly." During an active skill, skill_end (exit to target_state) and abandon_skill (rollback) were only visible/callable if the skill's allow-list named them — a skill file omitting them trapped the agent mid-skill with no exit and no rollback, while the injected skill prompt (src/agent/prompt.rs:770) advertised both.

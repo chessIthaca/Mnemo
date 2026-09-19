@@ -1,6 +1,7 @@
 +++
 title = "Switch-restart window — same place, same size, on top"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 SPEC: Switch-restart window lifecycle — the relaunched window must reopen exactly like the one it closed: same place, same size (re-maximized when maximized), and in the foreground. Landed on wt/mnemo commit 0ea1f41 (bug plan 3f87686a, user report 2027-01-24; round-2 review PASS).

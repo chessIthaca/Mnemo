@@ -12,6 +12,7 @@ import {
   pickDirectory,
   type ProjectInfo,
 } from "../../lib/tauri";
+import { flushWindowGeometry } from "../../lib/windowGeometryFlush";
 import {
   createButtonLabel,
   openButtonLabel,
@@ -79,6 +80,10 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
     setPhase("restarting");
     setError(null);
     try {
+      // Persist the current window bounds before the hard restart — the
+      // process exit never runs beforeunload, so the 400 ms save debounce
+      // would otherwise lose a just-made move/resize.
+      await flushWindowGeometry();
       await switchProject(path);
       // switchProject restarts the process; this line is unreachable on
       // success. If it returns, surface the error.
@@ -128,6 +133,8 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
       await createProject(chosenPath, name || undefined);
       // Then restart into the new project.
       setPhase("restarting");
+      // Flush the window bounds before the hard restart (see handleOpen).
+      await flushWindowGeometry();
       await switchProject(chosenPath);
     } catch (e) {
       setError(`Failed to create project: ${e}`);

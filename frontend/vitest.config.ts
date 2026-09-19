@@ -93,6 +93,7 @@ export default defineConfig({
       "src/components/resizeHandleMotif.test.ts",
       "src/lib/tauri.test.ts",
       "src/lib/windowRestore.test.ts",
+      "src/lib/windowGeometryFlush.test.ts",
       "src/lib/vitestInclude.test.ts",
       "src/App.shellRender.test.ts",
     ],

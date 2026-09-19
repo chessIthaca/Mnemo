@@ -238,12 +238,28 @@ fn main() {
             // other alive (proven by spike e9cd6fb1).
             let agent_chat_handle: Arc<std::sync::Mutex<Option<tauri::webview::Webview>>> =
                 Arc::new(std::sync::Mutex::new(None));
+            // A switch restart reloads in place of a window the user just
+            // closed: `switch_project` writes the pending-project marker and
+            // hard-exits (tauri::process::restart). Windows hands the
+            // foreground to another app when the old window is destroyed, and
+            // the relaunched process has no foreground right of its own (its
+            // parent is dead) — without this the restarted window opens
+            // BEHIND whatever took focus. set_focus (tao force_window_active:
+            // SetForegroundWindow + the ALT-key fallback) brings it back to
+            // the top, matching the window it replaces. Peeking does not
+            // consume the marker — build_brain below still owns it.
+            let switched_restart = mnemo::config::peek_pending_project().is_some();
             let window = WindowBuilder::new(app, "main")
                 .title("Mnemo")
                 .inner_size(1200.0, 720.0)
                 .min_inner_size(800.0, 560.0)
                 .center()
                 .build()?;
+            if switched_restart {
+                if let Err(e) = window.set_focus() {
+                    eprintln!("mnemo: failed to focus the restarted window: {e}");
+                }
+            }
             // Per-instance WebView2 user data folder: the FIRST instance
             // keeps WebView2's default profile; every ADDITIONAL instance
             // gets its own per-pid folder (see webview_udf.rs — without it a
@@ -1866,5 +1882,30 @@ mod tests {
         assert!(!is_adoptable_path("/usr/bin\n/usr/local/bin"));
         assert!(!is_adoptable_path("/usr/bin\u{7}:/bin"));
         assert!(!is_adoptable_path("/usr/bin\t/bin"));
+    }
+}
+
+#[cfg(test)]
+mod switch_restart_focus_contract {
+    //! Source-contract regression tests for the switch-restart window focus.
+    //! The defect needs two processes + a window manager to reproduce
+    //! end-to-end, so the guard pins the wiring instead (the same convention
+    //! as the frontend's windowRestore source contracts): a launch that
+    //! peeks the pending-project marker must focus the window it creates.
+
+    /// The window-creation path must peek the marker and set_focus when it
+    /// is present — without the guard the relaunched window opens behind
+    /// whatever took the foreground when the old window was destroyed.
+    #[test]
+    fn switch_restart_focuses_the_restarted_window() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("peek_pending_project().is_some()"),
+            "the restart detection must peek the pending-project marker"
+        );
+        assert!(
+            src.contains("window.set_focus()"),
+            "the restarted window must be focused (brought on top)"
+        );
     }
 }

@@ -289,4 +289,50 @@ describe("App.tsx restore applies the clamp (source contract)", () => {
     // Called exactly once — the import line carries no call parens.
     expect(appSource.split("clampRestoredGeometry(")).toHaveLength(2);
   });
+
+  it("re-maximizes when the saved geometry was maximized", () => {
+    // A maximized window used to restart un-maximized at its last normal
+    // bounds (the save skipped while maximized, so `maximized: true` was
+    // never persisted and the restore guard excluded it) — not the same
+    // sizing as the closed window. The restore must apply the clamped
+    // normal bounds and then re-maximize.
+    const start = appSource.indexOf("Restore saved geometry once on mount");
+    const end = appSource.indexOf("let saveTimer");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const restoreBlock = appSource.slice(start, end);
+    expect(restoreBlock).toContain("if (saved.maximized)");
+    expect(restoreBlock).toContain("win.maximize()");
+  });
+
+  it("persists the maximized flag instead of skipping the save", () => {
+    // The save path must write `maximized: true` on the last normal bounds
+    // (and beforeunload must carry the flag) — otherwise the re-maximize
+    // above can never fire.
+    expect(appSource).toContain("maximized: true");
+    expect(appSource).toContain("lastMaximized");
+  });
+
+  it("registers the geometry flusher for the switch-restart path", () => {
+    // App's geometry effect must register the flusher (and clear it on
+    // cleanup) so the picker's pre-restart flush has something to call —
+    // the hard process exit never runs beforeunload.
+    expect(appSource).toContain("registerWindowGeometryFlusher(() => {");
+    expect(appSource).toContain("registerWindowGeometryFlusher(null)");
+  });
+
+  it("keeps the maximized flag fresh between debounced saves", () => {
+    // Review LOW 2: beforeunload writes the cached flag synchronously (it
+    // can't await an IPC round-trip), so a maximize followed by a close
+    // within the 400 ms debounce would otherwise persist a stale
+    // `maximized: false`. Every move/resize event must refresh the flag
+    // fire-and-forget.
+    const start = appSource.indexOf("const debouncedSave");
+    const end = appSource.indexOf("registerWindowGeometryFlusher(() => {");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = appSource.slice(start, end);
+    expect(block).toContain("isMaximized()");
+    expect(block).toContain("lastMaximized = m");
+  });
 });

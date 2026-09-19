@@ -571,14 +571,30 @@ export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event
       ...last,
       calls: [
         ...last.calls,
-        { id: event.id, index: event.index, args: "", result: null },
+        {
+          id: event.id,
+          index: event.index,
+          args: "",
+          result: null,
+          // Timing stamp (tool-card duration display): when this call was
+          // issued. tool_result stamps the matching endedAt.
+          startedAt: Date.now(),
+        },
       ],
     };
   } else {
     transcript.push({
       kind: "tool",
       name: event.name,
-      calls: [{ id: event.id, index: event.index, args: "", result: null }],
+      calls: [
+        {
+          id: event.id,
+          index: event.index,
+          args: "",
+          result: null,
+          startedAt: Date.now(),
+        },
+      ],
     });
   }
   next.transcript = capTranscript(transcript);
@@ -742,6 +758,9 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
           ...calls[callIdx],
           result: event.result,
           liveOutput: undefined,
+          // Timing stamp (tool-card duration display): when this call's
+          // result landed — with the call's startedAt it yields the duration.
+          endedAt: Date.now(),
         };
         transcript[i] = { ...entry, calls };
         completedCall = calls[callIdx];

@@ -94,6 +94,7 @@ export default defineConfig({
       "src/lib/tauri.test.ts",
       "src/lib/windowRestore.test.ts",
       "src/lib/windowGeometryFlush.test.ts",
+      "src/lib/timeFormat.test.ts",
       "src/lib/vitestInclude.test.ts",
       "src/App.shellRender.test.ts",
     ],

@@ -232,7 +232,9 @@ describe("agent event reducers (table-driven)", () => {
     expect(t.kind).toBe("tool");
     if (t.kind === "tool") {
       expect(t.name).toBe("shell");
-      expect(t.calls).toEqual([{ id: "call-1", index: 0, args: "", result: null }]);
+      expect(t.calls).toEqual([
+        { id: "call-1", index: 0, args: "", result: null, startedAt: expect.any(Number) },
+      ]);
     }
   });
 
@@ -264,6 +266,44 @@ describe("agent event reducers (table-driven)", () => {
     const tool = a.transcript.find((e) => e.kind === "tool");
     expect(tool).toBeDefined();
     if (tool && tool.kind === "tool") expect(tool.calls).toHaveLength(2);
+  });
+
+  it("tool_call_start: stamps startedAt on the invocation (timing display)", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "file_edit" },
+    });
+    const a = agent(ID);
+    const tool = a.transcript.find((e) => e.kind === "tool");
+    if (tool && tool.kind === "tool") {
+      expect(tool.calls[0].startedAt).toEqual(expect.any(Number));
+      expect(tool.calls[0].endedAt).toBeUndefined();
+    }
+  });
+
+  it("tool_result: stamps endedAt on the matching call only (merged cards keep per-call stamps)", () => {
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 0, id: "call-1", name: "file_edit" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_call_start", index: 1, id: "call-2", name: "file_edit" },
+    });
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: { kind: "tool_result", tool_call_id: "call-1", result: { success: true, output: "ok" } },
+    });
+    const a = agent(ID);
+    const tool = a.transcript.find((e) => e.kind === "tool");
+    if (tool && tool.kind === "tool") {
+      // Both calls carry their own startedAt; only the matched call gets
+      // endedAt — the other is still running.
+      expect(tool.calls[0].startedAt).toEqual(expect.any(Number));
+      expect(tool.calls[1].startedAt).toEqual(expect.any(Number));
+      expect(tool.calls[0].endedAt).toEqual(expect.any(Number));
+      expect(tool.calls[1].endedAt).toBeUndefined();
+    }
   });
 
   it("tool_call_start: a failed call breaks the merge chain (error + success stay separate)", () => {

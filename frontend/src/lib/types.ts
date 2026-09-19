@@ -416,6 +416,18 @@ export interface ToolInvocation {
   args: string;
   result: ToolResult | null; // null = still running
   /**
+   * When the call was issued (ms since epoch) — stamped by the reducer on
+   * `tool_call`. With `endedAt` it drives the card's duration + wall-clock
+   * timing display. Absent on invocations restored from legacy saved
+   * conversations (they simply show no timing).
+   */
+  startedAt?: number;
+  /**
+   * When the result landed (ms since epoch) — stamped by the reducer on
+   * `tool_result`. Absent while the call is still running.
+   */
+  endedAt?: number;
+  /**
    * Live output tail while the call is running — appended by
    * `tool_output_delta` chunks (the reducer keeps only the last
    * `LIVE_OUTPUT_CAP` chars) and cleared the moment `result` lands. Rendered

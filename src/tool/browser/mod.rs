@@ -47,11 +47,22 @@ pub(crate) struct Ctx {
 pub(crate) const SCREENSHOT_DIR: &str = ".coding/browser/screenshots";
 
 /// Deserialize args or return an error `ToolResult`.
+///
+/// The tool name is passed in by the caller rather than read from `self`:
+/// a `macro_rules!` macro expands at its call site, so its body cannot
+/// refer to `self` at all (that is a hard `E0424` — "expected value, found
+/// module `self`"). Every caller is a `Tool::execute` method, so
+/// `parse_args!(Args, args, self.name())` evaluates the name in a scope
+/// where `self` genuinely exists.
 macro_rules! parse_args {
-    ($t:ty, $args:expr) => {
+    ($t:ty, $args:expr, $tool:expr) => {
         match serde_json::from_value::<$t>($args) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => {
+                return ToolResult::error(
+                    crate::tool::error_message::sanitize_arguments_error($tool, &e),
+                )
+            }
         }
     };
 }
@@ -105,7 +116,7 @@ impl Tool for OffscreenNavigateTool {
         struct Args {
             url: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self.0.manager.navigate(&args.url).await {
             Ok(info) => ToolResult::success(format!(
                 "opened page {} ({}): {}",
@@ -199,7 +210,7 @@ impl Tool for OffscreenClosePageTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args = parse_args!(PageArg, args);
+        let args = parse_args!(PageArg, args, self.name());
         match self.0.manager.close_page(args.page_id.as_deref()).await {
             Ok(()) => ToolResult::success("page closed"),
             Err(e) => ToolResult::error(format!("offscreen_browser_close_page failed: {e}")),
@@ -242,7 +253,7 @@ impl Tool for OffscreenScreenshotTool {
         SafetyLevel::AutoRun
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args = parse_args!(PageArg, args);
+        let args = parse_args!(PageArg, args, self.name());
         let png = match self.0.manager.screenshot(args.page_id.as_deref()).await {
             Ok(b) => b,
             Err(e) => {
@@ -306,7 +317,7 @@ impl Tool for OffscreenConsoleTool {
         SafetyLevel::AutoRun
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args = parse_args!(PageArg, args);
+        let args = parse_args!(PageArg, args, self.name());
         match self.0.manager.console(args.page_id.as_deref()).await {
             Ok(entries) => {
                 if entries.is_empty() {
@@ -356,7 +367,7 @@ impl Tool for OffscreenSnapshotTool {
         SafetyLevel::AutoRun
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args = parse_args!(PageArg, args);
+        let args = parse_args!(PageArg, args, self.name());
         match self.0.manager.snapshot(args.page_id.as_deref()).await {
             Ok(html) => ToolResult::success(html),
             Err(e) => ToolResult::error(format!("offscreen_browser_snapshot failed: {e}")),
@@ -643,7 +654,7 @@ impl Tool for OffscreenEvalTool {
             #[serde(default)]
             page_id: Option<String>,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self
             .0
             .manager
@@ -699,7 +710,7 @@ impl Tool for OffscreenClickTool {
             #[serde(default)]
             page_id: Option<String>,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self
             .0
             .manager
@@ -754,7 +765,7 @@ impl Tool for OffscreenTypeTool {
             #[serde(default)]
             page_id: Option<String>,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self
             .0
             .manager
@@ -808,7 +819,7 @@ impl Tool for OffscreenSwitchPageTool {
         struct Args {
             page_id: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self.0.manager.switch_page(&args.page_id).await {
             Ok(info) => ToolResult::success(format!(
                 "active page is now {} ({}): {}",
@@ -948,7 +959,7 @@ impl Tool for BrowserEvalTool {
         struct Args {
             expression: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self.0.manager.webview_eval(&args.expression).await {
             Ok(value) => ToolResult::success(
                 serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
@@ -1050,7 +1061,7 @@ impl Tool for BrowserNavigateTool {
         struct Args {
             url: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self.0.manager.webview_navigate(&args.url).await {
             Ok(landed) => ToolResult::success(format!("navigated the Browser tab to {landed}"))
                 .with_data(json!({ "url": landed })),
@@ -1107,7 +1118,7 @@ impl Tool for BrowserClickTool {
         struct Args {
             selector: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self.0.manager.webview_click(&args.selector).await {
             Ok(()) => ToolResult::success(format!("clicked '{}'", args.selector)),
             Err(e) => ToolResult::error(format!("browser_click failed: {e}")),
@@ -1163,7 +1174,7 @@ impl Tool for BrowserTypeTool {
             selector: String,
             text: String,
         }
-        let args = parse_args!(Args, args);
+        let args = parse_args!(Args, args, self.name());
         match self
             .0
             .manager

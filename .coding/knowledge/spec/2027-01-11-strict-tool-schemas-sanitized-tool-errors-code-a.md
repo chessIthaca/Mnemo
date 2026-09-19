@@ -1,6 +1,7 @@
 +++
 title = "Strict tool schemas + sanitized tool errors — code anchors (plan 21118961)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Investigation 2027-01 (plan 21118961, branch wt/mnemo) — anchors for strict-schema + tool-error-sanitizer work:

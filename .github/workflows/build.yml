@@ -77,6 +77,17 @@ jobs:
   macos:
     runs-on: macos-latest
     timeout-minutes: 90
+    # The `secrets` context is NOT available in step `if:` conditionals
+    # (workflow-load error: "Unrecognized named-value: 'secrets'"), so the
+    # Apple secret-group gates are computed here as job env and the gated
+    # steps below check `env.*`. These names deliberately differ from the
+    # APPLE_* names the tauri bundler reads — those stay GITHUB_ENV-exported
+    # by the gated steps, so a partial config can never hand tauri a
+    # set-but-empty identity.
+    env:
+      APPLE_SIGNING_GROUP_SET: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+      APPLE_NOTARY_GROUP_SET: ${{ secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_CONTENT != '' }}
+      APPLE_GROUPS_INCONSISTENT: ${{ (secrets.APPLE_CERTIFICATE != '') != (secrets.APPLE_SIGNING_IDENTITY != '') || (secrets.APPLE_API_ISSUER != '') != (secrets.APPLE_API_KEY_CONTENT != '') || (secrets.APPLE_API_KEY != '') != (secrets.APPLE_API_KEY_CONTENT != '') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -108,7 +119,7 @@ jobs:
       # the build would fail late with a confusing codesign/notarytool error
       # (review F3).
       - name: Check Apple secrets consistency
-        if: ${{ (secrets.APPLE_CERTIFICATE != '') != (secrets.APPLE_SIGNING_IDENTITY != '') || (secrets.APPLE_API_ISSUER != '') != (secrets.APPLE_API_KEY_CONTENT != '') || (secrets.APPLE_API_KEY != '') != (secrets.APPLE_API_KEY_CONTENT != '') }}
+        if: ${{ env.APPLE_GROUPS_INCONSISTENT == 'true' }}
         run: |
           echo "::error::Inconsistent Apple secrets. Set each group completely or leave it unset — signing: APPLE_CERTIFICATE + APPLE_CERTIFICATE_PASSWORD + APPLE_SIGNING_IDENTITY; notarization: APPLE_API_ISSUER + APPLE_API_KEY + APPLE_API_KEY_CONTENT."
           exit 1
@@ -118,7 +129,7 @@ jobs:
       # APPLE_SIGNING_IDENTITY (a statically-declared env of an unset secret
       # would be set-but-empty, which the bundler treats as a real identity).
       - name: Import Apple signing certificate
-        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' }}
+        if: ${{ env.APPLE_SIGNING_GROUP_SET == 'true' }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -138,7 +149,7 @@ jobs:
       # is present; the notarytool env is exported via GITHUB_ENV the same
       # way (set-only-when-complete, never set-but-empty).
       - name: Write notarization API key
-        if: ${{ secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_CONTENT != '' }}
+        if: ${{ env.APPLE_NOTARY_GROUP_SET == 'true' }}
         env:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}

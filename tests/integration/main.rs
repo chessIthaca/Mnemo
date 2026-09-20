@@ -8,6 +8,7 @@
 //! The suites are self-contained (no cross-module fixtures); test names
 //! keep their original `module::test` paths.
 
+mod ci_workflow;
 mod contract_fixtures;
 mod ipc_bridge;
 mod workflow_integration;

@@ -1,0 +1,7 @@
++++
+title = "self-healing offscreen browser — CDP timeouts, force-reap, watchdog probe (ec425270) — MERGED into main (752164e)"
+supersedes = "2027-01-11-self-healing-offscreen-browser-cdp-timeouts-forc"
+created = "2027-01-11"
++++
+
+MERGED into main at 752164e (752164e420903fa893f4449c4fb02f85a1911dd7) on 2026-09-20 via the merge_to_main skill; branch wt/mnemo deleted (pre-merge tip c91650c; work commit 880736c) - supersedes this record's earlier "Commit 880736c on wt/mnemo - UNMERGED" marker. WHAT: every launch-mode CDP round-trip in src/browser/mod.rs goes through the private cdp(&self, what, timeout, fut) wrapper (CDP_OP_TIMEOUT=30s, CDP_NAVIGATE_TIMEOUT=60s; #[cfg(test)] set_cdp_timeout overrides both); on timeout force_reap_wedged detaches + kills the browser off-lock (spawn_kill_task) and the next op respawns fresh via ensure_browser; State.generation (bumped only in ensure_browser) guards force_reap_wedged so a late-firing timeout cannot reap a respawned browser; the watchdog probes Browser::version() (browser-level, PROBE_TIMEOUT=5s, PROBE_STRIKES=2 consecutive) - op timeouts catch wedged renderers, the probe catches idle-wedged browser processes; ops hold no state lock when calling cdp. Regression test: wedge_renderer_times_out_and_self_heals (cargo test --features browser wedge_renderer -- --ignored). Full detail: .coding/knowledge/spec/2027-01-11-self-healing-offscreen-browser-cdp-timeouts-forc.md.

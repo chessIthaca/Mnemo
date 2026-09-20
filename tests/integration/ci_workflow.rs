@@ -36,3 +36,38 @@ fn build_workflow_step_ifs_never_reference_secrets() {
         }
     }
 }
+
+/// The workflow-level `CI` env var must be a clap-valid bool ("true"/"false").
+///
+/// The tauri CLI's `--ci` flag is a clap bool that reads the `CI` env var
+/// (`[env: CI=]` in `tauri build --help`) and rejects every value other than
+/// true/false — so `CI: "1"` killed `npx tauri build` at startup with
+/// `error: invalid value '1' for '--ci'` (exit 1 in ~2s, before the frontend
+/// rebuild even started). Regression: the pre-fix build.yml set `CI: "1"` and
+/// the windows job's "Tauri build (unsigned installers)" step never produced
+/// installers (run 35514715816, tag v0.1.1).
+#[test]
+fn build_workflow_ci_env_is_clap_bool() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("CI:") {
+            let value = trimmed["CI:".len()..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            assert!(
+                value == "true" || value == "false",
+                "line {} sets CI to {:?} — the tauri CLI's --ci flag reads the CI \
+                 env var via clap and only accepts true/false (\"1\" kills \
+                 `npx tauri build` at startup)",
+                idx + 1,
+                value
+            );
+        }
+    }
+}

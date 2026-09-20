@@ -2825,6 +2825,13 @@ mod tests {
         }
     }
 
+    /// Windows-only (user decision 2026-09-20): this test launches a real
+    /// headless Chromium and polls 15s for the profile dir's removal — on
+    /// the macOS CI leg (run 35521221353) the dir outlives the poll, and
+    /// the root cause is not diagnosable from a Windows host. Gated
+    /// rather than deadline-widened; Windows, where the app ships, keeps
+    /// the coverage.
+    #[cfg(windows)]
     #[tokio::test]
     async fn profile_dir_is_removed_on_close() {
         let manager = BrowserManager::new();

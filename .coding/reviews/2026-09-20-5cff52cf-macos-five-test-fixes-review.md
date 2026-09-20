@@ -1,0 +1,58 @@
+## Verdict: FINDINGS (0 high, 2 low)
+
+All five macOS test fixes are correct and platform-safe: the canonical-root fallback in `is_indexable_path` is verified inert on Windows, the cfg gates orphan no helper on a macOS compile, the webview structure assertions hold on both separators, and the cfg(unix) regression test is sound and fail-first. Two low findings: the plan's step-2 BUG memory record is absent from the store despite the step being checked, and the uncommitted set mixes the previous plan's post-merge bookkeeping into what would be this fix's commit.
+
+
+### Scope reviewed
+
+`git diff HEAD` (6 modified files) + untracked `.coding/plans/5cff52cf.md`, on `wt/mnemo` @ `aaf9819` (working tree clean otherwise). Read at source: `src/webview_args.rs` (:100-279), `src/codegraph/watcher.rs` (full, 408 lines), `src/agent/factory.rs` (:1100-1169, :1630-1942, :2100-2289), `src/browser/mod.rs` (:2780-2899), plus the plan file and the memory store.
+
+### Fix-by-fix verification
+
+**1. `src/webview_args.rs` — `secondary_udf_is_per_pid_under_webview2` (separator-agnostic assertions) — CORRECT.**
+- Production fn `secondary_webview_data_dir` (:137-139) is `base.join("WebView2").join(format!("mnemo-{pid}"))` — exactly two appended components on every host; no production bug, as claimed.
+- `dir.ends_with(Path::new("WebView2/mnemo-4242"))` is a component-wise comparison; the literal parses as exactly the two components `WebView2`, `mnemo-4242` on Unix (`/` is the separator) and on Windows (both `/` and `\` parse as separators) — it matches `dir`'s last two components on every host. The inline comment states precisely this.
+- `dir.parent().and_then(|p| p.parent()) == Some(base)`: `dir` = base + exactly 2 components on both hosts (on Unix the backslash-laden `base` is a single relative component; `join` still appends exactly two), so parent-twice yields `base` by component equality. Holds on both separators.
+- `assert_ne!` for distinct pids kept; comment carries run 35521221353. Test-only change.
+
+**2. `src/codegraph/watcher.rs` — `is_indexable_path` canonical-root fallback (the one production change) — CORRECT.**
+- Windows fast path unchanged: `under_base(path, root)` runs first and early-returns `true` on match; notify on Windows delivers the watched root's own form, so the raw prefix matches and `canonicalize` is never reached.
+- Fallback inert on Windows: when the raw prefix fails, `canonicalize(root)` yields a `\\?\`-verbatim path; a genuinely-outside path fails `under_base` against it too → `false`, identical to the old behavior. The only observable Windows delta is that a path under root expressed in verbatim/canonical form now matches — strictly more correct, same direction as the fix, and `under_base(path, canonicalize(root))` cannot accept anything outside the directory `root` names (no false positives possible).
+- The `canonical.as_path() != root` guard is semantically a no-op — component-wise `Path` equality implies identical `strip_prefix` behavior, so if `canonical == root` the retry would fail exactly as the raw attempt did — it is a pure short-circuit skipping a redundant `strip_prefix`. Correct and cheap.
+- Per-event cost: `event_is_indexable` runs per event inside the debounce loop's burst drain, before any index pass; `canonicalize` is one stat-family syscall paid only on raw-miss. Even a large burst (a `git checkout` under the watched root) costs microseconds per event against the index pass that follows. Acceptable. (Bonus: the fallback also fixes relative roots against absolute event paths on Unix — an improvement, not a regression; the Windows relative-root case behaves exactly as before.)
+- Regression test `is_indexable_path_accepts_canonical_event_paths` (cfg(unix)), read line-by-line since it is not compiled on Windows: `symlink(&root, &alias)` argument order correct (alias → root); `canonicalize(&alias)` resolves to root's canonical path; the canonical-form event path must match the symlinked root — **fails without the fix** (the old code was a plain `strip_prefix`, which returns `false` for a canonical event vs the symlinked alias) and passes with it. Sound on macOS (tempdir under `/var` → `/private/var` — exactly the production shape) and on Linux (the alias resolution alone suffices; it does not depend on `/var` being a symlink). The third assertion (`target/x.rs` rejected through the canonical form) pins that ignore-filtering survives the fallback — `target` is confirmed an ignored component by the pre-existing test at :281-283. The second assertion guards the raw fast path.
+- Poll budgets 0..200 × 50 ms (10 s cap, break-early on success): test-only latency insurance, commented with the FSEvents rationale. Fine.
+
+**3. `src/browser/mod.rs` — `profile_dir_is_removed_on_close` gated `#[cfg(windows)]` — CORRECT.**
+- Dated doc comment records the user decision (2026-09-20), the run id, and the gate-vs-widen rationale. The test uses only production API (`BrowserManager::new`/`navigate`/`close`, `state`) that has other callers — nothing orphaned on a macOS compile.
+
+**4. `src/agent/factory.rs` — deferral block gated `#[cfg(all(feature = "browser", windows))]` — CORRECT.**
+- The comment's factual claims verified against the code: exactly six on-screen WebView2 tools (`BrowserScreenshotTool`, `BrowserEvalTool`, `BrowserSnapshotTool`, `BrowserNavigateTool`, `BrowserClickTool`, `BrowserTypeTool`) are registered under `#[cfg(windows)]` at factory.rs:1127-1135; the measured numbers (14700 Windows vs 11246 macOS delta; default array 32796 identical on both sides) are recorded per the plan's MEASUREMENT paragraph — the corrected platform-conditional-group cause, not the superseded unification theory.
+- Dead-code audit for a macOS compile with the browser feature on (the CI leg's `--workspace` unification): `MockDescriber` has ungated callers at :2143 (image test) and :2232 (`set_vision`); `make_factory_with` at :2130 and :1385 (`make_factory`); `set_browser_inspection` has production callers (settings.rs:913, main.rs:1064, factory.rs:2023); `tools_array_chars` is used by the ungated ceilings loop. Every variable inside the gated block (`f2`, `wf2`, `r2`, `n0`, `c0`, `n1`, `c1`) is block-local; the outer `dir`/`factory`/`workflow`/`registry` are all used by ungated code. Nothing orphans → no `deny(warnings)` risk on macOS.
+- The ceilings loop is confirmed ungated (it continues past the block with `(Planning, 18_200)`, `(Executing, 33_200)`, `(PlanFrozen, 34_500)`, `(ExecutingResearch, 27_300)`, …) and on macOS the arrays are ~3.5k chars *smaller* (six tools absent), so the upper-bound ceilings still hold. All four feature×platform combinations are green by construction: Windows+browser runs the block (delta 14700 ≥ 12000); macOS+browser skips it; plain builds skip it on feature-off.
+
+**5. No unintended production behavior change.** The diff touches production code only in `watcher.rs` (`is_indexable_path` + its doc comments); the factory/browser/webview_args edits are all inside `mod tests`.
+
+
+### Findings
+
+**LOW-1 — BUG memory record missing despite plan step 2 checked `[x]`.**
+Plan step 2 ("Document root cause — memory_write a BUG: record") is marked complete, but no BUG record for the five macOS failures exists in the memory store: a `record_type=bug` browse of the newest records plus three targeted searches (run id 35521221353 + FSEvents/canonical/`is_indexable_path` terms; prefix `BUG: five`; a long symlink-root-cause query) all miss it — the newest BUG records are the previous session's (watchdog cfg gate, tauri CLI `--ci`, secrets-context, …), none for this plan. The root cause IS documented in the plan file and code comments, and the finish gate auto-captures a BUG digest, but the checked step claims a manual record that is not there. Remedy: `memory_write` the BUG record (symptom → root cause → fix + regression test name `is_indexable_path_accepts_canonical_event_paths`) before `finish`, or annotate step 2 that the finish auto-capture is the intended path.
+
+**LOW-2 — The fix commit would carry the previous plan's post-merge bookkeeping.**
+The uncommitted set includes plan fbada5bc's completion state: `.coding/backlog.jsonl` (item 7598b9e0 → done, note "Landed on main at aaf9819 … review PASS with zero findings") and `.coding/plans/fbada5bc.md` (step 3 ticked). Both are accurate — verified against git log (5569bc9 bump, 9b17fd3 review report, aaf9819 merge) — but the repo convention is dedicated bookkeeping commits (cf. dedf07a "bookkeeping: plan e66f3b75 completion tick", 424ac01 "docs(knowledge): record merge status"). Remedy: commit the two bookkeeping files as their own `bookkeeping:` commit before the fix commit, so the 5cff52cf commit carries only the five source files + the new plan file. (Folding them in knowingly is a defensible skip — the content is truthful — but then say so in the commit message.)
+
+### Checklist coverage
+
+- **Regression test exercises the changed path: YES.** `is_indexable_path_accepts_canonical_event_paths` calls `is_indexable_path` directly with the canonical-event/symlinked-root shape that the fix adds; fail-first confirmed by reading (old code = plain `strip_prefix` → `false`), with run 35521221353's two watcher failures as the live fail-first evidence. cfg(unix) is compiled on the macOS CI leg.
+- **Root cause documented: YES.** Plan context (including the MEASUREMENT paragraph correcting the deferral root cause from unification to the platform-conditional browser group) + code comments at all four sites, each carrying run 35521221353 and the 2026-09-20 decision dates where applicable.
+- **BUG memory written: NO** — see LOW-1.
+- **Documentation sync: no README/PLAN.md update needed.** Test-only + one private fn; no user-facing feature, config, or provider-strategy surface changed. The watcher's symlink tolerance is documented where it belongs — the module/fn doc comments (watcher.rs :48-51, :71-77). All comments carry the CI run id and decision dates as required.
+- **Multi-platform neutrality: PASS.** The cfg(unix) test uses `std::os::unix::fs::symlink` correctly gated; the cfg(windows) gates are test-only and per explicit user decision; no Windows-only API was added to cross-platform code; the macOS dead-code surface was statically audited (see fix 4) and is clean under `deny(warnings)`.
+- **File-tools-first: PASS.** No shell-mutation evidence; all edits are targeted, style-consistent, and line-ending-preserving (the diff stat shows surgical line counts, no whole-file rewrites).
+- **Verification claims** (Windows: `cargo test` 2489 passed / 0 failed / 5 ignored; `--features browser` 2511 / 0 / 21; zero warnings) are recorded by the parent; this read-only reviewer cannot re-run them, but the one platform-specific risk a Windows host cannot catch — macOS dead-code from the new gates — was audited statically above and is clean.
+
+### Notes (no action required)
+
+- The plan's detailed-step 5 text still carries the superseded "workspace feature unification" theory and the "Windows `--workspace` residual" wording, but the MEASUREMENT paragraph in the same plan file explicitly corrects both (the gate leaves no residual — Windows passes under any feature set since the six tools are always registered there), and the landed code comment carries the corrected cause with the measured numbers. The plan documents its own correction; nothing to change.
+- The parent's cited caller line numbers for `MockDescriber`/`make_factory_with` (2133/:2222) are off by ~10 lines from what the tree shows (:2143/:2232) — pre-edit approximations; the substance (other callers exist) is verified.

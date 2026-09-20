@@ -213,3 +213,4 @@ jobs:
             dist/macos/**/*.dmg
             dist/macos/**/*.zip
           generate_release_notes: true
+          fail_on_unmatched_files: true

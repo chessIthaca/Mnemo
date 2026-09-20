@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "mnemo-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

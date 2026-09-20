@@ -182,3 +182,34 @@ jobs:
             mnemo.app.zip
             target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
+
+  # The GitHub release itself — created by CI, only on v* tag pushes (a manual
+  # dispatch builds + uploads artifacts but never publishes). CI owns release
+  # creation: never create a release for a v* tag manually — an asset-less
+  # manual release would block this job from publishing the same tag.
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-installers
+          path: dist/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-bundles-aarch64
+          path: dist/macos
+      - name: Create GitHub release with installers
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/windows/**/*.msi
+            dist/windows/**/*.exe
+            dist/macos/**/*.dmg
+            dist/macos/**/*.zip
+          generate_release_notes: true

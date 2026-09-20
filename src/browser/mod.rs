@@ -12,16 +12,22 @@
 //!
 //! Lifecycle: the browser spawns on the first operation that needs it, and is
 //! re-spawned transparently when the process dies (the handler task ends, the
-//! stale state is cleared, and the next operation launches fresh). A
-//! background watchdog (spawned with the first browser) reaps a dead browser
-//! on its next tick — one that goes offline between operations no longer
-//! lingers until the next one — and periodically sweeps orphaned profile
-//! dirs: each profile carries a `.mnemo-live` marker touched every tick, so
-//! live profiles (this process's or another instance's) are never touched
-//! while dead managers' dirs are reaped regardless of age. Call
-//! [`BrowserManager::close`] to shut it down. All operations take an optional
-//! `page_id`; when omitted they act on the *active* page (the most recently
-//! opened or switched-to page).
+//! stale state is cleared, and the next operation launches fresh). Every
+//! launch-mode CDP round-trip is bounded by a timeout (~30s; ~60s for
+//! navigate): a *wedged* browser — alive process, open connection,
+//! unresponsive renderer, e.g. a page stuck in an infinite JS loop — is
+//! force-reaped on timeout, and the next operation launches fresh, so a
+//! wedge is a bounded error + automatic restart instead of an infinite hang.
+//! A background watchdog (spawned with the first browser) reaps a dead
+//! browser on its next tick — one that goes offline between operations no
+//! longer lingers until the next one — probes liveness (two consecutive
+//! probe timeouts force-reap an idle-wedged browser), and periodically
+//! sweeps orphaned profile dirs: each profile carries a `.mnemo-live` marker
+//! touched every tick, so live profiles (this process's or another
+//! instance's) are never touched while dead managers' dirs are reaped
+//! regardless of age. Call [`BrowserManager::close`] to shut it down. All
+//! operations take an optional `page_id`; when omitted they act on the
+//! *active* page (the most recently opened or switched-to page).
 //!
 //! Security: [`navigate`](BrowserManager::navigate) normalizes every input at
 //! the single choke point shared by the agent tool and the UI: scheme-less
@@ -118,6 +124,25 @@ const LIVE_MARKER: &str = ".mnemo-live";
 /// live markers, and sweep orphaned profile dirs.
 const WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Timeout for ordinary launch-mode CDP operations (eval, click, type,
+/// screenshot, snapshot, list/close/switch page). A healthy operation
+/// completes in well under 1s; 30s only fires on a wedged renderer — the
+/// false-fire cost is a browser restart + re-navigate.
+const CDP_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Timeout for `navigate`'s `new_page` round-trip: loading a slow site can
+/// legitimately take tens of seconds, so it gets twice the ordinary budget
+/// (the false-fire cost is a restart + re-navigate).
+const CDP_NAVIGATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Timeout for the watchdog's liveness probe — a cheap browser-level
+/// `Browser.getVersion` round-trip (see [`BrowserManager::watchdog_loop`]).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Consecutive probe timeouts before the watchdog force-reaps a browser as
+/// wedged. Two strikes ride out a single transient hiccup.
+const PROBE_STRIKES: u32 = 2;
+
 /// A profile dir whose [`LIVE_MARKER`] is older than this is treated as an
 /// orphan by the sweep, regardless of the dir's age. Generous on purpose:
 /// markers are only touched once per [`WATCHDOG_INTERVAL`], and a heavily
@@ -181,6 +206,12 @@ struct State {
     /// The headless browser process handle, once spawned (`Arc` so CDP calls
     /// can run on a cloned handle after the lock is dropped).
     browser: Option<Arc<Browser>>,
+    /// Launch generation: bumped every time `ensure_browser` stores a
+    /// freshly launched browser. The `cdp` wrapper captures it when an op
+    /// starts and `force_reap_wedged` no-ops on mismatch, so a late-firing
+    /// timeout can never reap a browser that was respawned after the
+    /// timed-out op's browser already died (review L2).
+    generation: u64,
     /// The CDP event-handler task; its end signals the process died.
     handler: Option<JoinHandle<()>>,
     /// Open pages, keyed by manager-assigned id.
@@ -265,6 +296,10 @@ pub struct BrowserManager {
     /// before the first browser launch (the watchdog reads it once, at
     /// spawn time).
     reap_interval_ms: AtomicU64,
+    /// Test-only override for the CDP op/navigate timeouts (0 = use the
+    /// [`CDP_OP_TIMEOUT`]/[`CDP_NAVIGATE_TIMEOUT`] defaults); atomic so
+    /// tests can set it via `&self` before the first operation.
+    cdp_timeout_ms: AtomicU64,
 }
 
 impl BrowserManager {
@@ -274,6 +309,7 @@ impl BrowserManager {
         Arc::new(Self {
             state: Arc::new(Mutex::new(State {
                 browser: None,
+                generation: 0,
                 handler: None,
                 pages: HashMap::new(),
                 active: None,
@@ -289,6 +325,7 @@ impl BrowserManager {
             webview_enabled: AtomicBool::new(cfg!(debug_assertions)),
             child_ensurer: std::sync::RwLock::new(None),
             reap_interval_ms: AtomicU64::new(WATCHDOG_INTERVAL.as_millis() as u64),
+            cdp_timeout_ms: AtomicU64::new(0),
         })
     }
 
@@ -324,6 +361,7 @@ impl BrowserManager {
         Arc::new(Self {
             state: Arc::new(Mutex::new(State {
                 browser: None,
+                generation: 0,
                 handler: None,
                 pages: HashMap::new(),
                 active: None,
@@ -339,6 +377,7 @@ impl BrowserManager {
             webview_enabled: AtomicBool::new(true),
             child_ensurer: std::sync::RwLock::new(None),
             reap_interval_ms: AtomicU64::new(WATCHDOG_INTERVAL.as_millis() as u64),
+            cdp_timeout_ms: AtomicU64::new(0),
         })
     }
 
@@ -349,6 +388,17 @@ impl BrowserManager {
     pub(crate) fn set_reap_interval(&self, interval: std::time::Duration) {
         self.reap_interval_ms
             .store(interval.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Test-only: shorten the CDP op/navigate timeouts so a wedged-renderer
+    /// repro fires in milliseconds instead of the production ~30s/60s. When
+    /// set, the value overrides BOTH timeouts (data:-URL navigates complete
+    /// in milliseconds, so tests can use one short value). Mirrors
+    /// [`set_reap_interval`](Self::set_reap_interval).
+    #[cfg(test)]
+    pub(crate) fn set_cdp_timeout(&self, timeout: std::time::Duration) {
+        self.cdp_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Ensure the browser process is running, spawning it if needed — or, if
@@ -403,6 +453,10 @@ impl BrowserManager {
         state.browser = Some(Arc::new(browser));
         state.handler = Some(task);
         state.profile = Some(profile);
+        // A fresh browser generation: late-firing timeouts from ops that
+        // started against the previous browser must not reap this one
+        // (review L2).
+        state.generation += 1;
         Ok(())
     }
 
@@ -427,35 +481,133 @@ impl BrowserManager {
         }
         // The process died (or the CDP connection dropped): drop the stale
         // handle + pages so a fresh launch starts from a clean slate
-        // (Review C2). Kill the child and remove the dead profile on a
+        // (Review C2), and kill the child + remove the dead profile on a
         // background task (Review B1).
-        state.handler.take();
-        if let Some(browser) = state.browser.take() {
-            let profile = state.profile.take();
-            if let Some(profile) = &profile {
-                // The dir no longer belongs to a live browser — declare it
-                // dead so the sweep reaps it if the removal below never
-                // happens or fails past its retry budget.
-                unregister_live_profile(profile.path());
-            }
-            tokio::spawn(async move {
-                // Only remove the profile dir once the child is actually
-                // dead — a live child holds locks on it, so removal
-                // would fail forever (Review M1).
-                if Self::kill_browser(browser).await {
-                    if let Some(profile) = profile {
-                        Self::schedule_profile_removal(profile);
-                    }
-                }
-            });
+        if let Some((browser, profile)) = Self::detach_browser(state) {
+            Self::spawn_kill_task(browser, profile);
         }
+        true
+    }
+
+    /// Detach the current launch-mode browser from `state`: abort the
+    /// console forwarders, clear the page/console/active state, take (and
+    /// abort) the handler task, and unregister the live profile. Returns
+    /// the browser + profile for the CALLER to kill off-lock (Review B1 —
+    /// awaiting a kill here would hold the state lock across it). Aborting
+    /// the handler is a no-op when it already finished (the dead path).
+    /// Callers hold the state lock.
+    fn detach_browser(state: &mut State) -> Option<(Arc<Browser>, Option<tempfile::TempDir>)> {
+        let browser = state.browser.take()?;
         for (_, task) in state.console_tasks.drain() {
             task.abort();
         }
         state.pages.clear();
         state.console.clear();
         state.active = None;
-        true
+        if let Some(task) = state.handler.take() {
+            task.abort();
+        }
+        let profile = state.profile.take();
+        if let Some(profile) = &profile {
+            // The dir no longer belongs to a live browser — declare it
+            // dead so the sweep reaps it if the removal below never happens
+            // or fails past its retry budget.
+            unregister_live_profile(profile.path());
+        }
+        Some((browser, profile))
+    }
+
+    /// Kill a detached browser and remove its profile on a background task
+    /// (Review B1 — callers hold, or are about to release, the state lock;
+    /// awaiting the kill inline would hold it across the kill). Only
+    /// removes the profile dir once the child is actually dead — a live
+    /// child holds locks on it, so removal would fail forever (Review M1).
+    fn spawn_kill_task(browser: Arc<Browser>, profile: Option<tempfile::TempDir>) {
+        tokio::spawn(async move {
+            if Self::kill_browser(browser).await {
+                if let Some(profile) = profile {
+                    Self::schedule_profile_removal(profile);
+                }
+            }
+        });
+    }
+
+    /// Force-reap a WEDGED launch-mode browser: alive process, open CDP
+    /// connection, unresponsive renderer (e.g. a page stuck in an infinite
+    /// JS loop). [`reap_dead_browser`](Self::reap_dead_browser) never fires
+    /// on such a browser — the wedge keeps its handler task alive, so the
+    /// `is_finished` gate stays closed — hence this path skips the gate
+    /// entirely and detaches unconditionally. The kill runs off-lock on a
+    /// background task (Review B1). Returns whether a browser was reaped
+    /// (a no-op when none is spawned); the next operation re-spawns fresh.
+    ///
+    /// `generation` is the launch generation the caller's operation
+    /// started against; on mismatch a newer browser was launched in the
+    /// meantime and reaping now would kill the healthy respawn — no-op
+    /// (review L2).
+    async fn force_reap_wedged(state: &Arc<Mutex<State>>, generation: u64) -> bool {
+        let detached = {
+            let mut state = state.lock().await;
+            if state.generation != generation {
+                // A newer browser was launched since the caller's op
+                // started: reaping now would kill the healthy respawn, and
+                // the op's own browser is already gone (its timeout,
+                // another op's, or the watchdog reaped it). No-op (review
+                // L2).
+                return false;
+            }
+            Self::detach_browser(&mut state)
+        };
+        match detached {
+            Some((browser, profile)) => {
+                Self::spawn_kill_task(browser, profile);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The effective CDP timeout for a round-trip whose production default
+    /// is `default`: the test override
+    /// ([`set_cdp_timeout`](Self::set_cdp_timeout)) when set, else
+    /// `default`.
+    fn cdp_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        let ms = self.cdp_timeout_ms.load(Ordering::Relaxed);
+        if ms > 0 {
+            std::time::Duration::from_millis(ms)
+        } else {
+            default
+        }
+    }
+
+    /// Run one launch-mode CDP round-trip bounded by `timeout`. The Ok path
+    /// passes the operation's own result/error through unchanged; on
+    /// timeout the wedged browser is force-reaped (killed; the next
+    /// operation re-spawns fresh) and a bounded, actionable error is
+    /// returned — without this, a wedged renderer (alive process, open
+    /// connection, unresponsive page) hangs the calling tool forever.
+    ///
+    /// The launch generation is captured up front so the force-reap only
+    /// ever targets the browser this operation ran against — a timeout
+    /// firing after a respawn must not reap the fresh browser (review L2).
+    async fn cdp<T>(
+        &self,
+        what: &str,
+        timeout: std::time::Duration,
+        fut: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let generation = self.state.lock().await.generation;
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                Self::force_reap_wedged(&self.state, generation).await;
+                Err(Error::Browser(format!(
+                    "{what} timed out after {}s — the browser was unresponsive and has been \
+                     restarted; re-navigate to reopen your pages",
+                    timeout.as_secs()
+                )))
+            }
+        }
     }
 
     /// Sweep orphaned browser profile dirs from the temp dir:
@@ -545,12 +697,39 @@ impl BrowserManager {
     /// Free-running: exits only when the manager's state drops (the `Weak`
     /// upgrade fails) or the runtime shuts down.
     async fn watchdog_loop(weak: std::sync::Weak<Mutex<State>>, interval: std::time::Duration) {
+        let mut strikes = 0u32;
         loop {
             tokio::time::sleep(interval).await;
             let Some(state) = weak.upgrade() else { break };
-            {
+            let (browser, generation) = {
                 let mut state = state.lock().await;
                 Self::reap_dead_browser(&mut state);
+                (state.browser.clone(), state.generation)
+            };
+            // Liveness probe: a wedged browser (alive process, open CDP
+            // connection, unresponsive) keeps its handler task alive, so
+            // reap_dead_browser never fires on it — this probe is the wedge
+            // detector. It is browser-level (Browser.getVersion) so a busy
+            // renderer doesn't false-positive; any answer — or a non-timeout
+            // error, the connection closing while the handler dies, which
+            // the next tick's reap_dead_browser handles — means live and
+            // resets the strikes. Only a timeout strikes; two consecutive
+            // strikes force-reap the wedged browser.
+            if let Some(browser) = browser {
+                if tokio::time::timeout(PROBE_TIMEOUT, browser.version())
+                    .await
+                    .is_err()
+                {
+                    strikes += 1;
+                    if strikes >= PROBE_STRIKES {
+                        Self::force_reap_wedged(&state, generation).await;
+                        strikes = 0;
+                    }
+                } else {
+                    strikes = 0;
+                }
+            } else {
+                strikes = 0;
             }
             touch_live_markers();
             let _ = tokio::task::spawn_blocking(Self::sweep_orphan_profiles).await;
@@ -585,23 +764,55 @@ impl BrowserManager {
         // `&mut State` borrow and cannot spawn it itself.)
         self.ensure_watchdog().await;
 
-        let page = browser
-            .new_page(url.clone())
-            .await
-            .map_err(|e| Error::Browser(format!("failed to open page '{url}': {e}")))?;
+        let page = self
+            .cdp(
+                "navigate",
+                self.cdp_timeout(CDP_NAVIGATE_TIMEOUT),
+                async {
+                    browser
+                        .new_page(url.clone())
+                        .await
+                        .map_err(|e| Error::Browser(format!("failed to open page '{url}': {e}")))
+                },
+            )
+            .await?;
 
         // Subscribe the page's console/exception event streams HERE (before
         // returning) so no event can arrive without a registered listener —
         // a spawned task might not be scheduled in time under load. On
         // failure, close the page and leave the rest of the state untouched
         // (a failed navigate must not clobber the active page — Review C3).
-        let (console_stream, log_stream) = match (
-            page.event_listener::<EventConsoleApiCalled>().await,
-            page.event_listener::<EventEntryAdded>().await,
-        ) {
-            (Ok(c), Ok(l)) => (c, l),
+        let listeners = self
+            .cdp(
+                "navigate",
+                self.cdp_timeout(CDP_NAVIGATE_TIMEOUT),
+                async {
+                    let console = page.event_listener::<EventConsoleApiCalled>().await;
+                    let log = page.event_listener::<EventEntryAdded>().await;
+                    Ok((console, log))
+                },
+            )
+            .await;
+        let (console_stream, log_stream) = match listeners {
+            Ok((Ok(c), Ok(l))) => (c, l),
+            // A timeout already force-reaped the browser — propagate its
+            // actionable message instead of the subscribe error below.
+            Err(e) => return Err(e),
             _ => {
-                let _ = page.close().await;
+                // Best-effort cleanup of the half-opened page — bounded
+                // like every other round-trip, so even a hanging close
+                // cannot stall the op (review L3).
+                let _ = self
+                    .cdp(
+                        "navigate",
+                        self.cdp_timeout(CDP_NAVIGATE_TIMEOUT),
+                        async {
+                            page.close().await.map_err(|e| {
+                                Error::Browser(format!("page close failed: {e}"))
+                            })
+                        },
+                    )
+                    .await;
                 return Err(Error::Browser(
                     "failed to subscribe console events for the new page".into(),
                 ));
@@ -633,7 +844,12 @@ impl BrowserManager {
             });
             state.console_tasks.insert(id.clone(), task);
         }
-        Self::page_info(&page, &id, true).await
+        self.cdp(
+            "navigate",
+            self.cdp_timeout(CDP_NAVIGATE_TIMEOUT),
+            Self::page_info(&page, &id, true),
+        )
+        .await
     }
 
     /// List all open pages. Pages that self-closed are pruned as they are
@@ -651,24 +867,33 @@ impl BrowserManager {
             (snapshot, state.active.clone())
         };
 
-        let mut out = Vec::new();
-        for (id, page) in snapshot {
-            let is_active = active.as_deref() == Some(id.as_str());
-            // A dead/zombie page fails even its url() call — prune it.
-            if page.url().await.is_err() {
-                let mut state = self.state.lock().await;
-                state.pages.remove(&id);
-                state.console.remove(&id);
-                if let Some(task) = state.console_tasks.remove(&id) {
-                    task.abort();
+        // The per-page url()/page_info round-trips are bounded as one unit:
+        // a wedged renderer hangs its page's url() read, which the timeout
+        // turns into a force-reap + bounded error instead of an infinite
+        // hang. (The pruning lock inside is short and cancel-safe.)
+        let mut out = self
+            .cdp("list_pages", self.cdp_timeout(CDP_OP_TIMEOUT), async move {
+                let mut out = Vec::new();
+                for (id, page) in snapshot {
+                    let is_active = active.as_deref() == Some(id.as_str());
+                    // A dead/zombie page fails even its url() call — prune it.
+                    if page.url().await.is_err() {
+                        let mut state = self.state.lock().await;
+                        state.pages.remove(&id);
+                        state.console.remove(&id);
+                        if let Some(task) = state.console_tasks.remove(&id) {
+                            task.abort();
+                        }
+                        if state.active.as_deref() == Some(id.as_str()) {
+                            state.active = state.pages.keys().next().cloned();
+                        }
+                        continue;
+                    }
+                    out.push(Self::page_info(&page, &id, is_active).await?);
                 }
-                if state.active.as_deref() == Some(id.as_str()) {
-                    state.active = state.pages.keys().next().cloned();
-                }
-                continue;
-            }
-            out.push(Self::page_info(&page, &id, is_active).await?);
-        }
+                Ok(out)
+            })
+            .await?;
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
     }
@@ -690,9 +915,16 @@ impl BrowserManager {
             }
             (id, page, task)
         };
-        page.close()
-            .await
-            .map_err(|e| Error::Browser(format!("failed to close page '{id}': {e}")))?;
+        self.cdp(
+            "close_page",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            async {
+                page.close()
+                    .await
+                    .map_err(|e| Error::Browser(format!("failed to close page '{id}': {e}")))
+            },
+        )
+        .await?;
         if let Some(task) = task {
             task.abort();
         }
@@ -711,15 +943,27 @@ impl BrowserManager {
             state.active = Some(page_id.to_string());
             page
         };
-        Self::page_info(&page, page_id, true).await
+        self.cdp(
+            "switch_page",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            Self::page_info(&page, page_id, true),
+        )
+        .await
     }
 
     /// Capture a PNG screenshot of the page (defaults to active).
     pub async fn screenshot(&self, page_id: Option<&str>) -> Result<Vec<u8>> {
         let (id, page) = Self::lookup(&self.state, page_id).await?;
-        page.screenshot(chromiumoxide::page::ScreenshotParams::default())
-            .await
-            .map_err(|e| Error::Browser(format!("screenshot failed on '{id}': {e}")))
+        self.cdp(
+            "screenshot",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            async {
+                page.screenshot(chromiumoxide::page::ScreenshotParams::default())
+                    .await
+                    .map_err(|e| Error::Browser(format!("screenshot failed on '{id}': {e}")))
+            },
+        )
+        .await
     }
 
     /// Drain the page's buffered console entries (defaults to active).
@@ -754,9 +998,16 @@ impl BrowserManager {
     /// for the agent to "see" the page without a screenshot.
     pub async fn snapshot(&self, page_id: Option<&str>) -> Result<String> {
         let (id, page) = Self::lookup(&self.state, page_id).await?;
-        page.content()
-            .await
-            .map_err(|e| Error::Browser(format!("snapshot failed on '{id}': {e}")))
+        self.cdp(
+            "snapshot",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            async {
+                page.content()
+                    .await
+                    .map_err(|e| Error::Browser(format!("snapshot failed on '{id}': {e}")))
+            },
+        )
+        .await
     }
 
     /// Evaluate a JavaScript expression and return its JSON value. Promises
@@ -770,39 +1021,62 @@ impl BrowserManager {
             .return_by_value(true)
             .build()
             .map_err(|e| Error::Browser(format!("invalid eval params: {e}")))?;
-        let out = page
-            .evaluate_expression(params)
-            .await
-            .map_err(|e| Error::Browser(format!("eval failed on '{id}': {e}")))?;
+        let out = self
+            .cdp(
+                "eval",
+                self.cdp_timeout(CDP_OP_TIMEOUT),
+                async {
+                    page.evaluate_expression(params)
+                        .await
+                        .map_err(|e| Error::Browser(format!("eval failed on '{id}': {e}")))
+                },
+            )
+            .await?;
         Ok(out.value().cloned().unwrap_or(serde_json::Value::Null))
     }
 
     /// Click the element matching `selector` (defaults to active page).
     pub async fn click(&self, page_id: Option<&str>, selector: &str) -> Result<()> {
         let (id, page) = Self::lookup(&self.state, page_id).await?;
-        let el = page.find_element(selector).await.map_err(|e| {
-            Error::Browser(format!("click: no element '{selector}' on '{id}': {e}"))
-        })?;
-        el.click()
-            .await
-            .map_err(|e| Error::Browser(format!("click failed on '{selector}': {e}")))?;
-        Ok(())
+        self.cdp(
+            "click",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            async {
+                let el = page.find_element(selector).await.map_err(|e| {
+                    Error::Browser(format!("click: no element '{selector}' on '{id}': {e}"))
+                })?;
+                el.click()
+                    .await
+                    .map_err(|e| Error::Browser(format!("click failed on '{selector}': {e}")))?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Focus the element matching `selector` and type `text` into it.
     pub async fn type_text(&self, page_id: Option<&str>, selector: &str, text: &str) -> Result<()> {
         let (id, page) = Self::lookup(&self.state, page_id).await?;
-        let el = page
-            .find_element(selector)
-            .await
-            .map_err(|e| Error::Browser(format!("type: no element '{selector}' on '{id}': {e}")))?;
-        el.click()
-            .await
-            .map_err(|e| Error::Browser(format!("focus failed on '{selector}': {e}")))?;
-        el.type_str(text)
-            .await
-            .map_err(|e| Error::Browser(format!("type failed on '{selector}': {e}")))?;
-        Ok(())
+        self.cdp(
+            "type",
+            self.cdp_timeout(CDP_OP_TIMEOUT),
+            async {
+                let el = page
+                    .find_element(selector)
+                    .await
+                    .map_err(|e| {
+                        Error::Browser(format!("type: no element '{selector}' on '{id}': {e}"))
+                    })?;
+                el.click()
+                    .await
+                    .map_err(|e| Error::Browser(format!("focus failed on '{selector}': {e}")))?;
+                el.type_str(text)
+                    .await
+                    .map_err(|e| Error::Browser(format!("type failed on '{selector}': {e}")))?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Shut the browser down and drop all pages + the throwaway profile. A
@@ -1587,6 +1861,7 @@ impl Default for BrowserManager {
         Self {
             state: Arc::new(Mutex::new(State {
                 browser: None,
+                generation: 0,
                 handler: None,
                 pages: HashMap::new(),
                 active: None,
@@ -1602,6 +1877,7 @@ impl Default for BrowserManager {
             webview_enabled: AtomicBool::new(cfg!(debug_assertions)),
             child_ensurer: std::sync::RwLock::new(None),
             reap_interval_ms: AtomicU64::new(WATCHDOG_INTERVAL.as_millis() as u64),
+            cdp_timeout_ms: AtomicU64::new(0),
         }
     }
 }
@@ -2180,6 +2456,120 @@ mod tests {
         assert_ne!(first.id, second.id);
         let pages = manager.list_pages().await.expect("list should succeed");
         assert_eq!(pages.len(), 1, "only the new page should exist: {pages:?}");
+        manager.close().await.expect("close should succeed");
+    }
+
+    /// Regression (plan ec425270): a wedged renderer — alive browser process,
+    /// open CDP connection, unresponsive page (e.g. stuck in an infinite JS
+    /// loop) — must not hang launch-mode operations forever. The op must
+    /// return a bounded error ("unresponsive" + "restart"), the wedged
+    /// browser must be force-reaped, and the next operation must transparently
+    /// respawn a fresh one (self-heal). Pre-fix, the eval never returns and
+    /// the 10s outer guard fires — the repro.
+    #[tokio::test]
+    #[ignore = "integration: spawns a headless Chromium process; run with `cargo test -- --ignored`"]
+    async fn wedge_renderer_times_out_and_self_heals() {
+        let manager = BrowserManager::new();
+        // Short CDP timeout so the wedge fires in ~3s instead of ~30s — but
+        // generous enough that a healthy cold-start navigate (browser
+        // spawn + target creation) never false-fires under it.
+        manager.set_cdp_timeout(std::time::Duration::from_secs(3));
+        // Healthy ops must not false-fire under the short timeout.
+        manager
+            .navigate("data:text/html,<h1>hi</h1>")
+            .await
+            .expect("navigate should succeed under the short CDP timeout");
+
+        // Wedge the renderer: the infinite loop blocks the page's main
+        // thread, so the Runtime.evaluate response never arrives.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            manager.eval(None, "while(true){}"),
+        )
+        .await;
+        let err = match outcome {
+            // The outer guard fired: the eval never returned — the defect.
+            Err(_) => {
+                // Clean up the wedged browser (the fix force-reaps it
+                // automatically) so the repro leaves no process behind.
+                manager.close().await.expect("close should succeed");
+                panic!("eval hung >10s on a wedged renderer — the defect");
+            }
+            Ok(Err(e)) => e,
+            Ok(Ok(v)) => panic!("eval should fail on a wedged renderer, got {v:?}"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("unresponsive"), "got: {msg}");
+        assert!(msg.contains("restart"), "got: {msg}");
+
+        // Self-heal: the next operation respawns a fresh browser, and only
+        // the new page exists (the wedged one died with its browser).
+        let page = manager
+            .navigate("data:text/html,<h1>again</h1>")
+            .await
+            .expect("navigate after the wedge should respawn a fresh browser");
+        let pages = manager.list_pages().await.expect("list should succeed");
+        assert_eq!(pages.len(), 1, "only the fresh page should exist: {pages:?}");
+        assert_eq!(pages[0].id, page.id, "the fresh page should be listed");
+        manager.close().await.expect("close should succeed");
+    }
+
+    /// The `cdp` wrapper passes a successful operation through unchanged —
+    /// the timeout must not alter the op's own result or error.
+    #[tokio::test]
+    async fn cdp_wrapper_passes_ok_through() {
+        let manager = BrowserManager::new();
+        let out = manager
+            .cdp(
+                "eval",
+                CDP_OP_TIMEOUT,
+                async { Ok::<_, Error>(serde_json::json!(42)) },
+            )
+            .await
+            .expect("an ok future must pass through");
+        assert_eq!(out, serde_json::json!(42));
+    }
+
+    /// The `cdp` wrapper bounds a never-resolving operation: it must return
+    /// an error mentioning "unresponsive" + "restart" instead of hanging
+    /// forever (the defect). Force-reaping a browser-less manager is a
+    /// no-op, so this needs no Chromium.
+    #[tokio::test]
+    async fn cdp_wrapper_times_out_pending_future() {
+        let manager = BrowserManager::new();
+        let err = manager
+            .cdp::<()>(
+                "eval",
+                std::time::Duration::from_millis(50),
+                std::future::pending(),
+            )
+            .await
+            .expect_err("a never-resolving op must time out");
+        let msg = err.to_string();
+        assert!(msg.contains("unresponsive"), "got: {msg}");
+        assert!(msg.contains("restart"), "got: {msg}");
+    }
+
+    /// The watchdog's liveness probe must not false-positive on a healthy
+    /// browser: several probe ticks against a live, responsive browser must
+    /// never accumulate [`PROBE_STRIKES`] (which would force-reap it).
+    #[tokio::test]
+    #[ignore = "integration: spawns a headless Chromium process; run with `cargo test -- --ignored`"]
+    async fn watchdog_probe_does_not_reap_healthy_browser() {
+        let manager = BrowserManager::new();
+        manager.set_reap_interval(std::time::Duration::from_millis(250));
+        manager
+            .navigate("data:text/html,<p>probe</p>")
+            .await
+            .expect("navigate should succeed");
+        // Several probe ticks against the healthy browser.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let pages = manager.list_pages().await.expect("list should succeed");
+        assert_eq!(
+            pages.len(),
+            1,
+            "the healthy browser must not be reaped by the probe: {pages:?}"
+        );
         manager.close().await.expect("close should succeed");
     }
 

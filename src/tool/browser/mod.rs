@@ -98,7 +98,9 @@ impl Tool for OffscreenNavigateTool {
              console, or send input. Only http(s), data:, and file:// URLs are allowed \
              (file:// is for debugging local HTML files; javascript: and other schemes are \
              rejected); a scheme-less hostname like www.google.com is auto-prefixed with \
-             https:// (http:// for localhost/IPs).",
+             https:// (http:// for localhost/IPs). Navigations are aborted after ~60s and \
+             other operations after ~30s — an unresponsive browser is restarted, so keep \
+             scripts short and split long waits.",
             json!({
                 "type": "object",
                 "properties": {
@@ -633,7 +635,9 @@ impl Tool for OffscreenEvalTool {
              and return its JSON value. Promises are awaited (awaitPromise) and results are \
              returned by value, so `Promise.resolve(42)` yields 42, not a promise handle. \
              The escape hatch for reading DOM state, calling functions, or mutating the page. \
-             Use with care — arbitrary script execution.",
+             Use with care — arbitrary script execution. Operations are aborted after ~30s \
+             and the browser restarts — keep scripts short and split long waits (an \
+             infinite loop wedges the page until the timeout reaps it).",
             json!({
                 "type": "object",
                 "properties": {

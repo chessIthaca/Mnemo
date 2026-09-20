@@ -1833,7 +1833,13 @@ mod tests {
             // param description gain the Reviewing append-window wording
             // (~+194); measures Executing at 32_312 chars. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 32_500),
+            // 32_500 → 33_200 (2027-02-05): the offscreen browser timeout
+            // descriptions (plan ec425270 — offscreen_browser_navigate +
+            // offscreen_browser_eval document the ~60s/30s abort +
+            // automatic-restart behavior, ~+484); measures Executing at
+            // 32_796 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::Executing, 33_200),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1867,7 +1873,12 @@ mod tests {
             // Executing ∪ finish); measures PlanFrozen at 33_598 chars —
             // 2 under the old ceiling, raised for real headroom.
             // Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 33_800),
+            // 33_800 → 34_500 (2027-02-05): same cause as the Executing
+            // raise above (the offscreen browser timeout descriptions,
+            // plan ec425270, ~+484; PlanFrozen = Executing ∪ finish);
+            // measures PlanFrozen at 34_082 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 34_500),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1908,7 +1919,14 @@ mod tests {
             // auto-translate advisory, ~+350); measures ExecutingResearch
             // at 26_243 chars. Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::ExecutingResearch, 26_800),
+            // 26_800 → 27_300 (2027-02-05): same cause as the Executing
+            // raise above (the offscreen browser timeout descriptions,
+            // plan ec425270, ~+484 — the browser family rides the research
+            // filters — plus ~+194 of update_plan append-window wording
+            // that landed after this filter's 2027-01-24 baseline);
+            // measures ExecutingResearch at 26_921 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::ExecutingResearch, 27_300),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -1960,7 +1978,12 @@ mod tests {
             // (update_plan's append-window wording rides Reviewing,
             // ~+194); measures Reviewing at 27_576 chars. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 27_800),
+            // 27_800 → 28_400 (2027-02-05): same cause as the Executing
+            // raise above (the offscreen browser timeout descriptions,
+            // plan ec425270, ~+484 — the browser family rides Reviewing);
+            // measures Reviewing at 28_060 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Reviewing, 28_400),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

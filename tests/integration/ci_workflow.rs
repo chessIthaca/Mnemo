@@ -17,8 +17,11 @@
 /// to load on every run.
 #[test]
 fn build_workflow_step_ifs_never_reference_secrets() {
-    let text = std::fs::read_to_string(".github/workflows/build.yml")
-        .expect("build.yml readable (tests run from the repo root)");
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
     for (idx, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("if:") {

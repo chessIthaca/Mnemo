@@ -49,7 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install npm deps (root + frontend workspace)
         run: npm ci
-      - name: Rust tests (workspace: mnemo + mnemo-app)
+      - name: Rust tests (workspace, mnemo + mnemo-app)
         run: cargo test --workspace
       - name: Frontend type-check
         run: npx tsc --noEmit

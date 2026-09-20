@@ -40,10 +40,18 @@ const WINDOWS_ONLY: &[&str] = &[
 fn opens_item(line: &str) -> bool {
     line.starts_with("fn ")
         || line.starts_with("pub fn ")
+        || line.starts_with("pub(crate) fn ")
+        || line.starts_with("unsafe fn ")
         || line.starts_with("struct ")
         || line.starts_with("pub struct ")
         || line.starts_with("static ")
         || line.starts_with("const ")
+        || line.starts_with("pub const ")
+        || line.starts_with("type ")
+        || line.starts_with("trait ")
+        || line.starts_with("enum ")
+        || line.starts_with("mod ")
+        || line.starts_with("use ")
         || line.starts_with("impl ")
 }
 
@@ -59,12 +67,13 @@ fn watchdog_windows_only_items_stay_cfg_gated() {
             continue;
         }
         // One-line items (`struct S(...);`, `const X: T = v;`) end at the
-        // semicolon; block items run to the next column-0 `}`.
+        // semicolon; block items run to the next column-0 `}` or `};`
+        // (the latter is how multi-line `use` blocks close).
         let end = if line.ends_with(';') {
             i
         } else {
             let mut j = i + 1;
-            while j < lines.len() && lines[j] != "}" {
+            while j < lines.len() && lines[j] != "}" && lines[j] != "};" {
                 j += 1;
             }
             j

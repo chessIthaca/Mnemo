@@ -766,11 +766,6 @@ fn ensure_symbols_ready(process: HANDLE) {
     });
 }
 
-/// Resolve one code address to a `module!symbol+0xN (file:line)` frame line.
-/// Best-effort: symbol lookup first (via `SymFromAddr` into a
-/// `SYMBOL_INFO`-sized buffer), then a `module+0xRVA` fallback using the
-/// module base from `SymGetModuleBase64`.
-#[cfg(windows)]
 /// The file name of the module containing `address` (e.g. `ntdll.dll`), or
 /// `None` when the address belongs to no loaded module.
 ///
@@ -801,6 +796,11 @@ fn module_name_for(process: HANDLE, address: u64) -> Option<(String, u64)> {
     Some((name, address - base))
 }
 
+/// Resolve one code address to a `module!symbol+0xN (file:line)` frame line.
+/// Best-effort: symbol lookup first (via `SymFromAddr` into a
+/// `SYMBOL_INFO`-sized buffer), then a `module+0xRVA` fallback using the
+/// module base from `SymGetModuleBase64`.
+#[cfg(windows)]
 fn resolve_frame(process: HANDLE, address: u64) -> String {
     ensure_symbols_ready(process);
 

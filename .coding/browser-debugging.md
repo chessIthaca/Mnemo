@@ -118,6 +118,12 @@ auto-run; mutations need approval.
 - **`browser_eval` / `offscreen_browser_eval` await promises** (`awaitPromise`
   + `return_by_value`), so `Promise.resolve(42)` yields `42`, not a promise
   handle.
+- **Operations abort after ~30s (~60s for navigate)** — an unresponsive or
+  wedged browser is killed and transparently restarted on the next
+  operation; re-navigate to reopen your pages. Keep eval scripts short and
+  split long waits: an infinite loop wedges the page until the timeout
+  reaps it (a background watchdog also probes liveness and force-reaps an
+  idle-wedged browser on its own).
 - **No same-origin limit on the live `browser_*` tools:** the child webview IS
   the top-level page (not an iframe in the app's DOM), so `browser_eval` /
   `browser_click` / `browser_type` operate on the child's main frame directly —

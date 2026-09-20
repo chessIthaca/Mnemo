@@ -71,3 +71,35 @@ fn build_workflow_ci_env_is_clap_bool() {
         }
     }
 }
+
+/// `uses:` pins must not target the deprecated Node.js 20 action majors.
+///
+/// GitHub deprecated Node 20 on Actions runners (2025-09-19): actions still
+/// targeting node20 are forced onto Node 24 with a warning annotation on
+/// every job, and a future runner image may drop Node 20 entirely, turning
+/// the warning into a hard failure. Regression: the pre-bump build.yml
+/// pinned actions/checkout@v4 (x3) and actions/setup-node@v4 (x2),
+/// annotating both jobs of every run (e.g. 35514715816, 35521221353).
+#[test]
+fn build_workflow_avoids_node20_actions() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+    for (idx, line) in text.lines().enumerate() {
+        let t = line.trim();
+        let t = t.strip_prefix("- ").unwrap_or(t);
+        if let Some(action) = t.strip_prefix("uses:") {
+            let action = action.trim();
+            assert!(
+                !matches!(action, "actions/checkout@v4" | "actions/setup-node@v4"),
+                "line {} pins {} - a node20-targeting action major (GitHub \
+                 deprecated Node 20 on Actions runners 2025-09-19); bump to \
+                 the Node-24-native v5 major",
+                idx + 1,
+                action
+            );
+        }
+    }
+}

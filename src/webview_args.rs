@@ -238,15 +238,27 @@ mod tests {
         assert!(env_flag_enabled(Some(std::ffi::OsString::from("yes"))));
     }
 
+    /// Regression (macOS CI leg, run 35521221353): the expected path used
+    /// to be a hardcoded `\`-separated literal, which can never equal a
+    /// `Path::join` result on a `/`-separator host — the production fn is
+    /// a plain join (fine); the assertion was platform-shaped. Assert the
+    /// structure (`<base>/WebView2/mnemo-<pid>`) instead, so the test
+    /// holds on every host.
     #[test]
     fn secondary_udf_is_per_pid_under_webview2() {
         let base = std::path::Path::new(r"C:\Users\carst\AppData\Local\com.mnemo.desktop");
         let dir = secondary_webview_data_dir(base, 4242);
+        // `Path::ends_with` compares components, and Windows parses both
+        // separators as component boundaries, so the forward-slash literal
+        // holds on every host.
+        assert!(
+            dir.ends_with(std::path::Path::new("WebView2/mnemo-4242")),
+            "the folder is <base>/WebView2/mnemo-<pid>, got {dir:?}"
+        );
         assert_eq!(
-            dir,
-            std::path::PathBuf::from(
-                r"C:\Users\carst\AppData\Local\com.mnemo.desktop\WebView2\mnemo-4242"
-            )
+            dir.parent().and_then(|p| p.parent()),
+            Some(base),
+            "the folder sits directly under the app-local-data base"
         );
         // Distinct pids get distinct folders.
         assert_ne!(dir, secondary_webview_data_dir(base, 4243));

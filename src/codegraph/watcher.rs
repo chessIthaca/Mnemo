@@ -44,20 +44,41 @@ use crate::codegraph::CodeGraph;
 /// backlog.jsonl) that would churn passes all session. Those files' content
 /// rows simply refresh on the next pass (startup, any source edit, or a
 /// manual rebuild).
+///
+/// Symlink-tolerant: FSEvents (macOS) delivers event paths with symlinks
+/// resolved, so a watched root under a symlinked path (every macOS
+/// tempdir: /var → /private/var) is also matched in its canonical form —
+/// see the fallback inside.
 fn is_indexable_path(path: &Path, root: &Path) -> bool {
-    let rel = match path.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => return false, // outside root — never react
-    };
-    for component in rel.components() {
-        if let std::path::Component::Normal(name) = component {
-            let name = &*name.to_string_lossy();
-            if crate::tool::agent::search::is_ignored_component(name) || name == ".coding" {
-                return false;
+    fn under_base(path: &Path, base: &Path) -> bool {
+        let rel = match path.strip_prefix(base) {
+            Ok(r) => r,
+            Err(_) => return false, // outside base — never react
+        };
+        for component in rel.components() {
+            if let std::path::Component::Normal(name) = component {
+                let name = &*name.to_string_lossy();
+                if crate::tool::agent::search::is_ignored_component(name) || name == ".coding" {
+                    return false;
+                }
             }
         }
+        true
     }
-    true
+    if under_base(path, root) {
+        return true;
+    }
+    // FSEvents (macOS) delivers event paths with every symlink resolved —
+    // a watched root that itself sits under a symlink (every macOS
+    // tempdir: /var → /private/var) then never prefix-matches, and the
+    // watcher silently filters ALL events out (both watcher tests failed
+    // this way on the macOS CI leg, run 35521221353). Retry against the
+    // canonicalized root; on Windows the raw prefix already matched (or
+    // the path is genuinely outside), so the fallback is inert there.
+    match std::fs::canonicalize(root) {
+        Ok(canonical) => canonical.as_path() != root && under_base(path, &canonical),
+        Err(_) => false,
+    }
 }
 
 /// Whether an event kind represents a content change worth re-indexing for
@@ -274,6 +295,38 @@ mod tests {
         assert!(!is_indexable_path(&other.path().join("o.rs"), root));
     }
 
+    /// Regression (macOS CI leg, run 35521221353): FSEvents delivers
+    /// event paths with every symlink resolved, so a watched root that
+    /// sits under a symlink (every macOS tempdir: /var → /private/var)
+    /// never prefix-matched its own events — the watcher filtered ALL of
+    /// them out and both watcher tests failed with "watcher must
+    /// auto-index…". The filter must accept an event path under the
+    /// canonical form of the root. Unix-only: building the alias takes a
+    /// symlink; the defect is FSEvents-specific (on Windows notify
+    /// delivers the watched root's own form and the raw prefix matches).
+    #[cfg(unix)]
+    #[test]
+    fn is_indexable_path_accepts_canonical_event_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        // An alias of the root — the not-yet-canonical form the watcher
+        // is handed.
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        // The event path in canonical form, as FSEvents delivers it.
+        let canonical = std::fs::canonicalize(&alias).unwrap();
+        let event = canonical.join("src").join("b.rs");
+        assert!(
+            is_indexable_path(&event, &alias),
+            "a canonical event path must match its symlinked root"
+        );
+        // The canonical root matches directly (the fast path).
+        assert!(is_indexable_path(&event, &canonical));
+        // The ignored-dir filtering holds through the canonical form too.
+        assert!(!is_indexable_path(&canonical.join("target/x.rs"), &alias));
+    }
+
     #[test]
     fn change_kind_filters_metadata_and_access() {
         use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
@@ -307,10 +360,11 @@ mod tests {
 
         std::fs::write(root.join("b.rs"), "pub fn beta() {}").unwrap();
 
-        // Poll with std sleeps — the fallback runtime drives the loop on its
-        // own thread.
+        // Poll with std sleeps — the fallback runtime drives the loop on
+        // its own thread. 200 × 50ms = 10s: FSEvents (macOS) delivers
+        // events after a latency window, so the poll must outlast it.
         let mut found = false;
-        for _ in 0..100 {
+        for _ in 0..200 {
             let view = graph.view().unwrap();
             if !view.resolve("beta").is_empty() {
                 found = true;
@@ -337,9 +391,11 @@ mod tests {
         // Create a new source file — the watcher should pick it up and index it.
         std::fs::write(root.join("b.rs"), "pub fn beta() {}").unwrap();
 
-        // Poll for the new symbol (bounded so a broken watcher fails fast).
+        // Poll for the new symbol (bounded so a broken watcher fails
+        // fast). 200 × 50ms = 10s: FSEvents (macOS) delivers events after
+        // a latency window, so the poll must outlast it.
         let mut found = false;
-        for _ in 0..100 {
+        for _ in 0..200 {
             let view = graph.view().unwrap();
             if !view.resolve("beta").is_empty() {
                 found = true;

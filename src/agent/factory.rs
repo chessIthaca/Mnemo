@@ -1672,7 +1672,17 @@ mod tests {
         // Apples-to-apples with the pre-disclosure behaviour only exists with
         // the browser feature on (the browser group carries ~900 tokens of
         // deferred schema); light builds skip this block.
-        #[cfg(feature = "browser")]
+        //
+        // Windows-only too (user decision 2026-09-20): the browser group
+        // is platform-conditional — the six on-screen WebView2 tools
+        // (register_browser_tools, cfg(windows)) exist only on Windows, so
+        // on macOS the all-loaded array is ~3.5k chars smaller and the
+        // deferral delta falls below the 12k threshold (measured 14700 on
+        // Windows vs 11246 on the macOS CI leg, run 35521221353 — the
+        // default array is identical, 32796 chars, on both sides). The
+        // assertion is calibrated to the Windows browser group; macOS
+        // skips it (the ceilings loop below still runs there).
+        #[cfg(all(feature = "browser", windows))]
         {
             // a fully
             // configured install (vision on, CDP on) with every group already

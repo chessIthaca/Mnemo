@@ -1,0 +1,44 @@
+# The new_release skill — cut a versioned GitHub release of Mnemo.
+#
+# Entered via skill_start("new_release") (Complete/Planning only). The build
+# workflow's `release` job (landed with the v0.1.1 release plan) creates the
+# GitHub release with the installers when a v* tag is pushed — this skill
+# prepares the tree and pushes the tag; it never creates the release itself.
+#
+# The prompt below is injected into the system prompt EVERY turn the skill
+# runs, so it stays a terse checklist. The rationale for its hard rules
+# lives here in comments (never injected) — do not move it into the prompt:
+# - ALL FIVE manifest files + the About-dialog fallback literal move together
+#   (step 1): src-tauri/tauri.conf.json is what the installers report; the
+#   Cargo.toml/package.json versions keep cargo and npm in sync. A half-bumped
+#   tree ships installers whose version disagrees with the tag.
+# - The tag points at MERGED main, never a branch tip (step 3): the release
+#   job checks out the tag — a branch-tip tag would build code that never
+#   landed on main.
+# - NEVER create the release manually (step 4): the workflow's release job
+#   owns release creation on v* tags. A manual asset-less release on the
+#   same tag blocks the CI one (published releases are immutable).
+# - The tag push is the one irreversible action (approval-gated; it triggers
+#   the ~30-90 min dual-runner build) — everything before it is fixable.
+# - The API check (step 4) reads the public repo REST API unauthenticated;
+#   no gh auth is needed.
+
+name = "new_release"
+available_in = ["complete", "planning"]
+target_state = "planning"
+tools = [
+  "file_read",
+  "file_edit",
+  "shell",
+  "git",
+  "skill_end",
+  "abandon_skill",
+]
+prompt = """\
+Cut a new versioned release of Mnemo. The build workflow's release job creates the GitHub release (with .msi/.exe/.dmg/mnemo.app.zip assets + generated notes) when a v* tag is pushed — this skill prepares the tree and pushes the tag; it NEVER creates the release itself. Steps:
+1. Bump the version in ALL FIVE manifest files together — src-tauri/tauri.conf.json, package.json, frontend/package.json, Cargo.toml, src-tauri/Cargo.toml — plus the About-dialog fallback literal in frontend/src/components/about/AboutDialog.tsx (patch bump, or the version named in the request; if already bumped, continue). Then `npm install --package-lock-only` to refresh package-lock.json and `cargo check` to refresh Cargo.lock, and commit everything on the working branch.
+2. Land it on main: commit ALL uncommitted work (.coding/ included), `git checkout main`, sync via shell (`git fetch origin`, `git pull --no-rebase`), merge --no-ff on the git tool — any conflict, in the pull or the merge: file_edit taking the UNION of both sides, `git add` + `git commit`; never drop a side, never `-X ours`/`-X theirs` — then verify BOTH builds (`npm run build` in frontend/ AND `cd src-tauri && cargo build`), `git branch -d`, push, and supersede this branch's stale status memories with successors recording "MERGED into main at <sha>" (skip when nothing matches).
+3. Tag the MERGED main commit (never a branch tip): `git tag -a v<version> -m "Mnemo v<version>"`, then push the tag via shell `git push origin v<version>` (approval-gated — triggers the ~30-90 min dual-runner build).
+4. Verify the run started: shell `Invoke-RestMethod https://api.github.com/repos/chessIthaca/Mnemo/actions/runs?event=push` — confirm a run for the tag is queued/in_progress. Do NOT create the release manually; it appears when the run completes.
+5. Report the run URL + the expected release URL (https://github.com/chessIthaca/Mnemo/releases/tag/v<version>); `skill_end` → Planning.\
+"""

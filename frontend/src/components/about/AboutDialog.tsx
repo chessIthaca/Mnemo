@@ -39,7 +39,7 @@ interface AboutDialogProps {
 export function AboutDialog({ open, onClose }: AboutDialogProps) {
   // The app version (from tauri.conf.json). Fetched when the dialog opens;
   // falls back to the manifest version on any error.
-  const [version, setVersion] = useState<string>("0.1.0");
+  const [version, setVersion] = useState<string>("0.1.1");
 
   // Hide the native child WebView2 while this full-viewport modal is open
   // (it's a separate HWND composited above the app's HTML — see useBrowserOverlay).

@@ -1,6 +1,7 @@
 +++
 title = "GitHub build workflow fails to load — secrets context in step if: conditionals (L111/121/141)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Symptom (user report, this session): GitHub Actions build workflow fails to load — "Unrecognized named-value: 'secrets'" at .github/workflows/build.yml L111, L121, L141 (the three Apple-secrets step `if:` conditionals). Surfaced after the L52 YAML-syntax fix (56132d3) let the file parse far enough for expression validation; the workflow had never loaded successfully.

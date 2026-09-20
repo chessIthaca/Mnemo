@@ -34,8 +34,7 @@ concurrency:
 
 env:
   # The tauri CLI's --ci flag (clap) reads the CI env var and only
-  # accepts true/false: "1" kills 
-px tauri build at startup
+  # accepts true/false: "1" kills `npx tauri build` at startup
   # (regression test: build_workflow_ci_env_is_clap_bool).
   CI: "true"
 

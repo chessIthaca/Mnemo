@@ -80,26 +80,6 @@ struct LoadToolsArgs {
     group: String,
 }
 
-/// Whether revealing `group` is allowed under `filter`. An `mcp.*` reveal
-/// connects to a foreign server (spawning a process / opening a session
-/// that lingers in the manager), so it is gated like the tools it would
-/// materialize — Agent category + NeedsApproval: allowed in
-/// Executing/Reviewing, blocked in Planning/Complete (safety gate) and
-/// research plans (name-prefix exclusion). Non-mcp groups pass through
-/// (the browser group stays loadable wherever `load_tools` itself is).
-/// Enforced by the dispatch layer right after the workflow filter
-/// re-check (review LOW 2).
-pub fn mcp_reveal_allowed(filter: &crate::tool::ToolFilter, group: &str) -> bool {
-    if !group.trim().starts_with("mcp.") {
-        return true;
-    }
-    filter.allows(
-        crate::tool::ToolCategory::Agent,
-        crate::tool::SafetyLevel::NeedsApproval,
-        "mcp__probe__probe",
-    )
-}
-
 #[async_trait]
 impl Tool for LoadToolsTool {
     fn name(&self) -> &str {
@@ -370,29 +350,6 @@ mod tests {
             "the schema enum is generated from the runtime table, never hand-listed"
         );
         assert!(en.iter().any(|v| v == "mcp.fs"));
-    }
-
-    #[test]
-    fn mcp_reveal_gate_matches_the_tool_filter() {
-        // LOW 2: an mcp.* reveal is allowed exactly where its (Agent +
-        // NeedsApproval) tools would be — Executing and Reviewing (where
-        // finding-fixes run), never in the read-only states, research
-        // plans, or a reviewer's allow-list.
-        use crate::tool::ToolFilter;
-        assert!(mcp_reveal_allowed(&ToolFilter::Executing, "mcp.fs"));
-        assert!(mcp_reveal_allowed(&ToolFilter::Reviewing, "mcp.fs"));
-        assert!(mcp_reveal_allowed(&ToolFilter::Executing, " mcp.fs "));
-        assert!(!mcp_reveal_allowed(&ToolFilter::Planning, "mcp.fs"));
-        assert!(!mcp_reveal_allowed(&ToolFilter::Complete, "mcp.fs"));
-        assert!(!mcp_reveal_allowed(
-            &ToolFilter::ExecutingResearch,
-            "mcp.fs"
-        ));
-        assert!(!mcp_reveal_allowed(&ToolFilter::Reviewer(vec![]), "mcp.fs"));
-        // Non-mcp groups are none of this gate's business — the browser
-        // group stays loadable wherever load_tools itself is allowed.
-        assert!(mcp_reveal_allowed(&ToolFilter::Planning, "browser"));
-        assert!(mcp_reveal_allowed(&ToolFilter::Complete, "image"));
     }
 
     /// A minimal deferred tool for the renderer tests: fixed group, schema

@@ -840,6 +840,8 @@ impl ToolFilter {
                 // user request to queue an item must never be impossible —
                 // extends mid-skill, e.g. a run-all item invoking
                 // merge_to_main when the user steers to queue an item.
+                // load_tools rides it too (backlog 77efc1b7) — see its
+                // comment below.
                 ToolCategory::Memory => true,
                 _ => {
                     name == "ask_user"
@@ -862,6 +864,15 @@ impl ToolFilter {
                         || name == "backlog_add"
                         || name == "backlog_status"
                         || name == "backlog_list"
+                        // load_tools rides the always-available set (backlog
+                        // 77efc1b7): a skill whose allow-list names MCP
+                        // tools needs the loader to materialize them — they
+                        // don't exist in the registry until the group is
+                        // revealed (named browser/image tools already
+                        // bypass deferral via `explicitly_names`). The
+                        // loaded tools still pass through this allow-list,
+                        // so this widens nothing.
+                        || name == "load_tools"
                         || allowed.iter().any(|n| n == name)
                 }
             },
@@ -2518,6 +2529,44 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert!(!names.contains(&"backlog_list".to_string()));
+    }
+
+    /// load_tools is callable in every workflow state and inside skills
+    /// (backlog 77efc1b7): the mcp.* reveal state gate is lifted — any
+    /// state can reveal/list a group's tools, and the revealed tools stay
+    /// filter-gated (mcp__ names stay excluded in Planning/Complete/
+    /// research). Inside a skill the loader materializes named MCP tools
+    /// (they don't exist in the registry until the group is revealed;
+    /// named browser/image tools already bypass deferral via
+    /// `explicitly_names`). A read-only reviewer never gets it (its strict
+    /// allow-list would have to name it, and the base list never does).
+    #[test]
+    fn load_tools_allowed_in_every_state_and_inside_skills() {
+        let allowed = |f: &ToolFilter| {
+            f.allows(ToolCategory::Agent, SafetyLevel::AutoRun, "load_tools")
+        };
+        assert!(allowed(&ToolFilter::Planning), "allowed in Planning");
+        assert!(allowed(&ToolFilter::Executing), "allowed in Executing");
+        assert!(
+            allowed(&ToolFilter::ExecutingResearch),
+            "allowed in ExecutingResearch"
+        );
+        assert!(allowed(&ToolFilter::PlanFrozen), "allowed in PlanFrozen");
+        assert!(allowed(&ToolFilter::Reviewing), "allowed in Reviewing");
+        assert!(allowed(&ToolFilter::Complete), "allowed in Complete");
+        assert!(
+            allowed(&ToolFilter::Skill(vec![])),
+            "allowed inside a skill (always-available set)"
+        );
+        assert!(
+            allowed(&ToolFilter::Skill(vec![
+                "offscreen_browser_navigate".into()
+            ])),
+            "allowed inside a skill that names deferred tools"
+        );
+        // A reviewer gets it only if its strict allow-list names it — the
+        // read-only surface never auto-grants it.
+        assert!(!allowed(&ToolFilter::Reviewer(vec![])));
     }
 
     /// The Skill filter is an allow-list: only the named tools (+ all memory

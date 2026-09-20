@@ -260,23 +260,6 @@ impl AgentLoop {
                     Vec::new(),
                 );
             }
-            // An mcp.* reveal connects to a foreign server (spawning a
-            // process that lingers in the manager) — gate it like the
-            // tools it would materialize (Agent + NeedsApproval), so
-            // research/planning cannot open a connection whose tools are
-            // unusable there (review LOW 2).
-            if let Some(group) = parsed_call.arguments.get("group").and_then(|v| v.as_str()) {
-                if !crate::tool::agent::load_tools::mcp_reveal_allowed(&filter, group) {
-                    return (
-                        ToolResult::error(format!(
-                            "tool group '{group}' is not available in the current workflow \
-                             state ({})",
-                            wf.state()
-                        )),
-                        Vec::new(),
-                    );
-                }
-            }
         }
 
         // Phase 4 main-agent-only plan policy gate (dispatch layer, after the

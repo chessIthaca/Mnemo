@@ -26,6 +26,7 @@ pub mod provider;
 pub mod runtime;
 pub mod safety_rules;
 pub mod skill;
+pub mod shell_path;
 pub mod thread_util;
 pub mod tool;
 pub mod webview_args;

@@ -119,9 +119,11 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --no-fail-fast 2>&1 | tee macos-test-output.txt
-      # Re-run only the failing tests with full stdout/stderr captured —
-      # `--no-capture` surfaces the panics the summary line alone hides.
-      - name: Re-run failing tests with full output
+      # Re-run the WHOLE workspace with stdout/stderr captured — `--no-capture`
+      # surfaces the panics the summary line alone hides. cargo has no
+      # "only the failed tests" mode, so this re-runs everything (it only
+      # runs when the first pass already failed, and appends to the same log).
+      - name: Re-run the test suite with full output
         if: ${{ steps.rust-tests.outcome == 'failure' }}
         continue-on-error: true
         run: |

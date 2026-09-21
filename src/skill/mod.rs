@@ -510,6 +510,43 @@ prompt = "Merge."
             sync < branch_merge,
             "the origin sync must precede the branch merge (sync at {sync}, merge at {branch_merge})"
         );
+        // The ruleset-aware two-path flow (ruleset 23755694, 2026-09-21): the
+        // detection step must exist and PRECEDE the direct path's checkout
+        // (detection before action), the PR path and the no-bypass rule must
+        // be pinned, and the direct path must push BEFORE deleting the branch
+        // (the GH013 recovery needs the ref intact — review round 1, H1).
+        let ruleset_check = merge
+            .prompt
+            .find("gh api repos/<owner>/<repo>/rulesets")
+            .expect("merge_to_main prompt carries the ruleset check");
+        let checkout_main = merge
+            .prompt
+            .find("git checkout main")
+            .expect("merge_to_main prompt carries the direct path");
+        assert!(
+            ruleset_check < checkout_main,
+            "the ruleset check must precede the direct path's checkout (check at {ruleset_check}, checkout at {checkout_main})"
+        );
+        assert!(
+            merge.prompt.contains("gh pr create --base main"),
+            "merge_to_main prompt carries the PR path"
+        );
+        assert!(
+            merge.prompt.contains("NEVER bypass"),
+            "merge_to_main prompt carries the no-bypass rule"
+        );
+        let direct_push = merge
+            .prompt
+            .find("git push` on the git tool")
+            .expect("merge_to_main prompt carries the direct-path push");
+        let branch_delete = merge
+            .prompt
+            .find("git branch -d <branch>")
+            .expect("merge_to_main prompt carries the branch cleanup");
+        assert!(
+            direct_push < branch_delete,
+            "the direct path must push BEFORE deleting the branch — the GH013 recovery needs the ref (push at {direct_push}, delete at {branch_delete})"
+        );
     }
 
     #[test]

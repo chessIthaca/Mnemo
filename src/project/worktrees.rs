@@ -12,11 +12,29 @@
 //! app-side and serialized by the caller: the merge_to_main skill cannot
 //! run from a linked worktree (git refuses to check out `main` there —
 //! it is checked out in the main worktree), so when a spawned item
-//! resolves Done the app merges its branch into `main` via a dedicated
-//! landing worktree, deletes the branch, and removes the item worktree.
-//! Merge conflicts are SURFACED, never auto-resolved: the merge is
-//! aborted, the branch + worktree are kept, and the conflicted file list
-//! is returned for the item note.
+//! resolves Done the app lands its branch itself. Two paths (backlog
+//! b52b041a, mirroring the skill's DECISION 2027-01-11): an UNPROTECTED
+//! `main` gets the direct landing — a `--no-ff` merge via the dedicated
+//! landing worktree, then branch delete + worktree removal; a PROTECTED
+//! `main` (an ACTIVE GitHub ruleset with a `pull_request` rule — this
+//! repo's 23755694) cannot receive direct pushes (GH013), so the
+//! landing pushes the branch and opens a PR the human approves and
+//! merges — the branch is KEPT (the PR's head), only the worktree is
+//! removed; once the human's merge is visible in `origin/main`, the
+//! next run-start sweeps the redundant ref
+//! ([`sweep_merged_runall_branches`], backlog 64662ef2). Merge
+//! conflicts are SURFACED, never auto-resolved: the merge
+//! is aborted, the branch + worktree are kept, and the conflicted file
+//! list is returned for the item note.
+//!
+//! Known residual (review L3, 2026-09-21): a detection FALSE NEGATIVE
+//! (gh transiently failing while the repo IS protected) takes the direct
+//! path — the local merge strands with no later signal (the direct path
+//! never pushes `main`, so no GH013 ever fires) and a later merge_to_main
+//! GH013 recovery would discard it. Fail-open is still the right call
+//! (gh-missing forces it; a false POSITIVE would push branches + open
+//! PRs on every unprotected repo), but the residual is real and
+//! accepted.
 //!
 //! All functions run blocking git subprocesses on the blocking thread
 //! pool (see `git_ops` for why). Unlike the rest of `git_ops`, the tests
@@ -26,7 +44,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::project::git_ops::git_raw;
+use crate::project::git_ops::{gh_raw, git_raw};
 
 /// The worktree root: `<main_root>/.worktrees` (gitignored — see the
 /// `.gitignore` entry).
@@ -107,20 +125,12 @@ pub async fn remove_item_worktree(
     branch: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let worktree_str = worktree
-            .to_str()
-            .ok_or("non-UTF-8 worktree path")?
-            .to_string();
-        // Prune stale worktree metadata first (review R3-L2): a worktree
-        // whose directory is already gone (deleted manually) leaves stale
-        // metadata that makes BOTH the remove and the branch delete fail
-        // ("cannot delete branch used by worktree"). Then run both ops
-        // independently — a remove failure must not skip the branch
-        // delete: a stale `wt/runall-*` branch blocks every later
-        // spawned-lane dispatch of the item ("branch already exists" →
-        // the fill's skip arm → permanently undispatchable via lanes).
-        let _ = git_raw(&main_root, &["worktree", "prune"]);
-        let removed = git_raw(&main_root, &["worktree", "remove", "--force", &worktree_str]);
+        // Both ops run independently (review R3-L2): a remove failure
+        // must not skip the branch delete — a stale `wt/runall-*` branch
+        // blocks every later spawned-lane dispatch of the item ("branch
+        // already exists" → the fill's skip arm → permanently
+        // undispatchable via lanes).
+        let removed = remove_worktree_only_impl(&main_root, &worktree);
         let deleted = git_raw(&main_root, &["branch", "-D", &branch]);
         removed?;
         deleted?;
@@ -128,6 +138,244 @@ pub async fn remove_item_worktree(
     })
     .await
     .map_err(|e| format!("worktree remove task failed: {e}"))?
+}
+
+/// Remove a dispatched item's worktree WITHOUT deleting its branch —
+/// the PR-path landing (backlog b52b041a): the branch is the PR's head
+/// and must survive the human merge. Merged `wt/runall-*` refs are
+/// swept at the next run-start once their commits are in `origin/main`
+/// ([`sweep_merged_runall_branches`], backlog 64662ef2); until then a
+/// stale branch only blocks re-dispatch of a Done item, which never
+/// re-dispatches.
+pub async fn remove_worktree_only(
+    main_root: PathBuf,
+    worktree: PathBuf,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || remove_worktree_only_impl(&main_root, &worktree))
+        .await
+        .map_err(|e| format!("worktree remove task failed: {e}"))?
+}
+
+/// The synchronous core of [`remove_worktree_only`] — shared with
+/// [`remove_item_worktree`] (which adds the branch delete). Prunes
+/// stale worktree metadata first (review R3-L2): a worktree whose
+/// directory is already gone (deleted manually) leaves stale metadata
+/// that makes the remove (and any branch delete) fail ("cannot delete
+/// branch used by worktree").
+fn remove_worktree_only_impl(main_root: &Path, worktree: &Path) -> Result<(), String> {
+    let worktree_str = worktree
+        .to_str()
+        .ok_or("non-UTF-8 worktree path")?
+        .to_string();
+    let _ = git_raw(main_root, &["worktree", "prune"]);
+    git_raw(main_root, &["worktree", "remove", "--force", &worktree_str]).map(|_| ())
+}
+
+/// Sweep merged `wt/runall-*` branches (backlog 64662ef2, review L4 of
+/// the b52b041a landing): the PR-path landing keeps every branch as a
+/// PR head — after the human merges, the local ref is redundant (its
+/// commits are in `origin/main`) and agent.md's "no branches
+/// accumulate" topology wants it gone.
+///
+/// The gate is conservative by construction: a branch is deleted only
+/// when its tip is an ANCESTOR of `origin/main` (`git merge-base
+/// --is-ancestor`) — the commits are already in main, so the local
+/// ref is pure redundancy (the remote PR head is untouched). Unmerged
+/// branches (PR open, or the merge not yet visible locally) are never
+/// touched. A branch still checked out in a worktree IS considered
+/// (its `+ ` listing prefix is stripped) but refused by git itself
+/// ("cannot delete branch used by worktree") — the in-flight case
+/// needs no extra code beyond the parse. A best-effort `git fetch
+/// origin` refreshes `origin/main` first: a failed fetch only DELAYS
+/// the sweep (a stale ref under-deletes, never over-deletes), and a
+/// `git worktree prune` first clears stale metadata so an
+/// externally-deleted worktree does not pin its branch in the listing
+/// forever (the R3-L2 lesson). No `gh pr view` double-guard: ancestry
+/// into `origin/main` already implies the commits landed. Known
+/// residual (review L3, 2026-09-21): a SQUASH-merged PR breaks
+/// ancestry (the squash commit is content-identical but SHA-different)
+/// — the branch lingers, under-deleting only; a `gh pr view --json
+/// state` == MERGED fallback would close it if ever needed.
+///
+/// Returns the deleted branch names (for the run-start log).
+pub async fn sweep_merged_runall_branches(main_root: PathBuf) -> Vec<String> {
+    tokio::task::spawn_blocking(move || sweep_merged_runall_branches_impl(&main_root))
+        .await
+        .unwrap_or_default()
+}
+
+/// The synchronous core of [`sweep_merged_runall_branches`].
+fn sweep_merged_runall_branches_impl(main_root: &Path) -> Vec<String> {
+    // Best-effort refresh — a stale origin/main only delays the sweep.
+    let _ = git_raw(main_root, &["fetch", "origin"]);
+    // Clear stale worktree metadata first (the R3-L2 lesson): an
+    // externally-deleted worktree's stale entry would keep marking its
+    // branch as checked out, pinning it in the listing forever.
+    let _ = git_raw(main_root, &["worktree", "prune"]);
+    let Ok(listing) = git_raw(main_root, &["branch", "--list", "wt/runall-*"]) else {
+        return Vec::new();
+    };
+    let mut deleted = Vec::new();
+    for line in listing.lines() {
+        // `git branch --list` prefixes the current branch with "* ",
+        // branches checked out in OTHER worktrees with "+ " (the
+        // in-flight runall shape), and the rest with two spaces. Both
+        // markers are stripped so a worktree-held branch is CONSIDERED —
+        // git's own "cannot delete branch used by worktree" refusal is
+        // what keeps it (review L1, 2026-09-21).
+        let branch = line
+            .strip_prefix("* ")
+            .or_else(|| line.strip_prefix("+ "))
+            .unwrap_or(line)
+            .trim();
+        if !branch.starts_with("wt/runall-") {
+            continue;
+        }
+        let merged = git_raw(
+            main_root,
+            &["merge-base", "--is-ancestor", branch, "origin/main"],
+        )
+        .is_ok();
+        if merged && git_raw(main_root, &["branch", "-D", branch]).is_ok() {
+            deleted.push(branch.to_string());
+        }
+    }
+    deleted
+}
+
+/// Parse a GitHub remote URL into `(owner, repo)` — the https, ssh,
+/// and scp-like forms, with or without the trailing `.git`, a trailing
+/// `/`, an ssh port (`ssh://git@github.com:22/o/r`), and a mixed-case
+/// host (`https://GitHub.com/o/r` — host matching is case-insensitive;
+/// the owner/repo segment stays case-sensitive) (backlog b52b041a: the
+/// ruleset-aware landing needs the slug for `gh api`; the edge shapes
+/// are review L2, 2026-09-21).
+///
+/// Non-GitHub remotes (local paths, other hosts) return `None` — the
+/// caller treats that as "nothing to check" (the direct path).
+fn parse_github_remote_url(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    // Host matching is case-insensitive; `to_ascii_lowercase`
+    // preserves length, so the lowercase suffix lengths index `url`
+    // directly.
+    let lower = url.to_ascii_lowercase();
+    let mut rest = None;
+    for prefix in [
+        "https://github.com/",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ] {
+        if let Some(suffix) = lower.strip_prefix(prefix) {
+            rest = Some(&url[url.len() - suffix.len()..]);
+            break;
+        }
+    }
+    // The ssh port form: ssh://git@github.com:<port>/o/r — drop the
+    // port segment (only when it is all digits, so a malformed
+    // ssh://git@github.com:o/r does not silently drop its owner).
+    if rest.is_none() {
+        if let Some(after) = lower.strip_prefix("ssh://git@github.com:") {
+            let url_after = &url[url.len() - after.len()..];
+            if let Some(slash) = url_after.find('/') {
+                let port = &url_after[..slash];
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    rest = Some(&url_after[slash + 1..]);
+                }
+            }
+        }
+    }
+    let rest = rest?;
+    let rest = rest.trim_end_matches('/');
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (owner, repo) = rest.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// The repo's GitHub `(owner, repo)` slug, from the `origin` remote —
+/// `None` when there is no origin or it is not a GitHub remote (the
+/// ruleset check only applies to GitHub repos; everything else takes
+/// the direct path).
+fn remote_github_slug(main_root: &Path) -> Option<(String, String)> {
+    let url = git_raw(main_root, &["remote", "get-url", "origin"]).ok()?;
+    parse_github_remote_url(url.trim())
+}
+
+/// Whether a `gh api repos/{owner}/{repo}/rulesets` payload shows a
+/// ruleset that blocks direct pushes to main: an ACTIVE ruleset
+/// carrying a `pull_request` rule (this repo: 23755694 — "Protect
+/// from direct pushing.", required_approving_review_count 1).
+///
+/// Fail-open by design (backlog b52b041a, mirroring the merge_to_main
+/// skill's decision): malformed JSON or an unexpected shape reads as
+/// "no ruleset" → the direct path. A false negative strands one local
+/// merge on the protected repo, but a false POSITIVE would push
+/// branches + open PRs on every unprotected repo — the worse failure.
+fn rulesets_json_blocks_direct_push(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(rulesets) = v.as_array() else {
+        return false;
+    };
+    rulesets.iter().any(|rs| {
+        rs.get("enforcement").and_then(|e| e.as_str()) == Some("active")
+            && rs
+                .get("rules")
+                .and_then(|r| r.as_array())
+                .is_some_and(|rules| {
+                    rules.iter().any(|rule| {
+                        rule.get("type").and_then(|t| t.as_str()) == Some("pull_request")
+                    })
+                })
+    })
+}
+
+/// Whether `main` is protected against direct pushes (backlog b52b041a):
+/// an ACTIVE GitHub ruleset with a `pull_request` rule on the repo.
+///
+/// Mirrors the merge_to_main skill's up-front check (DECISION
+/// 2027-01-11): `gh repo view --json nameWithOwner` for the slug
+/// (falling back to parsing the origin remote URL), then
+/// `gh api repos/{owner}/{repo}/rulesets`. ANY failure — gh missing,
+/// unauthenticated, no GitHub remote, a network error — reads as
+/// `false` (the direct path): gh-missing also means `gh pr create`
+/// would fail, so the PR path is not an option (the skill made the
+/// same call). Runs 2-3 subprocesses per landing — landings are
+/// serialized and rare; no caching by design (a ruleset added between
+/// two landings must be seen by the second).
+///
+/// Residual (review L3, 2026-09-21): a transient failure on a
+/// protected repo strands the local merge with no recovery signal —
+/// accepted, because the alternative (fail-closed) would PR-flow
+/// every unprotected repo on any gh hiccup.
+fn main_is_protected(main_root: &Path) -> bool {
+    let slug: Option<(String, String)> = gh_raw(
+        main_root,
+        &["repo", "view", "--json", "nameWithOwner"],
+    )
+    .ok()
+    .and_then(|out| {
+        let name = serde_json::from_str::<serde_json::Value>(&out)
+            .ok()?
+            .get("nameWithOwner")?
+            .as_str()?
+            .to_string();
+        let (owner, repo) = name.split_once('/')?;
+        Some((owner.to_string(), repo.to_string()))
+    });
+    let Some((owner, repo)) = slug.or_else(|| remote_github_slug(main_root)) else {
+        return false;
+    };
+    let Ok(json) = gh_raw(
+        main_root,
+        &["api", &format!("repos/{owner}/{repo}/rulesets")],
+    ) else {
+        return false;
+    };
+    rulesets_json_blocks_direct_push(&json)
 }
 
 /// Why a landing failed — the caller treats the arms differently
@@ -144,8 +392,23 @@ pub enum LandError {
     Git(String),
 }
 
-/// Land one dispatched item's branch into `main` via the dedicated
-/// landing worktree.
+/// How a landing landed (backlog b52b041a): the direct path merges into
+/// local `main`; the protected path opens a PR the human merges.
+#[derive(Debug)]
+pub enum Landed {
+    /// Merged into local `main` (`--no-ff`) — the direct path; the
+    /// branch delete + worktree removal follow in
+    /// [`remove_item_worktree`].
+    Merged,
+    /// A PR was opened (the protected path): its URL. The branch is
+    /// KEPT for the human merge — only the worktree is removed
+    /// ([`remove_worktree_only`]).
+    PullRequest(String),
+}
+
+/// Land one dispatched item's branch — via the dedicated landing
+/// worktree on an unprotected `main`, or via a PR on a protected one
+/// (backlog b52b041a).
 ///
 /// The landing worktree (`<main_root>/.worktrees/landing`, `main`
 /// checked out) is provisioned lazily and reused across landings —
@@ -154,22 +417,38 @@ pub enum LandError {
 /// be mid-item (the main agent's uncommitted work must never be touched
 /// by a landing). The CALLER serializes landings (one at a time).
 ///
-/// `Ok(())` — merged (`--no-ff`, so `main` only ever receives merge
-/// commits, mirroring the merge_to_main skill). The branch delete +
-/// worktree removal happen in [`remove_item_worktree`] afterwards (git
-/// refuses to delete a branch its worktree still has checked out).
+/// `Ok(Landed::Merged)` — the direct path: merged (`--no-ff`, so `main`
+/// only ever receives merge commits, mirroring the merge_to_main skill).
+/// The branch delete + worktree removal happen in
+/// [`remove_item_worktree`] afterwards (git refuses to delete a branch
+/// its worktree still has checked out).
+/// `Ok(Landed::PullRequest(url))` — the protected path: the branch was
+/// pushed and a PR opened (the human approves and merges); the branch
+/// is KEPT and only the worktree is removed ([`remove_worktree_only`]).
 /// `Err(LandError::Conflict(files))` — the merge conflicted: it was
 /// aborted (the landing worktree is back on clean `main`), the branch is
 /// KEPT for manual resolution, and the conflicted paths are returned for
 /// the item note.
-pub async fn land_item_branch(main_root: PathBuf, branch: String) -> Result<(), LandError> {
+pub async fn land_item_branch(
+    main_root: PathBuf,
+    branch: String,
+) -> Result<Landed, LandError> {
     tokio::task::spawn_blocking(move || land_item_branch_impl(&main_root, &branch))
         .await
         .map_err(|e| LandError::Git(format!("landing task failed: {e}")))?
 }
 
 /// The synchronous core of [`land_item_branch`].
-fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<(), LandError> {
+fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<Landed, LandError> {
+    // Backlog b52b041a: a protected `main` cannot receive the app-managed
+    // direct merge — the local merge commits are unpushable (GH013 on
+    // any direct push) and the post-landing branch delete would strand
+    // them — so land via a PR instead (the merge_to_main skill's design,
+    // DECISION 2027-01-11). Checked BEFORE the landing worktree: the PR
+    // path never touches it.
+    if main_is_protected(main_root) {
+        return land_via_pull_request(main_root, branch);
+    }
     let landing = worktrees_dir(main_root).join("landing");
     if !landing.exists() {
         let landing_str = landing
@@ -221,7 +500,7 @@ fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<(), LandError
         // Merged — the branch delete + worktree removal happen in
         // remove_item_worktree (git refuses to delete a branch its
         // worktree still has checked out).
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Landed::Merged),
         Err(merge_err) => {
             // Capture the conflicted paths BEFORE aborting (the abort
             // clears the index state that --diff-filter=U reads).
@@ -247,6 +526,96 @@ fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<(), LandError
     }
 }
 
+/// The protected-main landing (backlog b52b041a): push the branch and
+/// open a PR — the human approves and merges (the app cannot
+/// self-approve, required_approving_review_count 1). NEVER bypass the
+/// ruleset (no force-push, no admin override, no ruleset edits).
+///
+/// The branch is KEPT (the PR's head; merged `wt/runall-*` refs are
+/// swept at the next run-start — [`sweep_merged_runall_branches`],
+/// backlog 64662ef2). An already-open PR for the branch is reported
+/// instead of erroring
+/// (idempotent re-landing, the skill's rule). Any failure surfaces as
+/// [`LandError::Git`] naming the PR requirement and the exact command
+/// to run manually.
+///
+/// Unlike the skill's PR path (which builds the branch first — PRs get
+/// no CI), this does NOT build: the spawned agent's own closing
+/// sequence already ran the tests in the worktree before the plan
+/// completed — the producer-side guarantee the skill lacks (review
+/// L5, 2026-09-21, a conscious deviation from the mirrored design).
+fn land_via_pull_request(main_root: &Path, branch: &str) -> Result<Landed, LandError> {
+    let pr_requirement = format!(
+        "main is protected (an ACTIVE pull_request ruleset blocks direct \
+         pushes) — the branch {branch} must land via a pull request; run \
+         manually: gh pr create --base main --head {branch}"
+    );
+    // Push the branch (the PR's head); -u ties it to origin for the
+    // human's later operations.
+    git_raw(main_root, &["push", "-u", "origin", branch])
+        .map_err(|e| LandError::Git(format!("{pr_requirement} (push failed: {e})")))?;
+    // Title: the branch's latest commit subject; body: the commits the
+    // PR brings + the review note.
+    let mut title = git_raw(main_root, &["log", "-1", "--pretty=%s", branch])
+        .map_err(LandError::Git)?
+        .trim()
+        .to_string();
+    // A tip commit with an empty subject (git allows it via
+    // --allow-empty-message) would send `--title ""` — gh rejects a
+    // blank title. Fall back to the branch name (review L1,
+    // 2026-09-21): the landing stays robust instead of degrading to
+    // the error path.
+    if title.is_empty() {
+        title = branch.to_string();
+    }
+    let commits = git_raw(main_root, &["log", &format!("main..{branch}"), "--oneline"])
+        .map_err(LandError::Git)?;
+    let body = format!(
+        "{commits}\n\nApp-managed run-all landing on a protected main — \
+         awaiting human review (the app cannot self-approve)."
+    );
+    let url = match gh_raw(
+        main_root,
+        &[
+            "pr",
+            "create",
+            "--base",
+            "main",
+            "--head",
+            branch,
+            "--title",
+            &title,
+            "--body",
+            &body,
+        ],
+    ) {
+        Ok(out) => out.trim().to_string(),
+        Err(create_err) => {
+            // A PR may already exist for the branch (an earlier landing
+            // attempt, or a re-landing) — report it instead of failing
+            // (the skill's idempotence rule).
+            let existing = gh_raw(main_root, &["pr", "view", branch, "--json", "url"])
+                .ok()
+                .and_then(|out| {
+                    serde_json::from_str::<serde_json::Value>(&out)
+                        .ok()?
+                        .get("url")?
+                        .as_str()
+                        .map(str::to_string)
+                });
+            match existing {
+                Some(url) => url,
+                None => {
+                    return Err(LandError::Git(format!(
+                        "{pr_requirement} (gh pr create failed: {create_err})"
+                    )))
+                }
+            }
+        }
+    };
+    Ok(Landed::PullRequest(url))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +634,231 @@ mod tests {
         git_raw(dir.path(), &["add", "-A"]).unwrap();
         git_raw(dir.path(), &["commit", "-m", "init"]).unwrap();
         dir
+    }
+
+    #[test]
+    fn parse_github_remote_url_takes_both_forms() {
+        // Backlog b52b041a: the ruleset check needs the owner/repo slug
+        // from whatever remote form the clone uses.
+        let expect = Some(("chessIthaca".to_string(), "Mnemo".to_string()));
+        assert_eq!(
+            parse_github_remote_url("https://github.com/chessIthaca/Mnemo"),
+            expect
+        );
+        assert_eq!(
+            parse_github_remote_url("https://github.com/chessIthaca/Mnemo.git"),
+            expect
+        );
+        assert_eq!(
+            parse_github_remote_url("git@github.com:chessIthaca/Mnemo.git"),
+            expect
+        );
+        assert_eq!(
+            parse_github_remote_url("ssh://git@github.com/chessIthaca/Mnemo.git"),
+            expect
+        );
+        // Review L2 (2026-09-21): trailing slash, ssh port, and
+        // mixed-case host — realistic remote forms that must all yield
+        // the slug (a None here fail-opens the landing onto the direct
+        // path on a protected repo).
+        assert_eq!(
+            parse_github_remote_url("https://github.com/chessIthaca/Mnemo/"),
+            expect
+        );
+        assert_eq!(
+            parse_github_remote_url("ssh://git@github.com:22/chessIthaca/Mnemo.git"),
+            expect
+        );
+        assert_eq!(
+            parse_github_remote_url("https://GitHub.com/chessIthaca/Mnemo.git"),
+            expect
+        );
+        // Non-GitHub remotes and garbage: no slug → the direct path.
+        assert_eq!(parse_github_remote_url("https://gitlab.com/o/r"), None);
+        assert_eq!(parse_github_remote_url("C:\\some\\path"), None);
+        assert_eq!(parse_github_remote_url(""), None);
+    }
+
+    #[test]
+    fn remote_github_slug_reads_the_origin_remote() {
+        let repo = init_repo();
+        assert_eq!(
+            remote_github_slug(repo.path()),
+            None,
+            "no remote → no slug"
+        );
+        git_raw(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/chessIthaca/Mnemo.git"],
+        )
+        .unwrap();
+        assert_eq!(
+            remote_github_slug(repo.path()),
+            Some(("chessIthaca".to_string(), "Mnemo".to_string()))
+        );
+    }
+
+    #[test]
+    fn rulesets_json_detects_only_active_pull_request_rulesets() {
+        // Backlog b52b041a: the real ruleset 23755694 shape (verified via
+        // gh api during plan 8ad6fa91) must read as blocking; the
+        // non-blocking shapes must not.
+        let blocking = r#"[{"id":23755694,"source":"Repository","name":"Protect from direct pushing.","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]}]"#;
+        assert!(rulesets_json_blocks_direct_push(blocking));
+        // Inactive enforcement: the ruleset is disabled — direct pushes pass.
+        let inactive = blocking.replace("\"active\"", "\"disabled\"");
+        assert!(!rulesets_json_blocks_direct_push(&inactive));
+        // Active but no pull_request rule (e.g. deletion-only): not a PR gate.
+        let no_pr = r#"[{"id":1,"enforcement":"active","rules":[{"type":"deletion"}]}]"#;
+        assert!(!rulesets_json_blocks_direct_push(no_pr));
+        // No rulesets at all.
+        assert!(!rulesets_json_blocks_direct_push("[]"));
+        // Malformed / non-array: fail-open (the direct path), never a
+        // false-positive PR flow on every repo.
+        assert!(!rulesets_json_blocks_direct_push("not json"));
+        assert!(!rulesets_json_blocks_direct_push("{}"));
+    }
+
+    #[tokio::test]
+    async fn land_via_pull_request_surfaces_the_pr_requirement_when_the_push_fails() {
+        // Backlog b52b041a: on a protected main the PR path's failure
+        // mode must NAME the PR requirement (the acceptance criteria),
+        // not surface a raw push error. The dead local remote makes the
+        // push fail fast, deterministically, with no network.
+        let repo = init_repo();
+        git_raw(repo.path(), &["checkout", "-b", "wt/test"]).unwrap();
+        let (worktree, branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+                .await
+                .unwrap();
+        std::fs::write(worktree.join("item.txt"), "item work\n").unwrap();
+        git_raw(&worktree, &["add", "-A"]).unwrap();
+        git_raw(&worktree, &["commit", "-m", "item work"]).unwrap();
+        let dead_upstream = repo.path().join("no-such-upstream");
+        git_raw(
+            repo.path(),
+            &["remote", "add", "origin", dead_upstream.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let err = land_via_pull_request(repo.path(), &branch).unwrap_err();
+        match err {
+            LandError::Git(e) => {
+                assert!(
+                    e.contains("must land via a pull request"),
+                    "the error names the PR requirement: {e}"
+                );
+                assert!(
+                    e.contains(&format!("gh pr create --base main --head {branch}")),
+                    "the error carries the exact command: {e}"
+                );
+            }
+            other => panic!("expected a git error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_only_keeps_the_branch() {
+        // Backlog b52b041a: the PR-path landing keeps the branch (the
+        // PR's head) — only the worktree goes.
+        let repo = init_repo();
+        let (worktree, branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+                .await
+                .unwrap();
+        remove_worktree_only(repo.path().to_path_buf(), worktree.clone())
+            .await
+            .unwrap();
+        assert!(!worktree.exists(), "the worktree directory is gone");
+        assert!(
+            !git_raw(repo.path(), &["branch", "--list", &branch])
+                .unwrap()
+                .is_empty(),
+            "the branch is KEPT (the PR needs it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_only_runall_branches_merged_into_origin_main() {
+        // Backlog 64662ef2 (review L4 of the b52b041a landing): after the
+        // human merges a run-all PR, the redundant local ref is swept;
+        // unmerged branches, non-runall branches, and worktree-checked-out
+        // branches are never touched.
+        let repo = init_repo();
+        // A bare upstream as origin — OUTSIDE the repo's working tree: an
+        // in-tree upstream would be tracked by `git add -A`, and a later
+        // `git checkout` would restore the tracked copy of its
+        // refs/heads/main file, silently rewinding the bare repo's ref
+        // (the sync tests remove their in-tree upstream before
+        // provisioning for the same reason).
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = upstream_dir.path().join("upstream.git");
+        git_raw(
+            repo.path(),
+            &["init", "--bare", upstream.to_str().unwrap()],
+        )
+        .unwrap();
+        git_raw(
+            repo.path(),
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        )
+        .unwrap();
+        git_raw(repo.path(), &["push", "-u", "origin", "main"]).unwrap();
+
+        // A MERGED runall branch: commit on it, merge into main, push —
+        // its tip is an ancestor of origin/main → swept.
+        git_raw(repo.path(), &["checkout", "-b", "wt/runall-aaaaaaaa"]).unwrap();
+        std::fs::write(repo.path().join("landed.txt"), "landed\n").unwrap();
+        git_raw(repo.path(), &["add", "-A"]).unwrap();
+        git_raw(repo.path(), &["commit", "-m", "landed work"]).unwrap();
+        git_raw(repo.path(), &["checkout", "main"]).unwrap();
+        git_raw(
+            repo.path(),
+            &["merge", "--no-ff", "wt/runall-aaaaaaaa", "-m", "merge"],
+        )
+        .unwrap();
+        git_raw(repo.path(), &["push", "origin", "main"]).unwrap();
+
+        // An UNMERGED runall branch: its commit is not in origin/main →
+        // kept.
+        git_raw(repo.path(), &["checkout", "-b", "wt/runall-bbbbbbbb"]).unwrap();
+        std::fs::write(repo.path().join("open.txt"), "open\n").unwrap();
+        git_raw(repo.path(), &["add", "-A"]).unwrap();
+        git_raw(repo.path(), &["commit", "-m", "open work"]).unwrap();
+        git_raw(repo.path(), &["checkout", "main"]).unwrap();
+
+        // A merged NON-runall branch: never in the listing pattern →
+        // kept.
+        git_raw(repo.path(), &["branch", "wt/other"]).unwrap();
+
+        // A worktree-checked-out merged branch: the provisioned branch
+        // sits at main's tip (an ancestor of origin/main), but its
+        // worktree holds it checked out — git refuses the delete.
+        let (worktree, wt_branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "cccccccc1234".to_string())
+                .await
+                .unwrap();
+
+        let swept = sweep_merged_runall_branches(repo.path().to_path_buf()).await;
+        assert_eq!(swept, vec!["wt/runall-aaaaaaaa".to_string()]);
+        // The unmerged branch, the non-runall branch, and the
+        // worktree-held branch all survive.
+        for kept in ["wt/runall-bbbbbbbb", "wt/other", &wt_branch] {
+            assert!(
+                !git_raw(repo.path(), &["branch", "--list", kept])
+                    .unwrap()
+                    .is_empty(),
+                "{kept} must be kept"
+            );
+        }
+        // The swept branch is gone; the worktree still exists (only the
+        // branch delete is refused for it).
+        assert!(
+            git_raw(repo.path(), &["branch", "--list", "wt/runall-aaaaaaaa"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worktree.exists());
     }
 
     #[tokio::test]

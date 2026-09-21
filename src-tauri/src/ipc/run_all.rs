@@ -3011,13 +3011,19 @@ mod tests {
             snapshot < transition,
             "the note snapshot must happen BEFORE the transition"
         );
-        // Wiring: run-all START calls the sweep after the already-active
-        // check and BEFORE the pending count — adopted items count toward
-        // the run's total and dispatch in queue order.
+        // Wiring: run-all START calls the adoption sweep after the
+        // already-active check and BEFORE the pending count — adopted
+        // items count toward the run's total and dispatch in queue
+        // order. The merged-branch sweeper (backlog 64662ef2) sits
+        // between the adoption sweep and the pending count: a run-start
+        // that finds no eligible items must still sweep.
         let cmds = include_str!("backlog_cmds.rs");
         let adopt_call = cmds
             .find("adopt_orphaned_in_flight")
             .expect("backlog_run_all must call adopt_orphaned_in_flight");
+        let sweep_call = cmds
+            .find("sweep_merged_runall_branches")
+            .expect("backlog_run_all must call the merged-branch sweeper");
         let active_check = cmds
             .find("run-all is already active")
             .expect("backlog_run_all must keep the already-active check");
@@ -3025,9 +3031,14 @@ mod tests {
             .find("no pending backlog items to run")
             .expect("backlog_run_all must keep the pending-count check");
         assert!(
-            active_check < adopt_call && adopt_call < pending_count,
+            active_check < adopt_call
+                && adopt_call < sweep_call
+                && sweep_call < pending_count,
             "adoption must run AFTER the already-active check and BEFORE the \
-             pending count — adopted items count toward the run's total"
+             pending count — adopted items count toward the run's total; the \
+             sweeper must run BEFORE the pending-count early-return so a \
+             run-start that finds no eligible items still sweeps (backlog \
+             64662ef2, review L2)"
         );
     }
 
@@ -4434,14 +4445,15 @@ static LANDING_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Nothing inside the dispatch call tree re-enters (no deadlock).
 static DISPATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Land a spawned item's branch into `main` under the landing lock (plan
-/// ffd7a86f) — see [`land_item_branch`] for the semantics (serialized
-/// `--no-ff` merge via the landing worktree; conflicts aborted + surfaced
-/// with the branch kept).
+/// Land a spawned item's branch under the landing lock (plan ffd7a86f) —
+/// see [`land_item_branch`] for the semantics (serialized `--no-ff`
+/// merge via the landing worktree on an unprotected `main`, or a PR on
+/// a protected one, backlog b52b041a; conflicts aborted + surfaced with
+/// the branch kept).
 async fn land_spawned_branch(
     state: &IpcState,
     spawned: &crate::ipc::state::SpawnedRun,
-) -> Result<(), mnemo::project::worktrees::LandError> {
+) -> Result<mnemo::project::worktrees::Landed, mnemo::project::worktrees::LandError> {
     let _guard = LANDING_LOCK.lock().await;
     let root = state.project.root.lock().await.root.clone();
     mnemo::project::worktrees::land_item_branch(root, spawned.branch.clone()).await
@@ -4600,6 +4612,9 @@ pub async fn on_spawned_turn_resolved(
 
     let mut terminal_resolution = false;
     let mut remove_worktree = false;
+    // Backlog b52b041a: a PR-path landing keeps the branch (the PR's
+    // head — the human merges); every other removal deletes it.
+    let mut keep_branch = false;
     if success {
         // The same plan-loop gate as the main path, read from THIS
         // agent's workflow. The closed_earlier recovery (backlog
@@ -4645,9 +4660,21 @@ pub async fn on_spawned_turn_resolved(
                     // note carries the conflicted paths — the work still
                     // counts as Done.
                     let note = match land_spawned_branch(&state, &spawned).await {
-                        Ok(()) => {
+                        Ok(mnemo::project::worktrees::Landed::Merged) => {
                             remove_worktree = true;
                             None
+                        }
+                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                            // Backlog b52b041a: a protected main lands via
+                            // PR — the branch is KEPT (the PR's head; the
+                            // human merges), only the worktree goes, and
+                            // the item note carries the URL.
+                            remove_worktree = true;
+                            keep_branch = true;
+                            Some(format!(
+                                "landed via pull request (branch {} kept for the human merge): {url}",
+                                spawned.branch
+                            ))
                         }
                         Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
@@ -4818,8 +4845,20 @@ pub async fn on_spawned_turn_resolved(
                     // arm's landing discipline).
                     let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done, not re-dispatched".to_string();
                     match land_spawned_branch(&state, &spawned).await {
-                        Ok(()) => {
+                        Ok(mnemo::project::worktrees::Landed::Merged) => {
                             remove_worktree = true;
+                        }
+                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                            // Backlog b52b041a: a protected main lands via
+                            // PR — the branch is KEPT (the PR's head), only
+                            // the worktree goes, and the note carries the
+                            // URL.
+                            remove_worktree = true;
+                            keep_branch = true;
+                            suffix = format!(
+                                "{suffix} — landed via pull request (branch {} kept for the human merge): {url}",
+                                spawned.branch
+                            );
                         }
                         Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
@@ -4966,12 +5005,24 @@ pub async fn on_spawned_turn_resolved(
     }
     remove_spawned_run(&state, agent_id).await;
     if remove_worktree {
-        let _ = mnemo::project::worktrees::remove_item_worktree(
-            state.project.root.lock().await.root.clone(),
-            spawned.worktree.clone(),
-            spawned.branch.clone(),
-        )
-        .await;
+        // Backlog b52b041a: a PR-path landing keeps the branch (the
+        // PR's head — the human merges); every other removal deletes it
+        // (a stale `wt/runall-*` branch would block later dispatches).
+        let root = state.project.root.lock().await.root.clone();
+        let _ = if keep_branch {
+            mnemo::project::worktrees::remove_worktree_only(
+                root,
+                spawned.worktree.clone(),
+            )
+            .await
+        } else {
+            mnemo::project::worktrees::remove_item_worktree(
+                root,
+                spawned.worktree.clone(),
+                spawned.branch.clone(),
+            )
+            .await
+        };
     }
     retire_spawned_agent(&state, agent_id).await;
     emit_backlog_changed(app, &state).await;
@@ -5069,13 +5120,27 @@ pub(crate) async fn drain_spawned_on_exit(
             // for duplicate re-dispatch.
             let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done".to_string();
             match land_spawned_branch(&state, &spawned).await {
-                Ok(()) => {
+                Ok(mnemo::project::worktrees::Landed::Merged) => {
                     let _ = mnemo::project::worktrees::remove_item_worktree(
                         state.project.root.lock().await.root.clone(),
                         spawned.worktree.clone(),
                         spawned.branch.clone(),
                     )
                     .await;
+                }
+                Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                    // Backlog b52b041a: a protected main lands via PR —
+                    // the branch is KEPT (the PR's head), only the
+                    // worktree goes, and the note carries the URL.
+                    let _ = mnemo::project::worktrees::remove_worktree_only(
+                        state.project.root.lock().await.root.clone(),
+                        spawned.worktree.clone(),
+                    )
+                    .await;
+                    suffix = format!(
+                        "{suffix} — landed via pull request (branch {} kept for the human merge): {url}",
+                        spawned.branch
+                    );
                 }
                 Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
                     suffix = format!(

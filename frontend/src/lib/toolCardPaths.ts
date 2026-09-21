@@ -914,7 +914,7 @@ export function argLabel(args: string, toolName?: string): string | null {
     }
     return null;
   }
-  // For git_read calls, the `op` field (diff | log | show) is the meaningful
+  // For git_read calls, the `op` field (diff | log | show | status) is the meaningful
   // part — show it (plus the commit for show, the path filter for log/diff,
   // and log's limit) so the card reads "git_read (log -8)" or
   // "git_read (show d31b606)" instead of a bare "git_read" with no

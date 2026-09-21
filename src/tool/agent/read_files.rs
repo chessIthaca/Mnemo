@@ -161,20 +161,22 @@ impl Tool for ReadFilesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "read_files",
-            "Read files — one or many, in one call instead of N round-trips. Always \
-             pass `files` (an array of up to 10 {path, start_line?, max_lines?} specs) \
+            "Always pass `files` (an array of up to 10 {path, start_line?, max_lines?} specs) \
              — e.g. {\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}. \
              There is no zero-argument form: a read_files call with no files is always \
              an error. On a 'files is required' error, rewrite the full call from the \
-             path(s) you meant — do not resend the empty shape. Each file comes back \
-             under a header with line numbers; start_line + max_lines read only the \
-             relevant slice. A directory path returns a sorted listing. Per-file errors \
-             are reported inline, never fatal.",
+             path(s) you meant — do not resend the empty shape. If you catch yourself \
+             emitting read_files with no files, stop — write the path first, then \
+             the call. Read files — one or many, in one call instead of N round-trips. \
+             Each file comes back under a header with line numbers; start_line + \
+             max_lines read only the relevant slice. A directory path returns a \
+             sorted listing. Per-file errors are reported inline, never fatal.",
             json!({
                 "type": "object",
                 "properties": {
                     "files": {
                         "type": "array",
+                        "minItems": 1,
                         "description": "Read specs (max 10): {path, start_line?, max_lines?} per file.",
                         "items": {
                             "type": "object",
@@ -522,6 +524,21 @@ mod tests {
             "the shorthand params are no longer advertised: {props}"
         );
         assert_eq!(schema.parameters["required"], json!(["files"]));
+        assert!(
+            schema.description.starts_with("Always pass `files`"),
+            "the contract sentence LEADS the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("If you catch yourself"),
+            "the content-first anti-pattern clause: {}",
+            schema.description
+        );
+        assert_eq!(
+            schema.parameters["properties"]["files"]["minItems"],
+            json!(1),
+            "the files array advertises minItems: 1"
+        );
         assert!(
             schema.description.contains("Always pass `files`"),
             "{}",

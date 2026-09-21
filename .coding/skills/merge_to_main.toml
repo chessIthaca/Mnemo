@@ -4,7 +4,7 @@
 # calling skill_start("merge_to_main"); the agent drives the merge with its own
 # tools (git commit/merge/checkout/branch + file_edit for conflicts) and calls
 # skill_end to return to Planning. Memory tools work inside a skill without an
-# allow-list entry — step 6 is the post-merge hygiene.
+# allow-list entry — step 5 is the post-merge hygiene.
 #
 # The prompt below is injected into the system prompt EVERY turn the skill runs,
 # so it stays a terse checklist. The rationale for its hard rules lives here in
@@ -13,12 +13,12 @@
 # - NEVER stash (step 1): ten orphan stashes had accumulated by 2026-08-24, each
 #   one `.coding/` bookkeeping this skill dirtied by writing its own state into
 #   stack.json. The pre-merge commit covers it.
-# - BOTH builds (step 4): `npm run build` catches TS-only breaks (e.g. a
+# - BOTH builds (direct path): `npm run build` catches TS-only breaks (e.g. a
 #   Record<...> map missing a newly added tab key); `cd src-tauri && cargo build`
 #   compiles the bin crate (E0425/E0027 from renames or new struct/enum fields),
 #   which the root cargo build/test never sees. Post-merge breaks shipped
 #   repeatedly before this rule existed.
-# - Sync main BEFORE the merge (step 2): on 2026-09-13 main had drifted behind
+# - Sync main BEFORE the merge (direct path): on 2026-09-13 main had drifted behind
 #   origin/main, so the landed merge could not be pushed until a separate
 #   catch-up (merge commit 76af04b). Syncing first keeps it pushable in one pass.
 # - Tool per step (HIGH 1 of the merge_to_main review, plan d826b9ad): the sync
@@ -26,6 +26,27 @@
 #   push stay on the git tool — the structured, subcommand-checked core-operation
 #   path. Both force the always-on approval prompt (ShellTool::never_auto_for,
 #   2027-01-11, closed the bypass this note originally described).
+# - PR flow under a main-protection ruleset (2026-09-21): ruleset 23755694
+#   ("Protect from direct pushing.", target branch, conditions ref_name
+#   ~DEFAULT_BRANCH only, rules deletion/non_fast_forward/update/pull_request
+#   with required_approving_review_count 1) rejects direct pushes with GH013, so
+#   the skill detects it UP-FRONT (gh api repos/<owner>/<repo>/rulesets — an
+#   ACTIVE ruleset with a pull_request rule) and opens a PR instead; the
+#   GH013 recovery on the direct push covers ruleset-check false-negatives
+#   with a working, authenticated gh (a ruleset the list call missed, or a
+#   race) — NOT gh-missing/unauthed, where step 4's gh pr create would fail
+#   too. The hand-rolled precedent is PR #3 (plan 263a9e31). The author cannot self-approve, so the
+#   skill STOPS at the PR — the human approves and merges; NEVER bypass (no
+#   force-push, no admin override, no ruleset edits). The direct path is
+#   preserved for unprotected repos (the skill ships to other installs).
+# - The PR path builds the BRANCH first (not the merged tree): build.yml has no
+#   pull_request trigger (workflow_dispatch + v* tags only), so PRs get no CI
+#   proof — and adding PR CI would burn 10x-billed macOS runner minutes. The
+#   branch-tip build catches the historical break classes (TS-only and
+#   bin-crate compile errors are branch properties, not merge artifacts).
+# - Tag pushes are NOT blocked (new_release step 3): the ruleset's conditions
+#   target ~DEFAULT_BRANCH only — refs/tags/v* sit outside it (verified
+#   2027-01-11 via gh api .../rulesets/23755694).
 # - Memory convergence is automatic: the index re-derives from the merged files
 #   at the next project open (in-session: Settings → Memory → "Rebuild index from
 #   files"). Never hand-edit the DB.
@@ -48,12 +69,10 @@ tools = [
 ]
 prompt = """\
 Merge the branch named in the request (default: the current one) into main and clean up. Steps:
-1. Commit ALL uncommitted work on that branch, `.coding/` included — plans, knowledge, reviews, backlog.jsonl must land in the merge. NEVER stash.
-2. `git checkout <branch>` if needed, then `git checkout main`, then sync it FIRST via shell (the git tool has no fetch/pull): `git fetch origin`, `git pull --no-rebase`. Nothing new / no remote → continue.
-3. Merge on the **git** tool: `git merge --no-ff <branch>`. Any conflict, in the pull or the merge: file_edit taking the UNION of both sides, `git add` + `git commit`; never drop a side, never `-X ours`/`-X theirs`.
-4. Verify the MERGED tree builds — fix with file_edit until green: `npm run build` (frontend/) AND `cd src-tauri && cargo build` (the root build never compiles the bin crate).
-5. Green → `git branch -d <branch>` (never -D); optional `git push` on the git tool, approval-gated.
-6. Supersede this branch's stale status memories with successors recording "MERGED into main at <sha>" — search its name + pre-merge tip, skip when nothing matches, never another branch's records.
-7. `skill_end` → Planning; unresolvable → `abandon_skill`.\
+1. Commit ALL uncommitted work on that branch, `.coding/` included — plans, knowledge, reviews, backlog.jsonl must land. NEVER stash.
+2. Ruleset check via shell: `gh repo view --json nameWithOwner` (or parse `git remote get-url origin`), then `gh api repos/<owner>/<repo>/rulesets` — an ACTIVE ruleset with a `pull_request` rule blocks direct pushes to main (GH013). gh fails / no ruleset → direct path (step 3). Ruleset present → PR path (step 4).
+3. DIRECT path: `git checkout <branch>` if needed, then `git checkout main`, then sync it FIRST via shell (the git tool has no fetch/pull): `git fetch origin`, `git pull --no-rebase`. Nothing new / no remote → continue. Merge on the **git** tool: `git merge --no-ff <branch>`. Any conflict, in the pull or the merge: file_edit taking the UNION of both sides, `git add` + `git commit`; never drop a side, never `-X ours`/`-X theirs`. Verify the MERGED tree builds — fix with file_edit until green: `npm run build` (frontend/) AND `cd src-tauri && cargo build` (the root build never compiles the bin crate). Green → `git push` on the git tool, approval-gated (optional — skip on no remote); push success → `git branch -d <branch>` (never -D). A GH013 / protected-ref rejection → the ruleset check missed it: reset local main to origin/main (`git reset --hard origin/main` — the merge only existed locally; the PR re-lands it), then take the PR path (step 4) with the branch intact.
+4. PR path (ruleset present, or GH013 recovery): verify the BRANCH builds first — `npm run build` (frontend/) AND `cd src-tauri && cargo build`; fix with file_edit until green (PRs get no CI: build.yml triggers only on tags/dispatch). Push the branch on the git tool (`git push -u origin <branch>`, approval-gated), then open the PR via shell: `gh pr create --base main --head <branch> --title "<the branch's latest commit subject>" --body "<git log main..<branch> --oneline> + the review verdicts + build status"`. A PR already exists for the branch → report its URL. Report the PR URL and STOP — the author cannot self-approve (required_approving_review_count: 1); the human approves and merges. NEVER bypass the ruleset (no force-push, no admin override, no ruleset edits). Branch deletion and the MERGED-at-<sha> memory supersede happen AFTER the human merges (a later session).
+5. Supersede this branch's stale status memories with successors recording "MERGED into main at <sha>" (direct path) or "PR #N OPENED against main (head <branch>, tip <sha>), awaiting human review" (PR path) — search its name + pre-merge tip, skip when nothing matches, never another branch's records.
+6. `skill_end` → Planning; unresolvable → `abandon_skill`.\
 """
-

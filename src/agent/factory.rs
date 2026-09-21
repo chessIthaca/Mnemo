@@ -936,7 +936,7 @@ impl AgentLoopFactory {
             &project_root,
             self.core_operations.clone(),
         )));
-        // git_read is the read-only view into git (op = diff | log | show):
+        // git_read is the read-only view into git (op = diff | log | show | status):
         // the reviewer subagent's only way to see uncommitted changes (it has
         // no shell/git), and the bridge from a memory record's commit pointer
         // to shipped code. AutoRun by construction, which is exactly why it
@@ -1766,7 +1766,38 @@ mod tests {
             // heading-strip documentation (backlog 488248ce) plus schema
             // drift from plans landed since that pass. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Planning, 18_200),
+            // 18_200 → 18_700 (2027-02-05): the search tool's description
+            // gains the ESCAPE-HATCH note (backlog 38040f12 — literal:true
+            // advertised as the remedy for metacharacter/backslash-dense
+            // patterns, plus the malformed-rejection reformulation rule,
+            // ~+247); measures Planning at 18_275 chars (workspace-unified;
+            // standalone 17_938). Ceiling = measured + headroom, deliberate
+            // raise.
+            // 18_700 holds (2027-02-05, round 2): the search/search_read
+            // ESCAPE-HATCH parity (~+330, same cause as the Executing raise)
+            // rides Planning too — measures 18_605, 95 under; no raise
+            // needed.
+            // 18_700 → 18_900 (2027-02-05): git_read gains op="status"
+            // (backlog 1aa7e456 — the description documents the new op and
+            // the enum grows, ~+122); measures Planning at 18_727 chars.
+            // Ceiling = measured + headroom, deliberate raise.
+            // 18_900 → 19_500 (2027-02-05): the empty-call sweep (backlog
+            // d9ad618e) — five of the six fumbled tools ride Planning
+            // (graph_search/graph_context/graph_path/git_read/memory_write;
+            // shell is Executing-side only), each description gaining the
+            // no-zero-argument rule + example + recovery rule (~+900 chars
+            // of description text). Workspace-unified measures Planning at
+            // 19_241 chars on the final tree (standalone 18_757 + ~484
+            // load_tools delta under browser-on unification — the
+            // standalone run alone stays green; the workspace matrix is
+            // what CI checks). Baseline note: the prior 18_727 figure's
+            // comment stack was re-chained after the fact (the
+            // git_read-status measurement stacked above the escape-hatch
+            // figures though 37540e0 landed before 6f363f8), so 19_241 −
+            // 18_727 = +514 understates the sweep — the pinned 19_241
+            // printout is the authoritative reference for future raises.
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Planning, 19_500),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -1849,7 +1880,24 @@ mod tests {
             // automatic-restart behavior, ~+484); measures Executing at
             // 32_796 chars. Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::Executing, 33_200),
+            // 33_200 → 33_900 (2027-02-05): the search/search_read
+            // ESCAPE-HATCH parity (backlog 38040f12 review round 1 —
+            // search_read gains the note + RECOMMENDED wording, search
+            // gains the inline literal example, ~+330); measures Executing
+            // at 33_385 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            // 33_900 → 34_600 (2027-02-05): the empty-call sweep (backlog
+            // d9ad618e) — all six fumbled tools ride Executing (shell +
+            // the graph trio + git_read + memory_write), each description
+            // gaining the no-zero-argument rule + example + recovery rule
+            // (~+1_050 chars of description text); workspace-unified
+            // measures Executing at 34_169 chars on the final tree
+            // (standalone 33_685 + ~484 load_tools delta; the pre-sweep
+            // baselines in this stack were re-chained — see the Planning
+            // note — so delta-vs-baseline arithmetic understates the
+            // sweep; the pinned printouts are authoritative). Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 34_600),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1888,7 +1936,17 @@ mod tests {
             // plan ec425270, ~+484; PlanFrozen = Executing ∪ finish);
             // measures PlanFrozen at 34_082 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 34_500),
+            // 34_500 → 35_200 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330; PlanFrozen = Executing ∪ finish);
+            // measures PlanFrozen at 34_671 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 35_200 → 35_900 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures PlanFrozen at 35_455
+            // chars (standalone 34_971 + ~484 load_tools delta). Ceiling
+            // = measured + headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 35_900),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1936,7 +1994,17 @@ mod tests {
             // that landed after this filter's 2027-01-24 baseline);
             // measures ExecutingResearch at 26_921 chars. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 27_300),
+            // 27_300 → 28_000 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330); measures ExecutingResearch at
+            // 27_510 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            // 28_000 → 28_600 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures ExecutingResearch at
+            // 28_294 chars (standalone 27_810 + ~484 load_tools delta).
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::ExecutingResearch, 28_600),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -1993,7 +2061,16 @@ mod tests {
             // plan ec425270, ~+484 — the browser family rides Reviewing);
             // measures Reviewing at 28_060 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Reviewing, 28_400),
+            // 28_400 → 29_200 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330); measures Reviewing at 28_649
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            // 29_200 → 29_800 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures Reviewing at 29_433
+            // chars (standalone 28_949 + ~484 load_tools delta). Ceiling
+            // = measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 29_800),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -2012,7 +2089,23 @@ mod tests {
             // chars — the same tool set, figures and cause as Planning
             // (create_plan rides Complete). Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::Complete, 18_200),
+            // 18_200 → 18_700 (2027-02-05): same cause as the Planning raise
+            // above (the search ESCAPE-HATCH note, backlog 38040f12, ~+247);
+            // measures Complete at 18_275 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 18_700 holds (2027-02-05, round 2): same +330 parity growth as
+            // Planning — measures Complete at 18_605, 95 under; no raise
+            // needed.
+            // 18_700 → 18_900 (2027-02-05): same cause as the Planning raise
+            // above (git_read op="status", backlog 1aa7e456, ~+122);
+            // measures Complete at 18_727 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 18_900 → 19_500 (2027-02-05): same cause as the Planning
+            // raise (backlog d9ad618e — Complete carries the same read-only
+            // set); workspace-unified measures Complete at 19_241 chars
+            // (standalone 18_757 + ~484 load_tools delta). Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Complete, 19_500),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(

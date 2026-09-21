@@ -113,7 +113,10 @@ impl Tool for SearchReadTool {
              the top matched files' full numbered content — collapsing the search→read \
              round-trip. Literal queries use the content index when populated (engine: \
              index), walking otherwise. Build output and dependencies are always skipped. \
-              Returns a summary line, then the matched files (capped per-file and total). \
+              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+              prefer literal:true (it avoids escaping); if a call is rejected as \
+              malformed, do NOT resend it — reformulate. \
+               Returns a summary line, then the matched files (capped per-file and total). \
               For symbol questions — where is X defined, who calls X — call graph_search \
               (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
               symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
@@ -122,9 +125,9 @@ impl Tool for SearchReadTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal)."},
+                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal). Prefer literal:true for text with regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex)."},
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."},
                     "max_files": {"type": "integer", "description": "Maximum number of matched files to read (default 5, max 5)."}
                 },
                 "required": ["pattern"]
@@ -461,6 +464,49 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchReadTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    #[test]
+    fn schema_advertises_the_literal_escape_hatch() {
+        // Backlog f4d5e053: parity with search — the ESCAPE-HATCH note, the
+        // recovery rule, and the RECOMMENDED/pattern-param wording must
+        // stay advertised (the inline example lives in search's
+        // description). Mirrors the read_files collapse test (plan
+        // 9e0b266a).
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("ESCAPE-HATCH"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("prefer literal:true"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do NOT resend"),
+            "the recovery rule must ride the description: {}",
+            schema.description
+        );
+        let props = &schema.parameters["properties"];
+        assert!(
+            props["literal"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("RECOMMENDED"),
+            "the literal param must carry the RECOMMENDED wording: {}",
+            props["literal"]
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer literal:true"),
+            "the pattern param must carry the recommendation: {}",
+            props["pattern"]
+        );
     }
 
     #[tokio::test]

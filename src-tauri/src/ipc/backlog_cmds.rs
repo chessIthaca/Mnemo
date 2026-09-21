@@ -546,6 +546,23 @@ pub async fn backlog_run_all(
     // 6c6966b9) so the dispatch order picks them up and they count toward
     // the run's total.
     crate::ipc::run_all::adopt_orphaned_in_flight(state.inner()).await;
+    // Backlog 64662ef2 (review L4 of the b52b041a landing): sweep
+    // wt/runall-* branches whose PRs the human has merged — their
+    // commits are in origin/main, so the local refs are redundant.
+    // Best-effort + conservative (unmerged/worktree-held branches are
+    // never touched); runs before the pending-count check so a run
+    // that finds no eligible items still sweeps.
+    let swept = mnemo::project::worktrees::sweep_merged_runall_branches(
+        state.inner().project.root.lock().await.root.clone(),
+    )
+    .await;
+    if !swept.is_empty() {
+        eprintln!(
+            "backlog: swept {} merged runall branch(es): {}",
+            swept.len(),
+            swept.join(", ")
+        );
+    }
     // The run's total counts only ELIGIBLE items — pending and not
     // deferred (user request 2027-01-07: deferred items are excluded from
     // Run-All). A backlog whose pending items are ALL deferred still starts

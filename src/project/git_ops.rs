@@ -54,6 +54,40 @@ pub(crate) fn git_raw(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Run a `gh` (GitHub CLI) subcommand in `root`, returning stdout on
+/// success — the gh twin of [`git_raw`], same hardening
+/// (CREATE_NO_WINDOW on Windows, stderr on failure).
+///
+/// `pub(crate)` for the same reason as [`git_raw`]: the worktree
+/// module's ruleset-aware landing (backlog b52b041a) reuses the
+/// hardened runner instead of duplicating it. Failures are EXPECTED
+/// and handled by the caller — gh missing / unauthenticated means the
+/// landing takes its direct path (mirroring the merge_to_main skill's
+/// decision: gh-missing also means `gh pr create` would fail).
+pub(crate) fn gh_raw(root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new("gh");
+    cmd.args(args).current_dir(root);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn gh {args:?}: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "gh {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 /// Abstraction over git command execution, so tests can mock git instead of
 /// spawning a real `git` process. Production uses [`RealGit`] (spawns `git`);
 /// tests use [`MockGit`] (an in-memory mini-git) so the test suite doesn't

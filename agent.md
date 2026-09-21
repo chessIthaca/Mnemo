@@ -90,11 +90,15 @@ command.
 - Parallel run-all (plan ffd7a86f) adds per-item worktree branches
   (`wt/runall-<item8>`, forked from main into `.worktrees/runall-<item8>`)
   for concurrently dispatched backlog items. These are app-managed: the
-  app lands them via serialized `--no-ff` merges into main (the
-  merge_to_main skill cannot run from a linked worktree), so main still
-  only ever receives merge commits — NOTE: this app-managed landing pushes
-  main directly and is equally blocked by the main-protection ruleset
-  (follow-up backlog item; the skill's PR flow does not cover it).
+  app lands them itself (the merge_to_main skill cannot run from a linked
+  worktree), ruleset-aware since backlog b52b041a: an UNPROTECTED main
+  gets serialized `--no-ff` merges into local main (a local merge only —
+  it never pushed; the old "pushes main directly" note here was
+  inaccurate), so main still only ever receives merge commits; a
+  PROTECTED main (ACTIVE pull_request ruleset, detected up-front via
+  `gh api repos/{owner}/{repo}/rulesets`) gets the branch pushed + a PR
+  opened (`gh pr create --base main --head <branch>`), the URL reported
+  on the item, and the branch kept for the human merge — never bypass.
   Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.

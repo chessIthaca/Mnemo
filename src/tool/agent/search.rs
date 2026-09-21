@@ -1217,7 +1217,7 @@ impl Tool for SearchTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for."},
+                    "pattern": {"type": "string", "description": "The pattern to search for. Prefer literal:true for text with regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
                     "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."}
                 },
@@ -1544,6 +1544,57 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    #[test]
+    fn schema_advertises_the_literal_escape_hatch() {
+        // Backlog f4d5e053 (the 38040f12 incident's tool-description
+        // complement): a pattern dense in regex metacharacters or
+        // backslashes is exactly the emission class that degrades — the
+        // description must advertise `literal: true` as the remedy, the
+        // malformed-rejection recovery rule, and an inline example, so the
+        // first try succeeds instead of looping (plan 263a9e31: five
+        // consecutive failures on one escaped pattern). Mirrors the
+        // read_files collapse test (plan 9e0b266a).
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("ESCAPE-HATCH"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("prefer literal:true"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do NOT resend"),
+            "the recovery rule must ride the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("pattern (?< with literal true"),
+            "the inline example must show the exact call shape: {}",
+            schema.description
+        );
+        let props = &schema.parameters["properties"];
+        assert!(
+            props["literal"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("RECOMMENDED"),
+            "the literal param must carry the RECOMMENDED wording: {}",
+            props["literal"]
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer literal:true"),
+            "the pattern param must carry the recommendation: {}",
+            props["pattern"]
+        );
     }
 
     #[tokio::test]

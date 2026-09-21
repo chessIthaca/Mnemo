@@ -125,7 +125,7 @@ impl Tool for SearchReadTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal)."},
+                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal). Prefer literal:true for text with regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
                     "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."},
                     "max_files": {"type": "integer", "description": "Maximum number of matched files to read (default 5, max 5)."}
@@ -464,6 +464,49 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchReadTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    #[test]
+    fn schema_advertises_the_literal_escape_hatch() {
+        // Backlog f4d5e053: parity with search — the ESCAPE-HATCH note, the
+        // recovery rule, and the RECOMMENDED/pattern-param wording must
+        // stay advertised (the inline example lives in search's
+        // description). Mirrors the read_files collapse test (plan
+        // 9e0b266a).
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("ESCAPE-HATCH"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("prefer literal:true"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do NOT resend"),
+            "the recovery rule must ride the description: {}",
+            schema.description
+        );
+        let props = &schema.parameters["properties"];
+        assert!(
+            props["literal"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("RECOMMENDED"),
+            "the literal param must carry the RECOMMENDED wording: {}",
+            props["literal"]
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer literal:true"),
+            "the pattern param must carry the recommendation: {}",
+            props["pattern"]
+        );
     }
 
     #[tokio::test]

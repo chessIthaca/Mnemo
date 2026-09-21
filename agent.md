@@ -19,7 +19,7 @@ command.
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
 - Never commit to `main` — commit to the current feature branch.
-- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch. `git` core operations (`merge`/`push`) MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way.
+- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). `git` core operations (`merge`/`push`) MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way.
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,
@@ -82,8 +82,8 @@ command.
 
 ## Branch policy (working-branch topology)
 
-- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only ever receives merge commits (via the `merge_to_main` skill: `wt/*` → `main`; the `new_release` skill performs the same sanctioned merge inline as its step 2). The skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push), and only the sync runs on the shell tool; the merge and push stay on the approval-gated `git` tool. The old `develop` integration tier was removed (2026-08-24).
-- `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. `merge_to_main` deletes the merged branch after landing it, so no branches accumulate.
+- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only receives merges — directly via the `merge_to_main` skill on unprotected repos, or through the human's chosen PR merge method where a main-protection ruleset applies (this repo since 2026-09-21, ruleset 23755694: the skill detects it up-front, pushes the branch, opens the PR, and stops for the human approving review; the `new_release` skill performs the same ruleset-aware landing inline as its step 2). On the direct path the skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push); the sync runs on the shell tool, the merge and push on the approval-gated `git` tool (the PR path's branch push runs on the `git` tool, equally gated). The old `develop` integration tier was removed (2026-08-24).
+- `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. On the direct path `merge_to_main` deletes the merged branch after landing it; on the PR path the branch is deleted after the human merges the PR — no branches accumulate either way.
 - `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` + `instance.json` (per-instance local state) are gitignored — never committed.
 - After a git merge, the memory index converges automatically at the next project open (startup reconciliation re-derives on content-hash drift); in-session, Settings → Memory → "Rebuild index from files".
 - Never commit to main — commit to the current feature branch.
@@ -92,7 +92,10 @@ command.
   for concurrently dispatched backlog items. These are app-managed: the
   app lands them via serialized `--no-ff` merges into main (the
   merge_to_main skill cannot run from a linked worktree), so main still
-  only ever receives merge commits. Spawned items' reviewer reports land
+  only ever receives merge commits — NOTE: this app-managed landing pushes
+  main directly and is equally blocked by the main-protection ruleset
+  (follow-up backlog item; the skill's PR flow does not cover it).
+  Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.
 

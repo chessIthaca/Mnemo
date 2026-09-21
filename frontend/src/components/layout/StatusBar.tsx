@@ -779,9 +779,11 @@ export const StatusBar = memo(function StatusBar() {
         {/* Merge-to-main: shown when the workflow is Complete or Planning and
             we're on a non-main branch. Gated by the MergeToMainDialog
             confirmation. Enters the merge_to_main skill — the agent drives the
-            merge itself: commit, checkout main, sync main with origin (fetch +
-            pull --no-rebase), merge, resolve conflicts, delete branch; it never
-            stashes. */}
+            landing itself: commit, then either the direct merge (checkout
+            main, sync main with origin (fetch + pull --no-rebase), merge,
+            resolve conflicts, delete branch) or, where main is
+            ruleset-protected, a PR it opens and leaves for a human approving
+            review; it never stashes. */}
         {((workflowState === "complete" || workflowState === "planning") && gitBranch && gitBranch !== "main" && gitBranch !== "no-branch") && (
           <button
             onClick={() => setMergeOpen(true)}

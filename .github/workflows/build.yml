@@ -28,6 +28,14 @@ name: build
 
 on:
   workflow_dispatch:
+    inputs:
+      # Diagnostic escape hatch: the macOS leg is OFF the normal path (a tag
+      # push or an ordinary dispatch skips it), and runs ONLY when this input
+      # is explicitly set to true. See the macos job's comment.
+      run_macos:
+        description: "Run the macOS job (diagnostic only)"
+        type: boolean
+        default: false
   push:
     tags: ["v*"]
 
@@ -82,18 +90,29 @@ jobs:
             target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
-  # TEMPORARILY DISABLED (2026-09-20, user decision): the macOS leg failed
-  # `cargo test --workspace` on CI again (run 35531680467, tag v0.1.1) even
-  # after the five-test fixes, blocking every release. Disabled HERE ONLY —
-  # macOS support in the codebase and local builds are unchanged. To
-  # re-enable: (1) delete the `if: false` line below; (2) restore the
-  # release job's macos references — add `macos` back to its `needs:`, re-add
-  # the macos-bundles-aarch64 artifact download, and re-add the
+  # DIAGNOSTIC-ONLY (2026-09-21, user decision): the macOS leg is OFF the
+  # normal path. It failed `cargo test --workspace` on CI (run 35531680467,
+  # tag v0.1.1) even after the five-test fixes, and the failure could not be
+  # read back — the Actions job-logs API is admin-only (403), so the real
+  # cause is still unknown. This job therefore runs ONLY on a manual dispatch
+  # with `run_macos: true` (Actions tab -> Run workflow -> tick "Run the macOS
+  # job"), never on a tag push or an ordinary dispatch. macOS support in the
+  # codebase and local builds is unchanged.
+  #
+  # To restore it to the normal path (once the diagnostic run is green):
+  # (1) replace the `if:` below with the pre-existing behavior — the job should
+  # run on every tag push again; (2) restore the release job's macos
+  # references — add `macos` back to its `needs:`, re-add the
+  # macos-bundles-aarch64 artifact download, and re-add the
   # dist/macos/**/*.dmg + *.zip globs to its files list; (3) drop the
-  # TEMPORARILY DISABLED notes — the file-header STATUS note, the release
-  # job's pointer comment, and the new_release skill's Windows-only note.
+  # DIAGNOSTIC-ONLY notes — this comment, the file-header STATUS note, the
+  # release job's pointer comment, and the new_release skill's Windows-only
+  # note; (4) drop the `run_macos` dispatch input above.
   macos:
-    if: false
+    # Manual-dispatch-only: skipped on tag pushes and ordinary dispatches.
+    # MUST NOT reference `secrets` — the ci_workflow.rs guard rejects any
+    # `if:` line mentioning the secrets context (workflow-load error).
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_macos }}
     runs-on: macos-latest
     timeout-minutes: 90
     # The `secrets` context is NOT available in step `if:` conditionals
@@ -122,8 +141,39 @@ jobs:
       # Compile + test validation for the macOS target (the game_* tools and
       # the child webview are Windows-gated; everything else must be green
       # here). Browser tests launch the runner's preinstalled Chrome.
+      #
+      # DIAGNOSTIC (2026-09-21): the job-logs API is admin-only (403), so the
+      # failing test's output is captured here to a file and uploaded as an
+      # artifact — that artifact (or this step's inline log) is the evidence
+      # path. `continue-on-error` keeps the capture + upload steps running
+      # after a test failure; the job still reports failure at the end via the
+      # explicit "Fail if tests failed" step.
       - name: Rust tests (workspace, macOS compile validation)
-        run: cargo test --workspace
+        id: rust-tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee macos-test-output.txt
+      # Re-run only the failing tests with full stdout/stderr captured —
+      # `--no-capture` surfaces the panics the summary line alone hides.
+      - name: Re-run failing tests with full output
+        if: ${{ steps.rust-tests.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee -a macos-test-output.txt
+      - name: Upload macOS test output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-output
+          path: macos-test-output.txt
+          if-no-files-found: warn
+      - name: Fail if tests failed
+        if: ${{ steps.rust-tests.outcome == 'failure' }}
+        run: |
+          echo "::error::cargo test --workspace failed on macOS — see the macos-test-output artifact for the full log."
+          exit 1
       - name: Frontend type-check
         run: npx tsc --noEmit
         working-directory: frontend

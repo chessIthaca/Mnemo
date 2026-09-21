@@ -3336,20 +3336,28 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             ..Message::assistant(text, sanitized_calls)
         });
         for tc in tool_calls {
+            // Strategy-changing guidance on a REPEAT (backlog 38040f12):
+            // a bad-JSON failure is usually an EMISSION problem, and the
+            // generic "re-read the schema" advice below does not address
+            // it — so on a repeat of the same (tool, error) signature the
+            // model is steered toward a DIFFERENT FORMULATION instead of
+            // being told the same thing again. Live incident (plan
+            // 263a9e31): a backslash-dense `search` pattern failed to
+            // emit FIVE times in a row; every retry carried identical
+            // guidance, so the loop could not self-break. The scan runs
+            // BEFORE this result is pushed (same ordering rule as the
+            // tool-execution circuit breaker), so a match is always
+            // against a PRIOR failure.
+            let failed_content = bad_json_retry_message();
+            let guidance = if repeated_tool_failure(messages, &tc.name, &failed_content) {
+                repeated_bad_json_correction(&tc.name, &failed_content)
+            } else {
+                failed_content
+            };
             messages.push(Message::tool_result(
                 tc.id.clone(),
                 tc.name.clone(),
-                "error: arguments JSON was malformed or truncated — \
-                 please retry with valid, complete JSON. An empty \
-                 argument object is a mistake (except genuine no-arg \
-                 tools like current_plan/backlog_list): re-read the \
-                 tool's schema, rewrite the COMPLETE call with every \
-                 required field present and non-blank — content \
-                 first, never emit a call to discover fields — and \
-                 emit the corrected call once; never resend the \
-                 broken call unchanged. For large file writes, split \
-                 the content into smaller chunks or use multiple \
-                 file_edit calls.",
+                guidance,
             ));
         }
         // UI-only (backlog 63cbc20f): end the announced card — the
@@ -3495,6 +3503,87 @@ pub(crate) fn last_user_query(messages: &[Message]) -> Option<String> {
                 && !m.content.as_text().starts_with(HARNESS_CORRECTION_PREFIX)
         })
         .map(|m| m.content.as_text())
+}
+
+/// The per-call bad-JSON retry guidance (the FIRST failure): the model is
+/// told the arguments did not parse, that an empty argument object is a
+/// mistake, and to re-read the schema and re-emit the complete call. This
+/// is the right advice for the dropped-required-field class (plan
+/// 4fa222cc); it is deliberately NOT used on a repeat, where the problem
+/// is the emission itself (see [`repeated_bad_json_correction`]).
+fn bad_json_retry_message() -> String {
+    "error: arguments JSON was malformed or truncated — \
+     please retry with valid, complete JSON. An empty \
+     argument object is a mistake (except genuine no-arg \
+     tools like current_plan/backlog_list): re-read the \
+     tool's schema, rewrite the COMPLETE call with every \
+     required field present and non-blank — content \
+     first, never emit a call to discover fields — and \
+     emit the corrected call once; never resend the \
+     broken call unchanged. For large file writes, split \
+     the content into smaller chunks or use multiple \
+     file_edit calls."
+        .to_string()
+}
+
+/// Build the strategy-changing guidance for a REPEATED bad-JSON failure
+/// (backlog 38040f12). The first-failure message above assumes the model
+/// dropped a required field; when the SAME call fails to parse twice, the
+/// likely cause is the argument BODY — a pattern or string that will not
+/// survive JSON escaping. Telling the model to "re-read the schema" again
+/// is useless there (it already knows the schema), which is exactly how
+/// the live loop sustained five identical retries (plan 263a9e31).
+///
+/// So this message changes STRATEGY: it names a different formulation for
+/// the specific tool when the harness knows one, and otherwise directs a
+/// rebuild-from-scratch of the argument body. Harness-attributed so the
+/// transcript never reads it as human input.
+fn repeated_bad_json_correction(tool_name: &str, failed_content: &str) -> String {
+    let remedy = match tool_name {
+        // The live case: a regex with backslashes is exactly the payload
+        // that breaks JSON escaping, and `literal` sidesteps the escaping
+        // entirely — no backslashes needed for a plain-text query.
+        "search" | "search_read" => {
+            "This is usually an ESCAPING problem, not a schema problem — a \
+             pattern containing backslashes or quotes is hard to emit as \
+             JSON. Do NOT resend it. Instead, in priority order: (1) pass \
+             the same text with `literal: true`, which needs no regex \
+             escaping — e.g. pattern \"(?<\" with literal true; (2) use a \
+             metacharacter-free pattern — for a literal `(?<`, write the \
+             character class [(][?][<]; (3) search a single \
+             distinctive substring instead of the full pattern, or narrow \
+             with `glob` instead."
+                .to_string()
+        }
+        // A large body (a file's contents) is the other classic
+        // unparseable-arguments cause: the emission is truncated.
+        "file_write" | "file_edit" => {
+            "This is usually an EMISSION problem — the argument body is too \
+             large or too escape-heavy to come through intact. Do NOT \
+             resend it. Instead: write the file in smaller chunks (one \
+             file_write per section, or several file_edit calls), and avoid \
+             embedding large blocks of quotes/backslashes in a single \
+             argument."
+                .to_string()
+        }
+        _ => {
+            "Re-reading the schema will not help — you already know it, and \
+             the same call has now failed to parse twice. Change the SHAPE \
+             of the call instead: build the argument object from scratch \
+             (do not edit the previous one), keep string values short and \
+             free of backslashes/quotes where possible, and emit only the \
+             required fields plus what you actually need."
+                .to_string()
+        }
+    };
+    format!(
+        "{HARNESS_CORRECTION_PREFIX} — not the user]\n\
+         Your last two calls to `{tool_name}` failed with the identical error:\n\
+         {failed_content}\n\
+         A repeated identical failure means the earlier malformed call is \
+         still steering your output — you are re-emitting the previous \
+         arguments instead of reformulating. {remedy}"
+    )
 }
 
 /// Build the harness-attributed corrective message for a repeated

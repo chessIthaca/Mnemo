@@ -11282,3 +11282,136 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
          invalidate the recall cache (the query, the user message, is unchanged)"
     );
 }
+#[tokio::test]
+async fn repeated_bad_json_for_same_tool_changes_strategy() {
+    // Regression (backlog 38040f12; live incident plan 263a9e31): a tool
+    // call whose arguments need backslash escaping (a `search` pattern
+    // matching the literal `(?<`) failed to emit as valid JSON FIVE times
+    // in a row. handle_bad_json pushed the SAME retry message every time
+    // ("re-read the tool's schema, rewrite the COMPLETE call") — guidance
+    // about the SCHEMA, which the model already knows. For a
+    // content-EMISSION failure the missing information is a different
+    // FORMULATION, so every retry was identical and the loop could not
+    // self-break.
+    //
+    // The fix: on a REPEAT of the same (tool, error) signature the retry
+    // guidance must change strategy — naming a different formulation for
+    // the failing tool (for `search`: literal:true, or a
+    // metacharacter-free pattern) instead of re-issuing schema advice.
+    // The FIRST failure keeps the original schema-oriented message (it is
+    // correct for the dropped-required-field class from plan 4fa222cc).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // The exact live shape: a `search` call whose pattern is a
+    // backslash-dense regex, so the accumulated arguments are NOT valid
+    // JSON and handle_bad_json runs. `search` need not be registered —
+    // the bad-JSON path never dispatches the call, it only names it.
+    let bad_call = |n: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("call_{n}"),
+                name: "search".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                // Unterminated JSON string — the malformed-arguments
+                // signature (a backslash-dense pattern that did not
+                // survive emission).
+                fragment: r#"{"pattern":"\\(\\?<"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        bad_call(1),
+        bad_call(2),
+        bad_call(3),
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("find the lookbehind")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // Collect the per-call bad-JSON retry guidance pushed into history (the
+    // Tool-role error messages), in order.
+    let retry_guidance: Vec<String> = messages
+        .iter()
+        .filter(|m| m.role == Role::Tool && m.name.as_deref() == Some("search"))
+        .map(|m| m.content.as_text())
+        .collect();
+    assert_eq!(
+        retry_guidance.len(),
+        3,
+        "expected one bad-JSON retry message per failed call, got {}",
+        retry_guidance.len()
+    );
+
+    // The defect: attempts 2 and 3 repeat attempt 1 verbatim, so no retry
+    // carries new information and the model has no reason to reformulate.
+    assert_ne!(
+        retry_guidance[0], retry_guidance[1],
+        "a REPEATED bad-JSON failure must carry DIFFERENT guidance than the \
+         first (the loop cannot self-break while every retry is identical)"
+    );
+    // From the second repeat on, the guidance is idempotent BY DESIGN: the
+    // stuck state is the same, so the same different-formulation remedy is
+    // correct. What must NOT happen is a reversion to the first-failure
+    // schema advice — that is the guidance that carried no new information.
+    assert_ne!(
+        retry_guidance[0], retry_guidance[2],
+        "a further repeat must not revert to the first-failure schema advice"
+    );
+    assert!(
+        retry_guidance[2].contains("literal"),
+        "a further repeat must keep steering toward the new formulation"
+    );
+
+    // The strategy-changing guidance must name a concrete alternative
+    // formulation for `search` — not merely repeat "re-read the schema".
+    let repeat_guidance = format!("{}{}", retry_guidance[1], retry_guidance[2]);
+    assert!(
+        repeat_guidance.contains("literal"),
+        "the repeated-failure guidance must name `literal` as the escape \
+         hatch for a pattern that is hard to JSON-encode; got: {repeat_guidance}"
+    );
+    // Review round-1 hardening: pin harness attribution on the bad-JSON
+    // path, the documented idempotence from the second repeat on, and the
+    // CORRECT metacharacter-free encoding of the literal `(?<` —
+    // [(][?][<] (the two-class [(][?] / [(][<] form matches `(?(<`).
+    assert!(
+        retry_guidance[1].starts_with("[harness tool-call correction"),
+        "the repeat correction must be harness-attributed; got: {}",
+        retry_guidance[1]
+    );
+    assert_eq!(
+        retry_guidance[1], retry_guidance[2],
+        "the repeat guidance is idempotent by design — the stuck state is \
+         the same, so the same remedy is correct"
+    );
+    assert!(
+        repeat_guidance.contains("[(][?][<]"),
+        "the remedy must show the correct character class for the literal \
+         `(?<`; got: {repeat_guidance}"
+    );
+}

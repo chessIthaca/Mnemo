@@ -580,6 +580,17 @@ string (a live incident re-emitted the same missing-`message` git commit
 history-based, so it works across turn boundaries and decays naturally at
 the compaction boundary; `MAX_RETRIES` semantics are unchanged.
 
+Bad-JSON repeats get a sibling mechanism (backlog 38040f12): when the same
+tool's arguments fail to parse as JSON twice, the per-call retry message
+switches from schema advice to a strategy-changing, harness-attributed
+correction naming a different formulation per tool — `literal: true` or a
+metacharacter-free pattern for search/search_read, chunking for
+file_write/file_edit, rebuild-from-scratch otherwise — because a repeat
+means the emission itself is failing (typically escaping), which the
+model already knows the schema for. The correction rides the Tool role
+(context-only, no Error event) and the `MAX_BAD_JSON_RETRIES = 8` backstop
+is unchanged.
+
 ### Path safety (sandbox)
 
 All file agent tools route their path through `Sandbox::validate()` before any

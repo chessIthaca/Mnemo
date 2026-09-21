@@ -113,7 +113,10 @@ impl Tool for SearchReadTool {
              the top matched files' full numbered content — collapsing the search→read \
              round-trip. Literal queries use the content index when populated (engine: \
              index), walking otherwise. Build output and dependencies are always skipped. \
-              Returns a summary line, then the matched files (capped per-file and total). \
+              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+              prefer literal:true (it avoids escaping); if a call is rejected as \
+              malformed, do NOT resend it — reformulate. \
+               Returns a summary line, then the matched files (capped per-file and total). \
               For symbol questions — where is X defined, who calls X — call graph_search \
               (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
               symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
@@ -124,7 +127,7 @@ impl Tool for SearchReadTool {
                 "properties": {
                     "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal)."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex)."},
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."},
                     "max_files": {"type": "integer", "description": "Maximum number of matched files to read (default 5, max 5)."}
                 },
                 "required": ["pattern"]

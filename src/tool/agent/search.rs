@@ -1203,19 +1203,23 @@ impl Tool for SearchTool {
              pointing at literal:true. A broken regex is matched literally with a note. \
              Returns matching lines with paths and line numbers. Build output and \
              dependencies (target/, node_modules/, .git/, dist/) are pruned from the walk. \
-              For symbol questions — where is X defined, who calls X, callers/callees/blast \
-              radius — call graph_search (then graph_context(id=...)) FIRST; this tool is for \
-              text occurrences (comments, string literals, config keys, log text). \
-              Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
-              an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
-              SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-              and the walk is skipped; re-issue the same search to get the plain file search.",
+              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+              prefer literal:true (it avoids escaping) — e.g. a search for the \
+              literal (?< is pattern (?< with literal true; if a call is \
+              rejected as malformed, do NOT resend it — reformulate. \
+               For symbol questions — where is X defined, who calls X, callers/callees/blast \
+               radius — call graph_search (then graph_context(id=...)) FIRST; this tool is for \
+               text occurrences (comments, string literals, config keys, log text). \
+               Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
+               an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
+               SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
+               and the walk is skipped; re-issue the same search to get the plain file search.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "The pattern to search for."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex)."}
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."}
                 },
                 "required": ["pattern"]
             }),

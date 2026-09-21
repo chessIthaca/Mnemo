@@ -936,7 +936,7 @@ impl AgentLoopFactory {
             &project_root,
             self.core_operations.clone(),
         )));
-        // git_read is the read-only view into git (op = diff | log | show):
+        // git_read is the read-only view into git (op = diff | log | show | status):
         // the reviewer subagent's only way to see uncommitted changes (it has
         // no shell/git), and the bridge from a memory record's commit pointer
         // to shipped code. AutoRun by construction, which is exactly why it
@@ -1777,7 +1777,11 @@ mod tests {
             // ESCAPE-HATCH parity (~+330, same cause as the Executing raise)
             // rides Planning too — measures 18_605, 95 under; no raise
             // needed.
-            (ToolFilter::Planning, 18_700),
+            // 18_700 → 18_900 (2027-02-05): git_read gains op="status"
+            // (backlog 1aa7e456 — the description documents the new op and
+            // the enum grows, ~+122); measures Planning at 18_727 chars.
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Planning, 18_900),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -2050,7 +2054,11 @@ mod tests {
             // 18_700 holds (2027-02-05, round 2): same +330 parity growth as
             // Planning — measures Complete at 18_605, 95 under; no raise
             // needed.
-            (ToolFilter::Complete, 18_700),
+            // 18_700 → 18_900 (2027-02-05): same cause as the Planning raise
+            // above (git_read op="status", backlog 1aa7e456, ~+122);
+            // measures Complete at 18_727 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Complete, 18_900),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(

@@ -308,9 +308,9 @@ vitest (frontend), `tsc --noEmit` clean.
   text in a record body in place, `memory_amend` — appends a dated amendment
   paragraph to a knowledge record's file, stripping any leading `Amended …:`
   heading the caller supplies so exactly one heading lands, dated by the
-  tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
-  (`git_log`, `git_show` in
-  `tool/agent/git_read.rs`). `memory_search` is the single read path — one
+   tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
+   (`git_read`: diff/log/show/status, `tool/agent/git_read_tool.rs`).
+   `memory_search` is the single read path — one
   tool replaced the six former per-purpose read tools (they differed only by
   a record-type constant, a tier, or the presence of a query); its
   query-less browse mode (newest-first, narrowed by record_type/tier/prefix)

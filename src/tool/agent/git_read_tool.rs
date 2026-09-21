@@ -10,7 +10,7 @@
 //! principled rule, and paid three schemas to do it.
 //!
 //! Deliberately does NOT absorb the write-capable `git` tool. That split is
-//! load-bearing: these three are `AutoRun` (they never prompt, and they stay
+//! load-bearing: these four are `AutoRun` (they never prompt, and they stay
 //! visible in the read-only Planning and Complete states), while `git` is
 //! `NeedsApproval` and hidden there. Folding them together would either make
 //! reads prompt or make writes visible where no plan exists.
@@ -26,7 +26,7 @@ use serde_json::json;
 
 use crate::provider::ToolSchema;
 use crate::tool::agent::git_diff::GitDiffTool;
-use crate::tool::agent::git_read::{GitLogTool, GitShowTool};
+use crate::tool::agent::git_read::{GitLogTool, GitShowTool, GitStatusTool};
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Which read to perform. Only `op` is inspected here; the per-op arguments
@@ -41,6 +41,7 @@ pub struct GitReadTool {
     log: GitLogTool,
     show: GitShowTool,
     diff: GitDiffTool,
+    status: GitStatusTool,
 }
 
 impl GitReadTool {
@@ -50,7 +51,8 @@ impl GitReadTool {
         Self {
             log: GitLogTool::new(root.clone()),
             show: GitShowTool::new(root.clone()),
-            diff: GitDiffTool::new(root),
+            diff: GitDiffTool::new(root.clone()),
+            status: GitStatusTool::new(root),
         }
     }
 }
@@ -71,7 +73,9 @@ impl Tool for GitReadTool {
             "Read-only view into git. op=\"diff\": ALL uncommitted changes (stat + full \
              diff + untracked), never truncated — use this to review what changed. \
              op=\"log\": recent commits, newest first, optionally for one path. \
-             op=\"show\": one commit, stat by default. The bridge from a memory record's \
+             op=\"show\": one commit, stat by default. \
+             op=\"status\": the short working-tree status (clean tree → an empty \
+             listing) — the \"is the tree clean?\" check. The bridge from a memory record's \
              commit pointer to the shipped code. Never mutates git state; use the `git` \
              tool for that.",
             json!({
@@ -79,7 +83,7 @@ impl Tool for GitReadTool {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["diff", "log", "show"],
+                        "enum": ["diff", "log", "show", "status"],
                         "description": "Which read to perform."
                     },
                     "commit": {"type": "string", "description": "op=show: the commit-ish — a hex hash (7–40 chars), branch/tag, or revision like HEAD~2."},
@@ -107,7 +111,11 @@ impl Tool for GitReadTool {
             "diff" => self.diff.execute(args).await,
             "log" => self.log.execute(args).await,
             "show" => self.show.execute(args).await,
-            other => ToolResult::error(format!("unknown op '{other}' — valid: diff, log, show")),
+            "status" => self.status.execute(args).await,
+            other => ToolResult::error(format!(
+                "unknown op '{other}' — valid: diff, log, show, status; \
+                 for write operations (commit/merge/push/…) use the `git` tool"
+            )),
         }
     }
 }
@@ -169,13 +177,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_op_lists_dirty_tree_and_summarizes() {
+        // One modified tracked file (a.txt, from the fixture) plus one
+        // untracked file: the short form lists both, and the appended
+        // summary counts them (backlog 1aa7e456 — "is the tree clean?"
+        // needs a read-only home on git_read).
+        let dir = repo();
+        std::fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+        let tool = GitReadTool::new(dir.path());
+
+        let r = tool.execute(json!({"op": "status"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("M a.txt"), "{}", r.output);
+        assert!(r.output.contains("?? b.txt"), "{}", r.output);
+        assert!(
+            r.output.contains("(1 changed, 1 untracked)"),
+            "{}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn status_op_reports_clean_tree() {
+        // With everything committed the short form is empty and the summary
+        // says so — the "is the tree clean?" answer at a glance.
+        let dir = repo();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(p)
+                .output()
+                .expect("git runs");
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "second commit"]);
+        let tool = GitReadTool::new(p);
+
+        let r = tool.execute(json!({"op": "status"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("(working tree clean"), "{}", r.output);
+        assert!(!r.output.contains("?? "), "{}", r.output);
+    }
+
+    #[tokio::test]
     async fn unknown_or_missing_op_errors_with_the_valid_set() {
         let dir = repo();
         let tool = GitReadTool::new(dir.path());
 
         let r = tool.execute(json!({"op": "blame"})).await;
         assert!(!r.success);
-        assert!(r.output.contains("diff, log, show"), "{}", r.output);
+        assert!(
+            r.output.contains("diff, log, show, status"),
+            "{}",
+            r.output
+        );
+        assert!(
+            r.output.contains("`git` tool"),
+            "the unknown-op error must name the write-ops alternative: {}",
+            r.output
+        );
 
         let r = tool.execute(json!({})).await;
         assert!(!r.success, "op is required");

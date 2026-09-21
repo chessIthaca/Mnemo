@@ -450,7 +450,7 @@ const REVIEWER_BASE_TOOLS: &[&str] = &[
     "image_understand_diagram",
     // Read-only discovery.
     "list_models",
-    // One read-only view into git (op = diff | log | show) — the reviewer's
+    // One read-only view into git (op = diff | log | show | status) — the reviewer's
     // only way to see uncommitted changes, since it has no shell/git.
     "git_read",
     "web_fetch",

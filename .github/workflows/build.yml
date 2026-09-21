@@ -1,5 +1,10 @@
 # Multi-platform build pipeline (Windows + macOS).
 #
+# STATUS (2026-09-20): the macOS job is TEMPORARILY DISABLED (`if: false`) —
+# releases publish Windows-only installers until it's re-enabled; see the
+# macos job's comment for the reason + the re-enable checklist. macOS
+# support in the codebase (and local macOS builds) is unchanged.
+#
 # Triggers: manual (Actions tab → Run workflow) or pushing a v* tag.
 #
 # macOS signing + notarization is SECRETS-DRIVEN and group-gated: configure
@@ -77,7 +82,18 @@ jobs:
             target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
+  # TEMPORARILY DISABLED (2026-09-20, user decision): the macOS leg failed
+  # `cargo test --workspace` on CI again (run 35531680467, tag v0.1.1) even
+  # after the five-test fixes, blocking every release. Disabled HERE ONLY —
+  # macOS support in the codebase and local builds are unchanged. To
+  # re-enable: (1) delete the `if: false` line below; (2) restore the
+  # release job's macos references — add `macos` back to its `needs:`, re-add
+  # the macos-bundles-aarch64 artifact download, and re-add the
+  # dist/macos/**/*.dmg + *.zip globs to its files list; (3) drop the
+  # TEMPORARILY DISABLED notes — the file-header STATUS note, the release
+  # job's pointer comment, and the new_release skill's Windows-only note.
   macos:
+    if: false
     runs-on: macos-latest
     timeout-minutes: 90
     # The `secrets` context is NOT available in step `if:` conditionals
@@ -192,7 +208,9 @@ jobs:
   # manual release would block this job from publishing the same tag.
   release:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    needs: [windows, macos]
+    # macOS job temporarily disabled (see its comment above) — Windows
+    # installers only until it's re-enabled.
+    needs: [windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -203,17 +221,11 @@ jobs:
         with:
           name: windows-installers
           path: dist/windows
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-bundles-aarch64
-          path: dist/macos
       - name: Create GitHub release with installers
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/windows/**/*.msi
             dist/windows/**/*.exe
-            dist/macos/**/*.dmg
-            dist/macos/**/*.zip
           generate_release_notes: true
           fail_on_unmatched_files: true

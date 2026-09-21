@@ -395,7 +395,10 @@ impl Tool for ShellTool {
             "Execute a shell command — PowerShell 5.1 on Windows, sh on Unix. Requires \
              approval. command is required on every call — there is no zero-argument \
              form; an empty shell call is always an error (if you just made a shell \
-             call, the next one needs its own command). On Windows chain with ; not \
+             call, the next one needs its own command) — e.g. \
+             {\"command\":\"cargo test\",\"purpose\":\"running tests\"}. On a \
+             'command is required' error, rewrite the full call, do not resend the \
+             empty shape. On Windows chain with ; not \
              && / || — PowerShell 5.1 rejects bash-style chaining; it is auto-translated \
              to if ($?) gates with a note in the result, but prefer ; or separate \
              calls. A result is 'successful' when the command RAN: check the exit code \
@@ -448,9 +451,21 @@ impl Tool for ShellTool {
     /// receives throttled, UTF-8-safe chunks while the child runs, while the
     /// returned result is exactly what [`Tool::execute`] returns.
     async fn execute_streaming(&self, args: serde_json::Value, sink: OutputSink) -> ToolResult {
-        let args: ShellArgs = match serde_json::from_value(args) {
+        let args: ShellArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error itself (the
+            // read_files precedent, backlog 26cdbaf8) — the model reads this at
+            // retry time, so the FIRST retry succeeds instead of waiting for
+            // the circuit breaker.
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "shell",
+                    &e,
+                    &args,
+                    "Always pass command + purpose — there is no zero-argument form; \
+                     rewrite the full call, do not resend the empty shape.",
+                ))
+            }
         };
 
         let cwd = match self.resolve_cwd(args.cwd.as_deref()) {
@@ -1089,6 +1104,17 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("parameter 'command' is required"));
+        // Backlog d9ad618e: the recovery hint rides the error.
+        assert!(
+            result.output.contains("rewrite the full call"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not resend the empty shape"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -1139,6 +1165,17 @@ mod tests {
         );
         assert!(
             schema.description.contains("chain with ; not && / ||"),
+            "{}",
+            schema.description
+        );
+        // Backlog d9ad618e: the inline example + recovery rule.
+        assert!(
+            schema.description.contains("cargo test"),
+            "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do not resend the empty shape"),
             "{}",
             schema.description
         );

@@ -77,7 +77,10 @@ impl Tool for GitReadTool {
              op=\"status\": the short working-tree status (clean tree → an empty \
              listing) — the \"is the tree clean?\" check. The bridge from a memory record's \
              commit pointer to the shipped code. Never mutates git state; use the `git` \
-             tool for that.",
+             tool for that. \
+             Always pass `op` — e.g. {\"op\":\"log\"}. No zero-argument form; \
+             on an 'op is required' error rewrite the full call, do not \
+             resend the empty shape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -105,7 +108,17 @@ impl Tool for GitReadTool {
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
         let op = match serde_json::from_value::<GitReadArgs>(args.clone()) {
             Ok(a) => a.op,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "git_read",
+                    &e,
+                    &args,
+                    "Always pass op — there is no zero-argument form; rewrite \
+                     the full call, do not resend the empty shape.",
+                ))
+            }
         };
         match op.trim().to_ascii_lowercase().as_str() {
             "diff" => self.diff.execute(args).await,
@@ -218,6 +231,54 @@ mod tests {
         assert!(r.success, "{}", r.output);
         assert!(r.output.contains("(working tree clean"), "{}", r.output);
         assert!(!r.output.contains("?? "), "{}", r.output);
+    }
+
+    #[test]
+    fn schema_advertises_the_no_zero_argument_rule() {
+        // Backlog d9ad618e (the read_files precedent, backlog 26cdbaf8).
+        let dir = repo();
+        let tool = GitReadTool::new(dir.path());
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("No zero-argument form"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do not resend the empty shape"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("e.g. {"),
+            "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_call_error_carries_the_recovery_hint() {
+        // Backlog d9ad618e: the recovery hint rides the error itself, so the
+        // FIRST retry succeeds instead of waiting for the circuit breaker.
+        let dir = repo();
+        let tool = GitReadTool::new(dir.path());
+        let result = tool.execute(json!({})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("parameter 'op' is required"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("rewrite the full call"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not resend the empty shape"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]

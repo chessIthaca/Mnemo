@@ -133,7 +133,11 @@ impl Tool for MemoryWriteTool {
              is how you learn. Typed title prefixes classify the record \
              (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) as a pointer to on-disk \
              truth — keep it compact (gist + path/commit pointer); the file \
-             carries the detail.",
+             carries the detail. \
+             All three fields (tier, title, content) are required — e.g. \
+             {\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}. No \
+             zero-argument form; on a required-field error rewrite the full \
+             call, do not resend the empty shape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -153,9 +157,20 @@ impl Tool for MemoryWriteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryWriteArgs = match serde_json::from_value(args) {
+        let args: MemoryWriteArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "memory_write",
+                    &e,
+                    &args,
+                    "All of tier, title, content are required — there is no \
+                     zero-argument form; rewrite the full call, do not resend \
+                     the empty shape.",
+                ))
+            }
         };
         let tier = match MemoryTier::from_str(&args.tier) {
             Some(t) => t,
@@ -1378,6 +1393,52 @@ mod tests {
     fn make_store() -> Arc<dyn MemoryStoreTrait> {
         let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
         Arc::new(MemoryStore::open_in_memory(embedder).unwrap())
+    }
+
+    #[test]
+    fn schema_advertises_the_no_zero_argument_rule() {
+        // Backlog d9ad618e (the read_files precedent, backlog 26cdbaf8).
+        let tool = MemoryWriteTool::new(make_store());
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("No zero-argument form"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do not resend the empty shape"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("e.g. {"),
+            "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_call_error_carries_the_recovery_hint() {
+        // Backlog d9ad618e: the recovery hint rides the error itself, so the
+        // FIRST retry succeeds instead of waiting for the circuit breaker.
+        let tool = MemoryWriteTool::new(make_store());
+        let result = tool.execute(json!({})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("parameter 'tier' is required"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("rewrite the full call"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not resend the empty shape"),
+            "{}",
+            result.output
+        );
     }
 
     /// Build a knowledge-wired writing tool set over a temp project: the

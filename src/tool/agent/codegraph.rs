@@ -278,7 +278,10 @@ impl Tool for GraphSearchTool {
              and other source extensions) by name. Returns up to 20 candidates with file, line \
              range, kind, and the exact symbol id to pass to graph_context / graph_impact / \
              graph_path. Indexes symbol definitions only — string literals (tool names, config \
-             keys, log text) are not indexed; use the `search` tool for those.",
+             keys, log text) are not indexed; use the `search` tool for those. \
+             Always pass `query` — e.g. {\"query\":\"DeltaAccumulator\"}. No \
+             zero-argument form; on a 'query is required' error rewrite the \
+             full call, do not resend the empty shape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -294,9 +297,19 @@ impl Tool for GraphSearchTool {
         struct Args {
             query: String,
         }
-        let args: Args = match serde_json::from_value(args) {
+        let args: Args = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "graph_search",
+                    &e,
+                    &args,
+                    "Always pass query — there is no zero-argument form; rewrite \
+                     the full call, do not resend the empty shape.",
+                ))
+            }
         };
         // Freshness-aware query (backlog 95f21af0 — the F10 pattern for the
         // symbol index): a TOTAL miss may be staleness, not absence — the
@@ -423,7 +436,11 @@ impl Tool for GraphContextTool {
              Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). Call this immediately \
              after graph_search whenever you need callers/callees/imports — one call \
              replaces a grep chain and reading whole files. Pass an exact `id` from \
-             graph_search, or a `name` to resolve.",
+             graph_search, or a `name` to resolve. \
+             Always pass `id` (or `name`) — e.g. \
+             {\"id\":\"src/provider/stream.rs::DeltaAccumulator::52\"}. No \
+             zero-argument form; on a required-field error rewrite the full \
+             call, do not resend the empty shape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -446,7 +463,10 @@ impl Tool for GraphContextTool {
                 .or_else(|| args.name.clone())
                 .unwrap_or_default();
             if key.is_empty() {
-                return Err("either 'id' or 'name' is required".to_string());
+                // Backlog d9ad618e: the recovery rule rides the error (the
+                // read_files precedent) — an empty call lands here, not on
+                // the serde path (id/name are either-or by design).
+                return Err("either 'id' or 'name' is required — rewrite the full call, do not resend the empty shape".to_string());
             }
             let Some(id) = resolve_id(view, &key) else {
                 let candidates = view.resolve(&key);
@@ -594,7 +614,10 @@ impl Tool for GraphPathTool {
             "Find the shortest directed path between two symbols in the code knowledge graph \
              (e.g. how does `main` reach `db_connect`?) — use for reachability questions \
              ('can A reach B', 'how does X get to Y'). Each hop lists the edge kind \
-             (calls/imports/contains). Accepts exact ids from graph_search or names to resolve.",
+             (calls/imports/contains). Accepts exact ids from graph_search or names to resolve. \
+             Always pass `from` and `to` — e.g. {\"from\":\"main\",\"to\":\"db_connect\"}. \
+             No zero-argument form; on a required-field error rewrite the \
+             full call, do not resend the empty shape.",
             json!({
                 "type": "object",
                 "properties": {
@@ -612,9 +635,19 @@ impl Tool for GraphPathTool {
             from: String,
             to: String,
         }
-        let args: Args = match serde_json::from_value(args) {
+        let args: Args = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "graph_path",
+                    &e,
+                    &args,
+                    "Always pass from and to — there is no zero-argument form; \
+                     rewrite the full call, do not resend the empty shape.",
+                ))
+            }
         };
         run_query(self.graph.clone(), move |view| {
             let Some(from_id) = resolve_id(view, &args.from) else {
@@ -675,6 +708,74 @@ mod tests {
     fn payload(result: ToolResult) -> Value {
         assert!(result.success, "tool must succeed: {}", result.output);
         serde_json::from_str(&result.output).unwrap()
+    }
+
+    #[test]
+    fn schemas_advertise_the_no_zero_argument_rule() {
+        // Backlog d9ad618e (the read_files precedent, backlog 26cdbaf8): the
+        // three graph tools each carry the rule + example + recovery rule.
+        let (_dir, graph) = indexed_graph();
+        for (name, schema) in [
+            ("graph_search", GraphSearchTool::new(graph.clone()).schema()),
+            ("graph_context", GraphContextTool::new(graph.clone()).schema()),
+            ("graph_path", GraphPathTool::new(graph.clone()).schema()),
+        ] {
+            assert!(
+                schema.description.contains("No zero-argument form"),
+                "{name}: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.contains("do not resend the empty shape"),
+                "{name}: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.contains("e.g. {"),
+                "{name}: the inline example shows the exact call shape: {}",
+                schema.description
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_call_errors_carry_the_recovery_hint() {
+        // Backlog d9ad618e: an empty argument object errors with the recovery
+        // rule riding the error itself, so the FIRST retry succeeds instead
+        // of waiting for the circuit breaker.
+        let (_dir, graph) = indexed_graph();
+        for (name, result) in [
+            (
+                "graph_search",
+                GraphSearchTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+            (
+                "graph_context",
+                GraphContextTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+            (
+                "graph_path",
+                GraphPathTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+        ] {
+            assert!(!result.success, "{name} must reject an empty call");
+            assert!(
+                result.output.contains("rewrite the full call"),
+                "{name}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("do not resend the empty shape"),
+                "{name}: {}",
+                result.output
+            );
+        }
     }
 
     #[test]

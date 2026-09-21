@@ -1,0 +1,20 @@
+# A Mnemo skill — authored with the `skill_create` tool.
+#
+# A skill is a named overlay on the workflow. `skill_start` enters it: `prompt`
+# is injected into the system prompt EVERY turn it runs, and `tools` is the
+# allow-list the agent picks from (the memory tools, ask_user, current_plan,
+# skill_reload, the backlog tools and the exits skill_end/abandon_skill are
+# always available and need not be listed here).
+# `skill_end` lands the workflow in `target_state`; `abandon_skill` rolls back.
+#
+# Keep `prompt` a terse operative checklist — rationale belongs HERE, in the
+# comments, because only `prompt` costs context on every turn.
+#
+# Re-edit this file freely, then call `skill_reload` to pick the change up: the
+# registry is otherwise loaded once, at app startup.
+
+name = "noop-temp"
+available_in = ["executing"]
+target_state = "executing"
+tools = ["shell"]
+prompt = "noop"

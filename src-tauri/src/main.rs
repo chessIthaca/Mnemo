@@ -110,13 +110,14 @@ fn inherit_shell_path() {
     }
 }
 
-/// Whether a captured login-shell PATH value is safe to adopt: non-empty and
+/// Whether a captured login-shell PATH value is safe to adopt: non-blank and
 /// free of control characters (a newline means the rc files echoed extra
 /// output into the captured stdout). Spaces are LEGAL — PATH entries like
-/// `/Applications/Some App/bin` must not be rejected (review F5).
+/// `/Applications/Some App/bin` must not be rejected (review F5) — but a
+/// whitespace-only value is not a usable PATH and must be rejected.
 #[cfg(unix)]
 fn is_adoptable_path(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(|c| c.is_control())
+    !value.trim().is_empty() && !value.chars().any(|c| c.is_control())
 }
 
 /// Non-Unix: nothing to do — Windows GUI apps inherit the user PATH.
@@ -1875,13 +1876,26 @@ mod tests {
 
     /// Empty values and control characters (a rc file echoing into the
     /// captured stdout shows up as newlines/garbage) must still be rejected.
+    /// A whitespace-only value is not a usable PATH either — this assertion
+    /// was the macOS CI failure of 2026-09-21 (run 35575972400): the predicate
+    /// checked only `is_empty()`, so `"   "` slipped through.
     #[test]
     fn adoptable_path_rejects_empty_and_control_characters() {
         assert!(!is_adoptable_path(""));
         assert!(!is_adoptable_path("   "));
+        assert!(!is_adoptable_path("\t"));
+        assert!(!is_adoptable_path("\n"));
         assert!(!is_adoptable_path("/usr/bin\n/usr/local/bin"));
         assert!(!is_adoptable_path("/usr/bin\u{7}:/bin"));
         assert!(!is_adoptable_path("/usr/bin\t/bin"));
+    }
+
+    /// The trimmed-empty guard must not become a blanket whitespace rejection:
+    /// a real PATH whose entries merely CONTAIN spaces stays adoptable.
+    #[test]
+    fn adoptable_path_keeps_internal_spaces() {
+        assert!(is_adoptable_path(" /usr/local/bin"));
+        assert!(is_adoptable_path("/Applications/Some App/bin:/usr/bin"));
     }
 }
 

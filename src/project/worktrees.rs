@@ -20,7 +20,10 @@
 //! repo's 23755694) cannot receive direct pushes (GH013), so the
 //! landing pushes the branch and opens a PR the human approves and
 //! merges — the branch is KEPT (the PR's head), only the worktree is
-//! removed. Merge conflicts are SURFACED, never auto-resolved: the merge
+//! removed; once the human's merge is visible in `origin/main`, the
+//! next run-start sweeps the redundant ref
+//! ([`sweep_merged_runall_branches`], backlog 64662ef2). Merge
+//! conflicts are SURFACED, never auto-resolved: the merge
 //! is aborted, the branch + worktree are kept, and the conflicted file
 //! list is returned for the item note.
 //!
@@ -140,9 +143,10 @@ pub async fn remove_item_worktree(
 /// Remove a dispatched item's worktree WITHOUT deleting its branch —
 /// the PR-path landing (backlog b52b041a): the branch is the PR's head
 /// and must survive the human merge. Merged `wt/runall-*` refs are
-/// left in place — no sweeper deletes them yet (review L4,
-/// 2026-09-21; a follow-up is queued); a stale branch only blocks
-/// re-dispatch of a Done item, which never re-dispatches.
+/// swept at the next run-start once their commits are in `origin/main`
+/// ([`sweep_merged_runall_branches`], backlog 64662ef2); until then a
+/// stale branch only blocks re-dispatch of a Done item, which never
+/// re-dispatches.
 pub async fn remove_worktree_only(
     main_root: PathBuf,
     worktree: PathBuf,
@@ -165,6 +169,78 @@ fn remove_worktree_only_impl(main_root: &Path, worktree: &Path) -> Result<(), St
         .to_string();
     let _ = git_raw(main_root, &["worktree", "prune"]);
     git_raw(main_root, &["worktree", "remove", "--force", &worktree_str]).map(|_| ())
+}
+
+/// Sweep merged `wt/runall-*` branches (backlog 64662ef2, review L4 of
+/// the b52b041a landing): the PR-path landing keeps every branch as a
+/// PR head — after the human merges, the local ref is redundant (its
+/// commits are in `origin/main`) and agent.md's "no branches
+/// accumulate" topology wants it gone.
+///
+/// The gate is conservative by construction: a branch is deleted only
+/// when its tip is an ANCESTOR of `origin/main` (`git merge-base
+/// --is-ancestor`) — the commits are already in main, so the local
+/// ref is pure redundancy (the remote PR head is untouched). Unmerged
+/// branches (PR open, or the merge not yet visible locally) are never
+/// touched. A branch still checked out in a worktree IS considered
+/// (its `+ ` listing prefix is stripped) but refused by git itself
+/// ("cannot delete branch used by worktree") — the in-flight case
+/// needs no extra code beyond the parse. A best-effort `git fetch
+/// origin` refreshes `origin/main` first: a failed fetch only DELAYS
+/// the sweep (a stale ref under-deletes, never over-deletes), and a
+/// `git worktree prune` first clears stale metadata so an
+/// externally-deleted worktree does not pin its branch in the listing
+/// forever (the R3-L2 lesson). No `gh pr view` double-guard: ancestry
+/// into `origin/main` already implies the commits landed. Known
+/// residual (review L3, 2026-09-21): a SQUASH-merged PR breaks
+/// ancestry (the squash commit is content-identical but SHA-different)
+/// — the branch lingers, under-deleting only; a `gh pr view --json
+/// state` == MERGED fallback would close it if ever needed.
+///
+/// Returns the deleted branch names (for the run-start log).
+pub async fn sweep_merged_runall_branches(main_root: PathBuf) -> Vec<String> {
+    tokio::task::spawn_blocking(move || sweep_merged_runall_branches_impl(&main_root))
+        .await
+        .unwrap_or_default()
+}
+
+/// The synchronous core of [`sweep_merged_runall_branches`].
+fn sweep_merged_runall_branches_impl(main_root: &Path) -> Vec<String> {
+    // Best-effort refresh — a stale origin/main only delays the sweep.
+    let _ = git_raw(main_root, &["fetch", "origin"]);
+    // Clear stale worktree metadata first (the R3-L2 lesson): an
+    // externally-deleted worktree's stale entry would keep marking its
+    // branch as checked out, pinning it in the listing forever.
+    let _ = git_raw(main_root, &["worktree", "prune"]);
+    let Ok(listing) = git_raw(main_root, &["branch", "--list", "wt/runall-*"]) else {
+        return Vec::new();
+    };
+    let mut deleted = Vec::new();
+    for line in listing.lines() {
+        // `git branch --list` prefixes the current branch with "* ",
+        // branches checked out in OTHER worktrees with "+ " (the
+        // in-flight runall shape), and the rest with two spaces. Both
+        // markers are stripped so a worktree-held branch is CONSIDERED —
+        // git's own "cannot delete branch used by worktree" refusal is
+        // what keeps it (review L1, 2026-09-21).
+        let branch = line
+            .strip_prefix("* ")
+            .or_else(|| line.strip_prefix("+ "))
+            .unwrap_or(line)
+            .trim();
+        if !branch.starts_with("wt/runall-") {
+            continue;
+        }
+        let merged = git_raw(
+            main_root,
+            &["merge-base", "--is-ancestor", branch, "origin/main"],
+        )
+        .is_ok();
+        if merged && git_raw(main_root, &["branch", "-D", branch]).is_ok() {
+            deleted.push(branch.to_string());
+        }
+    }
+    deleted
 }
 
 /// Parse a GitHub remote URL into `(owner, repo)` — the https, ssh,
@@ -456,8 +532,9 @@ fn land_item_branch_impl(main_root: &Path, branch: &str) -> Result<Landed, LandE
 /// ruleset (no force-push, no admin override, no ruleset edits).
 ///
 /// The branch is KEPT (the PR's head; merged `wt/runall-*` refs are
-/// left in place — no sweeper yet, review L4 2026-09-21). An
-/// already-open PR for the branch is reported instead of erroring
+/// swept at the next run-start — [`sweep_merged_runall_branches`],
+/// backlog 64662ef2). An already-open PR for the branch is reported
+/// instead of erroring
 /// (idempotent re-landing, the skill's rule). Any failure surfaces as
 /// [`LandError::Git`] naming the PR requirement and the exact command
 /// to run manually.
@@ -699,6 +776,89 @@ mod tests {
                 .is_empty(),
             "the branch is KEPT (the PR needs it)"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_only_runall_branches_merged_into_origin_main() {
+        // Backlog 64662ef2 (review L4 of the b52b041a landing): after the
+        // human merges a run-all PR, the redundant local ref is swept;
+        // unmerged branches, non-runall branches, and worktree-checked-out
+        // branches are never touched.
+        let repo = init_repo();
+        // A bare upstream as origin — OUTSIDE the repo's working tree: an
+        // in-tree upstream would be tracked by `git add -A`, and a later
+        // `git checkout` would restore the tracked copy of its
+        // refs/heads/main file, silently rewinding the bare repo's ref
+        // (the sync tests remove their in-tree upstream before
+        // provisioning for the same reason).
+        let upstream_dir = tempfile::tempdir().unwrap();
+        let upstream = upstream_dir.path().join("upstream.git");
+        git_raw(
+            repo.path(),
+            &["init", "--bare", upstream.to_str().unwrap()],
+        )
+        .unwrap();
+        git_raw(
+            repo.path(),
+            &["remote", "add", "origin", upstream.to_str().unwrap()],
+        )
+        .unwrap();
+        git_raw(repo.path(), &["push", "-u", "origin", "main"]).unwrap();
+
+        // A MERGED runall branch: commit on it, merge into main, push —
+        // its tip is an ancestor of origin/main → swept.
+        git_raw(repo.path(), &["checkout", "-b", "wt/runall-aaaaaaaa"]).unwrap();
+        std::fs::write(repo.path().join("landed.txt"), "landed\n").unwrap();
+        git_raw(repo.path(), &["add", "-A"]).unwrap();
+        git_raw(repo.path(), &["commit", "-m", "landed work"]).unwrap();
+        git_raw(repo.path(), &["checkout", "main"]).unwrap();
+        git_raw(
+            repo.path(),
+            &["merge", "--no-ff", "wt/runall-aaaaaaaa", "-m", "merge"],
+        )
+        .unwrap();
+        git_raw(repo.path(), &["push", "origin", "main"]).unwrap();
+
+        // An UNMERGED runall branch: its commit is not in origin/main →
+        // kept.
+        git_raw(repo.path(), &["checkout", "-b", "wt/runall-bbbbbbbb"]).unwrap();
+        std::fs::write(repo.path().join("open.txt"), "open\n").unwrap();
+        git_raw(repo.path(), &["add", "-A"]).unwrap();
+        git_raw(repo.path(), &["commit", "-m", "open work"]).unwrap();
+        git_raw(repo.path(), &["checkout", "main"]).unwrap();
+
+        // A merged NON-runall branch: never in the listing pattern →
+        // kept.
+        git_raw(repo.path(), &["branch", "wt/other"]).unwrap();
+
+        // A worktree-checked-out merged branch: the provisioned branch
+        // sits at main's tip (an ancestor of origin/main), but its
+        // worktree holds it checked out — git refuses the delete.
+        let (worktree, wt_branch) =
+            provision_item_worktree(repo.path().to_path_buf(), "cccccccc1234".to_string())
+                .await
+                .unwrap();
+
+        let swept = sweep_merged_runall_branches(repo.path().to_path_buf()).await;
+        assert_eq!(swept, vec!["wt/runall-aaaaaaaa".to_string()]);
+        // The unmerged branch, the non-runall branch, and the
+        // worktree-held branch all survive.
+        for kept in ["wt/runall-bbbbbbbb", "wt/other", &wt_branch] {
+            assert!(
+                !git_raw(repo.path(), &["branch", "--list", kept])
+                    .unwrap()
+                    .is_empty(),
+                "{kept} must be kept"
+            );
+        }
+        // The swept branch is gone; the worktree still exists (only the
+        // branch delete is refused for it).
+        assert!(
+            git_raw(repo.path(), &["branch", "--list", "wt/runall-aaaaaaaa"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(worktree.exists());
     }
 
     #[tokio::test]

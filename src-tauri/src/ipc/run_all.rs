@@ -3011,13 +3011,19 @@ mod tests {
             snapshot < transition,
             "the note snapshot must happen BEFORE the transition"
         );
-        // Wiring: run-all START calls the sweep after the already-active
-        // check and BEFORE the pending count — adopted items count toward
-        // the run's total and dispatch in queue order.
+        // Wiring: run-all START calls the adoption sweep after the
+        // already-active check and BEFORE the pending count — adopted
+        // items count toward the run's total and dispatch in queue
+        // order. The merged-branch sweeper (backlog 64662ef2) sits
+        // between the adoption sweep and the pending count: a run-start
+        // that finds no eligible items must still sweep.
         let cmds = include_str!("backlog_cmds.rs");
         let adopt_call = cmds
             .find("adopt_orphaned_in_flight")
             .expect("backlog_run_all must call adopt_orphaned_in_flight");
+        let sweep_call = cmds
+            .find("sweep_merged_runall_branches")
+            .expect("backlog_run_all must call the merged-branch sweeper");
         let active_check = cmds
             .find("run-all is already active")
             .expect("backlog_run_all must keep the already-active check");
@@ -3025,9 +3031,14 @@ mod tests {
             .find("no pending backlog items to run")
             .expect("backlog_run_all must keep the pending-count check");
         assert!(
-            active_check < adopt_call && adopt_call < pending_count,
+            active_check < adopt_call
+                && adopt_call < sweep_call
+                && sweep_call < pending_count,
             "adoption must run AFTER the already-active check and BEFORE the \
-             pending count — adopted items count toward the run's total"
+             pending count — adopted items count toward the run's total; the \
+             sweeper must run BEFORE the pending-count early-return so a \
+             run-start that finds no eligible items still sweeps (backlog \
+             64662ef2, review L2)"
         );
     }
 

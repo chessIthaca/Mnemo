@@ -98,7 +98,9 @@ command.
   PROTECTED main (ACTIVE pull_request ruleset, detected up-front via
   `gh api repos/{owner}/{repo}/rulesets`) gets the branch pushed + a PR
   opened (`gh pr create --base main --head <branch>`), the URL reported
-  on the item, and the branch kept for the human merge — never bypass.
+  on the item, and the branch kept for the human merge — swept at the
+  next run-start once merged into `origin/main` (backlog 64662ef2) —
+  never bypass.
   Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.

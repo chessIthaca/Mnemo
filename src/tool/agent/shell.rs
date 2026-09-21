@@ -392,22 +392,24 @@ impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "shell",
-            "Execute a shell command — PowerShell 5.1 on Windows, sh on Unix. Requires \
-             approval. command is required on every call — there is no zero-argument \
-             form; an empty shell call is always an error (if you just made a shell \
-             call, the next one needs its own command) — e.g. \
-             {\"command\":\"cargo test\",\"purpose\":\"running tests\"}. On a \
-             'command is required' error, rewrite the full call, do not resend the \
-             empty shape. On Windows chain with ; not \
-             && / || — PowerShell 5.1 rejects bash-style chaining; it is auto-translated \
-             to if ($?) gates with a note in the result, but prefer ; or separate \
-             calls. A result is 'successful' when the command RAN: check the exit code \
-             to see whether it failed. Output streams live into the tool card while the \
-             command runs; the RESULT is capped (~100 KiB) with a truncation note, and \
-             well-known commands (cargo build/test, npm test/build, git status) are \
-             noise-filtered — errors, warnings and summaries always survive, and the raw \
-             stdout/stderr ride the result's data field. Commands exceeding the timeout \
-             are killed.",
+            "command + purpose are required on every call — e.g. \
+             {\"command\":\"cargo test\",\"purpose\":\"running tests\"}. There is no \
+             zero-argument form; an empty shell call is always an error (if you just \
+             made a shell call, the next one needs its own command). On a \
+             'command is required' error, rewrite the full call, do not resend \
+             the empty shape. If you catch yourself emitting shell with no command, \
+             stop — write the command first, then the call. Execute a shell \
+             command — PowerShell 5.1 on Windows, sh on Unix. Requires approval. \
+             On Windows chain with ; not && / || — PowerShell 5.1 rejects \
+             bash-style chaining; it is auto-translated to if ($?) gates with a \
+             note in the result, but prefer ; or separate calls. A result is \
+             'successful' when the command RAN: check the exit code to see \
+             whether it failed. Output streams live into the tool card while \
+             the command runs; the RESULT is capped (~100 KiB) with a truncation \
+             note, and well-known commands (cargo build/test, npm test/build, \
+             git status) are noise-filtered — errors, warnings, and summaries \
+             always survive, and the raw stdout/stderr ride the result's data \
+             field. Commands exceeding the timeout are killed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1158,6 +1160,16 @@ mod tests {
         // failure classes — the empty-argument trap and PowerShell chaining.
         let tool = tool_in(std::path::Path::new("."));
         let schema = tool.schema();
+        assert!(
+            schema.description.starts_with("command + purpose are required"),
+            "the contract sentence LEADS the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("If you catch yourself"),
+            "the content-first anti-pattern clause: {}",
+            schema.description
+        );
         assert!(
             schema.description.contains("no zero-argument form"),
             "{}",

@@ -271,17 +271,20 @@ impl Tool for GraphSearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_search",
-            "MANDATORY first step when locating a symbol definition — never read whole files \
-             or run grep chains to find one. Find symbols (functions, structs, traits, classes, \
-             …) in the project's code knowledge graph (Rust, TypeScript/TSX, JavaScript, \
-             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks — .rs/.ts/.tsx/.js \
-             and other source extensions) by name. Returns up to 20 candidates with file, line \
-             range, kind, and the exact symbol id to pass to graph_context / graph_impact / \
-             graph_path. Indexes symbol definitions only — string literals (tool names, config \
-             keys, log text) are not indexed; use the `search` tool for those. \
-             Always pass `query` — e.g. {\"query\":\"DeltaAccumulator\"}. No \
-             zero-argument form; on a 'query is required' error rewrite the \
-             full call, do not resend the empty shape.",
+            "Always pass `query` — e.g. {\"query\":\"DeltaAccumulator\"}. No \
+             zero-argument form; on a 'query is required' error rewrite the full \
+             call, do not resend the empty shape. If you catch yourself \
+             emitting graph_search with no query, stop — write the symbol name \
+             first, then the call. MANDATORY first step when locating a symbol \
+             definition — never read whole files or run grep chains to find \
+             one. Find symbols (functions, structs, traits, classes, …) in \
+             the project's code knowledge graph (Rust, TypeScript/TSX, JavaScript, \
+             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks — \
+             .rs/.ts/.tsx/.js and other source extensions) by name. Returns up \
+             to 20 candidates with file, line range, kind, and the exact symbol \
+             id to pass to graph_context / graph_impact / graph_path. Indexes \
+             symbol definitions only — string literals (tool names, config \
+             keys, log text) are not indexed; use the `search` tool for those.",
             json!({
                 "type": "object",
                 "properties": {
@@ -430,17 +433,19 @@ impl Tool for GraphContextTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_context",
-            "Get the 360° view of a symbol: its definition (file + lines) plus incoming and \
-             outgoing edges grouped by kind — callers, callees, imports, containment. Works \
-             the same for every indexed language (Rust, TypeScript/TSX, JavaScript, Python, \
-             Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). Call this immediately \
-             after graph_search whenever you need callers/callees/imports — one call \
-             replaces a grep chain and reading whole files. Pass an exact `id` from \
-             graph_search, or a `name` to resolve. \
-             Always pass `id` (or `name`) — e.g. \
+            "Always pass `id` (or `name`) — e.g. \
              {\"id\":\"src/provider/stream.rs::DeltaAccumulator::52\"}. No \
              zero-argument form; on a required-field error rewrite the full \
-             call, do not resend the empty shape.",
+             call, do not resend the empty shape. If you catch yourself \
+             emitting graph_context with no id, stop — write the symbol ref \
+             first, then the call. Get the 360° view of a symbol: its \
+             definition (file + lines) plus incoming and outgoing edges grouped \
+             by kind — callers, callees, imports, containment. Works the same \
+             for every indexed language (Rust, TypeScript/TSX, JavaScript, \
+             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). \
+             Call this immediately after graph_search whenever you need \
+             callers/callees/imports — one call replaces a grep chain and \
+             reading whole files.",
             json!({
                 "type": "object",
                 "properties": {
@@ -611,13 +616,16 @@ impl Tool for GraphPathTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_path",
-            "Find the shortest directed path between two symbols in the code knowledge graph \
-             (e.g. how does `main` reach `db_connect`?) — use for reachability questions \
-             ('can A reach B', 'how does X get to Y'). Each hop lists the edge kind \
-             (calls/imports/contains). Accepts exact ids from graph_search or names to resolve. \
-             Always pass `from` and `to` — e.g. {\"from\":\"main\",\"to\":\"db_connect\"}. \
-             No zero-argument form; on a required-field error rewrite the \
-             full call, do not resend the empty shape.",
+            "Always pass `from` and `to` — e.g. {\"from\":\"main\",\"to\":\"db_connect\"}. \
+             No zero-argument form; on a required-field error rewrite the full \
+             call, do not resend the empty shape. If you catch yourself \
+             emitting graph_path with no endpoints, stop — write from/to first, \
+             then the call. Find the shortest directed path between two symbols \
+             in the code knowledge graph (e.g. how does `main` reach \
+             `db_connect`?) — use for reachability questions ('can A reach \
+             B', 'how does X get to Y'). Each hop lists the edge kind \
+             (calls/imports/contains). Accepts exact ids from graph_search \
+             or names to resolve.",
             json!({
                 "type": "object",
                 "properties": {
@@ -733,6 +741,16 @@ mod tests {
             assert!(
                 schema.description.contains("e.g. {"),
                 "{name}: the inline example shows the exact call shape: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.starts_with("Always pass"),
+                "{name}: the contract sentence LEADS the description: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.contains("If you catch yourself"),
+                "{name}: the content-first anti-pattern clause: {}",
                 schema.description
             );
         }

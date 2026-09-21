@@ -127,17 +127,19 @@ impl Tool for MemoryWriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_write",
-            "MANDATORY the moment you learn a durable fact, decision, convention, or bug \
-             root cause — do NOT defer to session end; write it immediately or it is lost. \
-             Memories persist across sessions and are auto-recalled into future prompts: this \
-             is how you learn. Typed title prefixes classify the record \
-             (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) as a pointer to on-disk \
-             truth — keep it compact (gist + path/commit pointer); the file \
-             carries the detail. \
-             All three fields (tier, title, content) are required — e.g. \
+            "All three fields (tier, title, content) are required — e.g. \
              {\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}. No \
              zero-argument form; on a required-field error rewrite the full \
-             call, do not resend the empty shape.",
+             call, do not resend the empty shape. If you catch yourself \
+             emitting memory_write with no fields, stop — write the memory \
+             body first, then the call. MANDATORY the moment you learn a \
+             durable fact, decision, convention, or bug root cause — do NOT \
+             defer to session end; write it immediately or it is lost. \
+             Memories persist across sessions and are auto-recalled into \
+             future prompts: this is how you learn. Typed title prefixes classify \
+             the record (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) as a \
+             pointer to on-disk truth — keep it compact (gist + path/commit \
+             pointer); the file carries the detail.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1413,6 +1415,16 @@ mod tests {
         assert!(
             schema.description.contains("e.g. {"),
             "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.starts_with("All three fields"),
+            "the contract sentence LEADS the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("If you catch yourself"),
+            "the content-first anti-pattern clause: {}",
             schema.description
         );
     }

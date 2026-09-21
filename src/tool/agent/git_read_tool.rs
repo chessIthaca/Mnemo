@@ -70,17 +70,19 @@ impl Tool for GitReadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "git_read",
-            "Read-only view into git. op=\"diff\": ALL uncommitted changes (stat + full \
-             diff + untracked), never truncated — use this to review what changed. \
-             op=\"log\": recent commits, newest first, optionally for one path. \
-             op=\"show\": one commit, stat by default. \
-             op=\"status\": the short working-tree status (clean tree → an empty \
-             listing) — the \"is the tree clean?\" check. The bridge from a memory record's \
-             commit pointer to the shipped code. Never mutates git state; use the `git` \
-             tool for that. \
-             Always pass `op` — e.g. {\"op\":\"log\"}. No zero-argument form; \
+            "Always pass `op` — e.g. {\"op\":\"log\"}. No zero-argument form; \
              on an 'op is required' error rewrite the full call, do not \
-             resend the empty shape.",
+             resend the empty shape. If you catch yourself emitting \
+             git_read with no op, stop — write the op first, then the \
+             call. Read-only view into git. op=\"diff\": ALL uncommitted \
+             changes (stat + full diff + untracked), never truncated — use \
+             this to review what changed. op=\"log\": recent commits, \
+             newest first, optionally for one path. op=\"show\": one commit, \
+             stat by default. op=\"status\": the short working-tree status \
+             (clean tree → an empty listing) — the \"is the tree clean?\" \
+             check. The bridge from a memory record's commit pointer to the \
+             shipped code. Never mutates git state; use the `git` tool for \
+             that.",
             json!({
                 "type": "object",
                 "properties": {
@@ -252,6 +254,16 @@ mod tests {
         assert!(
             schema.description.contains("e.g. {"),
             "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.starts_with("Always pass `op`"),
+            "the contract sentence LEADS the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("If you catch yourself"),
+            "the content-first anti-pattern clause: {}",
             schema.description
         );
     }

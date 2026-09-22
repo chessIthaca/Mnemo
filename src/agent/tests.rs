@@ -1762,8 +1762,8 @@ async fn repeat_failure_across_an_intervening_success_still_fires() {
     // context, so the corrective schema injection is still the right
     // medicine — the live loop interleaved successful calls between the
     // identical malformed git calls and still re-emitted them 15 times.
-    // (This is the deliberate difference from tool_error_count, which any
-    // success resets.)
+    // (This is the deliberate difference from tool_error_count, which a
+    // failure-free batch containing a success resets.)
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("exists.txt"), "contents").unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
@@ -1866,8 +1866,9 @@ fn last_user_query_skips_harness_corrections() {
 #[tokio::test]
 async fn review_report_failures_abort_with_distinct_error() {
     // Backlog 5b46674d: write_review_report failures get DEDICATED retry
-    // accounting — unlike tool_error_count (reset by ANY successful tool
-    // call), the report-failure counter only resets on a successful
+    // accounting — unlike tool_error_count (reset by an error-free batch
+    // containing a success), the report-failure counter only resets on a
+    // successful
     // write_review_report. A reviewer that keeps failing verdict validation
     // (interleaved with successful reads) must abort with a DISTINCT final
     // error naming the review report, not finish silently report-less
@@ -9885,9 +9886,10 @@ impl LlmClient for BranchMock {
                 }]
             } else {
                 vec![
-                    // Vary the text per round so the cross-turn repetition
-                    // guard (Fix B) doesn't trip — this test isolates the
-                    // compaction ladder (Fix A).
+                    // Vary the text per round — the former cross-turn
+                    // repetition guard (Fix B) was removed 2027-01-24, so
+                    // nothing trips on identical text anymore; this test
+                    // isolates the compaction ladder (Fix A).
                     LlmEvent::TextDelta {
                         text: format!("attempt {n}"),
                     },
@@ -10031,86 +10033,45 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
 }
 
 #[tokio::test]
-async fn identical_responses_trip_repetition_guard() {
-    // Regression (2027-01-07 live incident): the model re-emitted the same
-    // read_files call over and over — each iteration executed it, appended
-    // the result, and the next iteration re-emitted the identical response
-    // (pattern continuation on a nearly-identical context). The in-stream
-    // R10 guard can't see it (each generation is short and clean); the
-    // repetition lives ACROSS iterations. The turn-level guard must break
-    // the turn on the 3rd identical consecutive response.
-    let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join("test.txt"), "file contents").unwrap();
-    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
-        dir.path().join("plans"),
-    )));
-    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-    let registry = make_registry((*sandbox).clone(), workflow.clone());
-
-    // The same file_read call ten times over — with FRESH provider-assigned
-    // ids each round, because the guard must key on name+arguments (the
-    // real re-emission had fresh ids), not on ids.
-    let responses: Vec<Vec<LlmEvent>> = (0..10)
+async fn identical_responses_after_successful_batches_do_not_abort() {
+    // Regression (2027-01-24 live incident): the model re-emitted the same
+    // two-call read batch three times — every call SUCCEEDED (the model was
+    // re-reading files it had already read). The former turn-level repetition
+    // guard aborted the turn before the third batch executed. Post-removal,
+    // identical responses after successful batches must never abort: the
+    // batches all execute, no guard error is emitted, and the turn ends
+    // normally when the model stops. (Error loops are owned by MAX_RETRIES;
+    // within-response loops by the in-stream R10 guard.)
+    let responses: Vec<Vec<LlmEvent>> = (0..3)
         .map(|i| {
-            vec![
-                LlmEvent::ToolCallStart {
-                    index: 0,
-                    id: format!("call_{i}"),
-                    name: "file_read".into(),
-                },
-                LlmEvent::ToolCallArgumentDelta {
-                    index: 0,
-                    fragment: r#"{"path":"test.txt"}"#.into(),
-                },
-                LlmEvent::Finish {
-                    reason: FinishReason::ToolCalls,
-                },
-            ]
+            let mut r = file_read_call(0, &format!("call_a{i}"), "a.txt");
+            r.extend(file_read_call(1, &format!("call_b{i}"), "b.txt"));
+            r.push(LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            });
+            r
         })
         .collect();
-    let provider = Arc::new(MockProvider::sequence(responses));
+    let (outcome, messages, mut fanin_rx) = guard_test_harness(
+        responses,
+        "read both files",
+        &[("a.txt", "contents A"), ("b.txt", "contents B")],
+    )
+    .await;
 
-    let agent = AgentLoop::new(
-        test_config(provider, registry, workflow, sandbox.clone()),
-        crate::project::Constitution::default(),
-    );
-
-    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
-    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
-    let mut messages = vec![Message::user_text("read test.txt")];
-
-    let outcome = agent
-        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
-        .await
-        .unwrap();
-
-    // The guard trips on the third identical response: exactly two tool
-    // results (the third call is NOT executed) and a clear error event.
+    // All three identical batches executed — nothing was withheld.
     let tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
     assert_eq!(
-        tool_results, 2,
-        "the third identical response must not execute its tool call"
+        tool_results, 6,
+        "all three identical successful batches must execute"
     );
-    let mut saw_guard = false;
-    let mut finished_events = 0usize;
     while let Ok((_, ev)) = fanin_rx.try_recv() {
-        match ev {
-            AgentEvent::Error { error, .. } if error.contains("repetition guard") => {
-                saw_guard = true;
-            }
-            AgentEvent::Finished { .. } => finished_events += 1,
-            _ => {}
+        if let AgentEvent::Error { error, .. } = ev {
+            panic!(
+                "identical responses after successful batches must never abort: {error}"
+            );
         }
     }
-    assert!(
-        saw_guard,
-        "the repetition guard must emit a clear error event"
-    );
-    assert_eq!(
-        finished_events, 0,
-        "the guard path must be Error-only — no trailing Finished (the \
-         MAX_RETRIES terminal-exclusivity contract)"
-    );
     assert_eq!(outcome.finish_reason, FinishReason::Stop);
 }
 
@@ -11413,5 +11374,173 @@ async fn repeated_bad_json_for_same_tool_changes_strategy() {
         repeat_guidance.contains("[(][?][<]"),
         "the remedy must show the correct character class for the literal \
          `(?<`; got: {repeat_guidance}"
+    );
+}
+/// A `file_read` tool-call event pair (Start + ArgumentDelta) for the given
+/// index/id/path — the building block of the tool-loop regression tests
+/// (backlog 7f72d3d7).
+fn file_read_call(index: u32, id: &str, path: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index,
+            id: id.into(),
+            name: "file_read".into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index,
+            fragment: format!(r#"{{"path":"{path}"}}"#),
+        },
+    ]
+}
+
+/// Harness for the tool-loop regression tests (backlog 7f72d3d7):
+/// builds a temp sandbox + registry + AgentLoop over `responses`, seeds
+/// `seed_files` (name → contents) into the sandbox, runs one turn, and
+/// returns the outcome, the message list, and the event receiver.
+async fn guard_test_harness(
+    responses: Vec<Vec<LlmEvent>>,
+    user_text: &str,
+    seed_files: &[(&str, &str)],
+) -> (crate::agent::TurnOutcome, Vec<Message>, mpsc::Receiver<(u64, AgentEvent)>) {
+    let dir = tempdir().unwrap();
+    for (name, contents) in seed_files {
+        std::fs::write(dir.path().join(name), contents).unwrap();
+    }
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let provider = Arc::new(MockProvider::sequence(responses));
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(user_text)];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    (outcome, messages, fanin_rx)
+}
+
+#[tokio::test]
+async fn single_batch_of_identical_failing_calls_does_not_abort() {
+    // Regression (backlog 7f72d3d7, user report 2027-01-24): three identical
+    // tool calls issued AT THE SAME TIME (one parallel batch) are ONE error
+    // interaction — the model sees all three error results and gets a chance
+    // to repair. Pre-fix, tool_error_count was per-call: the batch
+    // incremented it 0→3 and the post-batch MAX_RETRIES check aborted the
+    // turn after a single interaction.
+    let mut batch = file_read_call(0, "call_a", "missing.txt");
+    batch.extend(file_read_call(1, "call_b", "missing.txt"));
+    batch.extend(file_read_call(2, "call_c", "missing.txt"));
+    batch.push(LlmEvent::Finish {
+        reason: FinishReason::ToolCalls,
+    });
+    let responses = vec![
+        batch,
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ];
+    let (outcome, messages, mut fanin_rx) =
+        guard_test_harness(responses, "read missing.txt", &[]).await;
+    let tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
+    assert_eq!(
+        tool_results, 3,
+        "all three same-time calls must execute and feed results back"
+    );
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if let AgentEvent::Error { error, .. } = ev {
+            panic!("a single same-time batch must not abort the turn: {error}");
+        }
+    }
+    assert_eq!(outcome.finish_reason, FinishReason::Stop);
+}
+
+#[tokio::test]
+async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
+    // Regression (backlog 7f72d3d7): tool_error_count was per-call and reset
+    // by ANY success — a mixed [fail, success] batch erased the error, so the
+    // next identical response was not treated as a repair attempt and the
+    // repetition ring accumulated it; the third identical response tripped
+    // the guard even though the model saw an error after every interaction.
+    // Post-fix the mixed batch is ONE error interaction, so the break (if
+    // any) comes from MAX_RETRIES at the same error across three
+    // interactions — never from a repetition guard (removed 2027-01-24).
+    let mixed_batch = |i: usize| {
+        let mut r = file_read_call(0, &format!("call_f{i}"), "missing.txt");
+        r.extend(file_read_call(1, &format!("call_s{i}"), "present.txt"));
+        r.push(LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        });
+        r
+    };
+    let responses = vec![mixed_batch(1), mixed_batch(2), mixed_batch(3)];
+    let (_outcome, messages, mut fanin_rx) = guard_test_harness(
+        responses,
+        "read both files",
+        &[("present.txt", "contents")],
+    )
+    .await;
+    let tool_results = messages.iter().filter(|m| m.role == Role::Tool).count();
+    assert_eq!(
+        tool_results, 6,
+        "all three mixed batches must execute — an error-following response \
+         is a repair attempt, not repetition"
+    );
+    let mut terminal_error = None;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if let AgentEvent::Error { error, retrying: false } = ev {
+            terminal_error = Some(error);
+        }
+    }
+    let err = terminal_error.expect("three consecutive error interactions must abort");
+    assert!(
+        err.contains("consecutive tool errors"),
+        "the break must come from MAX_RETRIES (the same error across three \
+         interactions), not the repetition guard; got: {err}"
+    );
+    assert!(
+        !err.contains("repetition guard"),
+        "the repetition guard must not own error-repair loops; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn error_retries_owned_by_max_retries_not_repetition_guard() {
+    // Pin (backlog 7f72d3d7): the same failing call re-emitted across three
+    // DIFFERENT LLM interactions is an error-repair loop — owned by
+    // MAX_RETRIES ("consecutive tool errors"), never by the (since-removed)
+    // repetition guard — error-following responses are repair attempts, and
+    // the model gets a repair chance between interactions.
+    let responses: Vec<Vec<LlmEvent>> = (0..4)
+        .map(|i| {
+            let mut r = file_read_call(0, &format!("call_{i}"), "missing.txt");
+            r.push(LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            });
+            r
+        })
+        .collect();
+    let (_outcome, _messages, mut fanin_rx) =
+        guard_test_harness(responses, "read missing.txt", &[]).await;
+    let mut terminal_error = None;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if let AgentEvent::Error { error, retrying: false } = ev {
+            terminal_error = Some(error);
+        }
+    }
+    let err = terminal_error.expect("MAX_RETRIES must abort the error-repair loop");
+    assert!(
+        err.contains("consecutive tool errors"),
+        "the error-repair loop must be owned by MAX_RETRIES; got: {err}"
+    );
+    assert!(
+        !err.contains("repetition guard"),
+        "the repetition guard must not own error-repair loops; got: {err}"
     );
 }

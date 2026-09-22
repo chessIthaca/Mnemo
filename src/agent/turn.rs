@@ -114,9 +114,12 @@ pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correctio
 /// phase methods take `&mut TurnState` so this state threads through them
 /// without long parameter lists.
 pub(crate) struct TurnState {
-    /// Consecutive tool-error counter. Incremented on each failed tool
-    /// result, reset to 0 on any success. When it reaches MAX_RETRIES the
-    /// turn is aborted so a stuck model can't loop forever.
+    /// Consecutive tool-error INTERACTIONS (batches) counter. A batch with
+    /// any non-denial failure counts once (same-time identical failing
+    /// calls are one error event — the model sees every error result and
+    /// gets a chance to repair); a batch with no failure but at least one
+    /// success resets it to 0. When it reaches MAX_RETRIES the turn is
+    /// aborted so a stuck model can't loop forever.
     tool_error_count: u32,
     /// Consecutive bad-JSON counter — LLM-produced malformed/truncated
     /// tool-call arguments. The model can recover by emitting valid JSON,
@@ -168,13 +171,6 @@ pub(crate) struct TurnState {
     /// turn, with the attempt-5 abort never firing at all). This counter never
     /// resets within a turn, so the burn stays finite whatever the reset does.
     compact_total: u32,
-    /// Ring of the last assistant-response signatures (text + tool
-    /// name+arguments; provider-assigned ids EXCLUDED — the live incident
-    /// re-emitted with fresh ids). Three identical consecutive signatures
-    /// trip the repetition guard (the turn-level mirror of the in-stream
-    /// R10 guard): the model is pattern-continuing and would re-execute the
-    /// same call forever.
-    recent_response_sigs: std::collections::VecDeque<String>,
     /// Incremental token accounting (exact): the first request-loop
     /// iteration pays one BPE pass; later iterations only encode the
     /// messages appended since the previous count (tool results, the
@@ -214,7 +210,6 @@ impl TurnState {
             compact_announced: false,
             compact_attempts: 0,
             compact_total: 0,
-            recent_response_sigs: std::collections::VecDeque::new(),
             token_accounting: TokenAccounting::new(),
             last_recalled_user_query: None,
             last_recall_results: None,
@@ -735,59 +730,16 @@ impl AgentLoop {
                 });
             }
 
-            // Repetition guard (2027-01-07 re-emission incident — the
-            // turn-level mirror of the in-stream R10 guard): three
-            // byte-identical consecutive assistant responses (text + tool
-            // name+arguments; provider-assigned ids excluded — the live
-            // re-emission had fresh ids) mean the model is pattern-
-            // continuing and would re-execute the same call forever. Break
-            // the turn with a clear error instead of executing the third
-            // call. A retry after a tool error is legitimate (the model is
-            // responding to new information) — reset the ring so it doesn't
-            // count toward repetition; the MAX_RETRIES path owns that
-            // failure mode.
-            let response_sig = format!(
-                "{}\u{1f}{}",
-                text,
-                tool_calls
-                    .iter()
-                    .map(|tc| format!("{}:{}", tc.name, tc.arguments))
-                    .collect::<Vec<_>>()
-                    .join("\u{1e}")
-            );
-            if state.tool_error_count > 0 {
-                state.recent_response_sigs.clear();
-            }
-            state.recent_response_sigs.push_back(response_sig);
-            while state.recent_response_sigs.len() > 3 {
-                state.recent_response_sigs.pop_front();
-            }
-            if state.recent_response_sigs.len() == 3
-                && state.recent_response_sigs[0] == state.recent_response_sigs[1]
-                && state.recent_response_sigs[1] == state.recent_response_sigs[2]
-            {
-                // Terminal failure — Error only, no trailing Finished (the
-                // MAX_RETRIES terminal-exclusivity contract: one terminal
-                // outcome per turn failure; the forwarder's Error arm flips
-                // the running state and cleans up).
-                let _ = fanin_tx
-                    .send((
-                        agent_id,
-                        AgentEvent::Error {
-                            error: "repetition guard: 3 identical consecutive responses — \
-                                    breaking the tool loop"
-                                .into(),
-                            retrying: false,
-                        },
-                    ))
-                    .await;
-                return Ok(TurnOutcome {
-                    finish_reason: FinishReason::Stop,
-                    text,
-                    tool_calls_made: 0,
-                    stop_reason: state.stop_reason.take(),
-                });
-            }
+            // Cross-iteration tool-loop defense: a response that follows a
+            // tool error is a repair attempt, owned by MAX_RETRIES (the same
+            // error across three error INTERACTIONS — a same-time batch of
+            // failing calls is one interaction, backlog 7f72d3d7). The former
+            // turn-level repetition guard (three byte-identical consecutive
+            // responses) was removed 2027-01-24: after the 7f72d3d7 fix its
+            // only reachable domain was identical responses following
+            // SUCCESSFUL batches, which aborted legitimate re-reads (the
+            // 2027-01-24 12:41 incident). Within-response loops stay owned by
+            // the in-stream R10 guard (detect_repetition, provider/stream).
 
             // Record the assistant's tool-call message, run the tool batch
             // (safe points, execution, result feedback, workflow events),
@@ -1327,6 +1279,12 @@ impl AgentLoop {
         // PRIOR identical failure of the same tool; pushed after the
         // batch. (tool name, failed tool-result content).
         let mut pending_correction: Option<(String, String)> = None;
+        // Per-interaction error accounting (backlog 7f72d3d7): the batch is
+        // ONE interaction for the MAX_RETRIES cap — a batch of identical
+        // failing calls is one error event (the model sees every error
+        // result and gets a chance to repair), not N consecutive errors.
+        let mut batch_had_error = false;
+        let mut batch_had_success = false;
         // Add the assistant message with tool calls.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
@@ -1461,16 +1419,15 @@ impl AgentLoop {
                 }
             }
 
-            // Track consecutive tool errors for the MAX_RETRIES cap.
-            // User denials / DenyAll skips are deliberate safety choices,
-            // not a stuck model (Quality H1 / Phase 1 review) — do not
-            // count them toward the abort threshold.
+            // Per-interaction error accounting (backlog 7f72d3d7): track
+            // batch-level outcomes here; tool_error_count is applied ONCE
+            // after the loop. User denials / DenyAll skips are deliberate
+            // safety choices, not a stuck model (Quality H1 / Phase 1
+            // review) — they neither count nor reset the counter.
             if result.success {
-                state.tool_error_count = 0;
-            } else if is_user_denial_tool_output(&result.output) {
-                // leave tool_error_count unchanged
-            } else {
-                state.tool_error_count += 1;
+                batch_had_success = true;
+            } else if !is_user_denial_tool_output(&result.output) {
+                batch_had_error = true;
             }
 
             // Reviewer report-writing retry accounting (backlog 5b46674d):
@@ -1628,6 +1585,19 @@ impl AgentLoop {
                 .await;
                 break;
             }
+        }
+
+        // Apply the per-interaction error accounting ONCE per batch
+        // (backlog 7f72d3d7): any non-denial failure makes the batch ONE
+        // error interaction (+1 — same-time identical failing calls must
+        // not abort the turn in a single interaction, and the model gets a
+        // repair chance between interactions); a batch with no failure but
+        // at least one success resets the consecutive-error counter; a
+        // denial-only batch leaves it unchanged.
+        if batch_had_error {
+            state.tool_error_count += 1;
+        } else if batch_had_success {
+            state.tool_error_count = 0;
         }
 
         // Repeat-failure circuit breaker: push the queued corrective

@@ -355,3 +355,26 @@ fn dto_fixtures_match_serde() {
         );
     }
 }
+
+/// Normalize CRLF line endings to LF (backlog b93c0f6e): `include_str!`
+/// embeds working-tree bytes at compile time, so a git `autocrlf`-smudged
+/// (CRLF) checkout breaks every `"\n}\n"`-anchored body slice in the
+/// source-contract tests — the needle never matches `"\r\n}\r\n"` and the
+/// slice over-captures to EOF. Source-contract tests normalize the embedded
+/// source through this helper at the read boundary; committed file bytes are
+/// never changed and no `.gitattributes`/eol config is required.
+pub(crate) fn normalize_lf(src: &str) -> String {
+    src.replace("\r\n", "\n")
+}
+
+#[test]
+fn normalize_lf_converts_crlf_and_keeps_lf() {
+    assert_eq!(normalize_lf("a\r\nb\r\n"), "a\nb\n");
+    assert_eq!(normalize_lf("a\nb\n"), "a\nb\n");
+    // Idempotent: normalizing twice equals once.
+    let crlf = "fn f() {\r\n}\r\n";
+    assert_eq!(normalize_lf(&normalize_lf(crlf)), normalize_lf(crlf));
+    // A lone \r (classic-Mac line ending) is left alone — only CRLF pairs
+    // are normalized.
+    assert_eq!(normalize_lf("a\rb"), "a\rb");
+}

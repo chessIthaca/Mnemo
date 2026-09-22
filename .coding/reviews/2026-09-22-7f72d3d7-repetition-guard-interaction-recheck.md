@@ -1,0 +1,21 @@
+## Verdict: PASS
+
+Re-review of plan 3e9c30ac (bug_fixing, backlog 7f72d3d7) after the findings-fix, on branch `wt/macos-fix`, HEAD = d488267 ("Repetition guard: per-interaction error accounting (backlog 7f72d3d7)"). Working tree is clean (`git status` empty), so the change set under review is exactly that commit (which absorbed the prior uncommitted state). Prior report: `.coding/reviews/2026-09-22-7f72d3d7-repetition-guard-interaction-review.md` (FINDINGS, 0 high / 3 low, all comment/doc precision nits).
+
+## Finding-by-finding verification (all 3 fixed)
+
+- **Low 1 (stale per-call comments, 2 sites) — FIXED.**
+  - `src/agent/tests.rs:1765-1766` now reads "(This is the deliberate difference from tool_error_count, which a failure-free batch containing a success resets.)" — exactly the batch-level semantics (a success in a batch that also had a failure now increments; only a failure-free batch with a success resets), matching the suggested wording.
+  - `src/agent/tests.rs:1869-1871` now reads "unlike tool_error_count (reset by an error-free batch containing a success), the report-failure counter only resets on a successful write_review_report." — correct; the surrounding contrast (report-failures not reset by other tools' successes) is preserved. The rewrap splits "a successful / write_review_report" across lines — purely cosmetic line-wrapping, not a finding.
+- **Low 2 (docs/FEATURES.md precision) — FIXED.** The repetition-guard sentence now says "whose intervening tool batches had no error interaction" — the exact suggested wording, which correctly covers the denial-only-batch case the old "SUCCEEDED" wording missed. The appended repair-attempt / consecutive-error-cap / interaction-counting clause is accurate against the code (turn.rs apply-once block; mod.rs MAX_RETRIES doc).
+- **Low 3 (missing trailing newline in src/agent/tests.rs) — FIXED.** Verified directly: a `\n\z` regex search over `src/agent/tests.rs` matches at the file's final line (11586, the closing `}` of the last added test), i.e. the file now ends with a newline after the final `}`. Consistent with the commit diff showing no "\ No newline at end of file" marker on the new side.
+
+## Spot-check: no new issues introduced by the findings-fix
+
+- The findings-fix portion of d488267 touched **zero behavior lines**: the tests.rs hunks outside the appended regression tests are the two comment rewordings only; the FEATURES.md hunk is the single contract line (original update + the Low-2 rewording in one rewrite); turn.rs and mod.rs hunks are the already-verified original fix (batch-local `batch_had_error`/`batch_had_success` applied once post-loop, doc-comment updates). No logic, control-flow, or API surface changed in the fix round.
+- Prior verified-concerns list re-confirmed against the committed diff: denial exclusion preserved (`result.success` → `batch_had_success`; `!is_user_denial_tool_output` → `batch_had_error`; denial-only batch sets neither → counter unchanged); `bad_json_count` untouched (no hunk near it); early-break paths unchanged (synthesized "not run" results and the hard_stop break still bypass or correctly precede the post-loop apply); repeat-failure circuit breaker (`repeated_tool_failure`) untouched; `review_report_failures` per-call counter and its abort ordering untouched.
+- The three regression tests (`single_batch_of_identical_failing_calls_does_not_abort`, `mixed_error_success_batch_is_one_interaction_and_resets_ring`, `error_retries_owned_by_max_retries_not_repetition_guard`) plus helpers (`file_read_call`, `guard_test_harness`) are unchanged from the state the prior review already verified as sound; the comment fixes don't alter them.
+- Multi-platform neutrality: no new APIs, paths, or shell syntax (comment/doc-only fix round). File-tools-first policy: no shell-based file mutation in the change. Constitution: doc comments present on the new helpers/tests.
+- Test suite: parent attests `cargo test` post-fix exited 0 and warning-free under `#![deny(warnings)]` (2519 tests at prior review). As a read-only reviewer I did not re-run the suite; the clean tree at HEAD d488267 means the attested run corresponds exactly to the reviewed content.
+
+**Conclusion:** all three prior findings are fixed as specified, the fix round introduced no behavioral change, and the change set is ready. No new findings.

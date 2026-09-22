@@ -1194,6 +1194,10 @@ mod tests {
     /// of the match. Returns the text from the signature through the fn's
     /// closing brace (the column-0 `}`).
     fn fn_body(src: &str, name: &str) -> String {
+        // CRLF tolerance (backlog b93c0f6e): include_str! embeds working-tree
+        // bytes, so an autocrlf-smudged checkout embeds CRLF source and the
+        // "\n}\n" needle never matches — normalize at the read boundary.
+        let src = &src.replace("\r\n", "\n");
         let needle = format!("fn {name}(");
         let start = src
             .find(&needle)
@@ -1203,6 +1207,26 @@ mod tests {
             .map(|i| start + i)
             .unwrap_or(src.len());
         src[start..end].to_string()
+    }
+
+    /// CRLF tolerance (backlog b93c0f6e): include_str! embeds working-tree
+    /// bytes at compile time, so an autocrlf-smudged checkout embeds CRLF
+    /// source and the "\n}\n" slice needle never matches — the body then
+    /// over-captures to EOF. The extractor must normalize CRLF→LF before
+    /// slicing.
+    #[test]
+    fn fn_body_slices_crlf_source_exactly() {
+        let src = "fn first() {\r\n    let one = 1; // MARKER_ONE\r\n}\r\n\r\nfn second() {\r\n    let two = 2; // MARKER_TWO\r\n}\r\n";
+        let body = fn_body(src, "first");
+        assert!(
+            body.contains("MARKER_ONE"),
+            "the extracted body must contain the first function's marker"
+        );
+        assert!(
+            !body.contains("MARKER_TWO"),
+            "on CRLF input the newline-brace-newline needle never matches and \
+             the slice over-captures to EOF (backlog b93c0f6e)"
+        );
     }
 
     /// Source-contract regression test (quality review LOW 6 class-closure,

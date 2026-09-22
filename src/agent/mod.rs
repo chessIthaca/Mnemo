@@ -34,14 +34,17 @@ mod turn;
 
 pub use loop_impl::{drop_cancelled_steers, AgentLoop, AgentLoopConfig, StopReason, TurnOutcome};
 
-/// Maximum consecutive tool-EXECUTION errors before surfacing to the user and
-/// stopping the turn. A tool-execution error is a tool that ran and returned
-/// `success: false` (not a user denial/interrupt — those are excluded). The
-/// failed result is fed back to the model as a tool message and the model
-/// retries on the next iteration; this cap prevents an infinite loop when the
-/// model repeatedly makes the same mistake. The counter resets on any
-/// successful tool call so a long turn with occasional failures doesn't
-/// accumulate to the cap unfairly.
+/// Maximum consecutive tool-EXECUTION error INTERACTIONS (tool batches)
+/// before surfacing to the user and stopping the turn. A batch with any tool
+/// that ran and returned `success: false` (not a user denial/interrupt —
+/// those are excluded) counts ONCE, however many calls in it failed — three
+/// identical calls issued at the same time are one error event, and the
+/// model gets a repair chance between interactions (backlog 7f72d3d7). The
+/// failed results are fed back to the model as tool messages and the model
+/// retries on the next iteration; this cap prevents an infinite loop when
+/// the model repeatedly makes the same mistake. The counter resets on any
+/// batch without a failure (but with at least one success) so a long turn
+/// with occasional failures doesn't accumulate to the cap unfairly.
 ///
 /// This does NOT count LLM-produced malformed tool-call arguments (bad JSON) —
 /// those are a transient output issue the model can recover from by emitting

@@ -632,6 +632,7 @@ pub async fn backlog_stop_all(
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     use super::{resolve_run_all_concurrency, spawned_views, BacklogItemView};
     use crate::ipc::state::{RunAllState, SpawnedRun};
     use mnemo::backlog::{BacklogItem, BacklogStatus};
@@ -697,7 +698,7 @@ mod tests {
     /// (`backlog::tests::requeue_refuses_pending_in_flight_and_unknown`).
     #[test]
     fn backlog_retry_routes_through_guarded_requeue() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_retry command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -733,7 +734,7 @@ mod tests {
     /// `mnemo::backlog::tests`.
     #[test]
     fn backlog_add_routes_through_the_shape_validator() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_add command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -767,7 +768,7 @@ mod tests {
     /// add_at_top_lands_first_in_store_and_file_order`).
     #[test]
     fn backlog_add_position_routes_through_add_at() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_add command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -800,7 +801,7 @@ mod tests {
     /// dispatch_item needs the Tauri state.
     #[test]
     fn dispatch_item_clears_in_flight_pointer_on_send_failure() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("async fn dispatch_item(")
             .expect("dispatch_item present");
@@ -878,7 +879,7 @@ mod tests {
     /// source contract; the parsing itself is unit-tested above.
     #[test]
     fn backlog_read_paths_surface_checkpoint_sha() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         for command in [
             "async fn backlog_list(",
             "async fn backlog_add(",
@@ -907,7 +908,7 @@ mod tests {
     /// itself is unit-tested in `mnemo::backlog::tests`.
     #[test]
     fn backlog_set_deferred_routes_through_the_store_setter() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_set_deferred")
             .expect("backlog_set_deferred command present");
@@ -933,7 +934,7 @@ mod tests {
     /// starts the run and the first dispatch ends it cleanly).
     #[test]
     fn backlog_run_all_counts_only_eligible_items() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_run_all")
             .expect("backlog_run_all command present");
@@ -958,7 +959,7 @@ mod tests {
     /// unit-tested in `mnemo::backlog::tests`.
     #[test]
     fn backlog_clear_finished_touches_only_the_store_and_the_event() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_clear_finished")
             .expect("backlog_clear_finished command present");

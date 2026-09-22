@@ -639,6 +639,7 @@ fn enter_planning_if_complete(workflow: &mut Workflow) -> Option<(WorkflowState,
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     use super::*;
     use mnemo::workflow::{PlanKind, Workflow, WorkflowState};
 
@@ -654,7 +655,7 @@ mod tests {
     /// unit-tested in `mnemo::backlog::tests`.
     #[test]
     fn run_all_dispatch_next_selects_via_next_pending_eligible() {
-        let src = include_str!("run_all.rs");
+        let src = normalize_lf(include_str!("run_all.rs"));
         // NOTE: this file's tests module sits BEFORE the command functions,
         // so a plain `find` would match this test's own quoted signature —
         // `rfind` anchors on the real definition (the last occurrence).
@@ -810,7 +811,7 @@ mod tests {
     /// `mnemo::backlog::tests`.
     #[test]
     fn adopt_orphaned_in_flight_snapshots_the_live_only_view() {
-        let src = include_str!("run_all.rs");
+        let src = normalize_lf(include_str!("run_all.rs"));
         // NOTE: this file's tests module sits BEFORE the command functions,
         // so a plain `find` would match this test's own quoted signature —
         // `rfind` anchors on the real definition (the last occurrence).
@@ -843,7 +844,7 @@ mod tests {
     /// needs Tauri state, so the guard is pinned as a source contract.
     #[test]
     fn drain_run_all_on_main_exit_consults_landed_evidence() {
-        let src = include_str!("run_all.rs");
+        let src = normalize_lf(include_str!("run_all.rs"));
         // NOTE: this file's tests module sits BEFORE the command functions,
         // so a plain `find` would match this test's own quoted signature —
         // `rfind` anchors on the real definition (the last occurrence).
@@ -877,7 +878,7 @@ mod tests {
     /// source contract.
     #[test]
     fn adopt_orphaned_in_flight_consults_landed_evidence() {
-        let src = include_str!("run_all.rs");
+        let src = normalize_lf(include_str!("run_all.rs"));
         // NOTE: this file's tests module sits BEFORE the command functions,
         // so a plain `find` would match this test's own quoted signature —
         // `rfind` anchors on the real definition (the last occurrence).
@@ -1396,8 +1397,8 @@ mod tests {
         // transition must bump the run's done counter (symmetric with the
         // resolution paths), gated on the transition's bool so a blocked
         // flip (the continuation won the race) never double-counts.
-        let src = include_str!("run_all.rs");
-        let spawned = fn_body(src, "drain_spawned_on_exit");
+        let src = normalize_lf(include_str!("run_all.rs"));
+        let spawned = fn_body(&src, "drain_spawned_on_exit");
         assert!(
             spawned.contains("let transitioned ="),
             "the spawned drain captures its Done transition's result: {spawned}"
@@ -1407,7 +1408,7 @@ mod tests {
             "the spawned drain bumps the done counter on its own Done \
              transition: {spawned}"
         );
-        let main = fn_body(src, "drain_run_all_on_main_exit");
+        let main = fn_body(&src, "drain_run_all_on_main_exit");
         assert!(
             main.contains("main_done_bump = store.transition("),
             "the main drain captures its Done transition's result: {main}"
@@ -1427,10 +1428,10 @@ mod tests {
         // commit_success / lock-re-acquisition gap between the pre-check
         // and the transition, and an ungated bump double-counts the item
         // (display-only: the counter feeds the UI progress line).
-        let src = include_str!("run_all.rs");
+        let src = normalize_lf(include_str!("run_all.rs"));
         // flip_done_if_linked: the Done flip's result IS the return value
         // (no unconditional `true` after the transition).
-        let flip = fn_body(src, "flip_done_if_linked");
+        let flip = fn_body(&src, "flip_done_if_linked");
         assert!(
             !flip.contains("\n        true\n"),
             "flip_done_if_linked returns the transition's own result, not \
@@ -1438,7 +1439,7 @@ mod tests {
         );
         // The spawned success arm gates terminal_resolution on the
         // transition's bool.
-        let spawned = fn_body(src, "on_spawned_turn_resolved");
+        let spawned = fn_body(&src, "on_spawned_turn_resolved");
         assert!(
             spawned.contains("terminal_resolution = state"),
             "the spawned success arm gates its done bump on the \
@@ -1641,6 +1642,11 @@ mod tests {
     /// the text from the signature through the fn's closing brace (the
     /// column-0 `}`).
     fn fn_body(src: &str, name: &str) -> String {
+        // CRLF tolerance (backlog b93c0f6e): include_str! embeds working-tree
+        // bytes, so an autocrlf-smudged checkout embeds CRLF source and the
+        // "\n}\n" needle never matches — normalize at the read boundary
+        // (contract_fixtures::normalize_lf).
+        let src = &normalize_lf(src);
         let needle = format!("fn {name}(");
         let start = src
             .find(&needle)
@@ -1650,6 +1656,29 @@ mod tests {
             .map(|i| start + i)
             .unwrap_or(src.len());
         src[start..end].to_string()
+    }
+
+    /// CRLF tolerance (backlog b93c0f6e): include_str! embeds working-tree
+    /// bytes at compile time, so an autocrlf-smudged checkout embeds CRLF
+    /// source and the "\n}\n" slice needle never matches — the body then
+    /// over-captures to EOF, weakening (or falsely failing) every pin. The
+    /// extractor must normalize CRLF→LF before slicing: on CRLF input the
+    /// extracted body must end at the function's own closing brace, not run
+    /// to EOF.
+    #[test]
+    fn fn_body_slices_crlf_source_exactly() {
+        let src = "fn first() {\r\n    let one = 1; // MARKER_ONE\r\n}\r\n\r\nfn second() {\r\n    let two = 2; // MARKER_TWO\r\n}\r\n";
+        let body = fn_body(src, "first");
+        assert!(
+            body.contains("MARKER_ONE"),
+            "the extracted body must contain the first function's marker"
+        );
+        assert!(
+            !body.contains("MARKER_TWO"),
+            "the extracted body must end at the function's own closing brace — \
+             on CRLF input the newline-brace-newline needle never matches and \
+             the slice over-captures to EOF (backlog b93c0f6e)"
+        );
     }
 
     #[test]

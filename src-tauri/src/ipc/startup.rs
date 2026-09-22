@@ -161,6 +161,7 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     /// The snapshot's backlog must be the frontend-facing views (same as
     /// `backlog_list`) — image paths resolved + `checkpoint_sha` parsed —
     /// not the raw stored items (review LOW 1, plan 2929d340: the fourth
@@ -169,7 +170,7 @@ mod tests {
     /// contract, following the backlog_cmds.rs pattern.
     #[test]
     fn startup_snapshot_backlog_routes_through_resolve_item_view() {
-        let src = include_str!("startup.rs");
+        let src = normalize_lf(include_str!("startup.rs"));
         let start = src
             .find("async fn startup_snapshot(")
             .expect("startup_snapshot command present");

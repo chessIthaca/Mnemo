@@ -23,6 +23,21 @@ if not exist "node_modules\.bin\tauri.cmd" (
     goto :end
 )
 
+rem Tauri shells out to cargo; without it the build dies with a cryptic
+rem "cargo metadata ... program not found". rustup installs to
+rem %USERPROFILE%\.cargo\bin, which a console opened before the install does
+rem not have on PATH yet - pick it up so a fresh install works without relogin.
+where cargo >nul 2>&1
+if errorlevel 1 if exist "%USERPROFILE%\.cargo\bin\cargo.exe" set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
+where cargo >nul 2>&1
+if errorlevel 1 (
+    echo Rust toolchain not found - cargo is not on PATH.
+    echo Install it from https://rustup.rs ^(stable, with the MSVC C++ Build Tools^),
+    echo then run start.bat again.
+    pause
+    goto :end
+)
+
 if /i "%~1"=="dev" (
     pushd src-tauri
     call "..\node_modules\.bin\tauri.cmd" dev

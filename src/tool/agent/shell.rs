@@ -48,6 +48,7 @@ use crate::config::ShellFilterConfig;
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
+use crate::tool::agent::tool_contract;
 use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
 /// Default maximum wall-clock time a shell command may run before it is
@@ -392,14 +393,10 @@ impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "shell",
-            "command + purpose are required on every call — e.g. \
-             {\"command\":\"cargo test\",\"purpose\":\"running tests\"}. There is no \
-             zero-argument form; an empty shell call is always an error (if you just \
-             made a shell call, the next one needs its own command). On a \
-             'command is required' error, rewrite the full call, do not resend \
-             the empty shape. If you catch yourself emitting shell with no command, \
-             stop — write the command first, then the call. Execute a shell \
-             command — PowerShell 5.1 on Windows, sh on Unix. Requires approval. \
+            format!(
+                "{} If you just made a shell call, the next one needs its own \
+                 command. Execute a shell command — PowerShell 5.1 on Windows, sh \
+                 on Unix. Requires approval. \
              On Windows chain with ; not && / || — PowerShell 5.1 rejects \
              bash-style chaining; it is auto-translated to if ($?) gates with a \
              note in the result, but prefer ; or separate calls. A result is \
@@ -409,7 +406,12 @@ impl Tool for ShellTool {
              note, and well-known commands (cargo build/test, npm test/build, \
              git status) are noise-filtered — errors, warnings, and summaries \
              always survive, and the raw stdout/stderr ride the result's data \
-             field. Commands exceeding the timeout are killed.",
+                 field. Commands exceeding the timeout are killed.",
+                tool_contract::contract(
+                    "`command` + `purpose`",
+                    "{\"command\":\"cargo test\",\"purpose\":\"running tests\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -464,8 +466,7 @@ impl Tool for ShellTool {
                     "shell",
                     &e,
                     &args,
-                    "Always pass command + purpose — there is no zero-argument form; \
-                     rewrite the full call, do not resend the empty shape.",
+                    &tool_contract::recovery_hint("command + purpose"),
                 ))
             }
         };
@@ -1161,18 +1162,28 @@ mod tests {
         let tool = tool_in(std::path::Path::new("."));
         let schema = tool.schema();
         assert!(
-            schema.description.starts_with("command + purpose are required"),
+            schema.description.starts_with("Always pass `command` + `purpose`"),
             "the contract sentence LEADS the description: {}",
             schema.description
         );
+        // The content-first clause lives once in TOOL_CALL_DISCIPLINE
+        // (src/agent/prompt.rs) — the per-tool copy was the trim's point.
         assert!(
-            schema.description.contains("If you catch yourself"),
-            "the content-first anti-pattern clause: {}",
+            !schema.description.contains("If you catch yourself"),
+            "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
             schema.description
         );
         assert!(
-            schema.description.contains("no zero-argument form"),
+            schema.description.contains("No zero-argument form"),
             "{}",
+            schema.description
+        );
+        // Review L1 (2026-09-23): the shell-specific hint for the observed
+        // failure pattern (a successful call followed by an empty one) —
+        // dropped once by the trim, restored, now pinned.
+        assert!(
+            schema.description.contains("the next one needs its own command"),
+            "the shell-specific empty-call hint rides the substance: {}",
             schema.description
         );
         assert!(

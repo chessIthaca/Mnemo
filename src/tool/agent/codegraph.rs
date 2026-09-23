@@ -7,7 +7,12 @@
 //! Four tools, mirroring GitNexus's smart tools:
 //!
 //! - `graph_search` — name → candidate symbols (file + line + kind). The
-//!   cheap "where is X defined?" lookup that replaces a grep chain.
+//!   cheap "where is X defined?" lookup that replaces a grep chain. A
+//!   non-empty result carries `next` — the exact `graph_context(id=...)`
+//!   call for the first hit (plus `graph_impact` for blast radius) — so
+//!   the follow-up chain needs no re-derivation (plan aff95a51: the
+//!   under-chaining observed 2027-01 was a result-shape gap, not a
+//!   prompt gap).
 //! - `graph_context` — the 360° view of one symbol: definition + incoming
 //!   and outgoing edges grouped by kind (callers, callees, imports,
 //!   containment). One call = complete structural context.
@@ -48,6 +53,7 @@ use serde_json::{json, Value};
 use crate::codegraph::query::{CONTEXT_GROUP_CAP, ContextView, GraphView, RESOLVE_CAP};
 use crate::codegraph::CodeGraph;
 use crate::provider::ToolSchema;
+use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Run a read-only graph query on the blocking pool and shape the outcome.
@@ -271,11 +277,8 @@ impl Tool for GraphSearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_search",
-            "Always pass `query` — e.g. {\"query\":\"DeltaAccumulator\"}. No \
-             zero-argument form; on a 'query is required' error rewrite the full \
-             call, do not resend the empty shape. If you catch yourself \
-             emitting graph_search with no query, stop — write the symbol name \
-             first, then the call. MANDATORY first step when locating a symbol \
+            format!(
+                "{} MANDATORY first step when locating a symbol \
              definition — never read whole files or run grep chains to find \
              one. Find symbols (functions, structs, traits, classes, …) in \
              the project's code knowledge graph (Rust, TypeScript/TSX, JavaScript, \
@@ -284,7 +287,9 @@ impl Tool for GraphSearchTool {
              to 20 candidates with file, line range, kind, and the exact symbol \
              id to pass to graph_context / graph_impact / graph_path. Indexes \
              symbol definitions only — string literals (tool names, config \
-             keys, log text) are not indexed; use the `search` tool for those.",
+                 keys, log text) are not indexed; use the `search` tool for those.",
+                tool_contract::contract("`query`", "{\"query\":\"DeltaAccumulator\"}")
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -309,8 +314,7 @@ impl Tool for GraphSearchTool {
                     "graph_search",
                     &e,
                     &args,
-                    "Always pass query — there is no zero-argument form; rewrite \
-                     the full call, do not resend the empty shape.",
+                    &tool_contract::recovery_hint("query"),
                 ))
             }
         };
@@ -369,11 +373,21 @@ impl Tool for GraphSearchTool {
             let hint = matches
                 .is_empty()
                 .then(|| miss_hint(&args.query, matches.len()));
+            // The chaining pointer (plan aff95a51): the result is where the
+            // follow-up decision happens, so a hit carries the exact next
+            // call. Captured before the json! below moves `matches`.
+            let first_id = matches.first().map(|s| s.id.clone());
             let mut out = json!({
                 "query": args.query,
                 "count": matches.len(),
                 "symbols": matches,
             });
+            if let Some(id) = first_id {
+                out["next"] = json!(format!(
+                    "graph_context(id=\"{id}\") → callers/callees/imports; \
+                     graph_impact(id) → blast radius"
+                ));
+            }
             if let Some(hint) = hint {
                 out["hint"] = json!(hint);
             }
@@ -433,19 +447,20 @@ impl Tool for GraphContextTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_context",
-            "Always pass `id` (or `name`) — e.g. \
-             {\"id\":\"src/provider/stream.rs::DeltaAccumulator::52\"}. No \
-             zero-argument form; on a required-field error rewrite the full \
-             call, do not resend the empty shape. If you catch yourself \
-             emitting graph_context with no id, stop — write the symbol ref \
-             first, then the call. Get the 360° view of a symbol: its \
+            format!(
+                "{} Get the 360° view of a symbol: its \
              definition (file + lines) plus incoming and outgoing edges grouped \
              by kind — callers, callees, imports, containment. Works the same \
              for every indexed language (Rust, TypeScript/TSX, JavaScript, \
-             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). \
-             Call this immediately after graph_search whenever you need \
-             callers/callees/imports — one call replaces a grep chain and \
-             reading whole files.",
+                 Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). \
+                 Call this immediately after graph_search whenever you need \
+                 callers/callees/imports — one call replaces a grep chain and \
+                 reading whole files.",
+                tool_contract::contract(
+                    "`id` (or `name`)",
+                    "{\"id\":\"src/provider/stream.rs::DeltaAccumulator::52\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -471,7 +486,7 @@ impl Tool for GraphContextTool {
                 // Backlog d9ad618e: the recovery rule rides the error (the
                 // read_files precedent) — an empty call lands here, not on
                 // the serde path (id/name are either-or by design).
-                return Err("either 'id' or 'name' is required — rewrite the full call, do not resend the empty shape".to_string());
+                return Err(tool_contract::recovery_hint("`id` (or `name`)"));
             }
             let Some(id) = resolve_id(view, &key) else {
                 let candidates = view.resolve(&key);
@@ -616,16 +631,18 @@ impl Tool for GraphPathTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_path",
-            "Always pass `from` and `to` — e.g. {\"from\":\"main\",\"to\":\"db_connect\"}. \
-             No zero-argument form; on a required-field error rewrite the full \
-             call, do not resend the empty shape. If you catch yourself \
-             emitting graph_path with no endpoints, stop — write from/to first, \
-             then the call. Find the shortest directed path between two symbols \
+            format!(
+                "{} Find the shortest directed path between two symbols \
              in the code knowledge graph (e.g. how does `main` reach \
              `db_connect`?) — use for reachability questions ('can A reach \
              B', 'how does X get to Y'). Each hop lists the edge kind \
-             (calls/imports/contains). Accepts exact ids from graph_search \
-             or names to resolve.",
+                 (calls/imports/contains). Accepts exact ids from graph_search \
+                 or names to resolve.",
+                tool_contract::contract(
+                    "`from` and `to`",
+                    "{\"from\":\"main\",\"to\":\"db_connect\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -652,8 +669,7 @@ impl Tool for GraphPathTool {
                     "graph_path",
                     &e,
                     &args,
-                    "Always pass from and to — there is no zero-argument form; \
-                     rewrite the full call, do not resend the empty shape.",
+                    &tool_contract::recovery_hint("from and to"),
                 ))
             }
         };
@@ -749,8 +765,10 @@ mod tests {
                 schema.description
             );
             assert!(
-                schema.description.contains("If you catch yourself"),
-                "{name}: the content-first anti-pattern clause: {}",
+                !schema.description.contains("If you catch yourself"),
+                "{name}: the content-first clause lives ONCE in the universal \
+                 TOOL_CALL_DISCIPLINE block — a per-tool copy is exactly the \
+                 redundancy this plan removed: {}",
                 schema.description
             );
         }
@@ -794,6 +812,42 @@ mod tests {
                 result.output
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_hits_carry_the_graph_context_pointer() {
+        // Plan aff95a51: the under-chaining observed 2027-01 — search found
+        // the symbol but the graph_context follow-up never happened. The
+        // result now carries the exact next call so the chain needs no
+        // re-derivation; a total miss carries no pointer (its hint already
+        // points at `search`).
+        let (_dir, graph) = indexed_graph();
+        let hit = payload(
+            GraphSearchTool::new(graph.clone())
+                .execute(serde_json::json!({"query": "helper"}))
+                .await,
+        );
+        let next = hit["next"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a non-empty result carries the chaining pointer: {hit}"));
+        assert!(
+            next.starts_with("graph_context(id=\"src/lib.rs::helper::"),
+            "the pointer names the first hit's exact call: {next}"
+        );
+        assert!(
+            next.contains("graph_impact(id) → blast radius"),
+            "the pointer also names the blast-radius follow-up: {next}"
+        );
+
+        let miss = payload(
+            GraphSearchTool::new(graph)
+                .execute(serde_json::json!({"query": "nonexistent_xyz"}))
+                .await,
+        );
+        assert!(
+            miss.get("next").is_none(),
+            "a total miss carries no pointer — its hint points at `search`: {miss}"
+        );
     }
 
     #[test]

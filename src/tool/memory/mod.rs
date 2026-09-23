@@ -27,6 +27,7 @@ use crate::memory::{
     Memory, MemoryClass, MemoryFilter, MemoryRecordType, MemoryStoreTrait, MemoryTier,
 };
 use crate::provider::{LlmClient, SwappableProvider, ToolSchema};
+use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Arguments for `memory_write`.
@@ -127,19 +128,20 @@ impl Tool for MemoryWriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "memory_write",
-            "All three fields (tier, title, content) are required — e.g. \
-             {\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}. No \
-             zero-argument form; on a required-field error rewrite the full \
-             call, do not resend the empty shape. If you catch yourself \
-             emitting memory_write with no fields, stop — write the memory \
-             body first, then the call. MANDATORY the moment you learn a \
+            format!(
+                "{} MANDATORY the moment you learn a \
              durable fact, decision, convention, or bug root cause — do NOT \
              defer to session end; write it immediately or it is lost. \
              Memories persist across sessions and are auto-recalled into \
              future prompts: this is how you learn. Typed title prefixes classify \
              the record (SPEC:/DECISION:/BUG:/PLAN:/HOW:/REVIEW:) as a \
              pointer to on-disk truth — keep it compact (gist + path/commit \
-             pointer); the file carries the detail.",
+                 pointer); the file carries the detail.",
+                tool_contract::contract(
+                    "`tier`, `title`, `content`",
+                    "{\"tier\":\"semantic\",\"title\":\"DECISION: …\",\"content\":\"…\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -168,9 +170,7 @@ impl Tool for MemoryWriteTool {
                     "memory_write",
                     &e,
                     &args,
-                    "All of tier, title, content are required — there is no \
-                     zero-argument form; rewrite the full call, do not resend \
-                     the empty shape.",
+                    &tool_contract::recovery_hint("tier, title, content"),
                 ))
             }
         };
@@ -1418,13 +1418,15 @@ mod tests {
             schema.description
         );
         assert!(
-            schema.description.starts_with("All three fields"),
+            schema.description.starts_with("Always pass `tier`, `title`, `content`"),
             "the contract sentence LEADS the description: {}",
             schema.description
         );
+        // The content-first clause lives once in TOOL_CALL_DISCIPLINE
+        // (src/agent/prompt.rs) — the per-tool copy was the trim's point.
         assert!(
-            schema.description.contains("If you catch yourself"),
-            "the content-first anti-pattern clause: {}",
+            !schema.description.contains("If you catch yourself"),
+            "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
             schema.description
         );
     }

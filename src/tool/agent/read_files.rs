@@ -25,6 +25,7 @@ use serde_json::json;
 use crate::codegraph::walk::Lang;
 use crate::provider::ToolSchema;
 use crate::tool::agent::sandbox::Sandbox;
+use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Default maximum number of lines returned per file when the caller doesn't
@@ -161,16 +162,17 @@ impl Tool for ReadFilesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "read_files",
-            "Always pass `files` (an array of up to 10 {path, start_line?, max_lines?} specs) \
-             — e.g. {\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}. \
-             There is no zero-argument form: a read_files call with no files is always \
-             an error. On a 'files is required' error, rewrite the full call from the \
-             path(s) you meant — do not resend the empty shape. If you catch yourself \
-             emitting read_files with no files, stop — write the path first, then \
-             the call. Read files — one or many, in one call instead of N round-trips. \
-             Each file comes back under a header with line numbers; start_line + \
-             max_lines read only the relevant slice. A directory path returns a \
-             sorted listing. Per-file errors are reported inline, never fatal.",
+            format!(
+                "{} An array of up to 10 {{path, start_line?, max_lines?}} specs. \
+                 Read files — one or many, in one call instead of N round-trips. \
+                 Each file comes back under a header with line numbers; start_line + \
+                 max_lines read only the relevant slice. A directory path returns a \
+                 sorted listing. Per-file errors are reported inline, never fatal.",
+                tool_contract::contract(
+                    "`files`",
+                    "{\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -235,9 +237,9 @@ impl Tool for ReadFilesTool {
                     "read_files",
                     &e,
                     &args,
-                    "Always pass files (an array of {path, start_line?, max_lines?} \
-                     specs) — there is no zero-argument form; rewrite the full call, \
-                     do not resend the empty shape.",
+                    &tool_contract::recovery_hint(
+                        "files (an array of {path, start_line?, max_lines?} specs)",
+                    ),
                 ));
             }
         };
@@ -529,9 +531,11 @@ mod tests {
             "the contract sentence LEADS the description: {}",
             schema.description
         );
+        // The content-first clause lives once in TOOL_CALL_DISCIPLINE
+        // (src/agent/prompt.rs) — the per-tool copy was the trim's point.
         assert!(
-            schema.description.contains("If you catch yourself"),
-            "the content-first anti-pattern clause: {}",
+            !schema.description.contains("If you catch yourself"),
+            "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
             schema.description
         );
         assert_eq!(
@@ -545,7 +549,7 @@ mod tests {
             schema.description
         );
         assert!(
-            schema.description.contains("no zero-argument form"),
+            schema.description.contains("No zero-argument form"),
             "{}",
             schema.description
         );

@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::provider::ToolSchema;
 use crate::tool::agent::git_diff::GitDiffTool;
 use crate::tool::agent::git_read::{GitLogTool, GitShowTool, GitStatusTool};
+use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Which read to perform. Only `op` is inspected here; the per-op arguments
@@ -70,19 +71,18 @@ impl Tool for GitReadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "git_read",
-            "Always pass `op` — e.g. {\"op\":\"log\"}. No zero-argument form; \
-             on an 'op is required' error rewrite the full call, do not \
-             resend the empty shape. If you catch yourself emitting \
-             git_read with no op, stop — write the op first, then the \
-             call. Read-only view into git. op=\"diff\": ALL uncommitted \
+            format!(
+                "{} Read-only view into git. op=\"diff\": ALL uncommitted \
              changes (stat + full diff + untracked), never truncated — use \
              this to review what changed. op=\"log\": recent commits, \
              newest first, optionally for one path. op=\"show\": one commit, \
              stat by default. op=\"status\": the short working-tree status \
              (clean tree → an empty listing) — the \"is the tree clean?\" \
              check. The bridge from a memory record's commit pointer to the \
-             shipped code. Never mutates git state; use the `git` tool for \
-             that.",
+                 shipped code. Never mutates git state; use the `git` tool for \
+                 that.",
+                tool_contract::contract("`op`", "{\"op\":\"log\"}")
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -117,8 +117,7 @@ impl Tool for GitReadTool {
                     "git_read",
                     &e,
                     &args,
-                    "Always pass op — there is no zero-argument form; rewrite \
-                     the full call, do not resend the empty shape.",
+                    &tool_contract::recovery_hint("op"),
                 ))
             }
         };
@@ -236,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_advertises_the_no_zero_argument_rule() {
+    fn schema_advertises_the_short_empty_call_contract() {
         // Backlog d9ad618e (the read_files precedent, backlog 26cdbaf8).
         let dir = repo();
         let tool = GitReadTool::new(dir.path());
@@ -261,9 +260,11 @@ mod tests {
             "the contract sentence LEADS the description: {}",
             schema.description
         );
+        // The content-first clause lives once in TOOL_CALL_DISCIPLINE
+        // (src/agent/prompt.rs) — the per-tool copy was the trim's point.
         assert!(
-            schema.description.contains("If you catch yourself"),
-            "the content-first anti-pattern clause: {}",
+            !schema.description.contains("If you catch yourself"),
+            "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
             schema.description
         );
     }

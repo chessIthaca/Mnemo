@@ -99,6 +99,9 @@ pub fn needs_approval(
 ///   convert_line_endings** — validate the
 ///   `path` arg through the sandbox. If the sandbox accepts it (the path is
 ///   inside the project root), the call is project-scoped.
+/// - **multi_edit** — every `files[].path` entry must validate through the
+///   sandbox: all-or-nothing, since the call writes every entry (one
+///   out-of-project path makes the whole call not project-scoped).
 /// - **search** — always true. The search tool walks the project tree only
 ///   (it skips build artifacts + deps and never escapes the sandbox root).
 /// - **git** — only *read-only* subcommands (`status`, `diff`, `log`, and
@@ -131,6 +134,19 @@ pub fn is_project_scoped(tool_name: &str, args: &Value, sandbox: &Sandbox) -> bo
                 None => return false,
             };
             sandbox.validate(Path::new(path_str)).is_ok()
+        }
+        "multi_edit" => {
+            // All-or-nothing: a single out-of-project entry makes the whole
+            // call not project-scoped (the call writes every entry).
+            let files = match args.get("files").and_then(|v| v.as_array()) {
+                Some(files) if !files.is_empty() => files,
+                _ => return false,
+            };
+            files.iter().all(|f| {
+                f.get("path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| sandbox.validate(Path::new(p)).is_ok())
+            })
         }
         "search" | "search_read" => true,
         "git" => is_git_read_only(args),
@@ -403,6 +419,52 @@ mod tests {
         let sandbox = Sandbox::new(dir.path()).unwrap();
         let args = serde_json::json!({"content": "hi"});
         assert!(!is_project_scoped("file_write", &args, &sandbox));
+    }
+
+    #[test]
+    fn is_project_scoped_multi_edit_is_all_or_nothing() {
+        // multi_edit writes EVERY entry, so one out-of-project path makes the
+        // whole call not project-scoped (plan 2e27f896) — the conservative
+        // direction: an `AutoApproveProject` grant is withheld and the call
+        // prompts instead.
+        let dir = tempdir().unwrap();
+        let sandbox = Sandbox::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hi").unwrap();
+        let inside = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i0:x"]},
+                {"path": "b.txt", "ops": ["d1"]}
+            ]
+        });
+        assert!(is_project_scoped("multi_edit", &inside, &sandbox));
+        // One entry outside the project taints the whole call.
+        let outside = dir.path().parent().unwrap().join("outside.txt");
+        std::fs::write(&outside, "hi").unwrap();
+        let mixed = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i0:x"]},
+                {"path": outside.to_string_lossy(), "ops": ["i0:x"]}
+            ]
+        });
+        assert!(!is_project_scoped("multi_edit", &mixed, &sandbox));
+        // Shape failures fail closed: no `files` arg, an empty array, or an
+        // entry without a usable path.
+        assert!(!is_project_scoped(
+            "multi_edit",
+            &serde_json::json!({}),
+            &sandbox
+        ));
+        assert!(!is_project_scoped(
+            "multi_edit",
+            &serde_json::json!({"files": []}),
+            &sandbox
+        ));
+        assert!(!is_project_scoped(
+            "multi_edit",
+            &serde_json::json!({"files": [{"ops": ["d1"]}]}),
+            &sandbox
+        ));
     }
 
     #[test]

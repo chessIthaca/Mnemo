@@ -27,6 +27,7 @@
 
 pub mod codegraph;
 pub mod convert_line_endings;
+pub mod edit_ops;
 pub mod file_append;
 pub mod file_edit;
 pub mod file_read;
@@ -39,6 +40,7 @@ pub mod image_tools;
 pub mod line_endings;
 pub mod list_models;
 pub mod load_tools;
+pub mod multi_edit;
 pub mod pattern;
 pub mod read_files;
 pub mod sandbox;

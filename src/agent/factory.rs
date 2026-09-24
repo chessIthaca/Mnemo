@@ -61,6 +61,7 @@ use crate::tool::agent::{
         ImageUiDiffTool, ImageUiToArtifactTool, ImageUnderstandDiagramTool,
     },
     list_models::ListModelsTool,
+    multi_edit::MultiEditTool,
     read_files::ReadFilesTool,
     search::SearchTool,
     search_read::SearchReadTool,
@@ -912,6 +913,7 @@ impl AgentLoopFactory {
             ReadFilesTool::new(sandbox.clone()).with_codegraph(codegraph.clone()),
         ));
         registry.register(Box::new(FileEditTool::new(sandbox.clone())));
+        registry.register(Box::new(MultiEditTool::new(sandbox.clone())));
         registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
         registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
         registry.register(Box::new(
@@ -1897,7 +1899,16 @@ mod tests {
             // note — so delta-vs-baseline arithmetic understates the
             // sweep; the pinned printouts are authoritative). Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 34_600),
+            // 34_600 → 36_300 (2026-09-23): the multi_edit tool (backlog
+            // 2e27f896 — atomic multi-file edits sharing file_edit's op
+            // engine) joins the Agent set, and file_edit's batch field became
+            // the polymorphic `ops` array (compact line ops + anchor objects,
+            // one field carrying both forms) — the pair measures Executing at
+            // 35_999 chars. multi_edit's schema keeps only a pointer to
+            // file_edit's grammar (both ride the same tools array); the rest
+            // is API surface. Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::Executing, 36_300),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1946,7 +1957,12 @@ mod tests {
             // sweep); workspace-unified measures PlanFrozen at 35_455
             // chars (standalone 34_971 + ~484 load_tools delta). Ceiling
             // = measured + headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 35_900),
+            // 35_900 → 37_600 (2026-09-23): same cause as the Executing raise
+            // above (multi_edit joins the Agent set + file_edit's polymorphic
+            // `ops` field; PlanFrozen = Executing ∪ finish); measures
+            // PlanFrozen at 37_285 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::PlanFrozen, 37_600),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -2070,7 +2086,13 @@ mod tests {
             // sweep); workspace-unified measures Reviewing at 29_433
             // chars (standalone 28_949 + ~484 load_tools delta). Ceiling
             // = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 29_800),
+            // 29_800 → 31_600 (2026-09-23): same cause as the Executing raise
+            // above (multi_edit joins the set + file_edit's polymorphic `ops`
+            // field) — the Reviewer's read-only agent still carries the Agent
+            // file tools' SCHEMAS (it cannot call the mutation tools, but the
+            // advertised array is shared); measures Reviewing at 31_263
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 31_600),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -2450,6 +2472,7 @@ mod tests {
             // agent/file tools
             "read_files",
             "file_edit",
+            "multi_edit",
             "file_write",
             "convert_line_endings",
             "shell",

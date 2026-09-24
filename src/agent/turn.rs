@@ -3527,7 +3527,7 @@ fn repeated_bad_json_correction(tool_name: &str, failed_content: &str) -> String
         }
         // A large body (a file's contents) is the other classic
         // unparseable-arguments cause: the emission is truncated.
-        "file_write" | "file_edit" => {
+        "file_write" | "file_edit" | "multi_edit" => {
             "This is usually an EMISSION problem — the argument body is too \
              large or too escape-heavy to come through intact. Do NOT \
              resend it. Instead: write the file in smaller chunks (one \

@@ -77,8 +77,12 @@ command.
   to fix stray text in a record body) or (b) a verified file-tool freeze
   (repeated drift errors on verified-identical text after a genuine fresh
   read). State the justification when you fall back to it.
-- `file_edit` batch mode (`edits`) applies several edits to one file
-  atomically — one write, one combined diff; prefer it over N separate calls.
+- `file_edit` batch mode (`ops`) applies several edits to one file
+  atomically — compact line ops (`i`/`b`/`d`/`r` verbs with ranges and
+  payloads) and anchor items in one array, in order, one write, one combined
+  diff; prefer it over N separate calls. For edits spanning several files
+  under ONE approval, use `multi_edit` (`files: [{path, ops}]`,
+  all-or-nothing).
 
 ## Branch policy (working-branch topology)
 

@@ -253,6 +253,15 @@ pub struct SettingsSaveDto {
     pub bundled_embedding_model: Option<String>,
     #[serde(default)]
     pub clear_bundled_embedding_model: bool,
+    /// Laya classifier (opt-in): enable/disable it. Absent = keep the
+    /// current value (see `GeneralSection::laya`).
+    #[serde(default)]
+    pub laya_enabled: Option<bool>,
+    /// Laya `laya-serve` base URL, e.g. `"http://127.0.0.1:8000"`. Absent =
+    /// keep; a blank string clears it (the classifier then reports
+    /// unavailable when enabled).
+    #[serde(default)]
+    pub laya_endpoint: Option<String>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
     /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
@@ -542,6 +551,17 @@ pub fn validate_and_apply_settings_patch(
             general.general.bundled_embedding_model = Some(trimmed.to_string());
         }
     }
+    if let Some(enabled) = patch.laya_enabled {
+        general.general.laya.enabled = enabled;
+    }
+    if let Some(endpoint) = &patch.laya_endpoint {
+        let trimmed = endpoint.trim();
+        general.general.laya.endpoint = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
     }
@@ -821,6 +841,37 @@ mod tests {
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(!next.general.general.auto_compact_on_plan_complete);
+    }
+
+    #[test]
+    fn laya_patch_applies_enabled_and_endpoint() {
+        // The opt-in Laya classifier rides the save path: Some flips the
+        // enable flag, Some(endpoint) sets the base URL (trimmed), a blank
+        // endpoint clears it, and absent fields keep the current values.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            laya_enabled: Some(true),
+            laya_endpoint: Some("  http://127.0.0.1:8000  ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.enabled);
+        assert_eq!(
+            next.general.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        // A blank endpoint clears it; the enable flag is untouched.
+        let patch = SettingsSaveDto {
+            laya_endpoint: Some("   ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.enabled);
+        assert_eq!(next.general.general.laya.endpoint, None);
+        // Defaults: nothing set, nothing enabled.
+        let empty = Config::default();
+        assert!(!empty.general.general.laya.enabled);
+        assert!(empty.general.general.laya.endpoint.is_none());
     }
 
     #[test]

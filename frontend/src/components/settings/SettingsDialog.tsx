@@ -20,6 +20,7 @@ import {
   Database,
   Volume2,
   Plug,
+  Zap,
 } from "lucide-react";
 import {
   Dialog,
@@ -41,6 +42,7 @@ import { SoundsSection } from "./sections/SoundsSection";
 import { ProvidersSection } from "./sections/ProvidersSection";
 import { VisionSection } from "./sections/VisionSection";
 import { EmbeddingSection } from "./sections/EmbeddingSection";
+import { ClassifierSection } from "./sections/ClassifierSection";
 import { MemorySection } from "./sections/MemorySection";
 import { SafetySection } from "./sections/SafetySection";
 import { GitSection } from "./sections/GitSection";
@@ -65,6 +67,7 @@ const NAV_ICONS: Record<SettingsSectionId, typeof Server> = {
   git: GitBranch,
   vision: Eye,
   embeddings: Brain,
+  classifier: Zap,
   memory: Database,
   pricing: DollarSign,
   models: Cpu,
@@ -102,6 +105,7 @@ export function SettingsDialog({
   const gitRef = useRef<SettingsSectionHandle>(null);
   const visionRef = useRef<SettingsSectionHandle>(null);
   const embeddingsRef = useRef<SettingsSectionHandle>(null);
+  const classifierRef = useRef<SettingsSectionHandle>(null);
   const memoryRef = useRef<SettingsSectionHandle>(null);
   const pricingRef = useRef<SettingsSectionHandle>(null);
   const modelsRef = useRef<SettingsSectionHandle>(null);
@@ -116,6 +120,7 @@ export function SettingsDialog({
     git: gitRef,
     vision: visionRef,
     embeddings: embeddingsRef,
+    classifier: classifierRef,
     memory: memoryRef,
     pricing: pricingRef,
     models: modelsRef,
@@ -392,6 +397,16 @@ export function SettingsDialog({
                 ref={embeddingsRef}
                 active={open}
                 onDirtyChange={(d) => setSectionDirty("embeddings", d)}
+              />
+            </div>
+            <div
+              className={section === "classifier" ? "block" : "hidden"}
+              aria-hidden={section !== "classifier"}
+            >
+              <ClassifierSection
+                ref={classifierRef}
+                active={open}
+                onDirtyChange={(d) => setSectionDirty("classifier", d)}
               />
             </div>
             <div

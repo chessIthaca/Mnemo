@@ -12,6 +12,10 @@
     "default_provider": null,
     "embedding_model": null,
     "enable_browser_inspection": false,
+    "laya": {
+      "enabled": false,
+      "endpoint": null
+    },
     "safety": "approve-each-action",
     "vision_model": null
   },

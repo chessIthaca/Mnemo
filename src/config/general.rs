@@ -107,6 +107,15 @@ pub struct GeneralSection {
     /// so `"hash"` is how a user says "I really want keyword-only".
     #[serde(default = "default_bundled_embedding_model")]
     pub bundled_embedding_model: Option<String>,
+    /// **Laya classifier (opt-in).** When enabled, the app may consult a
+    /// running `laya-serve` instance (see [`LayaConfig`]) for fast,
+    /// calibrated "System 1" decisions. Disabled by default — an absent or
+    /// disabled section changes nothing: no classifier calls, no startup
+    /// cost, no new failure modes. Omitted from the saved config while both
+    /// fields hold their defaults, so configs that never touched Laya keep no
+    /// trace of it (mirrors `[ui.steering_notes]`).
+    #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
+    pub laya: LayaConfig,
     /// **Agent browser inspection (opt-in, security tradeoff).** When `true`,
     /// the app exposes the WebView2 Chrome DevTools Protocol on
     /// `localhost:9222` (the next free port when several instances run) so
@@ -168,6 +177,37 @@ pub struct EmbeddingModel {
     pub endpoint: String,
     /// The embedding model id at that endpoint.
     pub model: String,
+}
+
+/// Configuration for the Laya classifier — an opt-in "System 1" decision
+/// service (`convaiinnovations/laya`) served by `laya-serve` over HTTP.
+///
+/// Laya is a fast, calibrated text classifier (not a generator): the app
+/// asks it typed questions (choice / score / yes-no) and reads back
+/// calibrated probabilities. **Disabled by default** — when
+/// [`enabled`](Self::enabled) is false (or the `[general.laya]` section is
+/// absent) the app behaves exactly as before: no classifier calls, no
+/// startup cost, no new failure modes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Whether the Laya classifier is enabled. Off by default.
+    pub enabled: bool,
+    /// Base URL of a running `laya-serve` instance, e.g.
+    /// `"http://127.0.0.1:8000"`. Required when `enabled` is true; `None`
+    /// (or blank) means "not configured" and the classifier stays
+    /// unavailable.
+    pub endpoint: Option<String>,
+}
+
+impl LayaConfig {
+    /// True while both fields hold their defaults — the `[general.laya]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`SteeringNotesCfg`]'s empty-table skip), so untouched configs keep no
+    /// Laya trace.
+    fn is_default(&self) -> bool {
+        !self.enabled && self.endpoint.is_none()
+    }
 }
 
 /// A reference to a configured endpoint + model, used by per-context model
@@ -258,6 +298,7 @@ impl Default for GeneralSection {
             vision_model: None,
             embedding_model: None,
             bundled_embedding_model: default_bundled_embedding_model(),
+            laya: LayaConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
             auto_compact_on_plan_complete: false,
@@ -1063,6 +1104,66 @@ bundled_embedding_model = "all-MiniLM-L6-v2"
     }
 
     #[test]
+    fn laya_defaults_to_disabled() {
+        // Opt-in only: an absent [general.laya] section (fresh config and
+        // existing configs alike) means the classifier is disabled — zero
+        // behavior change.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.enabled);
+        assert!(cfg.general.laya.endpoint.is_none());
+    }
+
+    #[test]
+    fn laya_round_trips() {
+        let text = r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.enabled);
+        assert_eq!(
+            cfg.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        // Re-serialize + re-parse.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.enabled);
+        assert_eq!(
+            cfg2.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+    }
+
+    #[test]
+    fn laya_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [ui.steering_notes]: an untouched (default)
+        // section is skipped in config.toml; enabling Laya (or a leftover
+        // endpoint) writes it, and it round-trips.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.laya"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.laya"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.laya.enabled);
+        assert_eq!(
+            back.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+    }
+
+    #[test]
     fn embedding_model_round_trips() {
         let cfg = GeneralConfig {
             general: GeneralSection {
@@ -1463,6 +1564,7 @@ chat_hover_timestamps = true
                     model: "nomic-embed-text".into(),
                 }),
                 bundled_embedding_model: None,
+                laya: LayaConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,
                 auto_compact_on_plan_complete: false,

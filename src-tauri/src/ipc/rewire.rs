@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Runtime rewire of the vision client + memory embedder + model resolver
-//! after a config change.
+//! Runtime rewire of the vision client + memory embedder + optional Laya
+//! classifier + model resolver after a config change.
 //!
 //! Shared by [`save_endpoints`](super::settings::save_endpoints) and
 //! [`save_settings`](super::settings::save_settings): both reload the config
@@ -11,14 +11,24 @@
 //! (factory / memory store / model resolver) so the change takes effect
 //! without a restart.
 
-use mnemo::provider::client_factory::{build_embedder, build_vision_client};
+use mnemo::provider::client_factory::{build_classifier, build_embedder, build_vision_client};
+use tauri::Emitter;
 
 use crate::ipc::state::IpcState;
 
-/// Rebuild the live vision client + memory embedder from `cfg` and install
-/// them into the factory / memory store. No-op when those handles are absent
-/// (startup-error fallback). Shared by `save_settings` and `save_endpoints`.
-pub(super) fn rewire_vision_and_embedder(state: &IpcState, cfg: &mnemo::config::Config) {
+/// Rebuild the live vision client + memory embedder + optional Laya classifier
+/// from `cfg` and install them into the factory / memory store / classifier
+/// slot. No-op for the handles that are absent (startup-error fallback).
+/// Shared by `save_settings` and `save_endpoints`.
+///
+/// `app` is used only to emit `classifier://status` when the classifier slot
+/// is rebuilt — mirroring the startup emit (main.rs), so listeners (today the
+/// Settings → Classifier section) see a save-driven rewire without polling.
+pub(super) fn rewire_vision_embedder_and_classifier(
+    app: &tauri::AppHandle,
+    state: &IpcState,
+    cfg: &mnemo::config::Config,
+) {
     if let Some(factory) = &state.runtime.factory {
         let vision = build_vision_client(cfg);
         factory.set_vision(vision);
@@ -70,6 +80,36 @@ pub(super) fn rewire_vision_and_embedder(state: &IpcState, cfg: &mnemo::config::
         store.set_memory_search_config(cfg.general.memory.clone());
         store.set_embedder(new_embedder);
         eprintln!("rewire: embedder set (from config)");
+    }
+
+    // Laya classifier: rebuild from the saved config so enabling/disabling or
+    // repointing the endpoint takes effect without a restart. Disabled ⇒
+    // `None` + status Disabled (no client, no calls); the slot swap is what
+    // items 2-5 read. `build_classifier` also writes the shared status, so the
+    // Settings section sees the new state on its next read.
+    let new_classifier = build_classifier(cfg, state.runtime.classifier_status.clone());
+    *state
+        .runtime
+        .classifier
+        .write()
+        .expect("classifier lock poisoned") = new_classifier;
+    // Read back through the accessor items 2-5 will use, so the log shows the
+    // installed state (a poisoned lock reads as "cleared").
+    let classifier_active = state.classifier().map(|c| c.is_some()).unwrap_or(false);
+    eprintln!(
+        "rewire: classifier {}",
+        if classifier_active {
+            "active"
+        } else {
+            "cleared"
+        }
+    );
+
+    // Mirror the startup emit so a save-driven enable/disable/endpoint change
+    // reaches listeners immediately (the Settings section also re-polls after
+    // a save; the event keeps any future listener correct).
+    if let Ok(status) = state.classifier_status() {
+        let _ = app.emit("classifier://status", &status);
     }
 }
 

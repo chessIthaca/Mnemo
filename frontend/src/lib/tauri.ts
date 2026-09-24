@@ -241,7 +241,8 @@ export async function getContextCaps(): Promise<[number, number][]> {
 
 /**
  * The startup snapshot: everything the frontend needs on mount in one call
- * (agents, context caps, ALL workflow states, backlog, embedder status).
+ * (agents, context caps, ALL workflow states, backlog, embedder + classifier
+ * status).
  * Replaces 5 sequential invoke round-trips and closes the
  * stale-non-active-workflowStates gap (the old startup fetched only the
  * active agent's state).
@@ -252,6 +253,14 @@ export interface StartupSnapshot {
   workflow_states: [number, string][];
   backlog: BacklogItem[];
   embedder_status: string;
+  /**
+   * Laya classifier status: `"disabled"` (the default — Laya is opt-in and no
+   * classifier backend exists), `"ready"`, or `"failed"` (the endpoint failed
+   * the last call). Seed value for status consumers; the Settings → Classifier
+   * section reads the live status via `getClassifierStatus()` and the
+   * `classifier://status` event.
+   */
+  classifier_status: string;
   /**
    * Same-project instance conflict: set when another LIVE mnemo instance
    * already holds this project — the app asks before opening it (a second
@@ -276,7 +285,7 @@ export interface InstanceConflict {
 
 /**
  * Fetch the startup snapshot in one call. Seeds agents, context caps, ALL
- * workflow states, backlog, and embedder status on mount.
+ * workflow states, backlog, and embedder + classifier status on mount.
  */
 export async function getStartupSnapshot(): Promise<StartupSnapshot> {
   return await invoke("startup_snapshot");
@@ -435,6 +444,9 @@ export interface AppSettings {
     vision_model?: VisionModelConfig | null;
     embedding_model?: EmbeddingModelConfig | null;
     bundled_embedding_model?: string | null;
+    /** Laya classifier (opt-in) — whether it is enabled + the configured
+     *  `laya-serve` base URL (`null` = not configured). */
+    laya?: { enabled: boolean; endpoint: string | null };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
      *  default; debug builds always expose it regardless). */
@@ -530,6 +542,10 @@ export interface SettingsSavePatch {
   clear_embedding_model?: boolean;
   bundled_embedding_model?: string;
   clear_bundled_embedding_model?: boolean;
+  /** Laya classifier (opt-in): flip the enable flag. */
+  laya_enabled?: boolean;
+  /** Laya `laya-serve` base URL; a blank string clears it. */
+  laya_endpoint?: string;
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
@@ -630,6 +646,27 @@ export function onEmbedderStatus(
   handler: (status: string) => void,
 ): Promise<UnlistenFn> {
   return listen<string>("embedder://status", (event) => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * Get the live Laya classifier status ("disabled" / "ready" / "failed").
+ * `disabled` is the default — Laya is opt-in and, while it is off, no
+ * classifier backend exists and no call is ever made.
+ */
+export async function getClassifierStatus(): Promise<string> {
+  return await invoke("get_classifier_status");
+}
+
+/**
+ * Subscribe to Laya classifier status changes (`classifier://status` — emitted
+ * at startup and after a settings save rewires the backend).
+ */
+export function onClassifierStatus(
+  handler: (status: string) => void,
+): Promise<UnlistenFn> {
+  return listen<string>("classifier://status", (event) => {
     handler(event.payload);
   });
 }

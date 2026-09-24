@@ -19,7 +19,8 @@ use mnemo::memory::embedder::HashEmbedder;
 use mnemo::memory::MemoryStore;
 use mnemo::project::Project;
 use mnemo::provider::client_factory::{
-    build_client, build_embedder, build_vision_client, embedder_startup_plan, EmbedderStartupPlan,
+    build_classifier, build_client, build_embedder, build_vision_client, embedder_startup_plan,
+    EmbedderStartupPlan,
 };
 use mnemo::provider::openai::{OpenAiClient, OpenAiClientConfig};
 use mnemo::provider::trace::LlmRequestLog;
@@ -517,6 +518,8 @@ fn main() {
                             startup_error: None,
                             needs_project: false,
                             embedder_status: brain.embedder_status.clone(),
+                            classifier_status: brain.classifier_status.clone(),
+                            classifier: Arc::new(RwLock::new(brain.classifier.clone())),
                             instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
@@ -563,6 +566,21 @@ fn main() {
                             .expect("embedder status lock poisoned")
                             .clone();
                         let _ = app_handle.emit("embedder://status", &status);
+                    }
+
+                    // The classifier status was already determined by
+                    // `build_classifier` during brain construction (Disabled
+                    // unless Laya is enabled with an endpoint, Ready
+                    // otherwise). Emit it once so the Settings → Classifier
+                    // section reflects the real state on mount.
+                    {
+                        let app_handle = app.handle().clone();
+                        let status_lock = app.state::<IpcState>().runtime.classifier_status.clone();
+                        let status = status_lock
+                            .read()
+                            .expect("classifier status lock poisoned")
+                            .clone();
+                        let _ = app_handle.emit("classifier://status", &status);
                     }
 
                     // First-run model download: the configured bundled model
@@ -649,6 +667,10 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
+                            classifier_status: Arc::new(RwLock::new(
+                                mnemo::memory::classifier::ClassifierStatus::Disabled,
+                            )),
+                            classifier: Arc::new(RwLock::new(None)),
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -736,6 +758,10 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
+                            classifier_status: Arc::new(RwLock::new(
+                                mnemo::memory::classifier::ClassifierStatus::Disabled,
+                            )),
+                            classifier: Arc::new(RwLock::new(None)),
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -802,6 +828,7 @@ fn main() {
             ipc::settings::get_settings,
             ipc::settings::save_settings,
             ipc::settings::get_embedder_status,
+            ipc::settings::get_classifier_status,
             ipc::embeddings::list_bundled_embedding_models,
             ipc::embeddings::download_bundled_model,
             ipc::keys::get_api_keys,
@@ -987,6 +1014,14 @@ pub(crate) struct Brain {
     /// the circuit breaker's transitions surface live to the UI.
     /// `pub(crate)` so console mode can drive the deferred embedder load.
     pub(crate) embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
+    /// The shared classifier status — the same `Arc` held by `IpcState`, so
+    /// the enabled/disabled/failed state surfaces live to Settings. `Disabled`
+    /// unless the config enables Laya with an endpoint.
+    pub(crate) classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
+    /// The built Laya classifier when the config enables it with an endpoint —
+    /// `None` while disabled (no client is built and no call is ever made).
+    /// Moved into the `IpcState` slot at startup; items 2-5 consume it there.
+    pub(crate) classifier: Option<Arc<dyn mnemo::memory::classifier::Classifier>>,
     /// A configured bundled embedding model that wasn't installed at startup
     /// (first run): the store started on the hash embedder and the setup hook
     /// must download this model in the background, swapping it into the live
@@ -1289,6 +1324,16 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
             None,
         ),
     };
+
+    // The optional Laya classifier (opt-in; disabled by default). Built only
+    // when [general.laya] enables it with an endpoint — otherwise `None` with
+    // status Disabled and no HTTP client at all, so the app behaves exactly as
+    // before. Constructing the client does no I/O: startup is never blocked.
+    let classifier_status = Arc::new(RwLock::new(
+        mnemo::memory::classifier::ClassifierStatus::Disabled,
+    ));
+    let classifier = build_classifier(&config, classifier_status.clone());
+
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -1300,7 +1345,7 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
 
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per
-    // call. Settings saves update it via rewire_vision_and_embedder.
+    // call. Settings saves update it via rewire_vision_embedder_and_classifier.
     store.set_memory_search_config(config.general.memory.clone());
 
     // Startup reconciliation: check whether the semantic DB matches the
@@ -1852,6 +1897,8 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         trace,
         browser,
         embedder_status,
+        classifier_status,
+        classifier,
         pending_model_download: pending_download,
         pending_model_load: pending_load,
         _graph_watcher: graph_watcher,

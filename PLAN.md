@@ -1135,6 +1135,16 @@ These capabilities are implemented and shipped but were not in the original
 PLAN.md scope. They are documented here so the PRD reflects the shipped
 product.
 
+- **Opt-in Laya classifier foundation** (`src/memory/classifier.rs`, mirrored
+  `build_classifier` in `src/provider/client_factory.rs`) — a `Classifier`
+  trait beside `Embedder` plus a Laya HTTP backend (`POST /v1/systemone`) for
+  fast, calibrated "System 1" decisions. Disabled by default: with Laya off (or
+  enabled without an endpoint) no client is built and no call is ever made, so
+  the app behaves exactly as before. Status surfaces via
+  `get_classifier_status` + the startup snapshot, and Settings → Classifier
+  carries the toggle, endpoint URL, install hints, and live status (2027-01-16,
+  backlog bb54bdcc; the four consumer features — model routing, tool steering,
+  failure triage, memory typing — follow, each confidence-gated).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

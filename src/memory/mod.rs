@@ -9,6 +9,7 @@
 //! pre-v1 `sqlite-vec` FFI complexity while staying within SQLite's sweet spot
 //! (hundreds to low-thousands of entries per project).
 
+pub mod classifier;
 pub mod consolidation;
 pub mod embedder;
 pub mod finish_capture;
@@ -27,6 +28,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
+pub use classifier::{Answer, Classifier, ClassifierStatus, LayaClassifier, NoClassifier, Question};
 pub use embedder::{Embedder, EmbedderStatus, HashEmbedder};
 pub use knowledge::KnowledgeStore;
 pub use types::{

@@ -18,6 +18,7 @@ export type SettingsSectionId =
   | "git"
   | "vision"
   | "embeddings"
+  | "classifier"
   | "memory"
   | "pricing"
   | "models"
@@ -103,6 +104,20 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
     label: "Embeddings",
     hint: "Semantic memory recall",
     keywords: ["embedding", "nomic", "vector", "semantic", "memory", "ollama"],
+  },
+  {
+    id: "classifier",
+    label: "Classifier",
+    hint: "Laya System 1 (opt-in)",
+    keywords: [
+      "laya",
+      "classifier",
+      "system 1",
+      "classify",
+      "sidecar",
+      "laya-serve",
+      "endpoint",
+    ],
   },
   {
     id: "memory",
@@ -406,6 +421,21 @@ export function serializeChat(d: ChatDraft): string {
 }
 
 /**
+ * Snapshot of the Laya classifier draft (for dirty / discard). `endpoint` is
+ * the raw input value; "" means "not configured" (the backend clears the
+ * stored URL when the save patch carries a blank string).
+ */
+export interface ClassifierDraft {
+  enabled: boolean;
+  endpoint: string;
+}
+
+/** Serialize the classifier draft for dirty comparison. */
+export function serializeClassifier(d: ClassifierDraft): string {
+  return JSON.stringify(d);
+}
+
+/**
  * Snapshot of the notification-sound toggles (for draft / discard). Each
  * sound is disabled independently (persisted to config.toml [ui]).
  */
@@ -454,6 +484,7 @@ export function isSettingsSectionId(v: string): v is SettingsSectionId {
     v === "git" ||
     v === "vision" ||
     v === "embeddings" ||
+    v === "classifier" ||
     v === "memory" ||
     v === "pricing" ||
     v === "models" ||

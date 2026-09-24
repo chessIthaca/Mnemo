@@ -40,6 +40,7 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
+| **Optional Laya classifier** | An opt-in "System 1" text classifier: your own `laya-serve` sidecar answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
 | **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
 
@@ -155,6 +156,8 @@ Two heavyweight optional cargo features exist on the library — `browser` (head
 In the config dialog download a semantic model that runs locally on your machine for the memory to be most effective and reindex after that.
 
 If you want in browser debugging you have to enable it in the advanced section of the config dialog.
+
+If you want fast, calibrated "System 1" decisions (opt-in, off by default), run Laya as a sidecar yourself — `pip install "laya[serve]"`, then `laya-serve` — and enable the Classifier section with its endpoint URL.
 
 Have fun and let me know where we can improve things.
 Pull requests gratefully considered.

@@ -802,6 +802,9 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
   // (instead of snapping back to the empty state). Don't switch the active tab
   // — the user stays on whatever they were viewing. The same snapshot also
   // feeds the current top plan's changed-file list (planDiff effect).
+  // multi_edit is deliberately absent: a snapshot entry is ONE path, while a
+  // multi-file edit is N — its combined diff renders inline on the tool card
+  // (Message.tsx `editDiff`, toolCardPaths.fileEditDiff) instead.
   let lastDiff: LastDiff | null | undefined;
   if (
     completedCall &&
@@ -816,7 +819,10 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
       // leave empty
     }
     const previewPath =
-      resolvedPreview && typeof resolvedPreview.path === "string"
+      resolvedPreview !== null &&
+      resolvedPreview !== undefined &&
+      resolvedPreview.kind !== "multi_diff" &&
+      typeof resolvedPreview.path === "string"
         ? resolvedPreview.path
         : undefined;
     const unifiedDiff =

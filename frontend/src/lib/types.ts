@@ -143,12 +143,19 @@ export interface ToolResult {
   data?: unknown;
 }
 
-export interface ApprovalPreview {
-  kind: "diff" | "new_file";
-  path: string;
-  diff?: string;
-  content?: string;
-}
+/**
+ * The Rust `ApprovalPreview` (src/provider/mod.rs) as it reaches the UI,
+ * discriminated on `kind`:
+ * - `diff` — one file's unified diff (file_edit),
+ * - `new_file` — a new file's full content (file_write),
+ * - `multi_diff` — ONE combined diff covering every file a `multi_edit` call
+ *   changes (each file contributing its own `--- path` / `+++ path`
+ *   section), so no single `path` applies: the changed files are `paths`.
+ */
+export type ApprovalPreview =
+  | { kind: "diff"; path: string; diff?: string; content?: string }
+  | { kind: "new_file"; path: string; diff?: string; content?: string }
+  | { kind: "multi_diff"; paths: string[]; diff: string };
 
 export interface PlanStep {
   index: number;

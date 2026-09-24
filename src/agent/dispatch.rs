@@ -29,6 +29,12 @@ use crate::workflow::WorkflowState;
 
 /// The file tools [`ToolFilter::ExecutingResearch`] denies wholesale — the set
 /// a research plan may nevertheless use on an ARTIFACT target (`.coding/**`).
+///
+/// `multi_edit` is deliberately NOT part of this carve-out: a grant would have
+/// to judge EVERY `files[].path` atomically (the per-path link/junction ladder
+/// below), and the conservative default — a research plan denied the
+/// multi-file tool outright, with `file_edit` still available for its own
+/// artifacts — is safe and covers the observed need.
 const RESEARCH_ARTIFACT_TOOLS: [&str; 4] = [
     "file_edit",
     "file_write",
@@ -458,6 +464,19 @@ impl AgentLoop {
                 ) {
                     return (redirect, Vec::new());
                 }
+            }
+        }
+
+        // The same gate covers multi_edit's per-file paths (plan 2e27f896):
+        // EVERY entry's path is checked, and one gated path intercepts the
+        // whole call — nothing executes, so nothing writes.
+        if tc.name == "multi_edit" {
+            if let Some(redirect) = multi_edit_redirect(
+                crate::agent::steering_stats::SteeringStats::shared(),
+                agent_id,
+                &parsed_call.arguments,
+            ) {
+                return (redirect, Vec::new());
             }
         }
 
@@ -1195,7 +1214,7 @@ fn observe_mutation_vehicle(
     result: &ToolResult,
 ) {
     match tool_name {
-        "file_edit" | "file_write" | "file_append" => {
+        "file_edit" | "file_write" | "file_append" | "multi_edit" => {
             if result.success {
                 steering.note_file_tool_mutation();
             }
@@ -1255,6 +1274,28 @@ fn observe_edit_freshness(
                 }
             }
         }
+        "multi_edit" => {
+            // Per-path, like file_edit (plan 2e27f896): a success refreshes
+            // EVERY path the call wrote; a drift-class failure records the
+            // path its error names (the engine's message carries
+            // "files[i] 'path'", falling back to the first entry when the
+            // parse is inconclusive).
+            let paths = multi_edit_paths(args);
+            if result.success {
+                for path in &paths {
+                    steering.note_edit_success(agent_id, path);
+                }
+            } else if crate::agent::steering_stats::is_edit_drift_failure(tool_name, &result.output)
+            {
+                if let Some(path) = paths
+                    .iter()
+                    .find(|p| result.output.contains(p.as_str()))
+                    .or_else(|| paths.first())
+                {
+                    steering.note_edit_drift(agent_id, path);
+                }
+            }
+        }
         "read_files" => steering.note_file_read(agent_id, &read_files_paths(args)),
         "search_read" => steering.clear_edit_drift(agent_id),
         _ => {}
@@ -1277,6 +1318,21 @@ fn read_files_paths(args: &serde_json::Value) -> Vec<String> {
         }
     }
     paths
+}
+
+/// The `files[].path` entries a `multi_edit` call touches (plan 2e27f896) —
+/// the same arg shape the freshness bookkeeping and the stale-read gate use.
+fn multi_edit_paths(args: &serde_json::Value) -> Vec<String> {
+    args.get("files")
+        .and_then(|v| v.as_array())
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|f| f.get("path").and_then(|v| v.as_str()))
+                .map(|p| p.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// C5-family: the file_edit stale-read gate (backlog 714196da). When
@@ -1306,6 +1362,23 @@ pub(crate) fn file_edit_redirect(
          retry blind. First re-read the file with read_files (this exact path: {path}), \
          then retry the edit with the exact current text."
     )))
+}
+
+/// The stale-read gate's multi-file arm (plan 2e27f896): check EVERY
+/// `files[].path` entry of a `multi_edit` call, in order — the first gated
+/// path intercepts the WHOLE call (the multi-file tool is atomic, so one
+/// stale entry would otherwise write files whose ops the agent may have
+/// re-emitted from memory too; nothing executes, so nothing is written).
+/// The redirect result names the gated path, since the call carries several.
+/// Shares [`file_edit_redirect`]'s per-(agent, path) state and telemetry.
+pub(crate) fn multi_edit_redirect(
+    steering: &crate::agent::steering_stats::SteeringStats,
+    agent_id: AgentId,
+    args: &serde_json::Value,
+) -> Option<ToolResult> {
+    multi_edit_paths(args)
+        .iter()
+        .find_map(|path| file_edit_redirect(steering, agent_id, path))
 }
 
 /// C3: append this agent's queued nudge-escalation notes (an actionable
@@ -1428,6 +1501,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::tool::agent::sandbox::link_fixture::{plant_dir_link, plant_file_link};
+    use crate::tool::Tool;
 
     #[test]
     fn shell_mutation_pattern_matches_the_mutation_vehicles() {
@@ -1663,6 +1737,159 @@ mod tests {
             &serde_json::json!({"pattern": "x"}),
             &ToolResult::success("ok"),
         );
+        assert!(file_edit_redirect(&stats, 1, "b.txt").is_none());
+    }
+
+    /// The REAL drift-class `multi_edit` error: `MultiEditTool` executed
+    /// against a tempdir with a failing anchor on the second entry, the error
+    /// text taken verbatim. Deriving the fixture from the tool pins the
+    /// funnel's path-naming contract against the SHIPPED message shape — a
+    /// hand-written approximation can drift out of it and keep passing
+    /// (review L5). The drift-class assertion makes a marker change fail HERE
+    /// rather than silently in the funnel.
+    async fn real_multi_edit_drift_err() -> String {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "x\ny\n").unwrap();
+        let tool = crate::tool::agent::multi_edit::MultiEditTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let result = tool
+            .execute(serde_json::json!({
+                "files": [
+                    {"path": "a.txt", "ops": ["i1:ok"]},
+                    {"path": "b.txt", "ops": [{"old_string": "not-there", "new_string": "X"}]}
+                ]
+            }))
+            .await;
+        assert!(
+            !result.success,
+            "the failing anchor must abort the whole call: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("b.txt"),
+            "the shipped error names the failing entry: {}",
+            result.output
+        );
+        assert!(
+            crate::agent::steering_stats::is_edit_drift_failure("multi_edit", &result.output),
+            "the shipped error is drift-class: {}",
+            result.output
+        );
+        result.output
+    }
+
+    #[test]
+    fn multi_edit_paths_extracts_every_entry_path() {
+        // The stale-read gate and the freshness bookkeeping share one
+        // extraction (plan 2e27f896): the `files[].path` entries, in order.
+        let args = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i0:x"]},
+                {"path": "b.txt", "ops": ["d1"]}
+            ]
+        });
+        assert_eq!(
+            multi_edit_paths(&args),
+            vec!["a.txt".to_string(), "b.txt".to_string()]
+        );
+        // No files array / no entries / entries without a path: nothing to
+        // key on, so no path is ever gated or cleared.
+        assert!(multi_edit_paths(&serde_json::json!({})).is_empty());
+        assert!(multi_edit_paths(&serde_json::json!({"files": []})).is_empty());
+        assert!(multi_edit_paths(&serde_json::json!({"files": [{"ops": ["d1"]}]})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_edit_redirect_intercepts_when_any_entry_path_is_stale() {
+        // One stale entry intercepts the WHOLE call (plan 2e27f896): the
+        // multi-file tool is atomic, so letting the call through would write
+        // files the agent may equally have re-emitted from memory. The
+        // redirect names the gated path; the call never runs.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        let args = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i0:x"]},
+                {"path": "b.txt", "ops": ["d1"]}
+            ]
+        });
+        // Nothing stale yet → the call proceeds.
+        assert!(multi_edit_redirect(&stats, 1, &args).is_none());
+        // A drift-class failure on the SECOND entry arms only that path —
+        // fed from the REAL tool error (review L5), not a hand-written one.
+        let drift_err = real_multi_edit_drift_err().await;
+        stats.observe_result(1, "multi_edit", &drift_err);
+        stats.note_edit_drift(1, "b.txt");
+        let interception = multi_edit_redirect(&stats, 1, &args)
+            .expect("the stale entry intercepts the call");
+        assert!(
+            interception.output.contains("EDIT INTERCEPTED"),
+            "{}",
+            interception.output
+        );
+        assert!(
+            interception.output.contains("b.txt"),
+            "the redirect names the gated path: {}",
+            interception.output
+        );
+        // ...and a fresh read of it lifts the gate for the whole call.
+        stats.note_file_read(1, &["b.txt".to_string()]);
+        assert!(multi_edit_redirect(&stats, 1, &args).is_none());
+        // Drift on a path OUTSIDE the call is irrelevant to it.
+        stats.note_edit_drift(1, "c.txt");
+        assert!(multi_edit_redirect(&stats, 1, &args).is_none());
+        // A call whose paths are all unreadable/absent gates nothing.
+        assert!(multi_edit_redirect(&stats, 1, &serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn observe_edit_freshness_tracks_multi_edit_per_path() {
+        // The funnel's multi_edit arm (plan 2e27f896): a success clears drift
+        // for EVERY path the call wrote; a drift-class failure records the
+        // path its error names (the engine prefixes "files[i] 'path'"),
+        // falling back to the first entry when the message names none.
+        let stats = crate::agent::steering_stats::SteeringStats::new();
+        let args = serde_json::json!({
+            "files": [
+                {"path": "a.txt", "ops": ["i0:x"]},
+                {"path": "b.txt", "ops": ["d1"]}
+            ]
+        });
+        let drift_err = real_multi_edit_drift_err().await;
+        observe_edit_freshness(
+            &stats,
+            1,
+            "multi_edit",
+            &args,
+            &ToolResult::error(drift_err.as_str()),
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "b.txt").is_some(),
+            "the path named in the error is the one that drifts"
+        );
+        assert!(
+            file_edit_redirect(&stats, 1, "a.txt").is_none(),
+            "an unnamed sibling entry stays clean"
+        );
+        // The fallback: an error naming no entry path arms the first entry.
+        observe_edit_freshness(
+            &stats,
+            1,
+            "multi_edit",
+            &args,
+            &ToolResult::error("old_string not found — Re-read the file and retry."),
+        );
+        assert!(file_edit_redirect(&stats, 1, "a.txt").is_some());
+        // A successful call refreshes every path it wrote — both paths clean.
+        observe_edit_freshness(
+            &stats,
+            1,
+            "multi_edit",
+            &args,
+            &ToolResult::success("edited 2 file(s)"),
+        );
+        assert!(file_edit_redirect(&stats, 1, "a.txt").is_none());
         assert!(file_edit_redirect(&stats, 1, "b.txt").is_none());
     }
 

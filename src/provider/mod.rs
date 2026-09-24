@@ -1068,6 +1068,10 @@ pub enum ApprovalPreview {
     Diff { path: PathBuf, diff: String },
     /// The full content of a new file.
     NewFile { path: PathBuf, content: String },
+    /// One combined diff covering EVERY file a multi-file edit changes — the
+    /// concatenated per-file unified diffs, each carrying its own
+    /// `--- path` / `+++ path` header.
+    MultiDiff { paths: Vec<PathBuf>, diff: String },
 }
 
 /// A runtime-swappable provider slot — a shared handle to the main LLM client

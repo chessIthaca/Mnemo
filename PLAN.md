@@ -228,8 +228,12 @@ vitest (frontend), `tsc --noEmit` clean.
 
 - **Agent tools** — the coding tools the agent uses to do work: `file_read`,
   `read_files` (batch sibling), `file_edit` (EOL-agnostic literal/fuzzy
-  matching, atomic multi-edit batches via `edits`, append mode via `append`),
-  `file_write`, `file_append`, `shell`, `search`, `git`, `describe_image`.
+  matching, atomic multi-edit batches via `ops` — compact line ops (`i`/`b`/
+  `d`/`r` verbs with ranges and payloads) and anchor items sharing one array,
+  append mode via `append`), `multi_edit` (atomic multi-file edits,
+  `files: [{path, ops}]`, every file prepared before any write — one combined
+  diff, one approval), `file_write`, `file_append`, `shell`, `search`, `git`,
+  `describe_image`.
   Live in `tool/agent/`. Gated by
   workflow state. The two read tools cross-hint each other's argument shape
   in their invalid-args error when a model mixes up a call. `search`/
@@ -931,7 +935,7 @@ toggle). The layout mirrors the original design but with web-grade rendering:
 |---|---|
 | **Md viewer** | Renders a markdown file readably — headings, lists, code blocks (Shiki-highlighted), wrapped prose, tables, task lists. Scrollable. Editable (toggle edit mode). |
 | **Plan progress** | The current plan with checkboxes, progress count, active step highlighted. Reflects `.coding/plans/` on disk. |
-| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` approvals. Auto-shown when an approval is pending. |
+| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` / `multi_edit` approvals (`multi_edit` shows one combined diff covering every file it changes). Auto-shown when an approval is pending. |
 | **Tool output** | Live output from shell commands and search results. |
 | **File browser** | Navigable project file tree; opening a file switches to the md viewer. |
 

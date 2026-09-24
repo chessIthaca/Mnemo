@@ -6,9 +6,10 @@
 //!
 //! Takes an old/new string pair, applies the replacement, and the approval
 //! prompt renders a unified diff (via the `similar` crate) so you see exactly
-//! what changes before approving. A multi-edit batch (`edits`) applies
-//! several old/new pairs atomically — in order, one write, one combined
-//! diff; any failing item aborts with the file untouched.
+//! what changes before approving. An ops array (`ops`) applies several edits
+//! atomically — compact line ops (i/b/d/r verbs, ranges, payloads) and
+//! anchor items in order, one write, one combined diff; any failing op
+//! aborts with the file untouched.
 //!
 //! Byte-exactness (backlog 838b6f4e): `old_string` matches byte-exact —
 //! JS-escaped apostrophes (`\'`), backslashes (`\\`), and line endings are
@@ -35,16 +36,19 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::agent::steering_stats::EDIT_STALE_READ_MARK;
-use similar::TextDiff;
-
 use crate::error::Result;
 use crate::provider::{ApprovalPreview, ToolSchema};
+use crate::tool::agent::edit_ops::{
+    apply_ops, literal_splice, near_miss_diagnostic, parse_ops, validate_emission_artifacts,
+    validate_op_items, with_fresh_read_nudge, EditOp, MatchOrigin, SpliceOutcome,
+};
 use crate::tool::agent::line_endings::{
     denormalize_literal_newlines, detect_line_ending, normalize_line_endings,
 };
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
+
+pub use crate::tool::agent::edit_ops::{compute_diff, EditItem};
 
 /// Arguments for `file_edit`.
 #[derive(Debug, Deserialize)]
@@ -56,7 +60,7 @@ pub struct FileEditArgs {
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub old_string: String,
     /// The replacement text. Defaults to empty so multi-edit batch calls
-    /// (`edits`) can omit it — the items carry their own replacements. An
+    /// (`ops`) can omit it — the ops carry their own replacements. An
     /// empty `new_string` in single mode deletes `old_string`.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub new_string: String,
@@ -91,47 +95,34 @@ pub struct FileEditArgs {
     /// and line-range modes.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub fuzzy_whitespace: bool,
-    /// Atomic multi-edit batch (plan be16ea36 step 4): every item is applied
-    /// to the in-memory content IN ORDER and the result is written ONCE — any
-    /// failing item aborts the whole batch with NO write (the file stays
-    /// byte-identical). Each item's anchor must match exactly once in the
-    /// content as left by the preceding items unless the item sets `count`.
-    /// Mutually exclusive with the single-edit fields: leave `old_string`/
-    /// `new_string` empty and do not set `use_regex`/`replace_all`/`count`/
-    /// `lines` (the batch-level `fuzzy_whitespace` is each item's default).
-    #[serde(default)]
-    pub edits: Option<Vec<EditItem>>,
+    /// Ops array (plan 2e27f896, extending the batch of plan be16ea36): the
+    /// edits to apply IN ORDER — each element is either a compact line-op
+    /// string or an anchor object `{old_string, new_string, count?,
+    /// fuzzy_whitespace?}`. Compact ops: `{i|b|d|r}{N|N-M|N-}[:payload]`,
+    /// 1-indexed inclusive — `i101:text` inserts after line 101 (`i0:` top,
+    /// `i<line count>:` EOF), `b101:text` inserts before it, `d202-205`
+    /// deletes (`d202` one line, `d100-` to EOF), `r102:text` replaces
+    /// (`r100-120:text` a range; `r102:` leaves one empty line). Line numbers
+    /// refer to the content as left by the preceding ops; an anchor must
+    /// match exactly once unless it sets `count`. The result is written ONCE
+    /// — any failing op aborts the whole array with NO write (the file stays
+    /// byte-identical). Mutually exclusive with the single-edit fields: leave
+    /// `old_string`/`new_string` empty and do not set `use_regex`/
+    /// `replace_all`/`count`/`lines` (the array-level `fuzzy_whitespace` is
+    /// each anchor's default). The legacy `edits` key is accepted as an alias.
+    #[serde(default, alias = "edits")]
+    pub ops: Option<Vec<serde_json::Value>>,
     /// Append mode (plan be16ea36 step 5): when true, `new_string` is added
     /// at EOF instead of replacing a match — no `old_string` is needed. The
     /// appended text starts on a fresh line (prefixed by the file's detected
     /// line ending when the file doesn't already end with one) and is
     /// re-emitted in the file's detected style; an empty file takes the
     /// caller's text verbatim (no style to preserve). Mutually exclusive
-    /// with `edits`, line-range mode, `old_string`, and the matching knobs
+    /// with `ops`, line-range mode, `old_string`, and the matching knobs
     /// (`use_regex`/`replace_all`/`count`/`fuzzy_whitespace`). Errors when
     /// the file is missing — use `file_write` to create it.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub append: bool,
-}
-
-/// One edit in a multi-edit batch (file_edit's `edits` array, plan be16ea36
-/// step 4): replace `old_string` with `new_string` — `count` widens the match
-/// to the first N occurrences (default 1; required when the anchor matches
-/// more than once), `fuzzy_whitespace` enables whitespace-tolerant matching
-/// for THIS item (default: the batch-level `fuzzy_whitespace`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct EditItem {
-    /// The exact text to find (EOL-agnostic matching, as in single mode).
-    pub old_string: String,
-    /// The replacement text.
-    pub new_string: String,
-    /// Replace at most N occurrences of this item's `old_string` (default 1).
-    #[serde(default)]
-    pub count: Option<usize>,
-    /// Whitespace-tolerant matching for this item (default: the batch-level
-    /// `fuzzy_whitespace`).
-    #[serde(default)]
-    pub fuzzy_whitespace: Option<bool>,
 }
 
 /// The `file_edit` tool.
@@ -158,39 +149,6 @@ pub struct PreparedEdit {
     pub notes: Vec<String>,
 }
 
-/// Compute the unified diff between old and new content.
-pub fn compute_diff(path: &str, old: &str, new: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
-    let mut out = String::new();
-    out.push_str(&format!("--- {path}\n+++ {path}\n"));
-    for hunk in diff.unified_diff().context_radius(3).iter_hunks() {
-        out.push_str(&hunk.to_string());
-    }
-    out
-}
-
-/// The fresh-read nudge appended to drift-class edit failures (backlog
-/// 714196da): the content has drifted from the agent's last read, so the
-/// error steers to a re-read instead of inviting a blind retry from memory.
-/// The "Re-read the file" substring is the EditStaleRead steering marker
-/// ([`crate::agent::steering_stats`]) — part of the output contract; the
-/// dispatch funnel's stale-read gate counts and intercepts on it. The tail is
-/// one line: the error text IS the result output's first line, the marker
-/// surface.
-fn with_fresh_read_nudge(msg: impl std::fmt::Display) -> crate::error::Error {
-    crate::error::Error::NotFound(format!(
-        "{msg} — the content has likely drifted from your last read. \
-         {EDIT_STALE_READ_MARK} (read_files, this exact path) and retry with the \
-         exact current text; do not edit without a fresh read."
-    ))
-}
-
-/// Extensions treated as code files for the markdown-heading artifact check
-/// (backlog e8b39d72 H2): a '## ' line start inside these is an emission
-/// artifact, not a markdown heading. Markdown files (.md) are excluded by
-/// design.
-const ARTIFACT_CHECK_EXTENSIONS: [&str; 6] = ["rs", "ts", "tsx", "js", "json", "toml"];
-
 /// H5 advisory threshold (backlog e8b39d72): the payload size at which
 /// emission decay was observed in the 2026-12-20 incident (~700+ chars of
 /// dense tokenized source in a single edit). At or above this, the success
@@ -202,6 +160,29 @@ const EMISSION_FRAGILITY_PAYLOAD_BYTES: usize = 700;
 /// steering toward smaller fragments / `file_write` full-file replacement.
 /// Advisory only — the edit still applies.
 fn large_payload_note(args: &FileEditArgs) -> Option<String> {
+    // Ops mode measures each element — the largest single emitted fragment
+    // is what the advisory is about (anchor objects: their old/new pair;
+    // compact line ops: the whole op string, payload included).
+    if let Some(ops) = args.ops.as_deref() {
+        let largest = ops
+            .iter()
+            .map(|value| match value {
+                serde_json::Value::String(raw) => raw.len(),
+                other => serde_json::from_value::<EditItem>(other.clone())
+                    .map(|item| item.old_string.len().max(item.new_string.len()))
+                    .unwrap_or(0),
+            })
+            .max()
+            .unwrap_or(0);
+        return (largest >= EMISSION_FRAGILITY_PAYLOAD_BYTES).then(|| {
+            format!(
+                "NOTE: large edit payload (largest op ~{largest} chars) — \
+                 emission fragility has been observed near this size in long \
+                 sessions; use smaller fragments, or file_write for a full-file \
+                 replacement (backlog e8b39d72 H5)"
+            )
+        });
+    }
     let (o, n) = (args.old_string.len(), args.new_string.len());
     let larger = o.max(n);
     (larger >= EMISSION_FRAGILITY_PAYLOAD_BYTES).then(|| {
@@ -214,260 +195,17 @@ fn large_payload_note(args: &FileEditArgs) -> Option<String> {
     })
 }
 
-/// Backlog e8b39d72 H2: pre-write structural validation of a prepared edit —
-/// rejects the emission-decay artifact classes observed in the 2026-12-20
-/// incident (see .coding/knowledge/bug/2026-12-20-code-bearing-tool-payload-
-/// emissions-degrade-unde.md) BEFORE the edit is applied:
-///
-/// - markdown-heading lines ('## ' at a line start) inside non-markdown code
-///   files (Rust has no markdown headings — the '///' → '##' mangling
-///   artifact),
-/// - sentinel whole-values (the replacement being exactly 'unused' /
-///   'placeholder' — the fragment-replacement artifact),
-/// - adjacent byte-identical doc-comment lines ('///'/'//!' — the
-///   duplication artifact),
-/// - a delimiter-balance smoke-parse for `.rs` files (the truncation
-///   artifact; the scoped lexer skips strings, raw strings, chars, and
-///   comments so legit brace-bearing literals cannot false-positive).
-///
-/// These are EMISSION-ARTIFACT rejections, deliberately NOT the drift-class
-/// stale-read failure ([`with_fresh_read_nudge`]/`EditStaleRead`): a re-read
-/// cannot fix a corrupted emission, so the error steers to re-emit (smaller
-/// fragments / `file_write`) instead.
-fn validate_emission_artifacts(
-    path: &str,
-    content: &str,
-    new_string: &str,
-    new_content: &str,
-) -> crate::error::Result<()> {
-    validate_emission_artifacts_lines(path, new_string)?;
-    validate_emission_artifacts_braces(path, content, new_content)
-}
-
-/// The line-scoped emission-artifact checks — (a) markdown-heading lines
-/// inside non-markdown code files, (b) sentinel whole-values, (c) adjacent
-/// byte-identical doc-comment lines — scoped to ONE replacement text. The
-/// single paths run these on the one replacement; the batch path runs them
-/// PER ITEM (review L2: the items' join would weaken the sentinel
-/// exact-match — a longer join escapes it — and false-positive the
-/// dup-doc-line check across item boundaries, whose boundary lines are
-/// adjacent in the join but not in the spliced result).
-fn validate_emission_artifacts_lines(path: &str, new_string: &str) -> crate::error::Result<()> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let code_file = ARTIFACT_CHECK_EXTENSIONS.contains(&ext.as_str());
-
-    // (a) Markdown-heading lines inside non-markdown code files.
-    if code_file {
-        for (n, line) in new_string.lines().enumerate() {
-            if line.starts_with("## ") {
-                return Err(artifact_rejection(format!(
-                    "markdown-heading line at new_string line {}: '{line}' — \
-                     this is the '///' → '##' mangling artifact; this file type \
-                     has no markdown headings",
-                    n + 1
-                )));
-            }
-        }
-    }
-
-    // (b) Sentinel whole-values: the trimmed replacement is EXACTLY one of
-    // the observed placeholder tokens (the fragment-replacement artifact).
-    let trimmed = new_string.trim();
-    if trimmed == "unused" || trimmed == "placeholder" {
-        return Err(artifact_rejection(format!(
-            "sentinel-shaped replacement value '{trimmed}' — the \
-             fragment-replacement artifact: a real replacement must carry code"
-        )));
-    }
-
-    // (c) Adjacent byte-identical doc-comment lines (the duplication
-    // artifact).
-    let lines: Vec<&str> = new_string.lines().collect();
-    for pair in lines.windows(2) {
-        if pair[0] == pair[1]
-            && !pair[0].trim().is_empty()
-            && (pair[0].starts_with("///") || pair[0].starts_with("//!"))
-        {
-            return Err(artifact_rejection(format!(
-                "duplicated adjacent doc line: '{}' appears twice back-to-back \
-                 — the duplication artifact",
-                pair[0]
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// The delimiter-balance emission-artifact check (d) — delta-scoped to
-/// (content, new_content), `.rs` only. The batch path runs it ONCE on the
-/// combined result (the delta's right scope); truncation leaves unbalanced
-/// braces, and a file that was unbalanced before the edit is not this
-/// edit's fault.
-fn validate_emission_artifacts_braces(
-    path: &str,
-    content: &str,
-    new_content: &str,
-) -> crate::error::Result<()> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "rs" && rust_brace_deficit(new_content) > rust_brace_deficit(content) {
-        return Err(artifact_rejection(
-            "unbalanced delimiters after the edit (the brace/bracket/paren \
-             deficit grew) — the truncation artifact: the payload was cut off",
-        ));
-    }
-    Ok(())
-}
-
-/// The emission-artifact rejection error (backlog e8b39d72 H2): deliberately
-/// NOT the drift-class stale-read failure — a re-read cannot fix a corrupted
-/// emission, so the message steers to re-emit (smaller fragments / file_write
-/// full-file replacement) instead, and is deliberately NOT counted by the
-/// EditStaleRead steering marker.
-fn artifact_rejection(detail: impl std::fmt::Display) -> crate::error::Error {
-    crate::error::Error::InvalidInput(format!(
-        "edit rejected: emission artifact detected ({detail}) — the payload \
-         looks corrupted (model emission decay; see \
-         .coding/knowledge/bug/2026-12-20-code-bearing-tool-payload-emissions-\
-         degrade-unde.md). Do not blind-retry: re-emit carefully in SMALLER \
-         fragments, or use file_write for full-file replacement. (This is not \
-         a content-drift failure — a re-read will not help.)"
-    ))
-}
-
-/// The net unbalance of braces/brackets/parens in `source` — a minimal Rust
-/// lexer: skips `//` and (nestable) `/* */` comments, plain strings with
-/// escapes, `r"..."`/`r#"..."#` raw strings (any `#` count), and
-/// `'c'`/`'\\x'`/`'\\u{..}'` char literals; lifetimes/labels do not open a
-/// char context. Returns the count of unclosed openers plus mismatched
-/// closers (0 = balanced; `usize::MAX` = an unterminated raw string).
-fn rust_brace_deficit(source: &str) -> usize {
-    let bytes = source.as_bytes();
-    let mut i = 0usize;
-    let mut stack: Vec<u8> = Vec::new();
-    let mut deficit = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                let mut depth = 1usize;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        depth += 1;
-                        i += 2;
-                    } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => i += 2,
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-            }
-            b'\'' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
-                    i += 2;
-                    while i < bytes.len() && bytes[i] != b'\'' {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1;
-                    }
-                } else if i + 2 < bytes.len() && bytes[i + 2] == b'\'' {
-                    i += 3;
-                } else {
-                    i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
-                    }
-                }
-            }
-            b'r'
-                if i + 1 < bytes.len()
-                    && (bytes[i + 1] == b'"' || bytes[i + 1] == b'#') =>
-            {
-                let mut hashes = 0usize;
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] == b'#' {
-                    hashes += 1;
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b'"' {
-                    let mut closing = Vec::with_capacity(hashes + 1);
-                    closing.push(b'"');
-                    closing.resize(closing.len() + hashes, b'#');
-                    match source[j + 1..].find(std::str::from_utf8(&closing).expect("ascii")) {
-                        Some(pos) => i = j + 1 + pos + closing.len(),
-                        None => return usize::MAX,
-                    }
-                } else {
-                    i += 1;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-                    {
-                        i += 1;
-                    }
-                }
-            }
-            b'{' | b'[' | b'(' => {
-                stack.push(bytes[i]);
-                i += 1;
-            }
-            b'}' | b']' | b')' => {
-                let open = match bytes[i] {
-                    b'}' => b'{',
-                    b']' => b'[',
-                    _ => b'(',
-                };
-                match stack.pop() {
-                    Some(c) if c == open => {}
-                    _ => deficit += 1,
-                }
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-    deficit + stack.len()
-}
-
 /// Apply the edit to the file content, returning the new content + diff.
 /// This does NOT write to disk — it's used to prepare the approval preview.
 ///
 /// Dispatches to the multi-edit batch, line-range, regex, or literal
-/// implementation depending on the args. The batch (`edits`) takes
+/// implementation depending on the args. The ops array (`ops`) takes
 /// precedence (it is mutually exclusive with the single-edit fields);
 /// line-range mode (`lines`) requires no `old_string`; otherwise the
 /// `use_regex`/literal path runs.
 pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
-    if args.edits.is_some() {
-        prepare_edit_batch(args, content)
+    if args.ops.is_some() {
+        prepare_edit_ops(args, content)
     } else if args.append {
         prepare_edit_append(args, content)
     } else if args.lines.is_some() {
@@ -483,7 +221,7 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
                 "old_string is empty — provide old_string (string matching) or \
                  lines: [start, end] (line range). If you meant the literal text \
                  'null' (dropped by the null-stringify defense), use batch mode \
-                 (an edits item's old_string is required, never dropped) or \
+                 (an ops anchor item's old_string is required, never dropped) or \
                  use_regex (e.g. nul[l])"
                     .into(),
             ));
@@ -594,375 +332,6 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
     })
 }
 
-/// Normalize whitespace for fuzzy matching: strip trailing whitespace from
-/// each line and collapse runs of ASCII whitespace (space/tab) within a line
-/// to a single space. Newlines are preserved (line-ending normalization
-/// already happened upstream via `normalize_line_endings`). This lets a
-/// caller's `old_string` match despite tab-vs-space or extra-space
-/// differences — the *match* is fuzzy, but the replacement is spliced into
-/// the original content verbatim.
-///
-/// Returns the normalized string AND, for each byte of the normalized string,
-/// the byte offset it came from in the original (used to map a normalized
-/// match range back to original byte offsets for the verbatim splice). For a
-/// collapsed whitespace run, the emitted space is tagged with the offset of
-/// the *first* byte of the run.
-fn normalize_ws_with_offsets(s: &str) -> (String, Vec<usize>) {
-    let mut out = String::with_capacity(s.len());
-    let mut offsets: Vec<usize> = Vec::with_capacity(s.len());
-    let mut abs = 0usize; // running absolute byte offset in `s`
-    for line in s.split_inclusive('\n') {
-        let line_len = line.len();
-        let (body, has_nl) = match line.strip_suffix('\n') {
-            Some(b) => (b, true),
-            None => (line, false),
-        };
-        let body_start = abs;
-        // Collapse runs of ASCII whitespace within the line to a single space.
-        let mut in_ws = false;
-        for (rel_off, ch) in body.char_indices() {
-            let byte_off = body_start + rel_off;
-            if ch == ' ' || ch == '\t' {
-                if !in_ws {
-                    out.push(' ');
-                    offsets.push(byte_off);
-                    in_ws = true;
-                }
-                // else: part of the run — skip (not emitted).
-            } else {
-                // Push one offset entry PER BYTE of the emitted char, so the
-                // offset map stays aligned with `out` at the byte level (a
-                // multi-byte char like é contributes multiple bytes to `out`
-                // but is one char — without this, the map would be too short
-                // and byte-index lookups would misalign).
-                out.push(ch);
-                for _ in 0..ch.len_utf8() {
-                    offsets.push(byte_off);
-                }
-                in_ws = false;
-            }
-        }
-        // Strip trailing whitespace: if the last emitted char is a space (from
-        // a collapse), remove it and its offset.
-        if out.ends_with(' ') {
-            out.pop();
-            offsets.pop();
-        }
-        // Emit the newline (if any), tagged with its absolute offset.
-        if has_nl {
-            let nl_off = body_start + body.len();
-            out.push('\n');
-            offsets.push(nl_off);
-        }
-        abs += line_len;
-    }
-    (out, offsets)
-}
-
-/// Find `needle` in `haystack` using whitespace-normalized comparison, and
-/// return the byte range `(start, end)` of the match in the **original**
-/// `haystack` (not the normalized one). This lets us locate a match despite
-/// whitespace differences while splicing the replacement into the original
-/// content (preserving the file's exact surrounding whitespace).
-///
-/// Returns `None` if the normalized needle is not found. The first match is
-/// returned; callers loop for `count`/`replace_all`.
-///
-/// The match region covers the original bytes that the normalized needle
-/// "represents": internal whitespace (e.g. a tab between two words) is
-/// included (it was collapsed to a space in the normalized view), but
-/// trailing whitespace stripped during normalization is NOT included — it
-/// stays in the file, untouched, outside the splice.
-fn fuzzy_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-    let (norm_hay, hay_offsets) = normalize_ws_with_offsets(haystack);
-    let (norm_needle, _) = normalize_ws_with_offsets(needle);
-    if norm_needle.is_empty() {
-        return None;
-    }
-    let n_start = norm_hay.find(&norm_needle)?;
-    let n_end = n_start + norm_needle.len();
-
-    // Map the normalized match range back to original byte offsets. The start
-    // is the original offset of the first matched normalized byte.
-    let orig_start = *hay_offsets.get(n_start)?;
-
-    // The end is the byte immediately AFTER the last matched normalized
-    // byte's original char. We use the last match byte (n_end-1), NOT the next
-    // normalized byte (n_end), because trailing whitespace stripped during
-    // normalization sits between them — using n_end would wrongly consume it.
-    // The offset map is byte-aligned (one entry per normalized byte, with
-    // multi-byte chars repeating their offset), so hay_offsets[n_end-1] is the
-    // original offset of the last matched byte; adding that char's UTF-8 length
-    // gives the exclusive end bound.
-    let last_orig_off = *hay_offsets.get(n_end - 1)?;
-    let char_len = haystack[last_orig_off..]
-        .chars()
-        .next()
-        .map_or(1, |c| c.len_utf8());
-    let orig_end = last_orig_off + char_len;
-    Some((orig_start, orig_end))
-}
-
-/// How a literal anchor was matched (backlog 838b6f4e C): exactly, or via
-/// one of the fallbacks that absorb the observed apostrophe trap — a
-/// transport that JS-escapes quotes in the agent's view of the file (or
-/// the reverse) used to hard-fail byte-exact matching. The non-Exact
-/// origins ride the success output as a NOTE so a fallback is never
-/// silent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchOrigin {
-    Exact,
-    /// The needle carried JS escapes (\' → ') the file does not.
-    Unescaped,
-    /// The file carries JS escapes the needle does not (' → \').
-    Escaped,
-    /// Whitespace runs differ — fuzzy semantics applied automatically.
-    WhitespaceNormalized,
-}
-
-impl MatchOrigin {
-    /// The success-output NOTE for this origin (None for Exact — an exact
-    /// match is the silent default).
-    fn note(self) -> Option<&'static str> {
-        match self {
-            MatchOrigin::Exact => None,
-            MatchOrigin::Unescaped => Some(
-                "NOTE: matched via escape-normalization — old_string carried \
-                 JS-escaped quotes (\\') the file does not; the unescaped \
-                 variant was applied",
-            ),
-            MatchOrigin::Escaped => Some(
-                "NOTE: matched via escape-normalization — the file carries \
-                 JS-escaped quotes (\\') where old_string has plain ones; the \
-                 escaped variant was applied",
-            ),
-            MatchOrigin::WhitespaceNormalized => Some(
-                "NOTE: matched via whitespace normalization — runs of \
-                 spaces/tabs differ between old_string and the file; fuzzy \
-                 semantics were applied automatically",
-            ),
-        }
-    }
-}
-
-/// Unescape the JS quote escapes (backlog 838b6f4e C): `\'` → `'` and
-/// `\\` → `\`. Conservative — any other backslash sequence passes through
-/// untouched (a literal `\d` stays `\d`).
-fn unescape_js(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek() {
-                Some('\'') | Some('\\') => {
-                    out.push(chars.next().expect("peeked"));
-                }
-                _ => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// The mirror direction: `'` → `\'` and `\` → `\\`.
-fn escape_js(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("\\'"),
-            '\\' => out.push_str("\\\\"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// Escape a short display snippet for the near-miss diagnostic (backlog
-/// 838b6f4e D): newlines, tabs, and carriage returns become their escapes
-/// so the message stays on one line.
-fn escape_display(s: &str) -> String {
-    s.replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
-}
-
-/// The first-difference miss diagnostic (backlog 838b6f4e D): on a genuine
-/// literal miss, find the position in the LF-projected content sharing the
-/// longest common prefix with the needle (>= 8 chars) and report how far it
-/// matched and where the two diverge — turning a blind retry loop into a
-/// one-shot fix. Returns None when no position shares the threshold prefix
-/// (nothing useful to say). Char-based (not bytes) so the reported position
-/// and snippets are display-accurate.
-fn near_miss_diagnostic(content: &str, old_string: &str) -> Option<String> {
-    const MIN_PREFIX: usize = 8;
-    let (content_lf, _) = normalize_lf_with_offsets(content);
-    let needle: Vec<char> = normalize_line_endings(old_string, "\n").chars().collect();
-    let hay: Vec<char> = content_lf.chars().collect();
-    if needle.len() < MIN_PREFIX {
-        return None;
-    }
-    // Work budget (review L3): bound the worst case — long runs of the
-    // needle's first char (minified/generated content) times a long
-    // needle would otherwise degrade to unbounded O(n·m) on the blocking
-    // pool. Bail past the budget and report the best found so far.
-    const MAX_COMPARED: usize = 10_000_000;
-    let mut compared = 0usize;
-    let mut best_start = usize::MAX;
-    let mut best_len = 0usize;
-    'scan: for start in 0..hay.len() {
-        if hay[start] != needle[0] {
-            continue;
-        }
-        let mut len = 0usize;
-        while start + len < hay.len() && len < needle.len() && hay[start + len] == needle[len] {
-            len += 1;
-            compared += 1;
-            if compared > MAX_COMPARED {
-                break 'scan;
-            }
-        }
-        if len > best_len {
-            best_len = len;
-            best_start = start;
-        }
-    }
-    if best_len < MIN_PREFIX {
-        return None;
-    }
-    let file_next: String = hay[best_start + best_len..].iter().take(4).collect();
-    let sent_next: String = needle[best_len..].iter().take(4).collect();
-    Some(format!(
-        "near-miss: matched {}/{} chars; first difference at char {}: file \
-         has '{}', you sent '{}'",
-        best_len,
-        needle.len(),
-        best_len + 1,
-        escape_display(&file_next),
-        escape_display(&sent_next)
-    ))
-}
-
-/// Resolve the effective needle for a literal match (backlog 838b6f4e C):
-/// the exact LF-normalized needle when it occurs in the content; on a
-/// miss, the unescaped variant, then the escaped variant, then
-/// whitespace-normalized matching (when not already fuzzy). Returns the
-/// needle to splice with and how it was chosen — a miss everywhere
-/// returns the original needle with `Exact` (the callers report the miss;
-/// `Exact`'s absent NOTE keeps that path unchanged).
-fn resolve_match_variant(
-    content_lf: &str,
-    old_lf: &str,
-    fuzzy: bool,
-) -> (String, MatchOrigin) {
-    if content_lf.contains(old_lf) {
-        return (old_lf.to_string(), MatchOrigin::Exact);
-    }
-    let unescaped = unescape_js(old_lf);
-    if unescaped != old_lf && content_lf.contains(&unescaped) {
-        return (unescaped, MatchOrigin::Unescaped);
-    }
-    let escaped = escape_js(old_lf);
-    if escaped != old_lf && content_lf.contains(&escaped) {
-        return (escaped, MatchOrigin::Escaped);
-    }
-    if !fuzzy && fuzzy_find(content_lf, old_lf).is_some() {
-        return (old_lf.to_string(), MatchOrigin::WhitespaceNormalized);
-    }
-    (old_lf.to_string(), MatchOrigin::Exact)
-}
-
-/// The literal splice's outcome (backlog 838b6f4e C): the new content plus
-/// how the anchor was matched — the non-Exact origins become success-output
-/// NOTEs.
-struct SpliceOutcome {
-    new_content: String,
-    origin: MatchOrigin,
-}
-
-/// The literal edit's matching+splicing core, shared by the single-edit path
-/// and the multi-edit batch (plan be16ea36 step 4): EOL-agnostic matching on
-/// BOTH sides (the content is projected to LF with a byte-offset map back to
-/// the original; the needle is normalized to LF), then `new_string` —
-/// re-emitted in the file's detected (majority) ending style — is spliced
-/// into the ORIGINAL bytes at the mapped offsets, at most `limit`
-/// non-overlapping matches (fuzzy-whitespace matching when `fuzzy`). On an
-/// exact miss, the escape-normalization fallbacks are tried first
-/// (backlog 838b6f4e C — see [`resolve_match_variant`]); the chosen
-/// origin rides the outcome for the success NOTE. Returns `None` when the
-/// anchor matches nothing (after the fallbacks). Deliberately NO emission
-/// validation and NO diff here: the single path adds both for its one edit,
-/// while the batch path validates the COMBINED result once (a legitimate
-/// two-step batch can be temporarily unbalanced mid-batch) and emits one
-/// combined diff.
-fn literal_splice(
-    content: &str,
-    old_string: &str,
-    new_string: &str,
-    fuzzy: bool,
-    limit: usize,
-) -> Result<Option<SpliceOutcome>> {
-    let le = detect_line_ending(content);
-    let new_string = denormalize_literal_newlines(&normalize_line_endings(new_string, le));
-    // Matching happens in LF space on BOTH sides — an ending-style difference
-    // between the needle and the file can never cause a miss.
-    let old_lf = normalize_line_endings(old_string, "\n");
-    let new_lf = normalize_line_endings(&new_string, "\n");
-
-    if old_lf == new_lf {
-        return Err(crate::error::Error::InvalidInput(
-            "old_string and new_string are identical".into(),
-        ));
-    }
-    // In fuzzy mode, also reject when old/new differ only in whitespace —
-    // they'd normalize to the same string and the edit would be a no-op
-    // (or, worse, replace a region with whitespace-equivalent text).
-    if fuzzy && normalize_ws_with_offsets(&old_lf).0 == normalize_ws_with_offsets(&new_lf).0 {
-        return Err(crate::error::Error::InvalidInput(
-            "old_string and new_string are identical after whitespace normalization".into(),
-        ));
-    }
-
-    // LF projection of the content + a byte-offset map back into the
-    // original: matches are found in EOL-agnostic space, then spliced into
-    // the original bytes so untouched regions keep their exact endings.
-    let (content_lf, lf_offsets) = normalize_lf_with_offsets(content);
-    // Variant resolution (backlog 838b6f4e C): on an exact miss, the
-    // escape-normalized variants and whitespace-normalized matching absorb
-    // the apostrophe trap before the loop gives up.
-    let (old_lf, origin) = resolve_match_variant(&content_lf, &old_lf, fuzzy);
-    let fuzzy = fuzzy || origin == MatchOrigin::WhitespaceNormalized;
-    let mut out = String::with_capacity(content.len());
-    let mut lf_pos = 0usize; // cursor in the LF projection
-    let mut orig_pos = 0usize; // cursor in the original content
-    let mut replaced = 0usize;
-    while replaced < limit {
-        let found = if fuzzy {
-            fuzzy_find(&content_lf[lf_pos..], &old_lf).map(|(s, e)| (lf_pos + s, lf_pos + e))
-        } else {
-            content_lf[lf_pos..]
-                .find(&old_lf)
-                .map(|i| (lf_pos + i, lf_pos + i + old_lf.len()))
-        };
-        let Some((m_start, m_end)) = found else {
-            break;
-        };
-        let (o_start, o_end) = map_lf_region_to_original(&lf_offsets, content, m_start, m_end);
-        out.push_str(&content[orig_pos..o_start]);
-        out.push_str(&new_string);
-        orig_pos = o_end;
-        lf_pos = m_end;
-        replaced += 1;
-    }
-    if replaced == 0 {
-        return Ok(None);
-    }
-    out.push_str(&content[orig_pos..]);
-    Ok(Some(SpliceOutcome {
-        new_content: out,
-        origin,
-    }))
-}
-
 /// Literal (exact-string) edit path — EOL-agnostic matching (plan be16ea36
 /// step 2): the file content AND the caller's `old_string` are normalized to
 /// LF for matching, so a needle matches regardless of which ending style each
@@ -1038,92 +407,25 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
     })
 }
 
-/// Multi-edit batch path (plan be16ea36 step 4): apply every item to the
-/// in-memory content IN ORDER and return ONE PreparedEdit for the combined
-/// result — the caller writes once, so any failing item aborts the whole
-/// batch with the file untouched on disk (atomicity). Each item's anchor
-/// must match exactly once in the content as left by the preceding items
-/// unless the item sets `count` (which widens the match to the first N
-/// occurrences) — an ambiguous anchor without a count is rejected. The
-/// error names the item's 1-based index and the first line of its
-/// old_string. Emission artifacts are validated ONCE on the combined
-/// result (a legitimate two-step batch can be temporarily unbalanced
-/// mid-batch); the diff is one combined diff.
-fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
-    let items = validate_batch_args(args)?;
-    let mut current = content.to_string();
-    let mut notes: Vec<String> = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        let fuzzy = item.fuzzy_whitespace.unwrap_or(args.fuzzy_whitespace);
-        // Ambiguity guard: without an explicit count the anchor must match
-        // exactly once in the content as left by the preceding items.
-        if item.count.is_none() {
-            let occurrences = count_matches(&current, &item.old_string, fuzzy);
-            if occurrences > 1 {
-                return Err(crate::error::Error::InvalidInput(format!(
-                    "edit {}/{} is ambiguous: its old_string ('{}') matches \
-                     {occurrences} times — pass count on the item to replace \
-                     more than one occurrence",
-                    idx + 1,
-                    items.len(),
-                    anchor_excerpt(&item.old_string)
-                )));
-            }
-        }
-        let limit = item.count.unwrap_or(1).max(1);
-        match literal_splice(&current, &item.old_string, &item.new_string, fuzzy, limit)? {
-            Some(SpliceOutcome {
-                new_content: next,
-                origin,
-            }) if next != current => {
-                if let Some(note) = origin.note() {
-                    notes.push(format!("edit {}/{}: {note}", idx + 1, items.len()));
-                }
-                current = next;
-            }
-            Some(_) => {
-                return Err(batch_item_error(
-                    idx,
-                    items.len(),
-                    &item.old_string,
-                    crate::error::Error::NotFound(
-                        "the item produced no change (new_string equals the matched \
-                         region after line-ending normalization)"
-                            .into(),
-                    ),
-                ))
-            }
-            None => {
-                // First-difference pointer (backlog 838b6f4e D), scoped to
-                // the content as left by the preceding items.
-                let detail = near_miss_diagnostic(&current, &item.old_string)
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default();
-                return Err(batch_item_error(
-                    idx,
-                    items.len(),
-                    &item.old_string,
-                    with_fresh_read_nudge(format!("old_string not found in file{detail}")),
-                ))
-            }
-        }
-    }
-    // Per-item line-scoped emission checks (review L2): the items' join
-    // would weaken the sentinel exact-match (a longer join escapes it) and
-    // false-positive the dup-doc-line check across item boundaries (two
-    // items' boundary lines are adjacent in the join but not in the spliced
-    // result).
-    for item in items {
-        validate_emission_artifacts_lines(&args.path, &item.new_string)?;
-    }
-    // One combined brace-delta check for the whole batch (delta-scoped, so
-    // the combined result is the right scope).
-    validate_emission_artifacts_braces(&args.path, content, &current)?;
-    let diff = compute_diff(&args.path, content, &current);
+/// Ops path (plan 2e27f896; the batch of plan be16ea36 step 4): apply every
+/// op — compact line ops and anchor objects alike — to the in-memory content
+/// IN ORDER and return ONE PreparedEdit for the combined result. The caller
+/// writes once, so any failing op aborts the whole array with the file
+/// untouched on disk (atomicity). Line numbers refer to the content as left
+/// by the preceding ops; each anchor must match exactly once unless it sets
+/// `count` (which widens the match to the first N occurrences) — an
+/// ambiguous anchor without a count is rejected, and every error names the
+/// op's 1-based index. Emission artifacts are validated per op and once on
+/// the combined brace delta (a legitimate two-step array can be temporarily
+/// unbalanced mid-apply); the diff is one combined diff.
+fn prepare_edit_ops(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+    let ops = validate_ops(args)?;
+    let (new_content, notes) = apply_ops(&args.path, content, &ops, args.fuzzy_whitespace)?;
+    let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
         diff,
-        new_content: current,
+        new_content,
         notes,
     })
 }
@@ -1139,9 +441,9 @@ fn prepare_edit_batch(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
 /// have left `old_string` and the matching knobs unset (validated here);
 /// execute() steers a missing file to `file_write`.
 fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
-    if args.edits.is_some() {
+    if args.ops.is_some() {
         return Err(crate::error::Error::InvalidInput(
-            "append is mutually exclusive with edits".into(),
+            "append is mutually exclusive with ops".into(),
         ));
     }
     if args.lines.is_some() {
@@ -1219,233 +521,69 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
     })
 }
 
-/// The batch mode's argument validation (plan be16ea36 step 4): `edits` is
-/// mutually exclusive with every single-edit field — the items carry their
-/// own anchors — and must be non-empty. Returns the items on success.
-fn validate_batch_args(args: &FileEditArgs) -> Result<&[EditItem]> {
-    let items = args
-        .edits
+/// The ops mode's argument validation (plan 2e27f896, extending plan
+/// be16ea36 step 4's batch validation): `ops` is mutually exclusive with
+/// every single-edit field — the ops carry their own replacements — and must
+/// be non-empty. The element forms and the anchor item-level checks are the
+/// shared engine's (`edit_ops::parse_ops` / `edit_ops::validate_op_items`).
+/// Returns the parsed ops on success.
+fn validate_ops(args: &FileEditArgs) -> Result<Vec<EditOp>> {
+    let values = args
+        .ops
         .as_deref()
-        .ok_or_else(|| crate::error::Error::InvalidInput("edits is required".into()))?;
-    if items.is_empty() {
+        .ok_or_else(|| crate::error::Error::InvalidInput("ops is required".into()))?;
+    if values.is_empty() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is empty — provide at least one item".into(),
+            "ops is empty — provide at least one op".into(),
         ));
     }
     if !args.old_string.is_empty() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with old_string — the items carry their own \
-             old_string"
+            "ops is mutually exclusive with old_string — the anchor items carry their \
+             own old_string"
                 .into(),
         ));
     }
     if !args.new_string.is_empty() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with new_string — the items carry their own \
-             new_string"
+            "ops is mutually exclusive with new_string — the anchor items carry their \
+             own new_string"
                 .into(),
         ));
     }
     if args.use_regex {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with use_regex — batch items are literal \
+            "ops is mutually exclusive with use_regex — anchor items are literal \
              matches"
                 .into(),
         ));
     }
     if args.replace_all {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with replace_all — set count on the items \
-             instead"
+            "ops is mutually exclusive with replace_all — set count on the anchor \
+             items instead"
                 .into(),
         ));
     }
     if args.count.is_some() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with count — set it on the items instead"
+            "ops is mutually exclusive with count — set it on the anchor items instead"
                 .into(),
         ));
     }
     if args.lines.is_some() {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with line-range mode (lines)".into(),
+            "ops is mutually exclusive with line-range mode (lines)".into(),
         ));
     }
     if args.append {
         return Err(crate::error::Error::InvalidInput(
-            "edits is mutually exclusive with append — an append has no anchors"
-                .into(),
+            "ops is mutually exclusive with append — an append has no anchors".into(),
         ));
     }
-    // Every item needs a non-empty anchor (review H1): an empty old_string
-    // would match everywhere (the empty-needle hazard the single mode
-    // rejects) and used to reach a subtraction underflow in the EOL-agnostic
-    // core — reject it here with a clean error naming the item.
-    for (idx, item) in items.iter().enumerate() {
-        if item.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(format!(
-                "edit {}/{} has an empty old_string — every batch item needs an \
-                 anchor (an empty anchor matches everywhere and would corrupt \
-                 the file)",
-                idx + 1,
-                items.len()
-            )));
-        }
-        // No-op items (review L2, backlog 838b6f4e cause 3): the observed
-        // incident shape was a BATCH item with old_string == new_string —
-        // reject it here, pre-write (validate_batch_args runs after the
-        // file read inside the blocking closure; the file is never
-        // touched), with the same exact message the single-mode guard
-        // uses, naming the item.
-        if item.old_string == item.new_string {
-            return Err(crate::error::Error::InvalidInput(format!(
-                "no-op edit: edit {}/{} has old_string == new_string — nothing \
-                 to change",
-                idx + 1,
-                items.len()
-            )));
-        }
-    }
-    Ok(items)
-}
-
-/// Count non-overlapping matches of `needle` in `content` using the same
-/// EOL-agnostic (and optionally fuzzy-whitespace) matching as the literal
-/// splice — the batch ambiguity guard's counter (plan be16ea36 step 4).
-fn count_matches(content: &str, needle: &str, fuzzy: bool) -> usize {
-    let (content_lf, _) = normalize_lf_with_offsets(content);
-    let needle_lf = normalize_line_endings(needle, "\n");
-    if needle_lf.is_empty() {
-        return 0;
-    }
-    // Variant-aware (backlog 838b6f4e C): count with the same effective
-    // needle the splice will use, so a variant-matched anchor's ambiguity
-    // is still caught.
-    let (needle_lf, origin) = resolve_match_variant(&content_lf, &needle_lf, fuzzy);
-    let fuzzy = fuzzy || origin == MatchOrigin::WhitespaceNormalized;
-    let mut count = 0usize;
-    let mut pos = 0usize;
-    while pos <= content_lf.len() {
-        let found = if fuzzy {
-            fuzzy_find(&content_lf[pos..], &needle_lf).map(|(s, e)| (pos + s, pos + e))
-        } else {
-            content_lf[pos..]
-                .find(&needle_lf)
-                .map(|i| (pos + i, pos + i + needle_lf.len()))
-        };
-        match found {
-            Some((_, end)) if end > pos => {
-                count += 1;
-                pos = end;
-            }
-            _ => break,
-        }
-    }
-    count
-}
-
-/// A batch item's failure (plan be16ea36 step 4): names the item's 1-based
-/// index, the batch size, and the anchor excerpt, preserving the source
-/// error's class (NotFound stays drift-class so the stale-read gate arms;
-/// everything else is a caller error).
-fn batch_item_error(
-    index: usize,
-    total: usize,
-    old_string: &str,
-    source: crate::error::Error,
-) -> crate::error::Error {
-    let prefix = format!(
-        "edit {}/{} failed (anchor: '{}')",
-        index + 1,
-        total,
-        anchor_excerpt(old_string)
-    );
-    match source {
-        crate::error::Error::NotFound(msg) => {
-            crate::error::Error::NotFound(format!("{prefix}: {msg}"))
-        }
-        other => crate::error::Error::InvalidInput(format!("{prefix}: {other}")),
-    }
-}
-
-/// The anchor excerpt for batch error messages: the first line of the item's
-/// old_string, truncated to keep the error readable (plan be16ea36 step 4 —
-/// the error names the anchor index and the first line of its old_string).
-fn anchor_excerpt(old_string: &str) -> String {
-    let first = old_string.lines().next().unwrap_or("");
-    const MAX: usize = 100;
-    if first.chars().count() <= MAX {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(MAX).collect();
-        format!("{truncated}…")
-    }
-}
-
-/// Project `s` to LF-only line endings, returning the projection plus, for
-/// each byte of the projection, the byte offset in `s` it came from (one
-/// entry per byte, so byte-index lookups stay aligned; a multi-byte char
-/// repeats its offset). A "\r\n" pair projects to one '\n' tagged with the
-/// '\n' byte's offset (the '\r' has no image); a lone '\r' projects to '\n'
-/// tagged with its own offset. This is the matching substrate for the
-/// EOL-agnostic literal path: an LF-normalized needle matches the projection
-/// regardless of the file's per-line ending style.
-fn normalize_lf_with_offsets(s: &str) -> (String, Vec<usize>) {
-    let mut out = String::with_capacity(s.len());
-    let mut offsets: Vec<usize> = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\r' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => {
-                out.push('\n');
-                offsets.push(i + 1);
-                i += 2;
-            }
-            b'\r' => {
-                out.push('\n');
-                offsets.push(i);
-                i += 1;
-            }
-            _ => {
-                let ch = s[i..].chars().next().expect("i is a char boundary");
-                out.push(ch);
-                for _ in 0..ch.len_utf8() {
-                    offsets.push(i);
-                }
-                i += ch.len_utf8();
-            }
-        }
-    }
-    (out, offsets)
-}
-
-/// Map a match region `[m_start, m_end)` in the LF projection back to byte
-/// offsets in the original content. The start extends back across the '\r'
-/// when the match opens at the '\n' of a "\r\n" pair (the needle's leading
-/// line ending represents the whole pair); the end is exclusive, one past
-/// the original char carrying the last matched byte.
-fn map_lf_region_to_original(
-    lf_offsets: &[usize],
-    content: &str,
-    m_start: usize,
-    m_end: usize,
-) -> (usize, usize) {
-    // Defensive (review H1): an empty match region has no bytes to map —
-    // the callers reject empty anchors upstream; clamp to the map's bounds
-    // instead of underflowing on `m_end - 1`.
-    if m_end == 0 {
-        let pos = lf_offsets.get(m_start).copied().unwrap_or(content.len());
-        return (pos, pos);
-    }
-    let bytes = content.as_bytes();
-    let mut o_start = lf_offsets[m_start];
-    if bytes[o_start] == b'\n' && o_start > 0 && bytes[o_start - 1] == b'\r' {
-        o_start -= 1;
-    }
-    let last = lf_offsets[m_end - 1];
-    let char_len = content[last..].chars().next().map_or(1, |c| c.len_utf8());
-    (o_start, last + char_len)
+    let ops = parse_ops(values)?;
+    validate_op_items(&ops)?;
+    Ok(ops)
 }
 
 /// Regex edit path: `old_string` is a Rust regex; `new_string` may reference
@@ -1525,15 +663,16 @@ impl Tool for FileEditTool {
                exact content or the edit fails (escape/whitespace differences are \
                auto-absorbed with a NOTE): JS-escaped apostrophes (\\'), backslashes \
                (\\\\), and line endings are literal. If the anchor contains a quote, a \
-               backslash, or is >3 lines, prefer line-range mode (lines). Six modes: \
+               backslash, or is >3 lines, prefer the ops array with a compact line op. Six modes: \
               LITERAL (default, first \
               occurrence), REGEX (use_regex), LINE-RANGE (lines: [start, end] — no \
               old_string needed, so whitespace mismatches cannot bite), FUZZY \
-             (fuzzy_whitespace, literal only), BATCH (edits — an atomic multi-edit \
-             array applied in order with ONE write; any failing item aborts the whole \
-             batch with the file untouched on disk), and APPEND (append — add \
+             (fuzzy_whitespace, literal only), OPS (ops — an atomic ops array \
+             applied in order with ONE write; any failing op aborts the whole \
+             array with the file untouched on disk; an element is a compact \
+             line op like 'd202-205' or an anchor object), and APPEND (append — add \
              new_string at EOF on a fresh line; no old_string needed; the file must \
-             exist — use file_write to create it). BATCH and APPEND are mutually \
+             exist — use file_write to create it). OPS and APPEND are mutually \
              exclusive with every single-edit field. replace_all / count=N widen a \
              literal or regex match. An invalid regex is rejected with an actionable \
              error — match semantics never change silently before an edit.",
@@ -1542,14 +681,14 @@ impl Tool for FileEditTool {
                 "properties": {
                     "path": {"type": "string", "description": "Path to the file, relative to the project root."},
                     "old_string": {"type": ["string", "null"], "description": "The exact text to find, or a regex when use_regex=true."},
-                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); omit in batch mode — the edits items carry their own replacements. A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
+                    "new_string": {"type": ["string", "null"], "description": "The replacement text; supports $1/${name} capture refs when use_regex=true. Required in single mode (empty deletes old_string); omit in ops mode — the ops carry their own replacements. A replacement of exactly 'null' is dropped by the transport's null-stringify defense (empty = deletion) — use batch mode or include surrounding context."},
                     "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)."},
                     "use_regex": {"type": "boolean", "description": "Treat old_string as a Rust regex (default: false). In the replacement (new_string), use real newlines — a literal backslash-n is inserted as-is, not converted to a newline."},
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
                     "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
-                    "edits": {"type": "array", "description": "Atomic multi-edit batch: every item is applied IN ORDER and the result is written ONCE — any failing item aborts the whole batch with the file untouched. Each item: {old_string, new_string, count?, fuzzy_whitespace?}; an item's anchor must match exactly once in the content as left by the preceding items unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the batch-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}},
-                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with edits/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."}
+                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}]}},
+                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."}
                 },
                 "required": ["path"]
             }),
@@ -1600,7 +739,7 @@ impl Tool for FileEditTool {
         // changing the content); the normalized-equal guards (whitespace/
         // EOL) stay in the splice — only the byte-identical case is
         // knowable pre-read.
-        if args.edits.is_none()
+        if args.ops.is_none()
             && !args.append
             && args.lines.is_none()
             && !args.use_regex
@@ -1753,7 +892,7 @@ mod tests {
             "fuzzy_whitespace": null,
             "count": null,
             "lines": [1, 2],
-            "edits": null,
+            "ops": null,
             "append": null
         }))
         .expect("the strict-mode shape must deserialize");
@@ -1765,7 +904,7 @@ mod tests {
         assert!(!args.fuzzy_whitespace);
         assert!(!args.append);
         assert_eq!(args.count, None);
-        assert!(args.edits.is_none());
+        assert!(args.ops.is_none());
         assert_eq!(args.lines, Some(vec![1, 2]));
     }
 
@@ -1780,7 +919,7 @@ mod tests {
             count: None,
             lines: None,
             fuzzy_whitespace: false,
-            edits: None,
+            ops: None,
             append: false,
         }
     }
@@ -1802,7 +941,7 @@ mod tests {
             count,
             lines: None,
             fuzzy_whitespace: false,
-            edits: None,
+            ops: None,
             append: false,
         }
     }
@@ -1818,7 +957,7 @@ mod tests {
             count: None,
             lines: Some(vec![start, end]),
             fuzzy_whitespace: false,
-            edits: None,
+            ops: None,
             append: false,
         }
     }
@@ -2648,7 +1787,7 @@ mod tests {
             count: None,
             lines: None,
             fuzzy_whitespace: true,
-            edits: None,
+            ops: None,
             append: false,
         }
     }
@@ -2739,7 +1878,7 @@ mod tests {
             count: None,
             lines: None,
             fuzzy_whitespace: true, // ignored in regex mode
-            edits: None,
+            ops: None,
             append: false,
         };
         let prepared = prepare_edit(&args, "a1 b2\n").unwrap();
@@ -2806,7 +1945,7 @@ mod tests {
         assert_eq!(prepared.new_content, "  pub fn bar()  \n");
     }
 
-    // ---- multi-edit batch mode (edits) ----
+    // ---- ops mode (compact line ops + anchor items) ----
 
     /// Build batch-mode args with empty single-edit fields.
     fn batch_args(path: &str, items: Vec<EditItem>) -> FileEditArgs {
@@ -2819,7 +1958,7 @@ mod tests {
             count: None,
             lines: None,
             fuzzy_whitespace: false,
-            edits: Some(items),
+            ops: Some(items.iter().map(|i| serde_json::to_value(i).unwrap()).collect()),
             append: false,
         }
     }
@@ -2868,7 +2007,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "path": "a.rs",
-                "edits": [
+                "ops": [
                     {"old_string": "fn a() {}", "new_string": "fn a2() {}"},
                     {"old_string": "fn missing() {}", "new_string": "fn x() {}"}
                 ]
@@ -2888,7 +2027,7 @@ mod tests {
         // Backlog 9118714a: the transport stringifies JSON null for string
         // params into the literal string "null" — a batch call carrying
         // old_string:"null"/new_string:"null" tripped the false
-        // "edits is mutually exclusive with old_string" error, making batch
+        // "ops is mutually exclusive with old_string" error, making batch
         // mode unusable through the transport. The dispatch seam drops the
         // artifact from OPTIONAL properties; composed here with the tool
         // exactly as the seam composes them, the batch applies. The per-item
@@ -2899,7 +2038,7 @@ mod tests {
         let tool = make_tool(dir.path());
         let mut args = json!({
             "path": "a.rs",
-            "edits": [
+            "ops": [
                 {"old_string": "fn a() {}", "new_string": "fn a2() {}"},
                 {"old_string": "fn b() {}", "new_string": "fn b2() {}"}
             ],
@@ -2990,7 +2129,7 @@ mod tests {
 
     #[test]
     fn multi_edit_batch_rejects_single_edit_fields() {
-        // Mutual exclusivity: edits + old_string / use_regex / line-range.
+        // Mutual exclusivity: ops + old_string / use_regex / line-range.
         let mut args = batch_args(
             "a.txt",
             vec![EditItem {
@@ -3041,7 +2180,7 @@ mod tests {
             count: None,
             lines: None,
             fuzzy_whitespace: false,
-            edits: None,
+            ops: None,
             append: true,
         }
     }
@@ -3098,12 +2237,13 @@ mod tests {
         assert!(prepare_edit(&args, "x\n").is_err());
 
         let mut args = append_args("a.txt", "tail");
-        args.edits = Some(vec![EditItem {
+        args.ops = Some(vec![serde_json::to_value(EditItem {
             old_string: "x".into(),
             new_string: "y".into(),
             count: None,
             fuzzy_whitespace: None,
-        }]);
+        })
+        .unwrap()]);
         assert!(prepare_edit(&args, "x\n").is_err());
 
         let mut args = append_args("a.txt", "tail");
@@ -3137,6 +2277,105 @@ mod tests {
         assert!(msg.contains("edit 1/1"), "{msg}");
     }
 
+    #[test]
+    fn ops_compact_verbs_and_anchors_apply_through_file_edit() {
+        let mut args = batch_args("a.txt", vec![]);
+        args.ops = Some(vec![
+            json!("d1"),
+            json!({"old_string": "c", "new_string": "C"}),
+        ]);
+        let prepared = prepare_edit(&args, "a\nb\nc\n").expect("ops apply");
+        assert_eq!(prepared.new_content, "b\nC\n");
+        assert!(prepared.diff.contains("--- a.txt"), "{}", prepared.diff);
+    }
+
+    #[test]
+    fn ops_legacy_edits_alias_still_deserializes() {
+        // The advertised name is `ops`; the pre-rename `edits` key keeps
+        // working as a serde alias (old habits, stored transcripts).
+        let args: FileEditArgs = serde_json::from_value(json!({
+            "path": "a.txt",
+            "edits": [{"old_string": "a", "new_string": "b"}]
+        }))
+        .expect("the legacy edits key must stay accepted");
+        assert_eq!(args.ops.as_ref().map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn ops_schema_advertises_the_compact_grammar() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let params = tool.schema().parameters;
+        let ops = &params["properties"]["ops"];
+        assert!(ops.is_object(), "ops must be advertised: {params}");
+        assert!(
+            params["properties"].get("edits").is_none(),
+            "the legacy edits key must not be advertised: {params}"
+        );
+        let text = ops.to_string();
+        for needle in ["i101:text", "d202-205", "r102", "inserts after line 101"] {
+            assert!(text.contains(needle), "{needle} missing from the ops schema");
+        }
+        assert!(
+            ops["items"]["anyOf"].is_array(),
+            "items must accept both forms"
+        );
+    }
+
+    #[test]
+    fn ops_rejects_conflicting_single_edit_fields() {
+        let mut args = batch_args("a.txt", vec![]);
+        args.ops = Some(vec![json!("d1")]);
+        args.old_string = "x".into();
+        let err = prepare_edit(&args, "a\n").unwrap_err().to_string();
+        assert!(
+            err.contains("ops is mutually exclusive with old_string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ops_items_survive_strict_normalization() {
+        // file_edit is a STRICT_TOOLS member: the polymorphic ops items must
+        // normalize idempotently — both branches of the union stay, and the
+        // anchor branch gets the strict treatment (required + no extras).
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let normalized = crate::provider::strict::normalize_for_strict(&tool.schema().parameters);
+        let again = crate::provider::strict::normalize_for_strict(&normalized);
+        assert_eq!(normalized, again, "strict normalization must be idempotent");
+        let items = &normalized["properties"]["ops"]["items"];
+        let branches = items["anyOf"].as_array().expect("the union must survive");
+        assert_eq!(branches.len(), 2, "{items}");
+        let anchor = branches
+            .iter()
+            .find(|b| b.get("properties").is_some())
+            .expect("the anchor branch must survive");
+        assert_eq!(anchor["additionalProperties"], json!(false));
+        let required = anchor["required"]
+            .as_array()
+            .expect("required must be forced");
+        assert!(required.contains(&json!("old_string")));
+        assert!(required.contains(&json!("new_string")));
+    }
+
+    #[test]
+    fn large_payload_note_covers_ops_payloads() {
+        let big = "x".repeat(EMISSION_FRAGILITY_PAYLOAD_BYTES);
+        let mut args = batch_args("a.txt", vec![]);
+        args.ops = Some(vec![json!(format!("r1:{big}"))]);
+        let note = large_payload_note(&args).expect("note at threshold for an op");
+        assert!(note.contains("largest op"), "{note}");
+        let mut args = batch_args("a.txt", vec![]);
+        args.ops = Some(vec![json!({"old_string": big, "new_string": "y"})]);
+        let note = large_payload_note(&args).expect("note at threshold for an anchor item");
+        // Ops mode reports the largest element either way (string or object).
+        assert!(note.contains("largest op"), "{note}");
+        let mut args = batch_args("a.txt", vec![]);
+        args.ops = Some(vec![json!("d1")]);
+        assert!(large_payload_note(&args).is_none());
+    }
+
     #[tokio::test]
     async fn multi_edit_batch_empty_anchor_is_contained_on_the_approval_path() {
         // Review H1: the approval path (approval_preview →
@@ -3149,7 +2388,7 @@ mod tests {
         let tool = make_tool(dir.path());
         let result = tool.approval_preview(&json!({
             "path": "a.txt",
-            "edits": [{"old_string": "", "new_string": "x"}]
+            "ops": [{"old_string": "", "new_string": "x"}]
         }));
         assert!(
             result.is_none(),

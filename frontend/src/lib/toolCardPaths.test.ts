@@ -400,6 +400,40 @@ describe("buildPathChips", () => {
     ]);
   });
 
+  it("multi_edit: one chip per file the call writes (line null)", () => {
+    // multi_edit carries the same files[].path shape as read_files, so every
+    // file it writes gets a header chip — a multi-file edit names its files
+    // at a glance (plan 2e27f896). No read line applies → line null.
+    const calls = [
+      {
+        id: "c1",
+        args: JSON.stringify({
+          files: [
+            { path: "src/a.rs", ops: ["i0:x"] },
+            { path: "src/b.rs", ops: ["d1"] },
+          ],
+        }),
+      },
+    ];
+    expect(buildPathChips(calls, "multi_edit")).toEqual([
+      { key: expect.any(String), text: "a.rs", path: "src/a.rs", line: null },
+      { key: expect.any(String), text: "b.rs", path: "src/b.rs", line: null },
+    ]);
+  });
+
+  it("multi_edit: dedupes across grouped calls and caps at 3 with +N", () => {
+    const calls = [
+      { id: "c1", args: JSON.stringify({ files: [{ path: "a.rs" }, { path: "b.rs" }] }) },
+      {
+        id: "c2",
+        args: JSON.stringify({ files: [{ path: "b.rs" }, { path: "c.rs" }, { path: "d.rs" }] }),
+      },
+    ];
+    const chips = buildPathChips(calls, "multi_edit");
+    expect(chips.map((c) => c.text)).toEqual(["a.rs", "b.rs", "c.rs", "+1"]);
+    expect(chips[3].path).toBeNull();
+  });
+
   it("returns no chips for label-only tools (git, shell)", () => {
     // git/shell carry no file path — buildPathChips yields nothing (the label
     // chip is rendered separately by the ToolCard).
@@ -958,6 +992,22 @@ describe("fileEditDiff", () => {
   it("null for a still-running call (no result yet)", () => {
     expect(fileEditDiff(null)).toBeNull();
   });
+
+  it("returns the COMBINED diff of a successful multi_edit (same payload key)", () => {
+    // multi_edit reuses the {"diff": ...} payload — one combined diff with a
+    // --- / +++ section per file (plan 2e27f896) — so this renderer needs no
+    // tool-name-specific branch.
+    const diff =
+      "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n" +
+      "--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-x\n+y\n";
+    expect(
+      fileEditDiff({
+        success: true,
+        output: "edited src/a.rs\nedited src/b.rs",
+        data: { diff, paths: ["src/a.rs", "src/b.rs"] },
+      }),
+    ).toBe(diff);
+  });
 });
 
 /**
@@ -1127,6 +1177,7 @@ describe("displayName", () => {
     expect(displayName("graph_context")).toBe("Graph Context");
     expect(displayName("graph_impact")).toBe("Graph Impact");
     expect(displayName("graph_path")).toBe("Graph Path");
+    expect(displayName("multi_edit")).toBe("Multi Edit");
   });
 
   it("falls back to the raw name", () => {

@@ -1516,6 +1516,64 @@ export interface SessionSummary {
   reasoning_tokens: number;
 }
 
+/** One token-savings ledger row (a `savings_events` row). */
+export interface SavingsEvent {
+  id: string;
+  session_id: string | null;
+  /** The lever kind: `truncation`, `compaction`, `delta_read`, `skeleton`, … */
+  kind: string;
+  /** Free-form detail (path, command, archive id). Omitted when absent. */
+  detail?: string | null;
+  tokens_before: number;
+  tokens_after: number;
+  /** Signed: an `archive_expand` row re-adds content and so is negative. */
+  tokens_saved: number;
+  measured: boolean;
+  created_at: number;
+}
+
+/** One lever's savings — a row in the Dashboard's per-kind table. */
+export interface SavingsKindBreakdown {
+  kind: string;
+  event_count: number;
+  saved_tokens: number;
+}
+
+/** One day's savings — a bar in the Dashboard's time series. */
+export interface SavingsDayBreakdown {
+  /** The UTC day as epoch DAYS (`created_at / 86400`), not seconds. */
+  day: number;
+  event_count: number;
+  saved_tokens: number;
+}
+
+/** Prompt-cache efficiency across the project's recorded requests. */
+export interface CacheEfficiency {
+  prompt_tokens: number;
+  cached_tokens: number;
+  /** Requests that reported a cache figure. Gates whether a hit rate is shown;
+   *  the displayed rate itself is `cached_tokens / prompt_tokens` over every
+   *  recorded request, including rows that reported no usage. */
+  cached_not_null_requests: number;
+  request_count: number;
+}
+
+/**
+ * Aggregated token savings across the whole project (all sessions) — the
+ * Dashboard view's read path (backlog 652ae094). It aggregates the
+ * `savings_events` ledger the optimizer levers write (backlog e4a50d22).
+ */
+export interface SavingsStats {
+  /** Signed total of `tokens_saved` across every event. */
+  saved_tokens_total: number;
+  event_count: number;
+  per_kind: SavingsKindBreakdown[];
+  per_day: SavingsDayBreakdown[];
+  /** The most recent events, newest first (bounded on the backend). */
+  recent: SavingsEvent[];
+  cache: CacheEfficiency;
+}
+
 /**
  * Get per-session token + timing stats for the agent with the given id.
  * Errors if the agent has no session yet (no prompt sent).
@@ -1527,6 +1585,11 @@ export async function getSessionStats(agentId: AgentId): Promise<SessionStats> {
 /** Get per-project token + timing stats (aggregated across all sessions). */
 export async function getProjectStats(): Promise<ProjectStats> {
   return await invoke("get_project_stats");
+}
+
+/** Get per-project token-SAVINGS stats for the Dashboard view (652ae094). */
+export async function getSavingsStats(): Promise<SavingsStats> {
+  return await invoke("get_savings_stats");
 }
 
 /** Get the list of sessions with aggregated token counts (newest first). */

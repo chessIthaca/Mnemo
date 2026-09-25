@@ -185,8 +185,10 @@ compress_extra_commands = [] # extra command prefixes to compress
 
 Every lever writes a row to the `savings_events` ledger, so its cost/benefit is
 auditable. The always-advertised `expand_result` tool retrieves any archived
-result by id or keyword. The savings dashboard and its aggregates are a
-separate, still-pending piece of work.
+result by id or keyword. The Dashboard view (right panel, immediately before
+Memory) reads the ledger back per project: metered tokens saved, per-kind and
+per-day breakdowns, the recent events, and a prompt-cache section whose dollar
+figures are labelled ESTIMATED.
 
 Have fun and let me know where we can improve things.
 Pull requests gratefully considered.

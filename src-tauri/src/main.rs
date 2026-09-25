@@ -915,6 +915,7 @@ fn main() {
             ipc::codegraph_cmds::codegraph_rebuild_index,
             ipc::agent::get_session_stats,
             ipc::agent::get_project_stats,
+            ipc::agent::get_savings_stats,
             ipc::agent::get_session_list,
             ipc::files::read_file,
             ipc::files::read_image_data_url,

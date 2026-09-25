@@ -2082,6 +2082,117 @@ async fn savings_events_round_trip_and_negative_expansions() {
 }
 
 #[tokio::test]
+async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
+    // Backlog 652ae094: the Dashboard's read path — the ledger aggregated
+    // per-kind (biggest saver first), per UTC day (oldest first), the bounded
+    // recent window (newest first), the metered totals, and the prompt-cache
+    // numbers pulled from request_stats.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+
+    // A fresh project has an empty ledger: zeros and empty vectors, never an
+    // error — the Dashboard renders an honest empty state from this.
+    let empty = store.savings_stats().await.unwrap();
+    assert_eq!(empty.event_count, 0);
+    assert_eq!(empty.saved_tokens_total, 0);
+    assert!(empty.per_kind.is_empty());
+    assert!(empty.per_day.is_empty());
+    assert!(empty.recent.is_empty());
+    assert_eq!(empty.cache.request_count, 0);
+    assert_eq!(empty.cache.prompt_tokens, 0);
+    assert_eq!(empty.cache.cached_not_null_requests, 0);
+
+    // Two distinct UTC days (the day bucket is created_at / 86400).
+    let day1 = 1_700_000_000_i64;
+    let day2 = day1 + 86_400;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("skeleton", 12_000, 900, day1))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("compression", 8_000, 1_200, day1 + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("skeleton", 2_000, 400, day2))
+        .await
+        .unwrap();
+    // A re-expansion re-adds archived content, so it subtracts from the total.
+    store
+        .record_savings_event(&record("archive_expand", 0, 4_000, day2 + 60))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.event_count, 4);
+    // 11_100 + 6_800 + 1_600 - 4_000.
+    assert_eq!(stats.saved_tokens_total, 15_500);
+
+    // Per-kind, biggest saver first; the negative kind sorts last.
+    assert_eq!(stats.per_kind.len(), 3);
+    assert_eq!(stats.per_kind[0].kind, "skeleton");
+    assert_eq!(stats.per_kind[0].event_count, 2);
+    assert_eq!(stats.per_kind[0].saved_tokens, 12_700);
+    assert_eq!(stats.per_kind[1].kind, "compression");
+    assert_eq!(stats.per_kind[1].saved_tokens, 6_800);
+    assert_eq!(stats.per_kind[2].kind, "archive_expand");
+    assert_eq!(stats.per_kind[2].saved_tokens, -4_000);
+
+    // Per-day, oldest first, stamped as the epoch DAY.
+    assert_eq!(stats.per_day.len(), 2);
+    assert_eq!(stats.per_day[0].day, day1 / 86_400);
+    assert_eq!(stats.per_day[0].event_count, 2);
+    assert_eq!(stats.per_day[0].saved_tokens, 17_900);
+    assert_eq!(stats.per_day[1].day, day2 / 86_400);
+    assert_eq!(stats.per_day[1].saved_tokens, -2_400);
+
+    // Recent events, newest first.
+    assert_eq!(stats.recent.len(), 4);
+    assert_eq!(stats.recent[0].created_at, day2 + 60);
+    assert_eq!(stats.recent[3].created_at, day1);
+
+    // Cache efficiency from request_stats, NULL-safe: a row that never reported
+    // a cache figure must not count toward the hit-rate denominator, or a
+    // provider that never reports caching would look like a 0% hit rate.
+    let req = |prompt: u32, cached: Option<u32>| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: "m".into(),
+        endpoint: None,
+        prompt_tokens: prompt,
+        completion_tokens: 10,
+        reasoning_tokens: 0,
+        cached_tokens: cached,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: day1,
+        outcome: None,
+        purpose: None,
+    };
+    store
+        .record_request_stats(&req(1_000, Some(400)))
+        .await
+        .unwrap();
+    store.record_request_stats(&req(2_000, None)).await.unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.cache.request_count, 2);
+    assert_eq!(stats.cache.prompt_tokens, 3_000);
+    assert_eq!(stats.cache.cached_tokens, 400);
+    assert_eq!(stats.cache.cached_not_null_requests, 1);
+}
+
+#[tokio::test]
 async fn archive_round_trip_expand_returns_identical_content() {
     // Backlog e4a50d22 lever 3: the full original goes into the archive and
     // comes back byte-identical by id — the progressive-disclosure contract

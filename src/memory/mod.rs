@@ -33,10 +33,11 @@ pub use classifier::{Answer, Classifier, ClassifierStatus, LayaClassifier, NoCla
 pub use embedder::{Embedder, EmbedderStatus, HashEmbedder};
 pub use knowledge::KnowledgeStore;
 pub use types::{
-    ArchiveSearchHit, ArchivedToolResult, DayBreakdown, EpisodicData, Memory, MemoryAccessEntry,
-    MemoryClass, MemoryData, MemoryFilter, MemoryRecordType, MemorySearchConfig, MemoryTier,
-    ModelBreakdown, ProceduralData, ProjectStats, RequestStats, SavingsEvent, SemanticData, Session,
-    SessionStats, SessionSummary, WorkingData,
+    ArchiveSearchHit, ArchivedToolResult, CacheEfficiency, DayBreakdown, EpisodicData, Memory,
+    MemoryAccessEntry, MemoryClass, MemoryData, MemoryFilter, MemoryRecordType, MemorySearchConfig,
+    MemoryTier, ModelBreakdown, ProceduralData, ProjectStats, RequestStats, SavingsDayBreakdown,
+    SavingsEvent, SavingsKindBreakdown, SavingsStats, SemanticData, Session, SessionStats,
+    SessionSummary, WorkingData,
 };
 
 /// A scored memory result.
@@ -393,6 +394,12 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// session lists across all sessions — the row-level view the
     /// dashboard aggregates (backlog 652ae094) are built from.
     async fn savings_events_rows(&self, session_id: Option<&str>) -> Result<Vec<SavingsEvent>>;
+
+    /// Aggregate the `savings_events` ledger for the Dashboard view (backlog
+    /// 652ae094): metered totals, a per-kind and a per-day breakdown, the most
+    /// recent events, and the project's prompt-cache efficiency. An empty
+    /// ledger yields zeroed/empty fields, never an error.
+    async fn savings_stats(&self) -> Result<SavingsStats>;
 
     /// Archive the FULL original of an oversized tool result (backlog
     /// e4a50d22 lever 3) and return the new row id — the handle the context
@@ -2188,6 +2195,108 @@ impl MemoryStoreTrait for MemoryStore {
         })
         .await
         .map_err(|e| Error::Memory(format!("savings_events_rows task failed: {e}")))?
+    }
+
+    async fn savings_stats(&self) -> Result<SavingsStats> {
+        let read_conn = self.read_conn().clone();
+        tokio::task::spawn_blocking(move || -> Result<SavingsStats> {
+            let conn = read_conn.lock().expect("read conn lock poisoned");
+            let mut stats = SavingsStats::default();
+            // Totals. The ledger is empty on a fresh project, and the Dashboard
+            // must render an honest empty state rather than an error.
+            let (total, count) = conn.query_row(
+                "SELECT COALESCE(SUM(tokens_saved), 0), COUNT(*) FROM savings_events",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            stats.saved_tokens_total = total;
+            stats.event_count = count as u64;
+            // Per-kind breakdown, biggest saver first. Ties break on the kind
+            // name so the ordering is deterministic across runs.
+            let mut stmt = conn.prepare(
+                "SELECT kind, COUNT(*), COALESCE(SUM(tokens_saved), 0) FROM savings_events GROUP BY kind ORDER BY SUM(tokens_saved) DESC, kind",
+            )?;
+            let kind_rows = stmt.query_map([], |row| {
+                Ok(SavingsKindBreakdown {
+                    kind: row.get(0)?,
+                    event_count: row.get::<_, i64>(1)? as u64,
+                    saved_tokens: row.get(2)?,
+                })
+            })?;
+            for row in kind_rows {
+                stats.per_kind.push(
+                    row.map_err(|e| Error::Memory(format!("savings_stats kind read failed: {e}")))?,
+                );
+            }
+            // Per-day breakdown. `created_at` is in seconds; bucket by UTC day
+            // (86400s) like `project_stats`. NOTE: the STORED unit differs from
+            // project_stats — this holds the epoch DAY, not day-start seconds —
+            // so the frontend multiplies by 86_400_000 ms, not 1000.
+            let mut stmt2 = conn.prepare(
+                "SELECT created_at / 86400 AS day, COUNT(*), COALESCE(SUM(tokens_saved), 0) FROM savings_events GROUP BY day ORDER BY day",
+            )?;
+            let day_rows = stmt2.query_map([], |row| {
+                Ok(SavingsDayBreakdown {
+                    day: row.get(0)?,
+                    event_count: row.get::<_, i64>(1)? as u64,
+                    saved_tokens: row.get(2)?,
+                })
+            })?;
+            for row in day_rows {
+                stats.per_day.push(
+                    row.map_err(|e| Error::Memory(format!("savings_stats day read failed: {e}")))?,
+                );
+            }
+            // Recent events, newest first. Bounded so the IPC payload can never
+            // grow without limit as a project's ledger accumulates.
+            const RECENT_LIMIT: i64 = 50;
+            let mut stmt3 = conn.prepare(
+                "SELECT id, session_id, kind, detail, tokens_before, tokens_after, tokens_saved, measured, created_at FROM savings_events ORDER BY created_at DESC, id DESC LIMIT ?1",
+            )?;
+            let recent_rows = stmt3.query_map(params![RECENT_LIMIT], |row| {
+                Ok(SavingsEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    detail: row.get(3)?,
+                    tokens_before: row.get(4)?,
+                    tokens_after: row.get(5)?,
+                    tokens_saved: row.get(6)?,
+                    measured: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?;
+            for row in recent_rows {
+                stats.recent.push(
+                    row.map_err(|e| Error::Memory(format!("savings_stats recent read failed: {e}")))?,
+                );
+            }
+            // Prompt-cache efficiency from `request_stats`. `cached_tokens` is
+            // NULL for rows recorded before that dimension existed (and on
+            // providers that never report caching), so the hit-rate denominator
+            // counts only the rows that actually reported a figure.
+            let (prompt_tokens, cached_tokens, cached_rows, requests) = conn.query_row(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(COALESCE(cached_tokens, 0)), 0), COUNT(cached_tokens), COUNT(*) FROM request_stats",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            stats.cache = CacheEfficiency {
+                prompt_tokens: prompt_tokens as u64,
+                cached_tokens: cached_tokens as u64,
+                cached_not_null_requests: cached_rows as u64,
+                request_count: requests as u64,
+            };
+            Ok(stats)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("savings_stats task failed: {e}")))?
     }
 
     async fn archive_tool_result(

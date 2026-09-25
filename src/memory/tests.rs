@@ -62,6 +62,23 @@ fn make_anchor_store(model_id: &'static str) -> MemoryStore {
     .unwrap()
 }
 
+#[test]
+fn embedder_handle_recovers_from_a_poisoned_lock() {
+    // The failure-triage kNN overlay reads the live embedder through this
+    // getter on a failure-handling path — a poisoned lock (some other
+    // holder panicked mid-swap) must yield a valid embedder, never panic
+    // the turn. The guarded field is a plain `Arc` swap, so recovering the
+    // guard from the poison error is sound.
+    let store = make_store();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = store.embedder.write().expect("write guard for the poison");
+        panic!("poison the embedder lock");
+    }));
+    assert!(poisoned.is_err(), "the guard scope must have panicked");
+    let handle = store.embedder_handle();
+    assert_eq!(handle.model_id(), "hash");
+}
+
 #[tokio::test]
 async fn recall_semantic_fallback_on_zero_keyword_hits() {
     // Regression (backlog 82b831dc, 2026-12-06): zero FTS keyword hits

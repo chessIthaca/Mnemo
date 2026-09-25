@@ -1183,8 +1183,15 @@ product.
   `auto_finetune`) re-trains the checkpoint from that log when ≥50 new
   labeled rows accrued and hot-swaps the served checkpoint (an ineligible
   run exports the dataset + skips cleanly — laya 0.3.20 ships no training
-  surface). Both flags are separate opt-ins (default off); disabled behavior
-  is byte-identical (backlog 1a4049c1).
+  surface). The kNN overlay (`src/agent/failure_triage_knn.rs`, flag
+  `failure_triage_knn`) learns from that same log between fine-tunes: each
+  failure text is embedded with the live memory embedder, the five most
+  similar logged failures vote, and the vote share is the confidence (the
+  same 0.80 gate; consulted before the shared Laya slot, falling back to it
+  below threshold — no `laya-serve` needed, genuinely online: appended
+  dispositions are retrievable without a restart). All three flags are
+  separate opt-ins (default off); disabled behavior is byte-identical
+  (backlog 1a4049c1; the overlay is item 4b, backlog 057f7a34).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

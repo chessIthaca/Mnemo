@@ -29,6 +29,12 @@
 //! Base Laya checkpoints are near-chance zero-shot and over-confident on
 //! this task, so the log-then-fine-tune loop is what makes the gate
 //! trustworthy; until a fine-tuned checkpoint validates, the flag stays off.
+//!
+//! The opt-in kNN overlay (item 4b, [`failure_triage_knn`]) closes the
+//! gap between fine-tunes: it learns from the training log itself — every
+//! resolved disposition is retrievable on the next classification — and
+//! rides the app's local embedding backend, not `laya-serve`, so it is
+//! independent of the Laya endpoint.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::global_config_dir;
 use crate::memory::classifier::{Answer, Classifier, Question};
+use super::failure_triage_knn::KnnClassifier;
 
 /// The calibrated confidence an answer must reach before its class may
 /// steer failure handling. Below it (and with no answer at all) every
@@ -241,11 +248,13 @@ pub async fn triage_failure(classifier: &dyn Classifier, error_text: &str) -> Fa
 }
 
 /// The shared failure-triage inputs for the agent loops: the app runtime's
-/// live classifier slot plus the config-mirrored enable flag
-/// (`[general.laya] failure_triage`, default off).
+/// live classifier slot, the optional local kNN overlay
+/// ([`failure_triage_knn`] — consulted before the slot while
+/// `[general.laya] failure_triage_knn` is on), and the config-mirrored
+/// enable flag (`[general.laya] failure_triage`, default off).
 ///
-/// Reading BOTH at call time means a Settings save takes effect on the next
-/// failure with no rebuild — and every existing swap site of the shared
+/// Reading all of them at call time means a Settings save takes effect on
+/// the next failure with no rebuild — and every existing swap site of the shared
 /// slot (external rebuild on save, managed sidecar start, setup autostart)
 /// feeds the triage sites untouched. The flag is the separate opt-in the
 /// classifier docs require: base checkpoints are over-confident zero-shot,
@@ -259,6 +268,16 @@ pub struct FailureTriageHandle {
     /// The mirrored `[general.laya] failure_triage` flag: while false no
     /// classification is ever requested.
     pub enabled: Arc<AtomicBool>,
+    /// The optional kNN overlay ([`failure_triage_knn`]): `None` in
+    /// library/test usage and wherever the app did not wire one; consulted
+    /// by [`Self::triage`] before the shared slot while `knn_enabled` is
+    /// set. Holds no resources until first asked — the neighbor index
+    /// builds lazily on the first classification.
+    pub knn: Option<Arc<KnnClassifier>>,
+    /// The mirrored `[general.laya] failure_triage_knn` flag: while false
+    /// the overlay is never consulted and the gate is byte-identical to
+    /// the pre-overlay gate.
+    pub knn_enabled: Arc<AtomicBool>,
     /// Optional override for the training-log path (tests + the fine-tune
     /// dataset tooling). `None` uses the default
     /// `~/.mnemo/laya/training/failure_triage.jsonl`.
@@ -275,6 +294,8 @@ impl FailureTriageHandle {
         Self {
             classifier,
             enabled,
+            knn: None,
+            knn_enabled: Arc::new(AtomicBool::new(false)),
             log_path: None,
         }
     }
@@ -283,6 +304,19 @@ impl FailureTriageHandle {
     /// fine-tune dataset tooling). Returns `self` for chaining.
     pub fn with_log_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.log_path = Some(path.into());
+        self
+    }
+
+    /// Wire the kNN overlay (item 4b) into this gate: the classifier the
+    /// app builds over the training log, plus the mirrored
+    /// `[general.laya] failure_triage_knn` flag (read fresh on every
+    /// call, so a Settings save lands immediately). While the flag is on,
+    /// [`Self::triage`] consults the overlay before the shared slot; with
+    /// it off the gate is byte-identical to the pre-overlay gate. Returns
+    /// `self` for chaining.
+    pub fn with_knn(mut self, knn: Arc<KnnClassifier>, enabled: bool) -> Self {
+        self.knn = Some(knn);
+        self.knn_enabled = Arc::new(AtomicBool::new(enabled));
         self
     }
 
@@ -311,6 +345,13 @@ impl FailureTriageHandle {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Whether the kNN overlay is enabled (the mirrored
+    /// `[general.laya] failure_triage_knn` flag, read fresh on every
+    /// call — the factory setter updates it on a Settings save).
+    pub fn is_knn_enabled(&self) -> bool {
+        self.knn_enabled.load(Ordering::Relaxed)
+    }
+
     /// Clone the live classifier out of the shared slot. Any lock poisoning
     /// reads as "no classifier" (the classifier is optional machinery — it
     /// must never panic a turn). The read guard is dropped here, before any
@@ -323,14 +364,37 @@ impl FailureTriageHandle {
     }
 
     /// Classify one failure through the live gate. While the flag is off (or
-    /// the slot is empty) this returns [`FailureKeepReason::NoAnswer`]
-    /// WITHOUT asking anything — the structural guarantee that disabled
-    /// behavior is byte-identical (zero classifier calls).
+    /// the slot is empty and no overlay answered) this returns
+    /// [`FailureKeepReason::NoAnswer`] WITHOUT asking anything — the
+    /// structural guarantee that disabled behavior is byte-identical (zero
+    /// classifier calls).
+    ///
+    /// With the kNN overlay enabled ([`Self::with_knn`] + the mirrored
+    /// `failure_triage_knn` flag) the overlay is consulted FIRST: a
+    /// confident vote steers the failure locally and the shared slot's
+    /// classifier is never asked; anything below the threshold falls
+    /// through to the slot — and when the slot is empty, the overlay's own
+    /// fallback reason is returned (its observed confidence is the most
+    /// informative note the site can get). With the overlay flag off (or
+    /// no overlay wired) the path is byte-identical to the pre-overlay
+    /// gate.
     pub async fn triage(&self, error_text: &str) -> FailureTriage {
         if !self.is_enabled() {
             return FailureTriage::Fallback {
                 reason: FailureKeepReason::NoAnswer,
             };
+        }
+        if self.is_knn_enabled() {
+            if let Some(knn) = &self.knn {
+                let overlay = triage_failure(&**knn, error_text).await;
+                if matches!(overlay, FailureTriage::Classified { .. }) {
+                    return overlay;
+                }
+                let Some(classifier) = self.snapshot() else {
+                    return overlay;
+                };
+                return triage_failure(&*classifier, error_text).await;
+            }
         }
         let Some(classifier) = self.snapshot() else {
             return FailureTriage::Fallback {

@@ -19,6 +19,7 @@
       "checkpoint": null,
       "auto_type_memories": false,
       "failure_triage": false,
+      "failure_triage_knn": false,
       "auto_finetune": false
     },
     "safety": "approve-each-action",

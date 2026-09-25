@@ -265,6 +265,21 @@ pub struct LayaConfig {
     /// false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub failure_triage: bool,
+    /// Opt in to the kNN OVERLAY for failure triage (item 4b): on top of
+    /// the Laya checkpoint, a local kNN classifier retrieves the most
+    /// similar logged failures from the failure-triage training log
+    /// (embedding them with the app's existing embedding backend) and
+    /// majority-votes the class, with the vote share as the confidence.
+    /// Genuinely online learning — a disposition appended to the log is
+    /// retrievable on the next classification, no retraining needed — and
+    /// independent of the Laya endpoint: it rides the local embedder,
+    /// not `laya-serve`. Still gated by the master
+    /// [`failure_triage`](Self::failure_triage) flag and the same 0.80
+    /// confidence gate (a below-threshold or tied vote falls back to the
+    /// base classifier / the pre-classifier rules). Off by default, and
+    /// omitted from the saved config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub failure_triage_knn: bool,
     /// Opt in to the startup failure-triage FINE-TUNE (managed mode only):
     /// at startup the app compares the logged failure corpus against the
     /// last run's marker and, when enough new labeled rows accumulated, runs
@@ -305,6 +320,7 @@ impl LayaConfig {
             && self.checkpoint.is_none()
             && !self.auto_type_memories
             && !self.failure_triage
+            && !self.failure_triage_knn
             && !self.auto_finetune
     }
 }
@@ -1313,37 +1329,48 @@ auto_type_memories = true
     }
 
     #[test]
-    fn laya_failure_triage_and_auto_finetune_default_off_and_round_trip() {
-        // Both flags follow the same opt-in convention as auto-typing:
-        // absent ⇒ false, false leaves no serialized trace, and either flag
+    fn laya_failure_triage_flags_default_off_and_round_trip() {
+        // All three flags follow the same opt-in convention as auto-typing:
+        // absent ⇒ false, false leaves no serialized trace, and any flag
         // alone counts as "touched" so the section gets written.
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert!(!cfg.general.laya.failure_triage);
+        assert!(!cfg.general.laya.failure_triage_knn);
         assert!(!cfg.general.laya.auto_finetune);
 
         let text = r#"
 [general.laya]
 enabled = true
 failure_triage = true
+failure_triage_knn = true
 auto_finetune = true
 "#;
         let cfg: GeneralConfig = toml::from_str(text).unwrap();
         assert!(cfg.general.laya.failure_triage);
+        assert!(cfg.general.laya.failure_triage_knn);
         assert!(cfg.general.laya.auto_finetune);
         let back = toml::to_string(&cfg).unwrap();
         assert!(back.contains("failure_triage"));
+        assert!(back.contains("failure_triage_knn"));
         assert!(back.contains("auto_finetune"));
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
         assert!(cfg2.general.laya.failure_triage);
+        assert!(cfg2.general.laya.failure_triage_knn);
         assert!(cfg2.general.laya.auto_finetune);
 
         let untouched = LayaConfig::default();
         assert!(untouched.is_default());
         let serialized = toml::to_string(&untouched).unwrap();
         assert!(!serialized.contains("failure_triage"));
+        assert!(!serialized.contains("failure_triage_knn"));
         assert!(!serialized.contains("auto_finetune"));
         assert!(!LayaConfig {
             failure_triage: true,
+            ..Default::default()
+        }
+        .is_default());
+        assert!(!LayaConfig {
+            failure_triage_knn: true,
             ..Default::default()
         }
         .is_default());

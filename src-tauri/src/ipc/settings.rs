@@ -494,6 +494,11 @@ pub struct LayaWire {
     /// classified and a confident answer steers the harness; needs a
     /// fine-tuned checkpoint).
     pub failure_triage: bool,
+    /// Whether the kNN OVERLAY for failure triage is enabled — a separate
+    /// opt-in (a local classifier over the failure-triage training log,
+    /// riding the memory embedder; no `laya-serve` needed, but consulted
+    /// only while `failure_triage` itself is on).
+    pub failure_triage_knn: bool,
     /// Whether the startup failure-triage FINE-TUNE is enabled (managed
     /// mode only; never blocks startup).
     pub auto_finetune: bool,
@@ -905,6 +910,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 checkpoint: config.general.general.laya.checkpoint.clone(),
                 auto_type_memories: config.general.general.laya.auto_type_memories,
                 failure_triage: config.general.general.laya.failure_triage,
+                failure_triage_knn: config.general.general.laya.failure_triage_knn,
                 auto_finetune: config.general.general.laya.auto_finetune,
             },
             enable_browser_inspection: config.general.general.enable_browser_inspection,
@@ -1407,6 +1413,7 @@ mod settings_dto_tests {
                     checkpoint: None,
                     auto_type_memories: false,
                     failure_triage: false,
+                    failure_triage_knn: false,
                     auto_finetune: false,
                 },
                 enable_browser_inspection: false,
@@ -1539,6 +1546,7 @@ mod settings_dto_tests {
                     checkpoint: None,
                     auto_type_memories: false,
                     failure_triage: false,
+                    failure_triage_knn: false,
                     auto_finetune: false,
                 },
                 enable_browser_inspection: false,

@@ -246,6 +246,7 @@ fn dto_fixtures_match_serde() {
                 checkpoint: None,
                 auto_type_memories: false,
                 failure_triage: false,
+                failure_triage_knn: false,
                 auto_finetune: false,
             },
             enable_browser_inspection: false,

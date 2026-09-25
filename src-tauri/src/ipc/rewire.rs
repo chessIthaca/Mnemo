@@ -174,6 +174,12 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // next failure with no rebuild. The classifier slot needs no touch
         // here: every swap above writes the same Arc the gate holds.
         factory.set_failure_triage_enabled(laya_cfg.failure_triage);
+        // The kNN overlay flag (item 4b): the same live-toggle contract —
+        // the gate consults the overlay before the shared slot while this
+        // is on. The overlay reads the store's live embedder through its
+        // getter and tracks the training-log file itself, so an embedder
+        // change needs no extra wiring here — only the flag mirror.
+        factory.set_failure_triage_knn_enabled(laya_cfg.failure_triage_knn);
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

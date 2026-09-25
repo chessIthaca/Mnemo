@@ -1143,8 +1143,8 @@ product.
   the app behaves exactly as before. Status surfaces via
   `get_classifier_status` + the startup snapshot, and Settings → Classifier
   carries the toggle, endpoint URL, install hints, and live status (2027-01-16,
-  backlog bb54bdcc; the four consumer features — model routing, tool steering,
-  failure triage, memory typing — follow, each confidence-gated).
+  backlog bb54bdcc; the consumer features — memory typing (shipped), model
+  routing, tool steering, failure triage — each confidence-gated).
 - **Managed Laya runtime** (`src-tauri/src/ipc/laya.rs`) — embedding-parity
   UX for the classifier: Settings → Classifier downloads a self-contained
   runtime (uv binary + virtualenv + `laya[serve]` + checkpoint, ~0.8–1 GB
@@ -1153,6 +1153,19 @@ product.
   stops the `laya-serve` sidecar on 127.0.0.1 (startup hook + save-driven
   rewire + app-exit stop). No command line, no Python prerequisites;
   external mode (user-run endpoint) is preserved.
+- **Laya memory auto-typing** (`src/memory/auto_typing.rs`) — the
+  classifier's first consumer: at `memory_write` time a choice question
+  over the six typed prefixes may correct the writer's prefix when the
+  calibrated confidence clears 0.80; a low-confidence or missing answer
+  keeps the writer's prefix, and with the separate `auto_type_memories`
+  opt-in off (the default) nothing changes at all. The tool reads the
+  shared classifier slot + a flag mirror at call time (Settings toggles
+  are live without a rebuild), and every correction or keep is noted in
+  the write's message + data. Base checkpoints are near-chance on this
+  task — enable it only against a checkpoint fine-tuned on the seed
+  labeled set `seed_dataset` builds from `.coding/knowledge/` (covers
+  SPEC/DECISION/BUG/HOW; PLAN/REVIEW ride untrained until those corpora
+  can seed them — follow-up) (backlog a147b63c).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

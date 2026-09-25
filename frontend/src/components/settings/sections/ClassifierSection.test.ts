@@ -97,6 +97,7 @@ describe("ClassifierSection owns the opt-in controls", () => {
 
   it("persists the opt-in through saveSettings (config.toml [general.laya])", () => {
     expect(classifierSource).toContain("laya_enabled: enabled");
+    expect(classifierSource).toContain("laya_auto_type_memories: autoType");
     expect(classifierSource).toContain("laya_mode: mode");
     expect(classifierSource).toContain("laya_checkpoint: checkpoint");
     // Managed mode never persists an external endpoint (blank clears it).
@@ -109,6 +110,11 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("forwardRef<SettingsSectionHandle");
     expect(classifierSource).toContain("onDirtyChange?.(dirty)");
     expect(classifierSource).toContain("save: async () => {");
+  });
+
+  it("renders the auto-typing opt-in toggle with the fine-tuned caveat", () => {
+    expect(classifierSource).toContain("Auto-type memory records");
+    expect(classifierSource).toContain("fine-tuned checkpoint");
   });
 });
 
@@ -130,12 +136,13 @@ describe("classifier bindings stay wired to the backend names", () => {
 
   it("the settings types carry the laya fields (config + save patch)", () => {
     expect(tauriSource).toContain(
-      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n    };',
+      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n      /** Whether memory auto-typing is enabled (opt-in). */\n      auto_type_memories: boolean;\n    };',
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
     expect(tauriSource).toContain("laya_endpoint?: string;");
     expect(tauriSource).toContain('laya_mode?: "external" | "managed";');
     expect(tauriSource).toContain("laya_checkpoint?: string;");
+    expect(tauriSource).toContain("laya_auto_type_memories?: boolean;");
   });
 
   it("the startup snapshot type carries classifier_status", () => {
@@ -149,6 +156,7 @@ describe("serializeClassifier", () => {
     mode: "managed",
     checkpoint: "english",
     endpoint: "",
+    autoTypeMemories: false,
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
@@ -168,14 +176,18 @@ describe("serializeClassifier", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, endpoint: "http://127.0.0.1:8000" }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, autoTypeMemories: true }),
+    );
   });
 
-  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint)", () => {
+  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       mode: "managed",
       checkpoint: "english",
       endpoint: "",
+      autoTypeMemories: false,
     });
   });
 });

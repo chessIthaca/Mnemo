@@ -485,6 +485,10 @@ pub struct LayaWire {
     pub mode: LayaMode,
     /// Managed mode: the configured checkpoint id (`null` = "english").
     pub checkpoint: Option<String>,
+    /// Whether Laya auto-typing of memory records is enabled — a separate
+    /// opt-in from `enabled` (confidence-gated prefix correction at
+    /// `memory_write` time; needs a fine-tuned checkpoint).
+    pub auto_type_memories: bool,
 }
 
 /// A per-context model override (one entry of the `[models]` section). Emitted
@@ -891,6 +895,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 endpoint: config.general.general.laya.endpoint.clone(),
                 mode: config.general.general.laya.mode.clone(),
                 checkpoint: config.general.general.laya.checkpoint.clone(),
+                auto_type_memories: config.general.general.laya.auto_type_memories,
             },
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
@@ -1390,6 +1395,7 @@ mod settings_dto_tests {
                     endpoint: None,
                     mode: LayaMode::External,
                     checkpoint: None,
+                    auto_type_memories: false,
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
@@ -1519,6 +1525,7 @@ mod settings_dto_tests {
                     endpoint: None,
                     mode: LayaMode::External,
                     checkpoint: None,
+                    auto_type_memories: false,
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,

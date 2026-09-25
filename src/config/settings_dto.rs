@@ -271,6 +271,11 @@ pub struct SettingsSaveDto {
     /// = keep; a blank string clears it to the `"english"` default.
     #[serde(default)]
     pub laya_checkpoint: Option<String>,
+    /// Laya auto-typing of memory records (opt-in; enable only against a
+    /// fine-tuned checkpoint — base checkpoints mis-classify). Absent =
+    /// keep the current value.
+    #[serde(default)]
+    pub laya_auto_type_memories: Option<bool>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
     /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
@@ -581,6 +586,9 @@ pub fn validate_and_apply_settings_patch(
         } else {
             Some(trimmed.to_string())
         };
+    }
+    if let Some(auto_type) = patch.laya_auto_type_memories {
+        general.general.laya.auto_type_memories = auto_type;
     }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
@@ -923,6 +931,24 @@ mod tests {
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
         assert_eq!(next.general.general.laya.checkpoint, None);
+    }
+
+    #[test]
+    fn laya_patch_applies_auto_typing() {
+        // The auto-typing opt-in rides the same save path: Some flips it,
+        // absent keeps the current value.
+        let current = Config::default();
+        assert!(!current.general.general.laya.auto_type_memories);
+        let patch = SettingsSaveDto {
+            laya_auto_type_memories: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.auto_type_memories);
+        // Absent keeps it on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.auto_type_memories);
     }
 
     #[test]

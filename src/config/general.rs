@@ -235,6 +235,19 @@ pub struct LayaConfig {
     /// [`managed`](LayaMode::Managed) mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    /// Opt in to Laya auto-typing of memory records: at `memory_write`
+    /// time the record's typed prefix (SPEC/DECISION/BUG/PLAN/HOW/REVIEW)
+    /// is classified, and a confident answer may correct the writer's
+    /// prefix (confidence-gated — a low-confidence or missing answer keeps
+    /// the writer's prefix). Off by default, and meant to be enabled only
+    /// against a **fine-tuned** checkpoint: base Laya checkpoints are
+    /// near-chance zero-shot on this task and over-confident until
+    /// fine-tuned (train on `seed_dataset`'s labeled set — it covers
+    /// SPEC/DECISION/BUG/HOW; PLAN/REVIEW ship without seed examples), so
+    /// this is a separate opt-in from [`enabled`](Self::enabled). Omitted
+    /// from the saved config while false.
+    #[serde(default, skip_serializing_if = "laya_auto_typing_off")]
+    pub auto_type_memories: bool,
 }
 
 /// `skip_serializing_if` guard for [`LayaConfig::mode`]: `external` (the
@@ -242,6 +255,13 @@ pub struct LayaConfig {
 /// absence-while-unset behavior.
 fn laya_mode_is_external(mode: &LayaMode) -> bool {
     matches!(mode, LayaMode::External)
+}
+
+/// `skip_serializing_if` guard for [`LayaConfig::auto_type_memories`]:
+/// `false` (the default) stays unwritten, so untouched configs keep their
+/// exact pre-auto-typing shape.
+fn laya_auto_typing_off(off: &bool) -> bool {
+    !*off
 }
 
 impl LayaConfig {
@@ -254,6 +274,7 @@ impl LayaConfig {
             && self.endpoint.is_none()
             && self.mode == LayaMode::External
             && self.checkpoint.is_none()
+            && !self.auto_type_memories
     }
 }
 
@@ -1158,6 +1179,7 @@ bundled_embedding_model = "all-MiniLM-L6-v2"
         let cfg: GeneralConfig = toml::from_str("").unwrap();
         assert!(!cfg.general.laya.enabled);
         assert!(cfg.general.laya.endpoint.is_none());
+        assert!(!cfg.general.laya.auto_type_memories);
     }
 
     #[test]
@@ -1225,6 +1247,36 @@ endpoint = "http://127.0.0.1:8000"
             ..Default::default()
         };
         assert!(!managed.is_default());
+    }
+
+    #[test]
+    fn laya_auto_typing_defaults_off_and_round_trips() {
+        // Absent section ⇒ off (zero behavior change); the flag round-trips
+        // with the section; false never leaves a serialized trace; the flag
+        // alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.auto_type_memories);
+
+        let text = r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+auto_type_memories = true
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.auto_type_memories);
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.auto_type_memories);
+
+        let untouched = LayaConfig::default();
+        assert!(untouched.is_default());
+        assert!(!toml::to_string(&untouched).unwrap().contains("auto_type"));
+        let only_flag = LayaConfig {
+            auto_type_memories: true,
+            ..Default::default()
+        };
+        assert!(!only_flag.is_default());
     }
 
     #[test]

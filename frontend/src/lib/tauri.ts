@@ -455,6 +455,8 @@ export interface AppSettings {
       endpoint: string | null;
       mode: "external" | "managed";
       checkpoint: string | null;
+      /** Whether memory auto-typing is enabled (opt-in). */
+      auto_type_memories: boolean;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
@@ -560,6 +562,8 @@ export interface SettingsSavePatch {
   laya_mode?: "external" | "managed";
   /** Managed mode: the checkpoint id to serve ("english" | "multilingual"). */
   laya_checkpoint?: string;
+  /** Laya memory auto-typing (opt-in; needs a fine-tuned checkpoint). */
+  laya_auto_type_memories?: boolean;
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;

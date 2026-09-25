@@ -432,6 +432,9 @@ export interface ClassifierDraft {
   mode: "external" | "managed";
   checkpoint: string;
   endpoint: string;
+  /** The `auto_type_memories` opt-in — a separate toggle from `enabled`
+   * (confidence-gated prefix correction; needs a fine-tuned checkpoint). */
+  autoTypeMemories: boolean;
 }
 
 /** Serialize the classifier draft for dirty comparison. */

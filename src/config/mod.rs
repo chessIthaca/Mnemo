@@ -24,9 +24,9 @@ pub mod settings_dto;
 
 pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry};
 pub use general::{
-    EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig, MarkdownConfig, ModelRef,
-    ModelsConfig, SafetyMode, ShellFilterConfig, ShellFilterOverride, TraceConfig, VisionModel,
-    EMBEDDING_MODEL_SENTINEL_HASH,
+    EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig, LayaMode, MarkdownConfig,
+    ModelRef, ModelsConfig, SafetyMode, ShellFilterConfig, ShellFilterOverride, TraceConfig,
+    VisionModel, EMBEDDING_MODEL_SENTINEL_HASH,
 };
 pub use keys::KeyStore;
 pub use mcp::McpServerDef;

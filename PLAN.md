@@ -1145,6 +1145,14 @@ product.
   carries the toggle, endpoint URL, install hints, and live status (2027-01-16,
   backlog bb54bdcc; the four consumer features — model routing, tool steering,
   failure triage, memory typing — follow, each confidence-gated).
+- **Managed Laya runtime** (`src-tauri/src/ipc/laya.rs`) — embedding-parity
+  UX for the classifier: Settings → Classifier downloads a self-contained
+  runtime (uv binary + virtualenv + `laya[serve]` + checkpoint, ~0.8–1 GB
+  plus the checkpoint, under the app config dir) with live progress, and
+  while managed mode is enabled the app automatically starts, monitors, and
+  stops the `laya-serve` sidecar on 127.0.0.1 (startup hook + save-driven
+  rewire + app-exit stop). No command line, no Python prerequisites;
+  external mode (user-run endpoint) is preserved.
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

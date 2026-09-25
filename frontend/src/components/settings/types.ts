@@ -421,12 +421,16 @@ export function serializeChat(d: ChatDraft): string {
 }
 
 /**
- * Snapshot of the Laya classifier draft (for dirty / discard). `endpoint` is
- * the raw input value; "" means "not configured" (the backend clears the
- * stored URL when the save patch carries a blank string).
+ * Snapshot of the Laya classifier draft (for dirty / discard). `mode` picks
+ * managed (Mnemo downloads + runs laya-serve) vs external; `checkpoint` is
+ * the managed-mode checkpoint id; `endpoint` is the raw external-mode input
+ * value; "" means "not configured" (the backend clears the stored URL when
+ * the save patch carries a blank string).
  */
 export interface ClassifierDraft {
   enabled: boolean;
+  mode: "external" | "managed";
+  checkpoint: string;
   endpoint: string;
 }
 

@@ -7,10 +7,12 @@
  * tests in the style of ChatSection.test.ts (vitest runs in `node` env — no
  * React DOM infra).
  *
- * Pins the three surfaces of the opt-in contract: the section is registered
- * (nav + deep-link id), it persists the two config keys through the shared
- * save path, and the frontend bindings stay wired to the backend's exact
- * names (command, event, config + patch fields, snapshot field).
+ * Pins the surfaces of the opt-in contract: the section is registered
+ * (nav + deep-link id), it persists the config keys through the shared save
+ * path, the managed-runtime controls (mode toggle + checkpoint catalog +
+ * download progress) stay wired, and the frontend bindings stay wired to the
+ * backend's exact names (commands, event, config + patch fields, snapshot
+ * field).
  */
 
 import { describe, expect, it } from "vitest";
@@ -53,23 +55,54 @@ describe("Classifier settings section placement", () => {
 });
 
 describe("ClassifierSection owns the opt-in controls", () => {
-  it("renders the enable toggle, the endpoint input and the install hints", () => {
+  it("renders the enable toggle, the mode toggle and the external endpoint field", () => {
     expect(classifierSource).toContain("Enable the Laya classifier");
+    expect(classifierSource).toContain("Managed — recommended");
+    expect(classifierSource).toContain("External endpoint (advanced)");
     expect(classifierSource).toContain("laya-serve endpoint URL");
+  });
+
+  it("keeps the do-it-yourself install hints for external mode", () => {
     expect(classifierSource).toContain("pip install");
     expect(classifierSource).toContain("laya-serve");
   });
 
-  it("shows the live status (disabled / ready / failed) via the bindings", () => {
+  it("wires the managed checkpoint catalog + download through the bindings", () => {
+    expect(classifierSource).toContain("listLayaCheckpoints");
+    expect(classifierSource).toContain("setupLayaRuntime");
+    expect(classifierSource).toContain("Download (~{c.size_mb} MB)");
+    expect(classifierSource).toContain('name="laya-checkpoint"');
+  });
+
+  it("shows download progress from the downloading status payload", () => {
+    expect(classifierSource).toContain("typeof status === \"object\"");
+    expect(classifierSource).toContain("fmtPct");
+    expect(classifierSource).toContain(
+      "next.downloading.progress",
+    );
+  });
+
+  it("surfaces the honest disk-size note for the managed runtime", () => {
+    expect(classifierSource).toContain("~0.8–1 GB");
+  });
+
+  it("shows the live status (incl. installing / starting) via the bindings", () => {
     expect(classifierSource).toContain("getClassifierStatus");
     expect(classifierSource).toContain("onClassifierStatus");
     expect(classifierSource).toContain("Disabled — no classifier backend exists");
     expect(classifierSource).toContain("Failed — the last call got no answer");
+    expect(classifierSource).toContain("Installing — preparing the managed Laya runtime");
+    expect(classifierSource).toContain("Starting — launching the local laya-serve sidecar");
   });
 
   it("persists the opt-in through saveSettings (config.toml [general.laya])", () => {
     expect(classifierSource).toContain("laya_enabled: enabled");
-    expect(classifierSource).toContain("laya_endpoint: endpoint");
+    expect(classifierSource).toContain("laya_mode: mode");
+    expect(classifierSource).toContain("laya_checkpoint: checkpoint");
+    // Managed mode never persists an external endpoint (blank clears it).
+    expect(classifierSource).toContain(
+      'laya_endpoint: mode === "managed" ? "" : endpoint',
+    );
   });
 
   it("keeps the dialog save contract (forwardRef + dirty callback)", () => {
@@ -85,45 +118,64 @@ describe("classifier bindings stay wired to the backend names", () => {
   });
 
   it("the status listener targets the classifier://status event", () => {
-    expect(tauriSource).toContain('listen<string>("classifier://status"');
+    expect(tauriSource).toContain(
+      'listen<ClassifierStatusWire>("classifier://status"',
+    );
+  });
+
+  it("the managed-runtime commands target laya_catalog + laya_setup", () => {
+    expect(tauriSource).toContain('invoke("laya_catalog")');
+    expect(tauriSource).toContain('invoke("laya_setup", { checkpoint })');
   });
 
   it("the settings types carry the laya fields (config + save patch)", () => {
     expect(tauriSource).toContain(
-      "laya?: { enabled: boolean; endpoint: string | null };",
+      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n    };',
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
     expect(tauriSource).toContain("laya_endpoint?: string;");
+    expect(tauriSource).toContain('laya_mode?: "external" | "managed";');
+    expect(tauriSource).toContain("laya_checkpoint?: string;");
   });
 
   it("the startup snapshot type carries classifier_status", () => {
-    expect(tauriSource).toContain("classifier_status: string;");
+    expect(tauriSource).toContain("classifier_status: ClassifierStatusWire;");
   });
 });
 
 describe("serializeClassifier", () => {
   const base: ClassifierDraft = {
     enabled: true,
-    endpoint: "http://127.0.0.1:8000",
+    mode: "managed",
+    checkpoint: "english",
+    endpoint: "",
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
     expect(serializeClassifier(base)).toBe(serializeClassifier({ ...base }));
   });
 
-  it("distinguishes drafts that differ in either field (dirty detection)", () => {
+  it("distinguishes drafts that differ in any field (dirty detection)", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, enabled: false }),
     );
     expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({ ...base, endpoint: "" }),
+      serializeClassifier({ ...base, mode: "external" as const }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, checkpoint: "multilingual" }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, endpoint: "http://127.0.0.1:8000" }),
     );
   });
 
-  it("matches the persisted opt-in shape (enabled + endpoint)", () => {
+  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
-      endpoint: "http://127.0.0.1:8000",
+      mode: "managed",
+      checkpoint: "english",
+      endpoint: "",
     });
   });
 });

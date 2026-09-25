@@ -20,6 +20,17 @@ anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
 log = "0.4"
+# Managed Laya runtime (ipc/laya.rs): the uv download + readiness probe ride
+# reqwest (same version/feature set as the mnemo lib so the crate unifies),
+# and the uv release archives extract via zip (Windows asset) + tar/flate2
+# (unix assets).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "stream"] }
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+# uv release-asset digest verification (ipc/laya.rs verify_sha256) — same
+# version the mnemo lib pins for oauth PKCE, so the crate unifies.
+sha2 = "0.10"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

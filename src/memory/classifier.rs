@@ -7,7 +7,10 @@
 //! [`Classifier`] answers typed questions (`choice` / `score` / `noul`)
 //! about a state text. The only configured backend is a `laya-serve`
 //! instance reached over HTTP (`POST /v1/systemone` — Laya's Jev-compatible
-//! wire protocol). The classifier is **opt-in and disabled by default**:
+//! wire protocol); in managed mode the app itself downloads and runs that
+//! instance as a sidecar (the `ipc::laya` runtime module in the app crate),
+//! while external mode points at a user-run instance. The classifier is
+//! **opt-in and disabled by default**:
 //! with Laya off (or enabled without an endpoint) `build_classifier` returns
 //! `None` and the runtime slot stays empty — no backend object exists at all,
 //! so there are zero calls, zero cost, and zero new failure modes.
@@ -112,9 +115,19 @@ impl Answer {
 /// The live status of the classifier, surfaced to the UI. Off by default —
 /// with Laya disabled (or unconfigured) the app behaves exactly as before.
 ///
+/// The managed-runtime lifecycle adds three transient states (the embedding
+/// models' honesty contract: never show "ready" before it is):
+/// `Installing` / `Downloading` while the Settings → Classifier setup
+/// pipeline fetches the uv binary, builds the venv, and pulls the
+/// checkpoint; `Starting` between spawning the local `laya-serve` sidecar
+/// and its first successful answer. A terminal `Ready` / `Failed` always
+/// follows.
+///
 /// Serialization is externally tagged (the default): unit variants serialize
 /// as bare lowercase strings (`"disabled"`, …) matching the frontend string
-/// comparisons (the [`EmbedderStatus`](super::EmbedderStatus) convention).
+/// comparisons (the [`EmbedderStatus`](super::EmbedderStatus) convention);
+/// `Downloading` serializes as `{"downloading": {"label": …, "progress": …}}`
+/// exactly like [`EmbedderStatus::Downloading`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClassifierStatus {
@@ -127,6 +140,22 @@ pub enum ClassifierStatus {
     /// Calls keep being attempted — a success flips back to `Ready` — while
     /// callers fall back on the `None` answer.
     Failed,
+    /// The managed runtime is installing (Python env / `laya[serve]`
+    /// packages) — no download progress yet. Set only by the setup pipeline.
+    Installing,
+    /// A managed-runtime asset is downloading. `label` names the asset
+    /// (`"uv"`, `"runtime"`, the checkpoint id); `progress` is a
+    /// best-effort 0.0–1.0.
+    Downloading {
+        /// Human-facing asset name.
+        label: String,
+        /// Best-effort fraction downloaded (0.0–1.0).
+        progress: f64,
+    },
+    /// The managed `laya-serve` sidecar has been spawned on `127.0.0.1` but
+    /// has not answered the readiness probe yet — `Ready` (probe ok) or
+    /// `Failed` (timeout/crash) follows.
+    Starting,
 }
 
 impl Default for ClassifierStatus {
@@ -380,6 +409,38 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ClassifierStatus::Failed).unwrap(),
             serde_json::json!("failed")
+        );
+        // The managed-runtime lifecycle variants: bare strings for the unit
+        // states, an object for the progress-carrying one (the EmbedderStatus
+        // `downloading` shape).
+        assert_eq!(
+            serde_json::to_value(ClassifierStatus::Installing).unwrap(),
+            serde_json::json!("installing")
+        );
+        assert_eq!(
+            serde_json::to_value(ClassifierStatus::Starting).unwrap(),
+            serde_json::json!("starting")
+        );
+        assert_eq!(
+            serde_json::to_value(ClassifierStatus::Downloading {
+                label: "runtime".into(),
+                progress: 0.5
+            })
+            .unwrap(),
+            serde_json::json!({"downloading": {"label": "runtime", "progress": 0.5}})
+        );
+        // And the JSON shape round-trips back.
+        let back: ClassifierStatus =
+            serde_json::from_value(serde_json::json!({
+                "downloading": {"label": "english", "progress": 0.25}
+            }))
+            .unwrap();
+        assert_eq!(
+            back,
+            ClassifierStatus::Downloading {
+                label: "english".into(),
+                progress: 0.25
+            }
         );
     }
 

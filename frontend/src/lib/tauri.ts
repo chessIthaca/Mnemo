@@ -255,12 +255,14 @@ export interface StartupSnapshot {
   embedder_status: string;
   /**
    * Laya classifier status: `"disabled"` (the default — Laya is opt-in and no
-   * classifier backend exists), `"ready"`, or `"failed"` (the endpoint failed
-   * the last call). Seed value for status consumers; the Settings → Classifier
+   * classifier backend exists), `"ready"`, `"failed"` (the endpoint failed
+   * the last call), `"installing"` / `"starting"` (managed runtime phases),
+   * or `{ downloading: { label, progress } }` while a managed-runtime piece
+   * downloads. Seed value for status consumers; the Settings → Classifier
    * section reads the live status via `getClassifierStatus()` and the
    * `classifier://status` event.
    */
-  classifier_status: string;
+  classifier_status: ClassifierStatusWire;
   /**
    * Same-project instance conflict: set when another LIVE mnemo instance
    * already holds this project — the app asks before opening it (a second
@@ -444,9 +446,16 @@ export interface AppSettings {
     vision_model?: VisionModelConfig | null;
     embedding_model?: EmbeddingModelConfig | null;
     bundled_embedding_model?: string | null;
-    /** Laya classifier (opt-in) — whether it is enabled + the configured
+    /** Laya classifier (opt-in) — whether it is enabled, the runtime `mode`
+     *  ("managed": Mnemo downloads + runs laya-serve as a sidecar; "external":
+     *  the user runs it), the managed-mode checkpoint id, and the external
      *  `laya-serve` base URL (`null` = not configured). */
-    laya?: { enabled: boolean; endpoint: string | null };
+    laya?: {
+      enabled: boolean;
+      endpoint: string | null;
+      mode: "external" | "managed";
+      checkpoint: string | null;
+    };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
      *  default; debug builds always expose it regardless). */
@@ -546,6 +555,11 @@ export interface SettingsSavePatch {
   laya_enabled?: boolean;
   /** Laya `laya-serve` base URL; a blank string clears it. */
   laya_endpoint?: string;
+  /** Laya runtime mode: "managed" (Mnemo downloads + runs the sidecar) or
+   * "external" (user-provided endpoint). */
+  laya_mode?: "external" | "managed";
+  /** Managed mode: the checkpoint id to serve ("english" | "multilingual"). */
+  laya_checkpoint?: string;
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
@@ -651,24 +665,68 @@ export function onEmbedderStatus(
 }
 
 /**
- * Get the live Laya classifier status ("disabled" / "ready" / "failed").
+ * The Laya classifier status wire form: a unit-variant string, or the
+ * downloading payload `{ downloading: { label, progress } }` (progress 0–1)
+ * while a managed-runtime piece (uv / venv / checkpoint) downloads.
+ */
+export type ClassifierStatusWire =
+  | "disabled"
+  | "ready"
+  | "failed"
+  | "installing"
+  | "starting"
+  | { downloading: { label: string; progress: number } };
+
+/**
+ * Get the live Laya classifier status.
  * `disabled` is the default — Laya is opt-in and, while it is off, no
  * classifier backend exists and no call is ever made.
  */
-export async function getClassifierStatus(): Promise<string> {
+export async function getClassifierStatus(): Promise<ClassifierStatusWire> {
   return await invoke("get_classifier_status");
 }
 
 /**
  * Subscribe to Laya classifier status changes (`classifier://status` — emitted
- * at startup and after a settings save rewires the backend).
+ * at startup, during managed-runtime setup/startup phases, and after a
+ * settings save rewires the backend).
  */
 export function onClassifierStatus(
-  handler: (status: string) => void,
+  handler: (status: ClassifierStatusWire) => void,
 ): Promise<UnlistenFn> {
-  return listen<string>("classifier://status", (event) => {
+  return listen<ClassifierStatusWire>("classifier://status", (event) => {
     handler(event.payload);
   });
+}
+
+// ── Managed Laya runtime (download in Settings, Mnemo runs it) ─────────────
+
+/** A managed-Laya checkpoint catalog entry (Settings → Classifier). */
+export interface LayaCheckpointInfo {
+  /** The checkpoint id (`"english"` | `"multilingual"`). */
+  id: string;
+  /** Human-facing name. */
+  name: string;
+  /** Approximate download size (MiB). */
+  size_mb: number;
+  /** Whether this checkpoint was downloaded by a completed setup. */
+  installed: boolean;
+}
+
+/** List the managed-Laya checkpoints, each flagged `installed`. */
+export async function listLayaCheckpoints(): Promise<LayaCheckpointInfo[]> {
+  return await invoke("laya_catalog");
+}
+
+/**
+ * Download the managed Laya runtime (uv + venv + `laya[serve]` + the
+ * checkpoint) in the background. Fire-and-forget: emits `classifier://status`
+ * events — `installing` / `downloading { label, progress }` phases, then
+ * `ready` (or `failed`) — and starts the sidecar when the saved config
+ * already enables managed mode.
+ */
+export async function setupLayaRuntime(checkpoint: string): Promise<void> {
+  await invoke("laya_setup", { checkpoint });
 }
 
 // ── Bundled embedding models (fastembed, in-process) ───────────────────────

@@ -87,12 +87,80 @@ pub(super) fn rewire_vision_embedder_and_classifier(
     // `None` + status Disabled (no client, no calls); the slot swap is what
     // items 2-5 read. `build_classifier` also writes the shared status, so the
     // Settings section sees the new state on its next read.
-    let new_classifier = build_classifier(cfg, state.runtime.classifier_status.clone());
-    *state
-        .runtime
-        .classifier
-        .write()
-        .expect("classifier lock poisoned") = new_classifier;
+    //
+    // Managed mode takes the sidecar path instead: the app owns the runtime,
+    // so the rewire stops any running child first (a reconfigure must never
+    // leave a stale sidecar bound to a dead endpoint), and when enabled +
+    // installed swaps the slot to a pre-allocated loopback port and starts
+    // the new sidecar in the background (status Starting → probe →
+    // Ready/Failed on `classifier://status`). The server start never blocks
+    // the save call. External mode keeps the `build_classifier` path.
+    let laya_cfg = &cfg.general.general.laya;
+    if matches!(laya_cfg.mode, mnemo::config::LayaMode::Managed) {
+        let laya = state.runtime.laya.clone();
+        laya.stop();
+        let status = state.runtime.classifier_status.clone();
+        let checkpoint =
+            super::laya::find_checkpoint(laya_cfg.checkpoint.as_deref().unwrap_or("english"));
+        let port = if laya.is_checkpoint_installed(checkpoint.id) {
+            super::laya::LayaManager::alloc_free_port()
+        } else {
+            None
+        };
+        if laya_cfg.enabled && port.is_some() {
+            // Some(port): the client points at the fresh port right away; the
+            // background task drives Starting → Ready/Failed.
+            let port = port.expect("checked is_some above");
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Starting;
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") =
+                super::laya::build_managed_classifier(port, status.clone());
+            let app_handle = Some(app.clone());
+            tauri::async_runtime::spawn(async move {
+                super::laya::start_managed_server(&app_handle, laya, checkpoint, port).await;
+            });
+            eprintln!(
+                "rewire: classifier managed (checkpoint '{}', restarting sidecar)",
+                checkpoint.id
+            );
+        } else if laya_cfg.enabled {
+            // Enabled but the checkpoint is not installed or no free port:
+            // no client, and the hint says where to fix it.
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") = None;
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Disabled;
+            eprintln!(
+                "rewire: classifier managed but not ready (checkpoint '{}' not installed \
+                 or no free loopback port) — run the setup in Settings → Classifier",
+                checkpoint.id
+            );
+        } else {
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") = None;
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Disabled;
+            eprintln!("rewire: classifier cleared (managed disabled)");
+        }
+    } else {
+        let new_classifier = build_classifier(cfg, state.runtime.classifier_status.clone());
+        *state
+            .runtime
+            .classifier
+            .write()
+            .expect("classifier lock poisoned") = new_classifier;
+        eprintln!("rewire: classifier set (from config)");
+    }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").
     let classifier_active = state.classifier().map(|c| c.is_some()).unwrap_or(false);

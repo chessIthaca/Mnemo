@@ -28,6 +28,7 @@ pub mod error;
 pub mod events;
 pub mod files;
 pub mod keys;
+pub mod laya;
 pub mod mcp;
 pub mod memory_debug;
 pub mod memory_maintenance;

@@ -520,6 +520,7 @@ fn main() {
                             embedder_status: brain.embedder_status.clone(),
                             classifier_status: brain.classifier_status.clone(),
                             classifier: Arc::new(RwLock::new(brain.classifier.clone())),
+                            laya: brain.laya.clone(),
                             instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
@@ -615,6 +616,26 @@ fn main() {
                             );
                         }
                     }
+
+                    // Managed Laya: the classifier client already points at
+                    // the pre-allocated loopback port (build_brain); spawn
+                    // the sidecar now and drive the status to Ready/Failed
+                    // (progress on classifier://status).
+                    if let Some((checkpoint_id, port)) = &brain.pending_laya_start {
+                        let app_handle = Some(app.handle().clone());
+                        let manager = brain.laya.clone();
+                        let checkpoint = ipc::laya::find_checkpoint(checkpoint_id);
+                        let port = *port;
+                        tauri::async_runtime::spawn(async move {
+                            ipc::laya::start_managed_server(
+                                &app_handle,
+                                manager,
+                                checkpoint,
+                                port,
+                            )
+                            .await;
+                        });
+                    }
                 }
                 Ok(BrainOutcome::NeedsProject(config)) => {
                     // No project resolved at startup — show the project picker.
@@ -631,6 +652,11 @@ fn main() {
                         .unwrap_or_else(|_| Sandbox::new(std::path::Path::new(".")).unwrap());
                     let fallback_safety = Arc::new(RwLock::new(SafetyMode::default()));
                     let mgr = AgentManager::new(256);
+                    // A shared Disabled classifier status + manager pair —
+                    // managed Laya stays inert without a brain, but the
+                    // Settings catalog + setup still work.
+                    let (fallback_classifier_status, laya_manager) =
+                        ipc::laya::fresh_disabled();
                     let fallback_browser = mnemo::browser::BrowserManager::new();
                     attach_child_ensurer(&fallback_browser, app.handle().clone());
                     ipc::browser::spawn_console_forwarder(
@@ -667,10 +693,9 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
-                            classifier_status: Arc::new(RwLock::new(
-                                mnemo::memory::classifier::ClassifierStatus::Disabled,
-                            )),
+                            classifier_status: fallback_classifier_status,
                             classifier: Arc::new(RwLock::new(None)),
+                            laya: laya_manager,
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -716,6 +741,11 @@ fn main() {
                     let fallback_sandbox = Sandbox::new(&cwd)
                         .unwrap_or_else(|_| Sandbox::new(std::path::Path::new(".")).unwrap());
                     let fallback_config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+                    // A shared Disabled classifier status + manager pair —
+                    // managed Laya stays inert without a brain, but the
+                    // Settings catalog + setup still work.
+                    let (fallback_classifier_status, laya_manager) =
+                        ipc::laya::fresh_disabled();
                     let fallback_safety = Arc::new(RwLock::new(SafetyMode::default()));
                     let mgr = AgentManager::new(256);
                     // The brain failed to build, so there is no shared
@@ -758,10 +788,9 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
-                            classifier_status: Arc::new(RwLock::new(
-                                mnemo::memory::classifier::ClassifierStatus::Disabled,
-                            )),
+                            classifier_status: fallback_classifier_status,
                             classifier: Arc::new(RwLock::new(None)),
+                            laya: laya_manager,
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -831,6 +860,8 @@ fn main() {
             ipc::settings::get_classifier_status,
             ipc::embeddings::list_bundled_embedding_models,
             ipc::embeddings::download_bundled_model,
+            ipc::laya::laya_catalog,
+            ipc::laya::laya_setup,
             ipc::keys::get_api_keys,
             ipc::mcp::mcp_list_servers,
             ipc::mcp::mcp_save_servers,
@@ -922,6 +953,10 @@ fn main() {
                 if let Some(watchdog) = &app_handle.state::<IpcState>().watchdog {
                     watchdog.stop();
                 }
+
+                // Stop the managed laya-serve sidecar — it must never
+                // outlive the app (the LayaManager Drop is the backstop).
+                app_handle.state::<IpcState>().runtime.laya.stop();
 
                 // Drain any queued trace/provider-error log writes before the
                 // process exits — mirroring is asynchronous (background writer
@@ -1022,6 +1057,15 @@ pub(crate) struct Brain {
     /// `None` while disabled (no client is built and no call is ever made).
     /// Moved into the `IpcState` slot at startup; items 2-5 consume it there.
     pub(crate) classifier: Option<Arc<dyn mnemo::memory::classifier::Classifier>>,
+    /// The managed Laya runtime owner — the same `Arc` held by `IpcState`,
+    /// so the startup auto-start hook, the Settings rewire, and app exit
+    /// all steer one sidecar. `pub(crate)` so those paths can reach it.
+    pub(crate) laya: Arc<ipc::laya::LayaManager>,
+    /// Managed Laya start work the startup hooks owe: the checkpoint id +
+    /// the pre-allocated loopback port the classifier client was built
+    /// against. `pub(crate)` so the GUI + console hooks can spawn the
+    /// sidecar (the mirror of the deferred embedder fields above).
+    pub(crate) pending_laya_start: Option<(String, u16)>,
     /// A configured bundled embedding model that wasn't installed at startup
     /// (first run): the store started on the hash embedder and the setup hook
     /// must download this model in the background, swapping it into the live
@@ -1333,6 +1377,61 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         mnemo::memory::classifier::ClassifierStatus::Disabled,
     ));
     let classifier = build_classifier(&config, classifier_status.clone());
+    // The managed-runtime owner sharing the same status — inert until the
+    // startup hook / Settings rewire enable managed mode.
+    let laya = Arc::new(ipc::laya::LayaManager::new(classifier_status.clone()));
+
+    // Managed mode (`mode = "managed"`): the app owns the runtime. When
+    // enabled + the checkpoint is installed, the classifier client points
+    // at the loopback sidecar the startup hook spawns right after this
+    // (status Starting until the probe answers). Enabled but not installed
+    // ⇒ a hint is logged and no client exists (the Settings → Classifier
+    // setup completes it; `laya_setup` then starts the server and swaps
+    // the client in). External mode is untouched — `build_classifier`
+    // above handled it and returned None here.
+    let mut pending_laya_start = None;
+    let managed_classifier = match (
+        config.general.general.laya.mode,
+        config.general.general.laya.enabled,
+    ) {
+        (mnemo::config::LayaMode::Managed, true) => {
+            let checkpoint = ipc::laya::find_checkpoint(
+                config
+                    .general
+                    .general
+                    .laya
+                    .checkpoint
+                    .as_deref()
+                    .unwrap_or("english"),
+            );
+            if laya.is_checkpoint_installed(checkpoint.id) {
+                match ipc::laya::LayaManager::alloc_free_port() {
+                    Some(port) => {
+                        pending_laya_start = Some((checkpoint.id.to_string(), port));
+                        *classifier_status.write().expect("classifier status lock poisoned") =
+                            mnemo::memory::classifier::ClassifierStatus::Starting;
+                        ipc::laya::build_managed_classifier(port, classifier_status.clone())
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: no free loopback port for the managed laya-serve; \
+                             the classifier stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                eprintln!(
+                    "info: [general.laya] managed mode is enabled but the '{}' \
+                     checkpoint is not downloaded — run the setup in Settings → Classifier",
+                    checkpoint.id
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+    let classifier = managed_classifier.or(classifier);
 
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
@@ -1899,8 +1998,10 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         embedder_status,
         classifier_status,
         classifier,
+        laya,
         pending_model_download: pending_download,
         pending_model_load: pending_load,
+        pending_laya_start,
         _graph_watcher: graph_watcher,
     }))
 }

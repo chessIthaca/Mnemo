@@ -9,6 +9,7 @@
 //! pre-v1 `sqlite-vec` FFI complexity while staying within SQLite's sweet spot
 //! (hundreds to low-thousands of entries per project).
 
+pub mod auto_typing;
 pub mod classifier;
 pub mod consolidation;
 pub mod embedder;

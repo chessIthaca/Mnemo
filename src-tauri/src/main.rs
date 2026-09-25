@@ -519,7 +519,7 @@ fn main() {
                             needs_project: false,
                             embedder_status: brain.embedder_status.clone(),
                             classifier_status: brain.classifier_status.clone(),
-                            classifier: Arc::new(RwLock::new(brain.classifier.clone())),
+                            classifier: brain.classifier_slot.clone(),
                             laya: brain.laya.clone(),
                             instance_conflict,
                         },
@@ -1053,10 +1053,14 @@ pub(crate) struct Brain {
     /// the enabled/disabled/failed state surfaces live to Settings. `Disabled`
     /// unless the config enables Laya with an endpoint.
     pub(crate) classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
-    /// The built Laya classifier when the config enables it with an endpoint —
-    /// `None` while disabled (no client is built and no call is ever made).
-    /// Moved into the `IpcState` slot at startup; items 2-5 consume it there.
-    pub(crate) classifier: Option<Arc<dyn mnemo::memory::classifier::Classifier>>,
+    /// The shared classifier SLOT (the live handle, backlog a147b63c):
+    /// created in `build_brain_inner` and shared by the factory's
+    /// `memory_write` tools (call-time read) and the IPC `RuntimeState`
+    /// (rewire swaps it) — one Arc, no rebuilds. The auto-typing FLAG
+    /// mirror lives in the factory's gate handle (Settings saves flip it
+    /// via `set_auto_typing_enabled`).
+    pub(crate) classifier_slot:
+        Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
     /// The managed Laya runtime owner — the same `Arc` held by `IpcState`,
     /// so the startup auto-start hook, the Settings rewire, and app exit
     /// all steer one sidecar. `pub(crate)` so those paths can reach it.
@@ -1438,6 +1442,16 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         mnemo::config::LayaMode::Managed => managed_classifier,
         _ => managed_classifier.or(classifier),
     };
+    // The shared classifier SLOT + the auto-typing flag (backlog a147b63c):
+    // one Arc pair feeds the factory's memory_write tools (call-time read)
+    // and the IPC RuntimeState (rewire swaps the slot; Settings saves flip
+    // the flag via `set_auto_typing_enabled`).
+    let classifier_slot: Arc<
+        RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>,
+    > = Arc::new(RwLock::new(classifier.clone()));
+    let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.general.general.laya.auto_type_memories,
+    ));
 
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
@@ -1943,6 +1957,14 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // Wire the shared shell-output filter config so a `[shell_filter]` config
     // save is observed live by every ShellTool (no registry rebuild).
     .with_shell_filter_config(shell_filter)
+    // Wire the shared Laya auto-typing gate (backlog a147b63c):
+    // memory_write reads the classifier slot + flag at call time, and
+    // Settings saves flip the flag via `set_auto_typing_enabled` — no
+    // registry rebuild ever needed.
+    .with_auto_typing(mnemo::tool::memory::AutoTypingHandle {
+        classifier: classifier_slot.clone(),
+        enabled: auto_typing_flag.clone(),
+    })
     // Share the headless debug browser with the IPC layer (Browser tab).
     .with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —
@@ -2003,7 +2025,7 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         browser,
         embedder_status,
         classifier_status,
-        classifier,
+        classifier_slot,
         laya,
         pending_model_download: pending_download,
         pending_model_load: pending_load,

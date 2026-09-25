@@ -14,12 +14,15 @@
 pub mod retrieval;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::memory::auto_typing::{self, TypingDecision};
+use crate::memory::classifier::Classifier;
 use crate::memory::consolidation::consolidate_session;
 use crate::memory::indexer::{index_derived, reindex_knowledge_files};
 use crate::memory::knowledge::{self, KnowledgeStore};
@@ -74,6 +77,10 @@ pub struct MemoryWriteTool {
     /// in its worktree while the knowledge store stays factory-wide (the
     /// shared corpus). `None` (main-tree agents, tests) means no lane note.
     agent_root: Option<PathBuf>,
+    /// The Laya auto-typing gate, when wired ([`AutoTypingHandle`]):
+    /// `None` (unwired builds, tests) or an off/empty gate leaves the
+    /// writer's typed prefix byte-identical — zero behavior change.
+    typing: Option<AutoTypingHandle>,
 }
 
 impl MemoryWriteTool {
@@ -83,6 +90,7 @@ impl MemoryWriteTool {
             now: Box::new(utc_now_secs),
             knowledge: None,
             agent_root: None,
+            typing: None,
         }
     }
 
@@ -102,6 +110,7 @@ impl MemoryWriteTool {
             store,
             now: Box::new(utc_now_secs),
             agent_root: None,
+            typing: None,
         }
     }
 
@@ -113,6 +122,36 @@ impl MemoryWriteTool {
         self.agent_root = root;
         self
     }
+
+    /// Wire the Laya auto-typing gate (the shared classifier slot + the
+    /// `[general.laya] auto_type_memories` flag mirror). Both are read at
+    /// call time, so runtime classifier swaps AND Settings flag toggles
+    /// apply without rebuilding the tool.
+    pub fn with_auto_typing(mut self, handle: AutoTypingHandle) -> Self {
+        self.typing = Some(handle);
+        self
+    }
+}
+
+/// The shared auto-typing inputs for [`MemoryWriteTool`]: the app
+/// runtime's live classifier slot plus the config-mirrored enable flag
+/// (`[general.laya] auto_type_memories`, default off).
+///
+/// Reading BOTH at call time means a Settings save takes effect on the
+/// next write with no tool rebuild — and every existing swap site of the
+/// shared slot (external rebuild on save, managed sidecar start, setup
+/// autostart) feeds the tools untouched. The flag is the separate opt-in
+/// the classifier docs require: base checkpoints are over-confident
+/// zero-shot, so auto-typing must only ever run against a fine-tuned
+/// endpoint the user explicitly chose.
+#[derive(Clone)]
+pub struct AutoTypingHandle {
+    /// The app runtime's shared classifier slot — the same `Arc` the IPC
+    /// layer swaps on rewire and managed-mode start.
+    pub classifier: Arc<RwLock<Option<Arc<dyn Classifier>>>>,
+    /// The mirrored `[general.laya] auto_type_memories` flag: while false
+    /// the writer's prefix stands untouched.
+    pub enabled: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -178,7 +217,50 @@ impl Tool for MemoryWriteTool {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
-        let title = args.title;
+        let mut title = args.title;
+        // Laya auto-typing (backlog a147b63c, opt-in): a confident
+        // classifier may correct the writer's typed prefix BEFORE the
+        // record type is derived — one retitle then lands everywhere (the
+        // knowledge dir + file, the row's record_type, the slug). Every
+        // not-usable outcome keeps the writer's title; an unwired gate, an
+        // off flag, or an empty slot never even asks, so disabled behavior
+        // is byte-identical.
+        let typing_note: Option<String> = match self
+            .typing
+            .as_ref()
+            .filter(|gate| gate.enabled.load(Ordering::Relaxed))
+        {
+            Some(gate) => {
+                // Clone out of the slot and drop the read guard before the
+                // await (a held guard across the await could deadlock a
+                // concurrent swap).
+                let classifier = gate
+                    .classifier
+                    .read()
+                    .expect("classifier typing slot lock poisoned")
+                    .clone();
+                match classifier {
+                    Some(classifier) => {
+                        let decision = auto_typing::auto_type(
+                            classifier.as_ref(),
+                            &title,
+                            &args.content,
+                        )
+                        .await;
+                        match decision {
+                            TypingDecision::Retype { from, to, confidence } => {
+                                let note = auto_typing_note(from, to, confidence);
+                                title = auto_typing::retitle(&title, to);
+                                Some(note)
+                            }
+                            TypingDecision::KeepWriter { reason } => keep_writer_note(reason),
+                        }
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
         let record_type = MemoryRecordType::from_title(&title);
         // Knowledge-backed typed write: the record's FILE is the truth — the
         // body is UNBOUNDED (the indexer budgets the derived digest, so the
@@ -230,12 +312,17 @@ impl Tool for MemoryWriteTool {
                                 );
                             }
                         }
+                        if let Some(note) = &typing_note {
+                            msg.push_str(" — ");
+                            msg.push_str(note);
+                        }
                         ToolResult::success(msg).with_data(json!({
                             "id": row_id,
                             "tier": tier.as_str(),
                             "title": title,
                             "record_type": record_type.as_str(),
                             "knowledge": format!(".coding/knowledge/{rel}"),
+                            "auto_typed": typing_note,
                         }))
                     }
                     Err(e) => ToolResult::error(format!("failed to index knowledge record: {e}")),
@@ -260,15 +347,50 @@ impl Tool for MemoryWriteTool {
                         msg.push_str(" — ");
                         msg.push_str(suffix);
                     }
+                    if let Some(note) = &typing_note {
+                        msg.push_str(" — ");
+                        msg.push_str(note);
+                    }
                     ToolResult::success(msg).with_data(json!({
                         "id": id,
                         "tier": tier.as_str(),
                         "title": title,
+                        "auto_typed": typing_note,
                     }))
                 }
                 Err(e) => ToolResult::error(format!("failed to write memory: {e}")),
             }
         }
+    }
+}
+
+/// The result-message clause for one auto-typing RETYPE: what was
+/// corrected (the writer's prefix — or "(untyped)" — to the classifier's)
+/// and the confidence that cleared the threshold.
+fn auto_typing_note(from: MemoryRecordType, to: MemoryRecordType, confidence: f64) -> String {
+    let from = auto_typing::prefix_for(from).unwrap_or("(untyped)");
+    let to = auto_typing::prefix_for(to).unwrap_or("(untyped)");
+    format!("auto-typed {to} (was {from}, confidence {confidence:.2})")
+}
+
+/// The result-message clause for one auto-typing KEEP, or `None` when
+/// there is nothing worth reporting (the classifier agreed with the
+/// writer). Low confidence / no answer / unknown label each get one short
+/// clause — calibration observability without changing the write.
+fn keep_writer_note(reason: auto_typing::TypingKeepReason) -> Option<String> {
+    use auto_typing::TypingKeepReason;
+    match reason {
+        TypingKeepReason::Agrees => None,
+        TypingKeepReason::NoAnswer => {
+            Some("classifier kept the writer's prefix (no answer)".to_string())
+        }
+        TypingKeepReason::LowConfidence(confidence) => Some(format!(
+            "classifier kept the writer's prefix (confidence {confidence:.2} < {:.2})",
+            auto_typing::AUTO_TYPE_THRESHOLD
+        )),
+        TypingKeepReason::UnknownLabel(label) => Some(format!(
+            "classifier kept the writer's prefix (unknown label '{label}')"
+        )),
     }
 }
 
@@ -1475,6 +1597,210 @@ mod tests {
             MemorySupersedeTool::with_knowledge(store.clone(), knowledge.clone(), &plans_dir);
         let delete = MemoryDeleteTool::with_knowledge(store.clone(), knowledge.clone(), &plans_dir);
         (knowledge, write, update, supersede, delete)
+    }
+
+    /// A stub classifier answering one fixed choice — the acceptance
+    /// stand-in for a fine-tuned Laya checkpoint (`label: None` models
+    /// every no-answer path).
+    struct StubTypingClassifier {
+        label: Option<&'static str>,
+        confidence: f64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::memory::classifier::Classifier for StubTypingClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &crate::memory::classifier::Question,
+        ) -> Option<crate::memory::classifier::Answer> {
+            self.label.map(|label| crate::memory::classifier::Answer::Choice {
+                label: label.to_string(),
+                confidence: self.confidence,
+                probabilities: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    /// Build an auto-typing gate around an optional classifier; `enabled`
+    /// mirrors the `[general.laya] auto_type_memories` flag.
+    fn typing_handle(
+        classifier: Option<std::sync::Arc<dyn crate::memory::classifier::Classifier>>,
+        enabled: bool,
+    ) -> AutoTypingHandle {
+        AutoTypingHandle {
+            classifier: std::sync::Arc::new(std::sync::RwLock::new(classifier)),
+            enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_typing_disabled_leaves_the_title_byte_identical() {
+        // Acceptance pin: auto-typing unwired (flag off — the factory passes
+        // no slot) OR the slot empty (Laya off) — the write is byte-identical
+        // to the pre-auto-typing behavior: same title, same type, no
+        // classifier clause anywhere.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: mistyped but untouched",
+                "content": "Body."
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "SPEC: mistyped but untouched");
+        assert_eq!(data["record_type"], "spec");
+        assert!(data["auto_typed"].is_null());
+        assert!(!result.output.contains("classifier"));
+
+        // Empty slot (wired + flag on but Laya off): zero-change behavior.
+        let (_knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let write = write.with_auto_typing(typing_handle(None, true));
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: mistyped but untouched",
+                "content": "Body."
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "SPEC: mistyped but untouched");
+        assert_eq!(data["record_type"], "spec");
+        assert!(data["auto_typed"].is_null());
+        assert!(!result.output.contains("classifier"));
+
+        // Flag off (the config default — this is the Arc a Settings save
+        // flips): even a confident classifier is never consulted.
+        let (_knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let write = write.with_auto_typing(typing_handle(
+            Some(
+                std::sync::Arc::new(StubTypingClassifier {
+                    label: Some("BUG"),
+                    confidence: 0.99,
+                }) as std::sync::Arc<dyn crate::memory::classifier::Classifier>,
+            ),
+            false,
+        ));
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: mistyped but untouched",
+                "content": "Body."
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "SPEC: mistyped but untouched");
+        assert_eq!(data["record_type"], "spec");
+        assert!(!result.output.contains("classifier"));
+    }
+
+    #[tokio::test]
+    async fn auto_typing_confident_stub_retypes_a_mistyped_record() {
+        // Acceptance: Laya enabled + a confident (stub) classifier saying BUG
+        // while the writer titled it SPEC: — one retitle lands everywhere:
+        // the knowledge FILE moves to bug/, the row's record_type is bug,
+        // and message + data note the correction.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let write = write.with_auto_typing(typing_handle(
+            Some(
+                std::sync::Arc::new(StubTypingClassifier {
+                    label: Some("BUG"),
+                    confidence: 0.93,
+                }) as std::sync::Arc<dyn crate::memory::classifier::Classifier>,
+            ),
+            true,
+        ));
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: tabs lost on save",
+                "content": "Symptom: tabs vanish on save. Root cause: …"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "BUG: tabs lost on save");
+        assert_eq!(data["record_type"], "bug");
+        assert_eq!(
+            data["auto_typed"],
+            "auto-typed BUG: (was SPEC:, confidence 0.93)"
+        );
+        assert!(result.output.contains("auto-typed"));
+        assert!(result.output.contains(".coding/knowledge/bug/"));
+        // The knowledge FILE is the truth: it landed under bug/.
+        let bug_files =
+            std::fs::read_dir(knowledge.dir().join("bug")).unwrap().count();
+        assert_eq!(bug_files, 1);
+        let spec_files =
+            std::fs::read_dir(knowledge.dir().join("spec")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(spec_files, 0);
+    }
+
+    #[tokio::test]
+    async fn auto_typing_low_confidence_keeps_the_writers_prefix() {
+        // Acceptance: below the threshold the writer's prefix stands, and
+        // the message says why (calibration observability).
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let write = write.with_auto_typing(typing_handle(
+            Some(
+                std::sync::Arc::new(StubTypingClassifier {
+                    label: Some("BUG"),
+                    confidence: 0.42,
+                }) as std::sync::Arc<dyn crate::memory::classifier::Classifier>,
+            ),
+            true,
+        ));
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: tabs lost on save",
+                "content": "Symptom: tabs vanish on save."
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "SPEC: tabs lost on save");
+        assert_eq!(data["record_type"], "spec");
+        assert!(result.output.contains("classifier kept the writer's prefix"));
+    }
+
+    #[tokio::test]
+    async fn auto_typing_types_an_unprefixed_title() {
+        // The often-omitted-prefix case: a confident classifier applies the
+        // prefix the writer never wrote.
+        let dir = tempdir().unwrap();
+        let store = make_store();
+        let (_knowledge, write, _u, _s, _d) = make_knowledge_tools(&dir, store.clone());
+        let write = write.with_auto_typing(typing_handle(
+            Some(
+                std::sync::Arc::new(StubTypingClassifier {
+                    label: Some("HOW"),
+                    confidence: 0.9,
+                }) as std::sync::Arc<dyn crate::memory::classifier::Classifier>,
+            ),
+            true,
+        ));
+        let result = write
+            .execute(json!({
+                "tier": "semantic",
+                "title": "full test coverage checklist",
+                "content": "Run every suite before claiming green."
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let data = result.data.as_ref().expect("structured data");
+        assert_eq!(data["title"], "HOW: full test coverage checklist");
+        assert_eq!(data["record_type"], "how");
     }
 
     #[tokio::test]

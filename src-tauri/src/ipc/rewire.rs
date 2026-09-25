@@ -161,6 +161,14 @@ pub(super) fn rewire_vision_embedder_and_classifier(
             .expect("classifier lock poisoned") = new_classifier;
         eprintln!("rewire: classifier set (from config)");
     }
+    // Auto-typing flag (backlog a147b63c): memory_write reads the shared
+    // classifier slot + this mirrored flag at call time, so the Settings
+    // toggle lands on the very next write — no restart, no registry
+    // rebuild. The slot itself needs no touch here: every swap above
+    // writes the same Arc the factory's tools hold.
+    if let Some(factory) = &state.runtime.factory {
+        factory.set_auto_typing_enabled(laya_cfg.auto_type_memories);
+    }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").
     let classifier_active = state.classifier().map(|c| c.is_some()).unwrap_or(false);

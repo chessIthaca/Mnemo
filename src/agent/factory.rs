@@ -72,8 +72,8 @@ use crate::tool::agent::{
 };
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::{
-    MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool, MemorySupersedeTool,
-    MemoryUpdateTool, MemoryWriteTool,
+    AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
+    MemorySupersedeTool, MemoryUpdateTool, MemoryWriteTool,
 };
 use crate::tool::workflow::ask_user::AskUserTool;
 use crate::tool::workflow::plan::{
@@ -174,6 +174,11 @@ pub struct AgentLoopFactory {
     /// LLM at call time (currently `memory_consolidate`) see Settings swaps on
     /// their next call without rebuilding the registry. Mirrors `vision`.
     provider_slot: Arc<SwappableProvider>,
+    /// The shared Laya auto-typing gate for `memory_write` (backlog
+    /// a147b63c) — `None` until the IPC layer wires it via
+    /// `with_auto_typing` (the app runtime's shared classifier slot + the
+    /// `auto_type_memories` flag mirror).
+    typing: Option<AutoTypingHandle>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -343,6 +348,11 @@ impl AgentLoopFactory {
             // until the IPC layer pushes the loaded value at startup.
             browser_inspection: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp: None,
+            // No auto-typing gate at construction — the IPC layer wires it
+            // via `with_auto_typing` once the app runtime's classifier slot
+            // exists (backlog a147b63c). Until then `memory_write` never
+            // asks a classifier.
+            typing: None,
         }
     }
 
@@ -354,6 +364,26 @@ impl AgentLoopFactory {
     pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    /// Wire the shared Laya auto-typing gate (backlog a147b63c): the
+    /// `memory_write` tool reads the shared classifier slot + the
+    /// `[general.laya] auto_type_memories` flag at call time. When not
+    /// wired, `memory_write` keeps its pre-auto-typing behavior.
+    pub fn with_auto_typing(mut self, handle: AutoTypingHandle) -> Self {
+        self.typing = Some(handle);
+        self
+    }
+
+    /// Flip the auto-typing enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this so the toggle reaches already-built
+    /// tools with no registry rebuild.
+    pub fn set_auto_typing_enabled(&self, on: bool) {
+        if let Some(handle) = &self.typing {
+            handle
+                .enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The shared MCP manager, when wired (the IPC layer's Settings/Test
@@ -1192,16 +1222,25 @@ impl AgentLoopFactory {
             // reindexing. `None` (a plans dir that implies no root) keeps
             // the historical DB-only behavior.
             let knowledge = self.knowledge.clone();
-            let mk_write = |store: Arc<dyn MemoryStoreTrait>| match &knowledge {
-                Some(k) => MemoryWriteTool::with_knowledge(
-                    store.clone(),
-                    k.clone(),
-                    self.plans_dir.clone(),
-                )
-                // A worktree lane agent shares the factory-wide knowledge
-                // store (main tree) — the tool's result says so explicitly.
-                .with_agent_root(root.map(|r| r.project_root.clone())),
-                None => MemoryWriteTool::new(store.clone()),
+            let typing = self.typing.clone();
+            let mk_write = |store: Arc<dyn MemoryStoreTrait>| {
+                let tool = match &knowledge {
+                    Some(k) => MemoryWriteTool::with_knowledge(
+                        store.clone(),
+                        k.clone(),
+                        self.plans_dir.clone(),
+                    )
+                    // A worktree lane agent shares the factory-wide knowledge
+                    // store (main tree) — the tool's result says so explicitly.
+                    .with_agent_root(root.map(|r| r.project_root.clone())),
+                    None => MemoryWriteTool::new(store.clone()),
+                };
+                // The Laya auto-typing gate rides every memory_write —
+                // call-time reads keep Settings swaps/toggles live.
+                match &typing {
+                    Some(handle) => tool.with_auto_typing(handle.clone()),
+                    None => tool,
+                }
             };
             registry.register(Box::new(mk_write(store.clone())));
             // The single read path: search or browse, any record type, any
@@ -2445,6 +2484,24 @@ mod tests {
             registry2.get("list_models").is_some(),
             "list_models should be registered once a model resolver is wired in"
         );
+    }
+
+    #[test]
+    fn auto_typing_gate_flips_live_through_the_factory() {
+        // The gate's flag is the SAME Arc the rewire path flips via
+        // `set_auto_typing_enabled`, so a Settings toggle reaches
+        // already-built tools with no registry rebuild (backlog a147b63c).
+        let dir = tempdir().unwrap();
+        let handle = AutoTypingHandle {
+            classifier: Arc::new(std::sync::RwLock::new(None)),
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let flag = Arc::clone(&handle.enabled);
+        let factory = make_factory(dir.path()).with_auto_typing(handle);
+        factory.set_auto_typing_enabled(true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        factory.set_auto_typing_enabled(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

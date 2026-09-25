@@ -92,6 +92,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [enabled, setEnabled] = useState(false);
   const [endpoint, setEndpoint] = useState("");
   const [checkpoint, setCheckpoint] = useState("english");
+  // The auto-typing opt-in (`[general.laya] auto_type_memories`) — a
+  // separate toggle from the classifier enable flag.
+  const [autoType, setAutoType] = useState(false);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
   const [snapshot, setSnapshot] = useState<string>("");
   const [status, setStatus] = useState<ClassifierStatusWire>("disabled");
@@ -116,11 +119,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         mode: laya?.mode ?? "managed",
         checkpoint: laya?.checkpoint ?? "english",
         endpoint: laya?.endpoint ?? "",
+        autoTypeMemories: laya?.auto_type_memories ?? false,
       };
       setEnabled(next.enabled);
       setMode(next.mode);
       setCheckpoint(next.checkpoint);
       setEndpoint(next.endpoint);
+      setAutoType(next.autoTypeMemories);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
       // Read the live status directly (not from the startup snapshot) so the
@@ -161,7 +166,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     };
   }, [active]);
 
-  const draft: ClassifierDraft = { enabled, mode, checkpoint, endpoint };
+  const draft: ClassifierDraft = { enabled, mode, checkpoint, endpoint, autoTypeMemories: autoType };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
 
   useEffect(() => {
@@ -187,12 +192,14 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setError(null);
       setOk(false);
       try {
-        // The mode + enable flag + checkpoint ride along so toggling takes
-        // effect without a restart (the backend rewires the live classifier
-        // and starts/stops the managed sidecar). A blank endpoint clears the
+        // The mode + enable flag + checkpoint + the auto-typing opt-in ride
+        // along so toggling takes effect without a restart (the backend
+        // rewires the live classifier — flipping the auto-type flag — and
+        // starts/stops the managed sidecar). A blank endpoint clears the
         // stored URL server-side; managed mode never persists one.
         await saveSettings({
           laya_enabled: enabled,
+          laya_auto_type_memories: autoType,
           laya_mode: mode,
           ...(mode === "managed" ? { laya_checkpoint: checkpoint } : {}),
           laya_endpoint: mode === "managed" ? "" : endpoint,
@@ -247,6 +254,24 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           Enable the Laya classifier
           <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
             — consult it for cheap, calibrated decisions
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={autoType}
+          onChange={(e) => setAutoType(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Auto-type memory records
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — a confident classifier corrects the record's SPEC / DECISION /
+            BUG / PLAN / HOW / REVIEW prefix on write; low confidence keeps
+            yours. Enable only against a fine-tuned checkpoint — base models
+            mis-classify.
           </span>
         </span>
       </label>

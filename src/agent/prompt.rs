@@ -278,6 +278,9 @@ digests to stay compact.
 root cause → fix + regression test name · PLAN: plan digest · HOW: recurring \
 workflow · REVIEW: report digest.
 
+With Laya auto-typing enabled (opt-in), a confident classifier may correct \
+the prefix (low confidence keeps yours) — still choose it well.
+
 Pointer-first: a typed record carries the gist + path/commit pointer; the \
 file stays the truth — read the file for detail.
 

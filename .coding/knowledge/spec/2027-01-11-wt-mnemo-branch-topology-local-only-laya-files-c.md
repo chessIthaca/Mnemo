@@ -1,0 +1,6 @@
++++
+title = "wt/mnemo branch topology — local-only \"laya files\" commit 11a16560 + 7 untracked superseder records"
+created = "2027-01-11"
++++
+
+Repo C:/AgenticCoder/AgenticCoder (origin github.com/chessIthaca/Mnemo). State observed 2026-09-25/26 session. main = 614c42f70206dc1225d028789fb04b89e218bf40 = origin/main (PR #6 merged; remote branch origin/wt/mnemo DELETED, leaving the stale tracking ref .git/refs/remotes/origin/wt/mnemo = ec4605dfa9e9fec1940f94a0c95711f4d89dcc99). Local branch wt/mnemo = 11a16560bd5cf7f96bb8ee22862d85117de3076e ("laya files", parent ec4605d) — the ONLY local-only commit: adds `status = "superseded"` to the front matter of 7 .coding/knowledge/spec/2027-01-11-*.md (Laya suite x4, token dashboard, multi_edit, kNN overlay); those originals carry no status line on main. The matching successor records are UNTRACKED: .coding/knowledge/spec/2027-01-11-*-2.md (765-935 B each, front matter `supersedes = "<slug>"`) — the supersede pair is half-applied until both are committed. Merge geometry: ec4605d is an ancestor of both main and 11a16560, so merge base = ec4605d and `git merge main` into wt/mnemo is content-clean (no source files change; only the 7 knowledge files differ from main). Recovery anchor if the branch ref moves: 11a16560 (also recorded in .git/logs/HEAD).

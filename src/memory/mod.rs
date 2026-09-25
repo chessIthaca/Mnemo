@@ -33,9 +33,10 @@ pub use classifier::{Answer, Classifier, ClassifierStatus, LayaClassifier, NoCla
 pub use embedder::{Embedder, EmbedderStatus, HashEmbedder};
 pub use knowledge::KnowledgeStore;
 pub use types::{
-    DayBreakdown, EpisodicData, Memory, MemoryAccessEntry, MemoryClass, MemoryData, MemoryFilter,
-    MemoryRecordType, MemorySearchConfig, MemoryTier, ModelBreakdown, ProceduralData, ProjectStats,
-    RequestStats, SemanticData, Session, SessionStats, SessionSummary, WorkingData,
+    ArchiveSearchHit, ArchivedToolResult, DayBreakdown, EpisodicData, Memory, MemoryAccessEntry,
+    MemoryClass, MemoryData, MemoryFilter, MemoryRecordType, MemorySearchConfig, MemoryTier,
+    ModelBreakdown, ProceduralData, ProjectStats, RequestStats, SavingsEvent, SemanticData, Session,
+    SessionStats, SessionSummary, WorkingData,
 };
 
 /// A scored memory result.
@@ -382,6 +383,36 @@ pub trait MemoryStoreTrait: Send + Sync {
 
     /// Record one LLM-request usage row (tokens + timing + cached tokens).
     async fn record_request_stats(&self, stats: &RequestStats) -> Result<()>;
+
+    /// Record one token-savings ledger row (an optimization event's
+    /// before/after counts; `tokens_saved` negative for re-expansions).
+    /// Backlog e4a50d22 / 652ae094.
+    async fn record_savings_event(&self, event: &SavingsEvent) -> Result<()>;
+
+    /// List raw `savings_events` rows ordered by creation time. `None`
+    /// session lists across all sessions — the row-level view the
+    /// dashboard aggregates (backlog 652ae094) are built from.
+    async fn savings_events_rows(&self, session_id: Option<&str>) -> Result<Vec<SavingsEvent>>;
+
+    /// Archive the FULL original of an oversized tool result (backlog
+    /// e4a50d22 lever 3) and return the new row id — the handle the context
+    /// preview names so `expand_result` can serve the content back.
+    async fn archive_tool_result(
+        &self,
+        session_id: Option<&str>,
+        tool: &str,
+        detail: Option<&str>,
+        content: &str,
+    ) -> Result<String>;
+
+    /// Fetch one archived tool result by id (its full original content), or
+    /// `None` when the id is unknown.
+    async fn expand_tool_result(&self, id: &str) -> Result<Option<ArchivedToolResult>>;
+
+    /// Keyword-search the tool-result archive (backlog e4a50d22 lever 3) and
+    /// return ids + snippets, newest first. Degrades to a LIKE scan when FTS5
+    /// is unavailable on this build.
+    async fn search_archive(&self, query: &str, limit: usize) -> Result<Vec<ArchiveSearchHit>>;
 
     /// List a session's raw `request_stats` rows (ordered by creation time)
     /// — the row-level view the aggregates are built from, including the
@@ -2094,6 +2125,208 @@ impl MemoryStoreTrait for MemoryStore {
         })
         .await
         .map_err(|e| Error::Memory(format!("record_request_stats task failed: {e}")))?
+    }
+
+    async fn record_savings_event(&self, event: &SavingsEvent) -> Result<()> {
+        let conn = self.conn.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            conn.execute(
+                "INSERT INTO savings_events \
+                 (id, session_id, kind, detail, tokens_before, tokens_after, tokens_saved, \
+                  measured, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    event.id,
+                    event.session_id,
+                    event.kind,
+                    event.detail,
+                    event.tokens_before,
+                    event.tokens_after,
+                    event.tokens_saved,
+                    event.measured,
+                    event.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("record_savings_event task failed: {e}")))?
+    }
+
+    async fn savings_events_rows(&self, session_id: Option<&str>) -> Result<Vec<SavingsEvent>> {
+        let read_conn = self.read_conn().clone();
+        let session_id = session_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || -> Result<Vec<SavingsEvent>> {
+            let conn = read_conn.lock().expect("conn lock poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, kind, detail, tokens_before, tokens_after, \
+                 tokens_saved, measured, created_at FROM savings_events \
+                 WHERE (?1 IS NULL OR session_id = ?1) ORDER BY created_at, id",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(SavingsEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    detail: row.get(3)?,
+                    tokens_before: row.get(4)?,
+                    tokens_after: row.get(5)?,
+                    tokens_saved: row.get(6)?,
+                    measured: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(
+                    row.map_err(|e| Error::Memory(format!("savings_events_rows read failed: {e}")))?,
+                );
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("savings_events_rows task failed: {e}")))?
+    }
+
+    async fn archive_tool_result(
+        &self,
+        session_id: Option<&str>,
+        tool: &str,
+        detail: Option<&str>,
+        content: &str,
+    ) -> Result<String> {
+        let conn = self.conn.clone();
+        let id = uuid::Uuid::new_v4().to_string();
+        let row_id = id.clone();
+        let session_id = session_id.map(|s| s.to_string());
+        let tool = tool.to_string();
+        let detail = detail.map(|s| s.to_string());
+        let content = content.to_string();
+        let char_count = content.chars().count() as i64;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            conn.execute(
+                "INSERT INTO tool_result_archive \
+                 (id, session_id, tool, detail, content, char_count, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![row_id, session_id, tool, detail, content, char_count, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("archive_tool_result task failed: {e}")))??;
+        Ok(id)
+    }
+
+    async fn expand_tool_result(&self, id: &str) -> Result<Option<ArchivedToolResult>> {
+        let read_conn = self.read_conn().clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ArchivedToolResult>> {
+            let conn = read_conn.lock().expect("conn lock poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, tool, detail, content, char_count, created_at \
+                 FROM tool_result_archive WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query_map(params![id], |row| {
+                Ok(ArchivedToolResult {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    tool: row.get(2)?,
+                    detail: row.get(3)?,
+                    content: row.get(4)?,
+                    char_count: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?;
+            match rows.next() {
+                Some(row) => Ok(Some(row.map_err(|e| {
+                    Error::Memory(format!("expand_tool_result read failed: {e}"))
+                })?)),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("expand_tool_result task failed: {e}")))?
+    }
+
+    async fn search_archive(&self, query: &str, limit: usize) -> Result<Vec<ArchiveSearchHit>> {
+        let read_conn = self.read_conn().clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ArchiveSearchHit>> {
+            let conn = read_conn.lock().expect("conn lock poisoned");
+            let limit = limit as i64;
+            // FTS5 MATCH is syntax-sensitive: build a safe conjunction of
+            // quoted terms so a stray `-`/`*`/quote can never raise.
+            let terms: Vec<String> = query
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("\"{}\"", t.replace('"', "")))
+                .collect();
+            if schema::fts_available(&conn) && !terms.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT a.id, a.tool, a.detail, \
+                            snippet(tool_result_archive_fts, 1, '[', ']', '…', 12) \
+                     FROM tool_result_archive_fts \
+                     JOIN tool_result_archive a ON a.rowid = tool_result_archive_fts.rowid \
+                     WHERE tool_result_archive_fts MATCH ?1 \
+                     ORDER BY rank LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![terms.join(" AND "), limit], |row| {
+                    Ok(ArchiveSearchHit {
+                        id: row.get(0)?,
+                        tool: row.get(1)?,
+                        detail: row.get(2)?,
+                        snippet: row.get(3)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(|e| {
+                        Error::Memory(format!("search_archive read failed: {e}"))
+                    })?);
+                }
+                return Ok(out);
+            }
+            // LIKE fallback (no FTS5 on this build, or a query with no
+            // alphanumeric terms): a substring scan, newest first.
+            let like = format!("%{query}%");
+            let mut stmt = conn.prepare(
+                "SELECT id, tool, detail, content FROM tool_result_archive \
+                 WHERE content LIKE ?1 OR IFNULL(detail, '') LIKE ?1 \
+                 ORDER BY created_at DESC, id LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![like, limit], |row| {
+                let content: String = row.get(3)?;
+                let hit = content.find(query.as_str()).unwrap_or(0);
+                let start = content[..hit]
+                    .char_indices()
+                    .rev()
+                    .nth(120)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let snippet: String = content[start..].chars().take(240).collect();
+                Ok(ArchiveSearchHit {
+                    id: row.get(0)?,
+                    tool: row.get(1)?,
+                    detail: row.get(2)?,
+                    snippet,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| Error::Memory(format!("search_archive read failed: {e}")))?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("search_archive task failed: {e}")))?
     }
 
     async fn request_stats_rows(&self, session_id: &str) -> Result<Vec<RequestStats>> {

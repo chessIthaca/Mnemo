@@ -1808,6 +1808,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // a save_settings call (which calls factory.set_shell_filter_config) is
     // observed live on the next command without a registry rebuild.
     let shell_filter = Arc::new(std::sync::RwLock::new(config.general.shell_filter.clone()));
+    // Token-optimizer levers (backlog e4a50d22): live mirror of
+    // `[general.optimizer]`, shared with every lever-bearing tool build.
+    let optimizer_config = Arc::new(std::sync::RwLock::new(
+        config.general.general.optimizer.clone(),
+    ));
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -2004,6 +2009,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // Wire the shared shell-output filter config so a `[shell_filter]` config
     // save is observed live by every ShellTool (no registry rebuild).
     .with_shell_filter_config(shell_filter)
+    // Wire the shared token-optimizer config (backlog e4a50d22) so the
+    // `[general.optimizer]` flags are observed by every lever-bearing
+    // tool build (read_files delta/skeleton re-reads, shell output
+    // compression, …).
+    .with_optimizer_config(optimizer_config)
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no

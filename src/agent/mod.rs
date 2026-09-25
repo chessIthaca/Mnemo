@@ -28,6 +28,7 @@
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 
 pub mod approval;
+pub mod optimizer;
 pub mod context;
 pub mod factory;
 pub mod failure_triage;

@@ -116,6 +116,17 @@ pub struct GeneralSection {
     /// trace of it (mirrors `[ui.steering_notes]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
+    /// **Token-optimizer levers (opt-in, all default-off; backlog
+    /// e4a50d22).** The context levers that cut re-reads and command-output
+    /// waste at the tool dispatch layer: delta/skeleton re-reads, semantic
+    /// command-output compression, archive/expand progressive disclosure,
+    /// compaction survival, the S-F quality score, and the lean-output
+    /// nudge. An absent section means every lever off — behavior stays
+    /// byte-identical. Omitted from the saved config while every field
+    /// holds its default, so untouched configs keep no optimizer trace
+    /// (mirrors `[general.laya]`).
+    #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
+    pub optimizer: OptimizerConfig,
     /// **Agent browser inspection (opt-in, security tradeoff).** When `true`,
     /// the app exposes the WebView2 Chrome DevTools Protocol on
     /// `localhost:9222` (the next free port when several instances run) so
@@ -325,6 +336,114 @@ impl LayaConfig {
     }
 }
 
+/// The `[general.optimizer]` section — the token-optimizer levers (backlog
+/// e4a50d22), all default-off. Each flag is an independent opt-in: enabling
+/// one lever never turns on another, and a flag-off lever changes nothing
+/// (its code path is skipped entirely — tool/dispatch behavior stays
+/// byte-identical to the pre-lever build).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptimizerConfig {
+    /// **Lever 1 — delta + skeleton re-reads.** When `true`, `read_files`
+    /// serves a signature/import skeleton for re-reads of unchanged files
+    /// and a unified diff for changed ones, instead of the full content
+    /// every time. First reads and ranged reads still serve full content.
+    /// Off by default.
+    pub delta_reads: bool,
+    /// **Lever 2 — semantic command-output compression.** When `true`,
+    /// large shell-tool output from known command families (cargo, npm,
+    /// pytest, go) is collapsed to distinct error/warning lines + counts +
+    /// exit status before it reaches the context. Off by default.
+    pub compress_output: bool,
+    /// **Lever 3 — archive/expand progressive disclosure.** When `true`,
+    /// tool results above
+    /// [`archive_min_chars`](Self::archive_min_chars) are archived in full
+    /// to the per-project memory DB and the context carries a preview the
+    /// model can expand via the `expand_result` tool — instead of a lossy
+    /// head-only truncation. Off by default.
+    pub archive: bool,
+    /// **Lever 4 — compaction survival.** When `true`, compaction archives
+    /// a pre-compaction checkpoint, injects extracted decisions as a
+    /// must-preserve block, and appends a heuristic post-compaction digest
+    /// (no extra LLM call). Off by default.
+    pub compaction_survival: bool,
+    /// **Quality score.** When `true`, the S-F context-quality grade rides
+    /// the `ContextUsage` events for the ctx popup. Off by default.
+    pub quality_score: bool,
+    /// **Lean-output nudge.** When `true`, a cache-safe steering note
+    /// appended to the volatile tail at
+    /// [`lean_output_fill_pct`](Self::lean_output_fill_pct) context fill
+    /// nudges the model toward concise visible output. Off by default.
+    pub lean_output_nudge: bool,
+    /// Minimum length (chars) of a tool result before lever 3 archives
+    /// it. Results under the cap pass through the existing ingestion cap
+    /// unchanged.
+    pub archive_min_chars: usize,
+    /// Minimum length (chars) of filtered shell output before lever 2
+    /// attempts compression. Smaller outputs pass through untouched.
+    pub compress_min_chars: usize,
+    /// Context fill percentage that triggers the lean-output nudge.
+    pub lean_output_fill_pct: u8,
+    /// Requests between lean-output/quality nudges (a cooldown, so a long
+    /// session is not nagged on every turn).
+    pub nudge_cooldown_requests: u32,
+    /// User-extensible command patterns (regexes) eligible for lever 2
+    /// compression in addition to the built-in families, e.g.
+    /// `"dotnet build"` or `"make .*"`. Matched against the full command
+    /// line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compress_extra_commands: Vec<String>,
+}
+
+impl OptimizerConfig {
+    /// Default `archive_min_chars` — results this large (and up) get
+    /// archived by lever 3.
+    pub const DEFAULT_ARCHIVE_MIN_CHARS: usize = 20_000;
+    /// Default `compress_min_chars` — filtered output this large (and up)
+    /// is compressed by lever 2.
+    pub const DEFAULT_COMPRESS_MIN_CHARS: usize = 2_000;
+    /// Default `lean_output_fill_pct`.
+    pub const DEFAULT_LEAN_OUTPUT_FILL_PCT: u8 = 25;
+    /// Default `nudge_cooldown_requests`.
+    pub const DEFAULT_NUDGE_COOLDOWN_REQUESTS: u32 = 10;
+
+    /// True while every field holds its default — the
+    /// `[general.optimizer]` section is then omitted from `config.toml`,
+    /// so untouched configs keep no optimizer trace (mirrors
+    /// [`LayaConfig::is_default`]).
+    fn is_default(&self) -> bool {
+        !self.delta_reads
+            && !self.compress_output
+            && !self.archive
+            && !self.compaction_survival
+            && !self.quality_score
+            && !self.lean_output_nudge
+            && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
+            && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
+            && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
+            && self.nudge_cooldown_requests == Self::DEFAULT_NUDGE_COOLDOWN_REQUESTS
+            && self.compress_extra_commands.is_empty()
+    }
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            delta_reads: false,
+            compress_output: false,
+            archive: false,
+            compaction_survival: false,
+            quality_score: false,
+            lean_output_nudge: false,
+            archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
+            compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
+            lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
+            nudge_cooldown_requests: Self::DEFAULT_NUDGE_COOLDOWN_REQUESTS,
+            compress_extra_commands: Vec::new(),
+        }
+    }
+}
+
 /// A reference to a configured endpoint + model, used by per-context model
 /// overrides (the `[models]` section).
 ///
@@ -414,6 +533,7 @@ impl Default for GeneralSection {
             embedding_model: None,
             bundled_embedding_model: default_bundled_embedding_model(),
             laya: LayaConfig::default(),
+            optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
             auto_compact_on_plan_complete: false,
@@ -1329,6 +1449,50 @@ auto_type_memories = true
     }
 
     #[test]
+    fn optimizer_levers_default_off_and_round_trip() {
+        // Absent section ⇒ every lever off (byte-identical behavior); the
+        // untouched section serializes away; flags + knobs round-trip; any
+        // flag alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.optimizer.delta_reads);
+        assert!(!cfg.general.optimizer.compress_output);
+        assert!(!cfg.general.optimizer.archive);
+        assert!(!cfg.general.optimizer.compaction_survival);
+        assert!(!cfg.general.optimizer.quality_score);
+        assert!(!cfg.general.optimizer.lean_output_nudge);
+        assert_eq!(
+            cfg.general.optimizer.archive_min_chars,
+            OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
+        );
+
+        let text = r#"
+[general.optimizer]
+delta_reads = true
+archive = true
+archive_min_chars = 5000
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.optimizer.delta_reads);
+        assert!(cfg.general.optimizer.archive);
+        assert_eq!(cfg.general.optimizer.archive_min_chars, 5000);
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.optimizer.delta_reads);
+        assert_eq!(cfg2.general.optimizer.archive_min_chars, 5000);
+
+        // Untouched: no serialized trace; touched: is_default flips.
+        assert!(OptimizerConfig::default().is_default());
+        assert!(!toml::to_string(&GeneralConfig::default())
+            .unwrap()
+            .contains("optimizer"));
+        let only_flag = OptimizerConfig {
+            delta_reads: true,
+            ..Default::default()
+        };
+        assert!(!only_flag.is_default());
+    }
+
+    #[test]
     fn laya_failure_triage_flags_default_off_and_round_trip() {
         // All three flags follow the same opt-in convention as auto-typing:
         // absent ⇒ false, false leaves no serialized trace, and any flag
@@ -1828,6 +1992,7 @@ chat_hover_timestamps = true
                 }),
                 bundled_embedding_model: None,
                 laya: LayaConfig::default(),
+                optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,
                 auto_compact_on_plan_complete: false,

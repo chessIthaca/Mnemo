@@ -250,6 +250,13 @@ pub enum AgentEvent {
         used: u32,
         max: u32,
         breakdown: ContextBreakdown,
+        /// Lever 6's S–F quality grade (backlog e4a50d22). Graded at the
+        /// top-of-loop and post-compaction emissions, plus the `/new` reset
+        /// (fill 0). `None` when the `[general.optimizer] quality_score` flag
+        /// is off, on the mid-stream provider-exact re-anchor, and on the
+        /// app-side spawn seed — the frontend reads an absent grade as
+        /// "unchanged", so the popup keeps the last one instead of blanking.
+        quality: Option<crate::agent::optimizer::QualityReport>,
     },
     /// The workflow state changed.
     WorkflowStateChanged {
@@ -573,6 +580,10 @@ pub enum SerializableAgentEvent {
         used: u32,
         max: u32,
         breakdown: ContextBreakdown,
+        /// Mirrors [`AgentEvent::ContextUsage::quality`]. Omitted from the wire
+        /// when `None`, so the pre-lever JSON shape is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<crate::agent::optimizer::QualityReport>,
     },
     WorkflowStateChanged {
         state: WorkflowState,
@@ -814,11 +825,13 @@ impl AgentEvent {
                 used,
                 max,
                 breakdown,
+                quality,
             } => SerializedEvent {
                 event: SerializableAgentEvent::ContextUsage {
                     used,
                     max,
                     breakdown,
+                    quality,
                 },
                 approval_sender: None,
                 question_sender: None,
@@ -1754,5 +1767,51 @@ mod tests {
                 text: "it's complicated".into()
             }
         );
+    }
+
+    #[test]
+    fn context_usage_serializes_quality_only_when_present() {
+        // Lever 6 (backlog e4a50d22): the grade is additive on the wire. With
+        // `quality: None` the JSON carries no `quality` key at all, so the
+        // pre-lever shape — and the ipc fixture pinning it — stays valid.
+        let bare = SerializableAgentEvent::ContextUsage {
+            used: 1000,
+            max: 8000,
+            breakdown: ContextBreakdown::default(),
+            quality: None,
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("quality").is_none(), "{json}");
+
+        let graded = SerializableAgentEvent::ContextUsage {
+            used: 1000,
+            max: 8000,
+            breakdown: ContextBreakdown::default(),
+            quality: Some(crate::agent::optimizer::QualityReport {
+                grade: crate::agent::optimizer::QualityGrade::A,
+                fill_pct: 12,
+                waste_tokens: 34,
+                stale_read_rate: 5,
+                decision_density: 50,
+            }),
+        };
+        let json = serde_json::to_value(&graded).unwrap();
+        assert_eq!(json["quality"]["grade"], serde_json::json!("A"), "{json}");
+        assert_eq!(json["quality"]["fill_pct"], serde_json::json!(12));
+        assert_eq!(json["quality"]["waste_tokens"], serde_json::json!(34));
+        assert_eq!(json["quality"]["stale_read_rate"], serde_json::json!(5));
+        assert_eq!(json["quality"]["decision_density"], serde_json::json!(50));
+        // The app deserializes what the core serializes.
+        let back: SerializableAgentEvent = serde_json::from_value(json).unwrap();
+        match back {
+            SerializableAgentEvent::ContextUsage {
+                quality: Some(report),
+                ..
+            } => {
+                assert_eq!(report.grade, crate::agent::optimizer::QualityGrade::A);
+                assert_eq!(report.decision_density, 50);
+            }
+            other => panic!("expected a graded ContextUsage, got {other:?}"),
+        }
     }
 }

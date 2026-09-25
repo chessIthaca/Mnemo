@@ -134,6 +134,17 @@ pub struct AgentLoop {
     /// memories into the system prompt) and working-memory capture (recording
     /// tool events). `None` in tests that don't exercise memory.
     pub(crate) memory: Option<Arc<dyn MemoryStoreTrait>>,
+    /// Live `[general.optimizer]` config (token-optimizer levers, backlog
+    /// e4a50d22), shared with the factory's tool builds. The ingestion-time
+    /// levers (progressive disclosure of oversized results, compaction
+    /// survival) read it per turn. `None` in tests / directly-built loops —
+    /// every lever then stays off.
+    pub(crate) optimizer: Option<Arc<RwLock<crate::config::OptimizerConfig>>>,
+    /// Session counters behind lever 6's S–F quality score (backlog e4a50d22):
+    /// fed by [`record_savings_event`](AgentLoop::record_savings_event), read
+    /// when a `ContextUsage` event is emitted. Atomics, so the grade can be
+    /// computed from `&self` without a lock.
+    pub(crate) optimizer_state: super::optimizer::OptimizerState,
     /// Safety rules — regex-based auto-approve. When a tool call matches a
     /// rule in `.coding/safety.toml`, the approval prompt is skipped. `None`
     /// when no safety-rules file is configured (tests, or a project without
@@ -716,6 +727,8 @@ impl AgentLoop {
             constitution,
             safety_mode: Arc::new(RwLock::new(safety_mode)),
             memory,
+            optimizer: None,
+            optimizer_state: super::optimizer::OptimizerState::default(),
             safety_rules: None,
             vision,
             session: SessionState::new(),
@@ -760,6 +773,28 @@ impl AgentLoop {
     /// plan/review corpus.
     pub fn plans_dir(&self) -> &std::path::Path {
         &self.plans_dir
+    }
+
+    /// Attach the live `[general.optimizer]` config (token-optimizer levers,
+    /// backlog e4a50d22). Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`]; `None` for directly-built test loops, where every
+    /// lever stays off (byte-identical to the pre-lever build).
+    pub fn with_optimizer(
+        mut self,
+        optimizer: Arc<RwLock<crate::config::OptimizerConfig>>,
+    ) -> Self {
+        self.optimizer = Some(optimizer);
+        self
+    }
+
+    /// The live optimizer config, or the all-off default when none is wired
+    /// (tests, bare loops) — so a lever's gate reads the same shape either
+    /// way and a missing handle can never panic.
+    pub(crate) fn optimizer_config(&self) -> crate::config::OptimizerConfig {
+        self.optimizer
+            .as_ref()
+            .map(|c| c.read().expect("optimizer config lock poisoned").clone())
+            .unwrap_or_default()
     }
 
     /// Store the per-agent root override (parallel run-all worktree agents,

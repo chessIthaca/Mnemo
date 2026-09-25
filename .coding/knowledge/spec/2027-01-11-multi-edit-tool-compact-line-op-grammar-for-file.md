@@ -1,6 +1,7 @@
 +++
 title = "multi_edit tool + compact line-op grammar for file_edit"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 UNMERGED — on branch wt/mnemo, commit 88577b4 (plan e3d0758b, completed 2026-09-24; not yet merged to main).

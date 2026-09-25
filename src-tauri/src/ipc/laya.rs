@@ -758,6 +758,23 @@ async fn run_setup(
     Ok(())
 }
 
+/// Is `status` one of THIS setup's own in-progress states (`Installing`, or
+/// a `Downloading` tick for one of its assets — "uv" or the checkpoint
+/// id)? The completion arm's restore is conditioned on this: anything else
+/// in the status (a rewire's `Starting`, a terminal
+/// `Ready`/`Failed`/`Disabled`, a live classifier's self-heal, a second
+/// setup's phases) belongs to a concurrent writer and must never be
+/// overwritten by a stale snapshot.
+fn is_setup_progress(status: &ClassifierStatus, checkpoint_id: &str) -> bool {
+    match status {
+        ClassifierStatus::Installing => true,
+        ClassifierStatus::Downloading { label, .. } => {
+            label == checkpoint_id || label == "uv"
+        }
+        _ => false,
+    }
+}
+
 /// The autostart decision for a finished setup, derived from the LIVE
 /// config plus the checkpoint the setup just downloaded. Returns
 /// `(autostart, laya_off)`: `autostart` only when the config enables
@@ -847,12 +864,23 @@ pub fn spawn_setup_task(
                         let _ = app.emit("classifier://status", &s);
                     }
                 } else {
-                    // Restore what the setup's progress ticks overwrote —
-                    // typically the live classifier's Ready.
-                    let s = pre_setup_status.clone();
-                    *status.write().expect("classifier status lock poisoned") = s.clone();
-                    if let Some(app) = &app {
-                        let _ = app.emit("classifier://status", &s);
+                    // Restore ONLY what this setup itself overwrote: heal
+                    // the status back to the pre-setup value when it still
+                    // shows one of our own progress states. Any other value
+                    // (a rewire's Starting, a terminal Ready/Failed/
+                    // Disabled, a live classifier's self-heal) belongs to a
+                    // concurrent writer — restoring a stale snapshot over it
+                    // could pin a dishonest status with no self-heal path.
+                    let current = status
+                        .read()
+                        .expect("classifier status lock poisoned")
+                        .clone();
+                    if is_setup_progress(&current, checkpoint.id) {
+                        let s = pre_setup_status.clone();
+                        *status.write().expect("classifier status lock poisoned") = s.clone();
+                        if let Some(app) = &app {
+                            let _ = app.emit("classifier://status", &s);
+                        }
                     }
                     eprintln!(
                         "info: Laya runtime ready (checkpoint '{}') — the live config \
@@ -1362,5 +1390,37 @@ mod tests {
         // Enabled but external: a live external classifier stays untouched.
         cfg.mode = LayaMode::External;
         assert_eq!(setup_autostart_decision(&cfg, "english"), (false, false));
+    }
+
+    #[test]
+    fn is_setup_progress_covers_only_this_setups_own_states() {
+        assert!(is_setup_progress(&ClassifierStatus::Installing, "english"));
+        assert!(is_setup_progress(
+            &ClassifierStatus::Downloading {
+                label: "english".into(),
+                progress: 0.5
+            },
+            "english"
+        ));
+        assert!(is_setup_progress(
+            &ClassifierStatus::Downloading {
+                label: "uv".into(),
+                progress: 0.1
+            },
+            "english"
+        ));
+        // Another checkpoint's download belongs to a different setup.
+        assert!(!is_setup_progress(
+            &ClassifierStatus::Downloading {
+                label: "multilingual".into(),
+                progress: 0.5
+            },
+            "english"
+        ));
+        // Every other state belongs to a concurrent writer.
+        assert!(!is_setup_progress(&ClassifierStatus::Ready, "english"));
+        assert!(!is_setup_progress(&ClassifierStatus::Failed, "english"));
+        assert!(!is_setup_progress(&ClassifierStatus::Starting, "english"));
+        assert!(!is_setup_progress(&ClassifierStatus::Disabled, "english"));
     }
 }

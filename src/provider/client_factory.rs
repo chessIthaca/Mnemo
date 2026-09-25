@@ -352,6 +352,21 @@ pub fn build_classifier(
     status: Arc<RwLock<ClassifierStatus>>,
 ) -> Option<Arc<dyn Classifier>> {
     let laya = &config.general.general.laya;
+    if laya.mode == crate::config::LayaMode::Managed {
+        // Managed mode owns the whole lifecycle: the app layer downloads +
+        // starts the sidecar and builds the client against its loopback
+        // port (src-tauri/src/ipc/laya.rs) — an `endpoint` set here is
+        // ignored, and this builder reports Disabled until that client is
+        // swapped in.
+        if laya.enabled {
+            eprintln!(
+                "info: the Laya classifier is in managed mode — the app runs \
+                 laya-serve itself (Settings → Classifier)"
+            );
+        }
+        *status.write().expect("classifier status lock poisoned") = ClassifierStatus::Disabled;
+        return None;
+    }
     let endpoint = if laya.enabled {
         laya.endpoint
             .as_deref()
@@ -1099,6 +1114,31 @@ mod tests {
     }
 
     #[test]
+    fn build_classifier_managed_mode_defers_to_the_app_runtime() {
+        // Managed mode never builds an external client from `endpoint` —
+        // the app layer builds it against its own loopback sidecar.
+        use crate::config::{GeneralConfig, GeneralSection, LayaConfig, LayaMode};
+        let config = Config {
+            general: GeneralConfig {
+                general: GeneralSection {
+                    laya: LayaConfig {
+                        enabled: true,
+                        mode: LayaMode::Managed,
+                        endpoint: Some("http://127.0.0.1:8000".into()),
+                        ..Default::default()
+                    },
+                    ..GeneralSection::default()
+                },
+                ..GeneralConfig::default()
+            },
+            ..Config::default()
+        };
+        let status = Arc::new(RwLock::new(ClassifierStatus::Ready));
+        assert!(build_classifier(&config, Arc::clone(&status)).is_none());
+        assert_eq!(*status.read().unwrap(), ClassifierStatus::Disabled);
+    }
+
+    #[test]
     fn build_classifier_enabled_with_endpoint_returns_the_laya_backend() {
         use crate::config::{GeneralConfig, GeneralSection, LayaConfig};
         let config = Config {
@@ -1107,6 +1147,7 @@ mod tests {
                     laya: LayaConfig {
                         enabled: true,
                         endpoint: Some("http://127.0.0.1:8000".into()),
+                        ..Default::default()
                     },
                     ..GeneralSection::default()
                 },
@@ -1135,6 +1176,7 @@ mod tests {
                         laya: LayaConfig {
                             enabled: true,
                             endpoint: endpoint.clone(),
+                            ..Default::default()
                         },
                         ..GeneralSection::default()
                     },

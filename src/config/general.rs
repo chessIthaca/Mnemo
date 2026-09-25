@@ -111,8 +111,8 @@ pub struct GeneralSection {
     /// running `laya-serve` instance (see [`LayaConfig`]) for fast,
     /// calibrated "System 1" decisions. Disabled by default — an absent or
     /// disabled section changes nothing: no classifier calls, no startup
-    /// cost, no new failure modes. Omitted from the saved config while both
-    /// fields hold their defaults, so configs that never touched Laya keep no
+    /// cost, no new failure modes. Omitted from the saved config while every
+    /// field holds its default, so configs that never touched Laya keep no
     /// trace of it (mirrors `[ui.steering_notes]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
@@ -179,6 +179,26 @@ pub struct EmbeddingModel {
     pub model: String,
 }
 
+/// How the Laya backend is provided.
+///
+/// `external` (the default) keeps the original contract: the user runs
+/// `laya-serve` themselves and [`LayaConfig::endpoint`] names its base URL.
+/// `managed` has the app own the runtime — the Settings → Classifier section
+/// downloads a self-contained install (uv + venv + `laya[serve]` + the
+/// checkpoint) and Mnemo starts/stops a local `laya-serve` on `127.0.0.1`
+/// whenever Laya is enabled, mirroring the bundled embedding models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LayaMode {
+    /// A user-run `laya-serve` at [`LayaConfig::endpoint`] — the default,
+    /// and the only mode configs written before it existed know.
+    #[default]
+    External,
+    /// Mnemo downloads, starts, and stops the backend itself
+    /// (Settings → Classifier).
+    Managed,
+}
+
 /// Configuration for the Laya classifier — an opt-in "System 1" decision
 /// service (`convaiinnovations/laya`) served by `laya-serve` over HTTP.
 ///
@@ -187,17 +207,41 @@ pub struct EmbeddingModel {
 /// calibrated probabilities. **Disabled by default** — when
 /// [`enabled`](Self::enabled) is false (or the `[general.laya]` section is
 /// absent) the app behaves exactly as before: no classifier calls, no
-/// startup cost, no new failure modes.
+/// startup cost, no new failure modes. In [`managed`](LayaMode::Managed)
+/// mode the app runs the server itself (downloaded from Settings); in
+/// [`external`](LayaMode::External) mode it talks to a user-run instance at
+/// [`endpoint`](Self::endpoint).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct LayaConfig {
     /// Whether the Laya classifier is enabled. Off by default.
     pub enabled: bool,
     /// Base URL of a running `laya-serve` instance, e.g.
-    /// `"http://127.0.0.1:8000"`. Required when `enabled` is true; `None`
-    /// (or blank) means "not configured" and the classifier stays
-    /// unavailable.
+    /// `"http://127.0.0.1:8000"`. Required when `enabled` is true in
+    /// [`external`](LayaMode::External) mode; `None` (or blank) means "not
+    /// configured" and the classifier stays unavailable. Ignored in
+    /// [`managed`](LayaMode::Managed) mode, where the app runs the server
+    /// itself.
     pub endpoint: Option<String>,
+    /// How the backend is provided — a user-run server
+    /// ([`External`](LayaMode::External), the default) or the app-managed
+    /// runtime ([`Managed`](LayaMode::Managed)). Omitted from the saved
+    /// config while `external`, so untouched configs keep their exact
+    /// pre-managed shape.
+    #[serde(default, skip_serializing_if = "laya_mode_is_external")]
+    pub mode: LayaMode,
+    /// The managed-mode checkpoint to serve: `"english"` (the default when
+    /// `None`) or `"multilingual"`. Only read in
+    /// [`managed`](LayaMode::Managed) mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `skip_serializing_if` guard for [`LayaConfig::mode`]: `external` (the
+/// default) stays unwritten, mirroring the endpoint field's
+/// absence-while-unset behavior.
+fn laya_mode_is_external(mode: &LayaMode) -> bool {
+    matches!(mode, LayaMode::External)
 }
 
 impl LayaConfig {
@@ -206,7 +250,10 @@ impl LayaConfig {
     /// [`SteeringNotesCfg`]'s empty-table skip), so untouched configs keep no
     /// Laya trace.
     fn is_default(&self) -> bool {
-        !self.enabled && self.endpoint.is_none()
+        !self.enabled
+            && self.endpoint.is_none()
+            && self.mode == LayaMode::External
+            && self.checkpoint.is_none()
     }
 }
 
@@ -1161,6 +1208,68 @@ endpoint = "http://127.0.0.1:8000"
             back.general.laya.endpoint.as_deref(),
             Some("http://127.0.0.1:8000")
         );
+    }
+
+    #[test]
+    fn laya_mode_and_checkpoint_default_like_an_absent_section() {
+        // An absent [general.laya] section means external mode + no
+        // checkpoint — exactly the pre-managed shape, so existing configs
+        // are unaffected.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.general.laya.mode, LayaMode::External);
+        assert!(cfg.general.laya.checkpoint.is_none());
+        // is_default covers the new fields: managed mode alone counts as
+        // touched, so the section gets written.
+        let managed = LayaConfig {
+            mode: LayaMode::Managed,
+            ..Default::default()
+        };
+        assert!(!managed.is_default());
+    }
+
+    #[test]
+    fn laya_managed_mode_round_trips() {
+        let text = r#"
+[general.laya]
+enabled = true
+mode = "managed"
+checkpoint = "multilingual"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.enabled);
+        assert_eq!(cfg.general.laya.mode, LayaMode::Managed);
+        assert_eq!(
+            cfg.general.laya.checkpoint.as_deref(),
+            Some("multilingual")
+        );
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.enabled);
+        assert_eq!(cfg2.general.laya.mode, LayaMode::Managed);
+        assert_eq!(
+            cfg2.general.laya.checkpoint.as_deref(),
+            Some("multilingual")
+        );
+    }
+
+    #[test]
+    fn laya_mode_is_omitted_while_external() {
+        // The external default never writes `mode` — a serialized external
+        // config stays shape-compatible with pre-managed configs.
+        let external = LayaConfig {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:8000".into()),
+            ..Default::default()
+        };
+        let text = toml::to_string(&external).unwrap();
+        assert!(!text.contains("mode"));
+        let managed = LayaConfig {
+            mode: LayaMode::Managed,
+            ..Default::default()
+        };
+        assert!(toml::to_string(&managed)
+            .unwrap()
+            .contains("mode = \"managed\""));
     }
 
     #[test]

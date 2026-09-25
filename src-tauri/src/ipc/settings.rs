@@ -14,7 +14,7 @@ use tauri::State;
 
 use mnemo::config::general::UiConfig;
 use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
-use mnemo::config::{Endpoint, EndpointKind, SafetyMode};
+use mnemo::config::{Endpoint, EndpointKind, LayaMode, SafetyMode};
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::provider::client_factory::build_client;
@@ -478,6 +478,13 @@ pub struct LayaWire {
     pub enabled: bool,
     /// Base URL of the `laya-serve` instance (`null` = not configured).
     pub endpoint: Option<String>,
+    /// The runtime mode: managed (the app downloads + runs the sidecar) or
+    /// external (a user-run instance). MUST round-trip — the section's mode
+    /// radio initializes from it, and defaulting it client-side would
+    /// silently flip external configs to managed on the next save.
+    pub mode: LayaMode,
+    /// Managed mode: the configured checkpoint id (`null` = "english").
+    pub checkpoint: Option<String>,
 }
 
 /// A per-context model override (one entry of the `[models]` section). Emitted
@@ -882,6 +889,8 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
             laya: LayaWire {
                 enabled: config.general.general.laya.enabled,
                 endpoint: config.general.general.laya.endpoint.clone(),
+                mode: config.general.general.laya.mode.clone(),
+                checkpoint: config.general.general.laya.checkpoint.clone(),
             },
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
@@ -1376,7 +1385,12 @@ mod settings_dto_tests {
                 vision_model: None,
                 embedding_model: None,
                 bundled_embedding_model: None,
-                laya: LayaWire { enabled: false, endpoint: None },
+                laya: LayaWire {
+                    enabled: false,
+                    endpoint: None,
+                    mode: LayaMode::External,
+                    checkpoint: None,
+                },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
             },
@@ -1435,9 +1449,12 @@ mod settings_dto_tests {
         assert_eq!(v["general"]["default_model"], serde_json::Value::Null);
         assert_eq!(v["general"]["vision_model"], serde_json::Value::Null);
         // The opt-in Laya block always renders (a nested object): disabled +
-        // no endpoint when unconfigured.
+        // no endpoint when unconfigured — and the mode/checkpoint fields
+        // round-trip so an external config never silently flips to managed.
         assert_eq!(v["general"]["laya"]["enabled"], false);
         assert_eq!(v["general"]["laya"]["endpoint"], serde_json::Value::Null);
+        assert_eq!(v["general"]["laya"]["mode"], "external");
+        assert_eq!(v["general"]["laya"]["checkpoint"], serde_json::Value::Null);
         assert_eq!(v["general"]["safety"], "approve-each-action");
         assert_eq!(v["config_dir"], "/cfg");
         assert_eq!(v["context"]["summarize_at_fill_rate"], 0.3);
@@ -1497,7 +1514,12 @@ mod settings_dto_tests {
                 }),
                 embedding_model: None,
                 bundled_embedding_model: None,
-                laya: LayaWire { enabled: false, endpoint: None },
+                laya: LayaWire {
+                    enabled: false,
+                    endpoint: None,
+                    mode: LayaMode::External,
+                    checkpoint: None,
+                },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
             },

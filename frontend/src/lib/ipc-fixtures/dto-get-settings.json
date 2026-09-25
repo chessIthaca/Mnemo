@@ -14,7 +14,9 @@
     "enable_browser_inspection": false,
     "laya": {
       "enabled": false,
-      "endpoint": null
+      "endpoint": null,
+      "mode": "external",
+      "checkpoint": null
     },
     "safety": "approve-each-action",
     "vision_model": null

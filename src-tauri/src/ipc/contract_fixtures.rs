@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
-use mnemo::config::SafetyMode;
+use mnemo::config::{LayaMode, SafetyMode};
 use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
@@ -239,7 +239,12 @@ fn dto_fixtures_match_serde() {
             vision_model: None,
             embedding_model: None,
             bundled_embedding_model: None,
-            laya: LayaWire { enabled: false, endpoint: None },
+            laya: LayaWire {
+                enabled: false,
+                endpoint: None,
+                mode: LayaMode::External,
+                checkpoint: None,
+            },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,
         },

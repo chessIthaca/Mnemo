@@ -158,6 +158,11 @@ pub struct AgentRuntimeContext {
     /// `build_classifier`). Behind a lock so a Settings save can swap the
     /// rebuilt backend in without a restart.
     pub classifier: Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
+    /// The managed Laya runtime owner (setup pipeline, the `laya-serve`
+    /// child, its port) — one instance shared by the setup command, the
+    /// startup hook, the Settings rewire, and app exit so they all steer
+    /// the same sidecar. Inert until managed mode is enabled + set up.
+    pub laya: Arc<crate::ipc::laya::LayaManager>,
     /// The same-project instance conflict resolved at startup (main.rs):
     /// `Some` when another live mnemo instance already holds this project —
     /// the frontend warns before opening it (2027-01-13). Computed once, so

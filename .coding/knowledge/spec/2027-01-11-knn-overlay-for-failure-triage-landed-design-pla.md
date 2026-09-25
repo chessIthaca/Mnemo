@@ -1,6 +1,7 @@
 +++
 title = "kNN overlay for failure triage — landed design (plan f37e80f3, item 4b)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed design for the kNN overlay classifier for failure triage (plan f37e80f3, backlog 057f7a34, branch wt/mnemo — Laya chain item 4b, follow-up to item 4/commit f6ca8c6).

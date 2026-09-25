@@ -1,6 +1,7 @@
 +++
 title = "Laya failure triage + startup fine-tune — landed design (plan 02deea7c)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed design for the Laya failure-triage + startup fine-tune (plan 02deea7c, backlog 1a4049c1, branch wt/mnemo).

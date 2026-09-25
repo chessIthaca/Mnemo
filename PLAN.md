@@ -610,9 +610,11 @@ agent core the single writer to the ledger.
 * Tool-reported token counts are estimates (`chars / 4`, `measured = false`).
 * Credentials are redacted on every compressed surface the model sees.
 
-**Not in this scope**: the savings dashboard, its aggregates and its IPC live in
-backlog item `652ae094` — this work lands the levers plus the `savings_events`
-recording path using exactly that item's step-1 schema.
+**Dashboard**: the savings dashboard, its aggregates and its IPC landed
+afterwards in plan `6494b738` (backlog `652ae094`) — `savings_stats()`
+aggregating this ledger, the `get_savings_stats` IPC command, and the Dashboard
+view (right panel, immediately before Memory). That work reused this ledger's
+schema unchanged.
 
 ### Error recovery
 

@@ -330,6 +330,7 @@ export type RightPanelTab =
   | "backlog"
   | "browser"
   | "graph"
+  | "dashboard"
   | "memory";
 
 /** All right-panel tool tabs, in display order. Used for per-tab enable/disable. */
@@ -343,6 +344,7 @@ export const ALL_RIGHT_PANEL_TABS: RightPanelTab[] = [
   "backlog",
   "browser",
   "graph",
+  "dashboard",
   "memory",
 ];
 

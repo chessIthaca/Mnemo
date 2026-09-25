@@ -591,6 +591,71 @@ pub struct SavingsEvent {
     pub created_at: i64,
 }
 
+/// Aggregated token savings across the whole project (all sessions) — the read
+/// path behind the Dashboard view (backlog 652ae094). It aggregates the
+/// `savings_events` ledger that the optimizer levers write (backlog
+/// e4a50d22); it never writes to it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsStats {
+    /// Sum of `tokens_saved` across every event.
+    pub saved_tokens_total: i64,
+    /// Total number of ledger events.
+    pub event_count: u64,
+    /// Per-kind breakdown, largest saving first.
+    pub per_kind: Vec<SavingsKindBreakdown>,
+    /// Per-day savings, oldest day first (for the time-series bars).
+    pub per_day: Vec<SavingsDayBreakdown>,
+    /// The most recent events, newest first (bounded, for the event list).
+    pub recent: Vec<SavingsEvent>,
+    /// Prompt-cache efficiency from `request_stats`, so the dashboard can show
+    /// what caching saved beside what the levers saved.
+    pub cache: CacheEfficiency,
+}
+
+/// One lever kind's savings — a row in the Dashboard's per-kind table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsKindBreakdown {
+    /// The lever kind (`truncation`, `compaction`, `delta_read`, …).
+    pub kind: String,
+    /// Number of events of this kind.
+    pub event_count: u64,
+    /// Sum of `tokens_saved` for this kind. Signed, because an
+    /// `archive_expand` event re-adds archived content and subtracts.
+    pub saved_tokens: i64,
+}
+
+/// One day's savings — a bar in the Dashboard's time series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsDayBreakdown {
+    /// The UTC day the events fell on, as epoch DAYS (`created_at / 86_400`).
+    /// Days rather than an instant because this is a day bucket; the frontend
+    /// formats it for display.
+    pub day: i64,
+    /// Number of events on that day.
+    pub event_count: u64,
+    /// Sum of `tokens_saved` on that day. Signed (see
+    /// [`SavingsKindBreakdown::saved_tokens`]).
+    pub saved_tokens: i64,
+}
+
+/// Prompt-cache efficiency across the project's recorded requests, so the
+/// Dashboard can pair caching's effect with the levers'.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheEfficiency {
+    /// Total prompt tokens across all recorded requests.
+    pub prompt_tokens: u64,
+    /// Of those, the tokens served from the provider's prompt cache.
+    pub cached_tokens: u64,
+    /// Requests that reported a cache figure at all (`cached_tokens IS NOT
+    /// NULL`). This gates whether a hit rate is shown at all, and it is the
+    /// numerator of the "requests reporting cache" ratio. The displayed rate
+    /// itself is `cached_tokens / prompt_tokens` over EVERY recorded request —
+    /// including error/cancelled rows that never reported usage.
+    pub cached_not_null_requests: u64,
+    /// Total recorded requests.
+    pub request_count: u64,
+}
+
 /// One archived tool result (one row in `tool_result_archive`) — the full
 /// original of a tool result too large to keep in context (backlog
 /// e4a50d22 lever 3), retrievable by id through the `expand_result` tool.

@@ -4,7 +4,7 @@
 
 //! Startup snapshot — a single IPC command returning everything the frontend
 //! needs on mount (agents, context caps, ALL workflow states, backlog,
-//! embedder status), replacing 5 sequential `invoke` round-trips.
+//! embedder + classifier status), replacing 5 sequential `invoke` round-trips.
 //!
 //! Closes the stale-non-active-workflowStates gap: the old startup fetched
 //! only the ACTIVE agent's workflow state, so non-active tabs showed a stale
@@ -14,6 +14,7 @@
 use serde::Serialize;
 use tauri::State;
 
+use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::runtime::AgentId;
 use mnemo::workflow::WorkflowState;
@@ -39,6 +40,9 @@ pub struct StartupSnapshot {
     pub backlog: Vec<BacklogItemView>,
     /// Embedder status (same as `get_embedder_status`).
     pub embedder_status: EmbedderStatus,
+    /// Laya classifier status (same as `get_classifier_status`): `disabled`
+    /// (the default — Laya is opt-in) / `ready` / `failed`.
+    pub classifier_status: ClassifierStatus,
     /// The same-project instance conflict resolved at startup: `Some` when
     /// ANOTHER live mnemo instance already holds this project (the frontend
     /// asks before opening it), `None` otherwise. The incumbent's marker is
@@ -61,7 +65,7 @@ pub struct InstanceConflict {
 }
 
 /// Fetch the startup snapshot: agents, context caps, ALL workflow states,
-/// backlog, and embedder status in one call.
+/// backlog, and embedder + classifier status in one call.
 ///
 /// Replaces the 5 sequential `invoke` round-trips the frontend used to make
 /// on mount (`list_agents` + `context_caps` + `get_workflow_state(active)` +
@@ -144,6 +148,10 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
     // Embedder status.
     let embedder_status = state.embedder_status()?;
 
+    // Laya classifier status (opt-in; `disabled` unless enabled with an
+    // endpoint).
+    let classifier_status = state.classifier_status()?;
+
     // The same-project conflict was resolved at startup, before this
     // instance's marker overwrote the incumbent's (main.rs) — the snapshot
     // reports the state that existed the moment this instance launched.
@@ -155,6 +163,7 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
         workflow_states,
         backlog,
         embedder_status,
+        classifier_status,
         instance_conflict,
     })
 }

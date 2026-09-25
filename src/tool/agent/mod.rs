@@ -13,6 +13,9 @@
 //! - `convert_line_endings` (CRLF↔LF conversion in place, without a shell
 //!   invocation)
 //! - `shell` (platform-aware: PowerShell on Windows, sh elsewhere)
+//! - `expand_result` (auto-run; serves back a tool result that was archived
+//!   for size — by row id, or a keyword search over the archive. Always
+//!   registered, because archive rows can outlive the flag that created them)
 //! - `search` (grep + glob)
 //! - `search_read` (grep + glob, then auto-read the top-N matched files in
 //!   one call — collapses the search→read round-trip)
@@ -27,6 +30,8 @@
 
 pub mod codegraph;
 pub mod convert_line_endings;
+pub mod edit_ops;
+pub mod expand_result;
 pub mod file_append;
 pub mod file_edit;
 pub mod file_read;
@@ -39,7 +44,11 @@ pub mod image_tools;
 pub mod line_endings;
 pub mod list_models;
 pub mod load_tools;
+pub mod multi_edit;
+pub mod optimizer;
+pub mod output_compactor;
 pub mod pattern;
+pub mod read_cache;
 pub mod read_files;
 pub mod sandbox;
 pub mod search;

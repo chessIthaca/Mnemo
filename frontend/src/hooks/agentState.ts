@@ -14,6 +14,7 @@
 import type {
   AgentId,
   ApprovalPreview,
+  ContextQuality,
   TranscriptEntry,
   TurnPhase,
 } from "../lib/types";
@@ -294,7 +295,12 @@ export interface AgentState {
   /** The context breakdown of the most recent request (for the ctx hover
    * popup). `null` before the first Usage event. */
   lastContextBreakdown: LastContextBreakdown | null;
-  contextUsage: { used: number; max: number };
+  /** Context-window fill. `quality` is lever 6's S–F grade (backlog e4a50d22),
+   * present only while the backend's `[general.optimizer] quality_score` flag
+   * is on.
+   * The reducer carries the last known grade across events that omit it, so it
+   * is absent only until the first graded event. */
+  contextUsage: { used: number; max: number; quality?: ContextQuality };
   /** Per-role token breakdown (system/user/assistant/tool) from the most
    * recent ContextUsage event, for the ctx hover popup. */
   contextBreakdown: { system: number; user: number; assistant: number; tool: number };
@@ -324,6 +330,7 @@ export type RightPanelTab =
   | "backlog"
   | "browser"
   | "graph"
+  | "dashboard"
   | "memory";
 
 /** All right-panel tool tabs, in display order. Used for per-tab enable/disable. */
@@ -337,6 +344,7 @@ export const ALL_RIGHT_PANEL_TABS: RightPanelTab[] = [
   "backlog",
   "browser",
   "graph",
+  "dashboard",
   "memory",
 ];
 

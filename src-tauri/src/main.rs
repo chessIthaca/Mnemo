@@ -19,7 +19,8 @@ use mnemo::memory::embedder::HashEmbedder;
 use mnemo::memory::MemoryStore;
 use mnemo::project::Project;
 use mnemo::provider::client_factory::{
-    build_client, build_embedder, build_vision_client, embedder_startup_plan, EmbedderStartupPlan,
+    build_classifier, build_client, build_embedder, build_vision_client, embedder_startup_plan,
+    EmbedderStartupPlan,
 };
 use mnemo::provider::openai::{OpenAiClient, OpenAiClientConfig};
 use mnemo::provider::trace::LlmRequestLog;
@@ -517,6 +518,9 @@ fn main() {
                             startup_error: None,
                             needs_project: false,
                             embedder_status: brain.embedder_status.clone(),
+                            classifier_status: brain.classifier_status.clone(),
+                            classifier: brain.classifier_slot.clone(),
+                            laya: brain.laya.clone(),
                             instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
@@ -565,6 +569,21 @@ fn main() {
                         let _ = app_handle.emit("embedder://status", &status);
                     }
 
+                    // The classifier status was already determined by
+                    // `build_classifier` during brain construction (Disabled
+                    // unless Laya is enabled with an endpoint, Ready
+                    // otherwise). Emit it once so the Settings → Classifier
+                    // section reflects the real state on mount.
+                    {
+                        let app_handle = app.handle().clone();
+                        let status_lock = app.state::<IpcState>().runtime.classifier_status.clone();
+                        let status = status_lock
+                            .read()
+                            .expect("classifier status lock poisoned")
+                            .clone();
+                        let _ = app_handle.emit("classifier://status", &status);
+                    }
+
                     // First-run model download: the configured bundled model
                     // wasn't installed, so the store started on the hash
                     // embedder. Download in the background (progress via
@@ -597,6 +616,41 @@ fn main() {
                             );
                         }
                     }
+
+                    // Managed Laya: the classifier client already points at
+                    // the pre-allocated loopback port (build_brain); spawn
+                    // the sidecar now and drive the status to Ready/Failed
+                    // (progress on classifier://status).
+                    if let Some((checkpoint_id, port)) = &brain.pending_laya_start {
+                        let app_handle = Some(app.handle().clone());
+                        let manager = brain.laya.clone();
+                        let checkpoint = ipc::laya::find_checkpoint(checkpoint_id);
+                        let port = *port;
+                        tauri::async_runtime::spawn(async move {
+                            ipc::laya::start_managed_server(
+                                &app_handle,
+                                manager,
+                                checkpoint,
+                                port,
+                            )
+                            .await;
+                        });
+                    }
+
+                    // Startup failure-triage fine-tune (backlog 1a4049c1,
+                    // `[general.laya] auto_finetune`): managed runtime only.
+                    // The gate (enabled + managed + flag + installed) lives
+                    // in ipc::finetune; the spawned task counts the labeled
+                    // rows newer than the fine-tune marker and, when ≥50
+                    // accrued, fine-tunes via the managed venv and hot-swaps
+                    // the served checkpoint. Never blocks startup.
+                    ipc::finetune::spawn_startup_finetune(
+                        Some(app.handle().clone()),
+                        brain.laya.clone(),
+                        brain.classifier_slot.clone(),
+                        brain.classifier_status.clone(),
+                        brain.config.clone(),
+                    );
                 }
                 Ok(BrainOutcome::NeedsProject(config)) => {
                     // No project resolved at startup — show the project picker.
@@ -613,6 +667,11 @@ fn main() {
                         .unwrap_or_else(|_| Sandbox::new(std::path::Path::new(".")).unwrap());
                     let fallback_safety = Arc::new(RwLock::new(SafetyMode::default()));
                     let mgr = AgentManager::new(256);
+                    // A shared Disabled classifier status + manager pair —
+                    // managed Laya stays inert without a brain, but the
+                    // Settings catalog + setup still work.
+                    let (fallback_classifier_status, laya_manager) =
+                        ipc::laya::fresh_disabled();
                     let fallback_browser = mnemo::browser::BrowserManager::new();
                     attach_child_ensurer(&fallback_browser, app.handle().clone());
                     ipc::browser::spawn_console_forwarder(
@@ -649,6 +708,9 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
+                            classifier_status: fallback_classifier_status,
+                            classifier: Arc::new(RwLock::new(None)),
+                            laya: laya_manager,
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -694,6 +756,11 @@ fn main() {
                     let fallback_sandbox = Sandbox::new(&cwd)
                         .unwrap_or_else(|_| Sandbox::new(std::path::Path::new(".")).unwrap());
                     let fallback_config = Arc::new(tokio::sync::Mutex::new(Config::default()));
+                    // A shared Disabled classifier status + manager pair —
+                    // managed Laya stays inert without a brain, but the
+                    // Settings catalog + setup still work.
+                    let (fallback_classifier_status, laya_manager) =
+                        ipc::laya::fresh_disabled();
                     let fallback_safety = Arc::new(RwLock::new(SafetyMode::default()));
                     let mgr = AgentManager::new(256);
                     // The brain failed to build, so there is no shared
@@ -736,6 +803,9 @@ fn main() {
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
+                            classifier_status: fallback_classifier_status,
+                            classifier: Arc::new(RwLock::new(None)),
+                            laya: laya_manager,
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
@@ -802,8 +872,11 @@ fn main() {
             ipc::settings::get_settings,
             ipc::settings::save_settings,
             ipc::settings::get_embedder_status,
+            ipc::settings::get_classifier_status,
             ipc::embeddings::list_bundled_embedding_models,
             ipc::embeddings::download_bundled_model,
+            ipc::laya::laya_catalog,
+            ipc::laya::laya_setup,
             ipc::keys::get_api_keys,
             ipc::mcp::mcp_list_servers,
             ipc::mcp::mcp_save_servers,
@@ -842,6 +915,7 @@ fn main() {
             ipc::codegraph_cmds::codegraph_rebuild_index,
             ipc::agent::get_session_stats,
             ipc::agent::get_project_stats,
+            ipc::agent::get_savings_stats,
             ipc::agent::get_session_list,
             ipc::files::read_file,
             ipc::files::read_image_data_url,
@@ -895,6 +969,10 @@ fn main() {
                 if let Some(watchdog) = &app_handle.state::<IpcState>().watchdog {
                     watchdog.stop();
                 }
+
+                // Stop the managed laya-serve sidecar — it must never
+                // outlive the app (the LayaManager Drop is the backstop).
+                app_handle.state::<IpcState>().runtime.laya.stop();
 
                 // Drain any queued trace/provider-error log writes before the
                 // process exits — mirroring is asynchronous (background writer
@@ -987,6 +1065,27 @@ pub(crate) struct Brain {
     /// the circuit breaker's transitions surface live to the UI.
     /// `pub(crate)` so console mode can drive the deferred embedder load.
     pub(crate) embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
+    /// The shared classifier status — the same `Arc` held by `IpcState`, so
+    /// the enabled/disabled/failed state surfaces live to Settings. `Disabled`
+    /// unless the config enables Laya with an endpoint.
+    pub(crate) classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
+    /// The shared classifier SLOT (the live handle, backlog a147b63c):
+    /// created in `build_brain_inner` and shared by the factory's
+    /// `memory_write` tools (call-time read) and the IPC `RuntimeState`
+    /// (rewire swaps it) — one Arc, no rebuilds. The auto-typing FLAG
+    /// mirror lives in the factory's gate handle (Settings saves flip it
+    /// via `set_auto_typing_enabled`).
+    pub(crate) classifier_slot:
+        Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
+    /// The managed Laya runtime owner — the same `Arc` held by `IpcState`,
+    /// so the startup auto-start hook, the Settings rewire, and app exit
+    /// all steer one sidecar. `pub(crate)` so those paths can reach it.
+    pub(crate) laya: Arc<ipc::laya::LayaManager>,
+    /// Managed Laya start work the startup hooks owe: the checkpoint id +
+    /// the pre-allocated loopback port the classifier client was built
+    /// against. `pub(crate)` so the GUI + console hooks can spawn the
+    /// sidecar (the mirror of the deferred embedder fields above).
+    pub(crate) pending_laya_start: Option<(String, u16)>,
     /// A configured bundled embedding model that wasn't installed at startup
     /// (first run): the store started on the hash embedder and the setup hook
     /// must download this model in the background, swapping it into the live
@@ -1289,6 +1388,86 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
             None,
         ),
     };
+
+    // The optional Laya classifier (opt-in; disabled by default). Built only
+    // when [general.laya] enables it with an endpoint — otherwise `None` with
+    // status Disabled and no HTTP client at all, so the app behaves exactly as
+    // before. Constructing the client does no I/O: startup is never blocked.
+    let classifier_status = Arc::new(RwLock::new(
+        mnemo::memory::classifier::ClassifierStatus::Disabled,
+    ));
+    let classifier = build_classifier(&config, classifier_status.clone());
+    // The managed-runtime owner sharing the same status — inert until the
+    // startup hook / Settings rewire enable managed mode.
+    let laya = Arc::new(ipc::laya::LayaManager::new(classifier_status.clone()));
+
+    // Managed mode (`mode = "managed"`): the app owns the runtime. When
+    // enabled + the checkpoint is installed, the classifier client points
+    // at the loopback sidecar the startup hook spawns right after this
+    // (status Starting until the probe answers). Enabled but not installed
+    // ⇒ a hint is logged and no client exists (the Settings → Classifier
+    // setup completes it; `laya_setup` then starts the server and swaps
+    // the client in). External mode is untouched — `build_classifier`
+    // above handled it and returned None here.
+    let mut pending_laya_start = None;
+    let managed_classifier = match (
+        config.general.general.laya.mode,
+        config.general.general.laya.enabled,
+    ) {
+        (mnemo::config::LayaMode::Managed, true) => {
+            let checkpoint = ipc::laya::find_checkpoint(
+                config
+                    .general
+                    .general
+                    .laya
+                    .checkpoint
+                    .as_deref()
+                    .unwrap_or("english"),
+            );
+            if laya.is_checkpoint_installed(checkpoint.id) {
+                match ipc::laya::LayaManager::alloc_free_port() {
+                    Some(port) => {
+                        pending_laya_start = Some((checkpoint.id.to_string(), port));
+                        *classifier_status.write().expect("classifier status lock poisoned") =
+                            mnemo::memory::classifier::ClassifierStatus::Starting;
+                        ipc::laya::build_managed_classifier(port, classifier_status.clone())
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: no free loopback port for the managed laya-serve; \
+                             the classifier stays disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                eprintln!(
+                    "info: [general.laya] managed mode is enabled but the '{}' \
+                     checkpoint is not downloaded — run the setup in Settings → Classifier",
+                    checkpoint.id
+                );
+                None
+            }
+        }
+        _ => None,
+    };
+    // Managed mode owns the classifier: a stale external `endpoint` must not
+    // back-door a live classifier in at startup that any later save would
+    // drop (the rewire never falls back to the endpoint either).
+    let classifier = match config.general.general.laya.mode {
+        mnemo::config::LayaMode::Managed => managed_classifier,
+        _ => managed_classifier.or(classifier),
+    };
+    // The shared classifier SLOT + the auto-typing flag (backlog a147b63c):
+    // one Arc pair feeds the factory's memory_write tools (call-time read)
+    // and the IPC RuntimeState (rewire swaps the slot; Settings saves flip
+    // the flag via `set_auto_typing_enabled`).
+    let classifier_slot: Arc<
+        RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>,
+    > = Arc::new(RwLock::new(classifier.clone()));
+    let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.general.general.laya.auto_type_memories,
+    ));
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -1298,9 +1477,42 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     };
     let store_trait: Arc<dyn mnemo::memory::MemoryStoreTrait> = store.clone();
 
+    // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
+    // slot plus the `[general.laya] failure_triage` flag mirror. The factory
+    // hands it to every loop it builds; the loop's dispatch site and both
+    // provider retry layers read both at failure time, and a Settings save
+    // flips the flag via `set_failure_triage_enabled` (no rebuild).
+    //
+    // The opt-in kNN overlay (item 4b, `failure_triage_knn`): a local
+    // classifier over the failure-triage training log, consulted by the
+    // gate BEFORE the shared slot while its flag is on. Its embedder
+    // getter reads the store's LIVE shared embedder slot per
+    // classification (a background bundled-model load or a
+    // Settings-driven embedder swap flows in — the index re-embeds on
+    // the model-id change), and its index tracks the training-log FILE,
+    // so dispositions appended by any writer are picked up on the next
+    // classification — genuinely online, no retraining, no `laya-serve`.
+    // Lazy by construction: with the flag off nothing is ever read or
+    // embedded. Constructed AFTER the store so the getter can capture a
+    // store clone.
+    let store_for_knn = store.clone();
+    let failure_triage_handle = mnemo::agent::failure_triage::FailureTriageHandle::new(
+        classifier_slot.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(
+            config.general.general.laya.failure_triage,
+        )),
+    )
+    .with_knn(
+        Arc::new(mnemo::agent::failure_triage_knn::KnnClassifier::new(
+            Arc::new(move || store_for_knn.embedder_handle()),
+            mnemo::agent::failure_triage::training_log_path(),
+        )),
+        config.general.general.laya.failure_triage_knn,
+    );
+
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per
-    // call. Settings saves update it via rewire_vision_and_embedder.
+    // call. Settings saves update it via rewire_vision_embedder_and_classifier.
     store.set_memory_search_config(config.general.memory.clone());
 
     // Startup reconciliation: check whether the semantic DB matches the
@@ -1597,6 +1809,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // a save_settings call (which calls factory.set_shell_filter_config) is
     // observed live on the next command without a registry rebuild.
     let shell_filter = Arc::new(std::sync::RwLock::new(config.general.shell_filter.clone()));
+    // Token-optimizer levers (backlog e4a50d22): live mirror of
+    // `[general.optimizer]`, shared with every lever-bearing tool build.
+    let optimizer_config = Arc::new(std::sync::RwLock::new(
+        config.general.general.optimizer.clone(),
+    ));
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -1793,6 +2010,25 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // Wire the shared shell-output filter config so a `[shell_filter]` config
     // save is observed live by every ShellTool (no registry rebuild).
     .with_shell_filter_config(shell_filter)
+    // Wire the shared token-optimizer config (backlog e4a50d22) so the
+    // `[general.optimizer]` flags are observed by every lever-bearing
+    // tool build (read_files delta/skeleton re-reads, shell output
+    // compression, …).
+    .with_optimizer_config(optimizer_config)
+    // Wire the shared Laya auto-typing gate (backlog a147b63c):
+    // memory_write reads the classifier slot + flag at call time, and
+    // Settings saves flip the flag via `set_auto_typing_enabled` — no
+    // registry rebuild ever needed.
+    .with_auto_typing(mnemo::tool::memory::AutoTypingHandle {
+        classifier: classifier_slot.clone(),
+        enabled: auto_typing_flag.clone(),
+    })
+    // Wire the shared Laya failure-triage gate (backlog 1a4049c1): every loop
+    // the factory builds carries the classifier slot + flag, so the
+    // tool-dispatch auto-retry and both provider retry layers act on
+    // confident classifications — and a Settings save flips the flag live via
+    // `set_failure_triage_enabled` (no rebuild).
+    .with_failure_triage(failure_triage_handle)
     // Share the headless debug browser with the IPC layer (Browser tab).
     .with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —
@@ -1852,8 +2088,12 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         trace,
         browser,
         embedder_status,
+        classifier_status,
+        classifier_slot,
+        laya,
         pending_model_download: pending_download,
         pending_model_load: pending_load,
+        pending_laya_start,
         _graph_watcher: graph_watcher,
     }))
 }

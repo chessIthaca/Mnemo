@@ -10,6 +10,7 @@ import {
   attachAgentDispatch,
   detachAgentDispatch,
 } from "./useAgentEvents";
+import { useAgentStore } from "./useAgentStore";
 import { MAX_FLUSH_INTERVAL_MS } from "./deltaFlush";
 import type { AgentId, AgentEventPayload } from "../lib/types";
 
@@ -429,5 +430,52 @@ describe("agent-event delivery with no dispatcher attached", () => {
     attachAgentDispatch((p) => seen.push(p));
     deliverAgentEvent(payload(3, "c"));
     expect(seen).toHaveLength(1);
+  });
+});
+
+describe("approval_request auto-reveal (file-edit family)", () => {
+  // Review 1r: the auto-reveal condition must cover the SAME family
+  // DiffViewer's `isFileEditTool` renders — multi_edit was missing, so a
+  // pending multi_edit approval left the Diff tab closed while PLAN.md's
+  // Diff-viewer row promised "auto-shown when an approval is pending".
+  const approval = (tool: string): AgentEventPayload =>
+    ({
+      agent_id: 1,
+      event: {
+        kind: "approval_request",
+        tool_call_id: "c1",
+        tool_name: tool,
+        args: {},
+        preview: null,
+        core_operation: false,
+      },
+    }) as AgentEventPayload;
+
+  /** Park the right panel hidden on the Plan tab — the reveal preconditions. */
+  const parkPanel = (): void => {
+    useAgentStore.setState({
+      rightPanelVisible: false,
+      rightPanelTab: "plan",
+      disabledTabs: [],
+      agentParents: {},
+      activeAgent: null,
+    });
+  };
+
+  it("reveals the Diff tab for every file-edit tool — multi_edit included", () => {
+    const { dispatcher } = makeDispatcher();
+    for (const tool of ["file_edit", "file_write", "file_append", "multi_edit"]) {
+      parkPanel();
+      dispatcher.dispatch(approval(tool));
+      const s = useAgentStore.getState();
+      expect([tool, s.rightPanelVisible, s.rightPanelTab]).toEqual([tool, true, "diff"]);
+    }
+  });
+
+  it("does not reveal the Diff tab for a non-file-edit tool", () => {
+    const { dispatcher } = makeDispatcher();
+    parkPanel();
+    dispatcher.dispatch(approval("shell"));
+    expect(useAgentStore.getState().rightPanelVisible).toBe(false);
   });
 });

@@ -265,7 +265,8 @@ impl MarkerKind {
             // (one line), so first-line scoping applies — a read tool's file
             // content echoing the phrase can never fire it.
             MarkerKind::EditStaleRead => {
-                tool_name == "file_edit" && first_line().contains(self.marker())
+                matches!(tool_name, "file_edit" | "multi_edit")
+                    && first_line().contains(self.marker())
             }
         }
     }
@@ -287,10 +288,12 @@ const SEARCH_NUDGE_MARK: &str = "is an indexed symbol";
 /// same commit.
 pub(crate) const EDIT_STALE_READ_MARK: &str = "Re-read the file";
 
-/// Whether `output` is a drift-class `file_edit` failure — the
+/// Whether `output` is a drift-class edit failure (`file_edit` or
+/// `multi_edit` — the multi-file tool reuses the same single-line nudge
+/// contract and prefixes its errors with the failing path) — the
 /// [`MarkerKind::EditStaleRead`] detect rule, exposed for the dispatch
 /// funnel: it records per-path drift state ([`Inner::edit_drift`], plan
-/// be16ea36 step 3) when a file_edit result carries the marker. Kept beside
+/// be16ea36 step 3) when an edit result carries the marker. Kept beside
 /// [`MarkerKind::detect`] so the scoping rule has one home.
 pub(crate) fn is_edit_drift_failure(tool_name: &str, output: &str) -> bool {
     MarkerKind::EditStaleRead.detect(tool_name, output)

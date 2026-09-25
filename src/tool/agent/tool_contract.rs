@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn every_migrated_description_leads_with_the_shared_contract() {
-        // Plan aff95a51 drift guard: the 7 descriptors that carried the
+        // Plan aff95a51 drift guard: the descriptors that carried the
         // hand-copied empty-call block (across 5 files) were migrated to
         // `contract(...)`. A site that drifts back to a hand-copy (or
         // re-copies the content-first clause the universal
@@ -131,6 +131,7 @@ mod tests {
         use crate::memory::embedder::HashEmbedder;
         use crate::memory::{Embedder, MemoryStore, MemoryStoreTrait};
         use crate::tool::agent::codegraph::{GraphContextTool, GraphPathTool, GraphSearchTool};
+        use crate::tool::agent::expand_result::ExpandResultTool;
         use crate::tool::agent::git_read_tool::GitReadTool;
         use crate::tool::agent::read_files::ReadFilesTool;
         use crate::tool::agent::sandbox::Sandbox;
@@ -153,9 +154,10 @@ mod tests {
             ("read_files", ReadFilesTool::new(read_sandbox).schema()),
             ("shell", ShellTool::new(shell_sandbox).schema()),
             ("git_read", GitReadTool::new(dir.path()).schema()),
+            ("expand_result", ExpandResultTool::new(Some(store.clone())).schema()),
             ("memory_write", MemoryWriteTool::new(store).schema()),
         ];
-        assert_eq!(tools.len(), 7, "the migrated set is 7 descriptors");
+        assert_eq!(tools.len(), 8, "the migrated set is 8 descriptors");
 
         for (name, schema) in tools {
             assert!(

@@ -62,6 +62,23 @@ fn make_anchor_store(model_id: &'static str) -> MemoryStore {
     .unwrap()
 }
 
+#[test]
+fn embedder_handle_recovers_from_a_poisoned_lock() {
+    // The failure-triage kNN overlay reads the live embedder through this
+    // getter on a failure-handling path — a poisoned lock (some other
+    // holder panicked mid-swap) must yield a valid embedder, never panic
+    // the turn. The guarded field is a plain `Arc` swap, so recovering the
+    // guard from the poison error is sound.
+    let store = make_store();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = store.embedder.write().expect("write guard for the poison");
+        panic!("poison the embedder lock");
+    }));
+    assert!(poisoned.is_err(), "the guard scope must have panicked");
+    let handle = store.embedder_handle();
+    assert_eq!(handle.model_id(), "hash");
+}
+
 #[tokio::test]
 async fn recall_semantic_fallback_on_zero_keyword_hits() {
     // Regression (backlog 82b831dc, 2026-12-06): zero FTS keyword hits
@@ -1995,6 +2012,248 @@ async fn record(
 }
 
 #[tokio::test]
+async fn savings_events_round_trip_and_negative_expansions() {
+    // Backlog e4a50d22: the per-event ledger persists kind, before/after
+    // counts, the saved delta (negative for re-expansions), and the
+    // measured-vs-estimated flag; the rows reader filters by session and
+    // orders by creation time.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let now = 1_700_000_000;
+    store
+        .record_savings_event(&SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some("s1".into()),
+            kind: "skeleton".into(),
+            detail: Some("src/agent/turn.rs".into()),
+            tokens_before: 12_000,
+            tokens_after: 900,
+            tokens_saved: 11_100,
+            measured: false,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some("s1".into()),
+            kind: "archive_expand".into(),
+            detail: Some("arch-1".into()),
+            tokens_before: 0,
+            tokens_after: 4_000,
+            tokens_saved: -4_000,
+            measured: false,
+            created_at: now + 1,
+        })
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some("s2".into()),
+            kind: "compression".into(),
+            detail: Some("cargo test".into()),
+            tokens_before: 8_000,
+            tokens_after: 1_200,
+            tokens_saved: 6_800,
+            measured: true,
+            created_at: now + 2,
+        })
+        .await
+        .unwrap();
+    let rows = store.savings_events_rows(Some("s1")).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].kind, "skeleton");
+    assert_eq!(rows[0].detail.as_deref(), Some("src/agent/turn.rs"));
+    assert_eq!(rows[0].tokens_before, 12_000);
+    assert_eq!(rows[0].tokens_after, 900);
+    assert_eq!(rows[0].tokens_saved, 11_100);
+    assert!(!rows[0].measured);
+    assert_eq!(rows[1].kind, "archive_expand");
+    assert_eq!(rows[1].tokens_saved, -4_000);
+    // The unfiltered read spans sessions (the dashboard's raw view).
+    let all = store.savings_events_rows(None).await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(all[2].kind, "compression");
+    assert!(all[2].measured);
+    // Another session sees only its own rows.
+    let s2 = store.savings_events_rows(Some("s2")).await.unwrap();
+    assert_eq!(s2.len(), 1);
+}
+
+#[tokio::test]
+async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
+    // Backlog 652ae094: the Dashboard's read path — the ledger aggregated
+    // per-kind (biggest saver first), per UTC day (oldest first), the bounded
+    // recent window (newest first), the metered totals, and the prompt-cache
+    // numbers pulled from request_stats.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+
+    // A fresh project has an empty ledger: zeros and empty vectors, never an
+    // error — the Dashboard renders an honest empty state from this.
+    let empty = store.savings_stats().await.unwrap();
+    assert_eq!(empty.event_count, 0);
+    assert_eq!(empty.saved_tokens_total, 0);
+    assert!(empty.per_kind.is_empty());
+    assert!(empty.per_day.is_empty());
+    assert!(empty.recent.is_empty());
+    assert_eq!(empty.cache.request_count, 0);
+    assert_eq!(empty.cache.prompt_tokens, 0);
+    assert_eq!(empty.cache.cached_not_null_requests, 0);
+
+    // Two distinct UTC days (the day bucket is created_at / 86400).
+    let day1 = 1_700_000_000_i64;
+    let day2 = day1 + 86_400;
+    let record = |kind: &str, before: i64, after: i64, at: i64| SavingsEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        kind: kind.into(),
+        detail: None,
+        tokens_before: before,
+        tokens_after: after,
+        tokens_saved: before - after,
+        measured: false,
+        created_at: at,
+    };
+    store
+        .record_savings_event(&record("skeleton", 12_000, 900, day1))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("compression", 8_000, 1_200, day1 + 60))
+        .await
+        .unwrap();
+    store
+        .record_savings_event(&record("skeleton", 2_000, 400, day2))
+        .await
+        .unwrap();
+    // A re-expansion re-adds archived content, so it subtracts from the total.
+    store
+        .record_savings_event(&record("archive_expand", 0, 4_000, day2 + 60))
+        .await
+        .unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.event_count, 4);
+    // 11_100 + 6_800 + 1_600 - 4_000.
+    assert_eq!(stats.saved_tokens_total, 15_500);
+
+    // Per-kind, biggest saver first; the negative kind sorts last.
+    assert_eq!(stats.per_kind.len(), 3);
+    assert_eq!(stats.per_kind[0].kind, "skeleton");
+    assert_eq!(stats.per_kind[0].event_count, 2);
+    assert_eq!(stats.per_kind[0].saved_tokens, 12_700);
+    assert_eq!(stats.per_kind[1].kind, "compression");
+    assert_eq!(stats.per_kind[1].saved_tokens, 6_800);
+    assert_eq!(stats.per_kind[2].kind, "archive_expand");
+    assert_eq!(stats.per_kind[2].saved_tokens, -4_000);
+
+    // Per-day, oldest first, stamped as the epoch DAY.
+    assert_eq!(stats.per_day.len(), 2);
+    assert_eq!(stats.per_day[0].day, day1 / 86_400);
+    assert_eq!(stats.per_day[0].event_count, 2);
+    assert_eq!(stats.per_day[0].saved_tokens, 17_900);
+    assert_eq!(stats.per_day[1].day, day2 / 86_400);
+    assert_eq!(stats.per_day[1].saved_tokens, -2_400);
+
+    // Recent events, newest first.
+    assert_eq!(stats.recent.len(), 4);
+    assert_eq!(stats.recent[0].created_at, day2 + 60);
+    assert_eq!(stats.recent[3].created_at, day1);
+
+    // Cache efficiency from request_stats, NULL-safe: a row that never reported
+    // a cache figure must not count toward the hit-rate denominator, or a
+    // provider that never reports caching would look like a 0% hit rate.
+    let req = |prompt: u32, cached: Option<u32>| RequestStats {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        model: "m".into(),
+        endpoint: None,
+        prompt_tokens: prompt,
+        completion_tokens: 10,
+        reasoning_tokens: 0,
+        cached_tokens: cached,
+        ttft_ms: None,
+        generation_ms: None,
+        created_at: day1,
+        outcome: None,
+        purpose: None,
+    };
+    store
+        .record_request_stats(&req(1_000, Some(400)))
+        .await
+        .unwrap();
+    store.record_request_stats(&req(2_000, None)).await.unwrap();
+
+    let stats = store.savings_stats().await.unwrap();
+    assert_eq!(stats.cache.request_count, 2);
+    assert_eq!(stats.cache.prompt_tokens, 3_000);
+    assert_eq!(stats.cache.cached_tokens, 400);
+    assert_eq!(stats.cache.cached_not_null_requests, 1);
+}
+
+#[tokio::test]
+async fn archive_round_trip_expand_returns_identical_content() {
+    // Backlog e4a50d22 lever 3: the full original goes into the archive and
+    // comes back byte-identical by id — the progressive-disclosure contract
+    // (the context keeps a preview, the archive keeps the truth).
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let content = format!("{}\nDISTINCTIVE_MARKER_TOKEN\nbig = 0\n", "x".repeat(50_000));
+    let id = store
+        .archive_tool_result(Some("s1"), "shell", Some("cargo test"), &content)
+        .await
+        .unwrap();
+    let fetched = store.expand_tool_result(&id).await.unwrap().expect("row exists");
+    assert_eq!(fetched.content, content, "expand returns the identical original");
+    assert_eq!(fetched.char_count as usize, content.chars().count());
+    assert_eq!(fetched.tool.as_deref(), Some("shell"));
+    assert_eq!(fetched.detail.as_deref(), Some("cargo test"));
+    assert_eq!(fetched.session_id.as_deref(), Some("s1"));
+    // Unknown ids are None, not an error (a foreign project's DB, a pruned row).
+    assert!(store.expand_tool_result("nope").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn archive_search_finds_rows_by_keyword_with_a_snippet() {
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let a = store
+        .archive_tool_result(
+            None,
+            "shell",
+            Some("cargo build"),
+            "lots of noise\nUNIQUE_ALPHA error: broke\nmore noise",
+        )
+        .await
+        .unwrap();
+    store
+        .archive_tool_result(None, "read_files", Some("src/b.rs"), "unrelated body UNIQUE_BETA here")
+        .await
+        .unwrap();
+    let hits = store.search_archive("UNIQUE_ALPHA", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "only the row carrying the term: {hits:?}");
+    assert_eq!(hits[0].id, a);
+    assert_eq!(hits[0].tool.as_deref(), Some("shell"));
+    assert!(hits[0].snippet.contains("UNIQUE_ALPHA"), "{}", hits[0].snippet);
+    // No match at all -> empty, never an error.
+    assert!(store.search_archive("NOSUCHTERM_ZZZ", 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn archive_search_degrades_to_a_substring_scan_without_alnum_terms() {
+    // A query with no alphanumeric terms cannot build an FTS5 MATCH
+    // expression; the store must fall back to the LIKE scan and still find
+    // the row rather than erroring.
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    store
+        .archive_tool_result(None, "shell", Some("cmd"), "payload ### marker body")
+        .await
+        .unwrap();
+    let hits = store.search_archive("###", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].snippet.contains("###"), "{}", hits[0].snippet);
+}
+
+#[tokio::test]
 async fn request_stats_rows_separates_outcome_and_purpose_tags() {
     // R21: the row-level read separates error rows (outcome='error',
     // cached_tokens NULL) and compaction rows (purpose='summarize') from
@@ -2434,4 +2693,30 @@ async fn project_stats_empty_project_is_zero() {
     assert_eq!(stats.request_count, 0);
     assert!(stats.per_model.is_empty());
     assert!(stats.per_day.is_empty());
+}
+
+#[tokio::test]
+async fn compaction_checkpoint_round_trips_through_the_archive() {
+    // Backlog e4a50d22 lever 4: the region compaction is about to drop is
+    // archived under the `compaction_checkpoint` tool label BEFORE the summary
+    // replaces it, so the pointer handed to the model resolves back to the
+    // identical text (and the row stays keyword-searchable like lever 3's).
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let region = "#1 [User] DROPPED_ALPHA\n#2 [Assistant] DROPPED_BETA\n".to_string();
+    let id = store
+        .archive_tool_result(
+            Some("s1"),
+            "compaction_checkpoint",
+            Some("pre-compaction context"),
+            &region,
+        )
+        .await
+        .unwrap();
+    let fetched = store.expand_tool_result(&id).await.unwrap().expect("row exists");
+    assert_eq!(fetched.content, region, "the checkpoint comes back byte-identical");
+    assert_eq!(fetched.tool.as_deref(), Some("compaction_checkpoint"));
+    assert_eq!(fetched.detail.as_deref(), Some("pre-compaction context"));
+    let hits = store.search_archive("DROPPED_ALPHA", 10).await.unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].id, id);
 }

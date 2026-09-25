@@ -40,7 +40,9 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
+| **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
+| **Token-optimizer levers** | Six opt-in context-economy levers (`[general.optimizer]`, all off by default): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, and cache-safe lean-output nudges — each writing a `savings_events` row. |
 | **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
@@ -155,6 +157,38 @@ Two heavyweight optional cargo features exist on the library — `browser` (head
 In the config dialog download a semantic model that runs locally on your machine for the memory to be most effective and reindex after that.
 
 If you want in browser debugging you have to enable it in the advanced section of the config dialog.
+
+If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and pick Managed: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites. Advanced: run `laya-serve` yourself and point the section at its endpoint URL instead.
+
+### Context economy — the `[general.optimizer]` levers
+
+Six independent context-economy levers, all **off by default**; with a flag
+off, the code path is byte-identical to pre-lever behaviour. Add the `[general.optimizer]`
+section to `config.toml` and turn on what you want to economise:
+
+```toml
+[general.optimizer]
+delta_reads = true           # re-reads serve a skeleton or a diff, not whole files
+compress_output = true       # compress known command families + redact credentials
+archive = true               # archive large tool results; expand_result retrieves them
+compaction_survival = true   # survive summarization: checkpoint + preserved decisions
+quality_score = true         # S–F context grade in the ctx hover popup
+lean_output_nudge = true     # keep the model's own output lean as the window fills
+
+# knobs (defaults shown)
+archive_min_chars = 20000    # only results at least this large are archived
+compress_min_chars = 2000    # only outputs at least this long are compressed
+lean_output_fill_pct = 25    # fill % at which the lean-output nudge starts
+nudge_cooldown_requests = 10 # requests between two nudges
+compress_extra_commands = [] # extra command prefixes to compress
+```
+
+Every lever writes a row to the `savings_events` ledger, so its cost/benefit is
+auditable. The always-advertised `expand_result` tool retrieves any archived
+result by id or keyword. The Dashboard view (right panel, immediately before
+Memory) reads the ledger back per project: metered tokens saved, per-kind and
+per-day breakdowns, the recent events, and a prompt-cache section whose dollar
+figures are labelled ESTIMATED.
 
 Have fun and let me know where we can improve things.
 Pull requests gratefully considered.

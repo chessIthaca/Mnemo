@@ -19,7 +19,7 @@
 // test time, not prevented by derivation.
 
 import type { ComponentType } from "react";
-import { ListChecks, GitCompare, GitBranch, FolderTree, BarChart3, Activity, Inbox, Globe, Network, Brain } from "lucide-react";
+import { ListChecks, GitCompare, GitBranch, FolderTree, BarChart3, Activity, Inbox, Globe, Network, Brain, Gauge } from "lucide-react";
 
 import type { RightPanelTab } from "./agentState";
 import { FileViewer } from "../components/views/FileViewer";
@@ -31,6 +31,7 @@ import { LlmTraceView } from "../components/views/LlmTraceView";
 import { BacklogView } from "../components/views/BacklogView";
 import { BrowserView } from "../components/views/BrowserView";
 import { GraphView } from "../components/views/GraphView";
+import { DashboardView } from "../components/views/DashboardView";
 import { MemoryDebugView } from "../components/views/MemoryDebugView";
 
 /** The display + render metadata for one right-panel tab. */
@@ -61,5 +62,6 @@ export const RIGHT_PANEL_VIEWS: RightPanelView[] = [
   { id: "backlog", label: "Backlog", icon: Inbox, component: BacklogView },
   { id: "browser", label: "Browser", icon: Globe, component: BrowserView },
   { id: "graph", label: "Graph", icon: Network, component: GraphView },
+  { id: "dashboard", label: "Dashboard", icon: Gauge, component: DashboardView },
   { id: "memory", label: "Memory", icon: Brain, component: MemoryDebugView },
 ];

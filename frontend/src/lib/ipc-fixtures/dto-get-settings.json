@@ -12,6 +12,16 @@
     "default_provider": null,
     "embedding_model": null,
     "enable_browser_inspection": false,
+    "laya": {
+      "enabled": false,
+      "endpoint": null,
+      "mode": "external",
+      "checkpoint": null,
+      "auto_type_memories": false,
+      "failure_triage": false,
+      "failure_triage_knn": false,
+      "auto_finetune": false
+    },
     "safety": "approve-each-action",
     "vision_model": null
   },

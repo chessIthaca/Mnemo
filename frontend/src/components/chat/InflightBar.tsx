@@ -72,6 +72,28 @@ export function InflightBar({ agentId }: { agentId: number | null }) {
   return <InflightBarPanel state={state} agentId={agentId} />;
 }
 
+/**
+ * Colour-code the lever-6 S–F grade badge (backlog e4a50d22): green at the
+ * healthy end, red at the critical one. An unrecognised letter falls through to
+ * the worst band, so a future grade can never render uncoloured.
+ */
+function qualityColor(grade: string): string {
+  switch (grade) {
+    case "S":
+    case "A":
+      return "bg-emerald-500/15 text-emerald-300";
+    case "B":
+      return "bg-sky-500/15 text-sky-300";
+    case "C":
+      return "bg-amber-500/15 text-amber-300";
+    case "D":
+      return "bg-orange-500/15 text-orange-300";
+    case "F":
+    default:
+      return "bg-red-500/15 text-red-300";
+  }
+}
+
 /** The bar itself — receives the agent's state slice (guaranteed defined). */
 function InflightBarPanel({ state, agentId }: InflightBarProps) {
   const { running, activityLog, tokenUsage, lastRequestTiming, sessionTiming, lastContextBreakdown, contextUsage, contextBreakdown } = state;
@@ -443,6 +465,48 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                   <span className="text-slate-300">{fmtTokens(contextBreakdown.tool)}</span>
                 </div>
               </div>
+              {/* Lever 6 (backlog e4a50d22): the S–F context-quality grade.
+                  Rendered only when the backend's quality lever is on (the
+                  event omits `quality` otherwise), so the popup looks exactly
+                  as it did before when the flag is off. */}
+              {contextUsage.quality && (
+                <div className="mt-1 space-y-0.5 border-t border-border pt-1 font-mono">
+                  <div className="mb-0.5 flex items-center justify-between">
+                    <span className="text-slate-600">quality</span>
+                    <span
+                      className={`rounded px-1 font-semibold ${qualityColor(
+                        contextUsage.quality.grade,
+                      )}`}
+                    >
+                      {contextUsage.quality.grade}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">fill</span>
+                    <span className="text-slate-300">
+                      {fmtPct(contextUsage.quality.fill_pct)}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">waste</span>
+                    <span className="text-slate-300">
+                      {fmtTokens(contextUsage.quality.waste_tokens)}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">stale reads</span>
+                    <span className="text-slate-300">
+                      {contextUsage.quality.stale_read_rate}%
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-500">decisions</span>
+                    <span className="text-slate-300">
+                      {contextUsage.quality.decision_density}%
+                    </span>
+                  </div>
+                </div>
+              )}
               {!lastContextBreakdown && (
                 <div className="mt-0.5 text-slate-600">
                   no breakdown yet (send a prompt)

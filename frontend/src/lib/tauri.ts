@@ -241,7 +241,8 @@ export async function getContextCaps(): Promise<[number, number][]> {
 
 /**
  * The startup snapshot: everything the frontend needs on mount in one call
- * (agents, context caps, ALL workflow states, backlog, embedder status).
+ * (agents, context caps, ALL workflow states, backlog, embedder + classifier
+ * status).
  * Replaces 5 sequential invoke round-trips and closes the
  * stale-non-active-workflowStates gap (the old startup fetched only the
  * active agent's state).
@@ -252,6 +253,16 @@ export interface StartupSnapshot {
   workflow_states: [number, string][];
   backlog: BacklogItem[];
   embedder_status: string;
+  /**
+   * Laya classifier status: `"disabled"` (the default — Laya is opt-in and no
+   * classifier backend exists), `"ready"`, `"failed"` (the endpoint failed
+   * the last call), `"installing"` / `"starting"` (managed runtime phases),
+   * or `{ downloading: { label, progress } }` while a managed-runtime piece
+   * downloads. Seed value for status consumers; the Settings → Classifier
+   * section reads the live status via `getClassifierStatus()` and the
+   * `classifier://status` event.
+   */
+  classifier_status: ClassifierStatusWire;
   /**
    * Same-project instance conflict: set when another LIVE mnemo instance
    * already holds this project — the app asks before opening it (a second
@@ -276,7 +287,7 @@ export interface InstanceConflict {
 
 /**
  * Fetch the startup snapshot in one call. Seeds agents, context caps, ALL
- * workflow states, backlog, and embedder status on mount.
+ * workflow states, backlog, and embedder + classifier status on mount.
  */
 export async function getStartupSnapshot(): Promise<StartupSnapshot> {
   return await invoke("startup_snapshot");
@@ -435,6 +446,28 @@ export interface AppSettings {
     vision_model?: VisionModelConfig | null;
     embedding_model?: EmbeddingModelConfig | null;
     bundled_embedding_model?: string | null;
+    /** Laya classifier (opt-in) — whether it is enabled, the runtime `mode`
+     *  ("managed": Mnemo downloads + runs laya-serve as a sidecar; "external":
+     *  the user runs it), the managed-mode checkpoint id, and the external
+     *  `laya-serve` base URL (`null` = not configured). */
+    laya?: {
+      enabled: boolean;
+      endpoint: string | null;
+      mode: "external" | "managed";
+      checkpoint: string | null;
+      /** Whether memory auto-typing is enabled (opt-in). */
+      auto_type_memories: boolean;
+      /** Whether failure triage is enabled (opt-in; needs a fine-tuned
+       *  checkpoint). */
+      failure_triage: boolean;
+      /** Whether the kNN overlay for failure triage is enabled (opt-in;
+       *  local — rides the memory embedder, needs no laya-serve, consulted
+       *  only while failure_triage itself is on). */
+      failure_triage_knn: boolean;
+      /** Whether the startup failure-triage fine-tune is enabled (managed
+       *  mode only, opt-in). */
+      auto_finetune: boolean;
+    };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
      *  default; debug builds always expose it regardless). */
@@ -530,6 +563,25 @@ export interface SettingsSavePatch {
   clear_embedding_model?: boolean;
   bundled_embedding_model?: string;
   clear_bundled_embedding_model?: boolean;
+  /** Laya classifier (opt-in): flip the enable flag. */
+  laya_enabled?: boolean;
+  /** Laya `laya-serve` base URL; a blank string clears it. */
+  laya_endpoint?: string;
+  /** Laya runtime mode: "managed" (Mnemo downloads + runs the sidecar) or
+   * "external" (user-provided endpoint). */
+  laya_mode?: "external" | "managed";
+  /** Managed mode: the checkpoint id to serve ("english" | "multilingual"). */
+  laya_checkpoint?: string;
+  /** Laya memory auto-typing (opt-in; needs a fine-tuned checkpoint). */
+  laya_auto_type_memories?: boolean;
+  /** Laya failure triage (opt-in; needs a fine-tuned checkpoint). */
+  laya_failure_triage?: boolean;
+  /** The kNN overlay for failure triage (opt-in; local — rides the memory
+   *  embedder, needs no laya-serve; consulted only while laya_failure_triage
+   *  is on). */
+  laya_failure_triage_knn?: boolean;
+  /** Startup failure-triage fine-tune (managed mode only, opt-in). */
+  laya_auto_finetune?: boolean;
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
@@ -632,6 +684,74 @@ export function onEmbedderStatus(
   return listen<string>("embedder://status", (event) => {
     handler(event.payload);
   });
+}
+
+/**
+ * The Laya classifier status wire form: a unit-variant string, the
+ * downloading payload `{ downloading: { label, progress } }` (progress 0–1)
+ * while a managed-runtime piece (uv / venv / checkpoint) downloads, or the
+ * fine-tune payload `{ finetuning: { label } }` while the startup
+ * failure-triage fine-tune runs in the background.
+ */
+export type ClassifierStatusWire =
+  | "disabled"
+  | "ready"
+  | "failed"
+  | "installing"
+  | "starting"
+  | { downloading: { label: string; progress: number } }
+  | { finetuning: { label: string } };
+
+/**
+ * Get the live Laya classifier status.
+ * `disabled` is the default — Laya is opt-in and, while it is off, no
+ * classifier backend exists and no call is ever made.
+ */
+export async function getClassifierStatus(): Promise<ClassifierStatusWire> {
+  return await invoke("get_classifier_status");
+}
+
+/**
+ * Subscribe to Laya classifier status changes (`classifier://status` — emitted
+ * at startup, during managed-runtime setup/startup phases, and after a
+ * settings save rewires the backend).
+ */
+export function onClassifierStatus(
+  handler: (status: ClassifierStatusWire) => void,
+): Promise<UnlistenFn> {
+  return listen<ClassifierStatusWire>("classifier://status", (event) => {
+    handler(event.payload);
+  });
+}
+
+// ── Managed Laya runtime (download in Settings, Mnemo runs it) ─────────────
+
+/** A managed-Laya checkpoint catalog entry (Settings → Classifier). */
+export interface LayaCheckpointInfo {
+  /** The checkpoint id (`"english"` | `"multilingual"`). */
+  id: string;
+  /** Human-facing name. */
+  name: string;
+  /** Approximate download size (MiB). */
+  size_mb: number;
+  /** Whether this checkpoint was downloaded by a completed setup. */
+  installed: boolean;
+}
+
+/** List the managed-Laya checkpoints, each flagged `installed`. */
+export async function listLayaCheckpoints(): Promise<LayaCheckpointInfo[]> {
+  return await invoke("laya_catalog");
+}
+
+/**
+ * Download the managed Laya runtime (uv + venv + `laya[serve]` + the
+ * checkpoint) in the background. Fire-and-forget: emits `classifier://status`
+ * events — `installing` / `downloading { label, progress }` phases, then
+ * `ready` (or `failed`) — and starts the sidecar when the saved config
+ * already enables managed mode.
+ */
+export async function setupLayaRuntime(checkpoint: string): Promise<void> {
+  await invoke("laya_setup", { checkpoint });
 }
 
 // ── Bundled embedding models (fastembed, in-process) ───────────────────────
@@ -1396,6 +1516,64 @@ export interface SessionSummary {
   reasoning_tokens: number;
 }
 
+/** One token-savings ledger row (a `savings_events` row). */
+export interface SavingsEvent {
+  id: string;
+  session_id: string | null;
+  /** The lever kind: `truncation`, `compaction`, `delta_read`, `skeleton`, … */
+  kind: string;
+  /** Free-form detail (path, command, archive id). Omitted when absent. */
+  detail?: string | null;
+  tokens_before: number;
+  tokens_after: number;
+  /** Signed: an `archive_expand` row re-adds content and so is negative. */
+  tokens_saved: number;
+  measured: boolean;
+  created_at: number;
+}
+
+/** One lever's savings — a row in the Dashboard's per-kind table. */
+export interface SavingsKindBreakdown {
+  kind: string;
+  event_count: number;
+  saved_tokens: number;
+}
+
+/** One day's savings — a bar in the Dashboard's time series. */
+export interface SavingsDayBreakdown {
+  /** The UTC day as epoch DAYS (`created_at / 86400`), not seconds. */
+  day: number;
+  event_count: number;
+  saved_tokens: number;
+}
+
+/** Prompt-cache efficiency across the project's recorded requests. */
+export interface CacheEfficiency {
+  prompt_tokens: number;
+  cached_tokens: number;
+  /** Requests that reported a cache figure. Gates whether a hit rate is shown;
+   *  the displayed rate itself is `cached_tokens / prompt_tokens` over every
+   *  recorded request, including rows that reported no usage. */
+  cached_not_null_requests: number;
+  request_count: number;
+}
+
+/**
+ * Aggregated token savings across the whole project (all sessions) — the
+ * Dashboard view's read path (backlog 652ae094). It aggregates the
+ * `savings_events` ledger the optimizer levers write (backlog e4a50d22).
+ */
+export interface SavingsStats {
+  /** Signed total of `tokens_saved` across every event. */
+  saved_tokens_total: number;
+  event_count: number;
+  per_kind: SavingsKindBreakdown[];
+  per_day: SavingsDayBreakdown[];
+  /** The most recent events, newest first (bounded on the backend). */
+  recent: SavingsEvent[];
+  cache: CacheEfficiency;
+}
+
 /**
  * Get per-session token + timing stats for the agent with the given id.
  * Errors if the agent has no session yet (no prompt sent).
@@ -1407,6 +1585,11 @@ export async function getSessionStats(agentId: AgentId): Promise<SessionStats> {
 /** Get per-project token + timing stats (aggregated across all sessions). */
 export async function getProjectStats(): Promise<ProjectStats> {
   return await invoke("get_project_stats");
+}
+
+/** Get per-project token-SAVINGS stats for the Dashboard view (652ae094). */
+export async function getSavingsStats(): Promise<SavingsStats> {
+  return await invoke("get_savings_stats");
 }
 
 /** Get the list of sessions with aggregated token counts (newest first). */

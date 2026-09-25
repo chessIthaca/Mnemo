@@ -15,8 +15,10 @@
 //! the agent's `file_edit`/`file_write`/`file_append` tools, a human editor,
 //! `git checkout`/merge — without those paths needing to know the graph
 //! exists. Event filtering reuses the search tool's exclusion rules
-//! (`is_ignored_component` + extension gating), so build output, dependencies,
-//! and VCS metadata never trigger a re-index.
+//! (`is_ignored_component` plus the shared app-store predicate), so build
+//! output, dependencies, VCS metadata, and the app's own SQLite stores never
+//! trigger a re-index — while every other indexed file, `.coding/` artifacts
+//! included, does.
 //!
 //! The watcher is best-effort: a watcher that fails to start, a burst that
 //! races an in-progress index, or an indexing failure are all logged and
@@ -31,19 +33,19 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::codegraph::CodeGraph;
 
-/// Whether `path` should trigger a re-index: any file that does not pass
-/// through an ignored directory or `.coding/`. Mirrors `walk_searchable`'s
-/// coverage (the content index holds every searchable file, not just
-/// parseable source — review C1), so a docs/config edit refreshes its FTS
-/// rows too.
+/// Whether `path` should trigger a re-index: any file the content index
+/// covers — i.e. one that does not pass through an ignored directory or the
+/// app's own SQLite store family under `.coding/`.
 ///
-/// `.coding/` is deliberately excluded from WATCH events (while still being
-/// indexed by each pass): it holds the codegraph + memory DBs — which are
-/// written continuously DURING an index pass, so watching them would
-/// self-trigger a reindex loop — plus per-step bookkeeping (stack.json,
-/// backlog.jsonl) that would churn passes all session. Those files' content
-/// rows simply refresh on the next pass (startup, any source edit, or a
-/// manual rebuild).
+/// Mirrors `walk_searchable`'s coverage (the content index holds every
+/// searchable file, not just parseable source — review C1), so a docs/config
+/// edit refreshes its FTS rows too. `search::is_coding_data_file` is the
+/// single shared predicate behind BOTH sides of that mirror: `.coding/`
+/// artifacts (knowledge, plans, reviews, skills, backlog.jsonl) ARE watched,
+/// so a write there refreshes its own rows within the debounce instead of
+/// waiting for the next unrelated pass; only the graph + memory DBs stay
+/// unwatched, because an index pass writes those itself (watching them would
+/// re-index forever).
 ///
 /// Symlink-tolerant: FSEvents (macOS) delivers event paths with symlinks
 /// resolved, so a watched root under a symlinked path (every macOS
@@ -57,13 +59,20 @@ fn is_indexable_path(path: &Path, root: &Path) -> bool {
         };
         for component in rel.components() {
             if let std::path::Component::Normal(name) = component {
-                let name = &*name.to_string_lossy();
-                if crate::tool::agent::search::is_ignored_component(name) || name == ".coding" {
+                if crate::tool::agent::search::is_ignored_component(&name.to_string_lossy()) {
                     return false;
                 }
             }
         }
-        true
+        // Beyond the search ignore rules the ONLY exclusion is the app's own
+        // SQLite store family under `.coding/` (codegraph + memory DBs and
+        // their -wal/-shm/-journal sidecars): an index pass writes the graph
+        // DB itself, so watching it would self-trigger a reindex loop
+        // forever. Every other `.coding/` file (knowledge, plans, reviews,
+        // skills, backlog.jsonl) IS watched — the trigger set equals the
+        // content index's coverage, so a write there refreshes its own rows
+        // instead of waiting for an unrelated source edit to trigger a pass.
+        !crate::tool::agent::search::is_coding_data_file(rel)
     }
     if under_base(path, root) {
         return true;
@@ -281,15 +290,40 @@ mod tests {
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("target/x.rs"), "fn x() {}").unwrap();
         assert!(!is_indexable_path(&root.join("target/x.rs"), root));
-        // .coding/ holds the graph/memory DBs + per-step bookkeeping —
-        // watching it would self-trigger reindex loops on DB writes.
+        // `.coding/` artifacts ARE watched — only the app's SQLite stores
+        // are not (asserted above). Per-instance local state is written once
+        // per launch (src/instance_marker.rs) or on plan-step transitions,
+        // so the churn the old blanket exclusion feared is not real — while
+        // leaving it unwatched is exactly what let these files go stale.
         std::fs::create_dir_all(root.join(".coding/plans")).unwrap();
         std::fs::write(root.join(".coding/plans/stack.json"), "{}").unwrap();
-        assert!(!is_indexable_path(
-            &root.join(".coding/plans/stack.json"),
-            root
-        ));
+        assert!(
+            is_indexable_path(&root.join(".coding/plans/stack.json"), root),
+            "per-instance local state is watched so it cannot go stale"
+        );
         assert!(!is_indexable_path(&root.join(".coding/codegraph.db"), root));
+        assert!(!is_indexable_path(&root.join(".coding/memory.db-wal"), root));
+        // The trigger set mirrors the index's coverage: every OTHER
+        // `.coding/` file IS watched, so a knowledge/plan/review/backlog
+        // write refreshes its own rows instead of waiting for an unrelated
+        // edit to trigger a pass.
+        std::fs::create_dir_all(root.join(".coding/knowledge")).unwrap();
+        std::fs::create_dir_all(root.join(".coding/reviews")).unwrap();
+        std::fs::write(root.join(".coding/knowledge/k.md"), "# k").unwrap();
+        std::fs::write(root.join(".coding/reviews/r.md"), "# r").unwrap();
+        std::fs::write(root.join(".coding/backlog.jsonl"), "{}\n").unwrap();
+        assert!(
+            is_indexable_path(&root.join(".coding/knowledge/k.md"), root),
+            "a .coding/ knowledge artifact must trigger a pass"
+        );
+        assert!(
+            is_indexable_path(&root.join(".coding/reviews/r.md"), root),
+            "a .coding/ review artifact must trigger a pass"
+        );
+        assert!(
+            is_indexable_path(&root.join(".coding/backlog.jsonl"), root),
+            "the backlog store must trigger a pass"
+        );
         // Outside root.
         let other = tempdir().unwrap();
         assert!(!is_indexable_path(&other.path().join("o.rs"), root));
@@ -404,5 +438,54 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(found, "watcher must auto-index the new file's symbol");
+    }
+
+    /// Regression (content-index staleness ROOT CAUSE, 2027-01-25): a write
+    /// to a `.coding/` artifact the content index covers fired NO watcher
+    /// event, so its rows could only refresh when an unrelated non-`.coding`
+    /// edit happened to trigger a pass — permanently stale in an
+    /// artifact-heavy session (plans, memories, reviews). The trigger set
+    /// must equal the index's coverage: only the app's own SQLite stores
+    /// under `.coding/` stay unwatched, because an index pass writes those
+    /// itself (watching them would re-index forever).
+    #[tokio::test]
+    async fn watcher_reindexes_on_new_coding_artifact() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() {}").unwrap();
+        let graph = Arc::new(CodeGraph::open_in_memory(root.clone()).unwrap());
+        graph.index(None).unwrap();
+
+        let _watcher =
+            GraphWatcher::spawn(Arc::clone(&graph), root.clone(), Duration::from_millis(100))
+                .expect("spawn watcher");
+
+        // Write a `.coding/` knowledge artifact — the watcher must pick it up.
+        std::fs::create_dir_all(root.join(".coding/knowledge")).unwrap();
+        std::fs::write(
+            root.join(".coding/knowledge/live-artifact.md"),
+            "# live artifact\ncodingartifactmarker\n",
+        )
+        .unwrap();
+
+        // Poll the content index (bounded so a broken watcher fails fast).
+        // 200 × 50ms = 10s: FSEvents (macOS) delivers events after a latency
+        // window, so the poll must outlast it.
+        let mut found = false;
+        for _ in 0..200 {
+            if !graph
+                .search_content("codingartifactmarker", 10)
+                .unwrap()
+                .is_empty()
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            found,
+            "a .coding/ artifact write must trigger a watcher pass"
+        );
     }
 }

@@ -1,6 +1,7 @@
 +++
 title = "content-index staleness root causes — .coding indexed but never watched, plus the 800 ms debounce"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 ROOT CAUSE of content-index staleness (diagnosed 2027-01-25, asked as "nobody else edits files, so why stale?"). TWO mechanisms, both from Mnemo's own writes:

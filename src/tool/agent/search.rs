@@ -75,6 +75,39 @@ pub(crate) fn is_ignored_component(name: &str) -> bool {
     IGNORED_DIRS.contains(&name)
 }
 
+/// Whether a ROOT-RELATIVE path is one of the app's own SQLite stores under
+/// `.coding/` (the codegraph + memory DBs and their journal/WAL sidecars).
+///
+/// These are binary caches whose contents are meaningless as search results,
+/// and the graph DB is written DURING every index pass — indexing it into
+/// itself would re-index forever. This is the ONE predicate that keeps the
+/// content index's coverage and the file watcher's trigger set in agreement:
+/// the index skips these files and the watcher must not fire on them, so
+/// every OTHER `.coding/` file is both indexed and watched.
+///
+/// (A shared predicate rather than two rules: the sets drifted apart once —
+/// the watcher rejected `.coding/` wholesale while the index covered it, so
+/// knowledge/plan/review/backlog writes could never trigger the pass that
+/// would refresh their own rows.)
+pub(crate) fn is_coding_data_file(rel: &Path) -> bool {
+    const DATA_FILES: &[&str] = &[
+        "codegraph.db",
+        "codegraph.db-wal",
+        "codegraph.db-shm",
+        "codegraph.db-journal",
+        "memory.db",
+        "memory.db-wal",
+        "memory.db-shm",
+        "memory.db-journal",
+    ];
+    if rel.components().next().and_then(|c| c.as_os_str().to_str()) != Some(".coding") {
+        return false;
+    }
+    rel.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| DATA_FILES.contains(&name))
+}
+
 /// Whether a file should be searched: skip ignored dirs, the app's own data
 /// stores under `.coding/`, and files that are likely huge.
 ///
@@ -97,30 +130,11 @@ pub(crate) fn should_search(path: &Path, root: &Path) -> bool {
             }
         }
     }
-    // Never scan the app's own SQLite stores under `.coding/` (codegraph +
-    // memory DBs and their journal/WAL sidecars): they are binary caches
-    // whose contents are meaningless as search results, and indexing the
-    // graph DB into itself is self-referential (the DB changes during every
-    // pass, so it would re-index forever). read_to_string only skips them
-    // opportunistically (when a page happens to be non-UTF-8) — excluded
-    // deterministically here so the walk engine and the FTS content index
-    // stay in exact agreement.
-    if rel.components().next().and_then(|c| c.as_os_str().to_str()) == Some(".coding") {
-        const DATA_FILES: &[&str] = &[
-            "codegraph.db",
-            "codegraph.db-wal",
-            "codegraph.db-shm",
-            "codegraph.db-journal",
-            "memory.db",
-            "memory.db-wal",
-            "memory.db-shm",
-            "memory.db-journal",
-        ];
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if DATA_FILES.contains(&name) {
-                return false;
-            }
-        }
+    // Never scan the app's own SQLite stores under `.coding/` — see
+    // `is_coding_data_file`, the predicate the file watcher SHARES so the
+    // index's coverage and the watcher's trigger set cannot drift apart.
+    if is_coding_data_file(rel) {
+        return false;
     }
     // Skip files over 1 MB — likely minified bundles or data files.
     if let Ok(meta) = std::fs::metadata(path) {

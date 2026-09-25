@@ -1431,7 +1431,13 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         }
         _ => None,
     };
-    let classifier = managed_classifier.or(classifier);
+    // Managed mode owns the classifier: a stale external `endpoint` must not
+    // back-door a live classifier in at startup that any later save would
+    // drop (the rewire never falls back to the endpoint either).
+    let classifier = match config.general.general.laya.mode {
+        mnemo::config::LayaMode::Managed => managed_classifier,
+        _ => managed_classifier.or(classifier),
+    };
 
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),

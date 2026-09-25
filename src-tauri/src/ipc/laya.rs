@@ -51,7 +51,7 @@ use anyhow::{anyhow, Context as _, Result};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use mnemo::config::{global_config_dir, LayaMode};
+use mnemo::config::{global_config_dir, LayaConfig, LayaMode};
 use mnemo::memory::classifier::{Classifier, ClassifierStatus, LayaClassifier};
 
 use crate::ipc::state::IpcState;
@@ -732,25 +732,49 @@ async fn run_setup(
     Ok(())
 }
 
-/// Fire-and-forget setup: download the runtime + `checkpoint`, then (when
-/// `autostart` — the config enables managed mode AND this checkpoint is
-/// the configured one) start the server so the freshly enabled classifier
-/// goes live without a restart. `laya_disabled` says whether Laya is off
-/// in the config: only then is `Disabled` the honest post-setup status —
-/// otherwise a live classifier (an external endpoint, or a managed child
-/// serving a different checkpoint) keeps its status untouched.
+/// The autostart decision for a finished setup, derived from the LIVE
+/// config plus the checkpoint the setup just downloaded. Returns
+/// `(autostart, laya_off)`: `autostart` only when the config enables
+/// managed mode AND this checkpoint is the configured one (downloading a
+/// different checkpoint must never silently swap the live model — the
+/// save path makes that switch explicit); `laya_off` — the only case
+/// where a post-setup `Disabled` is the honest status — when Laya is off
+/// entirely. An enabled external-mode config keeps its live classifier
+/// untouched.
+fn setup_autostart_decision(laya: &LayaConfig, downloaded_id: &str) -> (bool, bool) {
+    let configured = laya
+        .checkpoint
+        .as_deref()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "english".to_string());
+    let laya_off = !laya.enabled;
+    let autostart = !laya_off && laya.mode == LayaMode::Managed && configured == downloaded_id;
+    (autostart, laya_off)
+}
+
+/// Fire-and-forget setup: download the runtime + `checkpoint`, then start
+/// the server so the freshly enabled classifier goes live without a
+/// restart. The autostart decision is re-derived from the LIVE config
+/// (`config`) when the setup finishes — see [`setup_autostart_decision`]
+/// — never from a snapshot taken at download start: a mid-setup save
+/// (disable, checkpoint switch, mode flip) must always win over the
+/// just-finished download.
 pub fn spawn_setup_task(
     app: Option<AppHandle>,
     manager: Arc<LayaManager>,
     checkpoint: &'static LayaCheckpoint,
-    autostart: bool,
-    laya_disabled: bool,
+    config: Arc<tokio::sync::Mutex<mnemo::config::Config>>,
     classifier_slot: Option<Arc<RwLock<Option<Arc<dyn Classifier>>>>>,
 ) {
     tauri::async_runtime::spawn(async move {
         let status = Arc::clone(&manager.status);
         let result = run_setup(&app, &status, &manager, checkpoint).await;
         manager.end_setup();
+        // Re-evaluate from the live config at completion time.
+        let (autostart, laya_off) = {
+            let cfg = config.lock().await;
+            setup_autostart_decision(&cfg.general.general.laya, checkpoint.id)
+        };
         match result {
             Ok(()) if autostart => {
                 let started = match LayaManager::alloc_free_port() {
@@ -780,7 +804,7 @@ pub fn spawn_setup_task(
                 // honest status when Laya is actually off in the config —
                 // otherwise leave any live classifier alone instead of
                 // clobbering its Ready status.
-                if laya_disabled {
+                if laya_off {
                     let s = ClassifierStatus::Disabled;
                     *status.write().expect("classifier status lock poisoned") = s.clone();
                     if let Some(app) = &app {
@@ -788,8 +812,8 @@ pub fn spawn_setup_task(
                     }
                 } else {
                     eprintln!(
-                        "info: Laya runtime ready (checkpoint '{}') — not the configured \
-                         one; the live classifier is untouched",
+                        "info: Laya runtime ready (checkpoint '{}') — the live config \
+                         does not select it; the live classifier is untouched",
                         checkpoint.id
                     );
                 }
@@ -896,18 +920,26 @@ pub async fn start_managed_server(
                 Some(port)
             } else {
                 // Scoped teardown: kill only the child THIS start spawned —
-                // a concurrent newer start (save-driven rewire) must
-                // survive an orphaned probe's failure path.
-                manager.stop_if_generation(generation);
-                eprintln!(
-                    "error: managed laya-serve never answered on port {port} \
-                     (see {})",
-                    manager.server_log_path().display()
-                );
-                let s = ClassifierStatus::Failed;
-                *status.write().expect("classifier status lock poisoned") = s.clone();
-                if let Some(app) = app {
-                    let _ = app.emit("classifier://status", &s);
+                // a concurrent newer start (save-driven rewire) must survive
+                // an orphaned probe's failure path AND keep its own status
+                // (no Failed overwrite when the generation no longer
+                // matched: the winner is healthy).
+                if manager.stop_if_generation(generation) {
+                    eprintln!(
+                        "error: managed laya-serve never answered on port {port} \
+                         (see {})",
+                        manager.server_log_path().display()
+                    );
+                    let s = ClassifierStatus::Failed;
+                    *status.write().expect("classifier status lock poisoned") = s.clone();
+                    if let Some(app) = app {
+                        let _ = app.emit("classifier://status", &s);
+                    }
+                } else {
+                    eprintln!(
+                        "info: the Laya readiness probe was superseded by a newer \
+                         start; keeping its status"
+                    );
                 }
                 None
             }
@@ -978,26 +1010,14 @@ pub async fn laya_setup(
     if !manager.begin_setup() {
         return Err("a Laya setup is already running".into());
     }
-    // Auto-start only when the config enables managed mode AND the
-    // downloaded checkpoint is the configured one — downloading a
-    // different checkpoint must never silently swap the live model; the
-    // save path makes that switch explicit.
-    let cfg = state.project.config.lock().await;
-    let laya = &cfg.general.general.laya;
-    let configured = laya
-        .checkpoint
-        .as_deref()
-        .map(|c| c.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "english".to_string());
-    let laya_disabled = !laya.enabled || laya.mode != LayaMode::Managed;
-    let autostart = !laya_disabled && configured == cp.id;
-    drop(cfg);
+    // The autostart decision is re-derived from the LIVE config when the
+    // (multi-minute) setup finishes — see `setup_autostart_decision` — so
+    // no snapshot rides along from download start.
     spawn_setup_task(
         Some(app),
         manager,
         cp,
-        autostart,
-        laya_disabled,
+        state.project.config.clone(),
         Some(state.runtime.classifier.clone()),
     );
     Ok(())
@@ -1188,6 +1208,9 @@ mod tests {
         link.set_size(0);
         link.set_entry_type(tar::EntryType::Symlink);
         link.set_mode(0o777);
+        // The decoy must genuinely be NAMED like the binary (set_path is
+        // the entry name; set_link_name is only the link target).
+        link.set_path(symlink.0).unwrap();
         link.set_link_name(symlink.1).unwrap();
         link.set_cksum();
         tar.append(&mut link, std::io::empty()).unwrap();
@@ -1261,5 +1284,25 @@ mod tests {
         // Case-insensitive hex, and a bare digest without the prefix.
         verify_sha256(&f, ABC.to_ascii_uppercase().as_str()).unwrap();
         assert!(verify_sha256(&f, "sha256:00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn setup_autostart_decision_follows_the_live_config() {
+        use mnemo::config::{LayaConfig, LayaMode};
+        let mut cfg = LayaConfig::default();
+        // Off entirely: no autostart, and Disabled is the honest status.
+        assert_eq!(setup_autostart_decision(&cfg, "english"), (false, true));
+        // Enabled + managed + the configured (defaulted) checkpoint.
+        cfg.enabled = true;
+        cfg.mode = LayaMode::Managed;
+        assert_eq!(setup_autostart_decision(&cfg, "english"), (true, false));
+        // A different checkpoint was downloaded: never swap silently.
+        assert_eq!(setup_autostart_decision(&cfg, "multilingual"), (false, false));
+        // Explicit checkpoint match (whitespace/case normalized).
+        cfg.checkpoint = Some(" Multilingual ".into());
+        assert_eq!(setup_autostart_decision(&cfg, "multilingual"), (true, false));
+        // Enabled but external: a live external classifier stays untouched.
+        cfg.mode = LayaMode::External;
+        assert_eq!(setup_autostart_decision(&cfg, "english"), (false, false));
     }
 }

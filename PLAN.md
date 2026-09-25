@@ -1369,10 +1369,11 @@ product.
   alternation), a distinct "glob matched no files" hint, and a filename
   fallback on zero content hits; `current_plan` reports the active plan's
   on-disk file; FTS index hits are freshness-checked (on-disk mtime vs
-  as-of-index) so the edit→watcher gap repairs a small staleness inline (≤ 8
-  stale files re-indexed and the query re-served from the fresh index with a
-  "reindexed N stale file(s)" note) and serves the walk with a staleness note
-  only above that cap or while an index pass runs;
+  as-of-index) so the edit→watcher gap repairs a modest staleness inline
+  under an adaptive bound (up to 32 stale files re-indexed within a ~500 ms
+  budget, then the query re-served from the fresh index with a "reindexed N
+  stale file(s)" note) and serves the walk with a staleness note only beyond
+  that ceiling, once the budget is spent, or while an index pass runs;
   `create_plan`'s RECALLED CONTEXT rider title-term-boosts on-point rows;
   uuid-shaped search patterns earn a fired-only known-memory-hit note; a
   session crossing 15 working-memory events gets a once-per-session

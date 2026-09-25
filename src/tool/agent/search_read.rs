@@ -265,11 +265,12 @@ impl Tool for SearchReadTool {
             // populated (same guards as search.rs — a fallback-fired pattern
             // walks so "matched literally" stays exact, review B1); matched
             // files arrive in relevance (bm25) order instead of walk order.
-            // A stale index (F10) is repaired inline for a small staleness
+            // A stale index (F10) is repaired inline for a modest staleness
             // (search::try_index re-indexes at most STALE_REINDEX_CAP files
-            // and re-queries once) — the re-index is disclosed in the note;
-            // a Stale outcome falls through to the walk with the staleness
-            // merged into the prepended note.
+            // under the codegraph stale-reindex budget, then re-queries
+            // once) — the re-index is disclosed in the note; a Stale outcome
+            // falls through to the walk with the staleness merged into the
+            // prepended note.
             let mut stale_note: Option<String> = None;
             if args.literal && !args.pattern.contains('\n') {
                 if let Some(g) = &graph {

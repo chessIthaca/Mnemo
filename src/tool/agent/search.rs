@@ -339,13 +339,16 @@ fn descend(
 const MAX_MATCHES: usize = 100;
 
 /// Maximum number of stale files re-indexed INLINE inside a search tool
-/// call (F10): a small staleness — the watcher's reindex lagging one or two
-/// edits — is repaired on the spot ([`CodeGraph::reindex_stale_files`]) and
-/// the query re-served from the fresh index. Above the cap (a checkout-scale
+/// call (F10): a staleness — the watcher's reindex lagging a burst of edits
+/// — is repaired on the spot ([`CodeGraph::reindex_stale_files`]) and the
+/// query re-served from the fresh index. This ceiling is an ADAPTIVE upper
+/// bound, NOT the latency guard itself: within it the repair runs under
+/// [`crate::codegraph::STALE_REINDEX_BUDGET`], whose pass stops between
+/// files once the budget is spent — a slow set therefore degrades to the
+/// walk instead of a slow tool call. Beyond the ceiling (a checkout-scale
 /// staleness), or while an index pass is running, the tree walk stays the
-/// answer: parsing dozens of files inside a tool call would blow the call's
-/// latency budget, and the walk is authoritative anyway.
-const STALE_REINDEX_CAP: usize = 8;
+/// answer: the walk is authoritative anyway.
+const STALE_REINDEX_CAP: usize = 32;
 
 /// Maximum number of bypassed delegation keys retained. Once a query has
 /// delegated, its identical re-issues never re-delegate in-session; the set
@@ -841,9 +844,11 @@ pub(crate) enum FtsOutcome {
     Hits(IndexHits),
     /// The FTS rows lag the working tree for `files` of the returned hits
     /// and the inline refresh did not clear it — above
-    /// [`STALE_REINDEX_CAP`], an index pass was already running, the
-    /// re-index failed, or the files were edited again during the retry.
-    /// The caller falls through to the walk and surfaces the staleness.
+    /// [`STALE_REINDEX_CAP`], [`crate::codegraph::STALE_REINDEX_BUDGET`]
+    /// spent before the last stale file was refreshed, an index pass was
+    /// already running, the re-index failed, or the files were edited again
+    /// during the retry. The caller falls through to the walk and surfaces
+    /// the staleness.
     Stale {
         files: usize,
     },
@@ -956,13 +961,15 @@ fn fts_page(
 /// F10 staleness (the FTS rows lag the working tree for some hit files) is
 /// REPAIRED, not just surfaced: when at most [`STALE_REINDEX_CAP`] files are
 /// stale and no index pass is running, they are re-indexed inline
-/// ([`crate::codegraph::CodeGraph::reindex_stale_files`]) and the query is
-/// re-run ONCE from the fresh index — the outcome then carries the number of
-/// refreshed files so the caller can disclose the side effect. A staleness
-/// above the cap, a busy index pass, a failed re-index, or files edited again
-/// during the retry yields [`FtsOutcome::Stale`] — the caller walks and
-/// surfaces the staleness. A re-index that empties the result set returns
-/// `None` (→ walk, no note): the walk is the authoritative answer.
+/// ([`crate::codegraph::CodeGraph::reindex_stale_files`], under
+/// [`crate::codegraph::STALE_REINDEX_BUDGET`]) and the query is re-run ONCE
+/// from the fresh index — the outcome then carries the number of files
+/// actually refreshed so the caller can disclose the side effect. A
+/// staleness above the ceiling, a budget that ran out with files still
+/// stale, a busy index pass, a failed re-index, or files edited again during
+/// the retry yields [`FtsOutcome::Stale`] — the caller walks and surfaces the
+/// staleness. A re-index that empties the result set returns `None` (→ walk,
+/// no note): the walk is the authoritative answer.
 pub(crate) fn try_index(
     graph: &crate::codegraph::CodeGraph,
     root: &Path,
@@ -980,14 +987,19 @@ pub(crate) fn try_index(
                 reindexed,
             }));
         }
-        if attempt == 0
-            && page.stale_paths.len() <= STALE_REINDEX_CAP
-            && graph
-                .reindex_stale_files(&page.stale_paths)
-                .is_ok_and(|n| n > 0)
-        {
-            reindexed = page.stale_paths.len();
-            continue; // re-query once from the fresh index
+        if attempt == 0 && page.stale_paths.len() <= STALE_REINDEX_CAP {
+            // The budget-bounded pass: an Err (busy/failed) and a spent
+            // budget with nothing refreshed both land on 0 → walk below. A
+            // budget spent MID-set leaves the rest stale, so the re-query
+            // still trips and the caller walks — `reindexed` can never
+            // over-report.
+            let refreshed = graph
+                .reindex_stale_files(&page.stale_paths, crate::codegraph::STALE_REINDEX_BUDGET)
+                .unwrap_or(0);
+            if refreshed > 0 {
+                reindexed = refreshed;
+                continue; // re-query once from the fresh index
+            }
         }
         return Some(FtsOutcome::Stale {
             files: page.stale_paths.len(),
@@ -1365,10 +1377,11 @@ impl Tool for SearchTool {
             // queries token `foo`), matching MORE lines than the literal
             // promises — only the walk engine keeps "matched literally"
             // semantics exact (review B1). A stale index (F10) is repaired
-            // inline for a small staleness — try_index re-indexes at most
-            // STALE_REINDEX_CAP files and re-queries once — so a Stale
-            // outcome here means the repair was not attempted or did not
-            // clear it (above the cap, a pass running, or re-edited files).
+            // inline for a modest staleness — try_index re-indexes at most
+            // STALE_REINDEX_CAP files under the codegraph stale-reindex
+            // budget, then re-queries once — so a Stale outcome here means
+            // the repair was not attempted or did not clear it (beyond the
+            // ceiling, the budget spent, a pass running, or re-edited files).
             let mut stale_note: Option<String> = None;
             if args.literal && !args.pattern.contains('\n') {
                 if let Some(g) = &graph {
@@ -3278,12 +3291,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nine_stale_files_reindex_inline() {
+        // The live repro (backlog 9201704f, 2027-01-25): NINE stale hit files
+        // — one past the old cap of 8 — fell back to the tree walk with
+        // "content index stale for 9 file(s)". The adaptive bound repairs
+        // them inline and serves the fresh index instead. This boundary is
+        // hit routinely: the watcher deliberately does not watch .coding/,
+        // so an artifact-heavy session (plans, memories, reviews) reaches a
+        // nine-file staleness with nobody else touching the tree.
+        let dir = tempdir().unwrap();
+        let count = 9;
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("stale{i:02}.md")), "needle v1\n").unwrap();
+        }
+        let tool = make_indexed_tool(dir.path());
+        // Edit every file AFTER indexing + bump mtimes — the edit→watcher
+        // gap, at the exact size the old hard cap refused.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for i in 0..count {
+            let path = dir.path().join(format!("stale{i:02}.md"));
+            std::fs::write(&path, "needle v2\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.output.contains("reindexed 9 stale file(s)"),
+            "nine stale files are repaired inline: {}",
+            r.output
+        );
+        assert!(r.output.contains("engine: index"), "{}", r.output);
+        assert!(
+            !r.output.contains("engine: walk"),
+            "no walk fallback for a nine-file staleness: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("note: note:"),
+            "single note prefix: {}",
+            r.output
+        );
+        assert!(r.output.contains("needle v2"), "{}", r.output);
+    }
+
+    #[tokio::test]
     async fn stale_above_the_reindex_cap_walks() {
-        // A checkout-scale staleness (more than STALE_REINDEX_CAP files)
-        // must NOT be repaired inline — parsing dozens of files inside a
-        // tool call would blow the latency budget. The walk stays the
-        // answer and the staleness is surfaced with a single "note: "
-        // prefix (the doubled "note: note:" bug, user request 2026-12-30).
+        // A staleness BEYOND the inline ceiling (more than
+        // STALE_REINDEX_CAP files) must NOT be repaired inline — the
+        // adaptive bound stops there and the walk stays the answer. The
+        // staleness is surfaced with a single "note: " prefix (the doubled
+        // "note: note:" bug, user request 2026-12-30).
         let dir = tempdir().unwrap();
         let cap = STALE_REINDEX_CAP;
         for i in 0..=cap {

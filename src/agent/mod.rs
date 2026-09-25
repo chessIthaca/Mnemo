@@ -17,14 +17,22 @@
 //! - [`loop_impl`] — the `AgentLoop` struct, constructors, and public handles.
 //! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall).
 //! - [`dispatch`] — tool-call dispatch, the approval gate, provider retry.
+//! - [`failure_triage`] — the Laya classifier's failure-classification
+//!   decision layer (classes, confidence gate, auto-retry policy, the
+//!   training log).
+//! - [`failure_triage_knn`] — the kNN overlay for failure triage (online
+//!   learning from the training log, independent of the Laya endpoint).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 
 pub mod approval;
+pub mod optimizer;
 pub mod context;
 pub mod factory;
+pub mod failure_triage;
+pub mod failure_triage_knn;
 pub mod prompt;
 pub mod steering_stats;
 

@@ -18,6 +18,7 @@ export type SettingsSectionId =
   | "git"
   | "vision"
   | "embeddings"
+  | "classifier"
   | "memory"
   | "pricing"
   | "models"
@@ -103,6 +104,20 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
     label: "Embeddings",
     hint: "Semantic memory recall",
     keywords: ["embedding", "nomic", "vector", "semantic", "memory", "ollama"],
+  },
+  {
+    id: "classifier",
+    label: "Classifier",
+    hint: "Laya System 1 (opt-in)",
+    keywords: [
+      "laya",
+      "classifier",
+      "system 1",
+      "classify",
+      "sidecar",
+      "laya-serve",
+      "endpoint",
+    ],
   },
   {
     id: "memory",
@@ -406,6 +421,36 @@ export function serializeChat(d: ChatDraft): string {
 }
 
 /**
+ * Snapshot of the Laya classifier draft (for dirty / discard). `mode` picks
+ * managed (Mnemo downloads + runs laya-serve) vs external; `checkpoint` is
+ * the managed-mode checkpoint id; `endpoint` is the raw external-mode input
+ * value; "" means "not configured" (the backend clears the stored URL when
+ * the save patch carries a blank string).
+ */
+export interface ClassifierDraft {
+  enabled: boolean;
+  mode: "external" | "managed";
+  checkpoint: string;
+  endpoint: string;
+  /** The `auto_type_memories` opt-in — a separate toggle from `enabled`
+   * (confidence-gated prefix correction; needs a fine-tuned checkpoint). */
+  autoTypeMemories: boolean;
+  /** The `failure_triage` opt-in — classify failures to steer retries. */
+  failureTriage: boolean;
+  /** The `failure_triage_knn` opt-in — the local kNN overlay over the
+   * failure-triage training log (needs no laya-serve; consulted only while
+   * failure triage itself is on). */
+  failureTriageKnn: boolean;
+  /** The `auto_finetune` opt-in — the startup fine-tune (managed only). */
+  autoFinetune: boolean;
+}
+
+/** Serialize the classifier draft for dirty comparison. */
+export function serializeClassifier(d: ClassifierDraft): string {
+  return JSON.stringify(d);
+}
+
+/**
  * Snapshot of the notification-sound toggles (for draft / discard). Each
  * sound is disabled independently (persisted to config.toml [ui]).
  */
@@ -454,6 +499,7 @@ export function isSettingsSectionId(v: string): v is SettingsSectionId {
     v === "git" ||
     v === "vision" ||
     v === "embeddings" ||
+    v === "classifier" ||
     v === "memory" ||
     v === "pricing" ||
     v === "models" ||

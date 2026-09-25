@@ -143,12 +143,19 @@ export interface ToolResult {
   data?: unknown;
 }
 
-export interface ApprovalPreview {
-  kind: "diff" | "new_file";
-  path: string;
-  diff?: string;
-  content?: string;
-}
+/**
+ * The Rust `ApprovalPreview` (src/provider/mod.rs) as it reaches the UI,
+ * discriminated on `kind`:
+ * - `diff` — one file's unified diff (file_edit),
+ * - `new_file` — a new file's full content (file_write),
+ * - `multi_diff` — ONE combined diff covering every file a `multi_edit` call
+ *   changes (each file contributing its own `--- path` / `+++ path`
+ *   section), so no single `path` applies: the changed files are `paths`.
+ */
+export type ApprovalPreview =
+  | { kind: "diff"; path: string; diff?: string; content?: string }
+  | { kind: "new_file"; path: string; diff?: string; content?: string }
+  | { kind: "multi_diff"; paths: string[]; diff: string };
 
 export interface PlanStep {
   index: number;
@@ -170,6 +177,25 @@ export interface PlanFile {
 export interface AgentEventPayload {
   agent_id: AgentId;
   event: SerializableAgentEvent;
+}
+
+/**
+ * The S–F context-quality grade (token-optimizer lever 6, backlog e4a50d22),
+ * computed by the backend from the current window fill plus the session's
+ * optimizer counters. Rides `context_usage` only while the backend's
+ * `[general.optimizer] quality_score` flag is on.
+ */
+export interface ContextQuality {
+  /** The letter grade, `"S"` (best) through `"F"` (worst). */
+  grade: string;
+  /** Window fill at the time of the report (0–100). */
+  fill_pct: number;
+  /** Cumulative tokens spent on redundant serves (skeletons). */
+  waste_tokens: number;
+  /** Share of lever-served reads that were stale re-reads (0–100). */
+  stale_read_rate: number;
+  /** Decisions seen per 100 messages (0–100). */
+  decision_density: number;
 }
 
 export type SerializableAgentEvent =
@@ -216,6 +242,13 @@ export type SerializableAgentEvent =
       used: number;
       max: number;
       breakdown: { system: number; user: number; assistant: number; tool: number };
+      /** Lever 6's S–F grade (backlog e4a50d22). Present on the top-of-loop,
+       * post-compaction and `/new` reset emissions. Omitted from the wire while
+       * the `[general.optimizer] quality_score` flag is off, and on the
+       * mid-stream provider-exact re-anchor plus the app-side spawn seed —
+       * where an absent value means "unchanged" (the UI keeps the last known
+       * grade rather than blanking). */
+      quality?: ContextQuality;
     }
   | {
       /** Context compaction completed — token count before/after. Emitted on

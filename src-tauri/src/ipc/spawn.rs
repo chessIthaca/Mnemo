@@ -390,6 +390,10 @@ pub(crate) async fn spawn_agent_shared(
                 used: 0,
                 max,
                 breakdown: mnemo::runtime::ContextBreakdown::default(),
+                // The grade helper is `pub(crate)` to mnemo, so this app-side
+                // seed event (fired before the first turn) stays ungraded — the
+                // first turn's own ContextUsage carries the report.
+                quality: None,
             },
         ))
         .await;

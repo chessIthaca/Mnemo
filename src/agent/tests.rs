@@ -11544,3 +11544,722 @@ async fn error_retries_owned_by_max_retries_not_repetition_guard() {
         "the repetition guard must not own error-repair loops; got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Failure-triage wiring tests (Laya chain item 4, plan 02deea7c).
+//
+// The tool-execution site's classified behavior: tier-1 harness auto-retry
+// (no model roundtrip) for a confident `transient` READ-ONLY failure, the
+// tier-2 guidance route for everything else, the class named in the
+// MAX_RETRIES abort, and the byte-identical pre-classifier path while the
+// `[general.laya] failure_triage` flag is off.
+// ---------------------------------------------------------------------------
+
+use crate::memory::classifier::{Answer, Classifier, Question};
+use super::failure_triage::FailureTriageHandle;
+
+/// What a [`FlakyTool`] does per call — the call counter drives it, so a
+/// harness auto-retry can be made to succeed where the first attempt failed.
+#[derive(Clone, Copy)]
+enum FlakyMode {
+    /// 0-based even calls fail, odd succeed — a retry heals the failure.
+    FailOnOddCalls,
+    /// Every call fails (a hard failure retries cannot heal).
+    AlwaysFail,
+}
+
+/// A minimal AutoRun stub tool under a chosen name. Auto-retry eligibility is
+/// decided BY NAME (the read-only allowlist), so the name is the knob:
+/// `file_read` is on the allowlist, `shell` is not.
+struct FlakyTool {
+    name: &'static str,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    mode: FlakyMode,
+}
+
+#[async_trait]
+impl crate::tool::Tool for FlakyTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn category(&self) -> crate::tool::ToolCategory {
+        crate::tool::ToolCategory::Agent
+    }
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            self.name,
+            "flaky test tool",
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )
+    }
+    fn safety(&self) -> crate::tool::SafetyLevel {
+        crate::tool::SafetyLevel::AutoRun
+    }
+    async fn execute(&self, _args: serde_json::Value) -> crate::tool::ToolResult {
+        let n = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fail = match self.mode {
+            FlakyMode::FailOnOddCalls => n % 2 == 0,
+            FlakyMode::AlwaysFail => true,
+        };
+        if fail {
+            crate::tool::ToolResult::error("connection reset by peer")
+        } else {
+            crate::tool::ToolResult::success("recovered output")
+        }
+    }
+}
+
+/// A classifier with one canned answer — `None` models a no-answer backend.
+struct FixedTriageClassifier {
+    answer: Option<Answer>,
+}
+
+#[async_trait]
+impl Classifier for FixedTriageClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        self.answer.clone()
+    }
+}
+
+/// Build a triage gate (enabled or not) answering `class` with `confidence`,
+/// logging to `log_path` — always a tempdir file, never the real `~/.mnemo`
+/// training log.
+fn triage_gate(
+    class: &str,
+    confidence: f64,
+    enabled: bool,
+    log_path: std::path::PathBuf,
+) -> FailureTriageHandle {
+    let classifier: Arc<dyn Classifier> = Arc::new(FixedTriageClassifier {
+        answer: Some(Answer::Choice {
+            label: class.to_string(),
+            confidence,
+            probabilities: std::collections::BTreeMap::new(),
+        }),
+    });
+    FailureTriageHandle::new(
+        Arc::new(std::sync::RwLock::new(Some(classifier))),
+        Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+    )
+    .with_log_path(log_path)
+}
+
+/// One tool-call response batch carrying a single call, ending in `ToolCalls`.
+fn one_call_batch(call_id: &str, name: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: call_id.to_string(),
+            name: name.to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: r#"{"path":"x.txt"}"#.to_string(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+/// A plain text response that ends the turn.
+fn text_stop(text: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::TextDelta {
+            text: text.to_string(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]
+}
+
+/// Drain the fan-in channel, returning every terminal Error message.
+fn terminal_errors(rx: &mut mpsc::Receiver<(u64, AgentEvent)>) -> Vec<String> {
+    let mut errors = Vec::new();
+    while let Ok((_, ev)) = rx.try_recv() {
+        if let AgentEvent::Error {
+            error,
+            retrying: false,
+        } = ev
+        {
+            errors.push(error);
+        }
+    }
+    errors
+}
+
+/// The text of every Tool-role message, in order.
+fn tool_texts(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .map(|m| m.content.as_text().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn transient_read_only_failure_is_auto_retried_without_a_model_roundtrip() {
+    // Acceptance (plan 02deea7c): a confident `transient` classification of a
+    // READ-ONLY tool call makes the HARNESS re-run the identical call — the
+    // model never sees the failure and never spends a repair roundtrip on it.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FlakyTool {
+        name: "file_read",
+        calls: calls.clone(),
+        mode: FlakyMode::FailOnOddCalls,
+    }));
+    let provider = Arc::new(CountingProvider::sequence(vec![
+        one_call_batch("call_1", "file_read"),
+        text_stop("done"),
+    ]));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            Arc::new(registry),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("transient", 0.95, true, log.clone()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read x.txt")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the harness must re-run the failing call exactly once"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "one tool batch + one final response — the auto-retry must cost ZERO \
+         additional model roundtrips"
+    );
+    let texts = tool_texts(&messages);
+    assert_eq!(texts.len(), 1, "one tool result, the retried success");
+    assert!(
+        texts[0].contains("recovered output"),
+        "the model sees the retried SUCCESS; got: {}",
+        texts[0]
+    );
+    assert!(
+        !texts[0].contains("[tool error]"),
+        "the swallowed failure must never reach the model; got: {}",
+        texts[0]
+    );
+    assert!(
+        texts[0].contains("[harness note]"),
+        "the swallowed retry is disclosed; got: {}",
+        texts[0]
+    );
+    let rows = super::failure_triage::read_rows(&log);
+    assert_eq!(rows.len(), 1, "the auto-retry logs one resolved row");
+    assert_eq!(rows[0].class, "transient");
+    assert_eq!(rows[0].action, "auto_retry");
+    assert_eq!(rows[0].disposition.as_deref(), Some("retry_succeeded"));
+}
+
+#[tokio::test]
+async fn mutating_tool_failure_is_never_auto_retried() {
+    // Safety pin: `shell` is NOT on the read-only allowlist — a side-effecting
+    // call must never be re-run by the harness (a partial effect followed by a
+    // blind re-run is exactly what the allowlist exists to prevent). The
+    // classified failure takes the guidance route instead.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FlakyTool {
+        name: "shell",
+        calls: calls.clone(),
+        mode: FlakyMode::AlwaysFail,
+    }));
+    let provider = Arc::new(CountingProvider::sequence(vec![
+        one_call_batch("call_1", "shell"),
+        text_stop("done"),
+    ]));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            Arc::new(registry),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("transient", 0.95, true, log.clone()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a mutating tool must never be harness-retried"
+    );
+    let texts = tool_texts(&messages);
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains("[tool error]"),
+        "the failure is fed back; got: {}",
+        texts[0]
+    );
+    assert!(
+        texts[0].contains("[harness triage]") && texts[0].contains("TRANSIENT"),
+        "the guidance route must name the classification; got: {}",
+        texts[0]
+    );
+    assert!(
+        super::failure_triage::read_rows(&log).is_empty(),
+        "an unresolved guidance row is dropped, never guessed into the log"
+    );
+}
+
+#[tokio::test]
+async fn auto_retry_budget_exhausts_then_falls_back_to_guidance() {
+    // The per-turn budget (MAX_AUTO_RETRIES_PER_TURN = 4) bounds harness
+    // retries: the first four heals are swallowed, the fifth failure falls
+    // back to the pre-classifier path with the classification named. The
+    // turn stays alive across the first four (each batch is failure-free
+    // once the retry is swallowed — tool_error_count stays 0).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FlakyTool {
+        name: "file_read",
+        calls: calls.clone(),
+        mode: FlakyMode::FailOnOddCalls,
+    }));
+    let mut responses = Vec::new();
+    for i in 1..=5 {
+        responses.push(one_call_batch(&format!("call_{i}"), "file_read"));
+    }
+    responses.push(text_stop("done"));
+    let provider = Arc::new(CountingProvider::sequence(responses));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            Arc::new(registry),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("transient", 0.95, true, log.clone()));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read x.txt")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        9,
+        "four healed retries (2 calls each) then one un-retried call"
+    );
+    assert_eq!(
+        provider.call_count(),
+        6,
+        "five tool batches + the final response — the retries never cost a \
+         roundtrip"
+    );
+    let texts = tool_texts(&messages);
+    assert_eq!(texts.len(), 5);
+    let swallowed = texts
+        .iter()
+        .filter(|t| t.contains("[harness note]"))
+        .count();
+    assert_eq!(swallowed, 4, "the budget must swallow exactly four retries");
+    let guided = texts
+        .iter()
+        .filter(|t| t.contains("[harness triage]"))
+        .count();
+    assert_eq!(guided, 1, "the budget-exhausted failure takes the guidance route");
+    let rows = super::failure_triage::read_rows(&log);
+    assert_eq!(rows.len(), 4, "the four heals log as resolved auto-retry rows");
+    assert!(rows.iter().all(|r| r.action == "auto_retry"));
+    assert!(rows
+        .iter()
+        .all(|r| r.disposition.as_deref() == Some("retry_succeeded")));
+}
+
+#[tokio::test]
+async fn max_retries_abort_names_the_classified_class_and_resolves_rows() {
+    // Three consecutive classified failures trip MAX_RETRIES: the abort
+    // message names the last classified class (observability for a
+    // fine-tuned pipeline), and the pending guidance rows resolve as
+    // cap_reached — never guessed, never left dangling.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FlakyTool {
+        name: "shell",
+        calls: calls.clone(),
+        mode: FlakyMode::AlwaysFail,
+    }));
+    let provider = Arc::new(CountingProvider::sequence(vec![
+        one_call_batch("call_1", "shell"),
+        one_call_batch("call_2", "shell"),
+        one_call_batch("call_3", "shell"),
+        text_stop("unreached"),
+    ]));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            Arc::new(registry),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("permanent", 0.9, true, log.clone()));
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "a permanent classification must not trigger a harness retry"
+    );
+    assert_eq!(
+        provider.call_count(),
+        3,
+        "the abort fires before a fourth request"
+    );
+    let texts = tool_texts(&messages);
+    assert_eq!(texts.len(), 3);
+    assert!(
+        texts.iter().all(|t| t.contains("PERMANENT")),
+        "every classified failure carries the permanent guidance; got: {texts:?}"
+    );
+    let errors = terminal_errors(&mut fanin_rx);
+    let abort = errors
+        .iter()
+        .find(|e| e.contains("consecutive tool errors"))
+        .unwrap_or_else(|| panic!("MAX_RETRIES must abort the turn; got: {errors:?}"));
+    assert!(
+        abort.contains("Last classified failure: permanent."),
+        "the abort message must name the last classified class; got: {abort}"
+    );
+    let rows = super::failure_triage::read_rows(&log);
+    assert_eq!(rows.len(), 3, "each classified failure logs exactly once");
+    assert!(rows.iter().all(|r| r.action == "guidance"));
+    assert!(rows
+        .iter()
+        .all(|r| r.disposition.as_deref() == Some("cap_reached")));
+}
+
+#[tokio::test]
+async fn disabled_triage_keeps_the_pre_classifier_failure_path() {
+    // Acceptance (byte-identical while the flag is off): no classification,
+    // no auto-retry, no guidance, the original abort message, and not a
+    // single training-log write.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FlakyTool {
+        name: "file_read",
+        calls: calls.clone(),
+        mode: FlakyMode::AlwaysFail,
+    }));
+    let provider = Arc::new(CountingProvider::sequence(vec![
+        one_call_batch("call_1", "file_read"),
+        one_call_batch("call_2", "file_read"),
+        one_call_batch("call_3", "file_read"),
+        text_stop("unreached"),
+    ]));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            Arc::new(registry),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("transient", 0.95, false, log.clone()));
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read x.txt")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "a disabled gate must never auto-retry"
+    );
+    let texts = tool_texts(&messages);
+    assert_eq!(texts.len(), 3);
+    assert!(
+        texts.iter().all(|t| t.contains("[tool error]")),
+        "failures feed back exactly as before; got: {texts:?}"
+    );
+    assert!(
+        texts.iter().all(|t| !t.contains("[harness triage]")),
+        "no guidance may ride a disabled gate's failures; got: {texts:?}"
+    );
+    let errors = terminal_errors(&mut fanin_rx);
+    let abort = errors
+        .iter()
+        .find(|e| e.contains("consecutive tool errors"))
+        .unwrap_or_else(|| panic!("MAX_RETRIES must abort the turn; got: {errors:?}"));
+    assert!(
+        !abort.contains("Last classified failure"),
+        "the abort message must stay byte-identical while triage is off; got: {abort}"
+    );
+    assert!(
+        !log.exists(),
+        "a disabled gate must not write a single training row"
+    );
+}
+
+/// A counting pass-through over [`MockProvider`] — the "the harness auto-retry
+/// cost ZERO model roundtrips" assertion hook. A wrapper (rather than a field
+/// on the mock itself) keeps the ~23 existing `MockProvider { .. }` literals
+/// untouched; the scripted queue alone cannot prove how many REQUESTS were
+/// made, which is exactly what the retry tests must measure.
+struct CountingProvider {
+    inner: MockProvider,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingProvider {
+    /// A counting mock that returns `responses` in sequence.
+    fn sequence(responses: Vec<Vec<LlmEvent>>) -> Self {
+        Self {
+            inner: MockProvider::sequence(responses),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Total `complete` calls served so far.
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl LlmClient for CountingProvider {
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    fn kind(&self) -> ProviderKind {
+        self.inner.kind()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+    fn record_tools_phase_ms(&self, ms: u32) {
+        self.inner.record_tools_phase_ms(ms);
+    }
+    async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.complete(messages, tools, tool_choice).await
+    }
+}
+// ---------------------------------------------------------------------------
+// Bad-JSON repair-loop triage (review HIGH-1 fix, plan 02deea7c): a confident
+// `permanent` aborts the repair loop before its 8-strike cap; every other
+// class, and any fallback, keeps today's ladder byte-identical.
+// ---------------------------------------------------------------------------
+
+/// One tool-call response batch with malformed arguments (the bad-JSON
+/// trigger), ending in `ToolCalls`.
+fn one_bad_json_call() -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: "call_1".to_string(),
+            name: "file_read".to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: "{bad json}".to_string(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn bad_json_confident_permanent_aborts_the_repair_loop_early() {
+    // Acceptance: one malformed-arguments response with a confident
+    // `permanent` classification ends the turn IMMEDIATELY — zero repair
+    // roundtrips — the abort names the class, and the log records exactly one
+    // abort_early row (site bad_json_repair) resolved as escalated.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let provider = Arc::new(CountingProvider::sequence(vec![one_bad_json_call()]));
+    let log = dir.path().join("triage.jsonl");
+    let agent = AgentLoop::new(
+        test_config(
+            provider.clone(),
+            make_registry((*sandbox).clone(), workflow.clone()),
+            workflow,
+            sandbox.clone(),
+        ),
+        crate::project::Constitution::default(),
+    )
+    .with_failure_triage(triage_gate("permanent", 0.95, true, log.clone()));
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read a file")];
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some((_id, event)) = fanin_rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+    let events = collector.await.unwrap();
+
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "the confident-permanent abort must cost ZERO repair roundtrips"
+    );
+    let saw_abort = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Error {
+                retrying: false,
+                error,
+            } if error.contains("classified permanent")
+                && error.contains("repair attempts cannot help")
+        )
+    });
+    assert!(saw_abort, "the abort must name the class; got {events:?}");
+    let rows = super::failure_triage::read_rows(&log);
+    assert_eq!(rows.len(), 1, "one abort_early row, resolved immediately");
+    assert_eq!(rows[0].site, "bad_json_repair");
+    assert_eq!(rows[0].class, "permanent");
+    assert_eq!(rows[0].action, "abort_early");
+    assert_eq!(rows[0].disposition.as_deref(), Some("escalated"));
+}
+
+#[tokio::test]
+async fn bad_json_below_threshold_or_non_permanent_keeps_the_ladder() {
+    // Byte-identical acceptance at this site: a low-confidence reading and a
+    // confident non-permanent class both fall through to today's 8-strike
+    // ladder with the pre-classifier wording and no rows logged.
+    for (class, confidence) in [("permanent", 0.50), ("needs_user", 0.95)] {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        let sequences: Vec<Vec<LlmEvent>> = (0..8).map(|_| one_bad_json_call()).collect();
+        let provider = Arc::new(CountingProvider::sequence(sequences));
+        let log = dir.path().join("triage.jsonl");
+        let agent = AgentLoop::new(
+            test_config(
+                provider.clone(),
+                make_registry((*sandbox).clone(), workflow.clone()),
+                workflow,
+                sandbox.clone(),
+            ),
+            crate::project::Constitution::default(),
+        )
+        .with_failure_triage(triage_gate(class, confidence, true, log.clone()));
+
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let mut messages = vec![Message::user_text("read a file")];
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some((_id, event)) = fanin_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+        drop(fanin_tx);
+        let events = collector.await.unwrap();
+
+        assert_eq!(
+            provider.call_count(),
+            8,
+            "the ladder must run to the 8-strike cap unchanged ({class}/{confidence})"
+        );
+        let saw_cap_abort = events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Error {
+                    retrying: false,
+                    error,
+                } if error.contains("kept failing to parse as JSON")
+            )
+        });
+        assert!(
+            saw_cap_abort,
+            "the pre-classifier cap wording must be byte-identical"
+        );
+        let rows = super::failure_triage::read_rows(&log);
+        assert!(
+            rows.is_empty(),
+            "a fallback (low confidence / non-permanent) never logs a row"
+        );
+    }
+}

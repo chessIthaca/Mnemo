@@ -148,6 +148,21 @@ pub struct AgentRuntimeContext {
     /// emitted to the frontend via the `embedder://status` event so the UI can
     /// show a banner when semantic recall has degraded to keyword-only.
     pub embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
+    /// The live status of the optional Laya classifier (Disabled / Ready /
+    /// Failed). `Disabled` is the default: Laya is opt-in, and while it is off
+    /// no classifier client is built and no call is ever made. Surfaced to the
+    /// frontend via `get_classifier_status` + the startup snapshot.
+    pub classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
+    /// The built classifier, when Laya is enabled with an endpoint — the
+    /// handle items 2-5 will consume (`None` while disabled; see
+    /// `build_classifier`). Behind a lock so a Settings save can swap the
+    /// rebuilt backend in without a restart.
+    pub classifier: Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
+    /// The managed Laya runtime owner (setup pipeline, the `laya-serve`
+    /// child, its port) — one instance shared by the setup command, the
+    /// startup hook, the Settings rewire, and app exit so they all steer
+    /// the same sidecar. Inert until managed mode is enabled + set up.
+    pub laya: Arc<crate::ipc::laya::LayaManager>,
     /// The same-project instance conflict resolved at startup (main.rs):
     /// `Some` when another live mnemo instance already holds this project —
     /// the frontend warns before opening it (2027-01-13). Computed once, so
@@ -328,6 +343,33 @@ impl IpcState {
             .embedder_status
             .read()
             .map_err(|e| format!("embedder status lock poisoned: {e}"))?
+            .clone())
+    }
+
+    /// The live classifier status (cloned).
+    pub fn classifier_status(
+        &self,
+    ) -> Result<mnemo::memory::classifier::ClassifierStatus, crate::ipc::error::IpcError> {
+        Ok(self
+            .runtime
+            .classifier_status
+            .read()
+            .map_err(|e| format!("classifier status lock poisoned: {e}"))?
+            .clone())
+    }
+
+    /// The built Laya classifier (cloned handle), or `None` while Laya is
+    /// disabled or unconfigured. Items 2-5 read this; a caller must treat
+    /// `None` as "no classifier" and fall back to its pre-classifier behavior.
+    pub fn classifier(
+        &self,
+    ) -> Result<Option<Arc<dyn mnemo::memory::classifier::Classifier>>, crate::ipc::error::IpcError>
+    {
+        Ok(self
+            .runtime
+            .classifier
+            .read()
+            .map_err(|e| format!("classifier lock poisoned: {e}"))?
             .clone())
     }
 }

@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::agent::context::ContextManager;
 use crate::config::{Config, Endpoint, EndpointKind, ModelRef};
+use crate::memory::classifier::{Classifier, ClassifierStatus, LayaClassifier};
 #[cfg(feature = "embeddings")]
 use crate::memory::embedder::BundledEmbedder;
 use crate::memory::embedder::{Embedder, EmbedderStatus, HashEmbedder};
@@ -327,6 +328,80 @@ pub fn build_embedder(
     // Hash mode — always ready (no external service).
     *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
     Arc::new(HashEmbedder::new())
+}
+
+/// Build the optional Laya classifier from the config — `None` unless Laya is
+/// enabled *and* a non-blank endpoint is configured.
+///
+/// This is the hard requirement's gate (backlog bb54bdcc): with Laya disabled
+/// (the default, including an absent `[general.laya]` section) or enabled
+/// without an endpoint, no HTTP client is built, no connection is ever opened,
+/// and the app behaves exactly as before — `status` is set to `Disabled`.
+/// When enabled with an endpoint, returns a [`LayaClassifier`] bound to that
+/// `laya-serve` instance and sets `status` to `Ready` (a failed call flips it
+/// to `Failed`).
+///
+/// `status` is the shared `Arc<RwLock<ClassifierStatus>>` the IPC layer
+/// exposes to the UI, so transitions surface live.
+///
+/// Never fails: enabling Laya without an endpoint — and, in the extreme, an
+/// unbuildable HTTP client — degrades to `None` with a logged warning, so
+/// startup is never blocked.
+pub fn build_classifier(
+    config: &Config,
+    status: Arc<RwLock<ClassifierStatus>>,
+) -> Option<Arc<dyn Classifier>> {
+    let laya = &config.general.general.laya;
+    if laya.mode == crate::config::LayaMode::Managed {
+        // Managed mode owns the whole lifecycle: the app layer downloads +
+        // starts the sidecar and builds the client against its loopback
+        // port (src-tauri/src/ipc/laya.rs) — an `endpoint` set here is
+        // ignored, and this builder reports Disabled until that client is
+        // swapped in.
+        if laya.enabled {
+            eprintln!(
+                "info: the Laya classifier is in managed mode — the app runs \
+                 laya-serve itself (Settings → Classifier)"
+            );
+        }
+        *status.write().expect("classifier status lock poisoned") = ClassifierStatus::Disabled;
+        return None;
+    }
+    let endpoint = if laya.enabled {
+        laya.endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+    } else {
+        None
+    };
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => {
+            if laya.enabled {
+                eprintln!(
+                    "warning: the Laya classifier is enabled but no endpoint URL is \
+                     configured; it stays disabled"
+                );
+            }
+            *status.write().expect("classifier status lock poisoned") = ClassifierStatus::Disabled;
+            return None;
+        }
+    };
+    match LayaClassifier::new(endpoint, Arc::clone(&status)) {
+        Ok(classifier) => {
+            *status.write().expect("classifier status lock poisoned") = ClassifierStatus::Ready;
+            Some(Arc::new(classifier))
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: failed to build the Laya classifier HTTP client for '{endpoint}': {e}; \
+                 it stays unavailable"
+            );
+            *status.write().expect("classifier status lock poisoned") = ClassifierStatus::Failed;
+            None
+        }
+    }
 }
 
 /// Load the configured bundled model, with the hash fallback on load error
@@ -1023,5 +1098,98 @@ mod tests {
             embedder_startup_plan(Some("all-MiniLM-L6-v2"), dir.path()),
             EmbedderStartupPlan::HashDefault
         );
+    }
+
+    #[test]
+    fn build_classifier_disabled_returns_none_and_leaves_status_disabled() {
+        // The hard requirement's regression pin: Laya disabled (the default —
+        // an absent [general.laya] section deserializes to exactly this) ⇒ no
+        // classifier, status Disabled, and no client built: zero behavior
+        // change.
+        let config = Config::default();
+        // Start from a non-Disabled status so the builder must overwrite it.
+        let status = Arc::new(RwLock::new(ClassifierStatus::Ready));
+        assert!(build_classifier(&config, Arc::clone(&status)).is_none());
+        assert_eq!(*status.read().unwrap(), ClassifierStatus::Disabled);
+    }
+
+    #[test]
+    fn build_classifier_managed_mode_defers_to_the_app_runtime() {
+        // Managed mode never builds an external client from `endpoint` —
+        // the app layer builds it against its own loopback sidecar.
+        use crate::config::{GeneralConfig, GeneralSection, LayaConfig, LayaMode};
+        let config = Config {
+            general: GeneralConfig {
+                general: GeneralSection {
+                    laya: LayaConfig {
+                        enabled: true,
+                        mode: LayaMode::Managed,
+                        endpoint: Some("http://127.0.0.1:8000".into()),
+                        ..Default::default()
+                    },
+                    ..GeneralSection::default()
+                },
+                ..GeneralConfig::default()
+            },
+            ..Config::default()
+        };
+        let status = Arc::new(RwLock::new(ClassifierStatus::Ready));
+        assert!(build_classifier(&config, Arc::clone(&status)).is_none());
+        assert_eq!(*status.read().unwrap(), ClassifierStatus::Disabled);
+    }
+
+    #[test]
+    fn build_classifier_enabled_with_endpoint_returns_the_laya_backend() {
+        use crate::config::{GeneralConfig, GeneralSection, LayaConfig};
+        let config = Config {
+            general: GeneralConfig {
+                general: GeneralSection {
+                    laya: LayaConfig {
+                        enabled: true,
+                        endpoint: Some("http://127.0.0.1:8000".into()),
+                        ..Default::default()
+                    },
+                    ..GeneralSection::default()
+                },
+                ..GeneralConfig::default()
+            },
+            ..Config::default()
+        };
+        let status = Arc::new(RwLock::new(ClassifierStatus::Disabled));
+        let classifier = build_classifier(&config, Arc::clone(&status))
+            .expect("enabled + endpoint must build the Laya backend");
+        // Configured with an endpoint ⇒ calls are attempted: Ready until the
+        // first failed call.
+        assert_eq!(*status.read().unwrap(), ClassifierStatus::Ready);
+        drop(classifier);
+    }
+
+    #[test]
+    fn build_classifier_enabled_without_endpoint_returns_none() {
+        use crate::config::{GeneralConfig, GeneralSection, LayaConfig};
+        // Enabled but unconfigured — a null or blank endpoint: a logged
+        // warning, no client, status Disabled. Never fatal.
+        for endpoint in [None, Some("   ".to_string())] {
+            let config = Config {
+                general: GeneralConfig {
+                    general: GeneralSection {
+                        laya: LayaConfig {
+                            enabled: true,
+                            endpoint: endpoint.clone(),
+                            ..Default::default()
+                        },
+                        ..GeneralSection::default()
+                    },
+                    ..GeneralConfig::default()
+                },
+                ..Config::default()
+            };
+            let status = Arc::new(RwLock::new(ClassifierStatus::Ready));
+            assert!(
+                build_classifier(&config, Arc::clone(&status)).is_none(),
+                "endpoint {endpoint:?} is unconfigured"
+            );
+            assert_eq!(*status.read().unwrap(), ClassifierStatus::Disabled);
+        }
     }
 }

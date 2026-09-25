@@ -22,11 +22,36 @@ interface FileEditArgs {
   content?: string;
 }
 
+/** The single previewed path; a `multi_diff` carries no single `path`, so
+ *  its FIRST changed file stands in (the Diff tab renders one file at a
+ *  time). Empty when there is no preview at all. */
+function previewPath(preview: ApprovalPreview | null | undefined): string {
+  if (preview === null || preview === undefined) return "";
+  return preview.kind === "multi_diff" ? (preview.paths[0] ?? "") : preview.path;
+}
+
+/** Whether a pending approval belongs to a file-editing tool whose Rust
+ *  preview the Diff tab renders — `file_edit` / `file_write` / `file_append`
+ *  / `multi_edit` (`multi_edit` carries the combined `multi_diff` preview;
+ *  leaving it out made the tab say "No file diff for this tool" — review
+ *  L1). Pure — pinned by test. */
+export function isFileEditTool(toolName: string): boolean {
+  return (
+    toolName === "file_edit" ||
+    toolName === "file_write" ||
+    toolName === "file_append" ||
+    toolName === "multi_edit"
+  );
+}
+
 /**
  * Resolve path + body for a pending approval: prefer Rust `preview`, fall
- * back to parsing tool args (legacy / non-file tools).
+ * back to parsing tool args (legacy / non-file tools). A `multi_diff` (the
+ * `multi_edit` preview) renders its ONE combined diff through the same
+ * unified-body path; the first changed file labels the header (review L1).
+ * Pure — pinned by test.
  */
-function contentFromPreviewOrArgs(
+export function contentFromPreviewOrArgs(
   preview: ApprovalPreview | null | undefined,
   toolName: string,
   args: FileEditArgs
@@ -52,6 +77,16 @@ function contentFromPreviewOrArgs(
       content: preview.content,
     };
   }
+  if (preview?.kind === "multi_diff" && typeof preview.diff === "string") {
+    // One combined diff covering every file the call changes, so no single
+    // `path` applies: the FIRST changed file labels the header (the tab
+    // renders one scope at a time; ApprovalPrompt mirrors this).
+    return {
+      path: preview.paths[0] || args.path || "(unknown path)",
+      mode: "unified",
+      unifiedDiff: preview.diff,
+    };
+  }
   // Args fallback.
   if (
     toolName === "file_edit" &&
@@ -73,7 +108,7 @@ function contentFromPreviewOrArgs(
     };
   }
   return {
-    path: args.path || preview?.path || "(unknown path)",
+    path: args.path || previewPath(preview) || "(unknown path)",
     mode: "none",
   };
 }
@@ -182,10 +217,11 @@ export function scopedResult<T>(
  *   top-level plan (`planDiffs`, one entry per path, newest first; resets
  *   when a new top-level plan starts).
  *
- * A pending `file_edit` / `file_write` / `file_append` approval always takes
- * precedence over both modes: the Rust `ApprovalPreview` (UI H3) renders a
- * real line-by-line diff (or the full new content) so the client does not
- * re-run LCS on raw args; falls back to args when the preview is null.
+ * A pending `file_edit` / `file_write` / `file_append` / `multi_edit` approval
+ * always takes precedence over both modes: the Rust `ApprovalPreview` (UI H3)
+ * renders a real line-by-line diff (or the full new content; `multi_edit`
+ * shows its ONE combined diff covering every changed file) so the client does
+ * not re-run LCS on raw args; falls back to args when the preview is null.
  */
 /** The dropdown's selected value: the explicit diff-path selection when set
  *  (deep-linked or picked — kept even when the path has no captured plan-diff
@@ -289,8 +325,7 @@ export function DiffViewer() {
 
   const toolName = pendingApproval?.toolName ?? "";
   const args = (pendingApproval?.args ?? {}) as FileEditArgs;
-  const isFileEdit =
-    toolName === "file_edit" || toolName === "file_write" || toolName === "file_append";
+  const isFileEdit = isFileEditTool(toolName);
   // Resolve the pending path from the Rust preview first (args.path can be
   // absent when the preview carries the path).
   const pendingResolved =

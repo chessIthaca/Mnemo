@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{self, TokenAccounting};
+use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::prompt;
 use super::StopReason;
@@ -134,6 +135,21 @@ pub(crate) struct TurnState {
     /// distinct final error naming the review report. Resets only on a
     /// successful `write_review_report`.
     review_report_failures: u32,
+    /// Harness auto-retries performed this turn — the per-turn budget
+    /// [`failure_triage::MAX_AUTO_RETRIES_PER_TURN`] for tier-1 retries
+    /// (confident `transient` read-only tool calls re-run by the harness
+    /// without a model roundtrip). Reset each turn.
+    auto_retries_this_turn: u32,
+    /// Classified failures on the guidance route (tier 2) awaiting their
+    /// disposition. A later failure-free successful batch is the retry
+    /// landing — they resolve `retry_succeeded`; the MAX_RETRIES abort
+    /// resolves them `cap_reached`. Leftover rows at turn end are dropped:
+    /// the outcome was never observed, and an unobserved disposition must
+    /// not be guessed into the training log.
+    pending_triage_rows: Vec<failure_triage::PendingFailureRow>,
+    /// The last classified failure class this turn — the MAX_RETRIES abort
+    /// message names it when present (absent = byte-identical message).
+    last_triage_class: Option<failure_triage::FailureClass>,
     /// Once the user answers DenyAll on any approval this turn, remaining
     /// tool calls auto-deny without prompting (Quality M1). Reset each turn.
     deny_all_latched: bool,
@@ -205,6 +221,9 @@ impl TurnState {
             tool_error_count: 0,
             bad_json_count: 0,
             review_report_failures: 0,
+            auto_retries_this_turn: 0,
+            pending_triage_rows: Vec::new(),
+            last_triage_class: None,
             deny_all_latched: false,
             stop_reason: None,
             compact_announced: false,
@@ -442,6 +461,7 @@ impl AgentLoop {
                             used,
                             max,
                             breakdown,
+                            quality: self.quality_report(used, max, messages.len()),
                         },
                     ))
                     .await;
@@ -459,11 +479,18 @@ impl AgentLoop {
             // install_system_messages. It pushes the tail + CONTEXT_FOOTER as
             // the last two messages (user- or system-role per vendor), popped
             // right after the request below.
+            // Token-optimizer lever 7 (backlog e4a50d22): tick the request
+            // clock and build this request's steering note (if any) BEFORE the
+            // tail is installed. `None` when both nudge flags are off, so the
+            // flag-off tail is byte-identical to today's.
+            let nudge =
+                self.nudge_for_request(token_count, context_manager.max_tokens(), messages.len());
             self.install_system_messages(
                 messages,
                 &provider,
                 memory_context.as_deref(),
                 &tool_filter,
+                nudge.as_deref(),
             )
             .await;
             // The provider request (connection establishment + first byte)
@@ -826,13 +853,29 @@ impl AgentLoop {
             // forwarder also latches against that, but the emission contract
             // is: one terminal outcome per turn failure.
             if state.tool_error_count >= MAX_RETRIES {
+                // Failure triage: the turn aborts with classified failures
+                // whose retry never landed — resolve them as `cap_reached`,
+                // and name the last classified class in the abort message
+                // (absent when triage is off => byte-identical message).
+                for pending in state.pending_triage_rows.drain(..) {
+                    failure_triage::resolve_failure(
+                        pending,
+                        failure_triage::TriageDisposition::CapReached,
+                    );
+                }
+                let classified = match state.last_triage_class {
+                    Some(class) => {
+                        format!(" Last classified failure: {}.", class.label())
+                    }
+                    None => String::new(),
+                };
                 let _ = fanin_tx
                     .send((
                         agent_id,
                         AgentEvent::Error {
                             error: format!(
                                 "Aborting turn: {MAX_RETRIES} consecutive tool errors \
-                                 (the model may be stuck)."
+                                 (the model may be stuck).{classified}"
                             ),
                             retrying: false,
                         },
@@ -1285,6 +1328,18 @@ impl AgentLoop {
         // result and gets a chance to repair), not N consecutive errors.
         let mut batch_had_error = false;
         let mut batch_had_success = false;
+        // Failure triage (Laya, opt-in; backlog 1a4049c1): classify the
+        // batch's first non-denial failure ONCE. The class steers the harness
+        // auto-retry below (tier 1), the guidance appended to the fed-back
+        // failure (tier 2), and the turn-level abort message (which names
+        // it). No gate / flag off / no usable answer / a denial => stays
+        // `None` and every branch below keeps its pre-classifier behavior
+        // byte-for-byte.
+        let mut batch_triage: Option<failure_triage::FailureTriage> = None;
+        // One classification per failed batch => at most one training-log
+        // row for it (either the tier-1 retry row or the tier-2 guidance
+        // row), never both.
+        let mut batch_triage_logged = false;
         // Add the assistant message with tool calls.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
@@ -1350,7 +1405,7 @@ impl AgentLoop {
                 break;
             }
 
-            let (result, buffered) = self
+            let (mut result, mut buffered) = self
                 .execute_tool_call(
                     tc,
                     fanin_tx,
@@ -1360,6 +1415,114 @@ impl AgentLoop {
                     &mut stop_signal,
                 )
                 .await;
+
+            // Failure triage (Laya, opt-in; backlog 1a4049c1): classify the
+            // batch's first non-denial failure ONCE. The class steers the
+            // harness auto-retry below (tier 1), the guidance appended to
+            // the fed-back failure (tier 2), and the turn-level abort message
+            // (which names it). No gate / flag off / no usable answer / a
+            // denial => `batch_triage` stays `None` and every branch below
+            // keeps its pre-classifier behavior byte-for-byte.
+            if !result.success
+                && !is_user_denial_tool_output(&result.output)
+                && batch_triage.is_none()
+                && stop_signal.is_none()
+            {
+                if let Some(gate) = &self.failure_triage {
+                    let triage = gate.triage(&result.output).await;
+                    if let failure_triage::FailureTriage::Classified { class, .. } = &triage {
+                        state.last_triage_class = Some(*class);
+                    }
+                    batch_triage = Some(triage);
+                }
+            }
+
+            // Tier 1 — harness auto-retry, NO model roundtrip: a confident
+            // `transient` classification of a READ-ONLY tool call is re-run
+            // by the harness itself with the identical arguments (read-only
+            // tools are approval-free, so the re-run cannot double-apply a
+            // side effect), bounded to one retry per call and
+            // [`failure_triage::MAX_AUTO_RETRIES_PER_TURN`] per turn. A
+            // swallowed success feeds the model only the successful result
+            // plus a one-line note and never counts as a tool error; a failed
+            // retry falls through to the normal feed-back below.
+            let mut auto_retried = false;
+            if !result.success && !batch_triage_logged && stop_signal.is_none() {
+                if let (
+                    Some(gate),
+                    Some(failure_triage::FailureTriage::Classified { class, confidence }),
+                ) = (&self.failure_triage, &batch_triage)
+                {
+                    let (class, confidence) = (*class, *confidence);
+                    if failure_triage::should_auto_retry(
+                        class,
+                        &tc.name,
+                        0,
+                        state.auto_retries_this_turn,
+                    ) {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            failure_triage::AUTO_RETRY_BACKOFF_MS,
+                        ))
+                        .await;
+                        let mut retry_stop: Option<StopReason> = None;
+                        let (retry_result, retry_buffered) = self
+                            .execute_tool_call(
+                                tc,
+                                fanin_tx,
+                                agent_id,
+                                cmd_rx,
+                                &mut state.deny_all_latched,
+                                &mut retry_stop,
+                            )
+                            .await;
+                        buffered.extend(retry_buffered);
+                        if retry_stop.is_some() {
+                            // The retry is this call's final word — merge its
+                            // stop signal exactly like the first attempt's.
+                            stop_signal = retry_stop;
+                        }
+                        state.auto_retries_this_turn += 1;
+                        batch_triage_logged = true;
+                        let pending = gate.log_failure(
+                            failure_triage::FailureSite::ToolBatch,
+                            Some(tc.name.as_str()),
+                            &result.output,
+                            class,
+                            confidence,
+                            failure_triage::TriageAction::AutoRetry,
+                        );
+                        if retry_result.success {
+                            failure_triage::resolve_failure(
+                                pending,
+                                failure_triage::TriageDisposition::RetrySucceeded,
+                            );
+                            auto_retried = true;
+                        } else {
+                            failure_triage::resolve_failure(
+                                pending,
+                                failure_triage::TriageDisposition::RetryFailed,
+                            );
+                        }
+                        result = retry_result;
+                    } else {
+                        // Tier 2 — the model still decides, but with the
+                        // classification named: queue the training-log row
+                        // (its disposition resolves when a later failure-free
+                        // batch succeeds, or as `cap_reached` at the abort).
+                        state
+                            .pending_triage_rows
+                            .push(gate.log_failure(
+                                failure_triage::FailureSite::ToolBatch,
+                                Some(tc.name.as_str()),
+                                &result.output,
+                                class,
+                                confidence,
+                                failure_triage::TriageAction::Guidance,
+                            ));
+                        batch_triage_logged = true;
+                    }
+                }
+            }
 
             // Merge the per-tool-call stop signal (Interrupt/Cancel from
             // approval or ask_user) into the turn-level stop_reason.
@@ -1497,6 +1660,40 @@ impl AgentLoop {
                 }
             }
 
+            // Token-optimizer savings ledger (backlog e4a50d22): a tool
+            // that served an optimized form (delta/skeleton re-read,
+            // compressed command output, archive preview, archive expand)
+            // reports its before/after token counts in the result's
+            // `data.savings` object — record the ledger row
+            // fire-and-forget. `measured` defaults false (the tools
+            // estimate), kept distinct in the row for the dashboard.
+            if let Some(data) = &result.data {
+                if let Some(events) = data.get("savings").and_then(serde_json::Value::as_array) {
+                    for savings in events {
+                        if let (Some(kind), Some(before), Some(after)) = (
+                            savings.get("kind").and_then(serde_json::Value::as_str),
+                            savings.get("tokens_before").and_then(serde_json::Value::as_i64),
+                            savings.get("tokens_after").and_then(serde_json::Value::as_i64),
+                        ) {
+                            self.record_savings_event(
+                                session_id,
+                                kind,
+                                savings
+                                    .get("detail")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string),
+                                before,
+                                after,
+                                savings
+                                    .get("measured")
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false),
+                            );
+                        }
+                    }
+                }
+            }
+
             // Feed the result back as a tool message. FAILED results are
             // wrapped in a structured `[tool error]` marker so the model
             // can reliably parse the error text and re-issue the call
@@ -1513,11 +1710,49 @@ impl AgentLoop {
             // compaction could trim it. Under the cap the text passes through
             // byte-for-byte, so the substring classifiers are unaffected (a
             // denial is orders of magnitude shorter than the cap).
-            let capped = context::cap_tool_result_text(&result.output);
+            // Progressive disclosure (token-optimizer lever 3, backlog
+            // e4a50d22): with the flag on, an oversized result is archived in
+            // full and the context carries a bounded preview naming the row —
+            // otherwise today's bounded text. The archive write happens BEFORE
+            // the substitution, so a preview never names a missing row; any
+            // failure falls back to the cap (fail-open).
+            let capped = self
+                .ingest_tool_output(
+                    session_id,
+                    &tc.name,
+                    Self::archive_detail(&tc.arguments).as_deref(),
+                    &result.output,
+                )
+                .await;
             let tool_content = if result.success {
-                capped
+                if auto_retried {
+                    // Tier-1 transparency: the model sees the SUCCESS (the
+                    // swallowed failure would only cost a repair roundtrip),
+                    // with a one-line note so it knows the result took an
+                    // extra beat and a transient blip was in play.
+                    format!(
+                        "{capped}\n[harness note] (auto-retried once after a transient failure)"
+                    )
+                } else {
+                    capped
+                }
             } else {
                 format!("[tool error] {capped}")
+            };
+            // The model-facing content: a classified failure carries its
+            // guidance note (tier 2). The repeat-failure breaker below keeps
+            // comparing the RAW marker (`tool_content`), so triage never
+            // disturbs repeat detection.
+            let feed_content = match (&batch_triage, result.success) {
+                (Some(failure_triage::FailureTriage::Classified { class, .. }), false)
+                    if !is_user_denial_tool_output(&result.output) =>
+                {
+                    format!(
+                        "{tool_content}\n[harness triage] {}",
+                        failure_triage::guidance_note(*class)
+                    )
+                }
+                _ => tool_content.clone(),
             };
 
             // Repeat-failure circuit breaker (tool-call robustness): when
@@ -1542,7 +1777,7 @@ impl AgentLoop {
                 pending_correction = Some((tc.name.clone(), tool_content.clone()));
             }
 
-            let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), tool_content);
+            let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), feed_content);
             messages.push(tool_message);
 
             let _ = fanin_tx
@@ -1598,6 +1833,15 @@ impl AgentLoop {
             state.tool_error_count += 1;
         } else if batch_had_success {
             state.tool_error_count = 0;
+            // Failure triage: a failure-free successful batch is the model's
+            // retry landing — the turn's pending classified failures (the
+            // guidance route) are now observed as `retry_succeeded`.
+            for pending in state.pending_triage_rows.drain(..) {
+                failure_triage::resolve_failure(
+                    pending,
+                    failure_triage::TriageDisposition::RetrySucceeded,
+                );
+            }
         }
 
         // Repeat-failure circuit breaker: push the queued corrective
@@ -1646,9 +1890,45 @@ impl AgentLoop {
         // pass. This keeps history byte-identical across batches so prefix
         // cache holds (~95% hit on stable requests), while keeping context
         // bounded under the provider's limit.
-        let truncated = crate::agent::context::compact_old_tool_results(messages, 10, 20, 500);
+        // Progressive disclosure (lever 3): with the flag on, the cutoff pass
+        // also hands back the FULL originals of the big results it cuts, so
+        // the turn can archive them instead of losing them. The flag off ⇒
+        // `min_archive_chars = usize::MAX` ⇒ no records, exactly today's run.
+        let cfg = self.optimizer_config();
+        let min_archive_chars = if cfg.archive {
+            cfg.archive_min_chars
+        } else {
+            usize::MAX
+        };
+        let (truncated, records) = crate::agent::context::compact_old_tool_results_collecting(
+            messages,
+            10,
+            20,
+            500,
+            min_archive_chars,
+        );
         if truncated > 0 {
             state.token_accounting.reset();
+        }
+        // Fire-and-forget: the context is already bounded, so the archive is a
+        // recovery path, never a blocking dependency (a failure is logged).
+        if let Some(store) = &self.memory {
+            for record in records {
+                let store = Arc::clone(store);
+                tokio::spawn(async move {
+                    if let Err(e) = store
+                        .archive_tool_result(
+                            None,
+                            record.tool.as_deref().unwrap_or("unknown"),
+                            record.pointer.as_deref(),
+                            &record.original,
+                        )
+                        .await
+                    {
+                        eprintln!("mnemo: failed to archive a compacted tool result: {e}");
+                    }
+                });
+            }
         }
     }
 
@@ -1872,14 +2152,46 @@ impl AgentLoop {
         // compact_ms stamp below stays on the turn's provider either way —
         // the metric attaches to the turn's trace, wherever the summary ran.
         let summary_provider = self.summarize_provider(provider);
+        // Token-optimizer lever 4 (backlog e4a50d22): compaction survival.
+        // With the flag on, (a) the region about to be dropped is archived in
+        // full BEFORE the summary replaces it, (b) the decisions made so far
+        // ride the summarizer as a must-preserve block, and (c) one digest
+        // note lands after the swap naming what the summary elided. Every step
+        // is fail-open: no store, or a store error, leaves today's behavior
+        // exactly — the summary still runs.
+        let survival = self.optimizer_config().compaction_survival;
+        let decisions = if survival {
+            crate::agent::optimizer::extract_decisions(messages)
+        } else {
+            Vec::new()
+        };
+        // Lever 6: the score's decision-density signal is fed from here — the
+        // decisions the harness has seen so far this session.
+        self.optimizer_state.note_decisions(decisions.len());
+        let preserve_block = context::must_preserve_block(&decisions);
+        let dropped_digest = if survival {
+            crate::agent::optimizer::build_digest(crate::agent::optimizer::dropped_region(
+                messages,
+                keep_recent,
+            ))
+        } else {
+            String::new()
+        };
+        let checkpoint_id = if survival {
+            self.checkpoint_before_compaction(session_id, messages, keep_recent)
+                .await
+        } else {
+            None
+        };
         let summarize_result = context_manager
-            .summarize_with_interrupt(
+            .summarize_with_interrupt_opts(
                 messages,
                 keep_recent,
                 // The compacted result is what the TURN provider sends next, so
                 // its window is the one that has to fit — not the summarizer's.
                 context::sendable_budget(provider.capabilities()),
                 summary_provider.as_ref(),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
             )
             .await;
@@ -2033,6 +2345,19 @@ impl AgentLoop {
             );
         }
         *messages = summarized;
+        // Token-optimizer lever 4 (backlog e4a50d22): one post-compaction
+        // digest note so the model keeps a map of what the summary elided,
+        // plus the pointer to the archived checkpoint when one was written.
+        if survival {
+            let pointer = match &checkpoint_id {
+                Some(id) => format!(
+                    "\npre-compaction context archived — expand_result id={id} to retrieve \
+                     dropped detail"
+                ),
+                None => String::new(),
+            };
+            messages.push(Message::system(format!("{dropped_digest}{pointer}")));
+        }
         // Drop any steers the user dismissed (the "x" on a pending
         // steer) before re-injecting buffered commands.
         crate::agent::drop_cancelled_steers(&mut buffered);
@@ -2099,6 +2424,7 @@ impl AgentLoop {
                     used,
                     max,
                     breakdown: *breakdown,
+                    quality: self.quality_report(used, max, messages.len()),
                 },
             ))
             .await;
@@ -2331,13 +2657,14 @@ impl AgentLoop {
         provider: &Arc<dyn LlmClient>,
         memory_context: Option<&str>,
         tool_filter: &crate::tool::ToolFilter,
+        nudge: Option<&str>,
     ) {
         // Build the system prompt head + volatile tail. (The workflow
         // tool filter was already read at the top of the iteration —
         // the token accounting consumes it first.)
         // The stable head is cached and rebuilt only when the constitution
         // changes (L4) — re-reads agent.md on mtime change internally.
-        let (stable_head, volatile_tail) = {
+        let (stable_head, mut volatile_tail) = {
             let wf = self.workflow.lock().await;
             let stable_head = self.constitution.stable_head();
             let mut volatile_tail = prompt::build_volatile_tail(
@@ -2484,6 +2811,11 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // even on error; this is safe because `complete_with_retry`
         // serializes the messages into the request body and the returned
         // stream borrows `&self` (the provider), not the messages slice.
+        // Token-optimizer lever 7 (backlog e4a50d22): the steering note rides
+        // the volatile tail — pushed here and popped right after the request,
+        // so the cached conversation prefix is never touched. A `None` nudge
+        // leaves the tail byte-identical to its pre-lever form.
+        crate::agent::optimizer::append_nudge(&mut volatile_tail, nudge);
         if tail_as_user {
             messages.push(Message::user_text(volatile_tail));
             messages.push(Message::user_text(prompt::CONTEXT_FOOTER));
@@ -2556,6 +2888,264 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 }
             });
         }
+    }
+
+    /// Record one token-savings ledger row (backlog e4a50d22): a lever's
+    /// before/after token counts for one optimization event. Fire-and-forget
+    /// — savings recording must never block or break the turn; a failed
+    /// durable write is logged, not swallowed (mirrors
+    /// [`record_stats_row`](Self::record_stats_row)). No-op when no memory
+    /// store is attached.
+    pub(crate) fn record_savings_event(
+        &self,
+        session_id: Option<&str>,
+        kind: &str,
+        detail: Option<String>,
+        tokens_before: i64,
+        tokens_after: i64,
+        measured: bool,
+    ) {
+        // Lever 6 counters (backlog e4a50d22): mirror the ledger row into the
+        // session's running counters so the S–F score is graded from exactly
+        // what the levers logged. In-memory, so this happens even when no
+        // store is attached (the spawn below is the durable half).
+        self.optimizer_state.record(kind, tokens_after);
+        let now_epoch = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let event = crate::memory::SavingsEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.map(|s| s.to_string()),
+            kind: kind.to_string(),
+            detail,
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before - tokens_after,
+            measured,
+            created_at: now_epoch,
+        };
+        if let Some(store) = &self.memory {
+            let store = Arc::clone(store);
+            tokio::spawn(async move {
+                if let Err(e) = store.record_savings_event(&event).await {
+                    eprintln!("mnemo: failed to record savings event: {e}");
+                }
+            });
+        }
+    }
+
+    /// Token-optimizer lever 6 (backlog e4a50d22): grade the context for a
+    /// `ContextUsage` event, or `None` when the quality lever is off — the
+    /// event then serializes byte-identically to its pre-lever form.
+    /// `used`/`max` are the values the event itself carries; the rest of the
+    /// signals come from the session counters, which
+    /// [`record_savings_event`](Self::record_savings_event) keeps current.
+    pub(crate) fn quality_report(
+        &self,
+        used: u32,
+        max: u32,
+        messages: usize,
+    ) -> Option<crate::agent::optimizer::QualityReport> {
+        if !self.optimizer_config().quality_score {
+            return None;
+        }
+        let fill_pct = if max == 0 {
+            0
+        } else {
+            (used.min(max) as u64 * 100 / max as u64) as u8
+        };
+        Some(crate::agent::optimizer::QualityReport::compute(
+            fill_pct,
+            messages,
+            self.optimizer_state.snapshot(),
+        ))
+    }
+
+    /// Token-optimizer lever 7 (backlog e4a50d22): the per-request steering
+    /// note, or `None` when both nudge levers are off, neither trigger fires,
+    /// or the shared cooldown is still running.
+    ///
+    /// Call it exactly ONCE per request — it ticks the request clock the
+    /// cooldown is measured against and updates the session's best-seen grade
+    /// (the quality-drop baseline).
+    fn nudge_for_request(&self, used: usize, max: usize, messages: usize) -> Option<String> {
+        let cfg = self.optimizer_config();
+        let request = self.optimizer_state.tick_request();
+        if !cfg.lean_output_nudge && !cfg.quality_score {
+            return None;
+        }
+        let fill_pct = if max == 0 {
+            0
+        } else {
+            (used.min(max) as u64 * 100 / max as u64) as u8
+        };
+        let report = crate::agent::optimizer::QualityReport::compute(
+            fill_pct,
+            messages,
+            self.optimizer_state.snapshot(),
+        );
+        let best = self.optimizer_state.observe_grade(report.grade);
+        let note = crate::agent::optimizer::nudge_note(
+            &report,
+            best,
+            cfg.lean_output_nudge,
+            cfg.lean_output_fill_pct,
+        )?;
+        if !self.optimizer_state.nudge_allowed(cfg.nudge_cooldown_requests) {
+            return None;
+        }
+        self.optimizer_state.mark_nudge(request);
+        Some(note)
+    }
+
+    /// Token-optimizer lever 3 (backlog e4a50d22): progressive disclosure at
+    /// ingestion. With the flag on and the output above `archive_min_chars`,
+    /// the FULL original is archived BEFORE the preview replaces it — so a
+    /// substituted result is never lost. The archive write is awaited (a
+    /// preview naming a missing row would be a lie). Any failure — no store,
+    /// DB error — falls back to today's bounded text: fail-open, logged.
+    async fn ingest_tool_output(
+        &self,
+        session_id: Option<&str>,
+        tool: &str,
+        detail: Option<&str>,
+        output: &str,
+    ) -> String {
+        let cfg = self.optimizer_config();
+        let Some(store) = &self.memory else {
+            return context::cap_tool_result_text(output);
+        };
+        if !cfg.archive || output.chars().count() < cfg.archive_min_chars {
+            return context::cap_tool_result_text(output);
+        }
+        match store.archive_tool_result(session_id, tool, detail, output).await {
+            Ok(id) => {
+                let preview = Self::archive_preview(output, &id);
+                self.record_savings_event(
+                    session_id,
+                    "archive",
+                    Some(tool.to_string()),
+                    crate::tool::agent::optimizer::estimate_tokens(output) as i64,
+                    crate::tool::agent::optimizer::estimate_tokens(&preview) as i64,
+                    false,
+                );
+                preview
+            }
+            Err(e) => {
+                eprintln!(
+                    "mnemo: failed to archive a tool result (falling back to the cap): {e}"
+                );
+                context::cap_tool_result_text(output)
+            }
+        }
+    }
+
+    /// Archive the region compaction is about to drop (token-optimizer lever 4,
+    /// backlog e4a50d22) and return the archive row id — `None` when there is no
+    /// store, nothing to archive, or the write failed. Fail-open by design:
+    /// compaction must never be blocked by its own checkpoint, so an error is
+    /// logged and the summary runs as today. The write is awaited because the
+    /// pointer handed to the model has to resolve.
+    pub(crate) async fn checkpoint_before_compaction(
+        &self,
+        session_id: Option<&str>,
+        messages: &[Message],
+        keep_recent: usize,
+    ) -> Option<String> {
+        let store = self.memory.as_ref()?;
+        let region = crate::agent::optimizer::checkpoint_region(messages, keep_recent);
+        if region.is_empty() {
+            return None;
+        }
+        let region_tokens = crate::tool::agent::optimizer::estimate_tokens(&region) as i64;
+        match store
+            .archive_tool_result(
+                session_id,
+                "compaction_checkpoint",
+                Some("pre-compaction context"),
+                &region,
+            )
+            .await
+        {
+            Ok(id) => {
+                // Informational ledger row: the checkpoint itself puts nothing
+                // into context (compaction is what reclaims the space), so
+                // before == after and the recorded saving is exactly 0 — the row
+                // exists so the dropped region's SIZE is visible without
+                // inflating the levers' claimed savings.
+                self.record_savings_event(
+                    session_id,
+                    "compaction_checkpoint",
+                    Some(id.clone()),
+                    region_tokens,
+                    region_tokens,
+                    false,
+                );
+                Some(id)
+            }
+            Err(e) => {
+                eprintln!("mnemo: failed to archive the pre-compaction checkpoint: {e}");
+                None
+            }
+        }
+    }
+
+    /// The bounded preview that replaces an archived result in context: a head
+    /// broad enough to recognize the content, the archive pointer, and a tail
+    /// (where a command's summary / exit status usually sits).
+    ///
+    /// The preview is a model-served surface like every compressed serve, so it
+    /// runs through the same credential redaction as `expand_result` — the
+    /// archived row keeps the raw text and the retrieval path redacts again on
+    /// the way out, so the two surfaces never disagree about a credential.
+    fn archive_preview(output: &str, id: &str) -> String {
+        const HEAD: usize = 1_500;
+        const TAIL: usize = 500;
+        let total = output.chars().count();
+        let tokens = crate::tool::agent::optimizer::estimate_tokens(output);
+        let served = crate::tool::agent::output_compactor::redact_secrets(output);
+        let chars: Vec<char> = served.chars().collect();
+        if chars.len() <= HEAD + TAIL {
+            // Barely over the threshold: the preview IS the content plus a
+            // pointer, so keep it whole and just name the archive row.
+            return format!(
+                "{served}\n[archived for size: {total} chars ~{tokens} tokens — expand with \
+                 expand_result id={id}]"
+            );
+        }
+        let head: String = chars[..HEAD].iter().collect();
+        let tail: String = chars[chars.len() - TAIL..].iter().collect();
+        format!(
+            "{head}\n\n[full output archived: {total} chars ~{tokens} tokens — {HEAD} head + \
+             {TAIL} tail shown. Retrieve it all with expand_result id={id}, or search the \
+             archive with expand_result query=<keywords>]\n\n{tail}"
+        )
+    }
+
+    /// Derive the archive row's `detail` from a tool call's raw arguments —
+    /// the command line, the file path, or the batch of read paths.
+    fn archive_detail(arguments: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+            return Some(cmd.to_string());
+        }
+        if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+            return Some(path.to_string());
+        }
+        if let Some(files) = v.get("files").and_then(|f| f.as_array()) {
+            let paths: Vec<&str> = files
+                .iter()
+                .filter_map(|s| s.get("path").and_then(|p| p.as_str()))
+                .collect();
+            if !paths.is_empty() {
+                return Some(paths.join(", "));
+            }
+        }
+        None
     }
 
     /// Issue the provider request (connection establishment + first byte),
@@ -2924,6 +3514,12 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                                         used: prompt_tokens,
                                         max: context_manager.max_tokens() as u32,
                                         breakdown: breakdown.clone(),
+                                        // Lever 6 grades only the top-of-loop and
+                                        // post-compaction emissions; this mid-stream
+                                        // re-anchor keeps the previous grade (the
+                                        // frontend reducer treats an absent quality
+                                        // as "unchanged").
+                                        quality: None,
                                     }))
                                     .await;
                             }
@@ -3216,6 +3812,85 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // MAX_BAD_JSON_RETRIES cap so three strikes doesn't stop a
         // model that can self-correct.
         state.bad_json_count += 1;
+        // Failure triage (Laya, opt-in; plan 02deea7c): a confident
+        // `permanent` reading of the malformed-arguments failure aborts the
+        // repair loop EARLY — the model roundtrip IS the bad-JSON retry, so
+        // no harness auto-retry exists here; the classification only decides
+        // whether more repair attempts are worth their roundtrips. Every
+        // other class, and any fallback, keeps today's ladder byte-identical.
+        // One row per strike, resolved immediately with `escalated` (the
+        // abort skips any further repair attempt — off-policy for the
+        // trainer, same as the provider skip).
+        if let Some(gate) = &self.failure_triage {
+            let error_text = match tool_calls.first() {
+                Some(tc) => format!(
+                    "tool-call arguments failed to parse as JSON (finish reason \
+                     {finish_reason:?}): {}",
+                    tc.arguments
+                ),
+                None => format!(
+                    "tool-call arguments failed to parse as JSON (finish reason \
+                     {finish_reason:?})"
+                ),
+            };
+            if let failure_triage::FailureTriage::Classified {
+                class: failure_triage::FailureClass::Permanent,
+                confidence,
+            } = gate.triage(&error_text).await
+            {
+                let pending = gate.log_failure(
+                    failure_triage::FailureSite::BadJsonRepair,
+                    tool_calls.first().map(|tc| tc.name.as_str()),
+                    &error_text,
+                    failure_triage::FailureClass::Permanent,
+                    confidence,
+                    failure_triage::TriageAction::AbortEarly,
+                );
+                failure_triage::resolve_failure(
+                    pending,
+                    failure_triage::TriageDisposition::Escalated,
+                );
+                // UI-only (backlog 63cbc20f): end every announced card
+                // before the final error — same discipline as the cap arm
+                // below.
+                for tc in tool_calls {
+                    let _ = fanin_tx
+                        .send((
+                            agent_id,
+                            AgentEvent::ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                result: ToolResult::error(
+                                    "arguments malformed or truncated — not run",
+                                ),
+                            },
+                        ))
+                        .await;
+                }
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Error {
+                            error: format!(
+                                "Aborted after {} malformed-arguments failures — \
+                                 classified permanent: repair attempts cannot help \
+                                 ({}).",
+                                state.bad_json_count,
+                                failure_triage::skip_hint(
+                                    failure_triage::FailureClass::Permanent
+                                )
+                            ),
+                            retrying: false,
+                        },
+                    ))
+                    .await;
+                return Some(TurnOutcome {
+                    finish_reason: FinishReason::Stop,
+                    text: text.to_string(),
+                    tool_calls_made: 0,
+                    stop_reason: state.stop_reason.take(),
+                });
+            }
+        }
         if state.bad_json_count >= MAX_BAD_JSON_RETRIES {
             // UI-only (backlog 63cbc20f): end every announced card
             // before the final error — the whole batch is discarded
@@ -3527,7 +4202,7 @@ fn repeated_bad_json_correction(tool_name: &str, failed_content: &str) -> String
         }
         // A large body (a file's contents) is the other classic
         // unparseable-arguments cause: the emission is truncated.
-        "file_write" | "file_edit" => {
+        "file_write" | "file_edit" | "multi_edit" => {
             "This is usually an EMISSION problem — the argument body is too \
              large or too escape-heavy to come through intact. Do NOT \
              resend it. Instead: write the file in smaller chunks (one \

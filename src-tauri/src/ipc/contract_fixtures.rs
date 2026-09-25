@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
-use mnemo::config::SafetyMode;
+use mnemo::config::{LayaMode, SafetyMode};
 use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
@@ -33,7 +33,8 @@ use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllPro
 use crate::ipc::codegraph_cmds::{CodegraphGraph, CodegraphStatus};
 use crate::ipc::settings::{
     GetSettingsContext, GetSettingsGeneral, GetSettingsResponse, GetSettingsSteeringNotes,
-    GetSettingsUi, ModelsConfigWire, ProjectWire, SaveEndpointsResponse, SaveSettingsResponse,
+    GetSettingsUi, LayaWire, ModelsConfigWire, ProjectWire, SaveEndpointsResponse,
+    SaveSettingsResponse,
 };
 use mnemo::backlog::{BacklogItem, BacklogStatus};
 
@@ -238,6 +239,16 @@ fn dto_fixtures_match_serde() {
             vision_model: None,
             embedding_model: None,
             bundled_embedding_model: None,
+            laya: LayaWire {
+                enabled: false,
+                endpoint: None,
+                mode: LayaMode::External,
+                checkpoint: None,
+                auto_type_memories: false,
+                failure_triage: false,
+                failure_triage_knn: false,
+                auto_finetune: false,
+            },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,
         },

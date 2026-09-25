@@ -228,8 +228,12 @@ vitest (frontend), `tsc --noEmit` clean.
 
 - **Agent tools** — the coding tools the agent uses to do work: `file_read`,
   `read_files` (batch sibling), `file_edit` (EOL-agnostic literal/fuzzy
-  matching, atomic multi-edit batches via `edits`, append mode via `append`),
-  `file_write`, `file_append`, `shell`, `search`, `git`, `describe_image`.
+  matching, atomic multi-edit batches via `ops` — compact line ops (`i`/`b`/
+  `d`/`r` verbs with ranges and payloads) and anchor items sharing one array,
+  append mode via `append`), `multi_edit` (atomic multi-file edits,
+  `files: [{path, ops}]`, every file prepared before any write — one combined
+  diff, one approval), `file_write`, `file_append`, `shell`, `search`, `git`,
+  `describe_image`.
   Live in `tool/agent/`. Gated by
   workflow state. The two read tools cross-hint each other's argument shape
   in their invalid-args error when a model mixes up a call. `search`/
@@ -555,6 +559,62 @@ As the agent works, the conversation grows. A `ContextManager` counts tokens
 fill-rate threshold (default 50%), summarizes the oldest turns into a single
 system message, keeping recent turns + the system prompt verbatim. Large tool
 results (file reads, shell, git) are truncated with a note.
+
+#### Optimizer levers (token-optimizer parity, backlog e4a50d22)
+
+Six independent, **default-off** context-economy levers live behind
+`[general.optimizer]` in `config.toml` (`OptimizerConfig`, `src/config/general.rs`).
+With a flag off its code path is byte-identical to the pre-lever behaviour —
+which is exactly what keeps the existing truncation/compaction/cap tests green
+without modification.
+
+| Lever | Flag | What it does |
+|---|---|---|
+| Delta/skeleton re-reads | `delta_reads` | A `read_files` re-read of a file the agent already has serves a skeleton (unchanged) or a unified diff (small change) instead of the whole file. |
+| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every model-served surface. |
+| Archive + expand | `archive` | Tool results past `archive_min_chars` are archived (full text in SQLite) and replaced by a preview; the always-advertised `expand_result` tool retrieves any row by id or keyword. |
+| Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
+| Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
+| Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
+
+**Two tables** (`src/memory/schema.rs`) record what the levers do:
+`savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,
+tokens_saved, measured, created_at`) — one row per optimization event, kinds
+`truncation, compaction, delta_read, skeleton, compression, archive,
+archive_expand, compaction_checkpoint` — and `tool_result_archive`
+(`id, session_id, tool, detail, content, char_count, created_at`) with an FTS5
+index (`tool_result_archive_fts`) behind `expand_result`'s keyword search.
+
+**Quality formula**: a 0–100 score starts at 100 and subtracts a fill penalty
+(0/6/18/35/62/70 for <40/40–59/60–74/75–89/90–94/95+ %), a waste penalty over
+`waste_tokens / served_tokens` (0/3/8/18/30 for <5/5–9/10–24/25–49/50+ %) and a
+stale-read penalty (0/3/8/15 for <10/10–24/25–49/50+ %). Bands: `S` >=95,
+`A` >=85, `B` >=70, `C` >=55, `D` >=40, else `F`. Fill is deliberately
+dominant — waste or stale reads alone can only reach `B`/`A`, so a
+busy-but-roomy session never reads as critical. Deterministic, with every band
+boundary unit-tested (`src/agent/optimizer.rs`).
+
+**Invariants** (each pinned by a test):
+
+* Nothing is dropped before it is archived — the archive write always precedes
+the substitution, and every archive/store error is fail-open (pre-lever
+behaviour is the fallback), so no lever can lose data.
+* The already-sent conversation prefix is never mutated: the lean-output nudge
+rides the *volatile tail*, popped right after the request. The post-compaction
+digest is a **persistent** system note appended to the freshly-compacted
+conversation — the summary itself is that rewrite, so nothing already sent is
+changed. Either way the provider prefix cache stays valid.
+* Tools stay store-free — they emit `data.savings {kind, tokens_before,
+tokens_after}` on the result and the turn loop records the row, keeping the
+agent core the single writer to the ledger.
+* Tool-reported token counts are estimates (`chars / 4`, `measured = false`).
+* Credentials are redacted on every compressed surface the model sees.
+
+**Dashboard**: the savings dashboard, its aggregates and its IPC landed
+afterwards in plan `6494b738` (backlog `652ae094`) — `savings_stats()`
+aggregating this ledger, the `get_savings_stats` IPC command, and the Dashboard
+view (right panel, immediately before Memory). That work reused this ledger's
+schema unchanged.
 
 ### Error recovery
 
@@ -931,7 +991,7 @@ toggle). The layout mirrors the original design but with web-grade rendering:
 |---|---|
 | **Md viewer** | Renders a markdown file readably — headings, lists, code blocks (Shiki-highlighted), wrapped prose, tables, task lists. Scrollable. Editable (toggle edit mode). |
 | **Plan progress** | The current plan with checkboxes, progress count, active step highlighted. Reflects `.coding/plans/` on disk. |
-| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` approvals. Auto-shown when an approval is pending. |
+| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` / `multi_edit` approvals (`multi_edit` shows one combined diff covering every file it changes). Auto-shown when an approval is pending. |
 | **Tool output** | Live output from shell commands and search results. |
 | **File browser** | Navigable project file tree; opening a file switches to the md viewer. |
 
@@ -1131,6 +1191,63 @@ These capabilities are implemented and shipped but were not in the original
 PLAN.md scope. They are documented here so the PRD reflects the shipped
 product.
 
+- **Opt-in Laya classifier foundation** (`src/memory/classifier.rs`, mirrored
+  `build_classifier` in `src/provider/client_factory.rs`) — a `Classifier`
+  trait beside `Embedder` plus a Laya HTTP backend (`POST /v1/systemone`) for
+  fast, calibrated "System 1" decisions. Disabled by default: with Laya off (or
+  enabled without an endpoint) no client is built and no call is ever made, so
+  the app behaves exactly as before. Status surfaces via
+  `get_classifier_status` + the startup snapshot, and Settings → Classifier
+  carries the toggle, endpoint URL, install hints, and live status (2027-01-16,
+  backlog bb54bdcc; the consumer features — memory typing (shipped), model
+  routing, tool steering, failure triage — each confidence-gated).
+- **Managed Laya runtime** (`src-tauri/src/ipc/laya.rs`) — embedding-parity
+  UX for the classifier: Settings → Classifier downloads a self-contained
+  runtime (uv binary + virtualenv + `laya[serve]` + checkpoint, ~0.8–1 GB
+  plus the checkpoint, under the app config dir) with live progress, and
+  while managed mode is enabled the app automatically starts, monitors, and
+  stops the `laya-serve` sidecar on 127.0.0.1 (startup hook + save-driven
+  rewire + app-exit stop). No command line, no Python prerequisites;
+  external mode (user-run endpoint) is preserved.
+- **Laya memory auto-typing** (`src/memory/auto_typing.rs`) — the
+  classifier's first consumer: at `memory_write` time a choice question
+  over the six typed prefixes may correct the writer's prefix when the
+  calibrated confidence clears 0.80; a low-confidence or missing answer
+  keeps the writer's prefix, and with the separate `auto_type_memories`
+  opt-in off (the default) nothing changes at all. The tool reads the
+  shared classifier slot + a flag mirror at call time (Settings toggles
+  are live without a rebuild), and every correction or keep is noted in
+  the write's message + data. Base checkpoints are near-chance on this
+  task — enable it only against a checkpoint fine-tuned on the seed
+  labeled set `seed_dataset` builds from `.coding/knowledge/` (covers
+  SPEC/DECISION/BUG/HOW; PLAN/REVIEW ride untrained until those corpora
+  can seed them — follow-up) (backlog a147b63c).
+- **Laya failure triage + startup fine-tune** (`src/agent/failure_triage.rs`,
+  `src-tauri/src/ipc/finetune.rs`) — the classifier's second consumer: at
+  every failure-handling site (the tool-execution cap + bad-JSON repair loop
+  in `src/agent/turn.rs` and BOTH provider retry layers — the inner
+  `complete_with_retry` and the outer `run_turn_attempt`) the error text is
+  classified (transient / permanent / needs_user / flaky_test,
+  `TRIAGE_THRESHOLD` 0.80 inclusive) and a confident answer lets the harness
+  act: a transient READ-ONLY tool failure is auto-retried without a model
+  roundtrip (≤1 per call, ≤4 per turn, never mutating tools), other classes
+  ride targeted guidance on the fed-back error, and a confident
+  needs-user/permanent provider error skips both retry ladders immediately
+  (a marked error text makes the outer layer skip without re-classifying; a
+  429 is never classified). Every classified failure is logged with its true
+  disposition to a JSONL training log; the startup fine-tune (managed mode +
+  `auto_finetune`) re-trains the checkpoint from that log when ≥50 new
+  labeled rows accrued and hot-swaps the served checkpoint (an ineligible
+  run exports the dataset + skips cleanly — laya 0.3.20 ships no training
+  surface). The kNN overlay (`src/agent/failure_triage_knn.rs`, flag
+  `failure_triage_knn`) learns from that same log between fine-tunes: each
+  failure text is embedded with the live memory embedder, the five most
+  similar logged failures vote, and the vote share is the confidence (the
+  same 0.80 gate; consulted before the shared Laya slot, falling back to it
+  below threshold — no `laya-serve` needed, genuinely online: appended
+  dispositions are retrievable without a restart). All three flags are
+  separate opt-ins (default off); disabled behavior is byte-identical
+  (backlog 1a4049c1; the overlay is item 4b, backlog 057f7a34).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

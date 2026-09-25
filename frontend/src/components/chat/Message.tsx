@@ -593,9 +593,10 @@ function ToolCard({
         <span className="font-medium">{displayName(name)}</span>
         {chips.map((chip) => {
           if (chip.path !== null) {
-            // file_edit chips deep-link into the Diff tab (user request) —
-            // every other tool opens the file in the Files tab as before.
-            const opensDiff = name === "file_edit";
+            // file_edit / multi_edit chips deep-link into the Diff tab (user
+            // request) — every other tool opens the file in the Files tab as
+            // before.
+            const opensDiff = name === "file_edit" || name === "multi_edit";
             return (
               <button
                 key={chip.key}
@@ -780,7 +781,9 @@ function CallDetail({
   // labeled stderr section, and an exit-code chip — instead of the raw
   // {"command": ...} JSON and one machine-marked output blob. A successful
   // file_edit similarly renders its Rust-side unified diff (`editDiff`
-  // below) instead of the raw old_string/new_string args JSON. Any other
+  // below, data.diff) instead of the raw old_string/new_string args JSON;
+  // multi_edit renders its ONE combined diff (every file the call changed)
+  // the same way. Any other
   // tool keeps the generic pretty-JSON + raw-output rendering.
   const shellArgs = name === "shell" ? shellCallFromArgs(call.args) : null;
   const shellOut = call.result && name === "shell" ? parseShellOutput(call.result.output) : null;
@@ -793,7 +796,8 @@ function CallDetail({
     shellOut && shellOut.stderr !== null
       ? stripSteeringNotes(shellOut.stderr, hiddenSteeringNotes)
       : null;
-  const editDiff = name === "file_edit" ? fileEditDiff(call.result) : null;
+  const editDiff =
+    name === "file_edit" || name === "multi_edit" ? fileEditDiff(call.result) : null;
   // A read_files result is a wall of numbered file content — the expanded
   // body instead shows just WHAT was read: one row per file with its actual
   // line range (parsed from the result's section headers), clickable to open

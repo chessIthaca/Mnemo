@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use super::failure_triage;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -133,6 +134,17 @@ pub struct AgentLoop {
     /// memories into the system prompt) and working-memory capture (recording
     /// tool events). `None` in tests that don't exercise memory.
     pub(crate) memory: Option<Arc<dyn MemoryStoreTrait>>,
+    /// Live `[general.optimizer]` config (token-optimizer levers, backlog
+    /// e4a50d22), shared with the factory's tool builds. The ingestion-time
+    /// levers (progressive disclosure of oversized results, compaction
+    /// survival) read it per turn. `None` in tests / directly-built loops —
+    /// every lever then stays off.
+    pub(crate) optimizer: Option<Arc<RwLock<crate::config::OptimizerConfig>>>,
+    /// Session counters behind lever 6's S–F quality score (backlog e4a50d22):
+    /// fed by [`record_savings_event`](AgentLoop::record_savings_event), read
+    /// when a `ContextUsage` event is emitted. Atomics, so the grade can be
+    /// computed from `&self` without a lock.
+    pub(crate) optimizer_state: super::optimizer::OptimizerState,
     /// Safety rules — regex-based auto-approve. When a tool call matches a
     /// rule in `.coding/safety.toml`, the approval prompt is skipped. `None`
     /// when no safety-rules file is configured (tests, or a project without
@@ -336,6 +348,13 @@ pub struct AgentLoop {
     /// inherit the same root (a worktree agent's reviewer must see the
     /// worktree's diff, not the main tree's).
     pub(crate) root_spec: Option<crate::agent::factory::AgentRootSpec>,
+    /// The optional failure-triage gate (the Laya classifier's failure-
+    /// handling consumer, `[general.laya] failure_triage`): the shared
+    /// classifier slot plus the config-mirrored enable flag that the
+    /// tool-dispatch and provider-retry sites read on every failure. `None`
+    /// in tests / when the Laya foundation is not wired — those sites then
+    /// keep their pre-classifier behavior byte-for-byte.
+    pub(crate) failure_triage: Option<failure_triage::FailureTriageHandle>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -708,6 +727,8 @@ impl AgentLoop {
             constitution,
             safety_mode: Arc::new(RwLock::new(safety_mode)),
             memory,
+            optimizer: None,
+            optimizer_state: super::optimizer::OptimizerState::default(),
             safety_rules: None,
             vision,
             session: SessionState::new(),
@@ -733,6 +754,7 @@ impl AgentLoop {
             last_review_report: std::sync::Mutex::new(None),
             plans_dir: std::path::PathBuf::new(),
             root_spec: None,
+            failure_triage: None,
         }
     }
 
@@ -753,6 +775,28 @@ impl AgentLoop {
         &self.plans_dir
     }
 
+    /// Attach the live `[general.optimizer]` config (token-optimizer levers,
+    /// backlog e4a50d22). Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`]; `None` for directly-built test loops, where every
+    /// lever stays off (byte-identical to the pre-lever build).
+    pub fn with_optimizer(
+        mut self,
+        optimizer: Arc<RwLock<crate::config::OptimizerConfig>>,
+    ) -> Self {
+        self.optimizer = Some(optimizer);
+        self
+    }
+
+    /// The live optimizer config, or the all-off default when none is wired
+    /// (tests, bare loops) — so a lever's gate reads the same shape either
+    /// way and a missing handle can never panic.
+    pub(crate) fn optimizer_config(&self) -> crate::config::OptimizerConfig {
+        self.optimizer
+            .as_ref()
+            .map(|c| c.read().expect("optimizer config lock poisoned").clone())
+            .unwrap_or_default()
+    }
+
     /// Store the per-agent root override (parallel run-all worktree agents,
     /// plan ffd7a86f). Returns `self` for chaining. Wired by
     /// [`AgentLoopFactory::build_with_root_spec`]; read by the IPC spawner so
@@ -767,6 +811,26 @@ impl AgentLoop {
     /// spawned by this agent inherit the same root.
     pub fn root_spec(&self) -> Option<&crate::agent::factory::AgentRootSpec> {
         self.root_spec.as_ref()
+    }
+
+    /// Attach the failure-triage gate (the Laya classifier's failure-handling
+    /// consumer, `[general.laya] failure_triage`). The gate carries the shared
+    /// classifier slot + the config-mirrored enable flag; BOTH are read at
+    /// failure time, so a Settings save takes effect on the next failure and
+    /// the flag can stay off (keeping the pre-classifier behavior) while the
+    /// slot itself is live. Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise triage.
+    pub fn with_failure_triage(mut self, handle: failure_triage::FailureTriageHandle) -> Self {
+        self.failure_triage = Some(handle);
+        self
+    }
+
+    /// The failure-triage gate this loop was built with (`None` when triage is
+    /// unwired). The IPC layer mirrors the config flag into the gate's live
+    /// enable flag, so a Settings toggle needs no rebuild.
+    pub fn failure_triage(&self) -> Option<&failure_triage::FailureTriageHandle> {
+        self.failure_triage.as_ref()
     }
 
     /// The context-manager fill rate this loop was built with — the LIVE

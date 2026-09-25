@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Runtime rewire of the vision client + memory embedder + model resolver
-//! after a config change.
+//! Runtime rewire of the vision client + memory embedder + optional Laya
+//! classifier + model resolver after a config change.
 //!
 //! Shared by [`save_endpoints`](super::settings::save_endpoints) and
 //! [`save_settings`](super::settings::save_settings): both reload the config
@@ -11,14 +11,24 @@
 //! (factory / memory store / model resolver) so the change takes effect
 //! without a restart.
 
-use mnemo::provider::client_factory::{build_embedder, build_vision_client};
+use mnemo::provider::client_factory::{build_classifier, build_embedder, build_vision_client};
+use tauri::Emitter;
 
 use crate::ipc::state::IpcState;
 
-/// Rebuild the live vision client + memory embedder from `cfg` and install
-/// them into the factory / memory store. No-op when those handles are absent
-/// (startup-error fallback). Shared by `save_settings` and `save_endpoints`.
-pub(super) fn rewire_vision_and_embedder(state: &IpcState, cfg: &mnemo::config::Config) {
+/// Rebuild the live vision client + memory embedder + optional Laya classifier
+/// from `cfg` and install them into the factory / memory store / classifier
+/// slot. No-op for the handles that are absent (startup-error fallback).
+/// Shared by `save_settings` and `save_endpoints`.
+///
+/// `app` is used only to emit `classifier://status` when the classifier slot
+/// is rebuilt — mirroring the startup emit (main.rs), so listeners (today the
+/// Settings → Classifier section) see a save-driven rewire without polling.
+pub(super) fn rewire_vision_embedder_and_classifier(
+    app: &tauri::AppHandle,
+    state: &IpcState,
+    cfg: &mnemo::config::Config,
+) {
     if let Some(factory) = &state.runtime.factory {
         let vision = build_vision_client(cfg);
         factory.set_vision(vision);
@@ -70,6 +80,124 @@ pub(super) fn rewire_vision_and_embedder(state: &IpcState, cfg: &mnemo::config::
         store.set_memory_search_config(cfg.general.memory.clone());
         store.set_embedder(new_embedder);
         eprintln!("rewire: embedder set (from config)");
+    }
+
+    // Laya classifier: rebuild from the saved config so enabling/disabling or
+    // repointing the endpoint takes effect without a restart. Disabled ⇒
+    // `None` + status Disabled (no client, no calls); the slot swap is what
+    // items 2-5 read. `build_classifier` also writes the shared status, so the
+    // Settings section sees the new state on its next read.
+    //
+    // Managed mode takes the sidecar path instead: the app owns the runtime,
+    // so the rewire stops any running child first (a reconfigure must never
+    // leave a stale sidecar bound to a dead endpoint), and when enabled +
+    // installed swaps the slot to a pre-allocated loopback port and starts
+    // the new sidecar in the background (status Starting → probe →
+    // Ready/Failed on `classifier://status`). The server start never blocks
+    // the save call. External mode keeps the `build_classifier` path.
+    let laya_cfg = &cfg.general.general.laya;
+    if matches!(laya_cfg.mode, mnemo::config::LayaMode::Managed) {
+        let laya = state.runtime.laya.clone();
+        laya.stop();
+        let status = state.runtime.classifier_status.clone();
+        let checkpoint =
+            super::laya::find_checkpoint(laya_cfg.checkpoint.as_deref().unwrap_or("english"));
+        let port = if laya.is_checkpoint_installed(checkpoint.id) {
+            super::laya::LayaManager::alloc_free_port()
+        } else {
+            None
+        };
+        if laya_cfg.enabled && port.is_some() {
+            // Some(port): the client points at the fresh port right away; the
+            // background task drives Starting → Ready/Failed.
+            let port = port.expect("checked is_some above");
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Starting;
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") =
+                super::laya::build_managed_classifier(port, status.clone());
+            let app_handle = Some(app.clone());
+            tauri::async_runtime::spawn(async move {
+                super::laya::start_managed_server(&app_handle, laya, checkpoint, port).await;
+            });
+            eprintln!(
+                "rewire: classifier managed (checkpoint '{}', restarting sidecar)",
+                checkpoint.id
+            );
+        } else if laya_cfg.enabled {
+            // Enabled but the checkpoint is not installed or no free port:
+            // no client, and the hint says where to fix it.
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") = None;
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Disabled;
+            eprintln!(
+                "rewire: classifier managed but not ready (checkpoint '{}' not installed \
+                 or no free loopback port) — run the setup in Settings → Classifier",
+                checkpoint.id
+            );
+        } else {
+            *state
+                .runtime
+                .classifier
+                .write()
+                .expect("classifier lock poisoned") = None;
+            *status.write().expect("classifier status lock poisoned") =
+                mnemo::memory::classifier::ClassifierStatus::Disabled;
+            eprintln!("rewire: classifier cleared (managed disabled)");
+        }
+    } else {
+        let new_classifier = build_classifier(cfg, state.runtime.classifier_status.clone());
+        *state
+            .runtime
+            .classifier
+            .write()
+            .expect("classifier lock poisoned") = new_classifier;
+        eprintln!("rewire: classifier set (from config)");
+    }
+    // Auto-typing flag (backlog a147b63c): memory_write reads the shared
+    // classifier slot + this mirrored flag at call time, so the Settings
+    // toggle lands on the very next write — no restart, no registry
+    // rebuild. The slot itself needs no touch here: every swap above
+    // writes the same Arc the factory's tools hold.
+    if let Some(factory) = &state.runtime.factory {
+        factory.set_auto_typing_enabled(laya_cfg.auto_type_memories);
+        // Failure triage (backlog 1a4049c1): the same live-toggle contract —
+        // the loop's dispatch site and both provider retry layers read the
+        // mirrored flag at failure time, so a Settings save lands on the
+        // next failure with no rebuild. The classifier slot needs no touch
+        // here: every swap above writes the same Arc the gate holds.
+        factory.set_failure_triage_enabled(laya_cfg.failure_triage);
+        // The kNN overlay flag (item 4b): the same live-toggle contract —
+        // the gate consults the overlay before the shared slot while this
+        // is on. The overlay reads the store's live embedder through its
+        // getter and tracks the training-log file itself, so an embedder
+        // change needs no extra wiring here — only the flag mirror.
+        factory.set_failure_triage_knn_enabled(laya_cfg.failure_triage_knn);
+    }
+    // Read back through the accessor items 2-5 will use, so the log shows the
+    // installed state (a poisoned lock reads as "cleared").
+    let classifier_active = state.classifier().map(|c| c.is_some()).unwrap_or(false);
+    eprintln!(
+        "rewire: classifier {}",
+        if classifier_active {
+            "active"
+        } else {
+            "cleared"
+        }
+    );
+
+    // Mirror the startup emit so a save-driven enable/disable/endpoint change
+    // reaches listeners immediately (the Settings section also re-polls after
+    // a save; the event keeps any future listener correct).
+    if let Ok(status) = state.classifier_status() {
+        let _ = app.emit("classifier://status", &status);
     }
 }
 

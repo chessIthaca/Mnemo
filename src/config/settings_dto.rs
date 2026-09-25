@@ -253,6 +253,42 @@ pub struct SettingsSaveDto {
     pub bundled_embedding_model: Option<String>,
     #[serde(default)]
     pub clear_bundled_embedding_model: bool,
+    /// Laya classifier (opt-in): enable/disable it. Absent = keep the
+    /// current value (see `GeneralSection::laya`).
+    #[serde(default)]
+    pub laya_enabled: Option<bool>,
+    /// Laya `laya-serve` base URL, e.g. `"http://127.0.0.1:8000"`. Absent =
+    /// keep; a blank string clears it (the classifier then reports
+    /// unavailable when enabled).
+    #[serde(default)]
+    pub laya_endpoint: Option<String>,
+    /// Laya provisioning mode: `external` (a user-run `laya-serve` at
+    /// `laya_endpoint`) or `managed` (the app downloads + runs it — see
+    /// Settings → Classifier). Absent = keep.
+    #[serde(default)]
+    pub laya_mode: Option<super::general::LayaMode>,
+    /// Managed-mode checkpoint id (`"english"` | `"multilingual"`). Absent
+    /// = keep; a blank string clears it to the `"english"` default.
+    #[serde(default)]
+    pub laya_checkpoint: Option<String>,
+    /// Laya auto-typing of memory records (opt-in; enable only against a
+    /// fine-tuned checkpoint — base checkpoints mis-classify). Absent =
+    /// keep the current value.
+    #[serde(default)]
+    pub laya_auto_type_memories: Option<bool>,
+    /// Laya failure triage (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_failure_triage: Option<bool>,
+    /// The kNN overlay for failure triage (opt-in; local — rides the
+    /// memory embedder, needs no `laya-serve`, consulted only while
+    /// `failure_triage` itself is on). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_failure_triage_knn: Option<bool>,
+    /// Startup failure-triage fine-tune (managed mode only, opt-in). Absent =
+    /// keep the current value.
+    #[serde(default)]
+    pub laya_auto_finetune: Option<bool>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
     /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
@@ -542,6 +578,40 @@ pub fn validate_and_apply_settings_patch(
             general.general.bundled_embedding_model = Some(trimmed.to_string());
         }
     }
+    if let Some(enabled) = patch.laya_enabled {
+        general.general.laya.enabled = enabled;
+    }
+    if let Some(endpoint) = &patch.laya_endpoint {
+        let trimmed = endpoint.trim();
+        general.general.laya.endpoint = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(mode) = patch.laya_mode {
+        general.general.laya.mode = mode;
+    }
+    if let Some(checkpoint) = &patch.laya_checkpoint {
+        let trimmed = checkpoint.trim();
+        general.general.laya.checkpoint = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(auto_type) = patch.laya_auto_type_memories {
+        general.general.laya.auto_type_memories = auto_type;
+    }
+    if let Some(triage) = patch.laya_failure_triage {
+        general.general.laya.failure_triage = triage;
+    }
+    if let Some(knn) = patch.laya_failure_triage_knn {
+        general.general.laya.failure_triage_knn = knn;
+    }
+    if let Some(finetune) = patch.laya_auto_finetune {
+        general.general.laya.auto_finetune = finetune;
+    }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
     }
@@ -821,6 +891,113 @@ mod tests {
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(!next.general.general.auto_compact_on_plan_complete);
+    }
+
+    #[test]
+    fn laya_patch_applies_enabled_and_endpoint() {
+        // The opt-in Laya classifier rides the save path: Some flips the
+        // enable flag, Some(endpoint) sets the base URL (trimmed), a blank
+        // endpoint clears it, and absent fields keep the current values.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            laya_enabled: Some(true),
+            laya_endpoint: Some("  http://127.0.0.1:8000  ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.enabled);
+        assert_eq!(
+            next.general.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        // A blank endpoint clears it; the enable flag is untouched.
+        let patch = SettingsSaveDto {
+            laya_endpoint: Some("   ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.enabled);
+        assert_eq!(next.general.general.laya.endpoint, None);
+        // Defaults: nothing set, nothing enabled.
+        let empty = Config::default();
+        assert!(!empty.general.general.laya.enabled);
+        assert!(empty.general.general.laya.endpoint.is_none());
+    }
+
+    #[test]
+    fn laya_patch_applies_mode_and_checkpoint() {
+        // Managed-mode fields ride the same save path: Some(mode) flips the
+        // provisioning mode, Some(checkpoint) sets it (trimmed), a blank
+        // checkpoint clears it to the english default, absent keeps current.
+        let current = Config::default();
+        assert_eq!(
+            current.general.general.laya.mode,
+            crate::config::LayaMode::External
+        );
+        let patch = SettingsSaveDto {
+            laya_mode: Some(crate::config::LayaMode::Managed),
+            laya_checkpoint: Some("  multilingual  ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
+        assert_eq!(
+            next.general.general.laya.checkpoint.as_deref(),
+            Some("multilingual")
+        );
+        // A blank checkpoint clears it; the mode is untouched.
+        let patch = SettingsSaveDto {
+            laya_checkpoint: Some("   ".into()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
+        assert_eq!(next.general.general.laya.checkpoint, None);
+    }
+
+    #[test]
+    fn laya_patch_applies_auto_typing() {
+        // The auto-typing opt-in rides the same save path: Some flips it,
+        // absent keeps the current value.
+        let current = Config::default();
+        assert!(!current.general.general.laya.auto_type_memories);
+        let patch = SettingsSaveDto {
+            laya_auto_type_memories: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.auto_type_memories);
+        // Absent keeps it on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.auto_type_memories);
+    }
+
+    #[test]
+    fn laya_patch_applies_failure_triage_flags_and_auto_finetune() {
+        // The triage flags + fine-tune ride the same save path: Some flips
+        // them, absent keeps the current value — and an untouched config
+        // stays default.
+        let current = Config::default();
+        assert!(!current.general.general.laya.failure_triage);
+        assert!(!current.general.general.laya.failure_triage_knn);
+        assert!(!current.general.general.laya.auto_finetune);
+        let patch = SettingsSaveDto {
+            laya_failure_triage: Some(true),
+            laya_failure_triage_knn: Some(true),
+            laya_auto_finetune: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.failure_triage_knn);
+        assert!(next.general.general.laya.auto_finetune);
+        // Absent keeps all three on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.failure_triage_knn);
+        assert!(next.general.general.laya.auto_finetune);
     }
 
     #[test]

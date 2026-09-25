@@ -14,12 +14,13 @@ use tauri::State;
 
 use mnemo::config::general::UiConfig;
 use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
-use mnemo::config::{Endpoint, EndpointKind, SafetyMode};
+use mnemo::config::{Endpoint, EndpointKind, LayaMode, SafetyMode};
+use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::provider::client_factory::build_client;
 
 use crate::ipc::error::IpcError;
-use crate::ipc::rewire::{rewire_vision_and_embedder, sync_model_resolver};
+use crate::ipc::rewire::{rewire_vision_embedder_and_classifier, sync_model_resolver};
 use crate::ipc::state::IpcState;
 
 /// Get the live embedder status (Ready / Checking / Fallback / Pulling /
@@ -29,6 +30,18 @@ use crate::ipc::state::IpcState;
 #[tauri::command]
 pub async fn get_embedder_status(state: State<'_, IpcState>) -> Result<EmbedderStatus, IpcError> {
     state.embedder_status()
+}
+
+/// Get the live Laya classifier status (Disabled / Ready / Failed). Opt-in:
+/// `disabled` is the default and means no classifier backend exists at all (no
+/// client built, no call attempted). Polled by the Settings → Classifier
+/// section on mount and after a save; updated via the `classifier://status`
+/// event.
+#[tauri::command]
+pub async fn get_classifier_status(
+    state: State<'_, IpcState>,
+) -> Result<ClassifierStatus, IpcError> {
+    state.classifier_status()
 }
 
 /// Get the global config for the Settings UI, minus secrets.
@@ -330,7 +343,7 @@ async fn resync_runtime_state(app: &tauri::AppHandle, state: &State<'_, IpcState
     // the memory embedder (embedding provider endpoint).
     {
         let cfg = state.project.config.lock().await;
-        rewire_vision_and_embedder(state, &cfg);
+        rewire_vision_embedder_and_classifier(app, state, &cfg);
         // An endpoint edit can change which `[models]` overrides resolve (a
         // referenced endpoint may have been added/removed/renamed), so push the
         // reloaded config into the resolver too.
@@ -455,6 +468,42 @@ pub struct EmbeddingModelWire {
     pub model: String,
 }
 
+/// The Laya classifier config (the `general.laya` value) — opt-in, disabled
+/// by default. Always emitted as a nested object (never `null`) so the
+/// frontend renders the opt-in state directly: `enabled` false + `endpoint`
+/// null when Laya is not configured.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayaWire {
+    /// Whether the Laya classifier is enabled.
+    pub enabled: bool,
+    /// Base URL of the `laya-serve` instance (`null` = not configured).
+    pub endpoint: Option<String>,
+    /// The runtime mode: managed (the app downloads + runs the sidecar) or
+    /// external (a user-run instance). MUST round-trip — the section's mode
+    /// radio initializes from it, and defaulting it client-side would
+    /// silently flip external configs to managed on the next save.
+    pub mode: LayaMode,
+    /// Managed mode: the configured checkpoint id (`null` = "english").
+    pub checkpoint: Option<String>,
+    /// Whether Laya auto-typing of memory records is enabled — a separate
+    /// opt-in from `enabled` (confidence-gated prefix correction at
+    /// `memory_write` time; needs a fine-tuned checkpoint).
+    pub auto_type_memories: bool,
+    /// Whether Laya FAILURE TRIAGE is enabled — a separate opt-in from
+    /// `enabled` (at every failure-handling site the error text is
+    /// classified and a confident answer steers the harness; needs a
+    /// fine-tuned checkpoint).
+    pub failure_triage: bool,
+    /// Whether the kNN OVERLAY for failure triage is enabled — a separate
+    /// opt-in (a local classifier over the failure-triage training log,
+    /// riding the memory embedder; no `laya-serve` needed, but consulted
+    /// only while `failure_triage` itself is on).
+    pub failure_triage_knn: bool,
+    /// Whether the startup failure-triage FINE-TUNE is enabled (managed
+    /// mode only; never blocks startup).
+    pub auto_finetune: bool,
+}
+
 /// A per-context model override (one entry of the `[models]` section). Emitted
 /// as `null` (not skipped) when unset, so the frontend can distinguish "no
 /// override" from "override to the default model".
@@ -556,6 +605,9 @@ pub struct GetSettingsGeneral {
     /// Bundled in-process embedding model id (`null` = hash mode). Takes
     /// precedence over `embedding_model` (the legacy remote path).
     pub bundled_embedding_model: Option<String>,
+    /// Laya classifier (opt-in) — whether it is enabled + the configured
+    /// `laya-serve` base URL (`null` = not configured).
+    pub laya: LayaWire,
     /// Whether the agent's `browser_*` browser-inspection tools are enabled
     /// (exposes an unauthenticated localhost CDP port — opt-in, off by
     /// default; debug builds always expose it regardless).
@@ -851,6 +903,16 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
             vision_model,
             embedding_model,
             bundled_embedding_model: config.general.general.bundled_embedding_model.clone(),
+            laya: LayaWire {
+                enabled: config.general.general.laya.enabled,
+                endpoint: config.general.general.laya.endpoint.clone(),
+                mode: config.general.general.laya.mode.clone(),
+                checkpoint: config.general.general.laya.checkpoint.clone(),
+                auto_type_memories: config.general.general.laya.auto_type_memories,
+                failure_triage: config.general.general.laya.failure_triage,
+                failure_triage_knn: config.general.general.laya.failure_triage_knn,
+                auto_finetune: config.general.general.laya.auto_finetune,
+            },
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
         },
@@ -911,6 +973,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
 /// Persist general / context / memory / ui / vision / pricing Settings.
 #[tauri::command]
 pub async fn save_settings(
+    app: tauri::AppHandle,
     state: State<'_, IpcState>,
     patch: SettingsSaveDto,
 ) -> Result<SaveSettingsResponse, IpcError> {
@@ -941,9 +1004,10 @@ pub async fn save_settings(
         }
     }
 
-    // Live-rewire vision + embedder so Settings changes take effect without
-    // restart (fill_rate changes apply to newly built agents only).
-    rewire_vision_and_embedder(&state, &reloaded);
+    // Live-rewire vision + embedder + classifier so Settings changes take
+    // effect without restart (fill_rate changes apply to newly built agents
+    // only).
+    rewire_vision_embedder_and_classifier(&app, &state, &reloaded);
 
     // Push the reloaded config into the per-context model resolver so
     // `[models]` overrides take effect on the next turn.
@@ -1266,6 +1330,8 @@ mod settings_dto_tests {
         assert!(p.summarize_at_fill_rate.is_none());
         assert!(p.trace_memory_budget_mb.is_none());
         assert!(p.trace_request_body_cap_kb.is_none());
+        assert!(p.laya_enabled.is_none());
+        assert!(p.laya_endpoint.is_none());
     }
 
     #[test]
@@ -1276,6 +1342,16 @@ mod settings_dto_tests {
         .unwrap();
         assert_eq!(p.trace_memory_budget_mb, Some(64));
         assert_eq!(p.trace_request_body_cap_kb, Some(512));
+    }
+
+    #[test]
+    fn settings_save_dto_parses_laya() {
+        let p: SettingsSaveDto = serde_json::from_str(
+            r#"{ "laya_enabled": true, "laya_endpoint": "http://127.0.0.1:8000" }"#,
+        )
+        .unwrap();
+        assert_eq!(p.laya_enabled, Some(true));
+        assert_eq!(p.laya_endpoint.as_deref(), Some("http://127.0.0.1:8000"));
     }
 
     #[test]
@@ -1330,6 +1406,16 @@ mod settings_dto_tests {
                 vision_model: None,
                 embedding_model: None,
                 bundled_embedding_model: None,
+                laya: LayaWire {
+                    enabled: false,
+                    endpoint: None,
+                    mode: LayaMode::External,
+                    checkpoint: None,
+                    auto_type_memories: false,
+                    failure_triage: false,
+                    failure_triage_knn: false,
+                    auto_finetune: false,
+                },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
             },
@@ -1387,6 +1473,13 @@ mod settings_dto_tests {
         assert_eq!(v["general"]["default_provider"], serde_json::Value::Null);
         assert_eq!(v["general"]["default_model"], serde_json::Value::Null);
         assert_eq!(v["general"]["vision_model"], serde_json::Value::Null);
+        // The opt-in Laya block always renders (a nested object): disabled +
+        // no endpoint when unconfigured — and the mode/checkpoint fields
+        // round-trip so an external config never silently flips to managed.
+        assert_eq!(v["general"]["laya"]["enabled"], false);
+        assert_eq!(v["general"]["laya"]["endpoint"], serde_json::Value::Null);
+        assert_eq!(v["general"]["laya"]["mode"], "external");
+        assert_eq!(v["general"]["laya"]["checkpoint"], serde_json::Value::Null);
         assert_eq!(v["general"]["safety"], "approve-each-action");
         assert_eq!(v["config_dir"], "/cfg");
         assert_eq!(v["context"]["summarize_at_fill_rate"], 0.3);
@@ -1446,6 +1539,16 @@ mod settings_dto_tests {
                 }),
                 embedding_model: None,
                 bundled_embedding_model: None,
+                laya: LayaWire {
+                    enabled: false,
+                    endpoint: None,
+                    mode: LayaMode::External,
+                    checkpoint: None,
+                    auto_type_memories: false,
+                    failure_triage: false,
+                    failure_triage_knn: false,
+                    auto_finetune: false,
+                },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
             },

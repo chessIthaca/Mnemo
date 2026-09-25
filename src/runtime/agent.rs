@@ -1119,14 +1119,45 @@ impl AgentTask {
         // Token count before compaction — used for the Compacted confirmation
         // event (before → after) so the user sees the reduction.
         let before = crate::agent::context::ContextManager::count_tokens(&self.messages) as u32;
+        // Token-optimizer lever 4 (backlog e4a50d22): the manual/slash path
+        // gets the same compaction-survival treatment as the auto path —
+        // archive the dropping region first, hand the summarizer the
+        // must-preserve decisions, and note the digest afterwards. Fail-open
+        // throughout; with the flag off this is byte-identical to today.
+        let survival = self.agent_loop.optimizer_config().compaction_survival;
+        let decisions = if survival {
+            crate::agent::optimizer::extract_decisions(&self.messages)
+        } else {
+            Vec::new()
+        };
+        // Lever 6 counters: the manual compaction path feeds the score's
+        // decision-density signal exactly like the auto path in turn.rs.
+        self.agent_loop.optimizer_state.note_decisions(decisions.len());
+        let preserve_block = crate::agent::context::must_preserve_block(&decisions);
+        let dropped_digest = if survival {
+            crate::agent::optimizer::build_digest(crate::agent::optimizer::dropped_region(
+                &self.messages,
+                6,
+            ))
+        } else {
+            String::new()
+        };
+        let checkpoint_id = if survival {
+            self.agent_loop
+                .checkpoint_before_compaction(self.session_id.as_deref(), &self.messages, 6)
+                .await
+        } else {
+            None
+        };
         let (summarized, mut buffered, stop, summarize_usage) = match context_manager
-            .summarize_with_interrupt(
+            .summarize_with_interrupt_opts(
                 &self.messages,
                 6,
                 // The TURN provider is what sends the compacted history next, so
                 // the result is bounded by its window, not the summarizer's.
                 crate::agent::context::sendable_budget(turn_provider.capabilities()),
                 provider.as_ref(),
+                (!preserve_block.is_empty()).then_some(preserve_block.as_str()),
                 cmd_rx,
             )
             .await
@@ -1221,6 +1252,20 @@ impl AgentTask {
         // Only apply the summary if the summarization wasn't interrupted.
         if stop.is_none() {
             self.messages = summarized;
+            // Token-optimizer lever 4 (backlog e4a50d22): the digest note plus
+            // the checkpoint pointer, mirroring the auto path in turn.rs.
+            if survival {
+                let pointer = match &checkpoint_id {
+                    Some(id) => format!(
+                        "\npre-compaction context archived — expand_result id={id} to \
+                         retrieve dropped detail"
+                    ),
+                    None => String::new(),
+                };
+                self.messages.push(crate::provider::Message::system(format!(
+                    "{dropped_digest}{pointer}"
+                )));
+            }
         }
         // Re-inject any commands buffered during the summarization LLM call
         // (mirrors the turn.rs summarization path at turn.rs:197-224). A
@@ -1304,6 +1349,9 @@ impl AgentTask {
                     used,
                     max,
                     breakdown,
+                    quality: self
+                        .agent_loop
+                        .quality_report(used, max, self.messages.len()),
                 },
             ))
             .await;
@@ -1353,6 +1401,7 @@ impl AgentTask {
                     used: 0,
                     max,
                     breakdown: crate::runtime::ContextBreakdown::default(),
+                    quality: self.agent_loop.quality_report(0, max, 0),
                 },
             ))
             .await;
@@ -1487,6 +1536,53 @@ mod tests {
             .any(|e| matches!(e, AgentEvent::TextDelta(t) if t == "Done!")));
 
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn clear_context_grades_the_report_only_when_the_quality_flag_is_on() {
+        // Lever 6 (backlog e4a50d22): `/new` (clear_context) is a THIRD graded
+        // emission site beyond top-of-loop and post-compaction. It grades the
+        // freshly-cleared window so the ctx popup badge resets honestly — the
+        // frontend reads an absent grade as "unchanged", so emitting `None`
+        // here would leave a stale grade on show at 0% fill. Pin both halves.
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        let build = |quality_score: bool| {
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(MockProvider {
+                        caps: Capabilities::openai(),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow: workflow.clone(),
+                    sandbox: sandbox.clone(),
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_optimizer(Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig {
+                quality_score,
+                ..Default::default()
+            })))
+        };
+
+        let max = 128_000;
+        let graded = build(true)
+            .quality_report(0, max, 0)
+            .expect("a cleared window is still graded when the flag is on");
+        assert_eq!(graded.fill_pct, 0, "a cleared window is 0% full");
+        assert_eq!(graded.grade, crate::agent::optimizer::QualityGrade::S);
+
+        assert!(
+            build(false).quality_report(0, max, 0).is_none(),
+            "the flag off must not put a grade on the wire"
+        );
     }
 
     /// A provider that always returns a non-retryable context-overflow error.

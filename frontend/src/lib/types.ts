@@ -179,6 +179,25 @@ export interface AgentEventPayload {
   event: SerializableAgentEvent;
 }
 
+/**
+ * The S–F context-quality grade (token-optimizer lever 6, backlog e4a50d22),
+ * computed by the backend from the current window fill plus the session's
+ * optimizer counters. Rides `context_usage` only while the backend's
+ * `[general.optimizer] quality_score` flag is on.
+ */
+export interface ContextQuality {
+  /** The letter grade, `"S"` (best) through `"F"` (worst). */
+  grade: string;
+  /** Window fill at the time of the report (0–100). */
+  fill_pct: number;
+  /** Cumulative tokens spent on redundant serves (skeletons). */
+  waste_tokens: number;
+  /** Share of lever-served reads that were stale re-reads (0–100). */
+  stale_read_rate: number;
+  /** Decisions seen per 100 messages (0–100). */
+  decision_density: number;
+}
+
 export type SerializableAgentEvent =
   | { kind: "started" }
   | { kind: "text_delta"; text: string }
@@ -223,6 +242,13 @@ export type SerializableAgentEvent =
       used: number;
       max: number;
       breakdown: { system: number; user: number; assistant: number; tool: number };
+      /** Lever 6's S–F grade (backlog e4a50d22). Present on the top-of-loop,
+       * post-compaction and `/new` reset emissions. Omitted from the wire while
+       * the `[general.optimizer] quality_score` flag is off, and on the
+       * mid-stream provider-exact re-anchor plus the app-side spawn seed —
+       * where an absent value means "unchanged" (the UI keeps the last known
+       * grade rather than blanking). */
+      quality?: ContextQuality;
     }
   | {
       /** Context compaction completed — token count before/after. Emitted on

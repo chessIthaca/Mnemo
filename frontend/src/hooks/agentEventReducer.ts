@@ -928,13 +928,22 @@ export const reduceUsage: Reducer<Ev<"usage">> = (agent, event) => {
 };
 
 /** context_usage: record the latest context-window fill + per-role breakdown. */
-export const reduceContextUsage: Reducer<Ev<"context_usage">> = (agent, event) => ({
-  agent: {
-    ...agent,
-    contextUsage: { used: event.used, max: event.max },
-    contextBreakdown: event.breakdown,
-  },
-});
+export const reduceContextUsage: Reducer<Ev<"context_usage">> = (agent, event) => {
+  // Lever 6 (backlog e4a50d22): the S–F grade rides this event, but only on the
+  // top-of-loop and post-compaction emissions — the mid-stream provider-exact
+  // re-anchor omits it. An ABSENT quality therefore means "unchanged": keep the
+  // last known grade so the popup badge never blinks off mid-turn.
+  const quality = event.quality ?? agent.contextUsage.quality;
+  return {
+    agent: {
+      ...agent,
+      contextUsage: quality
+        ? { used: event.used, max: event.max, quality }
+        : { used: event.used, max: event.max },
+      contextBreakdown: event.breakdown,
+    },
+  };
+};
 
 /**
  * compacted: context compaction finished — append a transcript confirmation

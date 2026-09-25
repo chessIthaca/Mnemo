@@ -560,6 +560,60 @@ fill-rate threshold (default 50%), summarizes the oldest turns into a single
 system message, keeping recent turns + the system prompt verbatim. Large tool
 results (file reads, shell, git) are truncated with a note.
 
+#### Optimizer levers (token-optimizer parity, backlog e4a50d22)
+
+Six independent, **default-off** context-economy levers live behind
+`[general.optimizer]` in `config.toml` (`OptimizerConfig`, `src/config/general.rs`).
+With a flag off its code path is byte-identical to the pre-lever behaviour —
+which is exactly what keeps the existing truncation/compaction/cap tests green
+without modification.
+
+| Lever | Flag | What it does |
+|---|---|---|
+| Delta/skeleton re-reads | `delta_reads` | A `read_files` re-read of a file the agent already has serves a skeleton (unchanged) or a unified diff (small change) instead of the whole file. |
+| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every model-served surface. |
+| Archive + expand | `archive` | Tool results past `archive_min_chars` are archived (full text in SQLite) and replaced by a preview; the always-advertised `expand_result` tool retrieves any row by id or keyword. |
+| Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
+| Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
+| Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
+
+**Two tables** (`src/memory/schema.rs`) record what the levers do:
+`savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,
+tokens_saved, measured, created_at`) — one row per optimization event, kinds
+`truncation, compaction, delta_read, skeleton, compression, archive,
+archive_expand, compaction_checkpoint` — and `tool_result_archive`
+(`id, session_id, tool, detail, content, char_count, created_at`) with an FTS5
+index (`tool_result_archive_fts`) behind `expand_result`'s keyword search.
+
+**Quality formula**: a 0–100 score starts at 100 and subtracts a fill penalty
+(0/6/18/35/62/70 for <40/40–59/60–74/75–89/90–94/95+ %), a waste penalty over
+`waste_tokens / served_tokens` (0/3/8/18/30 for <5/5–9/10–24/25–49/50+ %) and a
+stale-read penalty (0/3/8/15 for <10/10–24/25–49/50+ %). Bands: `S` >=95,
+`A` >=85, `B` >=70, `C` >=55, `D` >=40, else `F`. Fill is deliberately
+dominant — waste or stale reads alone can only reach `B`/`A`, so a
+busy-but-roomy session never reads as critical. Deterministic, with every band
+boundary unit-tested (`src/agent/optimizer.rs`).
+
+**Invariants** (each pinned by a test):
+
+* Nothing is dropped before it is archived — the archive write always precedes
+the substitution, and every archive/store error is fail-open (pre-lever
+behaviour is the fallback), so no lever can lose data.
+* The already-sent conversation prefix is never mutated: the lean-output nudge
+rides the *volatile tail*, popped right after the request. The post-compaction
+digest is a **persistent** system note appended to the freshly-compacted
+conversation — the summary itself is that rewrite, so nothing already sent is
+changed. Either way the provider prefix cache stays valid.
+* Tools stay store-free — they emit `data.savings {kind, tokens_before,
+tokens_after}` on the result and the turn loop records the row, keeping the
+agent core the single writer to the ledger.
+* Tool-reported token counts are estimates (`chars / 4`, `measured = false`).
+* Credentials are redacted on every compressed surface the model sees.
+
+**Not in this scope**: the savings dashboard, its aggregates and its IPC live in
+backlog item `652ae094` — this work lands the levers plus the `savings_events`
+recording path using exactly that item's step-1 schema.
+
 ### Error recovery
 
 The agent loop feeds every error back to the model as a `tool` role message

@@ -355,9 +355,8 @@ impl LayaManager {
             .expect("laya child lock poisoned")
             .take();
         match had {
-            Some((mut child, _)) => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Some((child, _)) => {
+                kill_child(child);
                 true
             }
             None => false,
@@ -374,13 +373,24 @@ impl LayaManager {
             .expect("laya child lock poisoned")
             .take_if(|(_, g)| *g == generation);
         match had {
-            Some((mut child, _)) => {
-                let _ = child.kill();
-                let _ = child.wait();
+            Some((child, _)) => {
+                kill_child(child);
                 true
             }
             None => false,
         }
+    }
+
+    /// Does the live child still belong to `generation`? A readiness probe
+    /// that succeeds after its child was superseded (a save-driven stop +
+    /// restart landed mid-probe) must not write `Ready` over the winner's
+    /// lifecycle or hand callers a dead port.
+    fn owns_generation(&self, generation: u64) -> bool {
+        self.child
+            .lock()
+            .expect("laya child lock poisoned")
+            .as_ref()
+            .is_some_and(|(_, g)| *g == generation)
     }
 
     /// Pick a free loopback port (bind :0, read it, drop the listener).
@@ -399,7 +409,16 @@ impl LayaManager {
     /// start survives. Does not wait for readiness (see
     /// [`start_managed_server`]).
     pub fn spawn_server(&self, checkpoint_id: &str, port: u16) -> std::io::Result<u64> {
-        self.stop();
+        // Hold the child lock across stop → spawn → record: two concurrent
+        // starts (save-driven rewire vs setup autostart vs startup hook)
+        // serialize, so the slower task's record can never overwrite the
+        // winner's (child, generation) and orphan a live child outside
+        // exit/Drop cleanup. `spawn()` is a few syscalls — no await under
+        // the lock, only a millisecond-scale stall.
+        let mut slot = self.child.lock().expect("laya child lock poisoned");
+        if let Some((child, _)) = slot.take() {
+            kill_child(child);
+        }
         let generation = self.child_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let serve = self.laya_serve_path();
         if !serve.is_file() {
@@ -422,9 +441,16 @@ impl LayaManager {
                 format!("spawning {} failed: {e}", serve.display()),
             )
         })?;
-        *self.child.lock().expect("laya child lock poisoned") = Some((child, generation));
+        *slot = Some((child, generation));
         Ok(generation)
     }
+}
+
+/// Kill + reap a child (the shared core of `stop` / `stop_if_generation` /
+/// the spawn critical section).
+fn kill_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The child must never outlive the app (orphaned `laya-serve` processes
@@ -768,6 +794,16 @@ pub fn spawn_setup_task(
 ) {
     tauri::async_runtime::spawn(async move {
         let status = Arc::clone(&manager.status);
+        // The setup's Installing/Downloading ticks overwrite the shared
+        // status even while a live classifier serves another checkpoint —
+        // snapshot the pre-setup status so the no-autostart completion arm
+        // can restore it instead of leaving a phantom ~99% download bar
+        // stuck (which would also disable every Download button via the
+        // busy flag).
+        let pre_setup_status = status
+            .read()
+            .expect("classifier status lock poisoned")
+            .clone();
         let result = run_setup(&app, &status, &manager, checkpoint).await;
         manager.end_setup();
         // Re-evaluate from the live config at completion time.
@@ -811,6 +847,13 @@ pub fn spawn_setup_task(
                         let _ = app.emit("classifier://status", &s);
                     }
                 } else {
+                    // Restore what the setup's progress ticks overwrote —
+                    // typically the live classifier's Ready.
+                    let s = pre_setup_status.clone();
+                    *status.write().expect("classifier status lock poisoned") = s.clone();
+                    if let Some(app) = &app {
+                        let _ = app.emit("classifier://status", &s);
+                    }
                     eprintln!(
                         "info: Laya runtime ready (checkpoint '{}') — the live config \
                          does not select it; the live classifier is untouched",
@@ -911,13 +954,26 @@ pub async fn start_managed_server(
             let hf_dir = manager.hf_cache_dir();
             let ready = wait_until_ready(app, &status, port, &hf_dir, Some(checkpoint)).await;
             if ready {
-                let s = ClassifierStatus::Ready;
-                *status.write().expect("classifier status lock poisoned") = s.clone();
-                if let Some(app) = app {
-                    let _ = app.emit("classifier://status", &s);
+                // Confirm this start still owns the child before declaring
+                // Ready: a save-driven stop + restart can land between the
+                // probe's success and this write, and the winner must keep
+                // its own lifecycle (and the callers must not swap to this
+                // — possibly dead — port).
+                if manager.owns_generation(generation) {
+                    let s = ClassifierStatus::Ready;
+                    *status.write().expect("classifier status lock poisoned") = s.clone();
+                    if let Some(app) = app {
+                        let _ = app.emit("classifier://status", &s);
+                    }
+                    eprintln!("info: managed laya-serve ready on port {port}");
+                    Some(port)
+                } else {
+                    eprintln!(
+                        "info: the Laya start on port {port} was superseded before \
+                         readiness; the newer start owns the lifecycle"
+                    );
+                    None
                 }
-                eprintln!("info: managed laya-serve ready on port {port}");
-                Some(port)
             } else {
                 // Scoped teardown: kill only the child THIS start spawned —
                 // a concurrent newer start (save-driven rewire) must survive
@@ -1180,6 +1236,8 @@ mod tests {
         assert!(!manager.stop());
         // A scoped stop on an empty slot (any generation) is a no-op too.
         assert!(!manager.stop_if_generation(7));
+        // An empty slot owns no generation.
+        assert!(!manager.owns_generation(7));
     }
 
     // -- extract_uv_asset: the archive boundary must stay traversal-safe --

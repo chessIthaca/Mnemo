@@ -437,6 +437,10 @@ export interface ClassifierDraft {
   autoTypeMemories: boolean;
   /** The `failure_triage` opt-in — classify failures to steer retries. */
   failureTriage: boolean;
+  /** The `failure_triage_knn` opt-in — the local kNN overlay over the
+   * failure-triage training log (needs no laya-serve; consulted only while
+   * failure triage itself is on). */
+  failureTriageKnn: boolean;
   /** The `auto_finetune` opt-in — the startup fine-tune (managed only). */
   autoFinetune: boolean;
 }

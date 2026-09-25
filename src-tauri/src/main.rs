@@ -1467,18 +1467,6 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.auto_type_memories,
     ));
-    // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
-    // slot plus the `[general.laya] failure_triage` flag mirror. The factory
-    // hands it to every loop it builds; the loop's dispatch site and both
-    // provider retry layers read both at failure time, and a Settings save
-    // flips the flag via `set_failure_triage_enabled` (no rebuild).
-    let failure_triage_handle = mnemo::agent::failure_triage::FailureTriageHandle::new(
-        classifier_slot.clone(),
-        Arc::new(std::sync::atomic::AtomicBool::new(
-            config.general.general.laya.failure_triage,
-        )),
-    );
-
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -1487,6 +1475,39 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         }
     };
     let store_trait: Arc<dyn mnemo::memory::MemoryStoreTrait> = store.clone();
+
+    // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
+    // slot plus the `[general.laya] failure_triage` flag mirror. The factory
+    // hands it to every loop it builds; the loop's dispatch site and both
+    // provider retry layers read both at failure time, and a Settings save
+    // flips the flag via `set_failure_triage_enabled` (no rebuild).
+    //
+    // The opt-in kNN overlay (item 4b, `failure_triage_knn`): a local
+    // classifier over the failure-triage training log, consulted by the
+    // gate BEFORE the shared slot while its flag is on. Its embedder
+    // getter reads the store's LIVE shared embedder slot per
+    // classification (a background bundled-model load or a
+    // Settings-driven embedder swap flows in — the index re-embeds on
+    // the model-id change), and its index tracks the training-log FILE,
+    // so dispositions appended by any writer are picked up on the next
+    // classification — genuinely online, no retraining, no `laya-serve`.
+    // Lazy by construction: with the flag off nothing is ever read or
+    // embedded. Constructed AFTER the store so the getter can capture a
+    // store clone.
+    let store_for_knn = store.clone();
+    let failure_triage_handle = mnemo::agent::failure_triage::FailureTriageHandle::new(
+        classifier_slot.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(
+            config.general.general.laya.failure_triage,
+        )),
+    )
+    .with_knn(
+        Arc::new(mnemo::agent::failure_triage_knn::KnnClassifier::new(
+            Arc::new(move || store_for_knn.embedder_handle()),
+            mnemo::agent::failure_triage::training_log_path(),
+        )),
+        config.general.general.laya.failure_triage_knn,
+    );
 
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per

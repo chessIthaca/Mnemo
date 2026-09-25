@@ -101,10 +101,12 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   // The auto-typing opt-in (`[general.laya] auto_type_memories`) — a
   // separate toggle from the classifier enable flag.
   const [autoType, setAutoType] = useState(false);
-  // The failure-triage opt-in (`[general.laya] failure_triage`) and the
-  // startup fine-tune opt-in (`[general.laya] auto_finetune`, managed mode
-  // only) — separate toggles, same opt-in convention.
+  // The failure-triage opt-in (`[general.laya] failure_triage`), its kNN
+  // overlay (`[general.laya] failure_triage_knn`), and the startup
+  // fine-tune opt-in (`[general.laya] auto_finetune`, managed mode only) —
+  // separate toggles, same opt-in convention.
   const [failureTriage, setFailureTriage] = useState(false);
+  const [failureTriageKnn, setFailureTriageKnn] = useState(false);
   const [autoFinetune, setAutoFinetune] = useState(false);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
   const [snapshot, setSnapshot] = useState<string>("");
@@ -132,6 +134,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         endpoint: laya?.endpoint ?? "",
         autoTypeMemories: laya?.auto_type_memories ?? false,
         failureTriage: laya?.failure_triage ?? false,
+        failureTriageKnn: laya?.failure_triage_knn ?? false,
         autoFinetune: laya?.auto_finetune ?? false,
       };
       setEnabled(next.enabled);
@@ -140,6 +143,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setEndpoint(next.endpoint);
       setAutoType(next.autoTypeMemories);
       setFailureTriage(next.failureTriage);
+      setFailureTriageKnn(next.failureTriageKnn);
       setAutoFinetune(next.autoFinetune);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
@@ -193,6 +197,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     endpoint,
     autoTypeMemories: autoType,
     failureTriage,
+    failureTriageKnn,
     autoFinetune,
   };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
@@ -220,16 +225,17 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setError(null);
       setOk(false);
       try {
-        // The mode + enable flag + checkpoint + the three Laya opt-ins ride
+        // The mode + enable flag + checkpoint + the four Laya opt-ins ride
         // along so toggling takes effect without a restart (the backend
-        // rewires the live classifier — flipping the auto-type and
-        // failure-triage flags — and starts/stops the managed sidecar). A
-        // blank endpoint clears the stored URL server-side; managed mode
-        // never persists one.
+        // rewires the live classifier — flipping the auto-type,
+        // failure-triage and kNN-overlay flags — and starts/stops the
+        // managed sidecar). A blank endpoint clears the stored URL
+        // server-side; managed mode never persists one.
         await saveSettings({
           laya_enabled: enabled,
           laya_auto_type_memories: autoType,
           laya_failure_triage: failureTriage,
+          laya_failure_triage_knn: failureTriageKnn,
           laya_auto_finetune: autoFinetune,
           laya_mode: mode,
           ...(mode === "managed" ? { laya_checkpoint: checkpoint } : {}),
@@ -325,6 +331,27 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             classified failure is logged with its true outcome so the startup
             fine-tune can learn from it. Enable only against a fine-tuned
             checkpoint — base models mis-classify.
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={failureTriageKnn}
+          onChange={(e) => setFailureTriageKnn(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Learn from logged failures between fine-tunes (kNN)
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — a local overlay over the failure-triage training log: the most
+            similar logged failures vote on the class (the vote share is the
+            confidence), so a resolved disposition is reusable on the very
+            next similar failure — no retraining, and no laya-serve needed (it
+            rides the memory embedder). Only takes effect while “Classify
+            failures” is on; below-threshold votes fall back to the
+            classifier / the pre-classifier rules.
           </span>
         </span>
       </label>

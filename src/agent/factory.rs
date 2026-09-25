@@ -418,6 +418,19 @@ impl AgentLoopFactory {
         }
     }
 
+    /// Flip the kNN overlay's enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this after `[general.laya]
+    /// failure_triage_knn` changes, so the toggle reaches already-built
+    /// loops with no rebuild. No-op when no gate is wired (the overlay is
+    /// then absent and the pre-classifier behavior stands).
+    pub fn set_failure_triage_knn_enabled(&self, on: bool) {
+        if let Some(handle) = &self.failure_triage {
+            handle
+                .knn_enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The shared MCP manager, when wired (the IPC layer's Settings/Test
     /// commands reuse it).
     pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {

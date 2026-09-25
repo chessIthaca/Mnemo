@@ -503,11 +503,16 @@ impl MemoryStore {
             .expect("search config lock poisoned") = config;
     }
 
-    /// Snapshot the current embedder (for diagnostics / tests).
+    /// Snapshot the live embedder (diagnostics / tests / the failure-triage
+    /// kNN overlay's per-classification getter). Poison-recovering: the
+    /// field is a plain `Arc` swap, so a poisoned lock (some other holder
+    /// panicked mid-swap) still yields a valid embedder instead of
+    /// panicking — the overlay rides a failure-handling path and must
+    /// never panic a turn.
     pub fn embedder_handle(&self) -> Arc<dyn Embedder> {
         self.embedder
             .read()
-            .expect("embedder lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 

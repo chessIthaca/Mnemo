@@ -99,6 +99,7 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("laya_enabled: enabled");
     expect(classifierSource).toContain("laya_auto_type_memories: autoType");
     expect(classifierSource).toContain("laya_failure_triage: failureTriage");
+    expect(classifierSource).toContain("laya_failure_triage_knn: failureTriageKnn");
     expect(classifierSource).toContain("laya_auto_finetune: autoFinetune");
     expect(classifierSource).toContain("laya_mode: mode");
     expect(classifierSource).toContain("laya_checkpoint: checkpoint");
@@ -119,12 +120,16 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("fine-tuned checkpoint");
   });
 
-  it("renders the failure-triage + startup fine-tune opt-in toggles", () => {
+  it("renders the failure-triage, kNN-overlay + startup fine-tune opt-in toggles", () => {
     expect(classifierSource).toContain("Classify failures to steer retries");
+    expect(classifierSource).toContain(
+      "Learn from logged failures between fine-tunes (kNN)",
+    );
     expect(classifierSource).toContain(
       "Fine-tune on startup from logged failures",
     );
     expect(classifierSource).toContain("checked={failureTriage}");
+    expect(classifierSource).toContain("checked={failureTriageKnn}");
     expect(classifierSource).toContain("checked={autoFinetune}");
   });
 
@@ -156,7 +161,24 @@ describe("classifier bindings stay wired to the backend names", () => {
 
   it("the settings types carry the laya fields (config + save patch)", () => {
     expect(tauriSource).toContain(
-      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n      /** Whether memory auto-typing is enabled (opt-in). */\n      auto_type_memories: boolean;\n      /** Whether failure triage is enabled (opt-in; needs a fine-tuned\n       *  checkpoint). */\n      failure_triage: boolean;\n      /** Whether the startup failure-triage fine-tune is enabled (managed\n       *  mode only, opt-in). */\n      auto_finetune: boolean;\n    };',
+      `laya?: {
+      enabled: boolean;
+      endpoint: string | null;
+      mode: "external" | "managed";
+      checkpoint: string | null;
+      /** Whether memory auto-typing is enabled (opt-in). */
+      auto_type_memories: boolean;
+      /** Whether failure triage is enabled (opt-in; needs a fine-tuned
+       *  checkpoint). */
+      failure_triage: boolean;
+      /** Whether the kNN overlay for failure triage is enabled (opt-in;
+       *  local — rides the memory embedder, needs no laya-serve, consulted
+       *  only while failure_triage itself is on). */
+      failure_triage_knn: boolean;
+      /** Whether the startup failure-triage fine-tune is enabled (managed
+       *  mode only, opt-in). */
+      auto_finetune: boolean;
+    };`
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
     expect(tauriSource).toContain("laya_endpoint?: string;");
@@ -164,6 +186,7 @@ describe("classifier bindings stay wired to the backend names", () => {
     expect(tauriSource).toContain("laya_checkpoint?: string;");
     expect(tauriSource).toContain("laya_auto_type_memories?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage?: boolean;");
+    expect(tauriSource).toContain("laya_failure_triage_knn?: boolean;");
     expect(tauriSource).toContain("laya_auto_finetune?: boolean;");
   });
 
@@ -180,6 +203,7 @@ describe("serializeClassifier", () => {
     endpoint: "",
     autoTypeMemories: false,
     failureTriage: false,
+    failureTriageKnn: false,
     autoFinetune: false,
   };
 
@@ -207,11 +231,14 @@ describe("serializeClassifier", () => {
       serializeClassifier({ ...base, failureTriage: true }),
     );
     expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, failureTriageKnn: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, autoFinetune: true }),
     );
   });
 
-  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + triage + fine-tune)", () => {
+  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + triage + kNN overlay + fine-tune)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       mode: "managed",
@@ -219,6 +246,7 @@ describe("serializeClassifier", () => {
       endpoint: "",
       autoTypeMemories: false,
       failureTriage: false,
+      failureTriageKnn: false,
       autoFinetune: false,
     });
   });

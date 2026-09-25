@@ -460,6 +460,10 @@ export interface AppSettings {
       /** Whether failure triage is enabled (opt-in; needs a fine-tuned
        *  checkpoint). */
       failure_triage: boolean;
+      /** Whether the kNN overlay for failure triage is enabled (opt-in;
+       *  local — rides the memory embedder, needs no laya-serve, consulted
+       *  only while failure_triage itself is on). */
+      failure_triage_knn: boolean;
       /** Whether the startup failure-triage fine-tune is enabled (managed
        *  mode only, opt-in). */
       auto_finetune: boolean;
@@ -572,6 +576,10 @@ export interface SettingsSavePatch {
   laya_auto_type_memories?: boolean;
   /** Laya failure triage (opt-in; needs a fine-tuned checkpoint). */
   laya_failure_triage?: boolean;
+  /** The kNN overlay for failure triage (opt-in; local — rides the memory
+   *  embedder, needs no laya-serve; consulted only while laya_failure_triage
+   *  is on). */
+  laya_failure_triage_knn?: boolean;
   /** Startup failure-triage fine-tune (managed mode only, opt-in). */
   laya_auto_finetune?: boolean;
   summarize_at_fill_rate?: number;

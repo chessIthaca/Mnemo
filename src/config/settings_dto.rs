@@ -280,6 +280,11 @@ pub struct SettingsSaveDto {
     /// checkpoint). Absent = keep the current value.
     #[serde(default)]
     pub laya_failure_triage: Option<bool>,
+    /// The kNN overlay for failure triage (opt-in; local — rides the
+    /// memory embedder, needs no `laya-serve`, consulted only while
+    /// `failure_triage` itself is on). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_failure_triage_knn: Option<bool>,
     /// Startup failure-triage fine-tune (managed mode only, opt-in). Absent =
     /// keep the current value.
     #[serde(default)]
@@ -600,6 +605,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(triage) = patch.laya_failure_triage {
         general.general.laya.failure_triage = triage;
+    }
+    if let Some(knn) = patch.laya_failure_triage_knn {
+        general.general.laya.failure_triage_knn = knn;
     }
     if let Some(finetune) = patch.laya_auto_finetune {
         general.general.laya.auto_finetune = finetune;
@@ -966,24 +974,29 @@ mod tests {
     }
 
     #[test]
-    fn laya_patch_applies_failure_triage_and_auto_finetune() {
-        // Both triage flags ride the same save path: Some flips them, absent
-        // keeps the current value — and an untouched config stays default.
+    fn laya_patch_applies_failure_triage_flags_and_auto_finetune() {
+        // The triage flags + fine-tune ride the same save path: Some flips
+        // them, absent keeps the current value — and an untouched config
+        // stays default.
         let current = Config::default();
         assert!(!current.general.general.laya.failure_triage);
+        assert!(!current.general.general.laya.failure_triage_knn);
         assert!(!current.general.general.laya.auto_finetune);
         let patch = SettingsSaveDto {
             laya_failure_triage: Some(true),
+            laya_failure_triage_knn: Some(true),
             laya_auto_finetune: Some(true),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.failure_triage_knn);
         assert!(next.general.general.laya.auto_finetune);
-        // Absent keeps both on.
+        // Absent keeps all three on.
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.failure_triage_knn);
         assert!(next.general.general.laya.auto_finetune);
     }
 

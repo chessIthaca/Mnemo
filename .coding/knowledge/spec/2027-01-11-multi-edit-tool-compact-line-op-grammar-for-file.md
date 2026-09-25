@@ -13,3 +13,5 @@ WHAT SHIPPED
 POINTERS
 - Plan: .coding/plans/e3d0758b.md · Reviews: .coding/reviews/2026-09-24-e3d0758b-multi-edit-review.md, -round2.md (1 low: Diff auto-show) and -round3.md (PASS) — all findings fixed.
 - Tests: root `cargo test` green; frontend `tsc --noEmit` + `vitest` green (1253).
+
+Amended 2027-01-11: Landed: the 2027-01-11 merge_to_main landing of wt/mnemo (merge 4cbc3b0, pre-merge tip 4c08077) carried 88577b4 into main together with this knowledge file — the "UNMERGED" header above is historical. Re-verified green on the re-dispatch (plan edf8c0cf, backlog 2e27f896): root cargo test 2,602 passed / 0 failed / 6 ignored under #![deny(warnings)] (all 9 multi_edit tests green, including the atomicity regression), frontend `tsc --noEmit` exit 0, vitest 91 files / 1,273 tests passed. src-tauri remains blocked by the Application Control policy (os error 4551) — the known environment fact recorded in plan e3d0758b's FINAL VERIFY.

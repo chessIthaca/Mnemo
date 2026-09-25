@@ -168,6 +168,12 @@ pub(super) fn rewire_vision_embedder_and_classifier(
     // writes the same Arc the factory's tools hold.
     if let Some(factory) = &state.runtime.factory {
         factory.set_auto_typing_enabled(laya_cfg.auto_type_memories);
+        // Failure triage (backlog 1a4049c1): the same live-toggle contract —
+        // the loop's dispatch site and both provider retry layers read the
+        // mirrored flag at failure time, so a Settings save lands on the
+        // next failure with no rebuild. The classifier slot needs no touch
+        // here: every swap above writes the same Arc the gate holds.
+        factory.set_failure_triage_enabled(laya_cfg.failure_triage);
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

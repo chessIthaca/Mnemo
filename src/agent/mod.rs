@@ -17,6 +17,9 @@
 //! - [`loop_impl`] — the `AgentLoop` struct, constructors, and public handles.
 //! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall).
 //! - [`dispatch`] — tool-call dispatch, the approval gate, provider retry.
+//! - [`failure_triage`] — the Laya classifier's failure-classification
+//!   decision layer (classes, confidence gate, auto-retry policy, the
+//!   training log).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!
@@ -25,6 +28,7 @@
 pub mod approval;
 pub mod context;
 pub mod factory;
+pub mod failure_triage;
 pub mod prompt;
 pub mod steering_stats;
 

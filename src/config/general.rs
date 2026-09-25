@@ -246,8 +246,36 @@ pub struct LayaConfig {
     /// SPEC/DECISION/BUG/HOW; PLAN/REVIEW ship without seed examples), so
     /// this is a separate opt-in from [`enabled`](Self::enabled). Omitted
     /// from the saved config while false.
-    #[serde(default, skip_serializing_if = "laya_auto_typing_off")]
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub auto_type_memories: bool,
+    /// Opt in to Laya FAILURE TRIAGE (backlog 1a4049c1): at every
+    /// failure-handling site (the tool-execution cap, the bad-JSON repair
+    /// loop, and BOTH provider retry layers) the error text is classified
+    /// transient/permanent/needs_user/flaky_test, and a confident answer
+    /// steers the harness — a transient READ-ONLY tool failure is re-run by
+    /// the harness without a model roundtrip, other classes ride classified
+    /// guidance on the fed-back error, and a needs-user/permanent provider
+    /// error skips the retry ladder outright. Confidence-gated (≥0.80): a
+    /// low-confidence or missing answer keeps the existing rules, and the
+    /// flag alone gates every classification + training-log write. Off by
+    /// default, and meant to be enabled only against a **fine-tuned**
+    /// checkpoint — base Laya checkpoints are near-chance zero-shot on this
+    /// task, which is exactly what [`auto_finetune`](Self::auto_finetune)
+    /// builds the labeled corpus for. Omitted from the saved config while
+    /// false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub failure_triage: bool,
+    /// Opt in to the startup failure-triage FINE-TUNE (managed mode only):
+    /// at startup the app compares the logged failure corpus against the
+    /// last run's marker and, when enough new labeled rows accumulated, runs
+    /// the Laya fine-tune on the managed venv and serves the fine-tuned
+    /// checkpoint. Off by default, and never blocking startup. A "check"
+    /// with no training surface installed (laya 0.3.20 ships none) exports
+    /// the labeled dataset and skips cleanly, leaving the marker untouched
+    /// so the next startup re-checks. Omitted from the saved config while
+    /// false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub auto_finetune: bool,
 }
 
 /// `skip_serializing_if` guard for [`LayaConfig::mode`]: `external` (the
@@ -257,10 +285,11 @@ fn laya_mode_is_external(mode: &LayaMode) -> bool {
     matches!(mode, LayaMode::External)
 }
 
-/// `skip_serializing_if` guard for [`LayaConfig::auto_type_memories`]:
-/// `false` (the default) stays unwritten, so untouched configs keep their
-/// exact pre-auto-typing shape.
-fn laya_auto_typing_off(off: &bool) -> bool {
+/// `skip_serializing_if` guard for [`LayaConfig`]'s boolean opt-ins
+/// (`auto_type_memories`, `failure_triage`, `auto_finetune`): `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-consumer shape.
+fn laya_flag_off(off: &bool) -> bool {
     !*off
 }
 
@@ -275,6 +304,8 @@ impl LayaConfig {
             && self.mode == LayaMode::External
             && self.checkpoint.is_none()
             && !self.auto_type_memories
+            && !self.failure_triage
+            && !self.auto_finetune
     }
 }
 
@@ -1180,6 +1211,8 @@ bundled_embedding_model = "all-MiniLM-L6-v2"
         assert!(!cfg.general.laya.enabled);
         assert!(cfg.general.laya.endpoint.is_none());
         assert!(!cfg.general.laya.auto_type_memories);
+        assert!(!cfg.general.laya.failure_triage);
+        assert!(!cfg.general.laya.auto_finetune);
     }
 
     #[test]
@@ -1277,6 +1310,48 @@ auto_type_memories = true
             ..Default::default()
         };
         assert!(!only_flag.is_default());
+    }
+
+    #[test]
+    fn laya_failure_triage_and_auto_finetune_default_off_and_round_trip() {
+        // Both flags follow the same opt-in convention as auto-typing:
+        // absent ⇒ false, false leaves no serialized trace, and either flag
+        // alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.failure_triage);
+        assert!(!cfg.general.laya.auto_finetune);
+
+        let text = r#"
+[general.laya]
+enabled = true
+failure_triage = true
+auto_finetune = true
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.failure_triage);
+        assert!(cfg.general.laya.auto_finetune);
+        let back = toml::to_string(&cfg).unwrap();
+        assert!(back.contains("failure_triage"));
+        assert!(back.contains("auto_finetune"));
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.failure_triage);
+        assert!(cfg2.general.laya.auto_finetune);
+
+        let untouched = LayaConfig::default();
+        assert!(untouched.is_default());
+        let serialized = toml::to_string(&untouched).unwrap();
+        assert!(!serialized.contains("failure_triage"));
+        assert!(!serialized.contains("auto_finetune"));
+        assert!(!LayaConfig {
+            failure_triage: true,
+            ..Default::default()
+        }
+        .is_default());
+        assert!(!LayaConfig {
+            auto_finetune: true,
+            ..Default::default()
+        }
+        .is_default());
     }
 
     #[test]

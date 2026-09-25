@@ -1,0 +1,68 @@
+## Verdict: FINDINGS (0 high, 1 low)
+
+Round-2 verification of all uncommitted changes on `wt/mnemo` for plan 02deea7c (Laya failure triage + startup fine-tune, backlog 1a4049c1) — ~29 tracked files plus the new `src/agent/failure_triage.rs` and `src-tauri/src/ipc/finetune.rs`, +1909/−44.
+
+**All four round-1 findings are fixed and verified in the current source by direct code reading.** The fix round introduced no regressions: the full diff was re-scanned and every round-1 "verified correct" invariant re-checked intact (byte-identical flags-off behavior at all four sites, 429 never classified, no duplicate rows across layers, read-only auto-retry allowlist, generation/status discipline in laya.rs). One LOW residual of the fix-3 round remains — two internal doc comments still describe the old increment-only dataset semantics.
+
+### LOW-1 — two doc comments still describe the increment-only fine-tune dataset that fix 3 removed
+
+Fix 3 changed the behavior so the marker gates the **trigger**, never the dataset, and updated the module doc, the `Run` variant doc, `docs/FEATURES.md`, the `main.rs` startup comment, and the `auto_finetune` config doc — but two doc comments still carry the old semantics, both with the same sentence:
+
+- `src-tauri/src/ipc/finetune.rs:150-151` — `write_finetune_marker`'s doc: "Write the last-fine-tune marker (`ts` unix seconds — **the training rows newer than it form the next fine-tune's dataset**)."
+- `src-tauri/src/ipc/laya.rs:331-333` — `finetune_marker_path`'s doc: "…its content is the unix-seconds ts of the last completed fine-tune — **the training rows newer than it form the next fine-tune's dataset**."
+
+Both contradict the shipped behavior (`finetune_decision` at finetune.rs:116-140 builds the dataset from ALL resolved rows — verified) and every other doc surface, and they are exactly the surfaces a future editor of the marker code reads first — the same staleness trap round-1's LOW-2 flagged when the behavior (not just the docs) had the increment-only shape. The task's fix-3 verification clause ("no doc surface still describes increment-only semantics") therefore does not fully hold. Behavior is unaffected; severity LOW (doc-only).
+
+**Fix:** reword both to trigger semantics, e.g. "…the training rows newer than it form the next fine-tune's ≥50-row trigger (never its dataset — the run retrains on the full resolved corpus)".
+
+## Round-1 fix verification (all read from the current source)
+
+### HIGH-1 — bad-JSON site wired: **VERIFIED FIXED**
+
+- The arm sits at `src/agent/turn.rs:3408-3486`, exactly after `state.bad_json_count += 1;` (:3407) and before the `MAX_BAD_JSON_RETRIES` cap check (:3487), inside `if let Some(gate) = &self.failure_triage` (:3417).
+- It classifies the malformed-arguments failure text built from the first call ("tool-call arguments failed to parse as JSON (finish reason …): {raw args}"); only `FailureTriage::Classified { class: Permanent, .. }` acts — `triage()` returns `Fallback::BelowThreshold` below `TRIAGE_THRESHOLD` 0.80 inclusive (failure_triage.rs:235), so 0.50-permanent cannot act, and a confident needs_user/transient/flaky_test matches no Permanent arm.
+- One row is logged (`FailureSite::BadJsonRepair`, tool = first call name, `TriageAction::AbortEarly`) and resolved immediately `Escalated` (:3433-3446). Both variants are live production symbols (used at turn.rs:3435/3440; `as_str` labels "bad_json_repair"/"abort_early" pinned by the label-stability tests, failure_triage.rs:927-939).
+- The abort mirrors the cap arm exactly: per-call synthetic ToolResults "arguments malformed or truncated — not run", final Error "Aborted after N malformed-arguments failures — classified permanent: repair attempts cannot help (the request itself must change)." with `retrying: false`, `Some(TurnOutcome)` carrying the pending steer via `state.stop_reason.take()` — zero repair roundtrips.
+- Tests verified by reading: `bad_json_confident_permanent_aborts_the_repair_loop_early` (tests.rs:12139-12199 — `provider.call_count()==1`, abort contains "classified permanent" + "repair attempts cannot help", exactly 1 row site/action/disposition bad_json_repair/abort_early/escalated) and `bad_json_below_threshold_or_non_permanent_keeps_the_ladder` (tests.rs:12202-12264 — permanent@0.50 AND needs_user@0.95: 8 provider calls, pre-classifier cap wording "kept failing to parse as JSON", zero rows).
+- The four pre-existing bad-JSON tests are present (tests.rs:1992/:2074/:8003/:11247) and exercise the no-gate path; `bad_json_aborts_at_higher_cap` spot-read — content consistent with pre-classifier semantics, gate-less loops take the byte-identical fallback (the arm is inside the `if let Some(gate)` check, and `triage()` short-circuits on the disabled flag without any classifier call, failure_triage.rs:329-341).
+- All six doc surfaces verified accurate: docs/FEATURES.md:48 ("the tool-execution cap, the bad-JSON repair loop, and both provider retry layers"), README.md:43, the PLAN.md consumer bullet, the failure_triage.rs module doc (:7-9), the `LayaConfig::failure_triage` doc (src/config/general.rs:251-265), and the Settings toggle copy ("at every failure site the error is classified").
+
+### LOW-1 (round 1) — restart_and_swap slot guard: **VERIFIED FIXED**
+
+- `slot_still_holds` (finetune.rs:261-273): `Arc::ptr_eq` comparison; both-None counts as holds. `run_startup_finetune` snapshots `observed_slot` at task start (:480-483).
+- Guard ordering verified — check → kill → start → re-check → swap: the rewire check at :390 precedes `alloc_free_port` (:397) and `start_server_models` (:405, the only sidecar-kill site), so a rewire during the run means the fine-tuned server is never started and the user's fresh sidecar never killed; the failed-restart restore path is equally guarded (re-check at :426 before the restore swap write); the fine-tuned swap write re-checks at :443 before writing at :450.
+- No new race introduced: `build_brain` writes the managed client into the slot synchronously at startup (main.rs:620-623 — "the classifier client already points at the pre-allocated loopback port (build_brain); spawn the sidecar now"), and `start_managed_server` never writes the slot — so the startup's own pending sidecar start cannot invalidate the snapshot. The only concurrent slot writers are the Settings rewire paths, and every one of them also drives the classifier status (rewire.rs:85-162: Starting / build_classifier-writes-status / Disabled), so the guard's skip paths leaving the status untouched are correct — the status is no longer `FineTuning`, and `restore_status_if_ours` would be a no-op anyway.
+
+### LOW-2 (round 1) — full-corpus dataset: **VERIFIED FIXED** (behavior), with the LOW-1 doc residual above
+
+- `finetune_decision` (finetune.rs:116-140): the trigger counts resolved rows strictly newer than the marker (≥ `FINETUNE_MIN_NEW_ROWS`=50); the dataset is ALL resolved rows — the marker gates WHEN, never WHAT.
+- `export_dataset` receives the full corpus in `run_startup_finetune`: the `Run` arm passes the full dataset (:521) and the `Ineligible` arm likewise (:531).
+- Tests verified: `trigger_counts_rows_newer_than_the_marker_but_the_dataset_is_the_full_corpus` (finetune.rs:649-668 — `Run{new_rows: 50, dataset: all 60 rows}`; 59 rows → `BelowThreshold{new_rows: 49}`) and `no_marker_counts_resolved_rows_only` (:671-685 ��� no marker → all 50 resolved rows are both trigger and dataset; the unresolved row never enters either).
+- Module doc (:13-17), `Run` variant doc (:90-93), and docs/FEATURES.md state the trigger/dataset split. `main.rs:644` and the `auto_finetune` config doc use trigger language.
+
+### LOW-3 (round 1) — spawn_blocking: **VERIFIED FIXED**
+
+- The fine-tune run is `tokio::task::spawn_blocking(move || run_finetune_process(&run_manager, &run_dataset, &run_out, n))` (finetune.rs:528-537); the JoinHandle is awaited and a join error maps to `FinetuneOutcome::Failed("the fine-tune task failed: …")`.
+- `child.wait()` now lives inside `run_finetune_process` on the blocking thread (:334); its doc comment updated (:288-295). tokio is a direct mnemo-app dep with features=["full"] (src-tauri/Cargo.toml:16).
+- Closure captures Arc<LayaManager>, two PathBufs, usize — Send+'static (and the compiled, green mnemo-app crate proves the bounds).
+- No minutes-long blocking call remains on the async path (read_rows / marker reads / export_dataset are quick file ops; the subprocess was the only long wait).
+## Regression re-scan of the round-1 "verified correct" list — all intact
+
+1. **Byte-identical with the flags off** — every triage surface sits behind `if let Some(gate) = &self.failure_triage`, and `FailureTriageHandle::triage` (failure_triage.rs:329-341) short-circuits on the disabled flag without any classifier call. The new bad-JSON arm is no exception; with no gate attached (all pre-existing tests) the ladder is structurally untouched.
+2. **429 never classified** — inner layer: the serialization-bug return and the `is_non_retryable() || is_rate_limited()` return (dispatch.rs:1064-1079) precede the triage arm (:1090-1115); outer layer: the `is_rate_limited()` fallback guard (runtime/agent.rs:564-587) precedes the triage arm (:596-657). The skip hints ("classified needs_user: retrying cannot help (credentials, permissions, or a quota need the user)" / "the request itself must change") contain none of the `is_rate_limited` needles, so a marked skip can never be mistaken for a 429.
+3. **No duplicate rows across layers** — the inner layer logs `ProviderTurn`/`SkipRetry` and resolves `Escalated` immediately while marking the error text (`is_classified_skip` needles "classified needs_user"/"classified permanent", error.rs:150-156); the outer layer then takes the `is_non_retryable` fast-fail and never re-classifies; the outer's own rows are once per attempt sequence (`pending_triage.is_none() && skip_triage.is_none()`); the tool-batch site is once per batch (`batch_triage` + `batch_triage_logged`); the bad-JSON site resolves immediately. Dispositions verified: tier-2 pending rows resolve `RetrySucceeded` on a failure-free batch (turn.rs:1781-1789) or `CapReached` at the MAX_RETRIES abort (turn.rs:852-857); outer `Ladder` rows resolve `RetryFailed` at final failure (runtime/agent.rs:713-720).
+4. **Read-only auto-retry allowlist** (failure_triage.rs:350-364) — unchanged, strictly read-only (search, search_read, read_files, graph_*, memory_search, backlog_list, current_plan, list_models, git_read). Tier-1 budgets re-verified (≤1 per call via the `0` attempt argument, ≤4 per turn via `MAX_AUTO_RETRIES_PER_TURN`, never mutating tools; stop-signal merge on the retry preserved, turn.rs:1459-1475).
+5. **Status + generation discipline in laya.rs** — `restore_status_if_ours` is still only-if-own with the lock released before the emit (finetune.rs:242-256); `spawn_server` still holds the child lock across stop→spawn→record (laya.rs:425-458); `stop_if_generation` (:378-391) and `owns_generation` (:397-403) gate the teardown and Ready writes in `start_server_models` (:1013-1057). The fine-tune's restart paths reuse exactly this machinery.
+6. **Wiring/config surface** — `FailureTriageHandle` built in main.rs build_brain_inner (:1471-1478), installed via `.with_failure_triage` (:1998-1999), accessor `failure_triage()` (loop_impl.rs:789-799); the flag is written by exactly two writers (startup init + rewire.rs:176 `set_failure_triage_enabled` — live toggle, no rebuild). `LayaConfig` fields are omitted-while-default via `laya_flag_off` and included in `is_default` (general.rs:267-278, 292-309) with round-trip tests (:1316-1351). The settings chain is complete: patch fields `laya_failure_triage`/`laya_auto_finetune` (settings_dto.rs:282/:286) applied at :601/:604 with round-trip tests (:957, :976-977), `LayaWire` DTO fields (settings.rs:496/:499) built from config (:907-908), contract fixture updated (contract_fixtures.rs:248-249), frontend draft/serialize/patch/fixture/tests all extended consistently (incl. the `finetuning` status union, tauri.ts:683-695, and the `"downloading" in status` narrowing so a fine-tune payload never touches download progress).
+
+## Test status
+
+Not re-runnable by this read-only reviewer. The parent's run on this exact tree — root `cargo test` 2633/0 (incl. both new bad-JSON tests; warning-free under `#![deny(warnings)]`), `cargo test -p mnemo-app` 328 lib + 13 integration / 0, tsc exit 0, vitest 1276/0 — is consistent with every test read during this review (assertions, fixtures, and wiring all line up). The known Application Control caveat did not fire per the amended HOW record in this diff.
+
+## Observations (no action required)
+
+1. The slot check (:443/:426) and the swap write (:450/:427) are two separate lock acquisitions — a microscopic TOCTOU remains that `restore_status_if_ours` avoids by fusing check+write under one guard. The window is nanoseconds (no await between the two) and self-corrects on the next save, exactly the residual round-1 documented; fusing would be polish, not a defect fix.
+2. `file_read` in `AUTO_RETRY_SAFE_TOOLS` (failure_triage.rs:353) names no registered tool — a harmless dead allowlist entry, unchanged from round 1 (round-1 minor observation).
+3. `read_rows`/`export_dataset`/marker I/O run on the async task — trivial at current corpus sizes (hundreds of JSONL rows); only worth the `spawn_blocking` treatment if the training log ever grows to tens of MB.
+
+**Bottom line:** the four round-1 findings are genuinely fixed; the only remaining defect is the two stale increment-only doc comments (LOW-1 above) — a two-line doc fix, no behavior change required.

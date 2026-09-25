@@ -227,7 +227,7 @@ fn dir_size(path: &Path) -> u64 {
 
 /// On Windows, keep the child from flashing a console window; a no-op
 /// elsewhere (per-platform branch, not a platform assumption).
-fn hide_console_window(cmd: &mut Command) {
+    pub(super) fn hide_console_window(cmd: &mut Command) {
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -328,6 +328,17 @@ impl LayaManager {
         self.base_dir.join("markers").join(checkpoint_id)
     }
 
+    /// The startup fine-tune marker (`markers/finetune-<checkpoint>`): its
+    /// content is the unix-seconds ts of the last completed fine-tune —
+    /// the training rows newer than it form the next fine-tune's ≥50-row
+    /// trigger (never its dataset — the run retrains on the full resolved
+    /// corpus).
+    pub fn finetune_marker_path(&self, checkpoint_id: &str) -> PathBuf {
+        self.base_dir
+            .join("markers")
+            .join(format!("finetune-{checkpoint_id}"))
+    }
+
     /// Was `checkpoint_id` downloaded by a successful setup (and is the
     /// runtime itself present)?
     pub fn is_checkpoint_installed(&self, checkpoint_id: &str) -> bool {
@@ -401,14 +412,18 @@ impl LayaManager {
             .map(|a| a.port())
     }
 
-    /// Spawn the managed `laya-serve` for `checkpoint_id` on the
+    /// Spawn the managed `laya-serve` serving `models` on the
     /// pre-allocated `port` (the one the classifier client was built
     /// against) and record the child tagged with a fresh generation.
+    /// `models` is the `LAYA_MODELS` value: a catalog checkpoint id in
+    /// managed mode, or a fine-tuned artifact directory path for the
+    /// startup fine-tune hot-swap (best-effort — a laya-serve that cannot
+    /// load it simply never gets ready).
     /// Returns that generation — a caller whose readiness probe fails must
     /// pass it to [`LayaManager::stop_if_generation`] so a concurrent newer
     /// start survives. Does not wait for readiness (see
     /// [`start_managed_server`]).
-    pub fn spawn_server(&self, checkpoint_id: &str, port: u16) -> std::io::Result<u64> {
+    pub fn spawn_server(&self, models: &str, port: u16) -> std::io::Result<u64> {
         // Hold the child lock across stop → spawn → record: two concurrent
         // starts (save-driven rewire vs setup autostart vs startup hook)
         // serialize, so the slower task's record can never overwrite the
@@ -431,7 +446,7 @@ impl LayaManager {
         let log = std::fs::File::create(self.server_log_path())?;
         let mut cmd = Command::new(&serve);
         cmd.current_dir(self.base_dir())
-            .envs(server_env(checkpoint_id, port, &self.hf_cache_dir()))
+            .envs(server_env(models, port, &self.hf_cache_dir()))
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log));
         hide_console_window(&mut cmd);
@@ -971,16 +986,32 @@ pub async fn start_managed_server(
     checkpoint: &LayaCheckpoint,
     port: u16,
 ) -> Option<u16> {
+    start_server_models(app, manager, checkpoint.id, port, Some(checkpoint)).await
+}
+
+/// Start (or restart) the managed `laya-serve` serving `models` (a catalog
+/// checkpoint id, or a fine-tuned artifact directory path — the startup
+/// fine-tune hot-swap) on `port`, driving the status Starting → Ready/Failed.
+/// `progress` names the catalog checkpoint for download-progress reporting
+/// (`None` for a fine-tuned artifact, which needs no download). Returns the
+/// port on success.
+pub(super) async fn start_server_models(
+    app: &Option<AppHandle>,
+    manager: Arc<LayaManager>,
+    models: &str,
+    port: u16,
+    progress: Option<&LayaCheckpoint>,
+) -> Option<u16> {
     let status = Arc::clone(&manager.status);
     let s = ClassifierStatus::Starting;
     *status.write().expect("classifier status lock poisoned") = s.clone();
     if let Some(app) = app {
         let _ = app.emit("classifier://status", &s);
     }
-    match manager.spawn_server(checkpoint.id, port) {
+    match manager.spawn_server(models, port) {
         Ok(generation) => {
             let hf_dir = manager.hf_cache_dir();
-            let ready = wait_until_ready(app, &status, port, &hf_dir, Some(checkpoint)).await;
+            let ready = wait_until_ready(app, &status, port, &hf_dir, progress).await;
             if ready {
                 // Confirm this start still owns the child before declaring
                 // Ready: a save-driven stop + restart can land between the

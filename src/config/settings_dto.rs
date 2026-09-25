@@ -276,6 +276,14 @@ pub struct SettingsSaveDto {
     /// keep the current value.
     #[serde(default)]
     pub laya_auto_type_memories: Option<bool>,
+    /// Laya failure triage (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_failure_triage: Option<bool>,
+    /// Startup failure-triage fine-tune (managed mode only, opt-in). Absent =
+    /// keep the current value.
+    #[serde(default)]
+    pub laya_auto_finetune: Option<bool>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
     /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
@@ -589,6 +597,12 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(auto_type) = patch.laya_auto_type_memories {
         general.general.laya.auto_type_memories = auto_type;
+    }
+    if let Some(triage) = patch.laya_failure_triage {
+        general.general.laya.failure_triage = triage;
+    }
+    if let Some(finetune) = patch.laya_auto_finetune {
+        general.general.laya.auto_finetune = finetune;
     }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
@@ -949,6 +963,28 @@ mod tests {
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.laya.auto_type_memories);
+    }
+
+    #[test]
+    fn laya_patch_applies_failure_triage_and_auto_finetune() {
+        // Both triage flags ride the same save path: Some flips them, absent
+        // keeps the current value — and an untouched config stays default.
+        let current = Config::default();
+        assert!(!current.general.general.laya.failure_triage);
+        assert!(!current.general.general.laya.auto_finetune);
+        let patch = SettingsSaveDto {
+            laya_failure_triage: Some(true),
+            laya_auto_finetune: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.auto_finetune);
+        // Absent keeps both on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.failure_triage);
+        assert!(next.general.general.laya.auto_finetune);
     }
 
     #[test]

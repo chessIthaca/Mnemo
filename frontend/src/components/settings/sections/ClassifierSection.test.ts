@@ -98,6 +98,8 @@ describe("ClassifierSection owns the opt-in controls", () => {
   it("persists the opt-in through saveSettings (config.toml [general.laya])", () => {
     expect(classifierSource).toContain("laya_enabled: enabled");
     expect(classifierSource).toContain("laya_auto_type_memories: autoType");
+    expect(classifierSource).toContain("laya_failure_triage: failureTriage");
+    expect(classifierSource).toContain("laya_auto_finetune: autoFinetune");
     expect(classifierSource).toContain("laya_mode: mode");
     expect(classifierSource).toContain("laya_checkpoint: checkpoint");
     // Managed mode never persists an external endpoint (blank clears it).
@@ -115,6 +117,24 @@ describe("ClassifierSection owns the opt-in controls", () => {
   it("renders the auto-typing opt-in toggle with the fine-tuned caveat", () => {
     expect(classifierSource).toContain("Auto-type memory records");
     expect(classifierSource).toContain("fine-tuned checkpoint");
+  });
+
+  it("renders the failure-triage + startup fine-tune opt-in toggles", () => {
+    expect(classifierSource).toContain("Classify failures to steer retries");
+    expect(classifierSource).toContain(
+      "Fine-tune on startup from logged failures",
+    );
+    expect(classifierSource).toContain("checked={failureTriage}");
+    expect(classifierSource).toContain("checked={autoFinetune}");
+  });
+
+  it("renders the fine-tuning status shape (the startup fine-tune hot-swap)", () => {
+    expect(classifierSource).toContain(
+      "fine-tuning ${status.finetuning.label}",
+    );
+    expect(classifierSource).toContain(
+      "Fine-tuning ${status.finetuning.label} on the logged failure",
+    );
   });
 });
 
@@ -136,13 +156,15 @@ describe("classifier bindings stay wired to the backend names", () => {
 
   it("the settings types carry the laya fields (config + save patch)", () => {
     expect(tauriSource).toContain(
-      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n      /** Whether memory auto-typing is enabled (opt-in). */\n      auto_type_memories: boolean;\n    };',
+      'laya?: {\n      enabled: boolean;\n      endpoint: string | null;\n      mode: "external" | "managed";\n      checkpoint: string | null;\n      /** Whether memory auto-typing is enabled (opt-in). */\n      auto_type_memories: boolean;\n      /** Whether failure triage is enabled (opt-in; needs a fine-tuned\n       *  checkpoint). */\n      failure_triage: boolean;\n      /** Whether the startup failure-triage fine-tune is enabled (managed\n       *  mode only, opt-in). */\n      auto_finetune: boolean;\n    };',
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
     expect(tauriSource).toContain("laya_endpoint?: string;");
     expect(tauriSource).toContain('laya_mode?: "external" | "managed";');
     expect(tauriSource).toContain("laya_checkpoint?: string;");
     expect(tauriSource).toContain("laya_auto_type_memories?: boolean;");
+    expect(tauriSource).toContain("laya_failure_triage?: boolean;");
+    expect(tauriSource).toContain("laya_auto_finetune?: boolean;");
   });
 
   it("the startup snapshot type carries classifier_status", () => {
@@ -157,6 +179,8 @@ describe("serializeClassifier", () => {
     checkpoint: "english",
     endpoint: "",
     autoTypeMemories: false,
+    failureTriage: false,
+    autoFinetune: false,
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
@@ -179,15 +203,23 @@ describe("serializeClassifier", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, autoTypeMemories: true }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, failureTriage: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, autoFinetune: true }),
+    );
   });
 
-  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing)", () => {
+  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + triage + fine-tune)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       mode: "managed",
       checkpoint: "english",
       endpoint: "",
       autoTypeMemories: false,
+      failureTriage: false,
+      autoFinetune: false,
     });
   });
 });

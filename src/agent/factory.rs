@@ -70,6 +70,7 @@ use crate::tool::agent::{
     web_fetch::WebFetchTool,
     write_review_report::WriteReviewReportTool,
 };
+use super::failure_triage::FailureTriageHandle;
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::{
     AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
@@ -179,6 +180,12 @@ pub struct AgentLoopFactory {
     /// `with_auto_typing` (the app runtime's shared classifier slot + the
     /// `auto_type_memories` flag mirror).
     typing: Option<AutoTypingHandle>,
+    /// The shared Laya failure-triage gate (backlog 1a4049c1) — `None` until
+    /// the IPC layer wires it via `with_failure_triage` (the SAME shared
+    /// classifier slot + the `failure_triage` flag mirror). Attached to every
+    /// loop built after the call, so the tool-dispatch and provider retry
+    /// layers read it at failure time.
+    failure_triage: Option<FailureTriageHandle>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -353,6 +360,10 @@ impl AgentLoopFactory {
             // exists (backlog a147b63c). Until then `memory_write` never
             // asks a classifier.
             typing: None,
+            // No failure-triage gate at construction either — wired via
+            // `with_failure_triage` (backlog 1a4049c1). Until then every
+            // failure-handling site keeps its pre-classifier behavior.
+            failure_triage: None,
         }
     }
 
@@ -380,6 +391,27 @@ impl AgentLoopFactory {
     /// tools with no registry rebuild.
     pub fn set_auto_typing_enabled(&self, on: bool) {
         if let Some(handle) = &self.typing {
+            handle
+                .enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Wire the shared Laya failure-triage gate (backlog 1a4049c1): every
+    /// agent loop built after this call carries the handle, whose shared
+    /// classifier slot + `[general.laya] failure_triage` flag mirror are read
+    /// at FAILURE time — so a Settings save needs no rebuild. When not wired,
+    /// every failure-handling site keeps its pre-classifier behavior.
+    pub fn with_failure_triage(mut self, handle: FailureTriageHandle) -> Self {
+        self.failure_triage = Some(handle);
+        self
+    }
+
+    /// Flip the failure-triage enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this so the toggle reaches already-built
+    /// loops with no rebuild.
+    pub fn set_failure_triage_enabled(&self, on: bool) {
+        if let Some(handle) = &self.failure_triage {
             handle
                 .enabled
                 .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -830,6 +862,15 @@ impl AgentLoopFactory {
         // Store the root spec on the loop so subagents spawned by this
         // agent inherit the same root (spawn_agent_shared reads it).
         agent = agent.with_root_spec(root.cloned());
+
+        // Attach the failure-triage gate (backlog 1a4049c1): the loop's
+        // tool-dispatch site and both provider retry layers read the shared
+        // classifier slot + the `[general.laya] failure_triage` flag at
+        // failure time, so a Settings save lands on the next failure with no
+        // registry or loop rebuild.
+        if let Some(handle) = &self.failure_triage {
+            agent = agent.with_failure_triage(handle.clone());
+        }
 
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the
         // loop's no-override resolution branch reports it, so the status bar

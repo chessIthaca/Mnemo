@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::context::{self, TokenAccounting};
+use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::prompt;
 use super::StopReason;
@@ -134,6 +135,21 @@ pub(crate) struct TurnState {
     /// distinct final error naming the review report. Resets only on a
     /// successful `write_review_report`.
     review_report_failures: u32,
+    /// Harness auto-retries performed this turn — the per-turn budget
+    /// [`failure_triage::MAX_AUTO_RETRIES_PER_TURN`] for tier-1 retries
+    /// (confident `transient` read-only tool calls re-run by the harness
+    /// without a model roundtrip). Reset each turn.
+    auto_retries_this_turn: u32,
+    /// Classified failures on the guidance route (tier 2) awaiting their
+    /// disposition. A later failure-free successful batch is the retry
+    /// landing — they resolve `retry_succeeded`; the MAX_RETRIES abort
+    /// resolves them `cap_reached`. Leftover rows at turn end are dropped:
+    /// the outcome was never observed, and an unobserved disposition must
+    /// not be guessed into the training log.
+    pending_triage_rows: Vec<failure_triage::PendingFailureRow>,
+    /// The last classified failure class this turn — the MAX_RETRIES abort
+    /// message names it when present (absent = byte-identical message).
+    last_triage_class: Option<failure_triage::FailureClass>,
     /// Once the user answers DenyAll on any approval this turn, remaining
     /// tool calls auto-deny without prompting (Quality M1). Reset each turn.
     deny_all_latched: bool,
@@ -205,6 +221,9 @@ impl TurnState {
             tool_error_count: 0,
             bad_json_count: 0,
             review_report_failures: 0,
+            auto_retries_this_turn: 0,
+            pending_triage_rows: Vec::new(),
+            last_triage_class: None,
             deny_all_latched: false,
             stop_reason: None,
             compact_announced: false,
@@ -826,13 +845,29 @@ impl AgentLoop {
             // forwarder also latches against that, but the emission contract
             // is: one terminal outcome per turn failure.
             if state.tool_error_count >= MAX_RETRIES {
+                // Failure triage: the turn aborts with classified failures
+                // whose retry never landed — resolve them as `cap_reached`,
+                // and name the last classified class in the abort message
+                // (absent when triage is off => byte-identical message).
+                for pending in state.pending_triage_rows.drain(..) {
+                    failure_triage::resolve_failure(
+                        pending,
+                        failure_triage::TriageDisposition::CapReached,
+                    );
+                }
+                let classified = match state.last_triage_class {
+                    Some(class) => {
+                        format!(" Last classified failure: {}.", class.label())
+                    }
+                    None => String::new(),
+                };
                 let _ = fanin_tx
                     .send((
                         agent_id,
                         AgentEvent::Error {
                             error: format!(
                                 "Aborting turn: {MAX_RETRIES} consecutive tool errors \
-                                 (the model may be stuck)."
+                                 (the model may be stuck).{classified}"
                             ),
                             retrying: false,
                         },
@@ -1285,6 +1320,18 @@ impl AgentLoop {
         // result and gets a chance to repair), not N consecutive errors.
         let mut batch_had_error = false;
         let mut batch_had_success = false;
+        // Failure triage (Laya, opt-in; backlog 1a4049c1): classify the
+        // batch's first non-denial failure ONCE. The class steers the harness
+        // auto-retry below (tier 1), the guidance appended to the fed-back
+        // failure (tier 2), and the turn-level abort message (which names
+        // it). No gate / flag off / no usable answer / a denial => stays
+        // `None` and every branch below keeps its pre-classifier behavior
+        // byte-for-byte.
+        let mut batch_triage: Option<failure_triage::FailureTriage> = None;
+        // One classification per failed batch => at most one training-log
+        // row for it (either the tier-1 retry row or the tier-2 guidance
+        // row), never both.
+        let mut batch_triage_logged = false;
         // Add the assistant message with tool calls.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
@@ -1350,7 +1397,7 @@ impl AgentLoop {
                 break;
             }
 
-            let (result, buffered) = self
+            let (mut result, mut buffered) = self
                 .execute_tool_call(
                     tc,
                     fanin_tx,
@@ -1360,6 +1407,114 @@ impl AgentLoop {
                     &mut stop_signal,
                 )
                 .await;
+
+            // Failure triage (Laya, opt-in; backlog 1a4049c1): classify the
+            // batch's first non-denial failure ONCE. The class steers the
+            // harness auto-retry below (tier 1), the guidance appended to
+            // the fed-back failure (tier 2), and the turn-level abort message
+            // (which names it). No gate / flag off / no usable answer / a
+            // denial => `batch_triage` stays `None` and every branch below
+            // keeps its pre-classifier behavior byte-for-byte.
+            if !result.success
+                && !is_user_denial_tool_output(&result.output)
+                && batch_triage.is_none()
+                && stop_signal.is_none()
+            {
+                if let Some(gate) = &self.failure_triage {
+                    let triage = gate.triage(&result.output).await;
+                    if let failure_triage::FailureTriage::Classified { class, .. } = &triage {
+                        state.last_triage_class = Some(*class);
+                    }
+                    batch_triage = Some(triage);
+                }
+            }
+
+            // Tier 1 — harness auto-retry, NO model roundtrip: a confident
+            // `transient` classification of a READ-ONLY tool call is re-run
+            // by the harness itself with the identical arguments (read-only
+            // tools are approval-free, so the re-run cannot double-apply a
+            // side effect), bounded to one retry per call and
+            // [`failure_triage::MAX_AUTO_RETRIES_PER_TURN`] per turn. A
+            // swallowed success feeds the model only the successful result
+            // plus a one-line note and never counts as a tool error; a failed
+            // retry falls through to the normal feed-back below.
+            let mut auto_retried = false;
+            if !result.success && !batch_triage_logged && stop_signal.is_none() {
+                if let (
+                    Some(gate),
+                    Some(failure_triage::FailureTriage::Classified { class, confidence }),
+                ) = (&self.failure_triage, &batch_triage)
+                {
+                    let (class, confidence) = (*class, *confidence);
+                    if failure_triage::should_auto_retry(
+                        class,
+                        &tc.name,
+                        0,
+                        state.auto_retries_this_turn,
+                    ) {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            failure_triage::AUTO_RETRY_BACKOFF_MS,
+                        ))
+                        .await;
+                        let mut retry_stop: Option<StopReason> = None;
+                        let (retry_result, retry_buffered) = self
+                            .execute_tool_call(
+                                tc,
+                                fanin_tx,
+                                agent_id,
+                                cmd_rx,
+                                &mut state.deny_all_latched,
+                                &mut retry_stop,
+                            )
+                            .await;
+                        buffered.extend(retry_buffered);
+                        if retry_stop.is_some() {
+                            // The retry is this call's final word — merge its
+                            // stop signal exactly like the first attempt's.
+                            stop_signal = retry_stop;
+                        }
+                        state.auto_retries_this_turn += 1;
+                        batch_triage_logged = true;
+                        let pending = gate.log_failure(
+                            failure_triage::FailureSite::ToolBatch,
+                            Some(tc.name.as_str()),
+                            &result.output,
+                            class,
+                            confidence,
+                            failure_triage::TriageAction::AutoRetry,
+                        );
+                        if retry_result.success {
+                            failure_triage::resolve_failure(
+                                pending,
+                                failure_triage::TriageDisposition::RetrySucceeded,
+                            );
+                            auto_retried = true;
+                        } else {
+                            failure_triage::resolve_failure(
+                                pending,
+                                failure_triage::TriageDisposition::RetryFailed,
+                            );
+                        }
+                        result = retry_result;
+                    } else {
+                        // Tier 2 — the model still decides, but with the
+                        // classification named: queue the training-log row
+                        // (its disposition resolves when a later failure-free
+                        // batch succeeds, or as `cap_reached` at the abort).
+                        state
+                            .pending_triage_rows
+                            .push(gate.log_failure(
+                                failure_triage::FailureSite::ToolBatch,
+                                Some(tc.name.as_str()),
+                                &result.output,
+                                class,
+                                confidence,
+                                failure_triage::TriageAction::Guidance,
+                            ));
+                        batch_triage_logged = true;
+                    }
+                }
+            }
 
             // Merge the per-tool-call stop signal (Interrupt/Cancel from
             // approval or ask_user) into the turn-level stop_reason.
@@ -1515,9 +1670,34 @@ impl AgentLoop {
             // denial is orders of magnitude shorter than the cap).
             let capped = context::cap_tool_result_text(&result.output);
             let tool_content = if result.success {
-                capped
+                if auto_retried {
+                    // Tier-1 transparency: the model sees the SUCCESS (the
+                    // swallowed failure would only cost a repair roundtrip),
+                    // with a one-line note so it knows the result took an
+                    // extra beat and a transient blip was in play.
+                    format!(
+                        "{capped}\n[harness note] (auto-retried once after a transient failure)"
+                    )
+                } else {
+                    capped
+                }
             } else {
                 format!("[tool error] {capped}")
+            };
+            // The model-facing content: a classified failure carries its
+            // guidance note (tier 2). The repeat-failure breaker below keeps
+            // comparing the RAW marker (`tool_content`), so triage never
+            // disturbs repeat detection.
+            let feed_content = match (&batch_triage, result.success) {
+                (Some(failure_triage::FailureTriage::Classified { class, .. }), false)
+                    if !is_user_denial_tool_output(&result.output) =>
+                {
+                    format!(
+                        "{tool_content}\n[harness triage] {}",
+                        failure_triage::guidance_note(*class)
+                    )
+                }
+                _ => tool_content.clone(),
             };
 
             // Repeat-failure circuit breaker (tool-call robustness): when
@@ -1542,7 +1722,7 @@ impl AgentLoop {
                 pending_correction = Some((tc.name.clone(), tool_content.clone()));
             }
 
-            let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), tool_content);
+            let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), feed_content);
             messages.push(tool_message);
 
             let _ = fanin_tx
@@ -1598,6 +1778,15 @@ impl AgentLoop {
             state.tool_error_count += 1;
         } else if batch_had_success {
             state.tool_error_count = 0;
+            // Failure triage: a failure-free successful batch is the model's
+            // retry landing — the turn's pending classified failures (the
+            // guidance route) are now observed as `retry_succeeded`.
+            for pending in state.pending_triage_rows.drain(..) {
+                failure_triage::resolve_failure(
+                    pending,
+                    failure_triage::TriageDisposition::RetrySucceeded,
+                );
+            }
         }
 
         // Repeat-failure circuit breaker: push the queued corrective
@@ -3216,6 +3405,85 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // MAX_BAD_JSON_RETRIES cap so three strikes doesn't stop a
         // model that can self-correct.
         state.bad_json_count += 1;
+        // Failure triage (Laya, opt-in; plan 02deea7c): a confident
+        // `permanent` reading of the malformed-arguments failure aborts the
+        // repair loop EARLY — the model roundtrip IS the bad-JSON retry, so
+        // no harness auto-retry exists here; the classification only decides
+        // whether more repair attempts are worth their roundtrips. Every
+        // other class, and any fallback, keeps today's ladder byte-identical.
+        // One row per strike, resolved immediately with `escalated` (the
+        // abort skips any further repair attempt — off-policy for the
+        // trainer, same as the provider skip).
+        if let Some(gate) = &self.failure_triage {
+            let error_text = match tool_calls.first() {
+                Some(tc) => format!(
+                    "tool-call arguments failed to parse as JSON (finish reason \
+                     {finish_reason:?}): {}",
+                    tc.arguments
+                ),
+                None => format!(
+                    "tool-call arguments failed to parse as JSON (finish reason \
+                     {finish_reason:?})"
+                ),
+            };
+            if let failure_triage::FailureTriage::Classified {
+                class: failure_triage::FailureClass::Permanent,
+                confidence,
+            } = gate.triage(&error_text).await
+            {
+                let pending = gate.log_failure(
+                    failure_triage::FailureSite::BadJsonRepair,
+                    tool_calls.first().map(|tc| tc.name.as_str()),
+                    &error_text,
+                    failure_triage::FailureClass::Permanent,
+                    confidence,
+                    failure_triage::TriageAction::AbortEarly,
+                );
+                failure_triage::resolve_failure(
+                    pending,
+                    failure_triage::TriageDisposition::Escalated,
+                );
+                // UI-only (backlog 63cbc20f): end every announced card
+                // before the final error — same discipline as the cap arm
+                // below.
+                for tc in tool_calls {
+                    let _ = fanin_tx
+                        .send((
+                            agent_id,
+                            AgentEvent::ToolResult {
+                                tool_call_id: tc.id.clone(),
+                                result: ToolResult::error(
+                                    "arguments malformed or truncated — not run",
+                                ),
+                            },
+                        ))
+                        .await;
+                }
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Error {
+                            error: format!(
+                                "Aborted after {} malformed-arguments failures — \
+                                 classified permanent: repair attempts cannot help \
+                                 ({}).",
+                                state.bad_json_count,
+                                failure_triage::skip_hint(
+                                    failure_triage::FailureClass::Permanent
+                                )
+                            ),
+                            retrying: false,
+                        },
+                    ))
+                    .await;
+                return Some(TurnOutcome {
+                    finish_reason: FinishReason::Stop,
+                    text: text.to_string(),
+                    tool_calls_made: 0,
+                    stop_reason: state.stop_reason.take(),
+                });
+            }
+        }
         if state.bad_json_count >= MAX_BAD_JSON_RETRIES {
             // UI-only (backlog 63cbc20f): end every announced card
             // before the final error — the whole batch is discarded

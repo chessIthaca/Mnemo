@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use super::approval;
+use super::failure_triage::{self, FailureClass, FailureTriage, TriageAction, TriageDisposition};
 use super::loop_impl::AgentLoop;
 use crate::error::Result;
 use crate::provider::{LlmClient, LlmEvent, Message, ToolCall};
@@ -1075,6 +1076,42 @@ impl AgentLoop {
                     }
                     if e.is_non_retryable() || e.is_rate_limited() {
                         return Err(e);
+                    }
+                    // Failure triage (Laya, opt-in; plan 02deea7c): classify
+                    // BEFORE burning this inner ladder. A confident needs-user
+                    // / permanent reading fails the layer immediately with the
+                    // verdict MARKED into the error text — the marker makes
+                    // `Error::is_non_retryable` true, so the turn-level layer
+                    // (`run_turn_attempt`) skips its own stack too WITHOUT
+                    // re-classifying, and exactly one classified row is logged
+                    // (here) per failure, never two. A 429 never reaches this
+                    // point (the arm above returns first) and is never
+                    // classified.
+                    if let Some(gate) = &self.failure_triage {
+                        let error_text = e.to_string();
+                        if let FailureTriage::Classified { class, confidence } =
+                            gate.triage(&error_text).await
+                        {
+                            if matches!(class, FailureClass::NeedsUser | FailureClass::Permanent) {
+                                let pending = gate.log_failure(
+                                    failure_triage::FailureSite::ProviderTurn,
+                                    None,
+                                    &error_text,
+                                    class,
+                                    confidence,
+                                    TriageAction::SkipRetry,
+                                );
+                                failure_triage::resolve_failure(
+                                    pending,
+                                    TriageDisposition::Escalated,
+                                );
+                                return Err(crate::error::Error::Provider(format!(
+                                    "{e} — classified {}: retrying cannot help ({})",
+                                    class.label(),
+                                    failure_triage::skip_hint(class),
+                                )));
+                            }
+                        }
                     }
                     if attempt < 2 {
                         // Jittered exponential backoff (equal jitter: half

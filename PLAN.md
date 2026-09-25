@@ -1166,6 +1166,25 @@ product.
   labeled set `seed_dataset` builds from `.coding/knowledge/` (covers
   SPEC/DECISION/BUG/HOW; PLAN/REVIEW ride untrained until those corpora
   can seed them — follow-up) (backlog a147b63c).
+- **Laya failure triage + startup fine-tune** (`src/agent/failure_triage.rs`,
+  `src-tauri/src/ipc/finetune.rs`) — the classifier's second consumer: at
+  every failure-handling site (the tool-execution cap + bad-JSON repair loop
+  in `src/agent/turn.rs` and BOTH provider retry layers — the inner
+  `complete_with_retry` and the outer `run_turn_attempt`) the error text is
+  classified (transient / permanent / needs_user / flaky_test,
+  `TRIAGE_THRESHOLD` 0.80 inclusive) and a confident answer lets the harness
+  act: a transient READ-ONLY tool failure is auto-retried without a model
+  roundtrip (≤1 per call, ≤4 per turn, never mutating tools), other classes
+  ride targeted guidance on the fed-back error, and a confident
+  needs-user/permanent provider error skips both retry ladders immediately
+  (a marked error text makes the outer layer skip without re-classifying; a
+  429 is never classified). Every classified failure is logged with its true
+  disposition to a JSONL training log; the startup fine-tune (managed mode +
+  `auto_finetune`) re-trains the checkpoint from that log when ≥50 new
+  labeled rows accrued and hot-swaps the served checkpoint (an ineligible
+  run exports the dataset + skips cleanly — laya 0.3.20 ships no training
+  surface). Both flags are separate opt-ins (default off); disabled behavior
+  is byte-identical (backlog 1a4049c1).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

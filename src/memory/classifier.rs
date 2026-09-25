@@ -127,7 +127,8 @@ impl Answer {
 /// as bare lowercase strings (`"disabled"`, …) matching the frontend string
 /// comparisons (the [`EmbedderStatus`](super::EmbedderStatus) convention);
 /// `Downloading` serializes as `{"downloading": {"label": …, "progress": …}}`
-/// exactly like [`EmbedderStatus::Downloading`].
+/// exactly like [`EmbedderStatus::Downloading`], and `FineTuning` as
+/// `{"finetuning": {"label": …}}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClassifierStatus {
@@ -156,6 +157,16 @@ pub enum ClassifierStatus {
     /// has not answered the readiness probe yet — `Ready` (probe ok) or
     /// `Failed` (timeout/crash) follows.
     Starting,
+    /// The startup failure-triage fine-tune is running in the background
+    /// (managed mode, the `auto_finetune` opt-in): the sidecar keeps
+    /// serving the current checkpoint. On success the server restarts
+    /// against the fine-tuned artifact (`Starting` → `Ready`); on any skip
+    /// the status returns to `Ready` — only a still-own `FineTuning` is
+    /// ever overwritten by the restore.
+    FineTuning {
+        /// Human-facing description (the checkpoint id being fine-tuned).
+        label: String,
+    },
 }
 
 impl Default for ClassifierStatus {
@@ -440,6 +451,23 @@ mod tests {
             ClassifierStatus::Downloading {
                 label: "english".into(),
                 progress: 0.25
+            }
+        );
+        // The fine-tune payload (the startup fine-tune hot-swap's own state).
+        assert_eq!(
+            serde_json::to_value(ClassifierStatus::FineTuning {
+                label: "english".into()
+            })
+            .unwrap(),
+            serde_json::json!({"finetuning": {"label": "english"}})
+        );
+        let back: ClassifierStatus =
+            serde_json::from_value(serde_json::json!({"finetuning": {"label": "english"}}))
+                .unwrap();
+        assert_eq!(
+            back,
+            ClassifierStatus::FineTuning {
+                label: "english".into()
             }
         );
     }

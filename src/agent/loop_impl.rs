@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use super::failure_triage;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -336,6 +337,13 @@ pub struct AgentLoop {
     /// inherit the same root (a worktree agent's reviewer must see the
     /// worktree's diff, not the main tree's).
     pub(crate) root_spec: Option<crate::agent::factory::AgentRootSpec>,
+    /// The optional failure-triage gate (the Laya classifier's failure-
+    /// handling consumer, `[general.laya] failure_triage`): the shared
+    /// classifier slot plus the config-mirrored enable flag that the
+    /// tool-dispatch and provider-retry sites read on every failure. `None`
+    /// in tests / when the Laya foundation is not wired — those sites then
+    /// keep their pre-classifier behavior byte-for-byte.
+    pub(crate) failure_triage: Option<failure_triage::FailureTriageHandle>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -733,6 +741,7 @@ impl AgentLoop {
             last_review_report: std::sync::Mutex::new(None),
             plans_dir: std::path::PathBuf::new(),
             root_spec: None,
+            failure_triage: None,
         }
     }
 
@@ -767,6 +776,26 @@ impl AgentLoop {
     /// spawned by this agent inherit the same root.
     pub fn root_spec(&self) -> Option<&crate::agent::factory::AgentRootSpec> {
         self.root_spec.as_ref()
+    }
+
+    /// Attach the failure-triage gate (the Laya classifier's failure-handling
+    /// consumer, `[general.laya] failure_triage`). The gate carries the shared
+    /// classifier slot + the config-mirrored enable flag; BOTH are read at
+    /// failure time, so a Settings save takes effect on the next failure and
+    /// the flag can stay off (keeping the pre-classifier behavior) while the
+    /// slot itself is live. Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise triage.
+    pub fn with_failure_triage(mut self, handle: failure_triage::FailureTriageHandle) -> Self {
+        self.failure_triage = Some(handle);
+        self
+    }
+
+    /// The failure-triage gate this loop was built with (`None` when triage is
+    /// unwired). The IPC layer mirrors the config flag into the gate's live
+    /// enable flag, so a Settings toggle needs no rebuild.
+    pub fn failure_triage(&self) -> Option<&failure_triage::FailureTriageHandle> {
+        self.failure_triage.as_ref()
     }
 
     /// The context-manager fill rate this loop was built with — the LIVE

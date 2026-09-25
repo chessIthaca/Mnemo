@@ -457,6 +457,12 @@ export interface AppSettings {
       checkpoint: string | null;
       /** Whether memory auto-typing is enabled (opt-in). */
       auto_type_memories: boolean;
+      /** Whether failure triage is enabled (opt-in; needs a fine-tuned
+       *  checkpoint). */
+      failure_triage: boolean;
+      /** Whether the startup failure-triage fine-tune is enabled (managed
+       *  mode only, opt-in). */
+      auto_finetune: boolean;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
@@ -564,6 +570,10 @@ export interface SettingsSavePatch {
   laya_checkpoint?: string;
   /** Laya memory auto-typing (opt-in; needs a fine-tuned checkpoint). */
   laya_auto_type_memories?: boolean;
+  /** Laya failure triage (opt-in; needs a fine-tuned checkpoint). */
+  laya_failure_triage?: boolean;
+  /** Startup failure-triage fine-tune (managed mode only, opt-in). */
+  laya_auto_finetune?: boolean;
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
@@ -669,9 +679,11 @@ export function onEmbedderStatus(
 }
 
 /**
- * The Laya classifier status wire form: a unit-variant string, or the
+ * The Laya classifier status wire form: a unit-variant string, the
  * downloading payload `{ downloading: { label, progress } }` (progress 0–1)
- * while a managed-runtime piece (uv / venv / checkpoint) downloads.
+ * while a managed-runtime piece (uv / venv / checkpoint) downloads, or the
+ * fine-tune payload `{ finetuning: { label } }` while the startup
+ * failure-triage fine-tune runs in the background.
  */
 export type ClassifierStatusWire =
   | "disabled"
@@ -679,7 +691,8 @@ export type ClassifierStatusWire =
   | "failed"
   | "installing"
   | "starting"
-  | { downloading: { label: string; progress: number } };
+  | { downloading: { label: string; progress: number } }
+  | { finetuning: { label: string } };
 
 /**
  * Get the live Laya classifier status.

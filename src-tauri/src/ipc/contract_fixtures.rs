@@ -245,6 +245,8 @@ fn dto_fixtures_match_serde() {
                 mode: LayaMode::External,
                 checkpoint: None,
                 auto_type_memories: false,
+                failure_triage: false,
+                auto_finetune: false,
             },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,

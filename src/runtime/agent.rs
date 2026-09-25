@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use crate::agent::failure_triage::{
+    self, FailureClass, FailureSite, FailureTriage, TriageAction, TriageDisposition,
+};
 use crate::agent::AgentLoop;
 use crate::memory::consolidation::{consolidate_session, corpus_digest};
 use crate::provider::{Message, MessageContent};
@@ -518,6 +521,15 @@ impl AgentTask {
     ) -> Option<crate::agent::TurnOutcome> {
         let mut attempt = 0u32;
         let mut tried_fallback = false;
+        // Failure triage (Laya, opt-in; plan 02deea7c): the logged row from
+        // the most recent classified attempt — resolved when its outcome is
+        // known (a later attempt succeeding = `retry_succeeded`; the
+        // final-failure path = `retry_failed`).
+        let mut pending_triage: Option<failure_triage::PendingFailureRow> = None;
+        // The class that SKIPPED the backoff ladder (needs-user / permanent).
+        // Named in the final-failure note + event so neither ever claims
+        // "retries exhausted" for a skip.
+        let mut skip_triage: Option<FailureClass> = None;
         loop {
             match self
                 .agent_loop
@@ -530,7 +542,15 @@ impl AgentTask {
                 )
                 .await
             {
-                Ok(outcome) => return Some(outcome),
+                Ok(outcome) => {
+                    if let Some(pending) = pending_triage.take() {
+                        failure_triage::resolve_failure(
+                            pending,
+                            TriageDisposition::RetrySucceeded,
+                        );
+                    }
+                    return Some(outcome);
+                }
                 Err(e) => {
                     // 429 fallback: a rate limit means the provider is out of
                     // quota — retrying the SAME provider never helps ("stop
@@ -574,7 +594,67 @@ impl AgentTask {
                         // on a condition that can never succeed.
                         attempt = MAX_PROVIDER_TURN_ATTEMPTS;
                     } else {
-                        attempt += 1;
+                        // Failure triage (Laya, opt-in; plan 02deea7c):
+                        // classify the provider error ONCE per attempt
+                        // sequence. The classifier only ADDS — a confident
+                        // needs-user / permanent reading skips the useless
+                        // backoff ladder (the same "set attempt to the cap"
+                        // trick the non-retryable arm uses), while a
+                        // transient / flaky-test reading — or no usable
+                        // answer at all — keeps today's ladder
+                        // byte-for-byte. A 429 never arrives here (the
+                        // fallback guard above owns it) and is never
+                        // classified.
+                        let mut classified = None;
+                        if pending_triage.is_none() && skip_triage.is_none() {
+                            if let Some(gate) = self.agent_loop.failure_triage() {
+                                let error_text = e.to_string();
+                                if let FailureTriage::Classified { class, confidence } =
+                                    gate.triage(&error_text).await
+                                {
+                                    classified = Some((gate, class, confidence, error_text));
+                                }
+                            }
+                        }
+                        match classified {
+                            Some((gate, class, confidence, error_text)) => match class {
+                                FailureClass::NeedsUser | FailureClass::Permanent => {
+                                    // The skip: logged now, disposition
+                                    // `escalated` — the ladder was
+                                    // deliberately not attempted, so the
+                                    // counterfactual is unobserved.
+                                    let pending = gate.log_failure(
+                                        FailureSite::ProviderTurn,
+                                        None,
+                                        &error_text,
+                                        class,
+                                        confidence,
+                                        TriageAction::SkipRetry,
+                                    );
+                                    failure_triage::resolve_failure(
+                                        pending,
+                                        TriageDisposition::Escalated,
+                                    );
+                                    skip_triage = Some(class);
+                                    attempt = MAX_PROVIDER_TURN_ATTEMPTS;
+                                }
+                                FailureClass::Transient | FailureClass::FlakyTest => {
+                                    // No behavior change — the existing
+                                    // ladder decides — but the row is logged
+                                    // now and resolved on its outcome.
+                                    pending_triage = Some(gate.log_failure(
+                                        FailureSite::ProviderTurn,
+                                        None,
+                                        &error_text,
+                                        class,
+                                        confidence,
+                                        TriageAction::Ladder,
+                                    ));
+                                    attempt += 1;
+                                }
+                            },
+                            None => attempt += 1,
+                        }
                     }
                     if attempt < MAX_PROVIDER_TURN_ATTEMPTS {
                         // Surface a retry note and retry after backoff.
@@ -630,8 +710,29 @@ impl AgentTask {
                         // after the fallback also 429'd) likewise failed
                         // without retries. The model still gets the actionable
                         // error text either way.
+                        // Failure triage: a classified attempt whose retry
+                        // never landed resolves `retry_failed` here.
+                        if let Some(pending) = pending_triage.take() {
+                            failure_triage::resolve_failure(
+                                pending,
+                                TriageDisposition::RetryFailed,
+                            );
+                        }
                         let qualifier = if e.is_rate_limited() {
                             "rate limited (429), no alternate provider found"
+                        } else if e.is_classified_skip() {
+                            "classified failure-triage skip (retrying cannot help)"
+                        } else if let Some(class) = skip_triage {
+                            match class {
+                                FailureClass::NeedsUser => {
+                                    "classified needs_user — retrying cannot help \
+                                     (credentials, permissions, or a quota need the user)"
+                                }
+                                _ => {
+                                    "classified permanent — retrying cannot help \
+                                     (the request itself must change)"
+                                }
+                            }
                         } else if e.is_non_retryable() {
                             "non-retryable provider error"
                         } else {
@@ -651,6 +752,8 @@ impl AgentTask {
                                 "{e} — {qualifier}. Switch models via the status-bar picker, \
                                  or configure another endpoint serving this model."
                             )
+                        } else if skip_triage.is_some() {
+                            format!("{e} — {qualifier}.")
                         } else {
                             err_text
                         };
@@ -1259,6 +1362,7 @@ impl AgentTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::classifier::{Answer, Classifier, Question};
     use crate::provider::Role;
     use crate::agent::context::ContextManager;
     use crate::agent::AgentLoopConfig;
@@ -7860,5 +7964,274 @@ mod tests {
 
         // Third call — flag was cleared, proceeds again.
         assert!(!flag.swap(true, std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // --- Failure triage at the provider site (plan 02deea7c) -------------
+
+    /// A provider that always returns a `Provider` error, with a call counter
+    /// — the retry-ladder / classifier-skip assertion hook.
+    struct ErrorProvider {
+        caps: Capabilities,
+        message: &'static str,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait]
+    impl LlmClient for ErrorProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock-error"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> Result<BoxStream<'_, LlmEvent>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::error::Error::Provider(self.message.into()))
+        }
+    }
+
+    /// A classifier with one canned answer — the gate's decision source.
+    struct CannedClassifier {
+        label: &'static str,
+        confidence: f64,
+    }
+
+    #[async_trait]
+    impl Classifier for CannedClassifier {
+        async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+            Some(Answer::Choice {
+                label: self.label.to_string(),
+                confidence: self.confidence,
+                probabilities: std::collections::BTreeMap::new(),
+            })
+        }
+    }
+
+    /// A failure-triage gate over a canned classifier, logging to `log` — a
+    /// tempdir file, never the real `~/.mnemo` training log.
+    fn triage_gate(
+        label: &'static str,
+        confidence: f64,
+        enabled: bool,
+        log: std::path::PathBuf,
+    ) -> crate::agent::failure_triage::FailureTriageHandle {
+        let classifier: Arc<dyn Classifier> = Arc::new(CannedClassifier { label, confidence });
+        crate::agent::failure_triage::FailureTriageHandle::new(
+            Arc::new(std::sync::RwLock::new(Some(classifier))),
+            Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+        )
+        .with_log_path(log)
+    }
+
+    /// Run ONE turn attempt against an always-erroring provider and return
+    /// (provider calls, emitted events, resolved training rows, conversation).
+    async fn run_provider_failure(
+        message: &'static str,
+        triage: crate::agent::failure_triage::FailureTriageHandle,
+        log: std::path::PathBuf,
+    ) -> (
+        u32,
+        Vec<AgentEvent>,
+        Vec<crate::agent::failure_triage::FailureLogRow>,
+        Vec<Message>,
+    ) {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            dir.path().join("plans"),
+        )));
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                AgentLoopConfig {
+                    provider: Arc::new(ErrorProvider {
+                        caps: Capabilities::openai(),
+                        message,
+                        calls: Arc::clone(&calls),
+                    }),
+                    tools: Arc::new(ToolRegistry::new()),
+                    workflow,
+                    sandbox,
+                    safety_mode: SafetyMode::Autonomous,
+                    context_manager: ContextManager::new(128_000, 0.5),
+                    memory: None,
+                    vision: None,
+                },
+                crate::project::Constitution::default(),
+            )
+            .with_failure_triage(triage),
+        );
+
+        let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let mut task = AgentTask::new(1, "triage-test".into(), agent_loop);
+        // Drive ONE turn attempt directly: `AgentTask::run`'s auto-continue
+        // loop re-runs a failed turn (MAX_AUTO_CONTINUE rounds), which would
+        // multiply every call/event count this harness asserts on.
+        let outcome = task.run_turn_attempt(&fanin_tx, &mut cmd_rx).await;
+        assert!(
+            outcome.is_none(),
+            "the provider always fails — the attempt must end in final failure"
+        );
+        let mut events = Vec::new();
+        while let Ok((_id, event)) = fanin_rx.try_recv() {
+            events.push(event);
+        }
+        let count = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let rows = crate::agent::failure_triage::read_rows(&log);
+        (count, events, rows, task.messages.clone())
+    }
+
+    /// The terminal provider-failure harness note from the conversation — the
+    /// in-context qualifier (`retries exhausted` / `classified …`) that the
+    /// terminal EVENT text deliberately does not always carry.
+    fn terminal_note(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.content.as_text().contains("failed terminally"))
+            .map(|m| m.content.as_text().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The text of the terminal (non-retrying) Error in `events`.
+    fn terminal_error(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Error {
+                    error,
+                    retrying: false,
+                } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("a terminal Error event must be surfaced")
+    }
+
+    #[tokio::test]
+    async fn provider_site_needs_user_classification_skips_the_retry_ladder() {
+        // Acceptance (plan 02deea7c, tier 3): a confident `needs_user`
+        // classification of a provider error that the EXISTING heuristics
+        // treat as retryable skips the useless backoff ladder — one provider
+        // call, zero retrying notes, and a terminal message that names the
+        // class (never "retries exhausted"). The live motivation: a quota
+        // error burns ~3s of jittered sleeps on a condition only the user can
+        // clear.
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("triage.jsonl");
+        let (calls, events, rows, messages) = run_provider_failure(
+            "quota exhausted: the account has no remaining credits for this period",
+            triage_gate("needs_user", 0.9, true, log.clone()),
+            log,
+        )
+        .await;
+
+        assert_eq!(calls, 1, "needs-user must skip the ladder (1 call, not 3)");
+        let retrying = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { retrying: true, .. }))
+            .count();
+        assert_eq!(retrying, 0, "a skipped ladder emits no retrying notes");
+        let terminal = terminal_error(&events);
+        assert!(
+            terminal.contains("classified needs_user"),
+            "the terminal message must name the classification; got: {terminal}"
+        );
+        let note = terminal_note(&messages);
+        assert!(
+            note.contains("classified needs_user") && !note.contains("retries exhausted"),
+            "the in-context note must name the classification and never claim an \
+             exhausted ladder; got: {note}"
+        );
+        assert_eq!(rows.len(), 1, "the skip logs one resolved row");
+        assert_eq!(rows[0].site, "provider_turn");
+        assert_eq!(rows[0].class, "needs_user");
+        assert_eq!(rows[0].action, "skip_retry");
+        assert_eq!(rows[0].disposition.as_deref(), Some("escalated"));
+        assert_eq!(rows[0].tool, None);
+    }
+
+    #[tokio::test]
+    async fn provider_site_transient_classification_keeps_the_ladder() {
+        // The classifier only ADDS: a `transient` reading keeps today's retry
+        // ladders byte-for-byte — the inner request ladder (3 attempts per
+        // turn attempt) AND the turn-level ladder (3 attempts) — and the one
+        // logged row resolves `retry_failed` when the turn finally gives up.
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("triage.jsonl");
+        let (calls, events, rows, messages) = run_provider_failure(
+            "HTTP 502 Bad Gateway: upstream connection reset",
+            triage_gate("transient", 0.95, true, log.clone()),
+            log,
+        )
+        .await;
+
+        assert_eq!(
+            calls, 9,
+            "a transient reading keeps BOTH pre-classifier ladders \
+             (3 inner request attempts × 3 turn attempts)"
+        );
+        let retrying = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { retrying: true, .. }))
+            .count();
+        assert_eq!(
+            retrying, 8,
+            "six inner request notes + two turn-level notes — the pre-classifier count"
+        );
+        let terminal = terminal_error(&events);
+        assert!(
+            terminal.contains("HTTP 502 Bad Gateway"),
+            "the ladder path surfaces the raw provider error; got: {terminal}"
+        );
+        let note = terminal_note(&messages);
+        assert!(
+            note.contains("retries exhausted") && !note.contains("classified"),
+            "the ladder path keeps its exhausted-ladder note and adds no \
+             classification; got: {note}"
+        );
+        assert_eq!(rows.len(), 1, "the classified failure logs exactly once");
+        assert_eq!(rows[0].action, "ladder");
+        assert_eq!(rows[0].class, "transient");
+        assert_eq!(rows[0].disposition.as_deref(), Some("retry_failed"));
+    }
+
+    #[tokio::test]
+    async fn provider_site_disabled_triage_keeps_the_ladder_unchanged() {
+        // Acceptance (byte-identical while the flag is off): the ladder runs
+        // exactly as before, nothing is classified, nothing is logged.
+        let dir = tempdir().unwrap();
+        let log = dir.path().join("triage.jsonl");
+        let (calls, events, rows, messages) = run_provider_failure(
+            "HTTP 502 Bad Gateway: upstream connection reset",
+            triage_gate("transient", 0.95, false, log.clone()),
+            log.clone(),
+        )
+        .await;
+
+        assert_eq!(
+            calls, 9,
+            "a disabled gate must not touch either ladder (3 inner × 3 turn attempts)"
+        );
+        let retrying = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Error { retrying: true, .. }))
+            .count();
+        assert_eq!(retrying, 8);
+        let note = terminal_note(&messages);
+        assert!(
+            note.contains("provider error, retries exhausted"),
+            "the wording stays pre-classifier; got: {note}"
+        );
+        assert!(rows.is_empty());
+        assert!(!log.exists(), "a disabled gate must not write a training row");
     }
 }

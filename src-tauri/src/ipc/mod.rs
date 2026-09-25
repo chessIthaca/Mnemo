@@ -26,6 +26,7 @@ pub mod config_io;
 pub mod embeddings;
 pub mod error;
 pub mod events;
+pub mod finetune;
 pub mod files;
 pub mod keys;
 pub mod laya;

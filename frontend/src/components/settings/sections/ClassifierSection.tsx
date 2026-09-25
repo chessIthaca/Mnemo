@@ -33,9 +33,12 @@ type LayaMode = "external" | "managed";
 /** Short chip label for a status (the downloading payload collapses to a %). */
 function statusLabel(status: ClassifierStatusWire): string {
   if (typeof status === "object") {
-    return `downloading ${status.downloading.label} (${fmtPct(
-      status.downloading.progress * 100,
-    )}%)`;
+    if ("downloading" in status) {
+      return `downloading ${status.downloading.label} (${fmtPct(
+        status.downloading.progress * 100,
+      )}%)`;
+    }
+    return `fine-tuning ${status.finetuning.label}`;
   }
   return status;
 }
@@ -43,9 +46,12 @@ function statusLabel(status: ClassifierStatusWire): string {
 /** One-line explanation of each live classifier status. */
 function statusHint(status: ClassifierStatusWire, managed: boolean): string {
   if (typeof status === "object") {
-    return `Downloading ${status.downloading.label} — ${fmtPct(
-      status.downloading.progress * 100,
-    )}%. The managed runtime + checkpoint total ~0.8–1 GB on disk.`;
+    if ("downloading" in status) {
+      return `Downloading ${status.downloading.label} — ${fmtPct(
+        status.downloading.progress * 100,
+      )}%. The managed runtime + checkpoint total ~0.8–1 GB on disk.`;
+    }
+    return `Fine-tuning ${status.finetuning.label} on the logged failure classifications — the sidecar keeps serving; the checkpoint hot-swaps when the run finishes.`;
   }
   switch (status) {
     case "ready":
@@ -95,6 +101,11 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   // The auto-typing opt-in (`[general.laya] auto_type_memories`) — a
   // separate toggle from the classifier enable flag.
   const [autoType, setAutoType] = useState(false);
+  // The failure-triage opt-in (`[general.laya] failure_triage`) and the
+  // startup fine-tune opt-in (`[general.laya] auto_finetune`, managed mode
+  // only) — separate toggles, same opt-in convention.
+  const [failureTriage, setFailureTriage] = useState(false);
+  const [autoFinetune, setAutoFinetune] = useState(false);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
   const [snapshot, setSnapshot] = useState<string>("");
   const [status, setStatus] = useState<ClassifierStatusWire>("disabled");
@@ -120,12 +131,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         checkpoint: laya?.checkpoint ?? "english",
         endpoint: laya?.endpoint ?? "",
         autoTypeMemories: laya?.auto_type_memories ?? false,
+        failureTriage: laya?.failure_triage ?? false,
+        autoFinetune: laya?.auto_finetune ?? false,
       };
       setEnabled(next.enabled);
       setMode(next.mode);
       setCheckpoint(next.checkpoint);
       setEndpoint(next.endpoint);
       setAutoType(next.autoTypeMemories);
+      setFailureTriage(next.failureTriage);
+      setAutoFinetune(next.autoFinetune);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
       // Read the live status directly (not from the startup snapshot) so the
@@ -151,7 +166,12 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     onClassifierStatus((next) => {
       setStatus(next);
       if (typeof next === "object") {
-        setProgress(next.downloading.progress);
+        // Download progress rides the downloading payload only — the
+        // fine-tune state carries no progress (the checkpoint hot-swaps
+        // when the run finishes).
+        if ("downloading" in next) {
+          setProgress(next.downloading.progress);
+        }
       } else {
         // Terminal status — refresh the catalog so a finished setup shows
         // the checkpoint as installed.
@@ -166,7 +186,15 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     };
   }, [active]);
 
-  const draft: ClassifierDraft = { enabled, mode, checkpoint, endpoint, autoTypeMemories: autoType };
+  const draft: ClassifierDraft = {
+    enabled,
+    mode,
+    checkpoint,
+    endpoint,
+    autoTypeMemories: autoType,
+    failureTriage,
+    autoFinetune,
+  };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
 
   useEffect(() => {
@@ -192,14 +220,17 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setError(null);
       setOk(false);
       try {
-        // The mode + enable flag + checkpoint + the auto-typing opt-in ride
+        // The mode + enable flag + checkpoint + the three Laya opt-ins ride
         // along so toggling takes effect without a restart (the backend
-        // rewires the live classifier — flipping the auto-type flag — and
-        // starts/stops the managed sidecar). A blank endpoint clears the
-        // stored URL server-side; managed mode never persists one.
+        // rewires the live classifier — flipping the auto-type and
+        // failure-triage flags — and starts/stops the managed sidecar). A
+        // blank endpoint clears the stored URL server-side; managed mode
+        // never persists one.
         await saveSettings({
           laya_enabled: enabled,
           laya_auto_type_memories: autoType,
+          laya_failure_triage: failureTriage,
+          laya_auto_finetune: autoFinetune,
           laya_mode: mode,
           ...(mode === "managed" ? { laya_checkpoint: checkpoint } : {}),
           laya_endpoint: mode === "managed" ? "" : endpoint,
@@ -272,6 +303,45 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             BUG / PLAN / HOW / REVIEW prefix on write; low confidence keeps
             yours. Enable only against a fine-tuned checkpoint — base models
             mis-classify.
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={failureTriage}
+          onChange={(e) => setFailureTriage(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Classify failures to steer retries
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — at every failure site the error is classified
+            (transient / permanent / needs_user / flaky_test) and a confident
+            class steers the harness: read-only calls auto-retry once without
+            a model roundtrip, other classes get targeted guidance, and
+            needs-user/permanent provider errors skip the retry ladder. Every
+            classified failure is logged with its true outcome so the startup
+            fine-tune can learn from it. Enable only against a fine-tuned
+            checkpoint — base models mis-classify.
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={autoFinetune}
+          onChange={(e) => setAutoFinetune(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Fine-tune on startup from logged failures
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — managed mode only: when enough new classified failures have
+            accrued since the last fine-tune, the checkpoint is retrained in
+            the background and hot-swapped. Never blocks startup.
           </span>
         </span>
       </label>

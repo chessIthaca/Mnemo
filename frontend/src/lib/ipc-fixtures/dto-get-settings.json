@@ -17,7 +17,9 @@
       "endpoint": null,
       "mode": "external",
       "checkpoint": null,
-      "auto_type_memories": false
+      "auto_type_memories": false,
+      "failure_triage": false,
+      "auto_finetune": false
     },
     "safety": "approve-each-action",
     "vision_model": null

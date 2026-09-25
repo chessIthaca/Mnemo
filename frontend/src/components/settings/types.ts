@@ -435,6 +435,10 @@ export interface ClassifierDraft {
   /** The `auto_type_memories` opt-in — a separate toggle from `enabled`
    * (confidence-gated prefix correction; needs a fine-tuned checkpoint). */
   autoTypeMemories: boolean;
+  /** The `failure_triage` opt-in — classify failures to steer retries. */
+  failureTriage: boolean;
+  /** The `auto_finetune` opt-in — the startup fine-tune (managed only). */
+  autoFinetune: boolean;
 }
 
 /** Serialize the classifier draft for dirty comparison. */

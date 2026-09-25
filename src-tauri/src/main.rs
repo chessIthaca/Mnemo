@@ -636,6 +636,21 @@ fn main() {
                             .await;
                         });
                     }
+
+                    // Startup failure-triage fine-tune (backlog 1a4049c1,
+                    // `[general.laya] auto_finetune`): managed runtime only.
+                    // The gate (enabled + managed + flag + installed) lives
+                    // in ipc::finetune; the spawned task counts the labeled
+                    // rows newer than the fine-tune marker and, when ≥50
+                    // accrued, fine-tunes via the managed venv and hot-swaps
+                    // the served checkpoint. Never blocks startup.
+                    ipc::finetune::spawn_startup_finetune(
+                        Some(app.handle().clone()),
+                        brain.laya.clone(),
+                        brain.classifier_slot.clone(),
+                        brain.classifier_status.clone(),
+                        brain.config.clone(),
+                    );
                 }
                 Ok(BrainOutcome::NeedsProject(config)) => {
                     // No project resolved at startup — show the project picker.
@@ -1452,6 +1467,17 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.auto_type_memories,
     ));
+    // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
+    // slot plus the `[general.laya] failure_triage` flag mirror. The factory
+    // hands it to every loop it builds; the loop's dispatch site and both
+    // provider retry layers read both at failure time, and a Settings save
+    // flips the flag via `set_failure_triage_enabled` (no rebuild).
+    let failure_triage_handle = mnemo::agent::failure_triage::FailureTriageHandle::new(
+        classifier_slot.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(
+            config.general.general.laya.failure_triage,
+        )),
+    );
 
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
@@ -1965,6 +1991,12 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         classifier: classifier_slot.clone(),
         enabled: auto_typing_flag.clone(),
     })
+    // Wire the shared Laya failure-triage gate (backlog 1a4049c1): every loop
+    // the factory builds carries the classifier slot + flag, so the
+    // tool-dispatch auto-retry and both provider retry layers act on
+    // confident classifications — and a Settings save flips the flag live via
+    // `set_failure_triage_enabled` (no rebuild).
+    .with_failure_triage(failure_triage_handle)
     // Share the headless debug browser with the IPC layer (Browser tab).
     .with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —

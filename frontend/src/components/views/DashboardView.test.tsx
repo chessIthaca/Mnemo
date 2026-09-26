@@ -20,6 +20,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { DashboardBody } from "./DashboardView";
 import { fmtTokens } from "../../lib/format";
 import type { PricingEntry, ProjectStats, SavingsStats } from "../../lib/tauri";
+import viewSource from "./DashboardView.tsx?raw";
 
 /** A pricing table where 1M uncached input tokens cost $3, 1M cached $0.30. */
 const pricing: PricingEntry[] = [
@@ -189,5 +190,34 @@ describe("DashboardBody (backlog 652ae094)", () => {
     const html = render(savings, project, otherModels);
     expect(html).toContain("No [[pricing]] entries for the models this project used");
     expect(html).not.toContain("never part of the metered totals");
+  });
+});
+
+/**
+ * Live update while the tab is open (user report 2027-01-25): the wrapper used
+ * to fetch once on mount, so the view stayed stale until it was closed and
+ * reopened. Its effect never runs under `renderToStaticMarkup`, so — like
+ * InflightBar.test.ts pins its elapsed-timer interval — the wiring is pinned at
+ * the source level instead.
+ */
+describe("DashboardView live refresh (user report 2027-01-25)", () => {
+  it("polls the savings ledger while its tab is open", () => {
+    // The house 2 s fallback cadence, matching PlanProgress's plan-file poll.
+    expect(viewSource).toContain("const POLL_MS = 2000;");
+    expect(viewSource).toContain("const interval = setInterval(() => void tick(), POLL_MS);");
+    // An open-but-idle view must not poll while the window is hidden...
+    expect(viewSource).toContain("document.hidden");
+    // ...nor stack IPC calls when a fetch outlives the poll interval.
+    expect(viewSource).toContain("inFlight.current");
+    // Regaining focus refreshes at once instead of waiting out the interval.
+    expect(viewSource).toContain('window.addEventListener("focus", onFocus)');
+    expect(viewSource).toContain('document.addEventListener("visibilitychange", onFocus)');
+  });
+
+  it("tears the poll down on unmount (closing the panel or switching tabs)", () => {
+    expect(viewSource).toContain("const interval = setInterval(");
+    expect(viewSource).toContain("clearInterval(interval);");
+    expect(viewSource).toContain('window.removeEventListener("focus", onFocus)');
+    expect(viewSource).toContain('document.removeEventListener("visibilitychange", onFocus)');
   });
 });

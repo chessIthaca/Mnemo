@@ -155,9 +155,8 @@ pub struct AgentRuntimeContext {
     /// frontend via `get_classifier_status` + the startup snapshot.
     pub classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
     /// The built classifier, when Laya is enabled — the handle items 2-5
-    /// will consume (`None` while disabled; see `build_classifier`). Behind
-    /// a lock so a Settings save can swap the rebuilt backend in without a
-    /// restart.
+    /// will consume (`None` while disabled). Behind a lock so a Settings
+    /// save can swap the rebuilt backend in without a restart.
     pub classifier: Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
     /// The managed Laya runtime owner (setup pipeline, the `laya-serve`
     /// child, its port) — one instance shared by the setup command, the

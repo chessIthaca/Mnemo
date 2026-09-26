@@ -467,9 +467,13 @@ pub fn plan_loop_allows_done(state: WorkflowState, changed_this_turn: bool) -> b
 /// flipped the item to Done with no status guard — `Pending → Done` is a
 /// legal transition row, and the transition WIPED the item's explanatory
 /// re-queue note. The guard: the item must currently be `InFlight`, and —
-/// when both linkages are readable — the item's `plan_id` (stamped at plan
-/// creation by `stamp_backlog_in_flight`) must match the completing plan
-/// (the workflow's root plan id, kept after `finish`). A re-queued item, a
+/// when both linkages are readable — the item's `plan_id` must match the
+/// completing plan (the workflow's root plan id, kept after `finish`). The
+/// linkage is recorded by `stamp_backlog_in_flight` at the main agent's
+/// `Executing` entry for BOTH a dispatched item (from its dispatch pointer)
+/// and a hand-stamped one (the pointer-less chat path, via
+/// `chat_linkage_candidate`); a pointer-less session is then resolvable by
+/// that linkage alone ([`resolve_linked_chat_item`]). A re-queued item, a
 /// mismatched plan, or an item that never planned must NOT transition.
 ///
 /// Pure function (unit-testable without a Tauri `AppHandle`), mirroring
@@ -2362,6 +2366,22 @@ mod tests {
                  in the tree for the resumed session"
             );
         }
+        // The pointer-less chat arm (backlog 9e859618) resolves ONLY by the
+        // item↔plan linkage and through the same guard — never a relaxed
+        // predicate, never CantResolve, never a rollback.
+        let chat = fn_body(include_str!("run_all.rs"), "resolve_linked_chat_item");
+        assert!(chat.contains("plan_loop_allows_done(main_state, loop_evidence)"));
+        assert!(chat.contains("run_all_success_disposition"));
+        assert!(
+            chat.contains("resolve_linkage_target"),
+            "the arm must select its item BY the plan linkage"
+        );
+        assert!(!chat.contains("BacklogStatus::CantResolve"));
+        assert!(!chat.contains("rollback("));
+        // The `Executing`-entry stamp falls back to the hand-stamped item
+        // when no dispatch pointer names one.
+        let stamp = fn_body(include_str!("run_all.rs"), "stamp_backlog_in_flight");
+        assert!(stamp.contains("chat_linkage_candidate(&store.items(), top_plan_id)"));
         // The single-dispatch path auto-feeds only past a terminally
         // resolved item.
         assert!(single.contains("resolved_terminally"));
@@ -2785,6 +2805,128 @@ mod tests {
             Some("X"),
             Some("X")
         ));
+    }
+
+    #[test]
+    fn chat_stamped_item_is_linked_then_resolves_by_linkage() {
+        // (backlog 9e859618) The chat path in miniature. An item stamped
+        // InFlight by an agent — no dispatch pointer, no linkage — used to
+        // strand: the `Executing` entry had nothing to link and the
+        // resolution had no arm that could see it. Both halves now do, and
+        // the Done guard itself is UNCHANGED throughout.
+        let dir = unique_temp_dir("chat-linkage");
+        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let item = store.add("chat-driven task".into(), vec![]);
+        store.set_status(&item.id, BacklogStatus::InFlight, None);
+
+        // 1. The `Executing` fallback finds the hand-stamped item...
+        assert_eq!(
+            chat_linkage_candidate(&store.items(), Some("plan-chat")).as_deref(),
+            Some(item.id.as_str())
+        );
+        // 2. ...but while it is UNLINKED the Done guard refuses it — the
+        //    pre-fix behaviour, pinned (the item never planned).
+        assert!(!plan_linkage_allows_done(
+            BacklogStatus::InFlight,
+            store.items()[0].plan_id.as_deref(),
+            Some("plan-chat"),
+        ));
+        // 3. The stamp records the linkage the dispatched paths record.
+        assert!(store.set_plan_id(&item.id, Some("plan-chat"), Some("Chat plan")));
+        // 4. The resolution arm's selection now finds it by linkage alone...
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-chat").as_deref(),
+            Some(item.id.as_str())
+        );
+        // ...and the same unchanged guard accepts it.
+        assert!(plan_linkage_allows_done(
+            BacklogStatus::InFlight,
+            store.items()[0].plan_id.as_deref(),
+            Some("plan-chat"),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A per-test temp directory — dependency-free, unique per tag and
+    /// process, cleaned up by the caller.
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mnemo-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn chat_linkage_candidate_relinks_a_superseded_plan() {
+        // (backlog 9e859618, review LOW-1) A chat item left linked to an
+        // abandoned plan must be re-linked by its successor's `Executing`
+        // entry — the same refresh the dispatched path performs — instead of
+        // stranding `InFlight` on a dead plan forever.
+        let dir = unique_temp_dir("chat-relink");
+        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let item = store.add("chat-driven task".into(), vec![]);
+        store.set_status(&item.id, BacklogStatus::InFlight, None);
+        store.set_plan_id(&item.id, Some("plan-old"), Some("Abandoned plan"));
+
+        // Its OWN plan entering again: already linked, nothing to re-link.
+        assert_eq!(chat_linkage_candidate(&store.items(), Some("plan-old")), None);
+        // A successor plan entering: the superseded item is claimed...
+        assert_eq!(
+            chat_linkage_candidate(&store.items(), Some("plan-new")).as_deref(),
+            Some(item.id.as_str())
+        );
+        // ...and re-linking makes it resolvable by the successor alone.
+        assert!(store.set_plan_id(&item.id, Some("plan-new"), Some("Successor")));
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-new").as_deref(),
+            Some(item.id.as_str())
+        );
+        assert_eq!(resolve_linkage_target(&store.items(), "plan-old"), None);
+        // With no readable plan id, only the never-linked case is claimed.
+        assert_eq!(chat_linkage_candidate(&store.items(), None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linkage_target_refuses_ambiguity_and_dead_items() {
+        // (backlog 9e859618) Never guess which item a completed plan owned,
+        // and never hand the resolution arm a dead or terminal item.
+        let dir = unique_temp_dir("linkage-target");
+        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let a = store.add("first".into(), vec![]);
+        store.set_status(&a.id, BacklogStatus::InFlight, None);
+        store.set_plan_id(&a.id, Some("plan-a"), None);
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-a").as_deref(),
+            Some(a.id.as_str()),
+            "exactly one claimant resolves"
+        );
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-zzz"),
+            None,
+            "an unknown plan matches nothing"
+        );
+        let b = store.add("second".into(), vec![]);
+        store.set_status(&b.id, BacklogStatus::InFlight, None);
+        store.set_plan_id(&b.id, Some("plan-a"), None);
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-a"),
+            None,
+            "two claimants: refuse rather than guess which one the plan owned"
+        );
+        assert!(store.remove(&b.id), "the second claimant is soft-deleted");
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-a").as_deref(),
+            Some(a.id.as_str()),
+            "a removed claimant never counts"
+        );
+        store.set_status(&a.id, BacklogStatus::Done, None);
+        assert_eq!(
+            resolve_linkage_target(&store.items(), "plan-a"),
+            None,
+            "a terminal item never resolves again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5475,6 +5617,67 @@ pub async fn on_main_turn_resolved(
         abandoned_plan_id,
     )
     .await;
+
+    // Pointer-less session (backlog 9e859618): a chat-driven plan never had a
+    // dispatch pointer, so neither branch above could see its item — resolve
+    // it by the linkage the forwarder recorded at its `Executing` entry.
+    // Deliberately after the dispatched paths: a dispatched item always wins,
+    // and one they just resolved is no longer `InFlight`.
+    resolve_linked_chat_item(app, &state, success, loop_evidence).await;
+}
+
+/// Resolve the item of a pointer-less (chat-driven) session by its plan
+/// linkage (backlog 9e859618).
+///
+/// A chat-driven plan has no dispatch pointer, so neither dispatch branch of
+/// [`on_main_turn_resolved`] can see its item. The forwarder DOES record the
+/// item↔plan linkage when the main agent's workflow enters `Executing`
+/// ([`stamp_backlog_in_flight`]), which makes the item resolvable by linkage
+/// alone: when the plan loop closed this turn, the item whose `plan_id` IS the
+/// completed plan resolves `Done` through the SAME guard the dispatched paths
+/// use — [`plan_linkage_allows_done`]'s `(Some, Some)` equality arm — never
+/// through a relaxed predicate.
+///
+/// The flip goes through [`run_all_success_disposition`], so it commits the
+/// item's work exactly as a dispatched `Done` does; once the closing sequence
+/// has committed, the tree is clean and that commit is a no-op. No auto-feed
+/// follows (the user is driving, not a run), and an abandoned plan is not
+/// treated as this item's failure — that stays the dispatched paths' job.
+///
+/// Unambiguous case only: nothing to do when no live `InFlight` item carries
+/// the completed plan id, and a refusal (annotate, no transition) when more
+/// than one does — never guess which item the plan owned.
+async fn resolve_linked_chat_item(
+    app: &tauri::AppHandle,
+    state: &IpcState,
+    success: bool,
+    loop_evidence: bool,
+) {
+    if !success {
+        return;
+    }
+    let Some(main_state) = main_agent_workflow_state(state).await else {
+        return;
+    };
+    if !plan_loop_allows_done(main_state, loop_evidence) {
+        return;
+    }
+    let Some(completed_plan) = main_agent_top_plan_id(state).await else {
+        return;
+    };
+    let (item, root) = {
+        let store = state.backlog.store.lock().await;
+        let items = store.items();
+        let Some(id) = resolve_linkage_target(&items, &completed_plan) else {
+            return;
+        };
+        let Some(item) = items.into_iter().find(|i| i.id == id) else {
+            return;
+        };
+        let root = state.project.root.lock().await.root.clone();
+        (item, root)
+    };
+    let _ = run_all_success_disposition(app, state, &item, root, loop_evidence, false, None).await;
 }
 
 /// Resolve the single-dispatch / auto-feed in-flight item (if any) against a
@@ -7012,6 +7215,91 @@ async fn finish_captured_item_done(app: &tauri::AppHandle, state: &IpcState, id:
 /// non-Executing state (e.g. Complete → Executing on a fresh plan) stamps
 /// again, which is harmless: the stamp only applies to still-`Pending`
 /// items. Pure function, unit-testable without a Tauri `AppHandle`.
+/// The item a dispatched-side `Executing` entry should link when NO dispatch
+/// pointer names one (backlog 9e859618 — the chat-driven path).
+///
+/// The status ⇔ plan-lifecycle contract (backlog 45dcf577) derives an item's
+/// status from its plan, so the two records must be joined: a dispatched path
+/// gets the join from its dispatch pointer, while a session driven from chat
+/// has none — the agent stamps the item `InFlight` with the `backlog_status`
+/// tool, and only this `Executing` entry can record which plan it belongs to.
+/// `current_plan` is the plan now entering `Executing`:
+///
+/// - an item with NO `plan_id` is the agent's own hand-stamp awaiting a plan;
+/// - an item linked to a DIFFERENT plan was linked to a plan that was
+///   abandoned and replaced, so this entry re-links it to the successor —
+///   the same refresh the dispatched path performs, so the linkage always
+///   names the plan the item's status derives from;
+/// - with no readable plan id, only the unlinked case is claimed.
+///
+/// Unambiguous answers only: exactly ONE live `InFlight` item qualifies. Zero
+/// candidates (nothing was stamped by hand) or several (two candidates —
+/// which one this plan owns is unknowable) resolve to `None`, which preserves
+/// the pre-change no-op behaviour.
+///
+/// TRADE-OFF (accepted, recorded from the plan-822c524a review, LOW-2): an
+/// item left `InFlight` and unlinked by a session that DIES before its plan
+/// completes — a crash, or an agent that never stamped its own item — is
+/// indistinguishable from this session's hand-stamp, so the next pointer-less
+/// plan adopts it. The window needs all three of a stale unlinked `InFlight`
+/// item, no dispatch pointer, and the current agent never stamping its own
+/// item; `adopt_orphaned_in_flight` does not narrow it, because that runs only
+/// at run-all start, which a chat-driven session never reaches. Before this
+/// helper the orphan had no recovery path within the pointer-less chat flow —
+/// it stranded until a run-all start (the `adopt_orphaned_in_flight` sweep) or
+/// a hand-stamp intervened — and a wrong `Done` is recoverable through the
+/// legal `Done → Pending` requeue.
+///
+/// Pure function (unit-testable without a Tauri `AppHandle`), mirroring
+/// [`plan_linkage_allows_done`].
+pub fn chat_linkage_candidate(
+    items: &[mnemo::backlog::BacklogItem],
+    current_plan: Option<&str>,
+) -> Option<String> {
+    let mut candidates = items.iter().filter(|item| {
+        item.deleted_at.is_none()
+            && item.status == BacklogStatus::InFlight
+            && match item.plan_id.as_deref() {
+                None => true,
+                Some(linked) => matches!(current_plan, Some(plan) if plan != linked),
+            }
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(candidate.id.clone())
+}
+
+/// The item a chat-driven session's completed plan owns (backlog 9e859618).
+///
+/// Used by [`resolve_linked_chat_item`]: a chat-driven session has no dispatch
+/// pointer, so its item can only be identified by the plan linkage the
+/// `Executing` entry recorded. Unambiguous answers only — exactly one live
+/// `InFlight` item whose `plan_id` IS `completed_plan`; zero (nothing claims the
+/// plan) or several (two items claiming it) resolve to `None`, so the caller
+/// never guesses which item the plan owned.
+///
+/// Pure function (unit-testable without a Tauri `AppHandle`), the mirror of
+/// [`chat_linkage_candidate`].
+pub fn resolve_linkage_target(
+    items: &[mnemo::backlog::BacklogItem],
+    completed_plan: &str,
+) -> Option<String> {
+    let mut matches = items.iter().filter(|item| {
+        item.deleted_at.is_none()
+            && item.status == BacklogStatus::InFlight
+            && item.plan_id.as_deref() == Some(completed_plan)
+    });
+    let target = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(target.id.clone())
+}
+
+/// Whether a main-agent workflow transition ENTERS `Executing` — the stamp
+/// gate for [`stamp_backlog_in_flight`].
 pub fn should_stamp_in_flight(prev: Option<WorkflowState>, new: WorkflowState) -> bool {
     matches!(new, WorkflowState::Executing) && prev != Some(WorkflowState::Executing)
 }
@@ -7028,6 +7316,14 @@ pub fn should_stamp_in_flight(prev: Option<WorkflowState>, new: WorkflowState) -
 /// repeated entries), while the linkage refreshes on every entry (a fresh
 /// plan replacing an abandoned one mid-dispatch re-links).
 ///
+/// The item is the dispatch pointer's when a dispatch is in flight; with no
+/// pointer (a chat-driven session — backlog 9e859618) it is the one
+/// hand-stamped `InFlight` item that is unlinked or still linked to a
+/// superseded plan, see [`chat_linkage_candidate`] (which re-links a
+/// superseded item to the plan now executing). Either way the linkage written
+/// here is what later lets a pointer-less session resolve `Done`
+/// ([`resolve_linked_chat_item`]).
+///
 /// The MAIN-agent gate lives at the call site (the forwarder owns the
 /// manager lock budget): child agents entering `Executing` must not stamp
 /// the main agent's item while it is still pre-planning.
@@ -7035,7 +7331,7 @@ pub(crate) async fn stamp_backlog_in_flight(app: &tauri::AppHandle, top_plan_id:
     let state = app.state::<IpcState>();
     // Run-All takes priority; then the single-dispatch in-flight pointer
     // (read-only — resolution still consumes it).
-    let item_id = {
+    let pointer = {
         let guard = state.backlog.run_all.lock().await;
         match guard.as_ref() {
             Some(r) => r
@@ -7051,10 +7347,14 @@ pub(crate) async fn stamp_backlog_in_flight(app: &tauri::AppHandle, top_plan_id:
                 .clone(),
         }
     };
+    let mut store = state.backlog.store.lock().await;
+    // Chat-path fallback (backlog 9e859618): with no dispatch pointer, the
+    // item an agent stamped `InFlight` by hand — and which no plan has linked
+    // yet — is the only item this `Executing` entry can belong to.
+    let item_id = pointer.or_else(|| chat_linkage_candidate(&store.items(), top_plan_id));
     let Some(id) = item_id else {
         return;
     };
-    let mut store = state.backlog.store.lock().await;
     let found = store
         .items()
         .iter()

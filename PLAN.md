@@ -515,10 +515,11 @@ shot.
   only on this branch)` hint when the finish lands on a non-main branch),
   and supersedes the plan's crash markers.
 
-Merge hygiene: the `merge_to_main` skill's post-merge step supersedes the
-branch-status records citing the merged branch (memory tools are always
-available inside a skill — no allow-list entry needed), so stale "unmerged"
-hints stop recalling once the branch lands. The compiled prompt encodes the
+Merge hygiene: the `merge_to_main` skill supersedes the branch-status records
+citing the merged branch ON THE BRANCH, before the landing commit (memory
+tools are always available inside a skill — no allow-list entry needed), so the
+successors land with the merge and stale "unmerged" hints stop recalling once
+the branch lands. The compiled prompt encodes the
 default-assumption rule: a feature/bug with no live unmerged marker is
 assumed to be in main (verify with `git_read` when it matters).
 

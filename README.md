@@ -40,9 +40,9 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
-| **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). |
+| **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). Optional tool-choice steering (`steer_tool_choice`) lets the classifier pick how `search`/`search_read` auto-delegation routes a query — symbol / text / memory — instead of the shape heuristics, and every steered search is logged with its disposition (delegated? escaped?) to seed a fine-tune. |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
-| **Token-optimizer levers** | Six opt-in context-economy levers (`[general.optimizer]`, all off by default): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, and cache-safe lean-output nudges — each writing a `savings_events` row. Settable in **Settings → Savings**. |
+| **Token-optimizer levers** | Six context-economy levers (`[general.optimizer]`, all on by default since 2027-01-25 — uncheck any in Settings → Savings): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, and cache-safe lean-output nudges — each writing a `savings_events` row. Settable in **Settings → Savings**. |
 | **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
@@ -158,24 +158,27 @@ In the config dialog download a semantic model that runs locally on your machine
 
 If you want in browser debugging you have to enable it in the advanced section of the config dialog.
 
-If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and pick Managed: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites. Advanced: run `laya-serve` yourself and point the section at its endpoint URL instead.
+If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and enable it: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + the English checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites, and nothing to point at an endpoint.
 
 ### Context economy — the `[general.optimizer]` levers
 
-Six independent context-economy levers, all **off by default**; with a flag
-off, the code path is byte-identical to pre-lever behaviour. Turn them on in
-**Settings → Savings** (each toggle takes effect on the next tool call — no
-restart; the Dashboard view meters what they save, per project), or add the
-`[general.optimizer]` section to `config.toml` by hand:
+Six independent context-economy levers, all **on by default** (2027-01-25 —
+saving tokens is the expected behaviour, not an opt-in); a flag turned off is
+byte-identical to pre-lever behaviour. Uncheck a lever in **Settings → Savings**
+(each toggle takes effect on the next tool call — no restart; the Dashboard view
+meters what they save, per project). A `config.toml` that never wrote the
+`[general.optimizer]` section runs every lever — the section appears only once
+you opt out of one (or move a knob), and an explicit `false` there is honoured
+as written:
 
 ```toml
 [general.optimizer]
-delta_reads = true           # re-reads serve a skeleton or a diff, not whole files
-compress_output = true       # compress known command families + redact credentials
-archive = true               # archive large tool results; expand_result retrieves them
-compaction_survival = true   # survive summarization: checkpoint + preserved decisions
-quality_score = true         # S–F context grade in the ctx hover popup
-lean_output_nudge = true     # keep the model's own output lean as the window fills
+delta_reads = false          # opt out: re-reads serve whole files again
+compress_output = false      # opt out: command output is served verbatim
+archive = false              # opt out: large tool results are not archived
+compaction_survival = false  # opt out: no checkpoint or preserved decisions
+quality_score = false        # opt out: no S–F grade in the ctx hover popup
+lean_output_nudge = false    # opt out: no lean-output steering line
 
 # knobs (defaults shown)
 archive_min_chars = 20000    # only results at least this large are archived

@@ -86,6 +86,20 @@ export function fmtPct(p: number): string {
 }
 
 /**
+ * Format a savings ratio — how many of the `before` tokens the optimizer
+ * kept out of the context — as the project's % text (`${fmtPct(x)}%`,
+ * backlog 9042b47c). The Dashboard's recent-events rows show this in place
+ * of the raw before → after sizes, so a row reads "92.5%" next to the
+ * metered savings figure. A non-positive `before` carries no ratio at all
+ * (and would render "NaN%"), so it yields "—". Negative savings stay
+ * signed and honest — never clamped.
+ */
+export function fmtSavingsPct(saved: number, before: number): string {
+  if (!(before > 0)) return "—";
+  return `${fmtPct((saved / before) * 100)}%`;
+}
+
+/**
  * Format an elapsed duration in milliseconds the way Claude's UI does:
  * "22s" under a minute, "1m 3s" under an hour, "1h 2m 3s" beyond (hour
  * shown, minutes always shown once an hour has passed, seconds always

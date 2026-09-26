@@ -9,7 +9,7 @@
 //! closes that gap with zero retraining: it embeds the incoming failure
 //! text with the app's existing embedding backend (the same shared embedder
 //! slot the memory store uses — never `laya-serve`, so the overlay is
-//! independent of the Laya endpoint), retrieves the [`KNN_K`] most similar
+//! independent of the laya-serve sidecar), retrieves the [`KNN_K`] most similar
 //! logged failures from the failure-triage training log, and majority-votes
 //! the [`FailureClass`] — the vote share IS the confidence, gated by the
 //! same inclusive 0.80

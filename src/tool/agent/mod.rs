@@ -56,6 +56,7 @@ pub mod search_read;
 pub mod shell;
 pub mod shell_filter;
 pub mod spawn_agent;
+pub mod tool_choice;
 pub mod tool_contract;
 pub mod web_fetch;
 pub mod write_review_report;

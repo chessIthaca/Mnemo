@@ -24,7 +24,7 @@ pub mod settings_dto;
 
 pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry};
 pub use general::{
-    EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig, LayaMode, MarkdownConfig,
+    EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig, MarkdownConfig,
     ModelRef, ModelsConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, ShellFilterOverride,
     TraceConfig, VisionModel, EMBEDDING_MODEL_SENTINEL_HASH,
 };

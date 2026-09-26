@@ -1,6 +1,7 @@
 +++
 title = "Laya managed uv sidecar (not in-process) for embedding-parity UX"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 DECISION (plan d6fc659a): the Laya classifier gets a MANAGED SIDECAR runtime, not an in-process port. Mnemo downloads uv (single-file binary, GitHub releases) on demand into <global_config_dir>/laya/bin, creates <config>/laya/venv via `uv venv --python 3.12` (uv fetches standalone CPython), `uv pip install "laya[serve]"`, and pre-downloads the checkpoint via `laya.load` with HF_HOME=<config>/laya/hf (progress = dir-size sampling, the embeddings trick). When enabled, Mnemo spawns the venv's laya-serve on 127.0.0.1:<free port> (LAYA_HOST/PORT/MODELS/PRELOAD/THREADS env), probes POST /v1/systemone with empty questions (returns 200 answers:{} — documented readiness probe), and kills the child on app exit / disable / reconfigure.

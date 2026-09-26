@@ -1450,9 +1450,9 @@ pub(crate) async fn run_console() -> i32 {
     // sidecar on the port the classifier client was built against. No
     // Tauri events in console mode — the status transitions still land in
     // the shared status for any GUI process reading it.
-    if let Some((checkpoint_id, port)) = &brain.pending_laya_start {
+    if let Some((_checkpoint_id, port)) = &brain.pending_laya_start {
         let manager = brain.laya.clone();
-        let checkpoint = crate::ipc::laya::find_checkpoint(checkpoint_id);
+        let checkpoint = crate::ipc::laya::english_checkpoint();
         let port = *port;
         let no_app: Option<tauri::AppHandle> = None;
         tokio::spawn(async move {

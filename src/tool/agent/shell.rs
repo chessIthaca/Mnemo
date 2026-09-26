@@ -930,11 +930,17 @@ mod tests {
 
     #[tokio::test]
     async fn compression_off_passes_output_through_byte_identically() {
-        // The default-off pin: with lever 2 off the call site changes
-        // nothing — every line survives and no savings data rides the
-        // result.
+        // The opt-out pin: the levers default ON, so this test opts lever 2
+        // out explicitly — off, the call site changes nothing, every line
+        // survives, and no savings data rides the result.
         let dir = tempdir().unwrap();
-        let tool = compactor_tool(dir.path(), OptimizerConfig::default());
+        let tool = compactor_tool(
+            dir.path(),
+            OptimizerConfig {
+                compress_output: false,
+                ..Default::default()
+            },
+        );
         let result = tool
             .execute(json!({"command": repetitive_cmd(), "purpose": "compression off"}))
             .await;

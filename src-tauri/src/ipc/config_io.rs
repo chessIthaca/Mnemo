@@ -203,8 +203,9 @@ pub(crate) fn resolve_model_provider(
 /// `ModelChanged` per agent) and the console runtime (which prints instead).
 ///
 /// The provider swap ALWAYS clears `resolved_model` — the provider just
-/// changed, so the previous turn's per-context override is stale until the
-/// next turn re-resolves it. Returns the ids of the agents whose loops were
+/// changed, so the previous request's per-context override is stale until the
+/// next request re-resolves it (resolution runs per request, 2027-01-25).
+/// Returns the ids of the agents whose loops were
 /// swapped, so each caller can surface the change through its own channel.
 pub(crate) async fn swap_provider_into_loops(
     factory: &Arc<AgentLoopFactory>,
@@ -218,8 +219,10 @@ pub(crate) async fn swap_provider_into_loops(
     // loop built from now on — backlog 51dab4da).
     factory.set_default_display_effort(display_effort.clone());
     // Swap into every live agent loop + clear the stale resolved model
-    // (mirrors `set_model`): the provider just changed, so the previous turn's
-    // per-context override is stale until the next turn re-resolves it.
+    // (mirrors `set_model`): the provider just changed, so the previous
+    // request's per-context override is stale until the next request
+    // re-resolves it — per-request resolution (2027-01-25), so a swap made
+    // mid-run lands before the next call.
     // Collect the ids so the caller can surface the swap after dropping the
     // lock.
     let agent_ids: Vec<AgentId> = {
@@ -255,8 +258,9 @@ pub(crate) async fn swap_provider_into_loops(
 /// later transitions to a state with a configured `[models.*]` slot, that
 /// configured model takes over; with nothing configured for the new state
 /// the pin keeps serving. Clears that loop's `resolved_model` so
-/// `list_agents` reports the new model immediately (the previous turn's
-/// per-context override is stale until the next turn re-resolves it).
+/// `list_agents` reports the new model immediately (the previous request's
+/// per-context override is stale until the next request re-resolves it —
+/// per-request resolution, 2027-01-25).
 ///
 /// Returns [`SwapOutcome::NotFound`] when the agent id is not in the map (the
 /// caller reports "no agent loop for agent {id}" and emits nothing).

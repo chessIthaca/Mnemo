@@ -299,7 +299,10 @@ pub enum AgentEvent {
     SkillStarted { name: String, prompt: String },
     /// The active model changed for this agent — emitted by the IPC layer
     /// (`set_model` / `save_endpoints`) right after the provider is swapped
-    /// into every live agent loop, so the frontend can update the per-agent
+    /// into every live agent loop, and by the turn loop's per-request seam
+    /// when a mid-run change (model picker, Settings save, a completed
+    /// deferred pick) makes the effective model/effort differ from the last
+    /// serve, so the frontend can update the per-agent
     /// model label (`agentModels`) immediately without a `list_agents` poll.
     /// `model` is the new effective model id (the swapped provider's model).
     /// `provider` is the `endpoints.toml` endpoint name serving that model —
@@ -308,7 +311,8 @@ pub enum AgentEvent {
     /// disambiguate; `None`/empty makes the frontend fall back to its
     /// endpoint-list resolution).
     /// This is a display event: it carries no oneshot and does not affect the
-    /// agent's turn (the swap takes effect on the next turn).
+    /// agent's turn boundaries (the swap takes effect on that turn's NEXT
+    /// REQUEST — per-request resolution, 2027-01-25).
     ModelChanged {
         model: String,
         provider: Option<String>,

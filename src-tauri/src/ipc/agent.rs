@@ -672,7 +672,8 @@ pub async fn set_model(
                         SerializableAgentEvent::Error {
                             error: format!(
                                 "Switching to '{model}' (smaller context) — \
-                                 conversation will be summarized on the next turn"
+                                 conversation will be summarized before the \
+                                 next request"
                             ),
                             retrying: false,
                         },

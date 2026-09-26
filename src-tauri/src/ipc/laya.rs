@@ -5,19 +5,19 @@
 //! Managed Laya runtime — download it in Settings, Mnemo runs it.
 //!
 //! The classifier foundation (`src/memory/classifier.rs`) talks to a
-//! `laya-serve` instance over HTTP. In managed mode
-//! (`[general.laya] mode = "managed"`) this module makes that instance a
+//! `laya-serve` instance over HTTP. Laya is managed-only
+//! (`[general.laya] enabled = true`) — this module makes that instance a
 //! detail the user never sees, mirroring the bundled embedding models:
 //!
 //! 1. **Setup** ([`laya_setup`], Settings → Classifier): download the uv
 //!    single-file binary (GitHub releases), create a private venv with a
 //!    uv-managed CPython (`uv venv --python 3.12`), `uv pip install
-//!    "laya[serve]"`, and pre-download the chosen checkpoint through the
+//!    "laya[serve]", and pre-download the English checkpoint through the
 //!    venv's python (`laya.load`) with `HF_HOME` redirected under the app
 //!    config dir. Progress rides the shared [`ClassifierStatus`] (emitted as
 //!    `classifier://status`), the same way embedder downloads ride
 //!    `embedder://status`.
-//! 2. **Runtime**: while Laya is enabled + managed + installed, the app
+//! 2. **Runtime**: while Laya is enabled + installed, the app spawns the
 //!    spawns the venv's `laya-serve` bound to `127.0.0.1:<free port>` with
 //!    `LAYA_MODELS=<checkpoint>` and probes `POST /v1/systemone` with an
 //!    empty `questions` dict (documented to return `200` with
@@ -30,7 +30,7 @@
 //! truncate each other's log), and `markers/<checkpoint>` (the
 //! per-checkpoint setup markers behind the catalog's `installed` flag).
 //!
-//! Managed mode stays opt-in-gated exactly like the foundation: with
+//! The runtime stays opt-in-gated exactly like the foundation: with
 //! `[general.laya]` absent or `enabled = false`, no setup runs, no server
 //! spawns, and no classifier client exists.
 //!
@@ -51,13 +51,13 @@ use anyhow::{anyhow, Context as _, Result};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use mnemo::config::{global_config_dir, LayaConfig, LayaMode};
+use mnemo::config::{global_config_dir, LayaConfig};
 use mnemo::memory::classifier::{Classifier, ClassifierStatus, LayaClassifier};
 
 use crate::ipc::state::IpcState;
 
-/// The HuggingFace repo every checkpoint lives in (a `subfolder` selects
-/// the non-English ones).
+/// The HuggingFace repo the checkpoint lives in (the English model is at
+/// the repo root).
 const LAYA_REPO: &str = "convaiinnovations/laya";
 
 /// The uv GitHub release feed (one single-file binary asset per platform).
@@ -84,8 +84,7 @@ const PROBE_ABSOLUTE_BUDGET: Duration = Duration::from_secs(900);
 /// A Laya checkpoint the managed runtime can serve (Settings → Classifier).
 #[derive(Debug, Clone)]
 pub struct LayaCheckpoint {
-    /// The short id used everywhere: `LAYA_MODELS`, the config value, the
-    /// marker file name.
+    /// The short id used everywhere: `LAYA_MODELS`, the marker file name.
     pub id: &'static str,
     /// The human-facing name shown in Settings.
     pub name: &'static str,
@@ -95,7 +94,7 @@ pub struct LayaCheckpoint {
     pub subfolder: Option<&'static str>,
 }
 
-/// The curated checkpoint catalog (mirrors the embedder model catalog).
+/// The curated checkpoint catalog — exactly one entry (English).
 pub fn checkpoint_catalog() -> &'static [LayaCheckpoint] {
     static CATALOG: &[LayaCheckpoint] = &[
         LayaCheckpoint {
@@ -104,26 +103,14 @@ pub fn checkpoint_catalog() -> &'static [LayaCheckpoint] {
             size_mb: 810,
             subfolder: None,
         },
-        LayaCheckpoint {
-            id: "multilingual",
-            name: "Laya Multilingual (100+ languages)",
-            size_mb: 650,
-            subfolder: Some("multilingual"),
-        },
     ];
     CATALOG
 }
 
-/// Resolve a checkpoint id (case-insensitive, whitespace-tolerant) to a
-/// catalog entry. Unknown ids fall back to the English checkpoint — a
-/// hand-edited config never breaks startup (strict validation lives in
-/// `laya_setup`).
-pub fn find_checkpoint(id: &str) -> &'static LayaCheckpoint {
-    let wanted = id.trim().to_ascii_lowercase();
-    checkpoint_catalog()
-        .iter()
-        .find(|c| c.id == wanted)
-        .unwrap_or(&checkpoint_catalog()[0])
+/// The one and only checkpoint (English). Multilingual support was removed,
+/// so the app always serves the English model.
+pub fn english_checkpoint() -> &'static LayaCheckpoint {
+    &checkpoint_catalog()[0]
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +402,10 @@ impl LayaManager {
     /// Spawn the managed `laya-serve` serving `models` on the
     /// pre-allocated `port` (the one the classifier client was built
     /// against) and record the child tagged with a fresh generation.
-    /// `models` is the `LAYA_MODELS` value: a catalog checkpoint id in
-    /// managed mode, or a fine-tuned artifact directory path for the
-    /// startup fine-tune hot-swap (best-effort — a laya-serve that cannot
-    /// load it simply never gets ready).
+    /// `models` is the `LAYA_MODELS` value: a catalog checkpoint id, or a
+    /// fine-tuned artifact directory path for the startup fine-tune
+    /// hot-swap (best-effort — a laya-serve that cannot load it simply
+    /// never gets ready).
     /// Returns that generation — a caller whose readiness probe fails must
     /// pass it to [`LayaManager::stop_if_generation`] so a concurrent newer
     /// start survives. Does not wait for readiness (see
@@ -489,9 +476,8 @@ pub fn fresh_disabled() -> (Arc<RwLock<ClassifierStatus>>, Arc<LayaManager>) {
     )
 }
 
-/// Build the managed classifier client for a running server — the
-/// foundation's `build_classifier` covers external mode; managed mode
-/// points the same backend at the loopback sidecar.
+/// Build the managed classifier client for a running sidecar — the same Laya
+/// backend pointed at the loopback server.
 pub fn build_managed_classifier(
     port: u16,
     status: Arc<RwLock<ClassifierStatus>>,
@@ -790,33 +776,24 @@ fn is_setup_progress(status: &ClassifierStatus, checkpoint_id: &str) -> bool {
     }
 }
 
-/// The autostart decision for a finished setup, derived from the LIVE
-/// config plus the checkpoint the setup just downloaded. Returns
-/// `(autostart, laya_off)`: `autostart` only when the config enables
-/// managed mode AND this checkpoint is the configured one (downloading a
-/// different checkpoint must never silently swap the live model — the
-/// save path makes that switch explicit); `laya_off` — the only case
+/// The autostart decision for a finished setup, derived from the LIVE config
+/// when the setup completes. Returns `(autostart, laya_off)`: `autostart`
+/// only when the config enables Laya (the runtime is managed-only, so an
+/// enabled config always wants the sidecar); `laya_off` — the only case
 /// where a post-setup `Disabled` is the honest status — when Laya is off
-/// entirely. An enabled external-mode config keeps its live classifier
-/// untouched.
-fn setup_autostart_decision(laya: &LayaConfig, downloaded_id: &str) -> (bool, bool) {
-    let configured = laya
-        .checkpoint
-        .as_deref()
-        .map(|c| c.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "english".to_string());
+/// entirely. Re-deriving from the live config means a mid-setup save always
+/// wins over the just-finished download.
+fn setup_autostart_decision(laya: &LayaConfig) -> (bool, bool) {
     let laya_off = !laya.enabled;
-    let autostart = !laya_off && laya.mode == LayaMode::Managed && configured == downloaded_id;
-    (autostart, laya_off)
+    (!laya_off, laya_off)
 }
 
 /// Fire-and-forget setup: download the runtime + `checkpoint`, then start
 /// the server so the freshly enabled classifier goes live without a
 /// restart. The autostart decision is re-derived from the LIVE config
 /// (`config`) when the setup finishes — see [`setup_autostart_decision`]
-/// — never from a snapshot taken at download start: a mid-setup save
-/// (disable, checkpoint switch, mode flip) must always win over the
-/// just-finished download.
+/// — never from a snapshot taken at download start: a mid-setup disable
+/// must always win over the just-finished download.
 pub fn spawn_setup_task(
     app: Option<AppHandle>,
     manager: Arc<LayaManager>,
@@ -841,7 +818,7 @@ pub fn spawn_setup_task(
         // Re-evaluate from the live config at completion time.
         let (autostart, laya_off) = {
             let cfg = config.lock().await;
-            setup_autostart_decision(&cfg.general.general.laya, checkpoint.id)
+            setup_autostart_decision(&cfg.general.general.laya)
         };
         match result {
             Ok(()) if autostart => {
@@ -860,8 +837,8 @@ pub fn spawn_setup_task(
                     }
                 };
                 // Swap the live classifier slot to the fresh sidecar
-                // endpoint (until now it was None — managed mode without
-                // an install).
+                // endpoint (until now it was None — enabled without an
+                // install).
                 if let (Some(slot), Some(port)) = (&classifier_slot, started) {
                     *slot.write().expect("classifier slot lock poisoned") =
                         build_managed_classifier(port, Arc::clone(&status));
@@ -1078,7 +1055,7 @@ pub(super) async fn start_server_models(
 /// The wire form of a catalog entry (Settings → Classifier).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LayaCheckpointWire {
-    /// The checkpoint id (`"english"` | `"multilingual"`).
+    /// The checkpoint id (always `"english"` — the only catalog entry).
     pub id: String,
     /// Human-facing name.
     pub name: String,
@@ -1105,23 +1082,14 @@ pub async fn laya_catalog(
         .collect())
 }
 
-/// Download the managed Laya runtime (uv + venv + `laya[serve]` +
-/// `checkpoint`). Fire-and-forget: progress arrives via
-/// `classifier://status`; when the current config already enables managed
-/// Laya, the server starts on success.
+/// Download the managed Laya runtime (uv + venv + `laya[serve]` + the
+/// English checkpoint). Fire-and-forget: progress arrives via
+/// `classifier://status`; when the current config enables Laya, the server
+/// starts on success.
 #[tauri::command]
-pub async fn laya_setup(
-    app: AppHandle,
-    state: State<'_, IpcState>,
-    checkpoint: String,
-) -> Result<(), String> {
+pub async fn laya_setup(app: AppHandle, state: State<'_, IpcState>) -> Result<(), String> {
     let manager = Arc::clone(&state.runtime.laya);
-    let Some(cp) = checkpoint_catalog()
-        .iter()
-        .find(|c| c.id == checkpoint.trim().to_ascii_lowercase())
-    else {
-        return Err(format!("unknown checkpoint: {checkpoint}"));
-    };
+    let cp = english_checkpoint();
     if !manager.begin_setup() {
         return Err("a Laya setup is already running".into());
     }
@@ -1197,7 +1165,7 @@ mod tests {
     #[test]
     fn server_env_binds_loopback_with_the_checkpoint_and_redirected_cache() {
         let hf = Path::new("/app/laya/hf");
-        let env = server_env("multilingual", 8123, hf);
+        let env = server_env("english", 8123, hf);
         let get = |k: &str| {
             env.iter()
                 .find(|(key, _)| key == k)
@@ -1206,7 +1174,7 @@ mod tests {
         };
         assert_eq!(get("LAYA_HOST"), "127.0.0.1");
         assert_eq!(get("LAYA_PORT"), "8123");
-        assert_eq!(get("LAYA_MODELS"), "multilingual");
+        assert_eq!(get("LAYA_MODELS"), "english");
         assert_eq!(get("LAYA_PRELOAD"), "1");
         assert_eq!(get("HF_HOME"), hf.display().to_string());
     }
@@ -1217,8 +1185,8 @@ mod tests {
         assert!(english.contains("import laya"));
         assert!(english.contains("\"convaiinnovations/laya\""));
         assert!(!english.contains("subfolder"));
-        let multi = preload_program(Some("multilingual"));
-        assert!(multi.contains("subfolder=\"multilingual\""));
+        let sub = preload_program(Some("some-subfolder"));
+        assert!(sub.contains("subfolder=\"some-subfolder\""));
     }
 
     #[test]
@@ -1240,13 +1208,9 @@ mod tests {
     }
 
     #[test]
-    fn find_checkpoint_is_tolerant_and_defaults_to_english() {
-        assert_eq!(find_checkpoint("english").id, "english");
-        assert_eq!(find_checkpoint(" Multilingual ").id, "multilingual");
-        // Unknown ids fall back to english rather than breaking a
-        // hand-edited config.
-        assert_eq!(find_checkpoint("nonsense").id, "english");
-        assert_eq!(checkpoint_catalog().len(), 2);
+    fn the_catalog_is_exactly_the_english_checkpoint() {
+        assert_eq!(english_checkpoint().id, "english");
+        assert_eq!(checkpoint_catalog().len(), 1);
     }
 
     #[test]
@@ -1270,7 +1234,6 @@ mod tests {
         .unwrap();
         std::fs::write(manager.laya_serve_path(), b"stub").unwrap();
         assert!(manager.is_checkpoint_installed("english"));
-        assert!(!manager.is_checkpoint_installed("multilingual"));
     }
 
     #[test]
@@ -1405,22 +1368,13 @@ mod tests {
 
     #[test]
     fn setup_autostart_decision_follows_the_live_config() {
-        use mnemo::config::{LayaConfig, LayaMode};
+        use mnemo::config::LayaConfig;
         let mut cfg = LayaConfig::default();
         // Off entirely: no autostart, and Disabled is the honest status.
-        assert_eq!(setup_autostart_decision(&cfg, "english"), (false, true));
-        // Enabled + managed + the configured (defaulted) checkpoint.
+        assert_eq!(setup_autostart_decision(&cfg), (false, true));
+        // Enabled: the app owns the runtime, so the finished setup autostarts.
         cfg.enabled = true;
-        cfg.mode = LayaMode::Managed;
-        assert_eq!(setup_autostart_decision(&cfg, "english"), (true, false));
-        // A different checkpoint was downloaded: never swap silently.
-        assert_eq!(setup_autostart_decision(&cfg, "multilingual"), (false, false));
-        // Explicit checkpoint match (whitespace/case normalized).
-        cfg.checkpoint = Some(" Multilingual ".into());
-        assert_eq!(setup_autostart_decision(&cfg, "multilingual"), (true, false));
-        // Enabled but external: a live external classifier stays untouched.
-        cfg.mode = LayaMode::External;
-        assert_eq!(setup_autostart_decision(&cfg, "english"), (false, false));
+        assert_eq!(setup_autostart_decision(&cfg), (true, false));
     }
 
     #[test]
@@ -1440,10 +1394,10 @@ mod tests {
             },
             "english"
         ));
-        // Another checkpoint's download belongs to a different setup.
+        // A different label's download belongs to a different setup.
         assert!(!is_setup_progress(
             &ClassifierStatus::Downloading {
-                label: "multilingual".into(),
+                label: "other".into(),
                 progress: 0.5
             },
             "english"

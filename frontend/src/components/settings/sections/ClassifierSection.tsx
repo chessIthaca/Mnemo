@@ -25,10 +25,7 @@ import {
   type SettingsSectionHandle,
 } from "../types";
 
-const inputCls =
-  "w-full rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent-color)]";
 
-type LayaMode = "external" | "managed";
 
 /** Short chip label for a status (the downloading payload collapses to a %). */
 function statusLabel(status: ClassifierStatusWire): string {
@@ -44,7 +41,7 @@ function statusLabel(status: ClassifierStatusWire): string {
 }
 
 /** One-line explanation of each live classifier status. */
-function statusHint(status: ClassifierStatusWire, managed: boolean): string {
+function statusHint(status: ClassifierStatusWire): string {
   if (typeof status === "object") {
     if ("downloading" in status) {
       return `Downloading ${status.downloading.label} — ${fmtPct(
@@ -57,9 +54,7 @@ function statusHint(status: ClassifierStatusWire, managed: boolean): string {
     case "ready":
       return "Ready — the classifier answers typed questions over HTTP.";
     case "failed":
-      return managed
-        ? "Failed — the sidecar did not start or the last call got no answer; see the log under the app config dir (laya/server-<pid>.log)."
-        : "Failed — the last call got no answer; check that laya-serve is running at the endpoint.";
+      return "Failed — the sidecar did not start or the last call got no answer; see the log under the app config dir (laya/server-<pid>.log).";
     case "installing":
       return "Installing — preparing the managed Laya runtime (uv + virtualenv + laya[serve])…";
     case "starting":
@@ -77,14 +72,10 @@ function statusHint(status: ClassifierStatusWire, managed: boolean): string {
  * (choice / score / yes-no) and reads back calibrated probabilities over
  * HTTP (`POST /v1/systemone`).
  *
- * Two modes:
- * - **Managed (recommended)**: Mnemo downloads a self-contained runtime
- *   (uv + virtualenv + `laya[serve]` + the checkpoint) right here in the
- *   section — no command line, no Python prerequisites — and automatically
- *   starts, monitors, and stops the local `laya-serve` sidecar on
- *   127.0.0.1 while the app runs.
- * - **External endpoint (advanced)**: the user runs `laya-serve` themselves
- *   and points Mnemo at its base URL.
+ * Mnemo owns the runtime: the section downloads a self-contained install
+ * (uv + virtualenv + `laya[serve]` + the English checkpoint) — no command
+ * line, no Python prerequisites — and automatically starts, monitors, and
+ * stops the local `laya-serve` sidecar on 127.0.0.1 while the app runs.
  *
  * Disabled by default — an absent or disabled configuration changes nothing:
  * no classifier calls, no startup cost, no new failure modes.
@@ -94,16 +85,17 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   onDirtyChange?: (dirty: boolean) => void;
 }>(function ClassifierSection({ active, onDirtyChange }, ref) {
   const bumpConfigVersion = useAgentStore((s) => s.bumpConfigVersion);
-  const [mode, setMode] = useState<LayaMode>("managed");
   const [enabled, setEnabled] = useState(false);
-  const [endpoint, setEndpoint] = useState("");
-  const [checkpoint, setCheckpoint] = useState("english");
   // The auto-typing opt-in (`[general.laya] auto_type_memories`) — a
   // separate toggle from the classifier enable flag.
   const [autoType, setAutoType] = useState(false);
+  // The tool-choice opt-in (`[general.laya] steer_tool_choice`) — the search
+  // and search_read tools let a confident classifier pick the delegation
+  // class (symbol / text / memory).
+  const [steerToolChoice, setSteerToolChoice] = useState(false);
   // The failure-triage opt-in (`[general.laya] failure_triage`), its kNN
   // overlay (`[general.laya] failure_triage_knn`), and the startup
-  // fine-tune opt-in (`[general.laya] auto_finetune`, managed mode only) —
+  // fine-tune opt-in (`[general.laya] auto_finetune`, managed runtime only) —
   // separate toggles, same opt-in convention.
   const [failureTriage, setFailureTriage] = useState(false);
   const [failureTriageKnn, setFailureTriageKnn] = useState(false);
@@ -129,19 +121,15 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       const laya = s.general.laya;
       const next: ClassifierDraft = {
         enabled: laya?.enabled ?? false,
-        mode: laya?.mode ?? "managed",
-        checkpoint: laya?.checkpoint ?? "english",
-        endpoint: laya?.endpoint ?? "",
         autoTypeMemories: laya?.auto_type_memories ?? false,
+        steerToolChoice: laya?.steer_tool_choice ?? false,
         failureTriage: laya?.failure_triage ?? false,
         failureTriageKnn: laya?.failure_triage_knn ?? false,
         autoFinetune: laya?.auto_finetune ?? false,
       };
       setEnabled(next.enabled);
-      setMode(next.mode);
-      setCheckpoint(next.checkpoint);
-      setEndpoint(next.endpoint);
       setAutoType(next.autoTypeMemories);
+      setSteerToolChoice(next.steerToolChoice);
       setFailureTriage(next.failureTriage);
       setFailureTriageKnn(next.failureTriageKnn);
       setAutoFinetune(next.autoFinetune);
@@ -192,10 +180,8 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
 
   const draft: ClassifierDraft = {
     enabled,
-    mode,
-    checkpoint,
-    endpoint,
     autoTypeMemories: autoType,
+    steerToolChoice,
     failureTriage,
     failureTriageKnn,
     autoFinetune,
@@ -206,13 +192,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
-  async function handleDownload(checkpointId: string) {
+  async function handleDownload() {
     setError(null);
     try {
       // setupLayaRuntime is fire-and-forget (returns immediately); the
       // progress UI is driven by the onClassifierStatus listener through the
       // installing / downloading / starting phases until ready/failed.
-      await setupLayaRuntime(checkpointId);
+      await setupLayaRuntime();
     } catch (e) {
       setError(errMsg(e));
     }
@@ -225,21 +211,17 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setError(null);
       setOk(false);
       try {
-        // The mode + enable flag + checkpoint + the four Laya opt-ins ride
-        // along so toggling takes effect without a restart (the backend
-        // rewires the live classifier — flipping the auto-type,
-        // failure-triage and kNN-overlay flags — and starts/stops the
-        // managed sidecar). A blank endpoint clears the stored URL
-        // server-side; managed mode never persists one.
+        // The enable flag + the five Laya opt-ins ride along so toggling
+        // takes effect without a restart (the backend rewires the live
+        // classifier — flipping the auto-type, tool-choice, failure-triage
+        // and kNN-overlay flags — and starts/stops the managed sidecar).
         await saveSettings({
           laya_enabled: enabled,
           laya_auto_type_memories: autoType,
+          laya_steer_tool_choice: steerToolChoice,
           laya_failure_triage: failureTriage,
           laya_failure_triage_knn: failureTriageKnn,
           laya_auto_finetune: autoFinetune,
-          laya_mode: mode,
-          ...(mode === "managed" ? { laya_checkpoint: checkpoint } : {}),
-          laya_endpoint: mode === "managed" ? "" : endpoint,
         });
         setSnapshot(serializeClassifier(draft));
         // The save rewires the live backend + status; pick it up right away.
@@ -274,9 +256,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         <p className="text-xs text-[color:var(--text-muted)]">
           An optional "System 1" decision service: a fast, calibrated text
           classifier (not a generator) that answers typed questions — choice,
-          score, or yes/no — with probabilities. Managed mode downloads and
-          runs it for you; disabled by default: nothing is called, and the
-          app behaves exactly as before.
+          score, or yes/no — with probabilities. Mnemo downloads and runs it
+          for you; disabled by default: nothing is called, and the app behaves
+          exactly as before.
         </p>
       </div>
 
@@ -309,6 +291,25 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             BUG / PLAN / HOW / REVIEW prefix on write; low confidence keeps
             yours. Enable only against a fine-tuned checkpoint — base models
             mis-classify.
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={steerToolChoice}
+          onChange={(e) => setSteerToolChoice(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Steer search delegation with the classifier
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — the search / search_read tools ask the classifier whether a
+            query wants the code graph (symbol), the file search (text), or
+            the memory store (memory), and a confident answer picks the
+            route; low confidence keeps today's heuristics. Enable only
+            against a fine-tuned checkpoint — base models mis-classify.
           </span>
         </span>
       </label>
@@ -366,7 +367,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         <span>
           Fine-tune on startup from logged failures
           <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
-            — managed mode only: when enough new classified failures have
+            — managed runtime only: when enough new classified failures have
             accrued since the last fine-tune, the checkpoint is retrained in
             the background and hot-swapped. Never blocks startup.
           </span>
@@ -374,144 +375,49 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       </label>
 
       <div className="space-y-2">
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
-          <input
-            type="radio"
-            name="laya-mode"
-            checked={mode === "managed"}
-            onChange={() => setMode("managed")}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
-          />
-          <span>
-            Managed — recommended
-            <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
-              — Mnemo downloads and runs laya-serve for you (127.0.0.1)
-            </span>
-          </span>
-        </label>
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
-          <input
-            type="radio"
-            name="laya-mode"
-            checked={mode === "external"}
-            onChange={() => setMode("external")}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
-          />
-          <span>
-            External endpoint (advanced)
-            <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
-              — you run laya-serve yourself
-            </span>
-          </span>
-        </label>
-      </div>
-
-      {mode === "managed" && (
-        <div className="space-y-2">
-          {catalog.map((c) => {
-            const isSel = checkpoint === c.id;
-            return (
-              <div
-                key={c.id}
-                className={`rounded-lg border p-3 transition-colors ${
-                  isSel
-                    ? "border-[color:var(--accent-color)] bg-[color:var(--accent-color)]/5"
-                    : "border-border bg-bg-primary"
-                }`}
+        {catalog.map((c) => (
+          <div key={c.id} className="rounded-lg border border-border bg-bg-primary p-3">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-[color:var(--text-primary)]">
+                {c.name}
+              </span>
+              {c.installed ? (
+                <span className="flex items-center gap-0.5 rounded bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
+                  <Check className="h-3 w-3" /> installed
+                </span>
+              ) : (
+                <span className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)]">
+                  ~{c.size_mb} MB
+                </span>
+              )}
+            </div>
+            <div className="mt-0.5 text-[0.7rem] text-[color:var(--text-muted)]">
+              <code>{c.id}</code> checkpoint
+            </div>
+            {!c.installed && !busy && (
+              <button
+                type="button"
+                onClick={() => void handleDownload()}
+                className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50"
               >
-                <label className="flex cursor-pointer items-start gap-2">
-                  <input
-                    type="radio"
-                    name="laya-checkpoint"
-                    checked={isSel}
-                    onChange={() => setCheckpoint(c.id)}
-                    className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-[color:var(--text-primary)]">
-                        {c.name}
-                      </span>
-                      {c.installed ? (
-                        <span className="flex items-center gap-0.5 rounded bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
-                          <Check className="h-3 w-3" /> installed
-                        </span>
-                      ) : (
-                        <span className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)]">
-                          ~{c.size_mb} MB
-                        </span>
-                      )}
-                    </div>
-                    <div className="mt-0.5 text-[0.7rem] text-[color:var(--text-muted)]">
-                      <code>{c.id}</code> checkpoint
-                    </div>
-                  </div>
-                </label>
-                {!c.installed && !busy && (
-                  <button
-                    type="button"
-                    onClick={() => void handleDownload(c.id)}
-                    className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50"
-                  >
-                    <Download className="h-3.5 w-3.5" />
-                    Download (~{c.size_mb} MB)
-                  </button>
-                )}
-              </div>
-            );
-          })}
-          <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-[color:var(--text-muted)]">
-            The managed runtime is self-contained but heavy: uv + virtualenv +
-            laya[serve] (~0.8–1 GB) plus the checkpoint (~650–810 MB), all
-            under the app config dir. No Python needs to be preinstalled.
+                <Download className="h-3.5 w-3.5" />
+                Download (~{c.size_mb} MB)
+              </button>
+            )}
           </div>
+        ))}
+        <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-[color:var(--text-muted)]">
+          The managed runtime is self-contained but heavy: uv + virtualenv +
+          laya[serve] (~0.8–1 GB) plus the English checkpoint (~810 MB), all
+          under the app config dir. No Python needs to be preinstalled.
         </div>
-      )}
-
-      {mode === "external" && (
-        <>
-          <label className="block space-y-1">
-            <span className="text-xs text-[color:var(--text-muted)]">
-              laya-serve endpoint URL
-            </span>
-            <input
-              type="text"
-              value={endpoint}
-              onChange={(e) => setEndpoint(e.target.value)}
-              className={inputCls}
-              placeholder="http://127.0.0.1:8000"
-            />
-            <span className="text-[0.7rem] text-[color:var(--text-muted)]">
-              Base URL of a running instance; the app posts to{" "}
-              <code>/v1/systemone</code>. A blank URL means "not configured" —
-              an enabled classifier then stays disabled.
-            </span>
-          </label>
-
-          <div className="space-y-1 rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-[color:var(--text-muted)]">
-            <div className="font-medium text-[color:var(--text-primary)]">
-              Install + run laya-serve yourself
-            </div>
-            <div>
-              <code>pip install "laya[serve]"</code>, then{" "}
-              <code>laya-serve</code> — it listens on{" "}
-              <code>http://127.0.0.1:8000</code> by default.
-            </div>
-          </div>
-        </>
-      )}
+      </div>
 
       <div className="rounded-lg border border-border bg-bg-primary p-3 text-xs">
         <span className="text-[color:var(--text-muted)]">Status: </span>
         <span className="font-medium text-[color:var(--text-primary)]">
           {statusLabel(status)}
         </span>
-        {status === "ready" && mode === "external" && endpoint.trim() !== "" && (
-          <span className="text-[color:var(--text-muted)]">
-            {" "}
-            @ {endpoint.trim()}
-          </span>
-        )}
         {typeof status === "object" && (
           <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
             <div
@@ -521,7 +427,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           </div>
         )}
         <div className="mt-1 text-[0.7rem] text-[color:var(--text-muted)]">
-          {statusHint(status, mode === "managed")}
+          {statusHint(status)}
         </div>
       </div>
 

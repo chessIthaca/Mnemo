@@ -34,7 +34,7 @@
 //! gap between fine-tunes: it learns from the training log itself — every
 //! resolved disposition is retrievable on the next classification — and
 //! rides the app's local embedding backend, not `laya-serve`, so it is
-//! independent of the Laya endpoint.
+//! independent of the laya-serve sidecar.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -255,7 +255,7 @@ pub async fn triage_failure(classifier: &dyn Classifier, error_text: &str) -> Fa
 ///
 /// Reading all of them at call time means a Settings save takes effect on
 /// the next failure with no rebuild — and every existing swap site of the shared
-/// slot (external rebuild on save, managed sidecar start, setup autostart)
+/// slot (rebuild on save, managed sidecar start, setup autostart)
 /// feeds the triage sites untouched. The flag is the separate opt-in the
 /// classifier docs require: base checkpoints are over-confident zero-shot,
 /// so triage must only ever run against a **fine-tuned** endpoint the user
@@ -263,7 +263,7 @@ pub async fn triage_failure(classifier: &dyn Classifier, error_text: &str) -> Fa
 #[derive(Clone)]
 pub struct FailureTriageHandle {
     /// The app runtime's shared classifier slot — the same `Arc` the IPC
-    /// layer swaps on rewire and managed-mode start.
+    /// layer swaps on rewire and managed-runtime start.
     pub classifier: Arc<RwLock<Option<Arc<dyn Classifier>>>>,
     /// The mirrored `[general.laya] failure_triage` flag: while false no
     /// classification is ever requested.

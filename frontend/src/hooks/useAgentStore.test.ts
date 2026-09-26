@@ -1522,6 +1522,34 @@ describe("agent event reducers (table-driven)", () => {
     expect(useAgentStore.getState().agentWireEfforts[ID]).toBeUndefined();
   });
 
+  it("model_changed mid-run retargets the tab label without ending the run (backlog fe499e37)", () => {
+    // The turn loop resolves its provider per REQUEST (2027-01-25), so a model
+    // or reasoning change made while the run is streaming lands on the next
+    // call and emits ModelChanged from that seam. The tab label (agentModels,
+    // plus the provider / effort mirrors the status bar reads) must follow it,
+    // and the run must stay running: this is a display event, not a turn
+    // boundary.
+    useAgentStore.setState((s) => ({
+      agents: { ...s.agents, [ID]: { ...emptyAgentState(), running: true } },
+      agentModels: { [ID]: "old-model" },
+      agentWireEfforts: { [ID]: "low" },
+    }));
+    useAgentStore.getState().handleAgentEvent({
+      agent_id: ID,
+      event: {
+        kind: "model_changed",
+        model: "new-model",
+        provider: "zai",
+        reasoning_effort: "high",
+      },
+    });
+    const state = useAgentStore.getState();
+    expect(state.agentModels[ID]).toBe("new-model");
+    expect(state.agentProviders[ID]).toBe("zai");
+    expect(state.agentWireEfforts[ID]).toBe("high");
+    expect(agent(ID).running).toBe(true);
+  });
+
   it("setAgentEffort records per-agent effort; clearAgentEfforts resets all", () => {
     // Regression (review L2, 2026-08-22): effort is now per-agent (each
     // agent's provider is rebuilt with its own effort), so the toolbar must

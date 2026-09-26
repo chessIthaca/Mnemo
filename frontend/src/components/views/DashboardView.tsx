@@ -177,8 +177,9 @@ export function DashboardBody({
         <div className={card}>
           <div className="text-slate-400">No savings recorded yet.</div>
           <div className="mt-1 text-slate-600">
-            Turn on context-economy levers in <code>config.toml</code> (
-            <code>[general.optimizer]</code>) and Mnemo will meter what they save here.
+            Turn on context-economy levers in Settings → Savings (or{" "}
+            <code>[general.optimizer]</code> in <code>config.toml</code>), and Mnemo
+            will meter what they save here.
           </div>
         </div>
       ) : null}

@@ -20,7 +20,7 @@ export type SettingsSectionId =
   | "embeddings"
   | "classifier"
   | "memory"
-  | "pricing"
+  | "savings"
   | "models"
   | "mcp"
   | "advanced";
@@ -138,10 +138,22 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
     ],
   },
   {
-    id: "pricing",
-    label: "Pricing",
-    hint: "Cost per 1M tokens",
-    keywords: ["cost", "price", "stats", "dollars"],
+    id: "savings",
+    label: "Savings",
+    hint: "Model rates & token savings",
+    keywords: [
+      "cost",
+      "price",
+      "stats",
+      "dollars",
+      "savings",
+      "tokens",
+      "optimizer",
+      "levers",
+      "archive",
+      "delta reads",
+      "compress",
+    ],
   },
   {
     id: "models",
@@ -501,7 +513,7 @@ export function isSettingsSectionId(v: string): v is SettingsSectionId {
     v === "embeddings" ||
     v === "classifier" ||
     v === "memory" ||
-    v === "pricing" ||
+    v === "savings" ||
     v === "models" ||
     v === "mcp" ||
     v === "advanced"

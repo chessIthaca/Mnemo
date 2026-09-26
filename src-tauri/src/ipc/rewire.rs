@@ -180,6 +180,13 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // getter and tracks the training-log file itself, so an embedder
         // change needs no extra wiring here — only the flag mirror.
         factory.set_failure_triage_knn_enabled(laya_cfg.failure_triage_knn);
+        // Token-optimizer levers ([general.optimizer], backlog e4a50d22): the
+        // same live-toggle contract — every lever-bearing tool reads the
+        // shared Arc<RwLock<OptimizerConfig>> per call, so a Settings save
+        // lands on the next tool call with no registry rebuild. Without this
+        // write the mirror kept its startup value, so a toggle silently needed
+        // an app restart.
+        factory.set_optimizer_config(cfg.general.general.optimizer.clone());
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

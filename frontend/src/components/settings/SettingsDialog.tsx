@@ -46,7 +46,7 @@ import { ClassifierSection } from "./sections/ClassifierSection";
 import { MemorySection } from "./sections/MemorySection";
 import { SafetySection } from "./sections/SafetySection";
 import { GitSection } from "./sections/GitSection";
-import { PricingSection } from "./sections/PricingSection";
+import { SavingsSection } from "./sections/SavingsSection";
 import { ModelsSection } from "./sections/ModelsSection";
 import { McpSection } from "./sections/McpSection";
 import { AdvancedSection } from "./sections/AdvancedSection";
@@ -69,7 +69,7 @@ const NAV_ICONS: Record<SettingsSectionId, typeof Server> = {
   embeddings: Brain,
   classifier: Zap,
   memory: Database,
-  pricing: DollarSign,
+  savings: DollarSign,
   models: Cpu,
   mcp: Plug,
   advanced: SlidersHorizontal,
@@ -107,7 +107,7 @@ export function SettingsDialog({
   const embeddingsRef = useRef<SettingsSectionHandle>(null);
   const classifierRef = useRef<SettingsSectionHandle>(null);
   const memoryRef = useRef<SettingsSectionHandle>(null);
-  const pricingRef = useRef<SettingsSectionHandle>(null);
+  const savingsRef = useRef<SettingsSectionHandle>(null);
   const modelsRef = useRef<SettingsSectionHandle>(null);
   const mcpRef = useRef<SettingsSectionHandle>(null);
   const advancedRef = useRef<SettingsSectionHandle>(null);
@@ -122,7 +122,7 @@ export function SettingsDialog({
     embeddings: embeddingsRef,
     classifier: classifierRef,
     memory: memoryRef,
-    pricing: pricingRef,
+    savings: savingsRef,
     models: modelsRef,
     mcp: mcpRef,
     advanced: advancedRef,
@@ -420,13 +420,13 @@ export function SettingsDialog({
               />
             </div>
             <div
-              className={section === "pricing" ? "block" : "hidden"}
-              aria-hidden={section !== "pricing"}
+              className={section === "savings" ? "block" : "hidden"}
+              aria-hidden={section !== "savings"}
             >
-              <PricingSection
-                ref={pricingRef}
+              <SavingsSection
+                ref={savingsRef}
                 active={open}
-                onDirtyChange={(d) => setSectionDirty("pricing", d)}
+                onDirtyChange={(d) => setSectionDirty("savings", d)}
               />
             </div>
             <div

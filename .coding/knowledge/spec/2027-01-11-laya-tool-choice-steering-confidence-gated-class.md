@@ -1,6 +1,7 @@
 +++
 title = "Laya tool-choice steering — confidence-gated classifier over the search auto-delegation decision (backlog e2c47d5f, commit 7b7691b)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Shipped the Laya tool-choice steering (Laya chain item 3) at commit 7b7691b on wt/mnemo (NOT yet landed in main). Optional, off by default via `[general.laya] steer_tool_choice`.

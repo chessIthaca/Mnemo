@@ -254,6 +254,20 @@ struct StreamOutcome {
     stream_error: Option<String>,
 }
 
+/// What one `handle_pending_swap` attempt did: whether the pre-swap summary
+/// rewrote `messages` (the caller then resets its incremental token
+/// accounting — see [`TokenAccounting`]), and whether an interrupt during that
+/// summarization ends the turn here.
+struct PendingSwapOutcome {
+    /// `true` when the pre-swap summary replaced `messages` — the caller
+    /// must `reset()` its incremental [`TokenAccounting`] (mirrors
+    /// `maybe_compact`'s reset gate).
+    rewrote: bool,
+    /// `Some` when an interrupt during the pre-swap summarization ends the
+    /// turn here; the swap completes either way.
+    early: Option<TurnOutcome>,
+}
+
 impl AgentLoop {
     /// Run a single turn: send messages to the provider, stream the response,
     /// execute tool calls, and feed results back. Emits events to the fan-in channel.
@@ -281,33 +295,34 @@ impl AgentLoop {
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         session_id: Option<&str>,
     ) -> crate::error::Result<TurnOutcome> {
+        // Seed the last-served effective triple (if this loop never served a
+        // request) from the display state the UI currently reports — the
+        // comparison base for the first serve, so a change that landed
+        // before it (e.g. a deferred pick completed just below) is announced
+        // while an unchanged serve stays silent.
+        self.seed_served_effective_if_empty();
+
         // Pending provider swap (deferred so the OLD provider can summarize
         // first when the new window is smaller) — handled in its own method;
         // Some(outcome) means an interrupt during the pre-swap summarization
         // ends the turn here.
-        if let Some(outcome) = self
+        // The pre-swap summary's rewrite marker needs no handling here: this
+        // call runs before `TurnState::fresh()`, so the accounting starts
+        // empty anyway.
+        let swap = self
             .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
-            .await
-        {
+            .await;
+        if let Some(outcome) = swap.early {
             return Ok(outcome);
         }
 
-        // Default provider + context manager snapshots, taken once per turn.
-        // Both are swappable at runtime (the model picker), and a single
-        // provider request must talk to one provider throughout — a swap
-        // mid-request takes effect on the next request. These defaults are
-        // the fallback when no per-context override resolves (see the
-        // per-iteration resolution at the top of the loop below).
-        let default_provider: Arc<dyn LlmClient> = self
-            .provider
-            .read()
-            .expect("provider lock poisoned")
-            .clone();
-        let default_context_manager = self
-            .context_manager
-            .read()
-            .expect("context_manager lock poisoned")
-            .clone();
+        // The default provider + context manager are NOT snapshotted here:
+        // both are swappable at runtime (the model picker, a Settings save,
+        // a deferred pick completed above), and a mid-run swap must land on
+        // the next provider request of this same turn —
+        // resolve_iteration_provider re-reads the live pair at the top of
+        // every loop iteration. A single provider request still talks to one
+        // provider throughout.
 
         let _ = fanin_tx.send((agent_id, AgentEvent::Started)).await;
 
@@ -327,6 +342,25 @@ impl AgentLoop {
         let mut state = TurnState::fresh();
 
         loop {
+            // A swap deferred mid-run (a smaller-context model pick) is
+            // completed HERE too — before this iteration's provider
+            // resolution — so it lands on the very next request of the same
+            // run, not the next turn. The turn-top call above covers swaps
+            // deferred between turns. Cheap no-op when nothing is pending.
+            let swap = self
+                .handle_pending_swap(messages, fanin_tx, agent_id, session_id, cmd_rx)
+                .await;
+            if let Some(outcome) = swap.early {
+                return Ok(outcome);
+            }
+            if swap.rewrote {
+                // The pre-swap summary replaced `messages` inside the
+                // already-counted prefix, which invalidates the incremental
+                // count (TokenAccounting's invariant) — recount from scratch
+                // (mirrors `maybe_compact`'s reset after summarization).
+                state.token_accounting.reset();
+            }
+
             // The request cycle begins: everything from here until the POST
             // goes out is the "sending" phase (model resolution, prompt
             // build, summarization, auto-recall, the provider request
@@ -349,14 +383,8 @@ impl AgentLoop {
 
             // The provider + context manager for THIS iteration's request
             // (re-resolved every iteration — see resolve_iteration_provider).
-            let (provider, context_manager) = self
-                .resolve_iteration_provider(
-                    &default_provider,
-                    &default_context_manager,
-                    fanin_tx,
-                    agent_id,
-                )
-                .await;
+            let (provider, context_manager) =
+                self.resolve_iteration_provider(fanin_tx, agent_id).await;
             // The workflow tool filter, read at the TOP of the iteration: the
             // token accounting must see the tools-schema overhead before its
             // first consumer this iteration (the update() below feeds the ctx
@@ -895,9 +923,16 @@ impl AgentLoop {
 
     /// Handle a pending provider swap: the model picker deferred it so the
     /// OLD provider can summarize first when the conversation is too large
-    /// for the new, smaller window. Returns `Some(TurnOutcome)` when an
-    /// interrupt during the pre-swap summarization ends the turn early;
-    /// `None` to continue the turn (the swap is completed either way).
+    /// for the new, smaller window. Returns [`PendingSwapOutcome`]:
+    /// `early: Some(TurnOutcome)` when an interrupt during the pre-swap
+    /// summarization ends the turn early, and `rewrote` when the summary
+    /// replaced `messages` (the caller must then reset its incremental token
+    /// accounting). The swap is completed either way.
+    ///
+    /// Called at the top of `run_turn` (a swap deferred between turns) AND
+    /// at the top of every loop iteration (a swap deferred mid-run) — so a
+    /// smaller-context pick made while a run is in flight lands before the
+    /// next request of that same run. Cheap no-op when nothing is pending.
     async fn handle_pending_swap(
         &self,
         messages: &mut Vec<Message>,
@@ -905,7 +940,10 @@ impl AgentLoop {
         agent_id: AgentId,
         session_id: Option<&str>,
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-    ) -> Option<TurnOutcome> {
+    ) -> PendingSwapOutcome {
+        // Set when the pre-swap summary replaced `messages` — reported to the
+        // caller so it can reset its incremental token accounting.
+        let mut rewrote = false;
         // Pending provider swap: if the user switched to a model with a smaller
         // context window, the swap was deferred so we can summarize using the
         // OLD provider first. Take it here (before the provider snapshot) so
@@ -949,6 +987,9 @@ impl AgentLoop {
                         cmd_rx,
                     )
                     .await;
+                // The summary path (Ok) rewrote `messages`; the failure path
+                // keeps the original list, so the count stays valid there.
+                let summarized_ok = summarize_result.is_ok();
                 let (summarized, mut buffered, stop_reason, summarize_usage) = match summarize_result
                 {
                     Ok(result) => result,
@@ -991,6 +1032,7 @@ impl AgentLoop {
                         (messages.clone(), Vec::new(), None, None)
                     }
                 };
+                rewrote = summarized_ok;
                 // R21: compaction's own mega-prompt is invisible to the main
                 // loop's Usage arm — record it tagged purpose='summarize' so
                 // its cost (up to ~300K tokens, guaranteed 0% cache) shows in
@@ -1104,12 +1146,15 @@ impl AgentLoop {
                         .write()
                         .expect("explicit_provider lock poisoned") =
                         Some((pending.provider, pending.context_manager));
-                    return Some(TurnOutcome {
-                        finish_reason: FinishReason::Stop,
-                        text: String::new(),
-                        tool_calls_made: 0,
-                        stop_reason: Some(stop),
-                    });
+                    return PendingSwapOutcome {
+                        rewrote,
+                        early: Some(TurnOutcome {
+                            finish_reason: FinishReason::Stop,
+                            text: String::new(),
+                            tool_calls_made: 0,
+                            stop_reason: Some(stop),
+                        }),
+                    };
                 }
             }
             // Complete the deferred swap.
@@ -1132,7 +1177,10 @@ impl AgentLoop {
                 ))
                 .await;
         }
-        None
+        PendingSwapOutcome {
+            rewrote,
+            early: None,
+        }
     }
 
     /// Emit workflow events for a successful workflow-tool call so the UI
@@ -1936,69 +1984,74 @@ impl AgentLoop {
     /// (re-run every loop iteration so a mid-turn workflow change — a
     /// `skill_start`/`skill_end` call, or a state transition from any
     /// workflow tool — switches to the configured per-context model on
-    /// the next request within the same turn). Falls back to the turn-start
-    /// default snapshot when no override resolves, and emits ModelChanged
-    /// when the effective model flips. Extracted from run_turn (quality
-    /// review HIGH 1); behavior unchanged.
+    /// the next request within the same turn). The no-override fallback is
+    /// the LIVE default pair, re-read here every iteration, so a mid-run
+    /// swap into the loop (the model picker, a Settings save, a completed
+    /// deferred pick) lands on the next request of the same turn instead of
+    /// waiting for the next turn. Emits ModelChanged when the effective
+    /// model/effort changes. Extracted from run_turn (quality review HIGH 1).
     async fn resolve_iteration_provider(
         &self,
-        default_provider: &Arc<dyn LlmClient>,
-        default_context_manager: &context::ContextManager,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
     ) -> (Arc<dyn LlmClient>, context::ContextManager) {
+        // The live default pair — re-read per iteration, never snapshotted
+        // across the turn. `set_provider`/`set_explicit_provider` swap these
+        // slots mid-run; a turn-start copy would serve the pre-swap provider
+        // to the rest of the turn.
+        let default_provider = self.provider();
+        let default_context_manager = self.context_manager();
         // Per-context model resolution — re-run EVERY iteration so a
         // mid-turn workflow change (skill_start/skill_end, or a state
         // transition from any workflow tool) takes effect on the next
         // provider request within this same turn. When the resolver
         // returns a model, build the throwaway provider + context
-        // manager for it; otherwise fall back to the default snapshot.
-        //
-        // Track the effective model across resolutions and emit
-        // ModelChanged when it flips: the per-turn override path updated
-        // `resolved_model` internally but never told the UI, so a
-        // mid-turn skill model switch (e.g. merge_to_main → grok) left
-        // the toolbar/tab label stale — only set_model/save_endpoints
-        // emitted the event (user report 2026-04-20).
-        let prev_resolved = self.resolved_model();
-        let prev_effort = self.resolved_effort();
+        // manager for it; otherwise fall back to the live default pair.
         let (provider, context_manager) = {
             let wf = self.workflow.lock().await;
             let skill_name = wf.active_skill().map(|s| s.name.as_str());
             let plan_kind = wf.active_plan_kind();
             match self.resolve_turn_provider(wf.state(), skill_name, plan_kind) {
                 Some((p, cm)) => (p, cm),
-                None => (Arc::clone(default_provider), default_context_manager.clone()),
+                None => (Arc::clone(&default_provider), default_context_manager.clone()),
             }
         };
         // The wf guard is dropped above — safe to await the fan-in send.
-        let now_resolved = self.resolved_model();
-        let now_effort = self.resolved_effort();
-        // Emit when the effective MODEL flips, or when only the EFFORT
-        // changes (the same model id can serve two contexts with different
-        // reasoning_effort overrides — the UI must not keep the stale
-        // effort, backlog 51dab4da).
-        if now_resolved != prev_resolved || now_effort != prev_effort {
-            // None = the default provider's model (the turn-start
-            // snapshot — the same model list_agents would report).
-            let effective =
-                now_resolved.unwrap_or_else(|| default_provider.model().to_string());
-            // The endpoint serving that model: the local `provider` Arc is
-            // exactly the client this iteration uses (the override when
-            // one resolved, else the default snapshot). Empty names (test
-            // mocks) become None — the frontend then falls back to its
-            // endpoint-list resolution, the pre-wire behavior.
-            let serving_endpoint = {
-                let n = provider.provider_name().to_string();
-                (!n.is_empty()).then_some(n)
-            };
+        // Announce the effective model/effort at the moment it SERVES a
+        // request — the per-request "landing" seam. The display state
+        // (`resolved_*`) alone cannot drive this: a swap into the live
+        // default slot clears it (`None` on both sides of a diff), so a
+        // mid-run model/reasoning change that actually landed went
+        // unannounced and the tab label stayed stale. `served_effective`
+        // remembers what the LAST request was served by (seeded from the
+        // pre-serve display state at turn entry), so any change that lands
+        // — a mid-run swap, a completed deferred pick, a mid-turn override
+        // flip — is announced exactly when it starts serving (2027-01-25),
+        // and a no-change serve emits nothing (no event spam).
+        let serving_model = provider.model().to_string();
+        // The endpoint serving that model: the local `provider` Arc is
+        // exactly the client this iteration uses. Empty names (test mocks)
+        // become None — the frontend then falls back to its endpoint-list
+        // resolution, the pre-wire behavior.
+        let serving_endpoint = {
+            let n = provider.provider_name().to_string();
+            (!n.is_empty()).then_some(n)
+        };
+        let serving_effort = self
+            .resolved_effort()
+            .or_else(|| self.default_display_effort());
+        if self.note_served_effective(
+            &serving_model,
+            serving_endpoint.as_deref(),
+            serving_effort.as_deref(),
+        ) {
             let _ = fanin_tx
                 .send((
                     agent_id,
                     AgentEvent::ModelChanged {
-                        model: effective,
+                        model: serving_model,
                         provider: serving_endpoint,
-                        reasoning_effort: now_effort,
+                        reasoning_effort: serving_effort,
                     },
                 ))
                 .await;

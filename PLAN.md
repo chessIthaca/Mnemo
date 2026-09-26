@@ -413,9 +413,10 @@ Config selects a default provider; `--provider` / `/provider` switches at
 runtime **for newly built agents** — the factory (`agent/factory.rs`) builds
 each new agent loop with the selected provider. Switching the provider for an
 already-**live** agent is a separate per-loop step via `set_provider`; the two
-paths are not atomic. `/model` and `/provider` therefore require a restart (or
-a fresh agent) to take effect for the main provider — the slash-command help
-notes this.
+paths are not atomic. Since 2027-01-25 the turn loop resolves its provider and
+context manager per REQUEST rather than per turn, so a live swap (the GUI model
+picker, a Settings save, the console `/model`) lands on the next request of a
+run already in flight, mid-run included.
 
 ## Enforced plan-first workflow
 

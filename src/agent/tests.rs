@@ -12263,3 +12263,467 @@ async fn bad_json_below_threshold_or_non_permanent_keeps_the_ladder() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mid-run model/reasoning changes land before the next call (2027-01-25,
+// backlog fe499e37): a change made while a run is in flight must serve the
+// immediately-next provider request of that SAME run (like a steering
+// message), and the landing must be announced so the tab's model label
+// updates. Pre-fix, the turn loop served its turn-start provider snapshot
+// to the rest of the turn and ModelChanged only fired on a resolved_* flip,
+// so a default-slot swap landed only on the next turn — silently.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A provider that performs a live swap into its own loop WHILE serving its
+/// FIRST request — the exact mid-stream window of a user's model/reasoning
+/// change — then answers with a tool call so the SAME run issues a second
+/// request. The second request must already be served by the swap target.
+struct MidStreamSwappingProvider {
+    /// The loop to swap into — filled by the test after construction (the
+    /// loop is built WITH this provider, so the handle is circular).
+    agent: Arc<std::sync::OnceLock<Arc<AgentLoop>>>,
+    /// The swap the "user" performs mid-stream.
+    swap: Box<dyn Fn(&AgentLoop) + Send + Sync>,
+    /// Swapped already? Only the first request performs it.
+    swapped: std::sync::atomic::AtomicBool,
+    /// The tool call answered to the first request (drives request #2 of the
+    /// same run): `(name, arguments-json)`.
+    tool_call: (&'static str, String),
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for MidStreamSwappingProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-default"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        if !self
+            .swapped
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Mid-stream: the user changed the model / reasoning effort while
+            // request #1 was in flight.
+            let agent = self
+                .agent
+                .get()
+                .expect("the test must fill the agent slot before run_turn");
+            (self.swap)(agent);
+            // First request: answer with a tool call so the SAME run issues a
+            // second request — the one the swap must already serve.
+            return Ok(Box::pin(futures::stream::iter(vec![
+                LlmEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_1".into(),
+                    name: self.tool_call.0.into(),
+                },
+                LlmEvent::ToolCallArgumentDelta {
+                    index: 0,
+                    fragment: self.tool_call.1.clone(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                },
+            ])));
+        }
+        // Later requests answer with a distinguishable text: if the swap did
+        // NOT land, this is what the test observes and asserts against — a
+        // regressed fix must FAIL fast, never hang the suite.
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: "from-old-default".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+
+/// The provider a mid-run change swaps IN ("the user's new pick"): reports
+/// its own model id and answers with distinguishable text, so a test can
+/// assert WHICH provider served the next request of the run.
+struct SwapTargetProvider {
+    model: String,
+    text: String,
+    caps: Capabilities,
+}
+
+#[async_trait]
+impl LlmClient for SwapTargetProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: self.text.clone(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+
+/// Build a loop whose default provider performs `swap` mid-stream (while
+/// serving request #1) and then answers with a `file_read` tool call against
+/// an existing sandbox file, so the SAME run issues a second request — the
+/// request the swap must already serve. `resolver` attaches a model resolver
+/// when the test exercises the override chain (the forced-model guard).
+fn mid_run_swap_agent(
+    dir: &tempfile::TempDir,
+    workflow: Arc<Mutex<Workflow>>,
+    swap: Box<dyn Fn(&AgentLoop) + Send + Sync>,
+    resolver: Option<Arc<dyn crate::model_resolver::ModelResolver>>,
+) -> Arc<AgentLoop> {
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    // A real file inside the sandbox: the tool call must succeed for the run
+    // to continue to request #2. Forward slashes keep the arguments JSON
+    // valid on Windows too.
+    let note = dir.path().join("note.txt");
+    std::fs::write(&note, "hello").unwrap();
+    let note_arg = note.display().to_string().replace('\\', "/");
+    let agent_slot: Arc<std::sync::OnceLock<Arc<AgentLoop>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let default_provider: Arc<dyn LlmClient> = Arc::new(MidStreamSwappingProvider {
+        agent: agent_slot.clone(),
+        swap,
+        swapped: std::sync::atomic::AtomicBool::new(false),
+        tool_call: ("file_read", format!(r#"{{"path": "{note_arg}"}}"#)),
+        caps: Capabilities::openai(),
+    });
+    let mut agent = AgentLoop::new(
+        test_config(default_provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    if let Some(resolver) = resolver {
+        agent = agent.with_model_resolver(resolver);
+    }
+    let agent = Arc::new(agent);
+    assert!(
+        agent_slot.set(agent.clone()).is_ok(),
+        "the slot must be empty before the first request"
+    );
+    agent
+}
+
+/// Drain the fan-in channel and return `(model, reasoning_effort)` for every
+/// `ModelChanged` event, in order.
+fn take_model_changed(
+    fanin_rx: &mut mpsc::Receiver<(crate::runtime::AgentId, AgentEvent)>,
+) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    while let Ok((_, event)) = fanin_rx.try_recv() {
+        if let AgentEvent::ModelChanged {
+            model,
+            reasoning_effort,
+            ..
+        } = event
+        {
+            out.push((model, reasoning_effort));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn mid_run_model_swap_lands_on_the_next_request() {
+    // The reported symptom (2027-01-25): with a run in flight, changing the
+    // model took effect only on the NEXT turn. This is the global picker /
+    // Settings-rebuild path (`swap_live_provider` → plain `set_provider`).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let swap_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let agent = mid_run_swap_agent(
+        &dir,
+        workflow,
+        Box::new(move |agent: &AgentLoop| {
+            agent.set_provider(
+                swap_target.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            );
+        }),
+        None,
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the note")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+
+    assert_eq!(
+        outcome.text, "from-swap-target",
+        "the request after a mid-run swap must already be served by the new provider"
+    );
+    assert_eq!(
+        take_model_changed(&mut fanin_rx),
+        vec![("swap-target".to_string(), None)],
+        "the landing must announce the newly-served model exactly once"
+    );
+}
+
+#[tokio::test]
+async fn mid_run_deferred_pick_lands_on_the_next_request() {
+    // The per-agent picker path with a SMALLER context window: the swap is
+    // deferred so the old provider could summarize an oversized conversation
+    // first — but a mid-run pick may not wait for the next turn, so the turn
+    // loop must complete it at the next iteration boundary.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let small_caps = Capabilities {
+        max_context: 2_000,
+        ..Capabilities::openai()
+    };
+    let swap_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: small_caps,
+    });
+    let agent = mid_run_swap_agent(
+        &dir,
+        workflow,
+        Box::new(move |agent: &AgentLoop| {
+            agent.set_explicit_provider(
+                swap_target.clone(),
+                context::ContextManager::new(2_000, 0.5),
+            );
+        }),
+        None,
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the note")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+
+    assert_eq!(
+        outcome.text, "from-swap-target",
+        "the deferred pick must complete at the next iteration and serve request #2"
+    );
+    assert_eq!(
+        take_model_changed(&mut fanin_rx),
+        vec![("swap-target".to_string(), None)],
+        "the completed deferred pick must announce the new model"
+    );
+}
+
+#[tokio::test]
+async fn mid_run_reasoning_effort_change_lands_on_the_next_request() {
+    // A reasoning-effort-only change (Settings rebuild): the model id is
+    // unchanged, only the effort differs — the very next request must carry
+    // it, and the landing must announce the new effort, or the tab / status
+    // bar keeps the stale one.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let effort_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "mock-default".into(),
+        text: "from-effort-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let agent = mid_run_swap_agent(
+        &dir,
+        workflow,
+        Box::new(move |agent: &AgentLoop| {
+            // Mirrors `swap_live_provider`: swap the slot and stamp the new
+            // display effort (the rebuilt provider carries it on the wire).
+            agent.set_provider(
+                effort_target.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            );
+            agent.set_resolved_effort(None);
+            agent.set_default_display_effort(Some("high".into()));
+        }),
+        None,
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the note")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+
+    assert_eq!(
+        outcome.text, "from-effort-target",
+        "the next request must already run on the rebuilt (new-effort) provider"
+    );
+    assert_eq!(
+        take_model_changed(&mut fanin_rx),
+        vec![("mock-default".to_string(), Some("high".to_string()))],
+        "the landing must announce the new effort under the unchanged model id"
+    );
+}
+
+#[tokio::test]
+async fn mid_run_swap_lands_while_reviewing() {
+    // The user called out Reviewing explicitly: the change must land in every
+    // workflow state, not only Executing — the per-request resolution is not
+    // state-gated.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
+        wf.complete_step(0).unwrap();
+        assert_eq!(wf.state(), crate::workflow::WorkflowState::Reviewing);
+    }
+    let swap_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let agent = mid_run_swap_agent(
+        &dir,
+        workflow,
+        Box::new(move |agent: &AgentLoop| {
+            agent.set_provider(
+                swap_target.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            );
+        }),
+        None,
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the note")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+
+    assert_eq!(
+        outcome.text, "from-swap-target",
+        "a mid-run swap must land while the workflow is in Reviewing"
+    );
+    assert_eq!(
+        take_model_changed(&mut fanin_rx),
+        vec![("swap-target".to_string(), None)]
+    );
+}
+
+#[tokio::test]
+async fn mid_run_default_swap_never_overrides_a_forced_model() {
+    // CONSTRAINT: a spawned reviewer runs on the configured reviewing model
+    // (spawn_agent's forced model) — a mid-run swap of the MAIN agent's
+    // default slot must not override it. The resolution chain (forced before
+    // the default fallback) stays authoritative.
+    use crate::config::ModelRef;
+    use crate::model_resolver::{ModelContext, ModelResolver};
+
+    /// Builds the forced model's provider — stands in for the factory
+    /// resolver that spawn_agent relies on.
+    struct CannedResolver {
+        provider: Arc<dyn LlmClient>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelResolver for CannedResolver {
+        fn resolve(&self, _ctx: ModelContext<'_>) -> Option<ModelRef> {
+            None
+        }
+        fn build_turn_provider(
+            &self,
+            _model: &ModelRef,
+            _fill_rate: f64,
+        ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+            Some((
+                self.provider.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            ))
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let forced_provider: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "forced-canned".into(),
+        text: "from-forced-canned".into(),
+        caps: Capabilities::openai(),
+    });
+    let swap_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
+        model: "swap-target".into(),
+        text: "from-swap-target".into(),
+        caps: Capabilities::openai(),
+    });
+    let agent = mid_run_swap_agent(
+        &dir,
+        workflow,
+        Box::new(move |agent: &AgentLoop| {
+            agent.set_provider(
+                swap_target.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            );
+        }),
+        Some(Arc::new(CannedResolver {
+            provider: forced_provider.clone(),
+        })),
+    );
+    agent.set_forced_model(ModelRef {
+        endpoint: "canned".into(),
+        model: "forced-canned".into(),
+        reasoning_effort: None,
+    });
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the note")];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    drop(fanin_tx);
+
+    assert_eq!(
+        outcome.text, "from-forced-canned",
+        "the forced (reviewer) model must keep serving every request"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        !events.is_empty(),
+        "the forced model's first serve must still announce itself"
+    );
+    assert!(
+        events.iter().all(|(m, _)| m == "forced-canned"),
+        "a mid-run default swap must never serve/announce for a forced-model loop: {events:?}"
+    );
+}

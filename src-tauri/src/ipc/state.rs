@@ -125,7 +125,8 @@ pub struct AgentRuntimeContext {
     pub safety_rules: Option<Arc<SafetyRules>>,
     /// The per-context model resolver (shared with the factory). The IPC layer
     /// pushes reloaded config into it after a Settings save so `[models]`
-    /// overrides take effect on the next turn. `None` when the brain failed to
+    /// overrides take effect on the next request (resolution runs per request,
+    /// 2027-01-25). `None` when the brain failed to
     /// build at startup.
     pub model_resolver: Option<Arc<mnemo::model_resolver::ConfigModelResolver>>,
     /// The shared headless debug browser (the same `Arc` the agent tools use,

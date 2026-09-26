@@ -215,7 +215,8 @@ pub(super) fn rewire_vision_embedder_and_classifier(
 }
 
 /// Push a reloaded config into the per-context model resolver so `[models]`
-/// overrides take effect on the next turn. No-op when the resolver is absent
+/// overrides take effect on the next request (per-request resolution,
+/// 2027-01-25). No-op when the resolver is absent
 /// (startup-error fallback). Shared by `save_settings` and `save_endpoints`.
 pub(super) fn sync_model_resolver(state: &IpcState, cfg: &mnemo::config::Config) {
     if let Some(resolver) = &state.runtime.model_resolver {

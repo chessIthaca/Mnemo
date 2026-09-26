@@ -18,7 +18,7 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { DashboardBody } from "./DashboardView";
-import { fmtTokens } from "../../lib/format";
+import { fmtSavingsPct, fmtTokens } from "../../lib/format";
 import type { PricingEntry, ProjectStats, SavingsStats } from "../../lib/tauri";
 import viewSource from "./DashboardView.tsx?raw";
 
@@ -131,11 +131,40 @@ describe("DashboardBody (backlog 652ae094)", () => {
     expect(card.indexOf("skeleton")).toBeLessThan(card.indexOf("archive_expand"));
   });
 
-  it("lists the recent events with their before → after sizes", () => {
+  it("lists the recent events as savings + % savings, raw sizes on hover", () => {
+    // 2027-01-25 (backlog fe499e37): the row used to print `12,000 → 900`.
+    // It now leads with the savings share, keeping the raw before → after
+    // sizes in the cell's title so the numbers stay reachable on hover.
     const html = render();
     expect(html).toContain("src/agent/turn.rs");
-    expect(html).toContain(fmtTokens(12_000));
-    expect(html).toContain(fmtTokens(900));
+    expect(html).toContain(fmtSavingsPct(11_100, 12_000)); // "92.5%"
+    expect(html).toContain(`title="${fmtTokens(12_000)} → ${fmtTokens(900)}"`);
+    expect(html).not.toContain(`${fmtTokens(12_000)} → ${fmtTokens(900)}</span>`);
+  });
+
+  it("never renders a NaN% when an event has no before size", () => {
+    // A row with tokens_before 0 has no ratio at all; the % cell falls back
+    // to an em dash instead of dividing by zero.
+    const html = render({
+      ...savings,
+      recent: [
+        {
+          id: "e0",
+          session_id: "s1",
+          kind: "skeleton",
+          detail: "empty",
+          tokens_before: 0,
+          tokens_after: 0,
+          tokens_saved: 0,
+          measured: false,
+          created_at: 1_700_000_000,
+        },
+      ],
+    });
+    const card = cardMarkup(html, "dashboard-recent");
+    expect(card).toContain("—");
+    expect(card).not.toContain("NaN");
+    expect(card).not.toContain("Infinity");
   });
 
   it("prices the ESTIMATED dollars at the project's realized rates", () => {
@@ -159,7 +188,10 @@ describe("DashboardBody (backlog 652ae094)", () => {
       recent: [],
     });
     expect(html).toContain("No savings recorded yet.");
-    expect(html).toContain("[general.optimizer]");
+    // The levers are on by default now, so the empty state must not send the
+    // user off to switch them on — it points at the tuning surface instead.
+    expect(html).toContain("The context-economy levers are on by default");
+    expect(html).toContain("Settings → Savings");
   });
 
   it("fabricates no dollar figure when the pricing table is empty", () => {

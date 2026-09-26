@@ -21,7 +21,7 @@
 //!   decision layer (classes, confidence gate, auto-retry policy, the
 //!   training log).
 //! - [`failure_triage_knn`] — the kNN overlay for failure triage (online
-//!   learning from the training log, independent of the Laya endpoint).
+//!   learning from the training log, independent of the laya-serve sidecar).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!

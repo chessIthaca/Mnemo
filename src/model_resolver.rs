@@ -27,8 +27,10 @@
 //! `role:"reviewer"` spawn-time pin) consumes it.
 //!
 //! The resolver holds a shared handle to the live [`Config`] so a Settings save
-//! (which reloads config) takes effect on the next turn without rebuilding the
-//! factory. It is `Send + Sync` and cheap to clone (an `Arc`).
+//! (which reloads config) takes effect on the next REQUEST without rebuilding
+//! the factory — resolution runs per request since 2027-01-25, so a save made
+//! mid-run lands before the next call. It is `Send + Sync` and cheap to clone
+//! (an `Arc`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -216,7 +218,8 @@ pub trait ModelResolver: Send + Sync {
 /// A [`ModelResolver`] backed by the live [`Config`] (shared handle).
 ///
 /// Reads the `[models]` section each call, so a Settings save takes effect on
-/// the next turn. The fill rate for context-manager sizing is passed by the
+/// the next request (per-request resolution, 2027-01-25 — a save mid-run lands
+/// before the next call). The fill rate for context-manager sizing is passed by the
 /// caller (the agent loop) at turn time — the resolver itself doesn't store
 /// it, since the loop already owns the authoritative fill rate.
 ///
@@ -224,7 +227,7 @@ pub trait ModelResolver: Send + Sync {
 /// connection pool + TLS session cache are reused across turns (a per-context
 /// override would otherwise rebuild a fresh client every turn, discarding
 /// keep-alive). The cache is invalidated wholesale on [`set_config`] (after a
-/// Settings save), so config changes take effect on the next turn.
+/// Settings save), so config changes take effect on the next request.
 pub struct ConfigModelResolver {
     config: Arc<RwLock<Config>>,
     /// The shared request/response trace log, wired into every provider this

@@ -257,25 +257,15 @@ pub struct SettingsSaveDto {
     /// current value (see `GeneralSection::laya`).
     #[serde(default)]
     pub laya_enabled: Option<bool>,
-    /// Laya `laya-serve` base URL, e.g. `"http://127.0.0.1:8000"`. Absent =
-    /// keep; a blank string clears it (the classifier then reports
-    /// unavailable when enabled).
-    #[serde(default)]
-    pub laya_endpoint: Option<String>,
-    /// Laya provisioning mode: `external` (a user-run `laya-serve` at
-    /// `laya_endpoint`) or `managed` (the app downloads + runs it — see
-    /// Settings → Classifier). Absent = keep.
-    #[serde(default)]
-    pub laya_mode: Option<super::general::LayaMode>,
-    /// Managed-mode checkpoint id (`"english"` | `"multilingual"`). Absent
-    /// = keep; a blank string clears it to the `"english"` default.
-    #[serde(default)]
-    pub laya_checkpoint: Option<String>,
     /// Laya auto-typing of memory records (opt-in; enable only against a
     /// fine-tuned checkpoint — base checkpoints mis-classify). Absent =
     /// keep the current value.
     #[serde(default)]
     pub laya_auto_type_memories: Option<bool>,
+    /// Laya tool-choice steering (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_steer_tool_choice: Option<bool>,
     /// Laya failure triage (opt-in; enable only against a fine-tuned
     /// checkpoint). Absent = keep the current value.
     #[serde(default)]
@@ -285,40 +275,41 @@ pub struct SettingsSaveDto {
     /// `failure_triage` itself is on). Absent = keep the current value.
     #[serde(default)]
     pub laya_failure_triage_knn: Option<bool>,
-    /// Startup failure-triage fine-tune (managed mode only, opt-in). Absent =
-    /// keep the current value.
+    /// Startup failure-triage fine-tune (managed runtime only, opt-in).
+    /// Absent = keep the current value.
     #[serde(default)]
     pub laya_auto_finetune: Option<bool>,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22 — all
-    /// opt-in, off by default). Absent = keep the current value, so a dialog
-    /// that never touched a lever leaves the section exactly as it was.
+    /// ON by default since 2027-01-25; uncheck to opt out). Absent = keep the
+    /// current value, so a dialog that never touched a lever leaves the section
+    /// exactly as it was.
     ///
     /// **Lever 1 — delta + skeleton re-reads**: `read_files` serves a
     /// signature/import skeleton (or a diff) instead of the full file on a
-    /// re-read. Off by default.
+    /// re-read. On by default.
     #[serde(default)]
     pub optimizer_delta_reads: Option<bool>,
     /// **Lever 2 — semantic command-output compression**: large shell output
     /// from known command families collapses to distinct error/warning lines
-    /// + counts. Off by default.
+    /// + counts. On by default.
     #[serde(default)]
     pub optimizer_compress_output: Option<bool>,
     /// **Lever 3 — archive/expand progressive disclosure**: tool results over
     /// `optimizer_archive_min_chars` are archived in full and the context
-    /// carries a preview the model can expand. Off by default.
+    /// carries a preview the model can expand. On by default.
     #[serde(default)]
     pub optimizer_archive: Option<bool>,
     /// **Lever 4 — compaction survival**: a pre-compaction checkpoint + a
-    /// must-preserve decisions block + a post-compaction digest. Off by
+    /// must-preserve decisions block + a post-compaction digest. On by
     /// default.
     #[serde(default)]
     pub optimizer_compaction_survival: Option<bool>,
     /// **Quality score**: the S-F context-quality grade in the ctx popup.
-    /// Off by default.
+    /// On by default.
     #[serde(default)]
     pub optimizer_quality_score: Option<bool>,
     /// **Lean-output nudge**: a cache-safe note pushing concise visible output
-    /// once context fill passes `optimizer_lean_output_fill_pct`. Off by
+    /// once context fill passes `optimizer_lean_output_fill_pct`. On by
     /// default.
     #[serde(default)]
     pub optimizer_lean_output_nudge: Option<bool>,
@@ -635,27 +626,11 @@ pub fn validate_and_apply_settings_patch(
     if let Some(enabled) = patch.laya_enabled {
         general.general.laya.enabled = enabled;
     }
-    if let Some(endpoint) = &patch.laya_endpoint {
-        let trimmed = endpoint.trim();
-        general.general.laya.endpoint = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
-    if let Some(mode) = patch.laya_mode {
-        general.general.laya.mode = mode;
-    }
-    if let Some(checkpoint) = &patch.laya_checkpoint {
-        let trimmed = checkpoint.trim();
-        general.general.laya.checkpoint = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
     if let Some(auto_type) = patch.laya_auto_type_memories {
         general.general.laya.auto_type_memories = auto_type;
+    }
+    if let Some(steer) = patch.laya_steer_tool_choice {
+        general.general.laya.steer_tool_choice = steer;
     }
     if let Some(triage) = patch.laya_failure_triage {
         general.general.laya.failure_triage = triage;
@@ -989,65 +964,19 @@ mod tests {
     }
 
     #[test]
-    fn laya_patch_applies_enabled_and_endpoint() {
+    fn laya_patch_applies_enabled() {
         // The opt-in Laya classifier rides the save path: Some flips the
-        // enable flag, Some(endpoint) sets the base URL (trimmed), a blank
-        // endpoint clears it, and absent fields keep the current values.
+        // enable flag, absent fields keep the current values.
         let current = Config::default();
         let patch = SettingsSaveDto {
             laya_enabled: Some(true),
-            laya_endpoint: Some("  http://127.0.0.1:8000  ".into()),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert!(next.general.general.laya.enabled);
-        assert_eq!(
-            next.general.general.laya.endpoint.as_deref(),
-            Some("http://127.0.0.1:8000")
-        );
-        // A blank endpoint clears it; the enable flag is untouched.
-        let patch = SettingsSaveDto {
-            laya_endpoint: Some("   ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(next.general.general.laya.enabled);
-        assert_eq!(next.general.general.laya.endpoint, None);
         // Defaults: nothing set, nothing enabled.
         let empty = Config::default();
         assert!(!empty.general.general.laya.enabled);
-        assert!(empty.general.general.laya.endpoint.is_none());
-    }
-
-    #[test]
-    fn laya_patch_applies_mode_and_checkpoint() {
-        // Managed-mode fields ride the same save path: Some(mode) flips the
-        // provisioning mode, Some(checkpoint) sets it (trimmed), a blank
-        // checkpoint clears it to the english default, absent keeps current.
-        let current = Config::default();
-        assert_eq!(
-            current.general.general.laya.mode,
-            crate::config::LayaMode::External
-        );
-        let patch = SettingsSaveDto {
-            laya_mode: Some(crate::config::LayaMode::Managed),
-            laya_checkpoint: Some("  multilingual  ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
-        assert_eq!(
-            next.general.general.laya.checkpoint.as_deref(),
-            Some("multilingual")
-        );
-        // A blank checkpoint clears it; the mode is untouched.
-        let patch = SettingsSaveDto {
-            laya_checkpoint: Some("   ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
-        assert_eq!(next.general.general.laya.checkpoint, None);
     }
 
     #[test]
@@ -1066,6 +995,24 @@ mod tests {
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.laya.auto_type_memories);
+    }
+
+    #[test]
+    fn laya_patch_applies_steer_tool_choice() {
+        // The tool-choice opt-in rides the same save path: Some flips it,
+        // absent keeps the current value.
+        let current = Config::default();
+        assert!(!current.general.general.laya.steer_tool_choice);
+        let patch = SettingsSaveDto {
+            laya_steer_tool_choice: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.steer_tool_choice);
+        // Absent keeps it on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.steer_tool_choice);
     }
 
     #[test]
@@ -1100,37 +1047,37 @@ mod tests {
         // The token-optimizer levers ride the same save path as the Laya
         // fields: Some flips a flag (both directions), absent keeps the
         // current value — so a dialog that never touched a lever cannot
-        // rewrite the section, and a default config keeps it omitted from
-        // config.toml entirely.
+        // rewrite the section, and a default config (every lever ON) keeps it
+        // omitted from config.toml entirely.
         let current = Config::default();
-        assert!(!current.general.general.optimizer.delta_reads);
-        assert!(!current.general.general.optimizer.archive);
+        assert!(current.general.general.optimizer.delta_reads);
+        assert!(current.general.general.optimizer.archive);
         let patch = SettingsSaveDto {
-            optimizer_delta_reads: Some(true),
-            optimizer_archive: Some(true),
+            optimizer_delta_reads: Some(false),
+            optimizer_archive: Some(false),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert!(next.general.general.optimizer.delta_reads);
-        assert!(next.general.general.optimizer.archive);
-        // Every lever the patch did not name stays off.
-        assert!(!next.general.general.optimizer.compress_output);
-        assert!(!next.general.general.optimizer.compaction_survival);
-        assert!(!next.general.general.optimizer.quality_score);
-        assert!(!next.general.general.optimizer.lean_output_nudge);
-        // Flip one back off; the other is untouched.
+        assert!(!next.general.general.optimizer.delta_reads);
+        assert!(!next.general.general.optimizer.archive);
+        // Every lever the patch did not name keeps the default, ON.
+        assert!(next.general.general.optimizer.compress_output);
+        assert!(next.general.general.optimizer.compaction_survival);
+        assert!(next.general.general.optimizer.quality_score);
+        assert!(next.general.general.optimizer.lean_output_nudge);
+        // Flip one back on; the other stays off.
         let patch = SettingsSaveDto {
-            optimizer_delta_reads: Some(false),
+            optimizer_delta_reads: Some(true),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(!next.general.general.optimizer.delta_reads);
-        assert!(next.general.general.optimizer.archive);
+        assert!(next.general.general.optimizer.delta_reads);
+        assert!(!next.general.general.optimizer.archive);
         // An empty patch changes nothing at all.
         let patch = SettingsSaveDto::default();
         let after = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(after.general.general.optimizer.archive);
-        assert!(!after.general.general.optimizer.delta_reads);
+        assert!(!after.general.general.optimizer.archive);
+        assert!(after.general.general.optimizer.delta_reads);
     }
 
     #[test]

@@ -1315,7 +1315,8 @@ three
         // No optimizer attached (CLI contract builds, pre-lever tests):
         // re-reads serve the full content again, byte-identical to the
         // pre-lever build, and no savings data rides the result — the
-        // regression pin for the lever's default-off invariant.
+        // regression pin for the ABSENT-optimizer path (an explicit
+        // `delta_reads = false` is pinned by the test below).
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
@@ -1336,7 +1337,12 @@ three
         // first flag-on read must serve the FULL content (no baseline was
         // recorded while off), and only the one after serves the skeleton.
         let dir = tempdir().unwrap();
-        let cfg = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig::default()));
+        // Explicit opt-out: the levers default ON (2027-01-25), so the
+        // flag-off half of this test has to say so.
+        let cfg = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig {
+            delta_reads: false,
+            ..Default::default()
+        }));
         let tool = ReadFilesTool::new(Sandbox::new(dir.path()).unwrap())
             .with_optimizer(Arc::clone(&cfg));
         let src: String = (0..60)

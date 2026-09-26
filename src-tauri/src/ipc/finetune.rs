@@ -4,8 +4,8 @@
 
 //! The startup failure-triage fine-tune (managed Laya runtime only).
 //!
-//! Gated on `[general.laya] auto_finetune` (Laya enabled + MANAGED mode +
-//! the flag + the managed runtime and checkpoint installed — see
+//! Gated on `[general.laya] auto_finetune` (Laya enabled + the flag +
+//! the managed runtime and checkpoint installed — see
 //! [`startup_finetune_checkpoint`]). At startup (after the managed sidecar
 //! spawn) the gate spawns a background task that reads the failure-triage
 //! training log (`~/.mnemo/laya/training/failure_triage.jsonl`, written by
@@ -44,11 +44,11 @@ use tauri::{AppHandle, Emitter};
 
 use mnemo::agent::failure_triage::{read_rows, training_log_path, FailureLogRow};
 use mnemo::config::Config;
-use mnemo::config::general::{LayaConfig, LayaMode};
+use mnemo::config::general::LayaConfig;
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};
 
 use super::laya::{
-    build_managed_classifier, find_checkpoint, hide_console_window, start_managed_server,
+    build_managed_classifier, english_checkpoint, hide_console_window, start_managed_server,
     start_server_models, LayaManager,
 };
 
@@ -206,22 +206,18 @@ pub fn build_finetune_args(dataset: &Path, out_dir: &Path) -> Vec<String> {
 }
 
 /// The startup fine-tune gate: `Some(checkpoint_id)` when the fine-tune may
-/// run — Laya enabled, MANAGED mode, `auto_finetune` on, and the managed
-/// runtime + configured checkpoint installed. Anything else is `None` and
-/// the startup hook spawns nothing (byte-identical startup). The checkpoint
-/// id defaults to `"english"` exactly like the managed start does.
+/// run — Laya enabled, `auto_finetune` on, and the managed runtime + the
+/// English checkpoint installed. Anything else is `None` and the startup hook
+/// spawns nothing (byte-identical startup).
 pub fn startup_finetune_checkpoint(laya: &LayaConfig, manager: &LayaManager) -> Option<String> {
-    if !laya.enabled || !laya.auto_finetune || laya.mode != LayaMode::Managed {
+    if !laya.enabled || !laya.auto_finetune {
         return None;
     }
-    let id = laya
-        .checkpoint
-        .clone()
-        .unwrap_or_else(|| "english".to_string());
-    if !manager.is_checkpoint_installed(&id) {
+    let id = english_checkpoint().id;
+    if !manager.is_checkpoint_installed(id) {
         return None;
     }
-    Some(id)
+    Some(id.to_string())
 }
 
 /// Set + emit a classifier status (the same discipline as the setup/start
@@ -418,7 +414,7 @@ async fn restart_and_swap(
              {original_checkpoint}"
         );
         if let Some(restore_port) = LayaManager::alloc_free_port() {
-            let checkpoint = find_checkpoint(original_checkpoint);
+            let checkpoint = english_checkpoint();
             if start_managed_server(app, manager.clone(), checkpoint, restore_port)
                 .await
                 .is_some()
@@ -466,7 +462,7 @@ pub async fn run_startup_finetune(
     config: Arc<tokio::sync::Mutex<Config>>,
 ) {
     // The gate, read from the LIVE shared config (the same handle settings
-    // saves go through): enabled + managed mode + `auto_finetune` + the
+    // saves go through): enabled + `auto_finetune` + the
     // managed runtime and checkpoint installed. Anything else is a no-op —
     // byte-identical startup.
     let laya_cfg = config.lock().await.general.general.laya.clone();
@@ -583,9 +579,9 @@ pub async fn run_startup_finetune(
 
 /// Spawn the startup fine-tune (the startup hook calls this at every
 /// startup): the spawned task reads the live `[general.laya]` config and
-/// runs the gate — a no-op unless it opens (Laya enabled, managed mode,
-/// `auto_finetune` on, and the managed runtime + configured checkpoint
-/// installed). The task never blocks startup.
+/// runs the gate — a no-op unless it opens (Laya enabled, `auto_finetune`
+/// on, and the managed runtime + configured checkpoint installed). The task
+/// never blocks startup.
 pub fn spawn_startup_finetune(
     app: Option<AppHandle>,
     manager: Arc<LayaManager>,
@@ -742,21 +738,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_gate_requires_enabled_managed_flag_and_install() {
+    fn startup_gate_requires_the_enabled_flag_and_an_install() {
         let dir = tempfile::tempdir().unwrap();
         let manager = test_manager(dir.path());
         let mut laya = LayaConfig::default();
         // Everything off by default → no fine-tune.
         assert_eq!(startup_finetune_checkpoint(&laya, &manager), None);
-        // The flag on but external mode → still nothing.
+        // The flag on but nothing installed → nothing.
         laya.enabled = true;
         laya.auto_finetune = true;
         assert_eq!(startup_finetune_checkpoint(&laya, &manager), None);
-        // Managed mode but nothing installed → nothing.
-        laya.mode = LayaMode::Managed;
-        assert_eq!(startup_finetune_checkpoint(&laya, &manager), None);
-        // Install the runtime (venv launcher) + the checkpoint marker → the
-        // gate opens on the default id.
+        // Install the runtime (venv launcher) + the English checkpoint marker
+        // → the gate opens on the one checkpoint.
         std::fs::create_dir_all(manager.laya_serve_path().parent().unwrap()).unwrap();
         std::fs::write(manager.laya_serve_path(), "").unwrap();
         std::fs::create_dir_all(manager.base_dir().join("markers")).unwrap();
@@ -764,19 +757,6 @@ mod tests {
         assert_eq!(
             startup_finetune_checkpoint(&laya, &manager),
             Some("english".to_string())
-        );
-        // An explicitly configured checkpoint is honored (and must itself be
-        // installed).
-        laya.checkpoint = Some("multilingual".into());
-        assert_eq!(startup_finetune_checkpoint(&laya, &manager), None);
-        std::fs::write(
-            manager.base_dir().join("markers").join("multilingual"),
-            "",
-        )
-        .unwrap();
-        assert_eq!(
-            startup_finetune_checkpoint(&laya, &manager),
-            Some("multilingual".to_string())
         );
     }
 }

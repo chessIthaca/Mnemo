@@ -250,7 +250,12 @@ vitest (frontend), `tsc --noEmit` clean.
   pointer) rides above the output and the file walk is skipped entirely; a
   query targeting semantic memory (a glob under `.coding/knowledge`/
   `.coding/reviews` or a typed `SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/
-  `REVIEW:` prefix) delegates to `memory_search` the same way. The block
+  `REVIEW:` prefix) delegates to `memory_search` the same way. With the
+  opt-in `[general.laya] steer_tool_choice` flag on and a confident answer,
+  the Laya classifier picks that route itself — SYMBOL / TEXT / MEMORY —
+  instead of the shape heuristics (below threshold, and whenever Laya is
+  off, the heuristics stand byte-identically; backlog e2c47d5f; each steered
+  search is logged with its disposition to seed a fine-tune). The block
   opens with `AUTO-DELEGATED to …` and re-issuing the SAME query
   (pattern+glob+literal) skips delegation and runs the plain file search
   (the escape hatch — sticky per query: a bounded set of bypassed keys,
@@ -408,9 +413,10 @@ Config selects a default provider; `--provider` / `/provider` switches at
 runtime **for newly built agents** — the factory (`agent/factory.rs`) builds
 each new agent loop with the selected provider. Switching the provider for an
 already-**live** agent is a separate per-loop step via `set_provider`; the two
-paths are not atomic. `/model` and `/provider` therefore require a restart (or
-a fresh agent) to take effect for the main provider — the slash-command help
-notes this.
+paths are not atomic. Since 2027-01-25 the turn loop resolves its provider and
+context manager per REQUEST rather than per turn, so a live swap (the GUI model
+picker, a Settings save, the console `/model`) lands on the next request of a
+run already in flight, mid-run included.
 
 ## Enforced plan-first workflow
 
@@ -563,11 +569,13 @@ results (file reads, shell, git) are truncated with a note.
 
 #### Optimizer levers (token-optimizer parity, backlog e4a50d22)
 
-Six independent, **default-off** context-economy levers live behind
-`[general.optimizer]` in `config.toml` (`OptimizerConfig`, `src/config/general.rs`).
-With a flag off its code path is byte-identical to the pre-lever behaviour —
-which is exactly what keeps the existing truncation/compaction/cap tests green
-without modification.
+Six independent context-economy levers live behind `[general.optimizer]` in
+`config.toml` (`OptimizerConfig`, `src/config/general.rs`) — **on by default
+since 2027-01-25** (saving tokens is the expected behaviour; a config that never
+wrote the section runs every lever, and an explicit `false` is honoured as
+written). With a flag off its code path is byte-identical to the pre-lever
+behaviour — which is what keeps the existing truncation/compaction/cap tests
+green, now that they opt a lever out explicitly.
 
 | Lever | Flag | What it does |
 |---|---|---|

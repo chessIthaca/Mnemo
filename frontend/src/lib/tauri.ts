@@ -446,17 +446,17 @@ export interface AppSettings {
     vision_model?: VisionModelConfig | null;
     embedding_model?: EmbeddingModelConfig | null;
     bundled_embedding_model?: string | null;
-    /** Laya classifier (opt-in) — whether it is enabled, the runtime `mode`
-     *  ("managed": Mnemo downloads + runs laya-serve as a sidecar; "external":
-     *  the user runs it), the managed-mode checkpoint id, and the external
-     *  `laya-serve` base URL (`null` = not configured). */
+    /** Laya classifier (opt-in) — whether it is enabled plus the auto-typing,
+     *  tool-choice steering, failure-triage and fine-tune opt-ins. Mnemo owns
+     *  the runtime: no mode, no endpoint, one English checkpoint. */
     laya?: {
       enabled: boolean;
-      endpoint: string | null;
-      mode: "external" | "managed";
-      checkpoint: string | null;
       /** Whether memory auto-typing is enabled (opt-in). */
       auto_type_memories: boolean;
+      /** Whether Laya tool-choice steering is enabled (opt-in; the
+       *  search/search_read tools let a confident classifier pick the
+       *  delegation class; needs a fine-tuned checkpoint). */
+      steer_tool_choice: boolean;
       /** Whether failure triage is enabled (opt-in; needs a fine-tuned
        *  checkpoint). */
       failure_triage: boolean;
@@ -465,7 +465,7 @@ export interface AppSettings {
        *  only while failure_triage itself is on). */
       failure_triage_knn: boolean;
       /** Whether the startup failure-triage fine-tune is enabled (managed
-       *  mode only, opt-in). */
+       *  runtime only, opt-in). */
       auto_finetune: boolean;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
@@ -600,22 +600,17 @@ export interface SettingsSavePatch {
   clear_bundled_embedding_model?: boolean;
   /** Laya classifier (opt-in): flip the enable flag. */
   laya_enabled?: boolean;
-  /** Laya `laya-serve` base URL; a blank string clears it. */
-  laya_endpoint?: string;
-  /** Laya runtime mode: "managed" (Mnemo downloads + runs the sidecar) or
-   * "external" (user-provided endpoint). */
-  laya_mode?: "external" | "managed";
-  /** Managed mode: the checkpoint id to serve ("english" | "multilingual"). */
-  laya_checkpoint?: string;
   /** Laya memory auto-typing (opt-in; needs a fine-tuned checkpoint). */
   laya_auto_type_memories?: boolean;
+  /** Laya tool-choice steering (opt-in; needs a fine-tuned checkpoint). */
+  laya_steer_tool_choice?: boolean;
   /** Laya failure triage (opt-in; needs a fine-tuned checkpoint). */
   laya_failure_triage?: boolean;
   /** The kNN overlay for failure triage (opt-in; local — rides the memory
    *  embedder, needs no laya-serve; consulted only while laya_failure_triage
    *  is on). */
   laya_failure_triage_knn?: boolean;
-  /** Startup failure-triage fine-tune (managed mode only, opt-in). */
+  /** Startup failure-triage fine-tune (managed runtime only, opt-in). */
   laya_auto_finetune?: boolean;
   /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
    *  is opt-in, off by default, and read per tool call from a live mirror, so
@@ -785,7 +780,7 @@ export function onClassifierStatus(
 
 /** A managed-Laya checkpoint catalog entry (Settings → Classifier). */
 export interface LayaCheckpointInfo {
-  /** The checkpoint id (`"english"` | `"multilingual"`). */
+  /** The checkpoint id (`"english"` — the only catalog entry). */
   id: string;
   /** Human-facing name. */
   name: string;
@@ -801,20 +796,21 @@ export async function listLayaCheckpoints(): Promise<LayaCheckpointInfo[]> {
 }
 
 /**
- * Download the managed Laya runtime (uv + venv + `laya[serve]` + the
+ * Download the managed Laya runtime (uv + venv + `laya[serve]` + the English
  * checkpoint) in the background. Fire-and-forget: emits `classifier://status`
  * events — `installing` / `downloading { label, progress }` phases, then
  * `ready` (or `failed`) — and starts the sidecar when the saved config
- * already enables managed mode.
+ * already enables Laya.
  */
-export async function setupLayaRuntime(checkpoint: string): Promise<void> {
-  await invoke("laya_setup", { checkpoint });
+export async function setupLayaRuntime(): Promise<void> {
+  await invoke("laya_setup");
 }
 
 // ── Bundled embedding models (fastembed, in-process) ───────────────────────
 
 /** A catalog entry for a bundled embedding model. */
 export interface BundledModelInfo {
+  /** The model id (e.g. `"all-MiniLM-L6-v2"`). */
   id: string;
   name: string;
   dim: number;
@@ -1421,7 +1417,8 @@ export async function saveEndpoints(
  * `agentId` selects the agent to switch; pass `null` for the legacy global
  * switch (factory + every live agent). The provider for the chosen endpoint +
  * model is rebuilt and swapped into that agent's loop only (takes effect on
- * its next turn); other agents keep their models.
+ * that agent's next request — a mid-run switch lands before the next call of
+ * the run already in flight); other agents keep their models.
  *
  * `reasoningEffort` is the raw dropdown value (`max`/`high`/`medium`/`low`/
  * `minimal`/`off`). The backend maps `"off"` to omitting the field from

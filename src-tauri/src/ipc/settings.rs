@@ -14,7 +14,7 @@ use tauri::State;
 
 use mnemo::config::general::{OptimizerConfig, UiConfig};
 use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
-use mnemo::config::{Endpoint, EndpointKind, LayaMode, SafetyMode};
+use mnemo::config::{Endpoint, EndpointKind, SafetyMode};
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::provider::client_factory::build_client;
@@ -470,25 +470,20 @@ pub struct EmbeddingModelWire {
 
 /// The Laya classifier config (the `general.laya` value) — opt-in, disabled
 /// by default. Always emitted as a nested object (never `null`) so the
-/// frontend renders the opt-in state directly: `enabled` false + `endpoint`
-/// null when Laya is not configured.
+/// frontend renders the opt-in state directly: `enabled` false + every opt-in
+/// false when Laya is not configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct LayaWire {
     /// Whether the Laya classifier is enabled.
     pub enabled: bool,
-    /// Base URL of the `laya-serve` instance (`null` = not configured).
-    pub endpoint: Option<String>,
-    /// The runtime mode: managed (the app downloads + runs the sidecar) or
-    /// external (a user-run instance). MUST round-trip — the section's mode
-    /// radio initializes from it, and defaulting it client-side would
-    /// silently flip external configs to managed on the next save.
-    pub mode: LayaMode,
-    /// Managed mode: the configured checkpoint id (`null` = "english").
-    pub checkpoint: Option<String>,
     /// Whether Laya auto-typing of memory records is enabled — a separate
     /// opt-in from `enabled` (confidence-gated prefix correction at
     /// `memory_write` time; needs a fine-tuned checkpoint).
     pub auto_type_memories: bool,
+    /// Whether Laya TOOL-CHOICE steering is enabled — a separate opt-in from
+    /// `enabled` (the search/search_read tools let a confident classifier pick
+    /// the delegation class; needs a fine-tuned checkpoint).
+    pub steer_tool_choice: bool,
     /// Whether Laya FAILURE TRIAGE is enabled — a separate opt-in from
     /// `enabled` (at every failure-handling site the error text is
     /// classified and a confident answer steers the harness; needs a
@@ -500,7 +495,7 @@ pub struct LayaWire {
     /// only while `failure_triage` itself is on).
     pub failure_triage_knn: bool,
     /// Whether the startup failure-triage FINE-TUNE is enabled (managed
-    /// mode only; never blocks startup).
+    /// runtime only; never blocks startup).
     pub auto_finetune: bool,
 }
 
@@ -605,8 +600,7 @@ pub struct GetSettingsGeneral {
     /// Bundled in-process embedding model id (`null` = hash mode). Takes
     /// precedence over `embedding_model` (the legacy remote path).
     pub bundled_embedding_model: Option<String>,
-    /// Laya classifier (opt-in) — whether it is enabled + the configured
-    /// `laya-serve` base URL (`null` = not configured).
+    /// Laya classifier (opt-in) — whether it is enabled + the opt-in flags.
     pub laya: LayaWire,
     /// Whether the agent's `browser_*` browser-inspection tools are enabled
     /// (exposes an unauthenticated localhost CDP port — opt-in, off by
@@ -911,10 +905,8 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
             bundled_embedding_model: config.general.general.bundled_embedding_model.clone(),
             laya: LayaWire {
                 enabled: config.general.general.laya.enabled,
-                endpoint: config.general.general.laya.endpoint.clone(),
-                mode: config.general.general.laya.mode.clone(),
-                checkpoint: config.general.general.laya.checkpoint.clone(),
                 auto_type_memories: config.general.general.laya.auto_type_memories,
+                steer_tool_choice: config.general.general.laya.steer_tool_choice,
                 failure_triage: config.general.general.laya.failure_triage,
                 failure_triage_knn: config.general.general.laya.failure_triage_knn,
                 auto_finetune: config.general.general.laya.auto_finetune,
@@ -1017,7 +1009,8 @@ pub async fn save_settings(
     rewire_vision_embedder_and_classifier(&app, &state, &reloaded);
 
     // Push the reloaded config into the per-context model resolver so
-    // `[models]` overrides take effect on the next turn.
+    // `[models]` overrides take effect on the next request (per-request
+    // resolution, 2027-01-25).
     sync_model_resolver(&state, &reloaded);
 
     // Push the reloaded `[git].core_operations` into the factory's shared
@@ -1338,7 +1331,6 @@ mod settings_dto_tests {
         assert!(p.trace_memory_budget_mb.is_none());
         assert!(p.trace_request_body_cap_kb.is_none());
         assert!(p.laya_enabled.is_none());
-        assert!(p.laya_endpoint.is_none());
     }
 
     #[test]
@@ -1354,11 +1346,11 @@ mod settings_dto_tests {
     #[test]
     fn settings_save_dto_parses_laya() {
         let p: SettingsSaveDto = serde_json::from_str(
-            r#"{ "laya_enabled": true, "laya_endpoint": "http://127.0.0.1:8000" }"#,
+            r#"{ "laya_enabled": true, "laya_auto_finetune": true }"#,
         )
         .unwrap();
         assert_eq!(p.laya_enabled, Some(true));
-        assert_eq!(p.laya_endpoint.as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(p.laya_auto_finetune, Some(true));
     }
 
     #[test]
@@ -1415,10 +1407,8 @@ mod settings_dto_tests {
                 bundled_embedding_model: None,
                 laya: LayaWire {
                     enabled: false,
-                    endpoint: None,
-                    mode: LayaMode::External,
-                    checkpoint: None,
                     auto_type_memories: false,
+                    steer_tool_choice: false,
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,
@@ -1481,20 +1471,16 @@ mod settings_dto_tests {
         assert_eq!(v["general"]["default_provider"], serde_json::Value::Null);
         assert_eq!(v["general"]["default_model"], serde_json::Value::Null);
         assert_eq!(v["general"]["vision_model"], serde_json::Value::Null);
-        // The opt-in Laya block always renders (a nested object): disabled +
-        // no endpoint when unconfigured — and the mode/checkpoint fields
-        // round-trip so an external config never silently flips to managed.
+        // The opt-in Laya block always renders (a nested object): disabled
+        // when unconfigured.
         assert_eq!(v["general"]["laya"]["enabled"], false);
-        assert_eq!(v["general"]["laya"]["endpoint"], serde_json::Value::Null);
-        assert_eq!(v["general"]["laya"]["mode"], "external");
-        assert_eq!(v["general"]["laya"]["checkpoint"], serde_json::Value::Null);
         assert_eq!(v["general"]["safety"], "approve-each-action");
         // The token-optimizer block renders as a nested object too — every
-        // lever off, and the knobs at their documented defaults (tied to the
-        // constants so a default change cannot silently desync the wire).
-        assert_eq!(v["general"]["optimizer"]["archive"], false);
-        assert_eq!(v["general"]["optimizer"]["delta_reads"], false);
-        assert_eq!(v["general"]["optimizer"]["quality_score"], false);
+        // cost-saving levers default to ON (12a65d1) with the knobs at their
+        // documented constants, so a default change cannot desync the wire.
+        assert_eq!(v["general"]["optimizer"]["archive"], true);
+        assert_eq!(v["general"]["optimizer"]["delta_reads"], true);
+        assert_eq!(v["general"]["optimizer"]["quality_score"], true);
         assert_eq!(
             v["general"]["optimizer"]["archive_min_chars"],
             serde_json::json!(OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS as u64)
@@ -1576,10 +1562,8 @@ mod settings_dto_tests {
                 bundled_embedding_model: None,
                 laya: LayaWire {
                     enabled: false,
-                    endpoint: None,
-                    mode: LayaMode::External,
-                    checkpoint: None,
                     auto_type_memories: false,
+                    steer_tool_choice: false,
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,

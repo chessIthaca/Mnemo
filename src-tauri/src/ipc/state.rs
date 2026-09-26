@@ -125,7 +125,8 @@ pub struct AgentRuntimeContext {
     pub safety_rules: Option<Arc<SafetyRules>>,
     /// The per-context model resolver (shared with the factory). The IPC layer
     /// pushes reloaded config into it after a Settings save so `[models]`
-    /// overrides take effect on the next turn. `None` when the brain failed to
+    /// overrides take effect on the next request (resolution runs per request,
+    /// 2027-01-25). `None` when the brain failed to
     /// build at startup.
     pub model_resolver: Option<Arc<mnemo::model_resolver::ConfigModelResolver>>,
     /// The shared headless debug browser (the same `Arc` the agent tools use,
@@ -153,15 +154,14 @@ pub struct AgentRuntimeContext {
     /// no classifier client is built and no call is ever made. Surfaced to the
     /// frontend via `get_classifier_status` + the startup snapshot.
     pub classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
-    /// The built classifier, when Laya is enabled with an endpoint — the
-    /// handle items 2-5 will consume (`None` while disabled; see
-    /// `build_classifier`). Behind a lock so a Settings save can swap the
-    /// rebuilt backend in without a restart.
+    /// The built classifier, when Laya is enabled — the handle items 2-5
+    /// will consume (`None` while disabled). Behind a lock so a Settings
+    /// save can swap the rebuilt backend in without a restart.
     pub classifier: Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
     /// The managed Laya runtime owner (setup pipeline, the `laya-serve`
     /// child, its port) — one instance shared by the setup command, the
     /// startup hook, the Settings rewire, and app exit so they all steer
-    /// the same sidecar. Inert until managed mode is enabled + set up.
+    /// the same sidecar. Inert until Laya is enabled + set up.
     pub laya: Arc<crate::ipc::laya::LayaManager>,
     /// The same-project instance conflict resolved at startup (main.rs):
     /// `Some` when another live mnemo instance already holds this project —

@@ -9,7 +9,7 @@
  *
  * Pins the surfaces of the opt-in contract: the section is registered
  * (nav + deep-link id), it persists the config keys through the shared save
- * path, the managed-runtime controls (mode toggle + checkpoint catalog +
+ * path, the managed-runtime controls (checkpoint catalog +
  * download progress) stay wired, and the frontend bindings stay wired to the
  * backend's exact names (commands, event, config + patch fields, snapshot
  * field).
@@ -55,23 +55,17 @@ describe("Classifier settings section placement", () => {
 });
 
 describe("ClassifierSection owns the opt-in controls", () => {
-  it("renders the enable toggle, the mode toggle and the external endpoint field", () => {
+  it("renders the enable toggle and the managed install card", () => {
     expect(classifierSource).toContain("Enable the Laya classifier");
-    expect(classifierSource).toContain("Managed — recommended");
-    expect(classifierSource).toContain("External endpoint (advanced)");
-    expect(classifierSource).toContain("laya-serve endpoint URL");
+    expect(classifierSource).toContain("Mnemo downloads and runs it");
   });
 
-  it("keeps the do-it-yourself install hints for external mode", () => {
-    expect(classifierSource).toContain("pip install");
-    expect(classifierSource).toContain("laya-serve");
-  });
 
   it("wires the managed checkpoint catalog + download through the bindings", () => {
     expect(classifierSource).toContain("listLayaCheckpoints");
     expect(classifierSource).toContain("setupLayaRuntime");
     expect(classifierSource).toContain("Download (~{c.size_mb} MB)");
-    expect(classifierSource).toContain('name="laya-checkpoint"');
+    expect(classifierSource).toContain("{c.id}</code> checkpoint");
   });
 
   it("shows download progress from the downloading status payload", () => {
@@ -90,7 +84,7 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("getClassifierStatus");
     expect(classifierSource).toContain("onClassifierStatus");
     expect(classifierSource).toContain("Disabled — no classifier backend exists");
-    expect(classifierSource).toContain("Failed — the last call got no answer");
+    expect(classifierSource).toContain("Failed — the sidecar did not start");
     expect(classifierSource).toContain("Installing — preparing the managed Laya runtime");
     expect(classifierSource).toContain("Starting — launching the local laya-serve sidecar");
   });
@@ -101,12 +95,6 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("laya_failure_triage: failureTriage");
     expect(classifierSource).toContain("laya_failure_triage_knn: failureTriageKnn");
     expect(classifierSource).toContain("laya_auto_finetune: autoFinetune");
-    expect(classifierSource).toContain("laya_mode: mode");
-    expect(classifierSource).toContain("laya_checkpoint: checkpoint");
-    // Managed mode never persists an external endpoint (blank clears it).
-    expect(classifierSource).toContain(
-      'laya_endpoint: mode === "managed" ? "" : endpoint',
-    );
   });
 
   it("keeps the dialog save contract (forwardRef + dirty callback)", () => {
@@ -156,18 +144,19 @@ describe("classifier bindings stay wired to the backend names", () => {
 
   it("the managed-runtime commands target laya_catalog + laya_setup", () => {
     expect(tauriSource).toContain('invoke("laya_catalog")');
-    expect(tauriSource).toContain('invoke("laya_setup", { checkpoint })');
+    expect(tauriSource).toContain('invoke("laya_setup")');
   });
 
   it("the settings types carry the laya fields (config + save patch)", () => {
     expect(tauriSource).toContain(
       `laya?: {
       enabled: boolean;
-      endpoint: string | null;
-      mode: "external" | "managed";
-      checkpoint: string | null;
       /** Whether memory auto-typing is enabled (opt-in). */
       auto_type_memories: boolean;
+      /** Whether Laya tool-choice steering is enabled (opt-in; the
+       *  search/search_read tools let a confident classifier pick the
+       *  delegation class; needs a fine-tuned checkpoint). */
+      steer_tool_choice: boolean;
       /** Whether failure triage is enabled (opt-in; needs a fine-tuned
        *  checkpoint). */
       failure_triage: boolean;
@@ -176,15 +165,13 @@ describe("classifier bindings stay wired to the backend names", () => {
        *  only while failure_triage itself is on). */
       failure_triage_knn: boolean;
       /** Whether the startup failure-triage fine-tune is enabled (managed
-       *  mode only, opt-in). */
+       *  runtime only, opt-in). */
       auto_finetune: boolean;
     };`
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
-    expect(tauriSource).toContain("laya_endpoint?: string;");
-    expect(tauriSource).toContain('laya_mode?: "external" | "managed";');
-    expect(tauriSource).toContain("laya_checkpoint?: string;");
     expect(tauriSource).toContain("laya_auto_type_memories?: boolean;");
+    expect(tauriSource).toContain("laya_steer_tool_choice?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage_knn?: boolean;");
     expect(tauriSource).toContain("laya_auto_finetune?: boolean;");
@@ -198,10 +185,8 @@ describe("classifier bindings stay wired to the backend names", () => {
 describe("serializeClassifier", () => {
   const base: ClassifierDraft = {
     enabled: true,
-    mode: "managed",
-    checkpoint: "english",
-    endpoint: "",
     autoTypeMemories: false,
+    steerToolChoice: false,
     failureTriage: false,
     failureTriageKnn: false,
     autoFinetune: false,
@@ -216,16 +201,10 @@ describe("serializeClassifier", () => {
       serializeClassifier({ ...base, enabled: false }),
     );
     expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({ ...base, mode: "external" as const }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({ ...base, checkpoint: "multilingual" }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
-      serializeClassifier({ ...base, endpoint: "http://127.0.0.1:8000" }),
-    );
-    expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, autoTypeMemories: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, steerToolChoice: true }),
     );
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, failureTriage: true }),
@@ -238,13 +217,11 @@ describe("serializeClassifier", () => {
     );
   });
 
-  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + triage + kNN overlay + fine-tune)", () => {
+  it("matches the persisted opt-in shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
-      mode: "managed",
-      checkpoint: "english",
-      endpoint: "",
       autoTypeMemories: false,
+      steerToolChoice: false,
       failureTriage: false,
       failureTriageKnn: false,
       autoFinetune: false,

@@ -1,6 +1,7 @@
 +++
 title = "reviewer rounds 2+ are delta-scoped via plan-frame stamps + app-rendered preamble (plan f4636852, a85de74 on wt/mnemo)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed: commit a85de74 on wt/mnemo (plan f4636852, backlog 85313a7e; review rounds 1-6, final verdict PASS at round 6 in .coding/reviews/2026-09-26-delta-scope-reviewer-rounds-85313a7e-review-round6.md).

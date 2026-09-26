@@ -12,7 +12,7 @@
  * entry sets the field value; free-typed values are preserved on save; a typed
  * model not in the list still saves.
  *
- * Token-optimizer levers (backlog ebe21e3c, [general.optimizer]): the six flags
+ * Token-optimizer levers (backlog ebe21e3c, [general.optimizer]): the seven flags
  * + four knobs + the extra-command list ride the SAME save patch as the pricing
  * rows, and both halves count towards the section's dirty state.
  *
@@ -71,6 +71,7 @@ describe("Optimizer levers in the Savings section", () => {
     "compaction_survival",
     "quality_score",
     "lean_output_nudge",
+    "recall_delta",
   ];
   const KNOBS = [
     "archive_min_chars",
@@ -79,7 +80,7 @@ describe("Optimizer levers in the Savings section", () => {
     "nudge_cooldown_requests",
   ];
 
-  it("renders all six levers and all four knobs", () => {
+  it("renders all seven levers and all four knobs", () => {
     // BOOL_FIELDS drives the toggle list and KNOBS the number inputs — a lever
     // or knob added backend-side without this file listing it fails loudly
     // here instead of going silently missing from the UI.
@@ -110,6 +111,7 @@ describe("Optimizer levers in the Savings section", () => {
     expect(source).toContain("optimizer_delta_reads: flags.delta_reads,");
     expect(source).toContain("optimizer_archive: flags.archive,");
     expect(source).toContain("optimizer_lean_output_nudge: flags.lean_output_nudge,");
+    expect(source).toContain("optimizer_recall_delta: flags.recall_delta,");
     expect(source).toContain("optimizer_archive_min_chars: knobs.archive_min_chars,");
     expect(source).toContain(
       "optimizer_nudge_cooldown_requests: knobs.nudge_cooldown_requests,",

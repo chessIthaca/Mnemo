@@ -152,6 +152,7 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
       "levers",
       "archive",
       "delta reads",
+      "recall delta",
       "compress",
     ],
   },

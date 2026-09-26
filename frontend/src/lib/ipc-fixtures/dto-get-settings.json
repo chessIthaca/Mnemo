@@ -27,6 +27,7 @@
       "compaction_survival": true,
       "quality_score": true,
       "lean_output_nudge": true,
+      "recall_delta": true,
       "archive_min_chars": 20000,
       "compress_min_chars": 2000,
       "lean_output_fill_pct": 25,

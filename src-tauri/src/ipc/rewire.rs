@@ -168,6 +168,12 @@ pub(super) fn rewire_vision_embedder_and_classifier(
     // writes the same Arc the factory's tools hold.
     if let Some(factory) = &state.runtime.factory {
         factory.set_auto_typing_enabled(laya_cfg.auto_type_memories);
+        // Tool-choice steering (backlog e2c47d5f): the same live-toggle
+        // contract — the search/search_read tools read the shared classifier
+        // slot + this mirrored flag per call, so a Settings save lands on the
+        // next search with no rebuild. The slot needs no touch here: every
+        // swap above writes the same Arc the tools hold.
+        factory.set_tool_choice_enabled(laya_cfg.steer_tool_choice);
         // Failure triage (backlog 1a4049c1): the same live-toggle contract —
         // the loop's dispatch site and both provider retry layers read the
         // mirrored flag at failure time, so a Settings save lands on the

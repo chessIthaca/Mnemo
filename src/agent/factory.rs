@@ -68,6 +68,7 @@ use crate::tool::agent::{
     search_read::SearchReadTool,
     shell::ShellTool,
     spawn_agent::SpawnAgentTool,
+    tool_choice::ToolChoiceHandle,
     web_fetch::WebFetchTool,
     write_review_report::WriteReviewReportTool,
 };
@@ -181,6 +182,11 @@ pub struct AgentLoopFactory {
     /// `with_auto_typing` (the app runtime's shared classifier slot + the
     /// `auto_type_memories` flag mirror).
     typing: Option<AutoTypingHandle>,
+    /// The shared Laya tool-choice gate for `search` / `search_read` (backlog
+    /// e2c47d5f) — `None` until the IPC layer wires it via `with_tool_choice`
+    /// (the SAME shared classifier slot + the `steer_tool_choice` flag
+    /// mirror). When not wired, both tools keep their regex heuristics.
+    tool_choice: Option<ToolChoiceHandle>,
     /// The shared Laya failure-triage gate (backlog 1a4049c1) — `None` until
     /// the IPC layer wires it via `with_failure_triage` (the SAME shared
     /// classifier slot + the `failure_triage` flag mirror). Attached to every
@@ -376,6 +382,10 @@ impl AgentLoopFactory {
             // `with_failure_triage` (backlog 1a4049c1). Until then every
             // failure-handling site keeps its pre-classifier behavior.
             failure_triage: None,
+            // No tool-choice gate at construction — wired via
+            // `with_tool_choice` (backlog e2c47d5f). Until then the search
+            // tools keep their regex auto-delegation heuristics byte-identically.
+            tool_choice: None,
         }
     }
 
@@ -403,6 +413,26 @@ impl AgentLoopFactory {
     /// tools with no registry rebuild.
     pub fn set_auto_typing_enabled(&self, on: bool) {
         if let Some(handle) = &self.typing {
+            handle
+                .enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Wire the shared Laya tool-choice gate (backlog e2c47d5f): the `search`
+    /// and `search_read` tools read the shared classifier slot + the
+    /// `[general.laya] steer_tool_choice` flag at call time. When not wired,
+    /// both tools keep their regex auto-delegation heuristics.
+    pub fn with_tool_choice(mut self, handle: ToolChoiceHandle) -> Self {
+        self.tool_choice = Some(handle);
+        self
+    }
+
+    /// Flip the tool-choice enable flag on the shared gate — the Settings save
+    /// path (rewire) calls this so the toggle reaches already-built tools with
+    /// no registry rebuild.
+    pub fn set_tool_choice_enabled(&self, on: bool) {
+        if let Some(handle) = &self.tool_choice {
             handle
                 .enabled
                 .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -1069,6 +1099,14 @@ impl AgentLoopFactory {
         if let Some(store) = &self.memory {
             search_tool = search_tool.with_memory(store.clone());
             search_read_tool = search_read_tool.with_memory(store.clone());
+        }
+        // Laya tool-choice steering (backlog e2c47d5f, opt-in): the shared
+        // classifier slot + the `steer_tool_choice` flag mirror, read per call
+        // so a Settings save lands on the next search without a rebuild.
+        // Unwired → the regex heuristics run byte-identically.
+        if let Some(handle) = &self.tool_choice {
+            search_tool = search_tool.with_tool_choice(handle.clone());
+            search_read_tool = search_read_tool.with_tool_choice(handle.clone());
         }
         registry.register(Box::new(search_tool));
         registry.register(Box::new(search_read_tool));
@@ -2750,6 +2788,25 @@ mod tests {
         factory.set_auto_typing_enabled(true);
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         factory.set_auto_typing_enabled(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn tool_choice_gate_flips_live_through_the_factory() {
+        // The gate's flag is the SAME Arc the rewire path flips via
+        // `set_tool_choice_enabled`, so a Settings toggle reaches
+        // already-built tools with no registry rebuild (backlog e2c47d5f).
+        let dir = tempdir().unwrap();
+        let handle = ToolChoiceHandle {
+            classifier: Arc::new(std::sync::RwLock::new(None)),
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            log_path: None,
+        };
+        let flag = Arc::clone(&handle.enabled);
+        let factory = make_factory(dir.path()).with_tool_choice(handle);
+        factory.set_tool_choice_enabled(true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        factory.set_tool_choice_enabled(false);
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 

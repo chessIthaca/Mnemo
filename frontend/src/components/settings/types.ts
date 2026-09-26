@@ -447,6 +447,10 @@ export interface ClassifierDraft {
   /** The `auto_type_memories` opt-in — a separate toggle from `enabled`
    * (confidence-gated prefix correction; needs a fine-tuned checkpoint). */
   autoTypeMemories: boolean;
+  /** The `steer_tool_choice` opt-in — a separate toggle from `enabled`
+   * (the search / search_read tools let a confident classifier pick the
+   * delegation class; needs a fine-tuned checkpoint). */
+  steerToolChoice: boolean;
   /** The `failure_triage` opt-in — classify failures to steer retries. */
   failureTriage: boolean;
   /** The `failure_triage_knn` opt-in — the local kNN overlay over the

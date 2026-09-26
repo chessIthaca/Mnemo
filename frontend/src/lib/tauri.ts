@@ -457,6 +457,10 @@ export interface AppSettings {
       checkpoint: string | null;
       /** Whether memory auto-typing is enabled (opt-in). */
       auto_type_memories: boolean;
+      /** Whether Laya tool-choice steering is enabled (opt-in; the
+       *  search/search_read tools let a confident classifier pick the
+       *  delegation class; needs a fine-tuned checkpoint). */
+      steer_tool_choice: boolean;
       /** Whether failure triage is enabled (opt-in; needs a fine-tuned
        *  checkpoint). */
       failure_triage: boolean;
@@ -609,6 +613,8 @@ export interface SettingsSavePatch {
   laya_checkpoint?: string;
   /** Laya memory auto-typing (opt-in; needs a fine-tuned checkpoint). */
   laya_auto_type_memories?: boolean;
+  /** Laya tool-choice steering (opt-in; needs a fine-tuned checkpoint). */
+  laya_steer_tool_choice?: boolean;
   /** Laya failure triage (opt-in; needs a fine-tuned checkpoint). */
   laya_failure_triage?: boolean;
   /** The kNN overlay for failure triage (opt-in; local — rides the memory

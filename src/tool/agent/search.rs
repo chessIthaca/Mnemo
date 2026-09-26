@@ -26,6 +26,17 @@
 //! break an earlier escape). Best-effort: an unindexed symbol, an empty
 //! recall, or any store hiccup falls through to the normal search.
 //!
+//! OPTIONAL CLASSIFIER STEERING (backlog e2c47d5f): with the opt-in
+//! `[general.laya] steer_tool_choice` flag on and a confident answer, the
+//! Laya classifier picks the delegation route — SYMBOL, TEXT, or MEMORY —
+//! instead of the shape heuristics above: `TEXT` suppresses delegation and
+//! the symbol nudge (a plain search), `SYMBOL` runs only the symbol arm, and
+//! `MEMORY` only the memory arm. Every fallback (unwired gate, flag off, low
+//! confidence, no answer, an unknown label) leaves the heuristics
+//! byte-identical to the pre-classifier behavior, and an escaped repeat never
+//! asks. A SYMBOL steer whose pattern yields no extractable name cannot
+//! resolve a block and falls back to the advisory symbol nudge below.
+//!
 //! SYMBOL NUDGE (the advisory fallback): on the escape repeat — and for
 //! alternation hunts whose branches resolve only fuzzily — the prepended
 //! note still points at graph_search/graph_context; symbol lookups belong
@@ -434,6 +445,11 @@ pub struct SearchTool {
     /// interleaved delegating queries. Bounded (most recent
     /// DELEGATION_SET_CAP keys, oldest evicted).
     delegation_state: Arc<std::sync::Mutex<Vec<DelegatedKey>>>,
+    /// The optional Laya tool-choice gate (backlog e2c47d5f): when wired and
+    /// enabled, a confident classifier picks the delegation class
+    /// (symbol/text/memory) and overrides the regex heuristics; otherwise the
+    /// heuristics run exactly as before.
+    tool_choice: Option<crate::tool::agent::tool_choice::ToolChoiceHandle>,
 }
 
 impl SearchTool {
@@ -445,6 +461,7 @@ impl SearchTool {
             graph,
             memory: None,
             delegation_state: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tool_choice: None,
         }
     }
 
@@ -452,6 +469,17 @@ impl SearchTool {
     /// memory-hit note (F9) when a derived row knows the id.
     pub fn with_memory(mut self, memory: Arc<dyn crate::memory::MemoryStoreTrait>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wire the shared Laya tool-choice gate (backlog e2c47d5f): when set and
+    /// enabled, a confident classifier answer selects the delegation class;
+    /// otherwise the regex heuristics stand.
+    pub fn with_tool_choice(
+        mut self,
+        handle: crate::tool::agent::tool_choice::ToolChoiceHandle,
+    ) -> Self {
+        self.tool_choice = Some(handle);
         self
     }
 }
@@ -1245,7 +1273,8 @@ impl Tool for SearchTool {
                Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
                an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
                SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-               and the walk is skipped; re-issue the same search to get the plain file search.",
+               and the walk is skipped; re-issue the same search to get the plain file search. \
+                With the optional Laya tool-choice classifier on and confident, it picks that route itself (symbol / text / memory); otherwise the heuristics above stand.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1292,11 +1321,46 @@ impl Tool for SearchTool {
         let key = DelegatedKey::new(&args.pattern, args.glob.as_deref(), args.literal);
         let escape = self.delegation_state.lock().unwrap().contains(&key);
 
+        // Laya tool-choice steering (backlog e2c47d5f, opt-in): when the
+        // classifier is wired, enabled, and confident, its class overrides the
+        // regex decision below — `Text` suppresses delegation and the symbol
+        // nudge (a plain search), `Symbol` runs only the symbol arm, `Memory`
+        // only the memory arm. Any fallback (unwired, disabled, low
+        // confidence, no answer) — and an escaped repeat, which never
+        // delegates — leaves `steered` `None`, so the heuristics run
+        // byte-identically to the pre-classifier behavior.
+        let steer_decision = if escape {
+            None
+        } else {
+            Some(
+                crate::tool::agent::tool_choice::steer_with_handle(
+                    self.tool_choice.as_ref(),
+                    &args.pattern,
+                    args.glob.as_deref(),
+                    args.literal,
+                )
+                .await,
+            )
+        };
+        let steered = steer_decision.as_ref().and_then(|d| d.choice());
+        // Training log (backlog e2c47d5f): one best-effort row per steered
+        // search — the query -> tool disposition a later fine-tune trains on.
+        // Live only while the gate is wired AND the opt-in flag is on, so a
+        // disabled gate provably writes nothing.
+        let log_live = crate::tool::agent::tool_choice::is_live(self.tool_choice.as_ref());
+        let log_path = self.tool_choice.as_ref().and_then(|h| h.log_path.clone());
+        let (allow_memory, allow_symbol, allow_nudge) = match steered {
+            Some(crate::tool::agent::tool_choice::ToolChoice::Symbol) => (false, true, true),
+            Some(crate::tool::agent::tool_choice::ToolChoice::Memory) => (true, false, false),
+            Some(crate::tool::agent::tool_choice::ToolChoice::Text) => (false, false, false),
+            None => (true, true, true),
+        };
+
         // Memory delegation (backlog b804012f): a query targeting the memory
         // store (knowledge/reviews glob or typed prefix) gets the recall
         // answer inline. Async store read — before the blocking scan, like
         // the F9 note above.
-        let memory_block = if escape {
+        let memory_block = if escape || !allow_memory {
             None
         } else {
             match &self.memory {
@@ -1338,7 +1402,7 @@ impl Tool for SearchTool {
             // recorded so an immediate repeat gets the plain search (the
             // escape hatch); a symbol hunt narrowed by a glob PREPENDS the
             // block above the normal results instead.
-            let symbol_block = if escape {
+            let symbol_block = if escape || !allow_symbol {
                 None
             } else {
                 graph.as_deref().and_then(|g| {
@@ -1349,6 +1413,17 @@ impl Tool for SearchTool {
             };
             let memory_delegated = memory_block.is_some();
             let delegated = memory_block.or(symbol_block);
+            if log_live {
+                crate::tool::agent::tool_choice::log_decision(
+                    &args.pattern,
+                    args.glob.as_deref(),
+                    args.literal,
+                    steer_decision.as_ref(),
+                    delegated.is_some(),
+                    escape,
+                    log_path.as_deref(),
+                );
+            }
             let mut prepended: Option<String> = None;
             if let Some(block) = delegated {
                 // Record the key on BOTH arms: the fast-path return AND the
@@ -1377,7 +1452,7 @@ impl Tool for SearchTool {
             // fire (symbol steering wins — one note, not two). Both yield
             // when a delegated block is prepended (it subsumes them). All
             // merged so everything rides ABOVE the results.
-            let nudge = if prepended.is_some() {
+            let nudge = if prepended.is_some() || !allow_nudge {
                 None
             } else {
                 symbol_nudge(&graph, &args.pattern)
@@ -1577,6 +1652,45 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    /// A classifier with a canned answer, for the tool-choice steering tests
+    /// (backlog e2c47d5f).
+    struct StubClassifier {
+        answer: Option<crate::memory::classifier::Answer>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::memory::classifier::Classifier for StubClassifier {
+        async fn classify(
+            &self,
+            _state: &str,
+            _question: &crate::memory::classifier::Question,
+        ) -> Option<crate::memory::classifier::Answer> {
+            self.answer.clone()
+        }
+    }
+
+    /// A tool-choice handle steering every query to `label` at `confidence`
+    /// (or a disabled one when `enabled` is false).
+    fn steering_handle(
+        label: &str,
+        confidence: f64,
+        enabled: bool,
+    ) -> crate::tool::agent::tool_choice::ToolChoiceHandle {
+        let stub: std::sync::Arc<dyn crate::memory::classifier::Classifier> =
+            std::sync::Arc::new(StubClassifier {
+                answer: Some(crate::memory::classifier::Answer::Choice {
+                    label: label.to_string(),
+                    confidence,
+                    probabilities: std::collections::BTreeMap::new(),
+                }),
+            });
+        crate::tool::agent::tool_choice::ToolChoiceHandle {
+            classifier: std::sync::Arc::new(std::sync::RwLock::new(Some(stub))),
+            enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+            log_path: Some(std::env::temp_dir().join("mnemo_tool_choice_test_search.jsonl")),
+        }
     }
 
     #[test]
@@ -3105,6 +3219,86 @@ mod tests {
         assert!(
             !r.output.contains("AUTO-DELEGATED"),
             "B's re-issue also escapes: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_choice_text_suppresses_symbol_delegation() {
+        // Backlog e2c47d5f: a confident TEXT class means the query is a plain
+        // text search — the symbol delegation the heuristics would emit is
+        // suppressed (the classifier changes only the DECISION).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        let tool =
+            make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.9, true));
+        let r = tool.execute(json!({"pattern": "hello"})).await;
+        assert!(r.success);
+        assert!(
+            !r.output.contains("AUTO-DELEGATED"),
+            "TEXT class suppresses delegation: {}",
+            r.output
+        );
+        assert!(r.output.contains("a.rs:1"), "plain results: {}", r.output);
+    }
+
+    #[tokio::test]
+    async fn tool_choice_memory_suppresses_symbol_delegation() {
+        // A confident MEMORY class routes only the memory arm, so a
+        // symbol-shaped query no longer delegates to the graph.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        let tool =
+            make_indexed_tool(dir.path()).with_tool_choice(steering_handle("MEMORY", 0.9, true));
+        let r = tool.execute(json!({"pattern": "hello"})).await;
+        assert!(r.success);
+        assert!(
+            !r.output.contains("AUTO-DELEGATED"),
+            "MEMORY class suppresses the symbol arm: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_choice_symbol_keeps_symbol_delegation() {
+        // A confident SYMBOL class agrees with the heuristics here — the
+        // delegation still fires (the classifier does not break it).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        let tool =
+            make_indexed_tool(dir.path()).with_tool_choice(steering_handle("SYMBOL", 0.9, true));
+        let r = tool.execute(json!({"pattern": "hello"})).await;
+        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+    }
+
+    #[tokio::test]
+    async fn tool_choice_below_threshold_falls_back_to_the_heuristics() {
+        // Confidence-gated: 0.5 must NOT steer, so the behavior is exactly the
+        // pre-classifier one (here: the heuristics delegate).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        let tool =
+            make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.5, true));
+        let r = tool.execute(json!({"pattern": "hello"})).await;
+        assert!(
+            r.output.starts_with("AUTO-DELEGATED"),
+            "below threshold keeps the heuristics: {}",
+            r.output
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_choice_disabled_handle_falls_back_to_the_heuristics() {
+        // Laya off / the flag false = zero behavior change: the classifier is
+        // never consulted and the heuristics stand.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
+        let tool =
+            make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.99, false));
+        let r = tool.execute(json!({"pattern": "hello"})).await;
+        assert!(
+            r.output.starts_with("AUTO-DELEGATED"),
+            "disabled keeps the heuristics: {}",
             r.output
         );
     }

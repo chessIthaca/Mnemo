@@ -499,6 +499,9 @@ export interface AppSettings {
       /** A cache-safe note nudging concise visible output once context fill
        *  passes `lean_output_fill_pct`. */
       lean_output_nudge: boolean;
+      /** Lever 7: a repeat auto-recall of an unchanged memory renders a
+       *  compact reference instead of re-sending its content snippet. */
+      recall_delta: boolean;
       /** Minimum tool-result length (chars) before lever 3 archives it. */
       archive_min_chars: number;
       /** Minimum filtered shell-output length (chars) before lever 2 tries to
@@ -622,6 +625,9 @@ export interface SettingsSavePatch {
   optimizer_compaction_survival?: boolean;
   optimizer_quality_score?: boolean;
   optimizer_lean_output_nudge?: boolean;
+  /** Recall delta: a repeat auto-recall of an unchanged memory renders a
+   *  compact reference instead of re-sending its content snippet. */
+  optimizer_recall_delta?: boolean;
   /** Minimum tool-result length (chars) before lever 3 archives it. */
   optimizer_archive_min_chars?: number;
   /** Minimum filtered shell-output length (chars) before lever 2 tries to

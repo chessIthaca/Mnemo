@@ -585,12 +585,13 @@ green, now that they opt a lever out explicitly.
 | Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
 | Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
 | Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
+| Recall delta | `recall_delta` | A repeat auto-recall of a memory whose id AND content hash were already injected in the same compaction epoch renders a compact reference — tier, title, stable id, score, `unchanged since injection (turn N)` — instead of re-sending the 160-char snippet; a new, changed, or post-compaction recall still arrives in full. |
 
 **Two tables** (`src/memory/schema.rs`) record what the levers do:
 `savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,
 tokens_saved, measured, created_at`) — one row per optimization event, kinds
 `truncation, compaction, delta_read, skeleton, compression, archive,
-archive_expand, compaction_checkpoint` — and `tool_result_archive`
+archive_expand, compaction_checkpoint, recall_delta` — and `tool_result_archive`
 (`id, session_id, tool, detail, content, char_count, created_at`) with an FTS5
 index (`tool_result_archive_fts`) behind `expand_result`'s keyword search.
 

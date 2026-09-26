@@ -9,7 +9,7 @@
  *
  * Pins the surfaces of the opt-in contract: the section is registered
  * (nav + deep-link id), it persists the config keys through the shared save
- * path, the managed-runtime controls (mode toggle + checkpoint catalog +
+ * path, the managed-runtime controls (checkpoint catalog +
  * download progress) stay wired, and the frontend bindings stay wired to the
  * backend's exact names (commands, event, config + patch fields, snapshot
  * field).
@@ -165,7 +165,7 @@ describe("classifier bindings stay wired to the backend names", () => {
        *  only while failure_triage itself is on). */
       failure_triage_knn: boolean;
       /** Whether the startup failure-triage fine-tune is enabled (managed
-       *  mode only, opt-in). */
+       *  runtime only, opt-in). */
       auto_finetune: boolean;
     };`
     );

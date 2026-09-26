@@ -465,7 +465,7 @@ export interface AppSettings {
        *  only while failure_triage itself is on). */
       failure_triage_knn: boolean;
       /** Whether the startup failure-triage fine-tune is enabled (managed
-       *  mode only, opt-in). */
+       *  runtime only, opt-in). */
       auto_finetune: boolean;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
@@ -610,7 +610,7 @@ export interface SettingsSavePatch {
    *  embedder, needs no laya-serve; consulted only while laya_failure_triage
    *  is on). */
   laya_failure_triage_knn?: boolean;
-  /** Startup failure-triage fine-tune (managed mode only, opt-in). */
+  /** Startup failure-triage fine-tune (managed runtime only, opt-in). */
   laya_auto_finetune?: boolean;
   /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
    *  is opt-in, off by default, and read per tool call from a live mirror, so

@@ -252,7 +252,7 @@ pub struct LayaConfig {
     /// omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub failure_triage_knn: bool,
-    /// Opt in to the startup failure-triage FINE-TUNE (managed mode only):
+    /// Opt in to the startup failure-triage FINE-TUNE (managed runtime only):
     /// at startup the app compares the logged failure corpus against the
     /// last run's marker and, when enough new labeled rows accumulated, runs
     /// the Laya fine-tune on the managed venv and serves the fine-tuned

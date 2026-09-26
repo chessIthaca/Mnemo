@@ -211,11 +211,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setError(null);
       setOk(false);
       try {
-        // The mode + enable flag + checkpoint + the four Laya opt-ins ride
-        // along so toggling takes effect without a restart (the backend
-        // rewires the live classifier — flipping the auto-type,
-        // failure-triage and kNN-overlay flags — and starts/stops the
-        // managed sidecar).
+        // The enable flag + the five Laya opt-ins ride along so toggling
+        // takes effect without a restart (the backend rewires the live
+        // classifier — flipping the auto-type, tool-choice, failure-triage
+        // and kNN-overlay flags — and starts/stops the managed sidecar).
         await saveSettings({
           laya_enabled: enabled,
           laya_auto_type_memories: autoType,

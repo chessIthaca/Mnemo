@@ -194,7 +194,7 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         }
     );
 
-    // Mirror the startup emit so a save-driven enable/disable/endpoint change
+    // Mirror the startup emit so a save-driven enable/disable change
     // reaches listeners immediately (the Settings section also re-polls after
     // a save; the event keeps any future listener correct).
     if let Ok(status) = state.classifier_status() {

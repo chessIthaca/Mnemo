@@ -262,6 +262,10 @@ pub struct SettingsSaveDto {
     /// keep the current value.
     #[serde(default)]
     pub laya_auto_type_memories: Option<bool>,
+    /// Laya tool-choice steering (opt-in; enable only against a fine-tuned
+    /// checkpoint). Absent = keep the current value.
+    #[serde(default)]
+    pub laya_steer_tool_choice: Option<bool>,
     /// Laya failure triage (opt-in; enable only against a fine-tuned
     /// checkpoint). Absent = keep the current value.
     #[serde(default)]
@@ -624,6 +628,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(auto_type) = patch.laya_auto_type_memories {
         general.general.laya.auto_type_memories = auto_type;
+    }
+    if let Some(steer) = patch.laya_steer_tool_choice {
+        general.general.laya.steer_tool_choice = steer;
     }
     if let Some(triage) = patch.laya_failure_triage {
         general.general.laya.failure_triage = triage;
@@ -988,6 +995,24 @@ mod tests {
         let patch = SettingsSaveDto::default();
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.laya.auto_type_memories);
+    }
+
+    #[test]
+    fn laya_patch_applies_steer_tool_choice() {
+        // The tool-choice opt-in rides the same save path: Some flips it,
+        // absent keeps the current value.
+        let current = Config::default();
+        assert!(!current.general.general.laya.steer_tool_choice);
+        let patch = SettingsSaveDto {
+            laya_steer_tool_choice: Some(true),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.steer_tool_choice);
+        // Absent keeps it on.
+        let patch = SettingsSaveDto::default();
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.laya.steer_tool_choice);
     }
 
     #[test]

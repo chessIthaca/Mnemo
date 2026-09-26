@@ -84,8 +84,7 @@ const PROBE_ABSOLUTE_BUDGET: Duration = Duration::from_secs(900);
 /// A Laya checkpoint the managed runtime can serve (Settings → Classifier).
 #[derive(Debug, Clone)]
 pub struct LayaCheckpoint {
-    /// The short id used everywhere: `LAYA_MODELS`, the config value, the
-    /// marker file name.
+    /// The short id used everywhere: `LAYA_MODELS`, the marker file name.
     pub id: &'static str,
     /// The human-facing name shown in Settings.
     pub name: &'static str,
@@ -793,9 +792,8 @@ fn setup_autostart_decision(laya: &LayaConfig) -> (bool, bool) {
 /// the server so the freshly enabled classifier goes live without a
 /// restart. The autostart decision is re-derived from the LIVE config
 /// (`config`) when the setup finishes — see [`setup_autostart_decision`]
-/// — never from a snapshot taken at download start: a mid-setup save
-/// (disable, checkpoint switch, mode flip) must always win over the
-/// just-finished download.
+/// — never from a snapshot taken at download start: a mid-setup disable
+/// must always win over the just-finished download.
 pub fn spawn_setup_task(
     app: Option<AppHandle>,
     manager: Arc<LayaManager>,

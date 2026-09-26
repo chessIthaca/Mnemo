@@ -1068,7 +1068,7 @@ pub(crate) struct Brain {
     pub(crate) embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
     /// The shared classifier status — the same `Arc` held by `IpcState`, so
     /// the enabled/disabled/failed state surfaces live to Settings. `Disabled`
-    /// unless the config enables Laya with an endpoint.
+    /// unless the config enables Laya.
     pub(crate) classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
     /// The shared classifier SLOT (the live handle, backlog a147b63c):
     /// created in `build_brain_inner` and shared by the factory's
@@ -1391,7 +1391,7 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     };
 
     // The optional Laya classifier (opt-in; disabled by default). Built only
-    // when [general.laya] enables it with an endpoint — otherwise `None` with
+    // when [general.laya] enables it — otherwise `None` with
     // status Disabled and no HTTP client at all, so the app behaves exactly as
     // before. Constructing the client does no I/O: startup is never blocked.
     let classifier_status = Arc::new(RwLock::new(

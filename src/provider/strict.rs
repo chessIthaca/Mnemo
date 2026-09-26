@@ -249,6 +249,7 @@ pub fn parameters_for(strict_supported: bool, schema: &Value) -> Value {
 /// buys nothing, and each normalized schema costs tokens on every request.
 pub const STRICT_TOOLS: &[&str] = &[
     "file_edit",
+    "multi_edit",
     "file_write",
     "file_append",
     "convert_line_endings",
@@ -493,6 +494,7 @@ mod tests {
         // set must name the file-mutation and plan tools explicitly.
         for name in [
             "file_edit",
+            "multi_edit",
             "file_write",
             "file_append",
             "create_plan",

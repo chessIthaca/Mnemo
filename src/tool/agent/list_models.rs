@@ -54,9 +54,9 @@ impl Tool for ListModelsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "list_models",
-            "List the configured model endpoints and the model ids each serves, so you can pick \
-             a model for spawn_agent's optional `model` parameter. Returns one line per endpoint \
-             (\"endpoint: model1, model2\"). No parameters.",
+            "Takes NO arguments — call it with {}. List the configured model endpoints and the \
+             model ids each serves, so you can pick a model for spawn_agent's optional `model` \
+             parameter. Returns one line per endpoint (\"endpoint: model1, model2\").",
             json!({
                 "type": "object",
                 "properties": {},
@@ -162,6 +162,15 @@ mod tests {
         let result = tool.execute(json!({})).await;
         assert!(!result.success);
         assert!(result.output.contains("unavailable"));
+    }
+    #[test]
+    fn schema_says_takes_no_arguments() {
+        let tool = ListModelsTool::new(None);
+        assert!(
+            tool.schema().description.starts_with("Takes NO arguments"),
+            "{}",
+            tool.schema().description
+        );
     }
 
     #[tokio::test]

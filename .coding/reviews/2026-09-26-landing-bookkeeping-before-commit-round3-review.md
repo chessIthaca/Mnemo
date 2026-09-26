@@ -1,0 +1,62 @@
+## Verdict: FINDINGS (0 high, 2 low)
+
+**Scope read:** HEAD equals the round-3 base `0a32445` — **zero intervening commits**, so the delta is exactly the uncommitted tree: `src/tool/agent/codegraph.rs` (98 changed lines: the const + its doc comment, and both staleness tests), the plan frame (+5 lines), and three untracked bookkeeping files (round-2 report; the diverged-caps SPEC, now `status = "superseded"`; and the aligned-at-32 SPEC — a **fifth path that post-dated the dispatch's changed-file list**; read and accuracy-checked). Not an empty-diff review.
+
+The substantive change verifies clean against the production repair path: ceiling 8 → 32 re-documented with the 500 ms `STALE_REINDEX_BUDGET` as the real latency guard, the above-cap test rebuilt dynamically at exactly ceiling+1 (33 stale files), and the new within-ceiling test is a genuine regression pin (it asserts the exact opposite of the old test's round-2-verified green outcome on the identical 9-file setup). But requirement (d) fails in two spots that still encode the old ceiling of 8 — one code doc line, one live memory record — both cheap to fix before the commit.
+
+### LOW 1 — codegraph.rs module doc still encodes the old ceiling (fails task check (d))
+
+`src/tool/agent/codegraph.rs:36` (module header, read directly, :32-40):
+
+> "…so a miss first sweeps the indexed source files' mtimes (stats only), reindexes **up to 8 stale files inline**, and re-resolves once from the fresh view…"
+
+Both 90fab97e review rounds explicitly tracked this line as the tree's one "8 stale" remnant, "correct only while the symbol cap is deliberately still 8." The delta re-documented the const's own doc comment (:234-245, excellent) but missed the module header ten lines of scroll above the tool list: it now understates the shipped repair ceiling 4× and contradicts the const's new doc in the same file. All other sweeps are clean: `cap is 8` → 0 `.rs` hits; `at most 8` → only immutable history plus an unrelated trace.rs "8 MiB"; `9 file(s)` → only search.rs:3359's historical live-symptom illustration (accurate); every remaining `STALE_REINDEX_CAP` reference (15 across the three `.rs` files) is name-based or dynamic, so auto-accurate. **Fix:** one `file_edit` on the :32-40 paragraph — e.g. "reindexes up to `STALE_REINDEX_CAP` (32) stale files inline under the shared 500 ms stale-reindex budget" — then re-run `cargo test` unpiped (doc-only, `deny(warnings)`-safe).
+
+### LOW 2 — a live DECISION memory record now contradicts the shipped code (hygiene: never leave two live records disagreeing)
+
+`.coding/knowledge/decision/2027-01-11-content-index-staleness-repairs-inline-under-an.md:15` (read in full — 23 lines, **no amendment paragraph**):
+
+> "OTHER CALLER: … Its OWN `STALE_REINDEX_CAP = 8` and its `stale.len() <= STALE_REINDEX_CAP` gate are deliberately UNTOUCHED - the symbol-index ceiling is a separate reviewed contract (plan 55163f1e) whose tests pin the 9-file boundary."
+
+False on three counts post-change: the const is now 32, the follow-on deliberately touched it, and no test pins a 9-file above-cap boundary anymore (the above-cap test now pins ceiling+1 = 33; the new within-ceiling test pins 9 as *repaired*). The new aligned-at-32 SPEC is live and disagrees with it (its `supersedes` covers only the diverged-caps SPEC). **Fix:** `memory_amend` a dated amendment paragraph to this DECISION (symbol ceiling later aligned at 32 under the ced9308a follow-on — see the aligned SPEC), *not* a supersede (the record's content-index core remains true); per this plan's own landing discipline, write it before the final commit. The remaining "9-file boundary" hits are immutable review/plan history, correctly left alone per the 90fab97e precedent.
+
+Everything else verifies clean — (a)–(c) in full, the beyond-ceiling fallback, and all standard checks; detail appended below.
+
+Reviewed-state: 0a32445876cb7015a72ffd809227369d34e86b49
+## Scope — what was actually read
+
+- **Delta enumeration:** `git_read` log (HEAD = `0a32445` = round-3 base → zero intervening commits, so no `op="show"` targets), status (2 modified + 3 untracked), and the full uncommitted diff (both files, every hunk). The dispatch's 4-path changed set plus one post-dispatch path (aligned-at-32 SPEC).
+- **codegraph.rs:** :32-45 (module doc), :225-246 (const + new doc), :300-426 (`graph_search` execute — total-miss trigger :343, ceiling gate :347, budget passed :352-353, pass-already-running / error handling, note emission :402-413), :943-987 (fixture pins: `helper` resolves from `src/lib.rs`, fresh `nonexistent_xyz` miss → count 0), :990-1180 (both target tests in full, plus the self-heal / fresh-miss-stays-fast / vanished-file siblings they mirror).
+- **Cross-checks:** `src/codegraph/mod.rs` :200-232 (`STALE_REINDEX_BUDGET`, pub, 500 ms) and :555-629 (`reindex_stale_files` — atomic flag claim, budget gate *before each file* at :617); `src/tool/agent/search.rs` :1395-1408 + `search_read.rs` :262-274 (cross-tool comments, all name-based); the 15 `STALE_REINDEX_CAP` references across 3 `.rs` files (both defs verified = 32).
+- **Bookkeeping:** both knowledge SPEC files (full), the DECISION file (23 lines, full), the round-2 report (verdict + scope).
+- **Sweeps:** `STALE_REINDEX` repo-wide; `may be stale` / `serving fresh graph results` (production :411/:407 vs tests :1100/:1160/:1164 — byte-match); `cap is 8` (0 hits); `9 file(s)`; `at most 8`; `up to 8`; `8 stale`; `9-file boundary`.
+
+## Task verifications
+
+**(a) Const + doc — PASS.** :246 `const STALE_REINDEX_CAP: usize = 32;` ✓. The doc (:234-245) calls it "an ADAPTIVE upper bound, NOT the latency guard itself" and names the real guard via a resolvable intra-doc link — `crate::codegraph::STALE_REINDEX_BUDGET` is `pub`, 500 ms (mod.rs:209), passed at the repair site (:352-353) ✓. Every claim checks against code: "stops between files once the budget is spent" — mod.rs:617 breaks *before* each file once `elapsed() >= budget` ✓; "(or a pass already running) serves the staleness note" — `compare_exchange` → `Ok(0)` → `.filter(|n| *n > 0)` → `unrepaired_stale` → note ✓. The retained "mirroring the search tool's cap" is now *true* (search.rs:371 = 32) and carries the now-true context ("Raised 8 → 32 … to match the content index's adaptive ceiling (commit 06276aa, backlog 9201704f)") — no residue of the old false state. **Is 32 defensible?** Yes: the repair is reached only from a *total miss* (:343) — a lookup that would otherwise serve a wrong empty result; the pass is budget-gated before each file, so worst-case block ≈ 500 ms + one in-flight file's read+parse; the ceiling only bounds the *considered* staleness (33+ → note, watcher covers the rest), and 32 typical files parse well inside the budget while a pathological set degrades to the plain miss. Same shared budget, same F10 pattern as the content index — parity adds no new risk class, and the user directive explicitly ranked accuracy over the note. (The doc's 61-file anecdote is past-tense motivation; 61 > 32 still notes, which the aligned SPEC correctly states.)
+
+**(b) Above-ceiling test — PASS.** :1062-1107 builds ceiling+1 **dynamically**: `for i in 0..(STALE_REINDEX_CAP - 1)` = 31 extras + the 2 fixture files = 33 = cap+1 — no off-by-one (a `cap - 2` loop would land exactly *at* the ceiling and reindex). All extras are written before `graph.index(None)` (:1084) so all 33 are indexed, then all 33 mtimes bumped to now+5 s; any non-bumped fixture file predates the index build and cannot be stale, so the stale set is structurally exactly 33. The note is pinned with the right count via `format!(…, STALE_REINDEX_CAP + 1)` (:1099-1102), byte-matching production :411, plus `!note.contains("reindexed")`, count 0, and the hint. Genuinely above the ceiling (33 > 32) — the old hardcoded-9 body would now be *inside* it and reindex.
+
+**(c) New within-ceiling test — PASS, genuine regression.** :1109-1167 builds 9 stale files (lib.rs, main.rs, extra0-6 — extras written before the :1125 index; extra0 then *rewritten after* it to contain only `pub fn fresh_symbol_xyz`), so the index has never seen the queried symbol — only a re-read of the stale file can answer it. 9 is above the old ceiling of 8 and inside the new 32; the old test version pinned exactly the old outcome on the *same* 9-file setup (count 0 + "may be stale — 9 file(s)" + no "reindexed", green at the round-2-verified base), so `count == 1` plus the repair-note assertions necessarily fail on the old ceiling — red-before/green-after without needing a runtime run. Assertions pin the repair precisely: count 1; note present containing "reindexed" AND "serving fresh graph results" (byte-substrings of production :407); `!contains("may be stale")` excludes the staleness note within the ceiling. No accidental symbol collisions (fixture pins above).
+
+**(d) Old-ceiling encodings / beyond-ceiling behavior — fails only on LOW 1.** The beyond-ceiling fallback and best-effort invariant are untouched by the delta (no hunks outside :231-246 and :1054-1167): sweep error → plain miss (`if let Ok`); reindex `Err`/`Ok(0)` → note; fresh-view failure after a successful repair → plain miss with the side effect still disclosed — a lookup is never failed by its own repair; the gate (:347) still serves the note above the ceiling, pinned by test (b).
+
+## Standard checks
+
+- **Correctness / bugs:** none in the delta — test arithmetic, staleness construction, and note strings all check out against production.
+- **Security:** nothing — tempdir-scoped tests, no new input surface, no `unsafe`; containment/flag guards pre-existing and unchanged.
+- **Documentation sync:** fails → LOW 1 (module doc :36). README/PLAN.md/docs were already synced for the content index by 06276aa and carry no symbol-index ceiling numbers; knowledge-side gap → LOW 2.
+- **Multi-platform neutrality:** PASS — tempdir + `std::fs::File::options().write(true).open(..).set_modified(SystemTime)` (std, cross-platform — the same pattern the sibling tests already use and the 2026-09-07 round-2 review vetted), future mtime +5 s, no `cfg(windows)`, no shell; the production delta is a const value + comments only.
+- **File-tools-first:** PASS — no shell-based file mutation anywhere in the delta; the knowledge/report files are memory-tool / `write_review_report` outputs.
+- **Warning-free:** no new warning source in the delta; parent's unpiped green suite under `#![deny(warnings)]` covers it.
+
+## `.coding/` bookkeeping — accuracy check (one line each)
+
+- **Round-2 report:** opens `## Verdict: PASS`, reviewed-state `0a32445` — matches; still uncommitted and riding this commit (expected carry-over, noted as a process remark — round 2's material was verified then, not re-reviewed).
+- **Plan frame:** follow-on paragraph + step 5 + stamps `2 0a32445…` / `3 0a32445…` — both correct (round 2 reviewed 0a32445; round 3 base = HEAD 0a32445); step 5's content matches what shipped. One loose phrase in step 5 — "keeping the beyond-ceiling / index-pass-running fallback to the authoritative tree walk" — graph_search has no tree walk (its own :330-336 comment says so; its fallback is the note + watcher); historical work-order wording, the shipped code and docs state it correctly.
+- **Diverged-caps SPEC:** `status = "superseded"` with the successor pointer on the aligned file — hygiene done; content accurately describes the pre-change divergence.
+- **Aligned-at-32 SPEC:** matches what shipped (both caps 32, budget the real guard, both repair sites, note strings, test names); its line pointers :239/:346 pre-date the final doc-comment growth (const now :246, budget call :353) — harmless drift in a pointer-first record (path + symbol accurate); no fix required.
+
+## Evidence note
+
+I ran nothing (read-only): the green-suite claim is the parent's (unpiped, exit 0 — under `#![deny(warnings)]` also the warning-free proof), and the "fails on the old ceiling" property of test (c) is established statically from the old test's round-2-verified green behavior on the identical 9-file setup (opposite assertions). After the LOW 1 doc fix, re-run `cargo test` unpiped and read `$LASTEXITCODE` directly (never a piped exit code); after the LOW 2 amendment, confirm no live record still claims symbol cap 8.

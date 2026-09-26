@@ -25,6 +25,7 @@ pub mod project;
 pub mod provider;
 pub mod runtime;
 pub mod safety_rules;
+pub mod shell_path;
 pub mod skill;
 pub mod thread_util;
 pub mod tool;

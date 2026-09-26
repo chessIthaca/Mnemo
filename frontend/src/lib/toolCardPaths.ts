@@ -41,7 +41,8 @@ function salvagePathLiteral(args: string): string | null {
  *
  * Only fields that genuinely carry a *file* are returned:
  * - top-level `path` / `file` (file_read, file_write, file_edit, …),
- * - the `read_files` `files[].path` array (batched reads),
+ * - the `read_files` / `multi_edit` `files[].path` array (batched reads,
+ *   multi-file edits — one chip per file),
  * - `write_review_report`'s `path` (a file under .coding/reviews/).
  *
  * Everything else (shell `purpose`, git `subcommand`, search `pattern`,
@@ -88,11 +89,13 @@ export function argPaths(args: string, toolName?: string): string[] {
     const salvaged = salvagePathLiteral(args);
     return salvaged !== null ? [salvaged] : [];
   }
-  // Batched reads: one path per spec. The Rust tool also accepts a single-file
-  // top-level `path` shorthand (absorbed from the old file_read tool); when
-  // `files` is absent/not-an-array, fall through to the common path/file
-  // fallback below so that shape still yields a clickable link.
-  if (toolName === "read_files") {
+  // Batched paths: one per spec for read_files (batched reads) and multi_edit
+  // (multi-file edits — every file the call writes gets a chip). read_files
+  // also accepts a single-file top-level `path` shorthand (absorbed from the
+  // old file_read tool); when `files` is absent/not-an-array, fall through to
+  // the common path/file fallback below so that shape still yields a
+  // clickable link.
+  if (toolName === "read_files" || toolName === "multi_edit") {
     const files = parsed.files;
     if (Array.isArray(files)) {
       return files
@@ -730,12 +733,13 @@ export function parseShellOutput(output: string): {
 }
 
 /**
- * The unified diff of a successful `file_edit` call, as carried in the tool
+ * The unified diff of a successful `file_edit` — or, for `multi_edit`, its one
+ * COMBINED diff covering every file the call changed — as carried in the tool
  * result's structured `data` payload (`{"diff": "..."}`, computed Rust-side
- * by the file_edit tool — src/tool/agent/file_edit.rs). Drives the expanded
- * call-detail body: instead of the raw `{"old_string": ...}` args JSON and
- * the one-line "edited path" output, the card renders the actual change via
- * `UnifiedDiffView` (Message.tsx).
+ * by the file_edit / multi_edit tools), so the rendering is tool-name
+ * agnostic: only `data.diff` is read. Drives the expanded call-detail body:
+ * instead of the raw args JSON and the one-line "edited path" output, the card
+ * renders the actual change via `UnifiedDiffView` (Message.tsx).
  *
  * Returns `null` for anything else — a failed edit (the error text is what
  * matters there), a result without the payload (e.g. an older transcript),
@@ -914,7 +918,7 @@ export function argLabel(args: string, toolName?: string): string | null {
     }
     return null;
   }
-  // For git_read calls, the `op` field (diff | log | show) is the meaningful
+  // For git_read calls, the `op` field (diff | log | show | status) is the meaningful
   // part — show it (plus the commit for show, the path filter for log/diff,
   // and log's limit) so the card reads "git_read (log -8)" or
   // "git_read (show d31b606)" instead of a bare "git_read" with no
@@ -1036,6 +1040,8 @@ export function displayName(name: string): string {
       return "Graph Impact";
     case "graph_path":
       return "Graph Path";
+    case "multi_edit":
+      return "Multi Edit";
     default:
       return name;
   }

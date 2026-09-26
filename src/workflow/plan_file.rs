@@ -134,7 +134,33 @@ pub struct PlanFile {
     /// `#[serde(skip)]` keeps it off the frontend wire shape.
     #[serde(skip)]
     pub detailed_steps: Option<String>,
+    /// The reviewer rounds dispatched for this plan (backlog 85313a7e) — one
+    /// [`ReviewRoundStamp`] per spawn, recording the round number and the
+    /// BASE REVISION that round reviewed (`git rev-parse HEAD` at dispatch
+    /// time, when the dispatcher suspends and the reviewer starts looking).
+    /// A later round reads the last stamp to delta-scope itself:
+    /// `git diff <base>` is exactly what changed since the previous round
+    /// verified the tree. Persisted as the `## Reviews` section (one
+    /// `<round> <base>` line per stamp); `#[serde(skip)]` keeps it off the
+    /// frontend wire shape (`PlanFile` is serialized directly to the UI).
+    #[serde(skip)]
+    pub reviews: Vec<ReviewRoundStamp>,
     pub steps: Vec<Step>,
+}
+
+/// One reviewer round dispatched for a plan (backlog 85313a7e).
+///
+/// `round` is 1-based in dispatch order; `base` is the commit-ish the round
+/// reviewed — `HEAD` at dispatch time. The NEXT round delta-scopes against it
+/// (`git diff <base>`), so a re-review verifies only what changed instead of
+/// re-reading the whole diff. Persisted as one `<round> <base>` line in the
+/// plan file's `## Reviews` section, so the scope survives a restart.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewRoundStamp {
+    /// The 1-based round number, in dispatch order.
+    pub round: u32,
+    /// The base revision this round reviewed (HEAD at dispatch time).
+    pub base: String,
 }
 
 /// A single step in a plan.
@@ -190,6 +216,7 @@ impl PlanFile {
             regression_test: None,
             landed_design: false,
             detailed_steps: None,
+            reviews: Vec::new(),
             steps,
         }
     }
@@ -204,6 +231,7 @@ impl PlanFile {
         let mut regression_test: Option<String> = None;
         let mut landed_design = false;
         let mut detailed_steps = String::new();
+        let mut reviews: Vec<ReviewRoundStamp> = Vec::new();
         let mut steps = Vec::new();
 
         let mut section = Section::Preamble;
@@ -227,6 +255,7 @@ impl PlanFile {
                     "bug" => Section::Bug,
                     "regression test" => Section::RegressionTest,
                     "landed design" => Section::LandedDesign,
+                    "reviews" => Section::Reviews,
                     "steps" => Section::Steps,
                     "detailed steps" => Section::DetailedSteps,
                     _ => {
@@ -310,6 +339,24 @@ impl PlanFile {
                     }
                     detailed_steps.push_str(line);
                 }
+                Section::Reviews => {
+                    // One `<round> <base>` line per stamp (our serialize).
+                    // A malformed line is SKIPPED, never an error: the
+                    // section is bookkeeping, and a hand-edited plan must
+                    // still load (the stamps are advisory scope hints, not
+                    // a safety gate).
+                    let trimmed_line = line.trim();
+                    if !trimmed_line.is_empty() {
+                        if let Some((round, base)) = trimmed_line.split_once(' ') {
+                            if let Ok(round) = round.trim().parse::<u32>() {
+                                reviews.push(ReviewRoundStamp {
+                                    round,
+                                    base: base.trim().to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -327,6 +374,7 @@ impl PlanFile {
             } else {
                 Some(detailed_steps.trim().to_string())
             },
+            reviews,
             steps,
         })
     }
@@ -355,6 +403,12 @@ impl PlanFile {
         }
         if self.landed_design {
             out.push_str("\n## Landed design\nyes\n");
+        }
+        if !self.reviews.is_empty() {
+            out.push_str("\n## Reviews\n");
+            for stamp in &self.reviews {
+                out.push_str(&format!("{} {}\n", stamp.round, stamp.base));
+            }
         }
         out
     }
@@ -533,6 +587,7 @@ enum Section {
     Bug,
     RegressionTest,
     LandedDesign,
+    Reviews,
     Other,
 }
 
@@ -860,6 +915,48 @@ mod tests {
             "# Plan: T\n\n## Goal\nG\n\n## Kind\nbug_fixing\n\n## Context\nC\n\n## Steps\n\n## Landed design\ntrue\n";
         let parsed = PlanFile::parse(hand_edited).unwrap();
         assert!(parsed.landed_design);
+    }
+
+    #[test]
+    fn review_round_stamps_roundtrip_and_skip_malformed_lines() {
+        // Backlog 85313a7e: each reviewer round stamps its base revision in
+        // the `## Reviews` section, so a re-review can delta-scope against
+        // it. Default plans (no section) parse to an empty vec; a malformed
+        // line is skipped while its siblings survive.
+        let mut plan = PlanFile::new("T", "G", "C", vec!["s".into()]);
+        plan.reviews.push(ReviewRoundStamp {
+            round: 1,
+            base: "abc1234".into(),
+        });
+        plan.reviews.push(ReviewRoundStamp {
+            round: 2,
+            base: "def5678".into(),
+        });
+        let text = plan.serialize();
+        assert!(
+            text.contains("## Reviews\n1 abc1234\n2 def5678\n"),
+            "missing review stamps: {text}"
+        );
+        let parsed = PlanFile::parse(&text).unwrap();
+        assert_eq!(parsed.reviews.len(), 2);
+        assert_eq!(parsed.reviews[0].round, 1);
+        assert_eq!(parsed.reviews[0].base, "abc1234");
+        assert_eq!(parsed.reviews[1].round, 2);
+        assert_eq!(parsed.reviews[1].base, "def5678");
+
+        // Default: no section → empty.
+        let plain = PlanFile::new("T", "G", "C", vec!["s".into()]);
+        let parsed = PlanFile::parse(&plain.serialize()).unwrap();
+        assert!(parsed.reviews.is_empty());
+
+        // Hand-edited: the malformed first line is skipped, its sibling
+        // survives (single-line literal — the emission guard rejects
+        // multi-line markdown fixtures).
+        let hand = "# Plan: T\n\n## Goal\nG\n\n## Kind\nimplementation\n\n## Context\nC\n\n## Steps\n\n## Reviews\nnonsense\n2 def5678\n";
+        let parsed = PlanFile::parse(hand).unwrap();
+        assert_eq!(parsed.reviews.len(), 1);
+        assert_eq!(parsed.reviews[0].round, 2);
+        assert_eq!(parsed.reviews[0].base, "def5678");
     }
 
     #[test]

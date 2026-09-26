@@ -1,0 +1,6 @@
++++
+title = "macOS CI failure root cause — adoptable_path_rejects_empty_and_control_characters"
+created = "2027-01-11"
++++
+
+ROOT CAUSE FOUND (2026-09-21, plan 263a9e31, diagnostic run 35575972400, artifact macos-test-output): the macOS CI failure is a SINGLE test — `tests::adoptable_path_rejects_empty_and_control_characters` in src-tauri/src/main.rs (test panics at src-tauri/src/main.rs:1881:9 with `assertion failed: !is_adoptable_path("   ")`). The other panics in the log (src/workflow/mod.rs:428, src-tauri/src/ipc/memory_maintenance.rs:627) are expected-panic tests that PASSED. Result: `test result: FAILED. 296 passed; 1 failed` for the mnemo-app bin target. So the five earlier fixes were correct; this is the sixth, distinct failure. The test asserts is_adoptable_path rejects a whitespace-only path, but the function accepts it. NOT yet root-caused to the exact branch — read src-tauri/src/main.rs around 1860-1890 (the test) and is_adoptable_path's implementation. The evidence path that worked (the job-logs API is 403): the workflow's own `tee macos-test-output.txt` + upload-artifact@v4 step, downloaded with `gh run download <id> --name macos-test-output`; `gh run view --log-failed` also becomes available once the run completes.

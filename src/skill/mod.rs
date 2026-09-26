@@ -477,9 +477,10 @@ prompt = "Merge."
         let merge = reg
             .get("merge_to_main")
             .expect("merge_to_main.toml parses and loads");
-        // The merge hygiene step: branch-status memories are superseded once
-        // the branch lands in main (memory tools are always available inside
-        // a skill, so the tools list needs no entry).
+        // The merge hygiene step: branch-status records are superseded on the
+        // branch, BEFORE the landing commit, so the successors land with the
+        // merge (memory tools are always available inside a skill, so the
+        // tools list needs no entry).
         assert!(
             merge.prompt.contains("MERGED into main"),
             "merge_to_main prompt carries the memory-cleanup step"
@@ -509,6 +510,105 @@ prompt = "Merge."
         assert!(
             sync < branch_merge,
             "the origin sync must precede the branch merge (sync at {sync}, merge at {branch_merge})"
+        );
+        // The ruleset-aware two-path flow (ruleset 23755694, 2026-09-21): the
+        // detection step must exist and PRECEDE the direct path's checkout
+        // (detection before action), the PR path and the no-bypass rule must
+        // be pinned, and the direct path must push BEFORE deleting the branch
+        // (the GH013 recovery needs the ref intact — review round 1, H1).
+        let ruleset_check = merge
+            .prompt
+            .find("gh api repos/<owner>/<repo>/rulesets")
+            .expect("merge_to_main prompt carries the ruleset check");
+        let checkout_main = merge
+            .prompt
+            .find("git checkout main")
+            .expect("merge_to_main prompt carries the direct path");
+        assert!(
+            ruleset_check < checkout_main,
+            "the ruleset check must precede the direct path's checkout (check at {ruleset_check}, checkout at {checkout_main})"
+        );
+        assert!(
+            merge.prompt.contains("gh pr create --base main"),
+            "merge_to_main prompt carries the PR path"
+        );
+        assert!(
+            merge.prompt.contains("NEVER bypass"),
+            "merge_to_main prompt carries the no-bypass rule"
+        );
+        let direct_push = merge
+            .prompt
+            .find("git push` on the git tool")
+            .expect("merge_to_main prompt carries the direct-path push");
+        let branch_delete = merge
+            .prompt
+            .find("git branch -d <branch>")
+            .expect("merge_to_main prompt carries the branch cleanup");
+        assert!(
+            direct_push < branch_delete,
+            "the direct path must push BEFORE deleting the branch — the GH013 recovery needs the ref (push at {direct_push}, delete at {branch_delete})"
+        );
+    }
+
+    #[test]
+    fn merge_to_main_and_new_release_write_their_records_before_the_landing_commit() {
+        // ORDERING, not mere presence (the 2026-09-26 defect): the landing
+        // skill's bookkeeping step ran AFTER the branch content was frozen, so
+        // its records could never land — protected main rejects the push, and
+        // the branch that could have carried them is merged/pushed/deleted.
+        // They dangled as uncommitted `.coding/` files and rode an unrelated
+        // branch (PR #7's landing needed the follow-up closeout plan fc41c5aa
+        // for exactly this). Landing records must be written — and committed —
+        // on the branch BEFORE it is pushed, and nothing may be written after.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let merge = reg
+            .get("merge_to_main")
+            .expect("merge_to_main.toml parses and loads");
+        let record = merge
+            .prompt
+            .find("Write this branch's landing records NOW")
+            .expect("merge_to_main prompt writes its landing records");
+        let commit = merge
+            .prompt
+            .find("Commit ALL uncommitted work")
+            .expect("merge_to_main prompt commits the branch before landing");
+        let push = merge
+            .prompt
+            .find("git push` on the git tool")
+            .expect("merge_to_main prompt carries the direct-path push");
+        assert!(
+            record < commit,
+            "the landing records must be written BEFORE the branch is committed (records at {record}, commit at {commit})"
+        );
+        assert!(
+            commit < push,
+            "the branch commit must precede the push (commit at {commit}, push at {push})"
+        );
+        assert!(
+            merge
+                .prompt
+                .contains("No memory or knowledge write after the landing"),
+            "merge_to_main prompt forbids writes after the landing"
+        );
+        assert!(
+            merge.prompt.contains("git status --short"),
+            "merge_to_main prompt verifies a clean worktree before skill_end"
+        );
+        let release = reg
+            .get("new_release")
+            .expect("new_release.toml parses and loads");
+        let release_record = release
+            .prompt
+            .find("Write this branch's landing records NOW")
+            .expect("new_release prompt writes its landing records");
+        let release_commit = release
+            .prompt
+            .find("commit ALL uncommitted work")
+            .expect("new_release prompt commits the branch before landing");
+        assert!(
+            release_record < release_commit,
+            "the landing records must be written BEFORE the branch is committed (records at {release_record}, commit at {release_commit})"
         );
     }
 

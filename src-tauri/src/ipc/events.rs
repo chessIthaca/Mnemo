@@ -2102,6 +2102,9 @@ mod watchdog_note_tests {
                 used: 1,
                 max: 2,
                 breakdown: Default::default(),
+                // Lever 6 is off in this vector, so the pre-lever JSON shape is
+                // what gets pinned (no `quality` key on the wire).
+                quality: None,
             },
             SerializableAgentEvent::StepCompleted { step_index: 1 },
             SerializableAgentEvent::SuggestionInjected {

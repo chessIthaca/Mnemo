@@ -1,0 +1,6 @@
++++
+title = "tool descriptions are contract-first — required-field rule + exact call shape lead; zero-arg tools say \"takes NO arguments\""
+created = "2027-01-11"
++++
+
+Convention (user direction 2027-01-17, extends the empty-call sweep SPEC 50242afc / plan e02134b2): tool descriptions are CONTRACT-FIRST. (1) A required-field tool's description LEADS with the required-field rule + the exact call shape (e.g. {"files":[{"path":"a.js"}]}) + the no-zero-argument-form rule + the rewrite-don't-resend recovery rule; the value proposition ("Read files — one or many…") comes AFTER, never first. (2) Name the content-first anti-pattern inline: "If you catch yourself emitting <tool> with no args, stop — write the <content> first, then the call." (3) Genuinely zero-arg tools (current_plan, backlog_list, list_models, skill_reload) state explicitly "Takes NO arguments — call it with {}" so the model stops over-generalizing "call the tool" → {} onto required-field tools. (4) Array params advertise "minItems": 1 (read_files files) so the empty-array contract is visible pre-call; runtime checks stay. Rationale: deepseek failure evidence — empty calls cluster right after a successful same-tool call; front-loading the value instead of the contract invites the empty shape.

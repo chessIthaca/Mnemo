@@ -44,13 +44,18 @@
 //!   kind or state can reach it.
 //! - the **approval-preview hook** — `Tool::approval_preview` called inline
 //!   from `dispatch::execute_tool_call` (no `spawn_blocking`) →
-//!   `file_edit`/`file_write::prepare_for_approval`, which calls `validate` /
-//!   `validate_for_creation` and then reads the file to build the diff. One
-//!   `canonicalize` + one preview read per *prompted* file-tool call, in the
-//!   same approval flow as `is_project_scoped`. Only those two tools override
-//!   the trait default (`file_append` and `convert_line_endings` have no hook);
-//!   their own `execute` paths ARE wrapped, so the hook is the exception rather
-//!   than the rule.
+//!   `file_edit`/`file_write`/`multi_edit::prepare_for_approval`. The first
+//!   two call `validate` / `validate_for_creation` and then read the file to
+//!   build the diff — one `canonicalize` + one preview read per *prompted*
+//!   file-tool call; `multi_edit` (plan e3d0758b) additionally validates and
+//!   reads EVERY entry of a prompted multi-file call (N `validate`s + N
+//!   in-memory applies, one preview read per entry) — materially heavier than
+//!   the single-file tools, the same trade-off class (one preview pass per
+//!   *prompted* call). All of it runs in the same approval flow as
+//!   `is_project_scoped`. Only those three tools override the trait default
+//!   (`file_append` and `convert_line_endings` have no hook); their own
+//!   `execute` paths ARE wrapped, so the hook is the exception rather than
+//!   the rule.
 //!
 //! The creation ladder ([`Sandbox::validate_for_write`], used by `file_write` /
 //! `file_append`) added three bounded syscalls on 2027-01-15 (plan b4812291): a

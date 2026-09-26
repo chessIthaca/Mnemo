@@ -950,6 +950,26 @@ pub async fn get_project_stats(state: State<'_, IpcState>) -> Result<serde_json:
     Ok(serde_json::to_value(&stats).map_err(|e| format!("serialize: {e}"))?)
 }
 
+/// Get per-project token-SAVINGS stats for the Dashboard view (aggregated
+/// across all sessions) — backlog 652ae094.
+///
+/// Reads the memory store's `savings_events` ledger (written by the optimizer
+/// levers, backlog e4a50d22) plus the prompt-cache numbers from
+/// `request_stats`.
+#[tauri::command]
+pub async fn get_savings_stats(state: State<'_, IpcState>) -> Result<serde_json::Value, IpcError> {
+    let factory = state.factory()?;
+    let store = factory
+        .memory_handle()
+        .ok_or_else(|| "no memory store configured".to_string())?;
+
+    let stats = store
+        .savings_stats()
+        .await
+        .map_err(|e| format!("failed to read savings stats: {e}"))?;
+    Ok(serde_json::to_value(&stats).map_err(|e| format!("serialize: {e}"))?)
+}
+
 /// Get the list of sessions with aggregated token counts (for the Stats tab's
 /// session list). Ordered newest-first.
 #[tauri::command]
@@ -968,6 +988,7 @@ pub async fn get_session_list(state: State<'_, IpcState>) -> Result<serde_json::
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     /// Regression (run-all dispatches the next backlog item into the main
     /// agent during steering, 2026-08-31): `send_suggestion` must halt an
     /// active run-all BEFORE sending the steer command. Without the halt, the
@@ -982,7 +1003,7 @@ mod tests {
     /// `backlog_retry_routes_through_guarded_requeue`.
     #[test]
     fn send_suggestion_halts_run_all_before_sending() {
-        let src = include_str!("agent.rs");
+        let src = normalize_lf(include_str!("agent.rs"));
         let start = src
             .find("pub async fn send_suggestion")
             .expect("send_suggestion command present");
@@ -1018,7 +1039,7 @@ mod tests {
     /// `AppHandle`.
     #[test]
     fn send_suggestion_records_the_intervention_latch_before_halting() {
-        let src = include_str!("agent.rs");
+        let src = normalize_lf(include_str!("agent.rs"));
         let start = src
             .find("pub async fn send_suggestion")
             .expect("send_suggestion command present");
@@ -1060,7 +1081,7 @@ mod tests {
     /// needs Tauri state.
     #[test]
     fn interrupt_records_the_latch_only_when_running() {
-        let src = include_str!("agent.rs");
+        let src = normalize_lf(include_str!("agent.rs"));
         let start = src
             .find("pub async fn interrupt(")
             .expect("interrupt command present");
@@ -1121,7 +1142,7 @@ mod tests {
         // Body contract: the command wires the overlay resolved by `skill_prompts`
         // into `start_skill`, and never the caller's argument. Reverting to
         // `start_skill(&skill, &prompt.unwrap_or_else(...))` fails here.
-        let src = include_str!("agent.rs");
+        let src = normalize_lf(include_str!("agent.rs"));
         let start = src
             .find("pub async fn enter_skill(")
             .expect("enter_skill command present");

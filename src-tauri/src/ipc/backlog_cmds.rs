@@ -546,6 +546,23 @@ pub async fn backlog_run_all(
     // 6c6966b9) so the dispatch order picks them up and they count toward
     // the run's total.
     crate::ipc::run_all::adopt_orphaned_in_flight(state.inner()).await;
+    // Backlog 64662ef2 (review L4 of the b52b041a landing): sweep
+    // wt/runall-* branches whose PRs the human has merged — their
+    // commits are in origin/main, so the local refs are redundant.
+    // Best-effort + conservative (unmerged/worktree-held branches are
+    // never touched); runs before the pending-count check so a run
+    // that finds no eligible items still sweeps.
+    let swept = mnemo::project::worktrees::sweep_merged_runall_branches(
+        state.inner().project.root.lock().await.root.clone(),
+    )
+    .await;
+    if !swept.is_empty() {
+        eprintln!(
+            "backlog: swept {} merged runall branch(es): {}",
+            swept.len(),
+            swept.join(", ")
+        );
+    }
     // The run's total counts only ELIGIBLE items — pending and not
     // deferred (user request 2027-01-07: deferred items are excluded from
     // Run-All). A backlog whose pending items are ALL deferred still starts
@@ -615,6 +632,7 @@ pub async fn backlog_stop_all(
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     use super::{resolve_run_all_concurrency, spawned_views, BacklogItemView};
     use crate::ipc::state::{RunAllState, SpawnedRun};
     use mnemo::backlog::{BacklogItem, BacklogStatus};
@@ -680,7 +698,7 @@ mod tests {
     /// (`backlog::tests::requeue_refuses_pending_in_flight_and_unknown`).
     #[test]
     fn backlog_retry_routes_through_guarded_requeue() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_retry command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -716,7 +734,7 @@ mod tests {
     /// `mnemo::backlog::tests`.
     #[test]
     fn backlog_add_routes_through_the_shape_validator() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_add command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -750,7 +768,7 @@ mod tests {
     /// add_at_top_lands_first_in_store_and_file_order`).
     #[test]
     fn backlog_add_position_routes_through_add_at() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         // Slice out the backlog_add command body so the assertions inspect
         // the real call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).
@@ -783,7 +801,7 @@ mod tests {
     /// dispatch_item needs the Tauri state.
     #[test]
     fn dispatch_item_clears_in_flight_pointer_on_send_failure() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("async fn dispatch_item(")
             .expect("dispatch_item present");
@@ -861,7 +879,7 @@ mod tests {
     /// source contract; the parsing itself is unit-tested above.
     #[test]
     fn backlog_read_paths_surface_checkpoint_sha() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         for command in [
             "async fn backlog_list(",
             "async fn backlog_add(",
@@ -890,7 +908,7 @@ mod tests {
     /// itself is unit-tested in `mnemo::backlog::tests`.
     #[test]
     fn backlog_set_deferred_routes_through_the_store_setter() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_set_deferred")
             .expect("backlog_set_deferred command present");
@@ -916,7 +934,7 @@ mod tests {
     /// starts the run and the first dispatch ends it cleanly).
     #[test]
     fn backlog_run_all_counts_only_eligible_items() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_run_all")
             .expect("backlog_run_all command present");
@@ -941,7 +959,7 @@ mod tests {
     /// unit-tested in `mnemo::backlog::tests`.
     #[test]
     fn backlog_clear_finished_touches_only_the_store_and_the_event() {
-        let src = include_str!("backlog_cmds.rs");
+        let src = normalize_lf(include_str!("backlog_cmds.rs"));
         let start = src
             .find("pub async fn backlog_clear_finished")
             .expect("backlog_clear_finished command present");

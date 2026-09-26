@@ -555,6 +555,149 @@ pub struct RequestStats {
     pub purpose: Option<String>,
 }
 
+/// One token-savings ledger row (one row in `savings_events`) — a single
+/// context-optimization event (backlog e4a50d22 / 652ae094): what was
+/// about to enter the context, what actually entered, and the difference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavingsEvent {
+    /// Unique row id (a UUID string).
+    pub id: String,
+    /// The memory session this event belongs to, when known.
+    pub session_id: Option<String>,
+    /// The lever that produced the event: `truncation`, `compaction`
+    /// (the existing levers, instrumented by backlog 652ae094) or the
+    /// optimizer kinds `delta_read`, `skeleton`, `compression`, `archive`,
+    /// `archive_expand`, `compaction_checkpoint`.
+    pub kind: String,
+    /// Free-form detail — the file path, the command line, or the archive
+    /// id, depending on the kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Token count of the original form (what would have entered the
+    /// context). Non-negative.
+    pub tokens_before: i64,
+    /// Token count of the served form (what actually entered the context).
+    /// Non-negative.
+    pub tokens_after: i64,
+    /// `tokens_before − tokens_after`. Negative for re-expansions (an
+    /// `archive_expand` re-adds archived content, subtracting from
+    /// savings).
+    pub tokens_saved: i64,
+    /// Whether the counts come from a metered source (provider-reported
+    /// usage) or an estimate (chars-per-token heuristics). Kept as a flag
+    /// so the dashboard can present metered vs estimated savings apart.
+    pub measured: bool,
+    /// Unix timestamp (seconds) of the event.
+    pub created_at: i64,
+}
+
+/// Aggregated token savings across the whole project (all sessions) — the read
+/// path behind the Dashboard view (backlog 652ae094). It aggregates the
+/// `savings_events` ledger that the optimizer levers write (backlog
+/// e4a50d22); it never writes to it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsStats {
+    /// Sum of `tokens_saved` across every event.
+    pub saved_tokens_total: i64,
+    /// Total number of ledger events.
+    pub event_count: u64,
+    /// Per-kind breakdown, largest saving first.
+    pub per_kind: Vec<SavingsKindBreakdown>,
+    /// Per-day savings, oldest day first (for the time-series bars).
+    pub per_day: Vec<SavingsDayBreakdown>,
+    /// The most recent events, newest first (bounded, for the event list).
+    pub recent: Vec<SavingsEvent>,
+    /// Prompt-cache efficiency from `request_stats`, so the dashboard can show
+    /// what caching saved beside what the levers saved.
+    pub cache: CacheEfficiency,
+}
+
+/// One lever kind's savings — a row in the Dashboard's per-kind table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsKindBreakdown {
+    /// The lever kind (`truncation`, `compaction`, `delta_read`, …).
+    pub kind: String,
+    /// Number of events of this kind.
+    pub event_count: u64,
+    /// Sum of `tokens_saved` for this kind. Signed, because an
+    /// `archive_expand` event re-adds archived content and subtracts.
+    pub saved_tokens: i64,
+}
+
+/// One day's savings — a bar in the Dashboard's time series.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavingsDayBreakdown {
+    /// The UTC day the events fell on, as epoch DAYS (`created_at / 86_400`).
+    /// Days rather than an instant because this is a day bucket; the frontend
+    /// formats it for display.
+    pub day: i64,
+    /// Number of events on that day.
+    pub event_count: u64,
+    /// Sum of `tokens_saved` on that day. Signed (see
+    /// [`SavingsKindBreakdown::saved_tokens`]).
+    pub saved_tokens: i64,
+}
+
+/// Prompt-cache efficiency across the project's recorded requests, so the
+/// Dashboard can pair caching's effect with the levers'.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheEfficiency {
+    /// Total prompt tokens across all recorded requests.
+    pub prompt_tokens: u64,
+    /// Of those, the tokens served from the provider's prompt cache.
+    pub cached_tokens: u64,
+    /// Requests that reported a cache figure at all (`cached_tokens IS NOT
+    /// NULL`). This gates whether a hit rate is shown at all, and it is the
+    /// numerator of the "requests reporting cache" ratio. The displayed rate
+    /// itself is `cached_tokens / prompt_tokens` over EVERY recorded request —
+    /// including error/cancelled rows that never reported usage.
+    pub cached_not_null_requests: u64,
+    /// Total recorded requests.
+    pub request_count: u64,
+}
+
+/// One archived tool result (one row in `tool_result_archive`) — the full
+/// original of a tool result too large to keep in context (backlog
+/// e4a50d22 lever 3), retrievable by id through the `expand_result` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedToolResult {
+    /// Unique row id (a UUID string) — the handle the context preview names.
+    pub id: String,
+    /// The memory session this result belongs to, when known.
+    pub session_id: Option<String>,
+    /// The tool that produced the result (`shell`, `read_files`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Free-form detail — the command line or file path, when the tool call had
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The full original output.
+    pub content: String,
+    /// `content`'s character count (denormalized so a listing need not load
+    /// the body).
+    pub char_count: i64,
+    /// Unix timestamp (seconds) of the archive write.
+    pub created_at: i64,
+}
+
+/// One keyword-search hit over the tool-result archive (backlog e4a50d22
+/// lever 3): the row id, its provenance, and a surrounding snippet — never
+/// the full content (that costs another `expand_result` by id).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveSearchHit {
+    /// The row id to pass back to `expand_result`.
+    pub id: String,
+    /// The tool that produced the archived result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The archived result's detail (command line / file path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A short excerpt around the match.
+    pub snippet: String,
+}
+
 /// Aggregated token usage + timing for a single session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionStats {

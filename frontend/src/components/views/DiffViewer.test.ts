@@ -4,7 +4,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { scopedResult, shouldFetchGitDiff, diffDropdownValue, needsTransientDiffOption, classifyGitDiffError, type DiffViewMode } from "./DiffViewer";
+import { scopedResult, shouldFetchGitDiff, diffDropdownValue, needsTransientDiffOption, classifyGitDiffError, contentFromPreviewOrArgs, isFileEditTool, type DiffViewMode } from "./DiffViewer";
 
 /**
  * Unit tests for the Diff tab's pure fetch predicate (the repo's
@@ -121,5 +121,35 @@ describe("classifyGitDiffError", () => {
 
   it("returns other for an empty message", () => {
     expect(classifyGitDiffError("")).toBe("other");
+  });
+});
+
+describe("isFileEditTool", () => {
+  it("covers every tool whose approval carries a diff preview (L1 regression)", () => {
+    // multi_edit's approval carries the combined multi_diff preview; missing
+    // it here made the Diff tab say "No file diff for this tool" while
+    // PLAN.md promised the combined diff.
+    expect(isFileEditTool("file_edit")).toBe(true);
+    expect(isFileEditTool("file_write")).toBe(true);
+    expect(isFileEditTool("file_append")).toBe(true);
+    expect(isFileEditTool("multi_edit")).toBe(true);
+    expect(isFileEditTool("shell")).toBe(false);
+    expect(isFileEditTool("read_files")).toBe(false);
+  });
+});
+
+describe("contentFromPreviewOrArgs", () => {
+  it("renders a multi_edit's combined diff from its multi_diff preview (L1 regression)", () => {
+    // Before the fix the multi_diff branch did not exist: the preview was
+    // inert and the tab showed no diff at all for a pending multi_edit.
+    const combined = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-a\n+A\n";
+    const resolved = contentFromPreviewOrArgs(
+      { kind: "multi_diff", paths: ["a.txt", "b.txt"], diff: combined },
+      "multi_edit",
+      {},
+    );
+    expect(resolved.mode).toBe("unified");
+    expect(resolved.path).toBe("a.txt");
+    expect(resolved.unifiedDiff).toBe(combined);
   });
 });

@@ -1,0 +1,22 @@
++++
+title = "merge_to_main is ruleset-aware — PR flow on protected repos, direct path preserved"
+created = "2027-01-11"
++++
+
+DECISION (2027-01-11, backlog 006ee7d6, plan 8ad6fa91): merge_to_main is ruleset-aware — two paths, PR flow on protected repos.
+
+THE TRIGGER: ruleset 23755694 ("Protect from direct pushing.", enforcement active, target branch, conditions ref_name ~DEFAULT_BRANCH only, rules deletion/non_fast_forward/update/pull_request with required_approving_review_count 1) rejects direct pushes to main with GH013 (discovered 2026-09-21, plan 263a9e31; the hand-rolled precedent was PR #3).
+
+THE DESIGN:
+1. Detection UP-FRONT via `gh api repos/<owner>/<repo>/rulesets` (owner/repo from `gh repo view --json nameWithOwner` or parsing `git remote get-url origin`) — an ACTIVE ruleset with a pull_request rule → PR path. Chosen over `git push --dry-run` (its ruleset evaluation is not guaranteed across git/GitHub versions). A GH013/protected-ref rejection on the direct push recovers into the PR flow: reset local main to origin/main (the merge only existed locally; the PR re-lands it), then push the branch and open the PR — this covers ruleset-check false-negatives with a working, authenticated gh, NOT gh-missing/unauthed (where gh pr create would fail too).
+2. Direct path (no ruleset): the existing flow — sync main first (fetch + pull --no-rebase), merge --no-ff on the git tool, conflicts via file_edit UNION, verify BOTH builds on the MERGED tree, push, THEN branch -d (push-before-delete: the GH013 recovery needs the branch ref intact). Preserved because the skill ships to other installs (mostly unprotected).
+3. PR path (ruleset present or GH013 recovery): verify the BRANCH builds first (build.yml has NO pull_request trigger — workflow_dispatch + v* tags only — so PRs get no CI proof; adding PR CI would burn 10x-billed macOS runner minutes; the branch-tip build catches the historical break classes, which are branch properties, not merge artifacts), push the branch (`git push -u origin <branch>` on the git tool, approval-gated), `gh pr create --base main --head <branch> --title <latest commit subject> --body <git log main..<branch> --oneline + review verdicts + build status>`, existing PR → report its URL, report the PR URL and STOP. The author cannot self-approve (required_approving_review_count: 1) — the human approves and merges. NEVER bypass (no force-push, no admin override, no ruleset edits).
+4. Memory supersede: direct path → "MERGED into main at <sha>"; PR path → "PR #N OPENED against main (head <branch>, tip <sha>), awaiting human review". Branch deletion on the PR path happens after the human merges (a later session).
+
+NEW_RELEASE: step 2 got the same ruleset-aware landing (PR path: verify the branch builds, push branch, gh pr create, report URL, STOP with re-run instructions — on re-run after the human merge, checkout main + sync, then continue to the tag). The TAG push (step 3) is NOT blocked: the ruleset's conditions target ~DEFAULT_BRANCH only — refs/tags/v* sit outside it (verified 2027-01-11 via gh api .../rulesets/23755694).
+
+KNOWN ADJACENT BREAKAGE (follow-up backlog item): src/project/worktrees.rs — the app-managed run-all landing (serialized --no-ff merges into main) pushes main directly and is equally blocked; needs its own ruleset-aware/PR-based landing in Rust.
+
+INVARIANT: the skill test shipped_skill_files_parse_and_merge_to_main_cleans_up_memories pins the prompt's ordered substrings ("git fetch origin" < "git pull --no-rebase" < "--no-ff <branch>", plus "MERGED into main") — the direct path's wording must stay first-in-order. Review round 1 additionally pinned: the ruleset check precedes the direct path's checkout, gh pr create --base main, NEVER bypass, and push-before-delete.
+
+Amended 2027-01-11: The KNOWN ADJACENT BREAKAGE paragraph is resolved (2026-09-21, backlog b52b041a, plan 8432b8cb): the app-managed run-all landing is now ruleset-aware with this same two-path design — detection via gh api repos/{owner}/{repo}/rulesets (ACTIVE + pull_request rule); a protected main gets the branch pushed + a PR opened (gh pr create --base main --head <branch>), the URL reported on the item, and the branch kept for the human merge; an unprotected main keeps the direct local --no-ff merge. The paragraph's premise was inaccurate: the app landing never pushed main (a local merge only) — the defect was the unpushable stranded merge plus the post-landing branch delete, not a blocked push. The "follow-up backlog item" note is superseded by the landed fix.

@@ -24,8 +24,10 @@ interface MergeToMainDialogProps {
 /**
  * Confirmation dialog for the "Merge to main" action. This dialog IS the
  * approval gate for the UI-initiated merge — confirming enters the
- * `merge_to_main` skill, where the agent drives the merge itself (commit,
- * checkout main, sync with origin, merge, resolve conflicts, delete branch). Built on Radix Dialog
+ * `merge_to_main` skill, where the agent drives the landing itself (commit,
+ * then either the direct merge — checkout main, sync with origin, merge,
+ * resolve conflicts — or, where main is ruleset-protected, a PR it opens and
+ * leaves for a human approving review). Built on Radix Dialog
  * (role="dialog", aria-modal, focus trap, Escape-to-close).
  */
 export function MergeToMainDialog({
@@ -71,9 +73,9 @@ export function MergeToMainDialog({
               <span className="font-medium text-cyan-400">main</span> itself:
             </p>
             <ul className="mb-3 space-y-1 pl-4 text-slate-400">
-              <li>• Commit the branch's work, then merge it into <code className="inline-code">main</code> (the skill never stashes)</li>
-              <li>• Sync <code className="inline-code">main</code> with origin first, and resolve any conflicts</li>
-              <li>• Delete the merged branch, return to Planning</li>
+              <li>• Commit the branch's work, then land it: merge into <code className="inline-code">main</code> directly, or — where main is ruleset-protected — open a PR and stop for a human approving review</li>
+              <li>• On the direct path: sync <code className="inline-code">main</code> with origin first, resolve any conflicts</li>
+              <li>• Delete the merged branch (on the PR path, after the human merges), return to Planning</li>
             </ul>
             <p className="text-slate-400">
               Core git operations (merge, push) always require approval, even in

@@ -726,6 +726,7 @@ pub async fn browser_webview_destroy(state: State<'_, IpcState>) -> Result<(), I
 
 #[cfg(test)]
 mod tests {
+    use crate::ipc::contract_fixtures::normalize_lf;
     use super::*;
 
     /// The overlay counter must balance: enter → depth 1, exit → depth 0.
@@ -978,7 +979,7 @@ mod tests {
     /// a silent runtime 404 for the frontend.
     #[test]
     fn stop_and_reload_commands_follow_navigate_pattern() {
-        let src = include_str!("browser_webview.rs");
+        let src = normalize_lf(include_str!("browser_webview.rs"));
         // Slice out each command body so the assertions inspect the real
         // call site — asserting against the whole file would be
         // self-referential (this test's own literals live in `src` too).

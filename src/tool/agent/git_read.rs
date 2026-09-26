@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Read-only git bridge tools — `git_log` and `git_show`.
+//! Read-only git bridge tools — `git_log`, `git_show` and `git_status`.
 //!
 //! These bridge memory records (which carry `commit <hash>` pointers) to the
 //! shipped code: `git_log` lists recent commits (optionally for one path),
-//! `git_show` displays a commit's stat or full diff. Both are read-only by
-//! construction — no subcommand dispatch, no write flags, no `args` passthrough
-//! — so they are `AutoRun` (the `git` tool is `NeedsApproval` because it can
-//! commit/merge/push; these two cannot).
+//! `git_show` displays a commit's stat or full diff, `git_status` answers
+//! "is the tree clean?" (`git status --short` plus a one-line summary). All
+//! are read-only by construction — no subcommand dispatch, no write flags, no
+//! `args` passthrough — so they are `AutoRun` (the `git` tool is
+//! `NeedsApproval` because it can commit/merge/push; these cannot).
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -262,6 +263,79 @@ impl Tool for GitShowTool {
             vec!["show", &args.commit]
         };
         run_git_read(&self.project_root, &argv).await
+    }
+}
+
+/// The `git_status` tool — the working-tree status (`git status --short`
+/// plus a one-line summary), so "is the tree clean?" has a read-only home
+/// on the same AutoRun surface as the other git reads.
+pub struct GitStatusTool {
+    project_root: PathBuf,
+}
+
+impl GitStatusTool {
+    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            project_root: project_root.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GitStatusTool {
+    fn name(&self) -> &str {
+        "git_status"
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Agent
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "git_status",
+            "The working-tree status: `git status --short` plus a one-line summary \
+             (clean tree → \"(working tree clean…)\"; dirty → \"(N changed, U \
+             untracked)\"). Read-only by construction.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        )
+    }
+
+    fn safety(&self) -> SafetyLevel {
+        SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> ToolResult {
+        let mut result = run_git_read(&self.project_root, &["status", "--short"]).await;
+        if result.success {
+            // Append a one-line summary so "is the tree clean?" is answerable
+            // at a glance: the short form lists one entry per line (empty =
+            // clean) and `?? ` prefixes untracked files. Ignored files are
+            // excluded by --short by design — they are not tree dirt.
+            if let Some(stdout) = result
+                .data
+                .as_ref()
+                .and_then(|d| d.get("stdout"))
+                .and_then(|s| s.as_str())
+            {
+                let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+                let summary = if lines.is_empty() {
+                    "(working tree clean — no changes, nothing untracked)".to_string()
+                } else {
+                    let untracked = lines.iter().filter(|l| l.starts_with("??")).count();
+                    format!(
+                        "({} changed, {} untracked)",
+                        lines.len() - untracked,
+                        untracked
+                    )
+                };
+                result.output = format!("{}\n{}", result.output.trim_end(), summary);
+            }
+        }
+        result
     }
 }
 

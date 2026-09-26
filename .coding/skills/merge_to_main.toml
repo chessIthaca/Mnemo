@@ -4,21 +4,22 @@
 # calling skill_start("merge_to_main"); the agent drives the merge with its own
 # tools (git commit/merge/checkout/branch + file_edit for conflicts) and calls
 # skill_end to return to Planning. Memory tools work inside a skill without an
-# allow-list entry — step 6 is the post-merge hygiene.
+# allow-list entry — the landing hygiene is step 2 (records) plus step 6 (the
+# no-write rule + clean-tree check).
 #
 # The prompt below is injected into the system prompt EVERY turn the skill runs,
 # so it stays a terse checklist. The rationale for its hard rules lives here in
 # comments (never injected) — do not move it back into the prompt, and do not
 # "simplify" the rules away; each one encodes a real failure:
-# - NEVER stash (step 1): ten orphan stashes had accumulated by 2026-08-24, each
+# - NEVER stash (step 3): ten orphan stashes had accumulated by 2026-08-24, each
 #   one `.coding/` bookkeeping this skill dirtied by writing its own state into
 #   stack.json. The pre-merge commit covers it.
-# - BOTH builds (step 4): `npm run build` catches TS-only breaks (e.g. a
+# - BOTH builds (direct path): `npm run build` catches TS-only breaks (e.g. a
 #   Record<...> map missing a newly added tab key); `cd src-tauri && cargo build`
 #   compiles the bin crate (E0425/E0027 from renames or new struct/enum fields),
 #   which the root cargo build/test never sees. Post-merge breaks shipped
 #   repeatedly before this rule existed.
-# - Sync main BEFORE the merge (step 2): on 2026-09-13 main had drifted behind
+# - Sync main BEFORE the merge (direct path): on 2026-09-13 main had drifted behind
 #   origin/main, so the landed merge could not be pushed until a separate
 #   catch-up (merge commit 76af04b). Syncing first keeps it pushable in one pass.
 # - Tool per step (HIGH 1 of the merge_to_main review, plan d826b9ad): the sync
@@ -26,11 +27,46 @@
 #   push stay on the git tool — the structured, subcommand-checked core-operation
 #   path. Both force the always-on approval prompt (ShellTool::never_auto_for,
 #   2027-01-11, closed the bypass this note originally described).
+# - PR flow under a main-protection ruleset (2026-09-21): ruleset 23755694
+#   ("Protect from direct pushing.", target branch, conditions ref_name
+#   ~DEFAULT_BRANCH only, rules deletion/non_fast_forward/update/pull_request
+#   with required_approving_review_count 1) rejects direct pushes with GH013, so
+#   the skill detects it UP-FRONT (gh api repos/<owner>/<repo>/rulesets — an
+#   ACTIVE ruleset with a pull_request rule) and opens a PR instead; the
+#   GH013 recovery on the direct push covers ruleset-check false-negatives
+#   with a working, authenticated gh (a ruleset the list call missed, or a
+#   race) — NOT gh-missing/unauthed, where step 5's gh pr create would fail
+#   too. The hand-rolled precedent is PR #3 (plan 263a9e31). The author cannot self-approve, so the
+#   skill STOPS at the PR — the human approves and merges; NEVER bypass (no
+#   force-push, no admin override, no ruleset edits). The direct path is
+#   preserved for unprotected repos (the skill ships to other installs).
+# - The PR path builds the BRANCH first (not the merged tree): build.yml has no
+#   pull_request trigger (workflow_dispatch + v* tags only), so PRs get no CI
+#   proof — and adding PR CI would burn 10x-billed macOS runner minutes. The
+#   branch-tip build catches the historical break classes (TS-only and
+#   bin-crate compile errors are branch properties, not merge artifacts).
+# - Tag pushes are NOT blocked (new_release step 3): the ruleset's conditions
+#   target ~DEFAULT_BRANCH only — refs/tags/v* sit outside it (verified
+#   2027-01-11 via gh api .../rulesets/23755694).
 # - Memory convergence is automatic: the index re-derives from the merged files
 #   at the next project open (in-session: Settings → Memory → "Rebuild index from
 #   files"). Never hand-edit the DB.
 # - Topology (one wt/* working branch per agent directory → protected main; the
 #   old `develop` tier was removed 2026-08-24) is documented in agent.md.
+# - Bookkeeping is written BEFORE the commit (2026-09-26): the old step 5 ran
+#   its supersede AFTER the branch was frozen — on the direct path after even
+#   `git branch -d` — so those records could never land. Protected main rejects
+#   the push, and the branch that could have carried them is merged/pushed/
+#   deleted; the writes dangled as uncommitted `.coding/` files and rode an
+#   unrelated branch. Evidence: PR #7's landing needed the follow-up closeout
+#   plan fc41c5aa for exactly this, and that closeout's own bookkeeping still
+#   sat uncommitted on main afterwards. The record TEXT had to move with the
+#   step: a record transported BY the merge cannot name that merge's own sha (a
+#   commit cannot contain its own hash) and the PR number exists only after
+#   `gh pr create` — i.e. after the push — so landing records are phrased on
+#   pre-landing facts: the branch, the date, and the branch's work tip (the tip
+#   BEFORE the bookkeeping commit; the merge commit is one `git log main
+#   --merges` away). Never move a memory/knowledge write back after the landing.
 
 name = "merge_to_main"
 available_in = ["complete", "planning"]
@@ -47,13 +83,12 @@ tools = [
   "abandon_skill",
 ]
 prompt = """\
-Merge the branch named in the request (default: the current one) into main and clean up. Steps:
-1. Commit ALL uncommitted work on that branch, `.coding/` included — plans, knowledge, reviews, backlog.jsonl must land in the merge. NEVER stash.
-2. `git checkout <branch>` if needed, then `git checkout main`, then sync it FIRST via shell (the git tool has no fetch/pull): `git fetch origin`, `git pull --no-rebase`. Nothing new / no remote → continue.
-3. Merge on the **git** tool: `git merge --no-ff <branch>`. Any conflict, in the pull or the merge: file_edit taking the UNION of both sides, `git add` + `git commit`; never drop a side, never `-X ours`/`-X theirs`.
-4. Verify the MERGED tree builds — fix with file_edit until green: `npm run build` (frontend/) AND `cd src-tauri && cargo build` (the root build never compiles the bin crate).
-5. Green → `git branch -d <branch>` (never -D); optional `git push` on the git tool, approval-gated.
-6. Supersede this branch's stale status memories with successors recording "MERGED into main at <sha>" — search its name + pre-merge tip, skip when nothing matches, never another branch's records.
+Merge the branch named in the request (default: the current one) into main and clean up. ORDER IS THE POINT: every memory/knowledge write happens BEFORE the branch's final commit (step 2 precedes step 3) — once the branch is pushed, nothing you write can land. Steps:
+1. Ruleset check via shell: `gh repo view --json nameWithOwner` (or parse `git remote get-url origin`), then `gh api repos/<owner>/<repo>/rulesets` — an ACTIVE ruleset with a `pull_request` rule blocks direct pushes to main (GH013). gh fails / no ruleset → direct path (step 4). Ruleset present → PR path (step 5).
+2. Write this branch's landing records NOW, before anything is committed — memory_supersede this branch's stale status records (search its name + pre-merge tip; skip when nothing matches, NEVER another branch's records). Phrase them on pre-landing facts only: the merge sha does not exist yet (a commit cannot contain its own hash) and the PR number exists only after `gh pr create`. Each successor keeps its topic with the title tail `— MERGED into main (branch <branch>, <YYYY-MM-DD>)`; its body names the branch and the branch's WORK TIP — run `git rev-parse HEAD` BEFORE this step and record that tip (the merge commit is then one `git log main --merges` away) — and on the PR path add `a PR against main is opened from this branch, awaiting human review`. Never write a sha or PR number you do not have.
+3. Commit ALL uncommitted work on that branch, `.coding/` included — plans, knowledge, reviews, backlog.jsonl must land, and this step carries the step-2 records into the merge. NEVER stash.
+4. DIRECT path: `git checkout <branch>` if needed, then `git checkout main`, then sync it FIRST via shell (the git tool has no fetch/pull): `git fetch origin`, `git pull --no-rebase`. Nothing new / no remote → continue. Merge on the **git** tool: `git merge --no-ff <branch>`. Any conflict, in the pull or the merge: file_edit taking the UNION of both sides, `git add` + `git commit`; never drop a side, never `-X ours`/`-X theirs`. Verify the MERGED tree builds — fix with file_edit until green: `npm run build` (frontend/) AND `cd src-tauri && cargo build` (the root build never compiles the bin crate). Green → `git push` on the git tool, approval-gated (optional — skip on no remote); push success → `git branch -d <branch>` (never -D). A GH013 / protected-ref rejection → the ruleset check missed it: reset local main to origin/main (`git reset --hard origin/main` — the merge only existed locally; the PR re-lands it), then take the PR path (step 5) with the branch intact.
+5. PR path (ruleset present, or GH013 recovery): verify the BRANCH builds first — `npm run build` (frontend/) AND `cd src-tauri && cargo build`; fix with file_edit until green (PRs get no CI: build.yml triggers only on tags/dispatch). Push the branch on the git tool (`git push -u origin <branch>`, approval-gated), then open the PR via shell: `gh pr create --base main --head <branch> --title "<the branch's latest commit subject>" --body "<git log main..<branch> --oneline> + the review verdicts + build status"`. A PR already exists for the branch → report its URL. Report the PR URL and STOP — the author cannot self-approve (required_approving_review_count: 1); the human approves and merges. NEVER bypass the ruleset (no force-push, no admin override, no ruleset edits). The step-2 records ship inside this PR and become part of main exactly when the human merges — nothing needs rewording afterwards; a later session only deletes the branch.
+6. No memory or knowledge write after the landing: from the push on the branch is frozen, and on protected main such a write can never even be pushed — it would dangle in the worktree and ride an unrelated branch. Check `git status --short` before `skill_end`: it must be EMPTY. Not empty → you wrote after the landing: commit those files on the branch and push that branch (PR path), or open a follow-up PR for them (direct path) — never leave them in the worktree.
 7. `skill_end` → Planning; unresolvable → `abandon_skill`.\
 """
-

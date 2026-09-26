@@ -7,7 +7,12 @@
 //! Four tools, mirroring GitNexus's smart tools:
 //!
 //! - `graph_search` — name → candidate symbols (file + line + kind). The
-//!   cheap "where is X defined?" lookup that replaces a grep chain.
+//!   cheap "where is X defined?" lookup that replaces a grep chain. A
+//!   non-empty result carries `next` — the exact `graph_context(id=...)`
+//!   call for the first hit (plus `graph_impact` for blast radius) — so
+//!   the follow-up chain needs no re-derivation (plan aff95a51: the
+//!   under-chaining observed 2027-01 was a result-shape gap, not a
+//!   prompt gap).
 //! - `graph_context` — the 360° view of one symbol: definition + incoming
 //!   and outgoing edges grouped by kind (callers, callees, imports,
 //!   containment). One call = complete structural context.
@@ -27,12 +32,13 @@
 //! `graph_search` total misses are staleness-aware (backlog 95f21af0 — the
 //! F10 pattern for the symbol index): the watcher's reindex is best-effort
 //! and unlike the search tool there is no walk to fall back on, so a miss
-//! first sweeps the indexed source files' mtimes (stats only), reindexes
-//! up to 8 stale files inline, and re-resolves once from the fresh view,
-//! disclosing the side effect ("reindexed N stale file(s)"); unrepaired
-//! staleness (above the cap, or a pass already running) carries a
-//! staleness note instead. Files not yet in the index (brand-new) remain
-//! watcher-dependent.
+//! first sweeps the indexed source files' mtimes (stats only), reindexes up
+//! to `STALE_REINDEX_CAP` (32) stale files inline under the shared 500 ms
+//! stale-reindex budget — the budget, not the ceiling, is the latency guard —
+//! and re-resolves once from the fresh view, disclosing the side effect
+//! ("reindexed N stale file(s)"); unrepaired staleness (above the ceiling, or
+//! a pass already running) carries a staleness note instead. Files not yet in
+//! the index (brand-new) remain watcher-dependent.
 //!
 //! Indexed languages: Rust (`.rs`) and TypeScript/TSX (`.ts`/`.tsx`). The
 //! tool descriptions state this explicitly so the agent reaches for the
@@ -48,6 +54,7 @@ use serde_json::{json, Value};
 use crate::codegraph::query::{CONTEXT_GROUP_CAP, ContextView, GraphView, RESOLVE_CAP};
 use crate::codegraph::CodeGraph;
 use crate::provider::ToolSchema;
+use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Run a read-only graph query on the blocking pool and shape the outcome.
@@ -225,12 +232,19 @@ fn miss_hint(query: &str, candidates: usize) -> String {
     }
 }
 
-/// Cap on graph_search's inline staleness repair (backlog 95f21af0 — the
-/// F10 pattern for the symbol index, mirroring the search tool's cap): a
-/// total miss with MORE stale files than this serves the staleness note
-/// instead of a large inline re-index — the watcher's next pass covers the
-/// rest.
-const STALE_REINDEX_CAP: usize = 8;
+/// Ceiling on graph_search's inline staleness repair (backlog 95f21af0 — the
+/// F10 pattern for the symbol index, mirroring the search tool's cap): an
+/// ADAPTIVE upper bound, NOT the latency guard itself. Within it the repair
+/// runs under [`crate::codegraph::STALE_REINDEX_BUDGET`], whose pass stops
+/// between files once the budget is spent, so a slow set degrades to the
+/// plain miss instead of a slow lookup. A total miss with MORE stale files
+/// than this (or a pass already running) serves the staleness note — the
+/// watcher's next pass covers the rest. Raised 8 → 32 on 2026-09-26 to match
+/// the content index's adaptive ceiling (commit 06276aa, backlog 9201704f):
+/// the old 8 left a checkout-scale drift (61 files) unrepaired and this
+/// plan's own regression-test symbol unindexed — accurate results matter
+/// more than the note.
+const STALE_REINDEX_CAP: usize = 32;
 
 /// Shared arg shape for the single-symbol tools: either an exact `id` or a
 /// `name` to resolve.
@@ -271,14 +285,19 @@ impl Tool for GraphSearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_search",
-            "MANDATORY first step when locating a symbol definition — never read whole files \
-             or run grep chains to find one. Find symbols (functions, structs, traits, classes, \
-             …) in the project's code knowledge graph (Rust, TypeScript/TSX, JavaScript, \
-             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks — .rs/.ts/.tsx/.js \
-             and other source extensions) by name. Returns up to 20 candidates with file, line \
-             range, kind, and the exact symbol id to pass to graph_context / graph_impact / \
-             graph_path. Indexes symbol definitions only — string literals (tool names, config \
-             keys, log text) are not indexed; use the `search` tool for those.",
+            format!(
+                "{} MANDATORY first step when locating a symbol \
+             definition — never read whole files or run grep chains to find \
+             one. Find symbols (functions, structs, traits, classes, …) in \
+             the project's code knowledge graph (Rust, TypeScript/TSX, JavaScript, \
+             Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks — \
+             .rs/.ts/.tsx/.js and other source extensions) by name. Returns up \
+             to 20 candidates with file, line range, kind, and the exact symbol \
+             id to pass to graph_context / graph_impact / graph_path. Indexes \
+             symbol definitions only — string literals (tool names, config \
+                 keys, log text) are not indexed; use the `search` tool for those.",
+                tool_contract::contract("`query`", "{\"query\":\"DeltaAccumulator\"}")
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -294,16 +313,26 @@ impl Tool for GraphSearchTool {
         struct Args {
             query: String,
         }
-        let args: Args = match serde_json::from_value(args) {
+        let args: Args = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "graph_search",
+                    &e,
+                    &args,
+                    &tool_contract::recovery_hint("query"),
+                ))
+            }
         };
         // Freshness-aware query (backlog 95f21af0 — the F10 pattern for the
         // symbol index): a TOTAL miss may be staleness, not absence — the
         // watcher's reindex is best-effort, and unlike the search tool
         // there is no walk to fall back on. Detect stale indexed source
-        // files (stats only), reindex up to STALE_REINDEX_CAP inline, and
-        // re-resolve ONCE from the fresh view. Best-effort: any error in
+        // files (stats only), reindex up to STALE_REINDEX_CAP inline under
+        // the shared stale-reindex budget, and re-resolve ONCE from the
+        // fresh view. Best-effort: any error in
         // the freshness path serves the plain miss — a lookup is never
         // failed by its own repair.
         let graph = self.graph.clone();
@@ -322,7 +351,7 @@ impl Tool for GraphSearchTool {
                             // the index shortly; Err = the reindex itself
                             // failed. Both leave the staleness unrepaired.
                             let repaired = graph
-                                .reindex_stale_files(&stale)
+                                .reindex_stale_files(&stale, crate::codegraph::STALE_REINDEX_BUDGET)
                                 .ok()
                                 .filter(|n| *n > 0);
                             match repaired {
@@ -353,11 +382,21 @@ impl Tool for GraphSearchTool {
             let hint = matches
                 .is_empty()
                 .then(|| miss_hint(&args.query, matches.len()));
+            // The chaining pointer (plan aff95a51): the result is where the
+            // follow-up decision happens, so a hit carries the exact next
+            // call. Captured before the json! below moves `matches`.
+            let first_id = matches.first().map(|s| s.id.clone());
             let mut out = json!({
                 "query": args.query,
                 "count": matches.len(),
                 "symbols": matches,
             });
+            if let Some(id) = first_id {
+                out["next"] = json!(format!(
+                    "graph_context(id=\"{id}\") → callers/callees/imports; \
+                     graph_impact(id) → blast radius"
+                ));
+            }
             if let Some(hint) = hint {
                 out["hint"] = json!(hint);
             }
@@ -417,13 +456,20 @@ impl Tool for GraphContextTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_context",
-            "Get the 360° view of a symbol: its definition (file + lines) plus incoming and \
-             outgoing edges grouped by kind — callers, callees, imports, containment. Works \
-             the same for every indexed language (Rust, TypeScript/TSX, JavaScript, Python, \
-             Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). Call this immediately \
-             after graph_search whenever you need callers/callees/imports — one call \
-             replaces a grep chain and reading whole files. Pass an exact `id` from \
-             graph_search, or a `name` to resolve.",
+            format!(
+                "{} Get the 360° view of a symbol: its \
+             definition (file + lines) plus incoming and outgoing edges grouped \
+             by kind — callers, callees, imports, containment. Works the same \
+             for every indexed language (Rust, TypeScript/TSX, JavaScript, \
+                 Python, Go, Java, C/C++, C#, Ruby, PHP, and HTML script blocks). \
+                 Call this immediately after graph_search whenever you need \
+                 callers/callees/imports — one call replaces a grep chain and \
+                 reading whole files.",
+                tool_contract::contract(
+                    "`id` (or `name`)",
+                    "{\"id\":\"src/provider/stream.rs::DeltaAccumulator::52\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -446,7 +492,10 @@ impl Tool for GraphContextTool {
                 .or_else(|| args.name.clone())
                 .unwrap_or_default();
             if key.is_empty() {
-                return Err("either 'id' or 'name' is required".to_string());
+                // Backlog d9ad618e: the recovery rule rides the error (the
+                // read_files precedent) — an empty call lands here, not on
+                // the serde path (id/name are either-or by design).
+                return Err(tool_contract::recovery_hint("`id` (or `name`)"));
             }
             let Some(id) = resolve_id(view, &key) else {
                 let candidates = view.resolve(&key);
@@ -591,10 +640,18 @@ impl Tool for GraphPathTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "graph_path",
-            "Find the shortest directed path between two symbols in the code knowledge graph \
-             (e.g. how does `main` reach `db_connect`?) — use for reachability questions \
-             ('can A reach B', 'how does X get to Y'). Each hop lists the edge kind \
-             (calls/imports/contains). Accepts exact ids from graph_search or names to resolve.",
+            format!(
+                "{} Find the shortest directed path between two symbols \
+             in the code knowledge graph (e.g. how does `main` reach \
+             `db_connect`?) — use for reachability questions ('can A reach \
+             B', 'how does X get to Y'). Each hop lists the edge kind \
+                 (calls/imports/contains). Accepts exact ids from graph_search \
+                 or names to resolve.",
+                tool_contract::contract(
+                    "`from` and `to`",
+                    "{\"from\":\"main\",\"to\":\"db_connect\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -612,9 +669,18 @@ impl Tool for GraphPathTool {
             from: String,
             to: String,
         }
-        let args: Args = match serde_json::from_value(args) {
+        let args: Args = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error (the
+            // read_files precedent, backlog 26cdbaf8).
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "graph_path",
+                    &e,
+                    &args,
+                    &tool_contract::recovery_hint("from and to"),
+                ))
+            }
         };
         run_query(self.graph.clone(), move |view| {
             let Some(from_id) = resolve_id(view, &args.from) else {
@@ -675,6 +741,122 @@ mod tests {
     fn payload(result: ToolResult) -> Value {
         assert!(result.success, "tool must succeed: {}", result.output);
         serde_json::from_str(&result.output).unwrap()
+    }
+
+    #[test]
+    fn schemas_advertise_the_no_zero_argument_rule() {
+        // Backlog d9ad618e (the read_files precedent, backlog 26cdbaf8): the
+        // three graph tools each carry the rule + example + recovery rule.
+        let (_dir, graph) = indexed_graph();
+        for (name, schema) in [
+            ("graph_search", GraphSearchTool::new(graph.clone()).schema()),
+            ("graph_context", GraphContextTool::new(graph.clone()).schema()),
+            ("graph_path", GraphPathTool::new(graph.clone()).schema()),
+        ] {
+            assert!(
+                schema.description.contains("No zero-argument form"),
+                "{name}: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.contains("do not resend the empty shape"),
+                "{name}: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.contains("e.g. {"),
+                "{name}: the inline example shows the exact call shape: {}",
+                schema.description
+            );
+            assert!(
+                schema.description.starts_with("Always pass"),
+                "{name}: the contract sentence LEADS the description: {}",
+                schema.description
+            );
+            assert!(
+                !schema.description.contains("If you catch yourself"),
+                "{name}: the content-first clause lives ONCE in the universal \
+                 TOOL_CALL_DISCIPLINE block — a per-tool copy is exactly the \
+                 redundancy this plan removed: {}",
+                schema.description
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_call_errors_carry_the_recovery_hint() {
+        // Backlog d9ad618e: an empty argument object errors with the recovery
+        // rule riding the error itself, so the FIRST retry succeeds instead
+        // of waiting for the circuit breaker.
+        let (_dir, graph) = indexed_graph();
+        for (name, result) in [
+            (
+                "graph_search",
+                GraphSearchTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+            (
+                "graph_context",
+                GraphContextTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+            (
+                "graph_path",
+                GraphPathTool::new(graph.clone())
+                    .execute(serde_json::json!({}))
+                    .await,
+            ),
+        ] {
+            assert!(!result.success, "{name} must reject an empty call");
+            assert!(
+                result.output.contains("rewrite the full call"),
+                "{name}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("do not resend the empty shape"),
+                "{name}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_hits_carry_the_graph_context_pointer() {
+        // Plan aff95a51: the under-chaining observed 2027-01 — search found
+        // the symbol but the graph_context follow-up never happened. The
+        // result now carries the exact next call so the chain needs no
+        // re-derivation; a total miss carries no pointer (its hint already
+        // points at `search`).
+        let (_dir, graph) = indexed_graph();
+        let hit = payload(
+            GraphSearchTool::new(graph.clone())
+                .execute(serde_json::json!({"query": "helper"}))
+                .await,
+        );
+        let next = hit["next"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a non-empty result carries the chaining pointer: {hit}"));
+        assert!(
+            next.starts_with("graph_context(id=\"src/lib.rs::helper::"),
+            "the pointer names the first hit's exact call: {next}"
+        );
+        assert!(
+            next.contains("graph_impact(id) → blast radius"),
+            "the pointer also names the blast-radius follow-up: {next}"
+        );
+
+        let miss = payload(
+            GraphSearchTool::new(graph)
+                .execute(serde_json::json!({"query": "nonexistent_xyz"}))
+                .await,
+        );
+        assert!(
+            miss.get("next").is_none(),
+            "a total miss carries no pointer — its hint points at `search`: {miss}"
+        );
     }
 
     #[test]
@@ -880,13 +1062,60 @@ mod tests {
 
     #[tokio::test]
     async fn stale_above_the_reindex_cap_notes_instead_of_reindexing() {
-        // Backlog 95f21af0 (review LOW 2): staleness ABOVE the cap is not
+        // Backlog 95f21af0 (review LOW 2): staleness ABOVE the ceiling is not
         // repaired inline — the miss is served with the staleness note
         // (pinning the note string + the no-inline-reindex-above-cap
         // behavior, mirroring the search tool's
-        // stale_above_the_reindex_cap_walks).
+        // stale_above_the_reindex_cap_walks). The ceiling is now the content
+        // index's adaptive 32 (raised 8 → 32 on 2026-09-26), so this needs
+        // ceiling + 1 stale files.
         let (dir, graph) = indexed_graph();
-        // 9 stale source files (cap is 8): the 2 fixture files + 7 more.
+        // STALE_REINDEX_CAP + 1 stale source files: the 2 fixture files plus
+        // ceiling - 1 extras.
+        let mut stale_names = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        for i in 0..(STALE_REINDEX_CAP - 1) {
+            let name = format!("src/extra{i}.rs");
+            std::fs::write(
+                dir.path().join(&name),
+                format!("pub fn extra_{i}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+            stale_names.push(name);
+        }
+        graph.index(None).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for name in &stale_names {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let tool = GraphSearchTool::new(graph);
+        let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
+        assert_eq!(out["count"], 0);
+        let note = out["note"].as_str().expect("the staleness note is served");
+        assert!(
+            note.contains(&format!(
+                "symbol index may be stale — {} file(s) on disk are newer than the index",
+                STALE_REINDEX_CAP + 1
+            )),
+            "note pins the stale count: {note}"
+        );
+        assert!(!note.contains("reindexed"), "no inline reindex above the cap");
+        assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
+    }
+
+    #[tokio::test]
+    async fn stale_within_the_reindex_ceiling_repairs_inline() {
+        // 2026-09-26 (user directive: accurate results matter more than the
+        // note): a drift WITHIN the adaptive ceiling must be REPAIRED inline
+        // and the lookup re-served from the fresh view. Nine stale files is
+        // exactly the case the old ceiling of 8 mishandled — the live
+        // 61-file drift left this plan's own regression-test symbol
+        // unindexed and forced the manual reindex detour.
+        let (dir, graph) = indexed_graph();
         for i in 0..7 {
             std::fs::write(
                 dir.path().join(format!("src/extra{i}.rs")),
@@ -895,6 +1124,13 @@ mod tests {
             .unwrap();
         }
         graph.index(None).unwrap();
+        // src/extra0.rs gains a symbol the index has never seen — only a
+        // re-read of the stale file can answer the query below.
+        std::fs::write(
+            dir.path().join("src/extra0.rs"),
+            "pub fn fresh_symbol_xyz() -> u32 { 7 }\n",
+        )
+        .unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         for name in [
             "src/lib.rs",
@@ -915,15 +1151,20 @@ mod tests {
                 .unwrap();
         }
         let tool = GraphSearchTool::new(graph);
-        let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
-        assert_eq!(out["count"], 0);
-        let note = out["note"].as_str().expect("the staleness note is served");
-        assert!(
-            note.contains("symbol index may be stale — 9 file(s) on disk are newer than the index"),
-            "note pins the stale count: {note}"
+        let out = payload(tool.execute(json!({ "query": "fresh_symbol_xyz" })).await);
+        assert_eq!(
+            out["count"], 1,
+            "the repaired view resolves the symbol: {out}"
         );
-        assert!(!note.contains("reindexed"), "no inline reindex above the cap");
-        assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
+        let note = out["note"].as_str().expect("the repair is disclosed");
+        assert!(
+            note.contains("reindexed") && note.contains("serving fresh graph results"),
+            "inline repair is disclosed: {note}"
+        );
+        assert!(
+            !note.contains("may be stale"),
+            "no staleness note within the ceiling: {note}"
+        );
     }
 
     #[test]

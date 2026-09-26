@@ -17,15 +17,24 @@
 //! - [`loop_impl`] — the `AgentLoop` struct, constructors, and public handles.
 //! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall).
 //! - [`dispatch`] — tool-call dispatch, the approval gate, provider retry.
+//! - [`failure_triage`] — the Laya classifier's failure-classification
+//!   decision layer (classes, confidence gate, auto-retry policy, the
+//!   training log).
+//! - [`failure_triage_knn`] — the kNN overlay for failure triage (online
+//!   learning from the training log, independent of the Laya endpoint).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 
 pub mod approval;
+pub mod optimizer;
 pub mod context;
 pub mod factory;
+pub mod failure_triage;
+pub mod failure_triage_knn;
 pub mod prompt;
+pub mod review_scope;
 pub mod steering_stats;
 
 mod dispatch;
@@ -34,14 +43,17 @@ mod turn;
 
 pub use loop_impl::{drop_cancelled_steers, AgentLoop, AgentLoopConfig, StopReason, TurnOutcome};
 
-/// Maximum consecutive tool-EXECUTION errors before surfacing to the user and
-/// stopping the turn. A tool-execution error is a tool that ran and returned
-/// `success: false` (not a user denial/interrupt — those are excluded). The
-/// failed result is fed back to the model as a tool message and the model
-/// retries on the next iteration; this cap prevents an infinite loop when the
-/// model repeatedly makes the same mistake. The counter resets on any
-/// successful tool call so a long turn with occasional failures doesn't
-/// accumulate to the cap unfairly.
+/// Maximum consecutive tool-EXECUTION error INTERACTIONS (tool batches)
+/// before surfacing to the user and stopping the turn. A batch with any tool
+/// that ran and returned `success: false` (not a user denial/interrupt —
+/// those are excluded) counts ONCE, however many calls in it failed — three
+/// identical calls issued at the same time are one error event, and the
+/// model gets a repair chance between interactions (backlog 7f72d3d7). The
+/// failed results are fed back to the model as tool messages and the model
+/// retries on the next iteration; this cap prevents an infinite loop when
+/// the model repeatedly makes the same mistake. The counter resets on any
+/// batch without a failure (but with at least one success) so a long turn
+/// with occasional failures doesn't accumulate to the cap unfairly.
 ///
 /// This does NOT count LLM-produced malformed tool-call arguments (bad JSON) —
 /// those are a transient output issue the model can recover from by emitting

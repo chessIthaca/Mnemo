@@ -391,6 +391,37 @@ impl ContextManager {
         Option<crate::agent::StopReason>,
         Option<SummarizerUsage>,
     )> {
+        self.summarize_with_interrupt_opts(
+            messages,
+            keep_recent,
+            sendable_budget,
+            provider,
+            None,
+            cmd_rx,
+        )
+        .await
+    }
+
+    /// [`summarize_with_interrupt`](Self::summarize_with_interrupt) with an
+    /// optional must-preserve block (token-optimizer lever 4, backlog
+    /// e4a50d22): the decisions already made, which the summarizer must keep
+    /// verbatim instead of compressing away. `None` renders exactly the prompt
+    /// the plain entry point always built, so the flag-off path and every
+    /// existing call site stay byte-identical.
+    pub async fn summarize_with_interrupt_opts(
+        &self,
+        messages: &[Message],
+        keep_recent: usize,
+        sendable_budget: usize,
+        provider: &dyn LlmClient,
+        must_preserve: Option<&str>,
+        cmd_rx: &mut tokio::sync::mpsc::Receiver<crate::runtime::AgentCommand>,
+    ) -> Result<(
+        Vec<Message>,
+        Vec<crate::runtime::AgentCommand>,
+        Option<crate::agent::StopReason>,
+        Option<SummarizerUsage>,
+    )> {
         use crate::runtime::AgentCommand;
         use futures::StreamExt;
 
@@ -419,7 +450,8 @@ impl ContextManager {
         // Build the structured summarization prompt (detects an existing
         // summary in messages[1] for a running-update path). The budget is
         // enforced per-message (markers) when the region alone is too big.
-        let summary_prompt = build_summary_prompt(messages, to_summarize, budget);
+        let summary_prompt =
+            build_summary_prompt_with_must_preserve(messages, to_summarize, budget, must_preserve);
 
         let summary_messages = vec![Message::user_text(summary_prompt)];
 
@@ -429,7 +461,12 @@ impl ContextManager {
             Ok(stream) => stream,
             Err(e) if e.is_context_overflow() => {
                 return Ok((
-                    mechanical_compaction(messages, cut, sendable_budget),
+                    mechanical_compaction_with_must_preserve(
+                        messages,
+                        cut,
+                        sendable_budget,
+                        must_preserve,
+                    ),
                     Vec::new(),
                     None,
                     None,
@@ -953,6 +990,40 @@ pub fn compact_old_tool_results(
     keep_high: usize,
     summary_chars: usize,
 ) -> usize {
+    compact_old_tool_results_collecting(messages, keep, keep_high, summary_chars, usize::MAX).0
+}
+
+/// One tool result truncated by [`compact_old_tool_results_collecting`],
+/// carrying its FULL pre-truncation original — the progressive-disclosure
+/// lever (backlog e4a50d22 lever 3) archives these, so a cut result stays
+/// recoverable instead of being lost to the cut.
+pub struct TruncationRecord {
+    /// Index of the truncated message in the slice passed in.
+    pub message_index: usize,
+    /// The tool that produced the result (`shell`, `read_files`, …).
+    pub tool: Option<String>,
+    /// The result's content BEFORE truncation.
+    pub original: String,
+    /// The originating call's re-read/re-run pointer, when the tool has one.
+    pub pointer: Option<String>,
+}
+
+/// [`compact_old_tool_results`] plus the pre-truncation originals of every
+/// result at or above `min_archive_chars` characters. This is the pure,
+/// store-free half of the progressive-disclosure lever: it mutates nothing
+/// about archiving, so compaction stays deterministic and testable, and the
+/// caller owns the (fallible) archive write.
+///
+/// Returns `(newly_truncated_count, records)`. Records are in truncation
+/// order; a result under the threshold yields no record (nothing was worth
+/// archiving), and a pass that truncates nothing returns an empty vec.
+pub fn compact_old_tool_results_collecting(
+    messages: &mut [Message],
+    keep: usize,
+    keep_high: usize,
+    summary_chars: usize,
+    min_archive_chars: usize,
+) -> (usize, Vec<TruncationRecord>) {
     let effective_high = keep_high.max(keep);
     // Collect the indices of all intact (not yet compacted) tool results. A
     // multipart result counts as intact only while it still holds an image
@@ -989,12 +1060,18 @@ pub fn compact_old_tool_results(
         .collect();
 
     let mut truncated_count = 0;
+    let mut records: Vec<TruncationRecord> = Vec::new();
     if truncatable_indices.len() > effective_high {
         // Cut back to `keep` truncatable tool results in one pass.
         let to_compact = &truncatable_indices[..truncatable_indices.len() - keep];
         for &idx in to_compact {
+            // Capture BEFORE the cut — once truncated, the original is gone.
+            let captured = capture_for_archive(&messages[idx], min_archive_chars, idx, messages);
             if truncate_tool_result_at(messages, idx, summary_chars) {
                 truncated_count += 1;
+                if let Some(record) = captured {
+                    records.push(record);
+                }
             }
         }
     }
@@ -1020,12 +1097,62 @@ pub fn compact_old_tool_results(
         .map(|(i, _)| i)
         .collect();
     for idx in oversize {
+        let captured = capture_for_archive(&messages[idx], min_archive_chars, idx, messages);
         if truncate_tool_result_at(messages, idx, TOOL_RESULT_MAX_CHARS) {
             truncated_count += 1;
+            if let Some(record) = captured {
+                records.push(record);
+            }
         }
     }
 
-    truncated_count
+    (truncated_count, records)
+}
+
+/// Capture a message's content + originating pointer for the archive, when
+/// the content is at or above `min_archive_chars`.
+fn capture_for_archive(
+    msg: &Message,
+    min_archive_chars: usize,
+    index: usize,
+    messages: &[Message],
+) -> Option<TruncationRecord> {
+    let original = match &msg.content {
+        MessageContent::Text(s) => s.clone(),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<String>(),
+    };
+    if original.chars().count() < min_archive_chars {
+        return None;
+    }
+    Some(TruncationRecord {
+        message_index: index,
+        tool: msg.name.clone(),
+        pointer: resolve_pointer(messages, index),
+        original,
+    })
+}
+
+/// Resolve the originating tool call's re-read/re-run pointer for message
+/// `idx` (the pointer [`truncate_tool_result_at`] bakes into its marker).
+fn resolve_pointer(messages: &[Message], idx: usize) -> Option<String> {
+    let msg = &messages[idx];
+    let tool_call_id = msg.tool_call_id.clone();
+    let name = msg.name.clone();
+    tool_call_id.as_deref().and_then(|id| {
+        let arguments = messages.iter().find_map(|m| {
+            m.tool_calls
+                .iter()
+                .find(|tc| tc.id == id)
+                .map(|tc| tc.arguments.clone())
+        });
+        arguments.and_then(|a| name.as_deref().and_then(|n| rerun_pointer(n, &a)))
+    })
 }
 
 /// Whether [`truncate_tool_result_at`] would actually shrink this message.
@@ -1634,6 +1761,61 @@ fn build_summary_prompt(
         ),
         None => format!("{SUMMARY_PROMPT_HEAD}{conv_text}{SUMMARY_FORMAT}"),
     }
+}
+
+/// [`build_summary_prompt`] plus an optional must-preserve block (token-
+/// optimizer lever 4, backlog e4a50d22). `None` — or an empty block — returns
+/// exactly what [`build_summary_prompt`] emits, so the flag-off path is
+/// byte-identical. `Some` appends the block AFTER the base prompt, keeping the
+/// base a strict prefix (cache-friendly against the summarizer endpoint).
+fn build_summary_prompt_with_must_preserve(
+    messages: &[Message],
+    to_summarize: &[Message],
+    budget_tokens: usize,
+    must_preserve: Option<&str>,
+) -> String {
+    let base = build_summary_prompt(messages, to_summarize, budget_tokens);
+    match must_preserve {
+        Some(block) if !block.is_empty() => format!("{base}{block}"),
+        _ => base,
+    }
+}
+
+/// Render the summarizer's must-preserve block from extracted decisions
+/// (token-optimizer lever 4, backlog e4a50d22). Empty input renders an empty
+/// string, so a caller can pass the result straight through as the
+/// `must_preserve` argument and get today's byte-identical prompt.
+pub fn must_preserve_block(decisions: &[String]) -> String {
+    if decisions.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\n## Must preserve — decisions already made (keep these in the summary; do not drop or \
+         re-litigate them)\n",
+    );
+    for decision in decisions {
+        out.push_str(&format!("- {decision}\n"));
+    }
+    out
+}
+
+/// [`mechanical_compaction`] with the must-preserve block inserted, so the
+/// lossy fallback carries the decisions too (token-optimizer lever 4). `None`
+/// returns the unchanged fallback.
+fn mechanical_compaction_with_must_preserve(
+    messages: &[Message],
+    cut: usize,
+    sendable_budget: usize,
+    must_preserve: Option<&str>,
+) -> Vec<Message> {
+    let mut out = mechanical_compaction(messages, cut, sendable_budget);
+    if let Some(block) = must_preserve.filter(|block| !block.is_empty()) {
+        // Right after the head + summary note, so the decisions ride the
+        // bounded result instead of being summarized away a second time.
+        let at = out.len().min(2);
+        out.insert(at, Message::system(block.to_string()));
+    }
+    out
 }
 
 /// Incremental token accounting over a growing conversation.
@@ -3332,6 +3514,44 @@ mod tests {
             tokens <= budget,
             "the built prompt must never exceed its budget: {tokens} > {budget}"
         );
+    }
+
+    #[test]
+    fn build_summary_prompt_without_must_preserve_is_byte_identical() {
+        // Backlog e4a50d22 lever 4: the must-preserve block is purely additive.
+        // With no decisions (None) or an empty block the prompt is
+        // byte-identical to the pre-lever form, so the flag-off path — and the
+        // summarizer endpoint's cache — see exactly today's bytes.
+        let messages = vec![
+            Message::system("system prompt"),
+            Message::user_text("what is the plan?"),
+            Message::assistant_text("we will use rusqlite"),
+        ];
+        let to_summarize = &messages[1..];
+        let base = build_summary_prompt(&messages, to_summarize, 100_000);
+        assert_eq!(
+            base,
+            build_summary_prompt_with_must_preserve(&messages, to_summarize, 100_000, None)
+        );
+        assert_eq!(
+            base,
+            build_summary_prompt_with_must_preserve(&messages, to_summarize, 100_000, Some(""))
+        );
+        // An empty decision set renders an empty block — the caller's guard
+        // (turn.rs passes `(!block.is_empty()).then_some(...)`).
+        assert!(must_preserve_block(&[]).is_empty());
+        // A non-empty block is appended AFTER the base prompt, so the base stays
+        // a strict prefix (cache-friendly against the summarizer endpoint).
+        let block = must_preserve_block(&["we will use rusqlite".to_string()]);
+        assert!(!block.is_empty());
+        let with_block =
+            build_summary_prompt_with_must_preserve(&messages, to_summarize, 100_000, Some(&block));
+        assert!(
+            with_block.starts_with(&base),
+            "the base prompt must stay a strict prefix"
+        );
+        assert!(with_block.ends_with(&block));
+        assert!(with_block.contains("we will use rusqlite"));
     }
 
     /// Regression (2027-01-23 runaway-tool-output report): token measurement

@@ -646,10 +646,10 @@ impl Tool for SkillReloadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "skill_reload",
-            "Re-read .coding/skills/*.toml into the live skill registry and report what changed. \
-             The registry is loaded once at app startup, so a skill file that was just created or \
-             hand-edited is invisible until this runs. Available in every workflow state, \
-             including while a skill is active.",
+            "Takes NO arguments — call it with {}. Re-read .coding/skills/*.toml into the live \
+             skill registry and report what changed. The registry is loaded once at app \
+             startup, so a skill file that was just created or hand-edited is invisible until \
+             this runs. Available in every workflow state, including while a skill is active.",
             json!({"type": "object", "properties": {}}),
         )
     }
@@ -867,6 +867,16 @@ mod tests {
             SkillReloadTool::new(library.clone()),
             library,
         )
+    }
+    #[test]
+    fn skill_reload_schema_says_takes_no_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, reload, _) = make_library_tools(dir.path());
+        assert!(
+            reload.schema().description.starts_with("Takes NO arguments"),
+            "{}",
+            reload.schema().description
+        );
     }
 
     /// Valid `skill_create` arguments for the skill `greet`.

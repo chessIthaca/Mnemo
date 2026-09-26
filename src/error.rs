@@ -107,6 +107,15 @@ impl Error {
         if self.is_serialization_bug() {
             return true;
         }
+        // A confident failure-triage classification marked the error as a
+        // SKIP (plan 02deea7c): the inner retry layer appended
+        // `classified needs_user` / `classified permanent` plus a hint, and
+        // both retry layers must skip through THIS shared predicate — without
+        // it the inner ladder alone would still burn three provider calls on
+        // a condition only the user can clear.
+        if self.is_classified_skip() {
+            return true;
+        }
         // Context overflow: the prompt + requested output exceed the
         // model's context window — permanent. The shared classification
         // lives in is_context_overflow (compaction's mechanical fallback
@@ -126,6 +135,24 @@ impl Error {
             // Retrying never helps.
             || s.contains("notfounderror")
             || (s.contains("model") && s.contains("not found"))
+    }
+
+    /// Whether a confident failure-triage classification marked this error as
+    /// a SKIP — the inner retry layer (`complete_with_retry`) appends
+    /// `classified needs_user` / `classified permanent` (the classifier's
+    /// canonical labels) plus a hint to the error text when the classifier
+    /// says retrying cannot help (plan 02deea7c), and
+    /// [`is_non_retryable`](Self::is_non_retryable) then makes BOTH retry
+    /// layers skip their stacks without re-classifying.
+    ///
+    /// The check is string-based for the same reason as the others: the
+    /// classification rides `Error::Provider(String)`.
+    pub fn is_classified_skip(&self) -> bool {
+        let s = match self {
+            Error::Provider(msg) => msg.to_lowercase(),
+            _ => return false,
+        };
+        s.contains("classified needs_user") || s.contains("classified permanent")
     }
 
     /// Whether this error is a context-window overflow — the prompt + output

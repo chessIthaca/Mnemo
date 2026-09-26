@@ -25,8 +25,9 @@
 //! - **Branch hint.** When the finish lands on a non-main branch, both digest
 //!   pointers carry `branch <name> @ <sha> (unmerged — exists only on this
 //!   branch)` so a recaller knows the work lives only on that branch until
-//!   merged (the `merge_to_main` skill supersedes these records at merge
-//!   time). Detection is best-effort — main, a detached HEAD, or a non-git
+//!   merged (the `merge_to_main` skill supersedes these records on the branch,
+//!   BEFORE the landing commit, so the successors land with the merge).
+//!   Detection is best-effort — main, a detached HEAD, or a non-git
 //!   root yields no hint; the digests are never blocked on it.
 //! - **Non-blocking.** The capture runs inside `finish`; a failure logs and
 //!   surfaces as a note in the finish output — it never blocks the state

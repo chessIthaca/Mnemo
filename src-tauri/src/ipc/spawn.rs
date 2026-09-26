@@ -390,6 +390,10 @@ pub(crate) async fn spawn_agent_shared(
                 used: 0,
                 max,
                 breakdown: mnemo::runtime::ContextBreakdown::default(),
+                // The grade helper is `pub(crate)` to mnemo, so this app-side
+                // seed event (fired before the first turn) stays ungraded — the
+                // first turn's own ContextUsage carries the report.
+                quality: None,
             },
         ))
         .await;
@@ -450,7 +454,7 @@ const REVIEWER_BASE_TOOLS: &[&str] = &[
     "image_understand_diagram",
     // Read-only discovery.
     "list_models",
-    // One read-only view into git (op = diff | log | show) — the reviewer's
+    // One read-only view into git (op = diff | log | show | status) — the reviewer's
     // only way to see uncommitted changes, since it has no shell/git.
     "git_read",
     "web_fetch",
@@ -965,7 +969,7 @@ mod tests {
         // hides file_write/git (mutations), so the reviewer's allow-list must
         // NOT contain them — even though they're in the reviewer's base list
         // (git isn't, but file_write-adjacent tools are). Crucially the
-        // read-only role tools (git_diff, write_review_report) ARE kept even
+        // read-only role tools (git_read, write_review_report) ARE kept even
         // though the parent lacks them (they're AutoRun / safe).
         let (agent_loops, _wf) = parent_in_state(1, mnemo::workflow::WorkflowState::Planning).await;
         let list = compute_subagent_allowlist(&agent_loops, Some(1), &Some("reviewer".into()))

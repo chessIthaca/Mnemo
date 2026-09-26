@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
-use mnemo::config::SafetyMode;
+use mnemo::config::{LayaMode, OptimizerConfig, SafetyMode};
 use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
@@ -33,7 +33,8 @@ use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllPro
 use crate::ipc::codegraph_cmds::{CodegraphGraph, CodegraphStatus};
 use crate::ipc::settings::{
     GetSettingsContext, GetSettingsGeneral, GetSettingsResponse, GetSettingsSteeringNotes,
-    GetSettingsUi, ModelsConfigWire, ProjectWire, SaveEndpointsResponse, SaveSettingsResponse,
+    GetSettingsUi, LayaWire, ModelsConfigWire, ProjectWire, SaveEndpointsResponse,
+    SaveSettingsResponse,
 };
 use mnemo::backlog::{BacklogItem, BacklogStatus};
 
@@ -238,8 +239,19 @@ fn dto_fixtures_match_serde() {
             vision_model: None,
             embedding_model: None,
             bundled_embedding_model: None,
+            laya: LayaWire {
+                enabled: false,
+                endpoint: None,
+                mode: LayaMode::External,
+                checkpoint: None,
+                auto_type_memories: false,
+                failure_triage: false,
+                failure_triage_knn: false,
+                auto_finetune: false,
+            },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,
+            optimizer: OptimizerConfig::default(),
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: 0.5,
@@ -354,4 +366,27 @@ fn dto_fixtures_match_serde() {
             generated.join("\n")
         );
     }
+}
+
+/// Normalize CRLF line endings to LF (backlog b93c0f6e): `include_str!`
+/// embeds working-tree bytes at compile time, so a git `autocrlf`-smudged
+/// (CRLF) checkout breaks every `"\n}\n"`-anchored body slice in the
+/// source-contract tests — the needle never matches `"\r\n}\r\n"` and the
+/// slice over-captures to EOF. Source-contract tests normalize the embedded
+/// source through this helper at the read boundary; committed file bytes are
+/// never changed and no `.gitattributes`/eol config is required.
+pub(crate) fn normalize_lf(src: &str) -> String {
+    src.replace("\r\n", "\n")
+}
+
+#[test]
+fn normalize_lf_converts_crlf_and_keeps_lf() {
+    assert_eq!(normalize_lf("a\r\nb\r\n"), "a\nb\n");
+    assert_eq!(normalize_lf("a\nb\n"), "a\nb\n");
+    // Idempotent: normalizing twice equals once.
+    let crlf = "fn f() {\r\n}\r\n";
+    assert_eq!(normalize_lf(&normalize_lf(crlf)), normalize_lf(crlf));
+    // A lone \r (classic-Mac line ending) is left alone — only CRLF pairs
+    // are normalized.
+    assert_eq!(normalize_lf("a\rb"), "a\rb");
 }

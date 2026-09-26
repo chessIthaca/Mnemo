@@ -802,6 +802,9 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
   // (instead of snapping back to the empty state). Don't switch the active tab
   // — the user stays on whatever they were viewing. The same snapshot also
   // feeds the current top plan's changed-file list (planDiff effect).
+  // multi_edit is deliberately absent: a snapshot entry is ONE path, while a
+  // multi-file edit is N — its combined diff renders inline on the tool card
+  // (Message.tsx `editDiff`, toolCardPaths.fileEditDiff) instead.
   let lastDiff: LastDiff | null | undefined;
   if (
     completedCall &&
@@ -816,7 +819,10 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
       // leave empty
     }
     const previewPath =
-      resolvedPreview && typeof resolvedPreview.path === "string"
+      resolvedPreview !== null &&
+      resolvedPreview !== undefined &&
+      resolvedPreview.kind !== "multi_diff" &&
+      typeof resolvedPreview.path === "string"
         ? resolvedPreview.path
         : undefined;
     const unifiedDiff =
@@ -922,13 +928,22 @@ export const reduceUsage: Reducer<Ev<"usage">> = (agent, event) => {
 };
 
 /** context_usage: record the latest context-window fill + per-role breakdown. */
-export const reduceContextUsage: Reducer<Ev<"context_usage">> = (agent, event) => ({
-  agent: {
-    ...agent,
-    contextUsage: { used: event.used, max: event.max },
-    contextBreakdown: event.breakdown,
-  },
-});
+export const reduceContextUsage: Reducer<Ev<"context_usage">> = (agent, event) => {
+  // Lever 6 (backlog e4a50d22): the S–F grade rides this event, but only on the
+  // top-of-loop and post-compaction emissions — the mid-stream provider-exact
+  // re-anchor omits it. An ABSENT quality therefore means "unchanged": keep the
+  // last known grade so the popup badge never blinks off mid-turn.
+  const quality = event.quality ?? agent.contextUsage.quality;
+  return {
+    agent: {
+      ...agent,
+      contextUsage: quality
+        ? { used: event.used, max: event.max, quality }
+        : { used: event.used, max: event.max },
+      contextBreakdown: event.breakdown,
+    },
+  };
+};
 
 /**
  * compacted: context compaction finished — append a transcript confirmation

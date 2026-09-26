@@ -134,7 +134,7 @@ describe("argLabel — read_files", () => {
 
 /**
  * Unit tests for the git_read branch of `argLabel` (lib/toolCardPaths.ts): the op
- * (diff | log | show) is the meaningful part of a read-only git query — the
+ * (diff | log | show | status) is the meaningful part of a read-only git query — the
  * card reads "git_read (log -8)" / "git_read (show d31b606)" instead of a
  * bare "git_read" (user report 2026-08-25: "git read should show some
  * information").
@@ -162,6 +162,10 @@ describe("argLabel — git_read", () => {
 
   it("diff: appends the path filter when present", () => {
     expect(argLabel('{"op":"diff","path":"src/"}', "git_read")).toBe("diff src/");
+  });
+
+  it("status: shows the bare op (no context fields to append)", () => {
+    expect(argLabel('{"op":"status"}', "git_read")).toBe("status");
   });
 
   it("returns null when the op is missing or malformed JSON", () => {

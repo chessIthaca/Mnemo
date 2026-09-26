@@ -11,7 +11,7 @@
 
 pub mod plan_file;
 
-pub use plan_file::{PlanFile, PlanKind, Step};
+pub use plan_file::{PlanFile, PlanKind, ReviewRoundStamp, Step};
 
 use std::path::PathBuf;
 
@@ -156,7 +156,7 @@ pub struct Workflow {
     /// An in-memory tool allow-list that overrides the state-derived
     /// [`ToolFilter`] when set. Used to constrain a spawned sub-agent to a
     /// read-only surface (e.g. a `role: "reviewer"` spawn is limited to read
-    /// tools + `git_diff` + `write_review_report`). When `Some`,
+    /// tools + `git_read` + `write_review_report`). When `Some`,
     /// [`allowed_tools`](Self::allowed_tools) returns [`ToolFilter::Skill`]
     /// seeded with this list regardless of the workflow state — the
     /// constraint holds even though the sub-agent shares the main agent's
@@ -313,6 +313,45 @@ impl Workflow {
         self.stack.last().map(|f| f.id.as_str())
     }
 
+    /// The reviewer rounds recorded for the ACTIVE plan, oldest first
+    /// (backlog 85313a7e). Empty when no plan is in flight or no reviewer has
+    /// been spawned yet. The spawn path reads this to decide whether the
+    /// coming spawn is a re-review (round >= 2, delta-scoped against the last
+    /// stamp's `base` revision) or a first review (full scope), and
+    /// [`record_review_round`](Self::record_review_round) appends to it.
+    pub fn review_rounds(&self) -> &[ReviewRoundStamp] {
+        self.stack
+            .last()
+            .map(|f| f.plan.reviews.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Stamp a reviewer round on the active plan (backlog 85313a7e): append a
+    /// [`ReviewRoundStamp`] whose `round` is the next 1-based number and whose
+    /// `base` is the revision that round reviewed (`HEAD` at dispatch time),
+    /// then rewrite the plan file so the scope survives a restart.
+    ///
+    /// Called by the reviewer spawn path on a SUCCESSFUL spawn only — a
+    /// rejected or failed spawn must never advance the round, or a crashed
+    /// reviewer would narrow the next round's scope to a diff it never
+    /// actually verified. Errors when no plan is in flight (the same
+    /// [`WorkflowNoPlan`](crate::error::Error::WorkflowNoPlan) as `update_plan`).
+    pub fn record_review_round(&mut self, base: &str) -> Result<()> {
+        let frame = self
+            .stack
+            .last_mut()
+            .ok_or_else(|| crate::error::Error::WorkflowNoPlan)?;
+        let round = frame.plan.reviews.len() as u32 + 1;
+        frame.plan.reviews.push(ReviewRoundStamp {
+            round,
+            base: base.to_string(),
+        });
+        // Rewrite the plan file in place (same id); the stack is unchanged, so
+        // stack.json needs no rewrite (mirrors update_plan's tail).
+        frame.plan.write_to_dir(&self.plans_dir, &frame.id)?;
+        Ok(())
+    }
+
     /// The kind of the active (top-of-stack) plan, if any.
     ///
     /// `None` when no plan is active (Planning with an empty stack). The top
@@ -384,7 +423,7 @@ impl Workflow {
     /// (or [`ToolFilter::Reviewer`] when the list came from a `role:
     /// "reviewer"` spawn, see [`set_reviewer_allowlist`]) regardless of
     /// state. This is what constrains a spawned reviewer to read
-    /// tools + `git_diff` + `write_review_report`: its workflow state is
+    /// tools + `git_read` + `write_review_report`: its workflow state is
     /// [`WorkflowState::Subagent`] (a role state stamped by the spawn path),
     /// and the allow-list — not any lifecycle state — defines its surface.
     pub fn allowed_tools(&self) -> ToolFilter {
@@ -1622,6 +1661,38 @@ mod tests {
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
         assert!(!wf.reviewed);
+    }
+
+    #[test]
+    fn record_review_round_stamps_and_persists_the_base() {
+        // Backlog 85313a7e: each reviewer spawn stamps its base revision on
+        // the plan frame, and the stamp survives a restart because it is
+        // written into the plan file (the `## Reviews` section). Round
+        // numbers are assigned in dispatch order from 1.
+        let dir = tempdir().unwrap();
+        let plans_dir = dir.path().join("plans");
+        let mut wf = Workflow::new(plans_dir.clone());
+        // No plan in flight: nothing to record (and no panic).
+        assert!(wf.review_rounds().is_empty());
+        assert!(wf.record_review_round("abc1234").is_err());
+        wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
+        assert!(wf.review_rounds().is_empty());
+        wf.record_review_round("abc1234").unwrap();
+        wf.record_review_round("def5678").unwrap();
+        let rounds = wf.review_rounds();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[0].round, 1);
+        assert_eq!(rounds[0].base, "abc1234");
+        assert_eq!(rounds[1].round, 2);
+        assert_eq!(rounds[1].base, "def5678");
+
+        // Persisted: a fresh Workflow loading the same plans dir sees both.
+        let mut reopened = Workflow::new(plans_dir.clone());
+        reopened.load_latest().unwrap();
+        let rounds = reopened.review_rounds();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[1].round, 2);
+        assert_eq!(rounds[1].base, "def5678");
     }
 
     #[test]

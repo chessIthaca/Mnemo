@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
@@ -197,6 +197,16 @@ pub fn snapshot_db(src_db: &Path, dest_db: &Path) -> Result<()> {
     conn.execute("VACUUM INTO ?1", [dest.as_ref()])?;
     Ok(())
 }
+
+/// The latency budget for an inline stale-reindex pass
+/// ([`CodeGraph::reindex_stale_files`]) — shared by the content-index
+/// (`search`/`search_read`) and symbol-index (`graph_search`) repair paths.
+///
+/// The pass holds the indexing-flag claim for its whole duration and stops
+/// between files once the budget is spent, so a checkout-scale staleness can
+/// never parse unbounded inside a tool call: the caller re-queries once and
+/// walks (the authoritative engine) if anything remains stale.
+pub const STALE_REINDEX_BUDGET: Duration = Duration::from_millis(500);
 
 impl CodeGraph {
     /// Open the on-disk graph for `root` (creating the DB file if needed).
@@ -566,7 +576,15 @@ impl CodeGraph {
     /// falls to the vanished branch, which prunes DB rows only — safe
     /// either way). Returns the number of files refreshed (upserted or
     /// pruned).
-    pub fn reindex_stale_files(&self, rel_paths: &[String]) -> Result<usize> {
+    ///
+    /// The pass is BUDGET-BOUNDED: `budget` caps how long the caller is
+    /// willing to block, checked between files — once it is spent the
+    /// remaining paths are simply left stale and the returned count reflects
+    /// only the files actually refreshed. The caller re-queries once and
+    /// walks if anything remains stale, so an overrun degrades to the
+    /// authoritative walk instead of a slow tool call. A zero budget
+    /// therefore refreshes nothing (the unit test pins that).
+    pub fn reindex_stale_files(&self, rel_paths: &[String], budget: Duration) -> Result<usize> {
         if self
             .indexing
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -583,10 +601,22 @@ impl CodeGraph {
             .root
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
+        // The budget clock. Started after the flag claim, so the claim
+        // itself (which can only fail instantly) is never charged to the
+        // budget.
+        let start = Instant::now();
         let mut refreshed = 0usize;
         let mut touched_source = false;
         let mut pruned = false;
         for rel in rel_paths {
+            // Budget gate — checked BEFORE each file, so a spent budget
+            // stops the pass without starting another file's parse. What is
+            // left stays stale: the caller's re-query sees it and walks
+            // (the authoritative engine), and the watcher's next pass
+            // refreshes the index shortly.
+            if start.elapsed() >= budget {
+                break;
+            }
             let abs = self.root.join(rel);
             let Ok(bytes) = std::fs::read(&abs) else {
                 // Vanished between the staleness detection and now — prune
@@ -1356,7 +1386,7 @@ mod tests {
             "pub fn helper() -> u32 { 42 }\npub fn fresh_marker() {}\n",
         )
         .unwrap();
-        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()]).unwrap();
+        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()], Duration::from_secs(60)).unwrap();
         assert_eq!(n, 1);
 
         // The stored mtime now matches the on-disk mtime — the F10
@@ -1394,7 +1424,7 @@ mod tests {
         assert_eq!((files, with_content), (3, 3));
 
         std::fs::remove_file(dir.path().join("app.ts")).unwrap();
-        let n = graph.reindex_stale_files(&["app.ts".to_string()]).unwrap();
+        let n = graph.reindex_stale_files(&["app.ts".to_string()], Duration::from_secs(60)).unwrap();
         assert_eq!(n, 1, "the vanished file counts as pruned");
         let (files, with_content) = graph.content_coverage().unwrap();
         assert_eq!((files, with_content), (2, 2), "rows gone");
@@ -1418,14 +1448,14 @@ mod tests {
         .unwrap();
 
         graph.set_indexing(true); // a pass is "running"
-        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()]).unwrap();
+        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()], Duration::from_secs(60)).unwrap();
         assert_eq!(n, 0, "busy claim → no-op");
         assert!(graph.is_indexing(), "someone else's flag is untouched");
         // And nothing was refreshed — the new content is not indexed yet.
         assert!(graph.search_content("busy_marker", 10).unwrap().is_empty());
 
         graph.set_indexing(false); // the pass is done
-        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()]).unwrap();
+        let n = graph.reindex_stale_files(&["src/lib.rs".to_string()], Duration::from_secs(60)).unwrap();
         assert_eq!(n, 1);
         assert!(!graph.is_indexing(), "guard cleared after the call");
         assert!(!graph.search_content("busy_marker", 10).unwrap().is_empty());
@@ -1469,7 +1499,10 @@ mod tests {
             .unwrap();
 
         let n = graph
-            .reindex_stale_files(&["../cg-outside-secret/secret.txt".to_string()])
+            .reindex_stale_files(
+                &["../cg-outside-secret/secret.txt".to_string()],
+                Duration::from_secs(60),
+            )
             .unwrap();
         assert_eq!(n, 0, "the out-of-root key is skipped, not refreshed");
         assert!(
@@ -1485,6 +1518,53 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn reindex_stale_files_respects_the_budget() {
+        // The adaptive bound (backlog 9201704f): the pass is budget-bounded,
+        // not count-bounded — a spent budget stops it between files and the
+        // remainder stays stale for the caller's re-query (and its walk).
+        // Duration::ZERO is the deterministic stand-in for "no time left":
+        // it is a no-op, which makes the tool-level "budget spent → walk"
+        // contract testable without wall-clock timing.
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        graph.index(None).unwrap();
+
+        // Two files edited AFTER indexing (the watcher-lag gap).
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn helper() -> u32 { 42 }\npub fn budget_marker_one() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "export function boot() {}\nexport function budget_marker_two() {}\n",
+        )
+        .unwrap();
+        let paths = vec!["src/lib.rs".to_string(), "app.ts".to_string()];
+
+        // No time left — nothing refreshed, neither edit is indexed yet.
+        let n = graph.reindex_stale_files(&paths, Duration::ZERO).unwrap();
+        assert_eq!(n, 0, "a spent budget refreshes nothing");
+        assert!(
+            graph.search_content("budget_marker_one", 10).unwrap().is_empty(),
+            "the first file is left stale"
+        );
+        assert!(
+            graph.search_content("budget_marker_two", 10).unwrap().is_empty(),
+            "the remainder of the set is left stale too"
+        );
+
+        // A generous budget processes the whole set.
+        let n = graph
+            .reindex_stale_files(&paths, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(n, 2, "both stale files refreshed");
+        assert!(!graph.search_content("budget_marker_one", 10).unwrap().is_empty());
+        assert!(!graph.search_content("budget_marker_two", 10).unwrap().is_empty());
     }
 
     #[test]

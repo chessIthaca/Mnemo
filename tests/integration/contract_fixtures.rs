@@ -185,6 +185,9 @@ fn event_fixtures_match_serde() {
                     assistant: 200,
                     tool: 100,
                 },
+                // Backward-compat pin: this fixture is the pre-lever wire shape
+                // and must stay byte-identical, so no `quality` key.
+                quality: None,
             },
         ),
         (

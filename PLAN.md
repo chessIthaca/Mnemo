@@ -569,11 +569,13 @@ results (file reads, shell, git) are truncated with a note.
 
 #### Optimizer levers (token-optimizer parity, backlog e4a50d22)
 
-Six independent, **default-off** context-economy levers live behind
-`[general.optimizer]` in `config.toml` (`OptimizerConfig`, `src/config/general.rs`).
-With a flag off its code path is byte-identical to the pre-lever behaviour —
-which is exactly what keeps the existing truncation/compaction/cap tests green
-without modification.
+Six independent context-economy levers live behind `[general.optimizer]` in
+`config.toml` (`OptimizerConfig`, `src/config/general.rs`) — **on by default
+since 2027-01-25** (saving tokens is the expected behaviour; a config that never
+wrote the section runs every lever, and an explicit `false` is honoured as
+written). With a flag off its code path is byte-identical to the pre-lever
+behaviour — which is what keeps the existing truncation/compaction/cap tests
+green, now that they opt a lever out explicitly.
 
 | Lever | Flag | What it does |
 |---|---|---|

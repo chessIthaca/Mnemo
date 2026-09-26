@@ -116,15 +116,15 @@ pub struct GeneralSection {
     /// trace of it (mirrors `[ui.steering_notes]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
-    /// **Token-optimizer levers (opt-in, all default-off; backlog
-    /// e4a50d22).** The context levers that cut re-reads and command-output
-    /// waste at the tool dispatch layer: delta/skeleton re-reads, semantic
-    /// command-output compression, archive/expand progressive disclosure,
-    /// compaction survival, the S-F quality score, and the lean-output
-    /// nudge. An absent section means every lever off — behavior stays
-    /// byte-identical. Omitted from the saved config while every field
-    /// holds its default, so untouched configs keep no optimizer trace
-    /// (mirrors `[general.laya]`).
+    /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
+    /// context levers that cut re-reads and command-output waste at the tool
+    /// dispatch layer: delta/skeleton re-reads, semantic command-output
+    /// compression, archive/expand progressive disclosure, compaction
+    /// survival, the S-F quality score, and the lean-output nudge. An absent
+    /// section means every lever holds its default (ON) — an explicit
+    /// `false` in `config.toml` is honoured as written. Omitted from the
+    /// saved config while every field holds its default, so untouched configs
+    /// keep no optimizer trace (mirrors `[general.laya]`).
     #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
     pub optimizer: OptimizerConfig,
     /// **Agent browser inspection (opt-in, security tradeoff).** When `true`,
@@ -348,10 +348,14 @@ impl LayaConfig {
 }
 
 /// The `[general.optimizer]` section — the token-optimizer levers (backlog
-/// e4a50d22), all default-off. Each flag is an independent opt-in: enabling
-/// one lever never turns on another, and a flag-off lever changes nothing
-/// (its code path is skipped entirely — tool/dispatch behavior stays
-/// byte-identical to the pre-lever build).
+/// e4a50d22), **all ON by default** (2027-01-25: saving tokens is the
+/// expected behavior, not an opt-in — a config that never wrote a
+/// `[general.optimizer]` block gets every lever without touching anything).
+/// Each flag stays independent — turning one off never turns another off —
+/// and a flag-off lever changes nothing (its code path is skipped entirely,
+/// so tool/dispatch behavior is the pre-lever behavior). A `false` written
+/// into `config.toml` is honoured as written: the defaults fill in only
+/// where the config says nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizerConfig {
@@ -359,32 +363,32 @@ pub struct OptimizerConfig {
     /// serves a signature/import skeleton for re-reads of unchanged files
     /// and a unified diff for changed ones, instead of the full content
     /// every time. First reads and ranged reads still serve full content.
-    /// Off by default.
+    /// On by default.
     pub delta_reads: bool,
     /// **Lever 2 — semantic command-output compression.** When `true`,
     /// large shell-tool output from known command families (cargo, npm,
     /// pytest, go) is collapsed to distinct error/warning lines + counts +
-    /// exit status before it reaches the context. Off by default.
+    /// exit status before it reaches the context. On by default.
     pub compress_output: bool,
     /// **Lever 3 — archive/expand progressive disclosure.** When `true`,
     /// tool results above
     /// [`archive_min_chars`](Self::archive_min_chars) are archived in full
     /// to the per-project memory DB and the context carries a preview the
     /// model can expand via the `expand_result` tool — instead of a lossy
-    /// head-only truncation. Off by default.
+    /// head-only truncation. On by default.
     pub archive: bool,
     /// **Lever 4 — compaction survival.** When `true`, compaction archives
     /// a pre-compaction checkpoint, injects extracted decisions as a
     /// must-preserve block, and appends a heuristic post-compaction digest
-    /// (no extra LLM call). Off by default.
+    /// (no extra LLM call). On by default.
     pub compaction_survival: bool,
     /// **Quality score.** When `true`, the S-F context-quality grade rides
-    /// the `ContextUsage` events for the ctx popup. Off by default.
+    /// the `ContextUsage` events for the ctx popup. On by default.
     pub quality_score: bool,
     /// **Lean-output nudge.** When `true`, a cache-safe steering note
     /// appended to the volatile tail at
     /// [`lean_output_fill_pct`](Self::lean_output_fill_pct) context fill
-    /// nudges the model toward concise visible output. Off by default.
+    /// nudges the model toward concise visible output. On by default.
     pub lean_output_nudge: bool,
     /// Minimum length (chars) of a tool result before lever 3 archives
     /// it. Results under the cap pass through the existing ingestion cap
@@ -421,14 +425,15 @@ impl OptimizerConfig {
     /// True while every field holds its default — the
     /// `[general.optimizer]` section is then omitted from `config.toml`,
     /// so untouched configs keep no optimizer trace (mirrors
-    /// [`LayaConfig::is_default`]).
+    /// [`LayaConfig::is_default`]). The default is every lever ON, so the
+    /// section is written only once a lever is opted out of (or a knob moves).
     fn is_default(&self) -> bool {
-        !self.delta_reads
-            && !self.compress_output
-            && !self.archive
-            && !self.compaction_survival
-            && !self.quality_score
-            && !self.lean_output_nudge
+        self.delta_reads
+            && self.compress_output
+            && self.archive
+            && self.compaction_survival
+            && self.quality_score
+            && self.lean_output_nudge
             && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
             && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
             && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
@@ -440,12 +445,12 @@ impl OptimizerConfig {
 impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
-            delta_reads: false,
-            compress_output: false,
-            archive: false,
-            compaction_survival: false,
-            quality_score: false,
-            lean_output_nudge: false,
+            delta_reads: true,
+            compress_output: true,
+            archive: true,
+            compaction_survival: true,
+            quality_score: true,
+            lean_output_nudge: true,
             archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
             compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
             lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
@@ -1460,17 +1465,18 @@ auto_type_memories = true
     }
 
     #[test]
-    fn optimizer_levers_default_off_and_round_trip() {
-        // Absent section ⇒ every lever off (byte-identical behavior); the
-        // untouched section serializes away; flags + knobs round-trip; any
-        // flag alone counts as "touched" so the section gets written.
+    fn optimizer_levers_default_on_and_round_trip() {
+        // Absent section ⇒ every lever ON (saving tokens is the default); the
+        // untouched section serializes away; explicit opt-outs + knobs
+        // round-trip; a lever opted out counts as "touched" so the section
+        // gets written.
         let cfg: GeneralConfig = toml::from_str("").unwrap();
-        assert!(!cfg.general.optimizer.delta_reads);
-        assert!(!cfg.general.optimizer.compress_output);
-        assert!(!cfg.general.optimizer.archive);
-        assert!(!cfg.general.optimizer.compaction_survival);
-        assert!(!cfg.general.optimizer.quality_score);
-        assert!(!cfg.general.optimizer.lean_output_nudge);
+        assert!(cfg.general.optimizer.delta_reads);
+        assert!(cfg.general.optimizer.compress_output);
+        assert!(cfg.general.optimizer.archive);
+        assert!(cfg.general.optimizer.compaction_survival);
+        assert!(cfg.general.optimizer.quality_score);
+        assert!(cfg.general.optimizer.lean_output_nudge);
         assert_eq!(
             cfg.general.optimizer.archive_min_chars,
             OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
@@ -1478,17 +1484,22 @@ auto_type_memories = true
 
         let text = r#"
 [general.optimizer]
-delta_reads = true
-archive = true
+delta_reads = false
 archive_min_chars = 5000
 "#;
         let cfg: GeneralConfig = toml::from_str(text).unwrap();
-        assert!(cfg.general.optimizer.delta_reads);
-        assert!(cfg.general.optimizer.archive);
+        assert!(
+            !cfg.general.optimizer.delta_reads,
+            "an explicit opt-out is honoured"
+        );
+        assert!(
+            cfg.general.optimizer.archive,
+            "an unnamed lever keeps its default"
+        );
         assert_eq!(cfg.general.optimizer.archive_min_chars, 5000);
         let back = toml::to_string(&cfg).unwrap();
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
-        assert!(cfg2.general.optimizer.delta_reads);
+        assert!(!cfg2.general.optimizer.delta_reads);
         assert_eq!(cfg2.general.optimizer.archive_min_chars, 5000);
 
         // Untouched: no serialized trace; touched: is_default flips.
@@ -1497,7 +1508,7 @@ archive_min_chars = 5000
             .unwrap()
             .contains("optimizer"));
         let only_flag = OptimizerConfig {
-            delta_reads: true,
+            delta_reads: false,
             ..Default::default()
         };
         assert!(!only_flag.is_default());

@@ -73,9 +73,10 @@ const KNOBS: { field: keyof Knobs; label: string; step: number }[] = [
 ];
 
 /**
- * Savings section — the token-optimizer levers ([general.optimizer]: opt-in,
- * off by default) plus the [[pricing]] rows the Stats/Dashboard cost estimates
- * use, so one place covers what a token costs and what Mnemo saves.
+ * Savings section — the token-optimizer levers ([general.optimizer]: ON by
+ * default since 2027-01-25, uncheck to opt out) plus the [[pricing]] rows the
+ * Stats/Dashboard cost estimates use, so one place covers what a token costs
+ * and what Mnemo saves.
  */
 export const SavingsSection = forwardRef<SettingsSectionHandle, {
   active: boolean;
@@ -237,8 +238,9 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
               Optimizer levers
             </h4>
             <p className="text-xs text-[color:var(--text-muted)]">
-              All opt-in and off by default. The Dashboard meters what they
-              save; a flip lands on the next tool call — no restart.
+              All on by default; uncheck a lever to opt out. The Dashboard
+              meters what they save; a flip lands on the next tool call — no
+              restart.
             </p>
           </div>
 

@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { fmtPct, fmtTokens, fmtRate, fmtDuration } from "./format";
+import { fmtPct, fmtSavingsPct, fmtTokens, fmtRate, fmtDuration } from "./format";
 
 describe("fmtTokens", () => {
   it("leaves small values raw", () => {
@@ -105,5 +105,31 @@ describe("fmtPct", () => {
     expect(fmtPct(0)).toBe("0");
     expect(fmtPct(0.04)).toBe("0");
     expect(fmtPct(-0)).toBe("0");
+  });
+});
+
+describe("fmtSavingsPct", () => {
+  it("renders the saved share of the before size", () => {
+    expect(fmtSavingsPct(11_100, 12_000)).toBe("92.5%");
+    expect(fmtSavingsPct(111_456, 120_000)).toBe("92.9%");
+    expect(fmtSavingsPct(12_000, 12_000)).toBe("100%");
+  });
+
+  it("keeps small and zero savings readable", () => {
+    expect(fmtSavingsPct(0, 12_000)).toBe("0%");
+    expect(fmtSavingsPct(120, 12_000)).toBe("1%");
+    expect(fmtSavingsPct(4, 12_000)).toBe("0%");
+  });
+
+  it("stays honest about negative savings (no clamping)", () => {
+    expect(fmtSavingsPct(-4_000, 12_000)).toBe("-33.3%");
+    expect(fmtSavingsPct(-12_000, 12_000)).toBe("-100%");
+  });
+
+  it("has no ratio to show without a positive before size", () => {
+    expect(fmtSavingsPct(5_000, 0)).toBe("—");
+    expect(fmtSavingsPct(0, 0)).toBe("—");
+    expect(fmtSavingsPct(5_000, -1)).toBe("—");
+    expect(fmtSavingsPct(5_000, Number.NaN)).toBe("—");
   });
 });

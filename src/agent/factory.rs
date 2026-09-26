@@ -368,9 +368,9 @@ impl AgentLoopFactory {
             // Mirrors the config default (`enable_browser_inspection = false`)
             // until the IPC layer pushes the loaded value at startup.
             browser_inspection: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            // Default optimizer config (every lever off); the IPC layer
-            // overrides via `with_optimizer_config` from the loaded config
-            // at startup (mirrors `shell_filter`).
+            // Optimizer config at its default (every lever ON, 2027-01-25);
+            // the IPC layer overrides via `with_optimizer_config` from the
+            // loaded config at startup (mirrors `shell_filter`).
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
             mcp: None,
             // No auto-typing gate at construction — the IPC layer wires it

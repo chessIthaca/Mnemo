@@ -1,0 +1,66 @@
+## Verdict: FINDINGS (0 high, 4 low)
+
+The core fix is correct and complete: the reordered `merge_to_main` prompt preserves every pre-existing contract, the write→commit→land sequence is internally consistent, landing records are phrased only on pre-landing facts, the new test asserts ORDER and is genuinely red on the pre-fix prompt, and the PR-path "MERGED into main" tail self-consistency argument holds. All four findings are LOW — three are stale doc/comment text left describing the old post-merge ordering (one of them, PLAN.md:518, was explicitly inside the plan's own fix scope), one is a record-style consistency gap between the two skills.
+
+## Scope and what was actually read
+
+Working tree is dirty (15 modified + 10 untracked files), so this is a real diff review. Read in full: `.coding/skills/merge_to_main.toml` (93 lines) and `.coding/skills/new_release.toml` (57 lines) plus both HEAD blobs via `git show HEAD:<path>`; `src/skill/mod.rs` lines 460–632 (both tests) and the `include_str!` embed at :285-286; the doc targets `agent.md` (working-tree Environment bullet + new Branch-policy bullet), `docs/FEATURES.md:25-50`, `src/memory/finish_capture.rs:12-51`; `PLAN.md:298-312` and `505-529`; the plan file `.coding/plans/ced9308a.md`; `git log` for the skill file; `backlog_list`; and one swept knowledge marker/successor pair for the bookkeeping accuracy check. Sweeps run: `merge_to_main` across README.md (0 hits), PLAN.md (2), docs/**/*.md (1 — the updated FEATURES line), src/**/*.rs (115 hits, all spot-checked); `post-merge` across PLAN.md and src; `at merge time` across src; `supersed` across src/memory/*.rs.
+
+Reviewed-state: f7e1fa5d052c93068097a8078bf6e326ad935ce2
+## Risk-focus verification (a)–(f)
+
+**(a) Pre-existing contracts — ALL survive the reorder.** Verified against the HEAD blob of the prompt:
+
+- Ruleset check BEFORE the direct path: step 1 (`gh repo view --json nameWithOwner` … `gh api repos/<owner>/<repo>/rulesets`) routes to "direct path (step 4)" / "PR path (step 5)" ✓
+- Sync before merge: step 4 keeps verbatim "sync it FIRST via shell (the git tool has no fetch/pull): `git fetch origin`, `git pull --no-rebase` … Merge on the **git** tool: `git merge --no-ff <branch>`" ✓
+- GH013 reset-then-PR recovery: verbatim ("reset local main to origin/main (`git reset --hard origin/main` — the merge only existed locally; the PR re-lands it)"), with the step reference correctly renumbered 4→5 ✓
+- No-bypass rule: "NEVER bypass the ruleset (no force-push, no admin override, no ruleset edits)" ✓
+- Build the BRANCH on the PR path: "verify the BRANCH builds first — `npm run build` (frontend/) AND `cd src-tauri && cargo build`; … (PRs get no CI: build.yml triggers only on tags/dispatch)" ✓
+- Commit ALL uncommitted work (`.coding/` included) + NEVER stash: step 3, enhanced with "this step carries the step-2 records into the merge" ✓
+- Push before `git branch -d`: "Green → `git push` on the git tool, approval-gated … push success → `git branch -d <branch>` (never -D)" ✓
+- Also preserved: the conflict-union rule, both-builds on the MERGED tree, "A PR already exists → report its URL", author-cannot-self-approve, PR-path branch deletion after the human merges ("a later session only deletes the branch" — the old step-4 tail), and every guard of the old supersede step (search its name + pre-merge tip; skip when nothing matches; never another branch's records — now in step 2) ✓
+- new_release: diffed old vs new — only the supersede clause moved/rephrased, plus the new no-write rule and clean-tree check; ruleset check, sync order, direct path, PR path, re-run-to-tag behaviour and steps 3–5 are byte-identical ✓
+
+**(b) Internal consistency — no stranded records.** merge_to_main: step 2 writes the records and step 3 commits them, both explicitly "on that branch"; `git checkout main` happens only in step 4, after the commit; all in-prompt step cross-references are correctly renumbered (1→4/5, GH013→5). new_release step 2 has the identical FIRST-records / THEN-commit / THEN-ruleset / THEN-land shape. The loop is closed by step 6 (merge_to_main) and the step-2 tail (new_release): `git status --short` must be empty before `skill_end`, with a recovery instruction that never leaves files in the worktree. The work tip is captured before the bookkeeping commit (`git rev-parse HEAD` BEFORE the step), so the body names the pre-bookkeeping tip as documented. ✓
+
+**(c) Pre-landing phrasing — nothing demands a post-freeze fact.** Tail `— MERGED into main (branch <branch>, <YYYY-MM-DD>)`; body names only branch, date and work tip; the PR-path body line describes the state accurately; and the prompt adds the explicit rule "Never write a sha or PR number you do not have." No merge sha or PR number is requested anywhere in the records. ✓
+
+**(d) PR-path "MERGED" tail while a PR is open — the argument HOLDS, not a finding.** The record is transported BY the PR, so it becomes visible in main exactly when its claim becomes true; a rejected PR means the record never lands (self-consistent). During the open-PR window the only readers are branch-local sessions, and the body carries the accurate intermediate state ("a PR against main is opened from this branch, awaiting human review"). agent.md documents precisely this contract ("it becomes true exactly when the human merges"). This is the only phrasing that fixes the circularity — any post-merge rewrite would recreate the dangling-write defect. See Finding 4 for the one asymmetry this exposes.
+
+**(e) The test asserts ORDER and is genuinely red pre-fix.** `merge_to_main_and_new_release_write_their_records_before_the_landing_commit` uses byte-index comparisons (`record < commit < push` for merge_to_main; `release_record < release_commit` for new_release), not mere `contains`, and every `.expect` message names its contract. Red pre-fix, verified by reading the HEAD blobs: neither old prompt contains `Write this branch's landing records NOW` (old merge_to_main superseded in step 5, after commit+push; old new_release after push and `git branch -d`) — the first `.expect` panics. Green post-fix: every marker verified present in the correct string order in both new prompts. The existing contract test is untouched (`src/skill/mod.rs` is +62/−0) and I verified all its pinned substrings and orders (`git fetch origin` < `git pull --no-rebase` < `--no-ff <branch>`; ruleset-check < `git checkout main`; `git push` on the git tool < `git branch -d <branch>`; `MERGED into main`, `gh pr create --base main`, `NEVER bypass`) still hold against the new prompt — no red-for-the-wrong-reason. ✓
+
+**(f) Doc sync — three of four targets correct; one stale root doc.** agent.md (Environment bullet + new Branch-policy bullet), `docs/FEATURES.md:36`, and `src/memory/finish_capture.rs:25-31` all describe the new ordering accurately (write → commit → land; pre-landing facts; empty `git status --short`). README.md has no merge_to_main references. PLAN.md:305, `src/agent/prompt.rs:117` and `src/project/git_ops.rs:227` are unaffected. But **PLAN.md:518 still describes the old post-merge supersede** (Finding 1). Searches for `post-merge` / `at merge time` found no other stale ordering text outside `.coding/` history.
+## Findings (all LOW)
+
+### LOW 1 — PLAN.md:518-521 still describes the old post-merge supersede
+
+`PLAN.md:518`: "Merge hygiene: the `merge_to_main` skill's post-merge step supersedes the branch-status records citing the merged branch (memory tools are always available inside a skill — no allow-list entry needed), so stale "unmerged" hints stop recalling once the branch lands." — This is the old ordering. Post-fix the skill supersedes the records on the branch BEFORE the landing commit (that is the entire point of this plan), so the records land WITH the merge rather than "once the branch lands". The plan's step 6 explicitly listed PLAN.md in its search-and-fix scope ("search `merge_to_main` across `*.md` … `PLAN.md`; agent.md is the known one) and fix each") — this one was missed. PLAN.md is the project's technical-decision record, so a reader of it would implement/expect the pre-fix behaviour. Fix: reword to the new semantics, e.g. "Merge hygiene: the `merge_to_main` skill supersedes the branch-status records citing the merged branch ON THE BRANCH, before the landing commit (memory tools are always available inside a skill — no allow-list entry needed), so the successors land with the merge and stale `unmerged` hints stop recalling once the branch lands."
+
+### LOW 2 — Three stale step references in merge_to_main.toml's header comment
+
+The prompt was renumbered (6 steps → 7, different assignments) but the never-injected header rationale block kept the old step numbers:
+- `:7` "Memory tools work inside a skill without an allow-list entry — **step 5 is the post-merge hygiene**" — stale: step 5 is now the PR path; the hygiene is step 2 (records) + step 6 (no-write rule / clean-tree check).
+- `:13` "**NEVER stash (step 1)**" — stale: the commit + NEVER stash rule moved to step 3.
+- `:37` "NOT gh-missing/unauthed, where **step 4's** `gh pr create` would fail too" — stale: `gh pr create` is now step 5.
+
+The new header block (:55-68) documents the reorder accurately, so the file now contradicts itself. The header is never injected, but it is the skill's rationale documentation (and the plan's root-cause write-up lives there — plan step "Root cause write-up"). Fix: update the three references to steps 3, 2/6 and 5 respectively. (new_release.toml's header step references were checked and are all still correct.)
+
+### LOW 3 — Stale comment in the existing contract test (src/skill/mod.rs:480-482)
+
+"`// The merge hygiene step: branch-status memories are superseded once the branch lands in main`" — describes the old post-merge supersede and now contradicts the comment of the new sibling test 80 lines below ("Landing records must be written — and committed — on the branch BEFORE it is pushed"). It's a doc-comment staleness in the very file this diff touches, of exactly the category the plan's step 6 targeted. Fix: reword to "branch-status records are superseded on the branch, before the landing commit, so the successors land with the merge". The assertions below it are unaffected (`MERGED into main` is still present in the new prompt's record tail).
+
+### LOW 4 — new_release's landing-record clause omits the PR-path body note merge_to_main carries
+
+merge_to_main step 2 adds, "on the PR path add `a PR against main is opened from this branch, awaiting human review`" so a branch-local reader during the open-PR window is not misled by the "MERGED into main" title tail. new_release step 2's record clause (identical situation: same protected-repo PR path) names only the branch and work tip — during the PR-open window its records read as an unqualified "MERGED into main" claim, and new_release's own flow depends on knowing whether the bump is actually on main yet (step 3 tags merged main). The (d) self-consistency argument still holds for both skills (visibility in main coincides with truth), so this is a consistency gap, not a correctness break — but the plan step said to "restate it with the same pre-landing marker + phrasing", and the two skills now produce subtly different record formats. Fix: add the same conditional clause to new_release step 2 ("on the PR path add `a PR against main is opened from this branch, awaiting human review`").
+
+## Standard checks
+
+- **Correctness:** the reorder is complete, no functional break found; the existing contract test still holds against the new prompt (verified pin by pin).
+- **Security:** no new surface. The supersede stays scoped ("this branch's stale status records … NEVER another branch's records"); the `git reset --hard origin/main` recovery is pre-existing and scoped to GH013. The empty-`git status --short` gate is a genuine safety addition.
+- **Multi-platform neutrality:** the delta introduces no platform-specific APIs, paths or shell syntax; the new test's `env!("CARGO_MANIFEST_DIR")` + `Path::join(".coding/skills")` is cross-platform (same pattern as the existing sibling test). Out-of-delta observation (pre-existing, untouched by this diff, NOT counted): new_release.toml step 4's `Invoke-RestMethod` is PowerShell-only — worth a future pass for the macOS story.
+- **File-tools-first:** no shell-based file mutation anywhere in the delta. Clean.
+- **Warning-free build:** reviewer is read-only (no shell), so `cargo test` could not be run by me; static inspection of the new test found no warning sources (every binding and panic-format arg is used), and the parent runs the suite in the closing sequence — rerun `cargo test` unpiped after fixing the findings.
+
+## `.coding/` bookkeeping — accuracy check (one line, per the exclusion rule)
+
+The swept bookkeeping matches what shipped: 9 knowledge files gained `status = "superseded"` markers, the 8 successor records and the flipped backlog rows ("Marked done during the wt/mnemo post-merge closeout (PR #7, merge f7e1fa5)") and the two plan frames are consistent with the recorded PR #7 / closeout-plan fc41c5aa story (spot-checked the multi-edit -3/-4 pair against the live memory index and the backlog rows).

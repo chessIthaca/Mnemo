@@ -265,11 +265,12 @@ impl Tool for SearchReadTool {
             // populated (same guards as search.rs — a fallback-fired pattern
             // walks so "matched literally" stays exact, review B1); matched
             // files arrive in relevance (bm25) order instead of walk order.
-            // A stale index (F10) is repaired inline for a small staleness
+            // A stale index (F10) is repaired inline for a modest staleness
             // (search::try_index re-indexes at most STALE_REINDEX_CAP files
-            // and re-queries once) — the re-index is disclosed in the note;
-            // a Stale outcome falls through to the walk with the staleness
-            // merged into the prepended note.
+            // under the codegraph stale-reindex budget, then re-queries
+            // once) — the re-index is disclosed in the note; a Stale outcome
+            // falls through to the walk with the staleness merged into the
+            // prepended note.
             let mut stale_note: Option<String> = None;
             if args.literal && !args.pattern.contains('\n') {
                 if let Some(g) = &graph {
@@ -771,11 +772,20 @@ mod tests {
         // target/ — Rust build output (must be skipped).
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("target/built.rs"), "fn findme() {}").unwrap();
+        // .worktrees/ — app-managed run-all worktrees: duplicate copies of
+        // the tree, never project source.
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.rs"),
+            "fn findme() {}",
+        )
+        .unwrap();
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"pattern": "findme"})).await;
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("=== src.rs"));
         assert!(!result.output.contains("target/built.rs"));
+        assert!(!result.output.contains(".worktrees"));
         assert!(result.output.contains("skipped"));
     }
 

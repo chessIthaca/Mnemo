@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use mnemo::config::general::UiConfig;
+use mnemo::config::general::{OptimizerConfig, UiConfig};
 use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
 use mnemo::config::{Endpoint, EndpointKind, LayaMode, SafetyMode};
 use mnemo::memory::classifier::ClassifierStatus;
@@ -617,6 +617,12 @@ pub struct GetSettingsGeneral {
     /// dispatched). Run-All only — interactive completions never trigger
     /// it. Opt-in, off by default.
     pub auto_compact_on_plan_complete: bool,
+    /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — the
+    /// six flags plus their knobs, rendered as a nested object like `laya`.
+    /// `OptimizerConfig` serializes directly (its `compress_extra_commands`
+    /// list is skipped while empty), so the Settings → Savings section reads
+    /// every current value and only sends what the user changed.
+    pub optimizer: OptimizerConfig,
 }
 
 /// The `context` object inside [`GetSettingsResponse`].
@@ -915,6 +921,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
             },
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
+            optimizer: config.general.general.optimizer.clone(),
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: config.general.context.summarize_at_fill_rate,
@@ -1418,6 +1425,7 @@ mod settings_dto_tests {
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
+                optimizer: OptimizerConfig::default(),
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.3,
@@ -1481,6 +1489,33 @@ mod settings_dto_tests {
         assert_eq!(v["general"]["laya"]["mode"], "external");
         assert_eq!(v["general"]["laya"]["checkpoint"], serde_json::Value::Null);
         assert_eq!(v["general"]["safety"], "approve-each-action");
+        // The token-optimizer block renders as a nested object too — every
+        // lever off, and the knobs at their documented defaults (tied to the
+        // constants so a default change cannot silently desync the wire).
+        assert_eq!(v["general"]["optimizer"]["archive"], false);
+        assert_eq!(v["general"]["optimizer"]["delta_reads"], false);
+        assert_eq!(v["general"]["optimizer"]["quality_score"], false);
+        assert_eq!(
+            v["general"]["optimizer"]["archive_min_chars"],
+            serde_json::json!(OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS as u64)
+        );
+        assert_eq!(
+            v["general"]["optimizer"]["compress_min_chars"],
+            serde_json::json!(OptimizerConfig::DEFAULT_COMPRESS_MIN_CHARS as u64)
+        );
+        assert_eq!(
+            v["general"]["optimizer"]["lean_output_fill_pct"],
+            serde_json::json!(OptimizerConfig::DEFAULT_LEAN_OUTPUT_FILL_PCT as u64)
+        );
+        assert_eq!(
+            v["general"]["optimizer"]["nudge_cooldown_requests"],
+            serde_json::json!(OptimizerConfig::DEFAULT_NUDGE_COOLDOWN_REQUESTS as u64)
+        );
+        // An empty extra-command list is skipped by serde.
+        assert_eq!(
+            v["general"]["optimizer"]["compress_extra_commands"],
+            serde_json::Value::Null
+        );
         assert_eq!(v["config_dir"], "/cfg");
         assert_eq!(v["context"]["summarize_at_fill_rate"], 0.3);
         assert_eq!(v["ui"]["theme"], "dark");
@@ -1551,6 +1586,7 @@ mod settings_dto_tests {
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
+                optimizer: OptimizerConfig::default(),
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.4,

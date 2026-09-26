@@ -3,7 +3,7 @@
 // See LICENSE in the repository root.
 
 /**
- * Pricing model combobox — data-layer unit tests (backlog 82dd66fc). The
+ * Savings model combobox — data-layer unit tests (backlog 82dd66fc). The
  * dropdown must list the models available from the configured endpoints,
  * grouped/deduped across them (a model id can repeat — entries are
  * annotated with the endpoint names) and sorted; the filter rule keeps an

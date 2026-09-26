@@ -34,6 +34,7 @@ pub mod factory;
 pub mod failure_triage;
 pub mod failure_triage_knn;
 pub mod prompt;
+pub mod review_scope;
 pub mod steering_stats;
 
 mod dispatch;

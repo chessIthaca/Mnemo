@@ -582,6 +582,17 @@ impl AgentLoopFactory {
             .expect("shell_filter lock poisoned") = cfg;
     }
 
+    /// Update the live `[general.optimizer]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every lever-bearing tool built from this factory shares
+    /// the same `Arc<RwLock<OptimizerConfig>>` (see
+    /// [`with_optimizer_config`](Self::with_optimizer_config)) and reads it per
+    /// call, so a Settings toggle lands on the next tool call — no registry
+    /// rebuild and no app restart.
+    pub fn set_optimizer_config(&self, cfg: OptimizerConfig) {
+        *self.optimizer.write().expect("optimizer lock poisoned") = cfg;
+    }
+
     /// Swap in a new provider (e.g. when the user switches models from the
     /// status bar). Rebuilds the context manager from the new provider's max
     /// context so freshly built agents summarize at the right threshold.
@@ -961,7 +972,15 @@ impl AgentLoopFactory {
         self.register_vision_tool(&mut registry, &sandbox);
         self.register_memory_tools(&mut registry, root);
         self.register_codegraph_tools(&mut registry, root);
-        self.register_spawn_tool(&mut registry, agent_id);
+        // The reviewer-round scope wiring (backlog 85313a7e) needs the project
+        // root the git reads run in — resolved the way `register_agent_tools`
+        // resolves it (the agent's own root when it has one, else the
+        // factory's).
+        let project_root = match root {
+            Some(spec) => spec.project_root.clone(),
+            None => self.project_root.clone(),
+        };
+        self.register_spawn_tool(&mut registry, workflow, &project_root, agent_id);
         #[cfg(feature = "browser")]
         self.register_browser_tools(&mut registry, &sandbox);
         // The reveal half of progressive disclosure — registered last so it
@@ -1067,8 +1086,9 @@ impl AgentLoopFactory {
         registry.register(Box::new(GitReadTool::new(&project_root)));
         // write_review_report is the reviewer subagent's single output channel
         // (writes only under .coding/reviews/). Always registered; gated by
-        // the workflow ToolFilter.
-        registry.register(Box::new(WriteReviewReportTool::new(self.reviews_dir())));
+        // the workflow ToolFilter, and built through the single construction
+        // point below so its provenance wiring cannot drift from its test.
+        registry.register(Box::new(self.build_write_review_report_tool(&project_root)));
         // list_models is read-only discovery (which models are configured) so
         // the agent can pick one for spawn_agent's `model` parameter. Omitted
         // when no model resolver is wired (tests / no `[models]` section) —
@@ -1416,15 +1436,37 @@ impl AgentLoopFactory {
         }
     }
 
+    /// The `write_review_report` tool with its provenance wiring attached
+    /// (backlog 85313a7e): a freshly created report then ends with the revision
+    /// the round reviewed.
+    ///
+    /// A SINGLE construction point, shared by the registration in
+    /// `register_agent_tools` and the reviewer-tools wiring test — the stamp's
+    /// behaviour needs a real git repository to witness (pinned instead by the
+    /// `FakeScoper` tests in the tool's own module), so the REGISTRATION is
+    /// asserted structurally. Dropping `with_review_scoper` here reverts the
+    /// stamp and fails that test (review round 1, LOW 3).
+    fn build_write_review_report_tool(&self, project_root: &Path) -> WriteReviewReportTool {
+        WriteReviewReportTool::new(self.reviews_dir()).with_review_scoper(
+            Arc::new(crate::agent::review_scope::GitReviewScoper),
+            project_root.to_path_buf(),
+        )
+    }
+
     /// Register the spawn-agent tool once the IPC layer has wired in a
     /// spawner. Without one there's no way to start a background agent, so the
     /// tool is omitted entirely (rather than erroring at call time). When this
     /// agent has a runtime id, the tool is made parent-aware so background
     /// agents it spawns are registered as its children (closing the
-    /// completion-notification feedback loop).
+    /// completion-notification feedback loop). The per-agent `workflow` and
+    /// `project_root` are wired in as the review-round scope (backlog
+    /// 85313a7e), so a reviewer spawn carries the harness-rendered preamble
+    /// and stamps its round on the plan frame.
     fn register_spawn_tool(
         &self,
         registry: &mut ToolRegistry,
+        workflow: &Arc<Mutex<Workflow>>,
+        project_root: &Path,
         agent_id: Option<crate::runtime::AgentId>,
     ) {
         if let Some(spawner) = self.spawner.read().expect("spawner lock poisoned").clone() {
@@ -1444,6 +1486,18 @@ impl AgentLoopFactory {
             if let Some(memory) = &self.memory {
                 tool = tool.with_memory(Arc::clone(memory));
             }
+            // The review-round scope (backlog 85313a7e): a reviewer spawn then
+            // gets the harness-rendered preamble appended to its task — the
+            // verdict contract, the one-line constitution checks, the
+            // `.coding/**` bookkeeping rule, and for round >= 2 the delta scope
+            // (the delta since `<base>`, named via the reviewer's own
+            // `git_read` ops, + the changed file set) — and stamps its round on
+            // the plan frame once the spawn succeeds.
+            tool = tool.with_review_scope(
+                Arc::clone(workflow),
+                project_root.to_path_buf(),
+                Arc::new(crate::agent::review_scope::GitReviewScoper),
+            );
             registry.register(Box::new(tool));
         }
     }
@@ -1787,6 +1841,90 @@ mod tests {
     /// Raising a ceiling is a legitimate outcome — but it should be a
     /// deliberate edit to this test, with the new tool justified, not a
     /// silent drift.
+    /// A spawner that records what it was asked to spawn (review round 1,
+    /// LOW 3: the factory's reviewer wiring had no witness).
+    struct RecordingSpawner {
+        calls: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    impl RecordingSpawner {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSpawner for RecordingSpawner {
+        async fn spawn(
+            &self,
+            name: &str,
+            task: &str,
+            role: Option<String>,
+        ) -> Result<crate::runtime::AgentId, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), task.to_string(), role));
+            Ok(1)
+        }
+    }
+
+    /// Backlog 85313a7e, review round 1 LOW 3: every behaviour test builds the
+    /// reviewer tools with their builders directly, so DROPPING a registration
+    /// call in the factory reverted the whole feature with a green suite. This
+    /// drives the tools through the REGISTRY instead.
+    #[tokio::test]
+    async fn registered_reviewer_tools_carry_their_wiring() {
+        let dir = tempdir().unwrap();
+        let factory = make_factory(dir.path());
+        let spawner = Arc::new(RecordingSpawner::new());
+        factory.set_spawner(spawner.clone());
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+
+        // The spawn path: a reviewer spawn through the REGISTERED tool must
+        // carry the harness-rendered contract even though the task supplies
+        // none of it — i.e. `with_review_scope` is wired at registration, and
+        // the registered tool is bound to the factory's own workflow + project
+        // root.
+        let tool = registry.get("spawn_agent").expect("spawn_agent registered");
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "review the diff",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        {
+            let calls = spawner.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                calls[0].1.contains("## Reviewer contract"),
+                "the registered spawn tool must render the harness contract: {}",
+                calls[0].1
+            );
+            assert!(
+                calls[0].1.contains("## Verdict: PASS"),
+                "the contract must carry the verdict contract: {}",
+                calls[0].1
+            );
+        }
+
+        // The report path: its provenance stamp needs a real git repository to
+        // witness (its behaviour is pinned by the `FakeScoper` tests in the
+        // tool's own module), so the REGISTRATION is asserted structurally —
+        // through the same construction point the registry uses.
+        assert!(
+            factory
+                .build_write_review_report_tool(dir.path())
+                .provenance_wired(),
+            "the registered report tool must carry its provenance scoper"
+        );
+    }
+
     #[test]
     fn tools_array_stays_within_context_budget() {
         use crate::tool::ToolFilter;

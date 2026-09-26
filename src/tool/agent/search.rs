@@ -51,8 +51,13 @@ use crate::tool::agent::pattern;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
-/// Directory names that are never searched — build output, dependencies, or
-/// VCS metadata. Searching these is slow and almost never what the user wants.
+/// Directory names that are never searched — build output, dependencies, VCS
+/// metadata, or app-managed worktrees. Searching these is slow and almost
+/// never what the user wants. `.worktrees/` (run-all item worktrees linked
+/// under the main tree) holds a duplicate copy of the project: indexing it
+/// would add duplicate rows, and its own continuously-written
+/// `.coding/codegraph.db` would otherwise trigger debounced passes on the
+/// MAIN tree's watcher.
 const IGNORED_DIRS: &[&str] = &[
     "target",       // Rust build output
     "node_modules", // JS dependencies
@@ -68,6 +73,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".idea",        // JetBrains
     ".vscode",      // VS Code (keep config, skip nothing — but skip anyway)
     ".claude",      // Claude Code's own bookkeeping (plans, settings) — not project source
+    ".worktrees",   // app-managed run-all worktrees (wt/runall-<item8>)
 ];
 
 /// Whether a path component is an ignored directory.
@@ -2033,6 +2039,16 @@ mod tests {
         // project source. Must be skipped like the other ignored dirs.
         std::fs::create_dir_all(dir.path().join(".claude/plans")).unwrap();
         std::fs::write(dir.path().join(".claude/plans/old.md"), "findme").unwrap();
+        // .worktrees/ — app-managed run-all worktrees (agent.md): linked
+        // worktrees under the main tree, each a duplicate copy of the
+        // project. Indexing them duplicates rows, and a worktree's own
+        // .coding/ DB writes must not churn the main index pass.
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.rs"),
+            "fn findme() {}",
+        )
+        .unwrap();
 
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"pattern": "findme"})).await;
@@ -2044,8 +2060,33 @@ mod tests {
         assert!(!result.output.contains("node_modules"));
         assert!(!result.output.contains(".git"));
         assert!(!result.output.contains(".claude"));
+        assert!(!result.output.contains(".worktrees"));
         // The summary reports skipped files.
         assert!(result.output.contains("skipped"));
+    }
+
+    /// Guard (NOT a regression pin — green before and after the
+    /// `.worktrees` fix): the ignore rules are ROOT-RELATIVE, so a project
+    /// root that IS itself a worktree path (a run-all item agent runs in
+    /// `.worktrees/runall-<id>`) stays fully searchable. If the predicate
+    /// were ever applied to absolute paths, the fix that stops the MAIN
+    /// tree indexing worktree duplicates would blind every worktree
+    /// instance's own search.
+    #[tokio::test]
+    async fn worktree_root_stays_searchable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".worktrees/runall-abcd12");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/own.rs"), "fn findme() {}").unwrap();
+
+        let tool = make_tool(&root);
+        let result = tool.execute(json!({"pattern": "findme"})).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("src/own.rs"),
+            "a worktree instance's own root must stay searchable: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -2612,7 +2653,8 @@ mod tests {
     #[tokio::test]
     async fn pruned_walk_matches_the_index_engine_and_never_searches_ignored_dirs() {
         // Equivalence pin: over a tree WITH ignored dirs (node_modules,
-        // target, dist), the pruned walk engine reports the same totals as
+        // target, dist, .worktrees), the pruned walk engine reports the
+        // same totals as
         // the index engine (whose coverage walker prunes the same dirs),
         // and a needle planted inside an ignored dir never matches.
         let dir = tempdir().unwrap();
@@ -2623,6 +2665,12 @@ mod tests {
         std::fs::write(dir.path().join("target/built.rs"), "findme").unwrap();
         std::fs::create_dir_all(dir.path().join("dist")).unwrap();
         std::fs::write(dir.path().join("dist/out.js"), "findme").unwrap();
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.js"),
+            "findme",
+        )
+        .unwrap();
 
         let walker = make_tool(dir.path());
         let r_walk = walker
@@ -2635,7 +2683,7 @@ mod tests {
             r_walk.output
         );
         assert!(
-            r_walk.output.contains("skipped 3 ignored dirs"),
+            r_walk.output.contains("skipped 4 ignored dirs"),
             "pruned dirs are counted: {}",
             r_walk.output
         );

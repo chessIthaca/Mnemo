@@ -477,12 +477,13 @@ impl Tool for BacklogListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "backlog_list",
-            "List the user's backlog — the persistent queue of tasks/prompts shown in the \
-             Backlog tab, waiting to be dispatched to a future agent session. Read-only: it \
-             returns every item (id, status, note, truncated text) with pending items first, \
-             and changes nothing. Use it to see what is queued before adding or updating \
-             items, and whenever you need the item id for backlog_status. Available in every \
-             workflow state (a read-only query, like the memory tools).",
+            "Takes NO arguments — call it with {}. List the user's backlog — the persistent \
+             queue of tasks/prompts shown in the Backlog tab, waiting to be dispatched to a \
+             future agent session. Read-only: it returns every item (id, status, note, \
+             truncated text) with pending items first, and changes nothing. Use it to see \
+             what is queued before adding or updating items, and whenever you need the item \
+             id for backlog_status. Available in every workflow state (a read-only query, \
+             like the memory tools).",
             json!({ "type": "object", "properties": {} }),
         )
     }
@@ -1103,6 +1104,11 @@ mod tests {
         assert_eq!(tool.name(), "backlog_list");
         assert_eq!(tool.category(), ToolCategory::Workflow);
         assert_eq!(tool.safety(), SafetyLevel::AutoRun);
+        assert!(
+            tool.schema().description.starts_with("Takes NO arguments"),
+            "the zero-arg note LEADS the description: {}",
+            tool.schema().description
+        );
     }
 
     #[tokio::test]

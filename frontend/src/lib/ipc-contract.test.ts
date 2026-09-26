@@ -45,6 +45,7 @@ import approvalRequestNullPreview from "./ipc-fixtures/event-approval-request-nu
 import toolResult from "./ipc-fixtures/event-tool-result.json";
 import usage from "./ipc-fixtures/event-usage.json";
 import contextUsage from "./ipc-fixtures/event-context-usage.json";
+import contextUsageQuality from "./ipc-fixtures/event-context-usage-quality.json";
 import compacted from "./ipc-fixtures/event-compacted.json";
 import compactStarted from "./ipc-fixtures/event-compact-started.json";
 import visionDescribe from "./ipc-fixtures/event-vision-describe.json";
@@ -216,6 +217,41 @@ describe("IPC contract — event fixtures dispatch through the reducer", () => {
   it("event-context-usage: records the context-window fill", () => {
     useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: contextUsage }));
     expect(agent(ID).contextUsage).toEqual({ used: 1000, max: 8000 });
+  });
+
+  it("event-context-usage-quality: stores the S–F grade", () => {
+    // Lever 6 (backlog e4a50d22): the grade rides the same event.
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: contextUsageQuality }));
+    expect(agent(ID).contextUsage).toEqual({
+      used: 6000,
+      max: 8000,
+      quality: {
+        grade: "C",
+        fill_pct: 75,
+        waste_tokens: 1200,
+        stale_read_rate: 30,
+        decision_density: 50,
+      },
+    });
+  });
+
+  it("event-context-usage without quality KEEPS the stored grade", () => {
+    // The mid-stream provider-exact re-anchor omits `quality`, so an absent
+    // value must mean "unchanged" — otherwise the popup badge blinks off
+    // mid-turn.
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: contextUsageQuality }));
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: contextUsage }));
+    expect(agent(ID).contextUsage).toEqual({
+      used: 1000,
+      max: 8000,
+      quality: {
+        grade: "C",
+        fill_pct: 75,
+        waste_tokens: 1200,
+        stale_read_rate: 30,
+        decision_density: 50,
+      },
+    });
   });
 
   it("event-compacted: appends a transcript confirmation entry", () => {
@@ -440,6 +476,12 @@ describe("IPC contract — DTO fixture field shapes", () => {
     expect(dtoGetSettings.general.default_provider === null || typeof dtoGetSettings.general.default_provider === "string").toBe(true);
     // vision_model must be emitted as null (not skipped) when unconfigured.
     expect(dtoGetSettings.general.vision_model).toBeNull();
+    // The token-optimizer block rides `general` (Settings → Savings reads it):
+    // the six levers are booleans, the knobs are numbers.
+    expect(typeof dtoGetSettings.general.optimizer.archive).toBe("boolean");
+    expect(typeof dtoGetSettings.general.optimizer.delta_reads).toBe("boolean");
+    expect(typeof dtoGetSettings.general.optimizer.archive_min_chars).toBe("number");
+    expect(typeof dtoGetSettings.general.optimizer.nudge_cooldown_requests).toBe("number");
     expect(typeof dtoGetSettings.context.summarize_at_fill_rate).toBe("number");
     expect(typeof dtoGetSettings.context.proxy_cache_ceiling_tokens).toBe("number");
     expect(typeof dtoGetSettings.ui.theme).toBe("string");

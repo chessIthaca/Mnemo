@@ -17,8 +17,9 @@ interface ApprovalPromptProps {
  * Whether a tool call only touches files inside the project directory.
  * Computed client-side (a simpler heuristic than the Rust `is_project_scoped`):
  * file_edit/file_write/file_append/file_read/convert_line_endings with a
- * `path` arg, search, and git are project-scoped; shell is not (it can run
- * anything).
+ * `path` arg, multi_edit with every `files[].path` a non-empty string (one
+ * out-of-project entry taints the call — it writes them all), search, and git
+ * are project-scoped; shell is not (it can run anything).
  */
 function isProjectScoped(toolName: string, args: Record<string, unknown>): boolean {
   switch (toolName) {
@@ -28,6 +29,20 @@ function isProjectScoped(toolName: string, args: Record<string, unknown>): boole
     case "file_read":
     case "convert_line_endings":
       return typeof args.path === "string" && args.path.length > 0;
+    case "multi_edit": {
+      const files = args.files;
+      return (
+        Array.isArray(files) &&
+        files.length > 0 &&
+        files.every(
+          (f) =>
+            f !== null &&
+            typeof f === "object" &&
+            typeof (f as Record<string, unknown>).path === "string" &&
+            ((f as Record<string, unknown>).path as string).length > 0,
+        )
+      );
+    }
     case "search":
     case "git":
       return true;
@@ -48,15 +63,26 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
     content?: string;
     command?: string;
     cwd?: string;
+    files?: { path?: string }[];
   };
   const preview = approval.preview;
+  // multi_edit edits several files in one call — its Rust preview is the
+  // combined `multi_diff` (no single `path`), so the diff toggle's label is
+  // the FILE COUNT instead of a path.
+  const isMultiEdit = approval.toolName === "multi_edit";
   const isFileEdit =
-    approval.toolName === "file_edit" || approval.toolName === "file_write";
+    approval.toolName === "file_edit" ||
+    approval.toolName === "file_write" ||
+    isMultiEdit;
   // Prefer Rust preview path; fall back to args.path for older payloads.
   const filePath =
-    (preview && typeof preview.path === "string" && preview.path) ||
+    (preview !== null && preview !== undefined && preview.kind !== "multi_diff"
+      ? preview.path
+      : "") ||
     args?.path ||
     "";
+  const multiEditPaths = preview?.kind === "multi_diff" ? preview.paths : [];
+  const fileCount = isMultiEdit ? multiEditPaths.length || args?.files?.length || 0 : 0;
   // Core operations (git merge/push) always prompt regardless of mode/rules,
   // so "Mark Safe" (writes a rule) and "Allow for project" (would flip the
   // mode) are both no-ops there — hide them.
@@ -234,7 +260,9 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
               className="flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200"
             >
               <FileCode className="h-3.5 w-3.5" />
-              {filePath}
+              {fileCount > 0
+                ? `${fileCount} file${fileCount === 1 ? "" : "s"}`
+                : filePath}
             </button>
           )}
         </div>
@@ -307,7 +335,9 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
       )}
       {showDiff && isFileEdit && (
         <div className="mt-3">
-          {preview?.kind === "diff" && typeof preview.diff === "string" ? (
+          {preview?.kind === "multi_diff" && typeof preview.diff === "string" ? (
+            <UnifiedDiffView diffText={preview.diff} />
+          ) : preview?.kind === "diff" && typeof preview.diff === "string" ? (
             <UnifiedDiffView diffText={preview.diff} />
           ) : preview?.kind === "new_file" &&
             typeof preview.content === "string" ? (

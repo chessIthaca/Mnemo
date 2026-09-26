@@ -44,10 +44,11 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use crate::config::ShellFilterConfig;
+use crate::config::{OptimizerConfig, ShellFilterConfig};
 use crate::provider::ToolSchema;
 use crate::tool::agent::read_files::truncate_to_boundary;
 use crate::tool::agent::sandbox::Sandbox;
+use crate::tool::agent::tool_contract;
 use crate::tool::{OutputSink, SafetyLevel, Tool, ToolCategory, ToolOutputStream, ToolResult};
 
 /// Default maximum wall-clock time a shell command may run before it is
@@ -320,6 +321,12 @@ pub struct ShellTool {
     /// the SAME handle `GitTool` holds). Seeded by the factory so a Settings →
     /// Git save takes effect on the next shell call without a registry rebuild.
     core_operations: Arc<RwLock<Vec<String>>>,
+    /// Shared token-optimizer config (the `[general.optimizer]` section,
+    /// backlog e4a50d22). Lever 2 (semantic command-output compression)
+    /// reads the `compress_output` flag + knobs at call time; the handle is
+    /// shared with every ShellTool, so a config save is observed on the next
+    /// command without a registry rebuild. Defaults to all-off.
+    optimizer: Arc<RwLock<OptimizerConfig>>,
 }
 
 impl ShellTool {
@@ -330,6 +337,7 @@ impl ShellTool {
             timeout: DEFAULT_TIMEOUT,
             filter_config: Arc::new(RwLock::new(ShellFilterConfig::default())),
             core_operations: Arc::new(RwLock::new(vec!["merge".to_string(), "push".to_string()])),
+            optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
         }
     }
 
@@ -355,6 +363,15 @@ impl ShellTool {
     /// default and would drift from the Settings → Git list.
     pub fn with_core_operations(mut self, ops: Arc<RwLock<Vec<String>>>) -> Self {
         self.core_operations = ops;
+        self
+    }
+
+    /// Wire the shared `[general.optimizer]` config (token-optimizer lever 2,
+    /// backlog e4a50d22). Called once by the factory at startup; every
+    /// ShellTool shares the handle, so a config save is observed on the next
+    /// command without a registry rebuild (mirrors `with_filter_config`).
+    pub fn with_optimizer(mut self, cfg: Arc<RwLock<OptimizerConfig>>) -> Self {
+        self.optimizer = cfg;
         self
     }
 
@@ -392,19 +409,25 @@ impl Tool for ShellTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "shell",
-            "Execute a shell command — PowerShell 5.1 on Windows, sh on Unix. Requires \
-             approval. command is required on every call — there is no zero-argument \
-             form; an empty shell call is always an error (if you just made a shell \
-             call, the next one needs its own command). On Windows chain with ; not \
-             && / || — PowerShell 5.1 rejects bash-style chaining; it is auto-translated \
-             to if ($?) gates with a note in the result, but prefer ; or separate \
-             calls. A result is 'successful' when the command RAN: check the exit code \
-             to see whether it failed. Output streams live into the tool card while the \
-             command runs; the RESULT is capped (~100 KiB) with a truncation note, and \
-             well-known commands (cargo build/test, npm test/build, git status) are \
-             noise-filtered — errors, warnings and summaries always survive, and the raw \
-             stdout/stderr ride the result's data field. Commands exceeding the timeout \
-             are killed.",
+            format!(
+                "{} If you just made a shell call, the next one needs its own \
+                 command. Execute a shell command — PowerShell 5.1 on Windows, sh \
+                 on Unix. Requires approval. \
+             On Windows chain with ; not && / || — PowerShell 5.1 rejects \
+             bash-style chaining; it is auto-translated to if ($?) gates with a \
+             note in the result, but prefer ; or separate calls. A result is \
+             'successful' when the command RAN: check the exit code to see \
+             whether it failed. Output streams live into the tool card while \
+             the command runs; the RESULT is capped (~100 KiB) with a truncation \
+             note, and well-known commands (cargo build/test, npm test/build, \
+             git status) are noise-filtered — errors, warnings, and summaries \
+             always survive, and the raw stdout/stderr ride the result's data \
+                 field. Commands exceeding the timeout are killed.",
+                tool_contract::contract(
+                    "`command` + `purpose`",
+                    "{\"command\":\"cargo test\",\"purpose\":\"running tests\"}"
+                )
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -448,9 +471,20 @@ impl Tool for ShellTool {
     /// receives throttled, UTF-8-safe chunks while the child runs, while the
     /// returned result is exactly what [`Tool::execute`] returns.
     async fn execute_streaming(&self, args: serde_json::Value, sink: OutputSink) -> ToolResult {
-        let args: ShellArgs = match serde_json::from_value(args) {
+        let args: ShellArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            // Backlog d9ad618e: the recovery rule rides the error itself (the
+            // read_files precedent, backlog 26cdbaf8) — the model reads this at
+            // retry time, so the FIRST retry succeeds instead of waiting for
+            // the circuit breaker.
+            Err(e) => {
+                return ToolResult::error(crate::tool::agent::read_files::invalid_args_error(
+                    "shell",
+                    &e,
+                    &args,
+                    &tool_contract::recovery_hint("command + purpose"),
+                ))
+            }
         };
 
         let cwd = match self.resolve_cwd(args.cwd.as_deref()) {
@@ -598,6 +632,45 @@ impl Tool for ShellTool {
                 } else {
                     format!("{stdout}\n[stderr]\n{stderr}")
                 };
+                // Token-optimizer lever 2 (backlog e4a50d22): semantic
+                // command-output compression. Runs AFTER the shell_filter
+                // above (which shaped `stdout`/`stderr`) and ONLY when the
+                // flag is on and the filtered output exceeds
+                // `compress_min_chars`. It substitutes the LLM-facing
+                // `combined` only — the raw stdout/stderr in `data` stay
+                // untouched, and a non-family command or a compact form that
+                // is not meaningfully smaller leaves `combined` byte-identical.
+                let mut savings: Option<serde_json::Value> = None;
+                {
+                    let compact_cfg = self
+                        .optimizer
+                        .read()
+                        .expect("optimizer config lock poisoned")
+                        .clone();
+                    if compact_cfg.compress_output
+                        && combined.chars().count() >= compact_cfg.compress_min_chars
+                    {
+                        if let Some(compacted) = super::output_compactor::compress(
+                            &args.command,
+                            &stdout,
+                            &stderr,
+                            code,
+                            &compact_cfg,
+                        ) {
+                            if compacted.text.chars().count() < combined.chars().count() {
+                                let before = super::optimizer::estimate_tokens(&combined);
+                                let after = super::optimizer::estimate_tokens(&compacted.text);
+                                combined = compacted.text;
+                                savings = Some(super::optimizer::savings_event(
+                                    "compression",
+                                    &args.command,
+                                    before,
+                                    after,
+                                ));
+                            }
+                        }
+                    }
+                }
                 // Advisory steering (see GREP_NUDGE): prepended AFTER the
                 // command ran, so the nudge rides even a failing grep; the
                 // raw stdout/stderr in `data` stay nudge-free.
@@ -623,14 +696,20 @@ impl Tool for ShellTool {
                 // Many commands return non-zero exit codes while still doing
                 // what was intended (e.g. grep finding no matches, PowerShell
                 // cmdlets with Write-Error). The LLM decides if it failed.
+                let mut result_data = json!({
+                    "exit_code": code,
+                    "stdout": raw_stdout,
+                    "stderr": raw_stderr
+                });
+                if let Some(event) = savings {
+                    // Lever 2's before/after counts ride `data.savings`; the
+                    // turn loop records each as a savings_events ledger row.
+                    result_data["savings"] = serde_json::Value::Array(vec![event]);
+                }
                 ToolResult {
                     success: true,
                     output: capped,
-                    data: Some(json!({
-                        "exit_code": code,
-                        "stdout": raw_stdout,
-                        "stderr": raw_stderr
-                    })),
+                    data: Some(result_data),
                 }
             }
             Err(e) => ToolResult::error(format!("failed to execute command: {e}")),
@@ -814,6 +893,112 @@ mod tests {
 
     fn tool_in(dir: &std::path::Path) -> ShellTool {
         ShellTool::new(Sandbox::new(dir).unwrap())
+    }
+
+    /// A command printing 40 identical lines. The shell filter's repeat
+    /// collapse is disabled in the lever-2 tests, so the COMPACTOR is what
+    /// acts on these lines.
+    fn repetitive_cmd() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "1..40 | ForEach-Object { 'repeated build noise line' }"
+        } else {
+            "for i in $(seq 40); do echo 'repeated build noise line'; done"
+        }
+    }
+
+    /// The extra-command pattern matching [`repetitive_cmd`] — lever 2's
+    /// user-extensible allowlist path, so exercising the call site needs no
+    /// real `cargo`/`npm` build.
+    fn repetitive_pattern() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "ForEach-Object"
+        } else {
+            "seq 40"
+        }
+    }
+
+    /// A filter-disabled tool with lever 2 wired to `cfg`, isolating the
+    /// compactor from the (separately tested) shell filter.
+    fn compactor_tool(dir: &std::path::Path, cfg: OptimizerConfig) -> ShellTool {
+        ShellTool::new(Sandbox::new(dir).unwrap())
+            .with_filter_config(Arc::new(RwLock::new(ShellFilterConfig {
+                enabled: false,
+                overrides: vec![],
+            })))
+            .with_optimizer(Arc::new(RwLock::new(cfg)))
+    }
+
+    #[tokio::test]
+    async fn compression_off_passes_output_through_byte_identically() {
+        // The default-off pin: with lever 2 off the call site changes
+        // nothing — every line survives and no savings data rides the
+        // result.
+        let dir = tempdir().unwrap();
+        let tool = compactor_tool(dir.path(), OptimizerConfig::default());
+        let result = tool
+            .execute(json!({"command": repetitive_cmd(), "purpose": "compression off"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            result.output.matches("repeated build noise line").count(),
+            40,
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("compressed"), "{}", result.output);
+        let data = result.data.expect("data");
+        assert!(data.get("savings").is_none(), "no savings row when off: {data}");
+    }
+
+    #[tokio::test]
+    async fn compression_collapses_output_and_preserves_raw_data() {
+        let dir = tempdir().unwrap();
+        let cfg = OptimizerConfig {
+            compress_output: true,
+            compress_min_chars: 100,
+            compress_extra_commands: vec![repetitive_pattern().to_string()],
+            ..Default::default()
+        };
+        let tool = compactor_tool(dir.path(), cfg);
+        let result = tool
+            .execute(json!({"command": repetitive_cmd(), "purpose": "compression on"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        // The LLM-facing output is the compact form…
+        assert!(result.output.contains("compressed generic output"), "{}", result.output);
+        assert!(result.output.contains("(repeated 40×)"), "{}", result.output);
+        // …while the raw stdout in `data` is untouched (the shell_filter
+        // contract: the card renders the raw text).
+        let data = result.data.expect("data");
+        let raw = data["stdout"].as_str().expect("data.stdout");
+        assert_eq!(raw.matches("repeated build noise line").count(), 40, "{raw}");
+        // The before/after counts ride data.savings for the ledger.
+        let savings = data["savings"].as_array().expect("savings array");
+        assert_eq!(savings.len(), 1);
+        assert_eq!(savings[0]["kind"], "compression");
+        let before = savings[0]["tokens_before"].as_i64().unwrap();
+        let after = savings[0]["tokens_after"].as_i64().unwrap();
+        assert!(after < before, "{before} -> {after}");
+    }
+
+    #[tokio::test]
+    async fn compression_skips_commands_no_family_or_pattern_matches() {
+        // Lever 2 on, but neither a known family nor an extra pattern
+        // matches: the output passes through unchanged, no savings row.
+        let dir = tempdir().unwrap();
+        let cfg = OptimizerConfig {
+            compress_output: true,
+            compress_min_chars: 100,
+            ..Default::default()
+        };
+        let tool = compactor_tool(dir.path(), cfg);
+        let result = tool
+            .execute(json!({"command": repetitive_cmd(), "purpose": "no match"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.output.matches("repeated build noise line").count(), 40);
+        assert!(!result.output.contains("compressed"), "{}", result.output);
+        assert!(result.data.expect("data").get("savings").is_none());
     }
 
     #[test]
@@ -1089,6 +1274,17 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("parameter 'command' is required"));
+        // Backlog d9ad618e: the recovery hint rides the error.
+        assert!(
+            result.output.contains("rewrite the full call"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("do not resend the empty shape"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -1133,12 +1329,43 @@ mod tests {
         let tool = tool_in(std::path::Path::new("."));
         let schema = tool.schema();
         assert!(
-            schema.description.contains("no zero-argument form"),
+            schema.description.starts_with("Always pass `command` + `purpose`"),
+            "the contract sentence LEADS the description: {}",
+            schema.description
+        );
+        // The content-first clause lives once in TOOL_CALL_DISCIPLINE
+        // (src/agent/prompt.rs) — the per-tool copy was the trim's point.
+        assert!(
+            !schema.description.contains("If you catch yourself"),
+            "the content-first clause lives once in TOOL_CALL_DISCIPLINE, not per tool: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("No zero-argument form"),
             "{}",
+            schema.description
+        );
+        // Review L1 (2026-09-23): the shell-specific hint for the observed
+        // failure pattern (a successful call followed by an empty one) —
+        // dropped once by the trim, restored, now pinned.
+        assert!(
+            schema.description.contains("the next one needs its own command"),
+            "the shell-specific empty-call hint rides the substance: {}",
             schema.description
         );
         assert!(
             schema.description.contains("chain with ; not && / ||"),
+            "{}",
+            schema.description
+        );
+        // Backlog d9ad618e: the inline example + recovery rule.
+        assert!(
+            schema.description.contains("cargo test"),
+            "the inline example shows the exact call shape: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do not resend the empty shape"),
             "{}",
             schema.description
         );

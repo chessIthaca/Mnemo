@@ -40,7 +40,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::context::ContextManager;
 use crate::agent::{AgentLoop, AgentLoopConfig};
-use crate::config::{SafetyMode, ShellFilterConfig};
+use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -52,6 +52,7 @@ use crate::skill::SkillLibrary;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::agent::{
     convert_line_endings::ConvertLineEndingsTool,
+    expand_result::ExpandResultTool,
     file_edit::FileEditTool,
     file_write::FileWriteTool,
     git::GitTool,
@@ -61,6 +62,7 @@ use crate::tool::agent::{
         ImageUiDiffTool, ImageUiToArtifactTool, ImageUnderstandDiagramTool,
     },
     list_models::ListModelsTool,
+    multi_edit::MultiEditTool,
     read_files::ReadFilesTool,
     search::SearchTool,
     search_read::SearchReadTool,
@@ -69,10 +71,11 @@ use crate::tool::agent::{
     web_fetch::WebFetchTool,
     write_review_report::WriteReviewReportTool,
 };
+use super::failure_triage::FailureTriageHandle;
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::{
-    MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool, MemorySupersedeTool,
-    MemoryUpdateTool, MemoryWriteTool,
+    AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
+    MemorySupersedeTool, MemoryUpdateTool, MemoryWriteTool,
 };
 use crate::tool::workflow::ask_user::AskUserTool;
 use crate::tool::workflow::plan::{
@@ -173,6 +176,17 @@ pub struct AgentLoopFactory {
     /// LLM at call time (currently `memory_consolidate`) see Settings swaps on
     /// their next call without rebuilding the registry. Mirrors `vision`.
     provider_slot: Arc<SwappableProvider>,
+    /// The shared Laya auto-typing gate for `memory_write` (backlog
+    /// a147b63c) — `None` until the IPC layer wires it via
+    /// `with_auto_typing` (the app runtime's shared classifier slot + the
+    /// `auto_type_memories` flag mirror).
+    typing: Option<AutoTypingHandle>,
+    /// The shared Laya failure-triage gate (backlog 1a4049c1) — `None` until
+    /// the IPC layer wires it via `with_failure_triage` (the SAME shared
+    /// classifier slot + the `failure_triage` flag mirror). Attached to every
+    /// loop built after the call, so the tool-dispatch and provider retry
+    /// layers read it at failure time.
+    failure_triage: Option<FailureTriageHandle>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -243,6 +257,13 @@ pub struct AgentLoopFactory {
     /// `browser_*` tools are advertised at all (see `Tool::available`) —
     /// atomic so a Settings save lands on the next turn without a rebuild.
     browser_inspection: Arc<std::sync::atomic::AtomicBool>,
+    /// Live mirror of `[general.optimizer]` (token-optimizer levers,
+    /// backlog e4a50d22), shared with every lever-bearing tool built from
+    /// this factory (read_files delta/skeleton re-reads, shell output
+    /// compression, …). Defaults to all-off; the IPC layer overrides via
+    /// [`with_optimizer_config`](Self::with_optimizer_config) from the
+    /// loaded config at startup (mirrors `shell_filter`).
+    optimizer: Arc<RwLock<OptimizerConfig>>,
 }
 
 impl AgentLoopFactory {
@@ -341,7 +362,20 @@ impl AgentLoopFactory {
             // Mirrors the config default (`enable_browser_inspection = false`)
             // until the IPC layer pushes the loaded value at startup.
             browser_inspection: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Default optimizer config (every lever off); the IPC layer
+            // overrides via `with_optimizer_config` from the loaded config
+            // at startup (mirrors `shell_filter`).
+            optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
             mcp: None,
+            // No auto-typing gate at construction — the IPC layer wires it
+            // via `with_auto_typing` once the app runtime's classifier slot
+            // exists (backlog a147b63c). Until then `memory_write` never
+            // asks a classifier.
+            typing: None,
+            // No failure-triage gate at construction either — wired via
+            // `with_failure_triage` (backlog 1a4049c1). Until then every
+            // failure-handling site keeps its pre-classifier behavior.
+            failure_triage: None,
         }
     }
 
@@ -353,6 +387,60 @@ impl AgentLoopFactory {
     pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    /// Wire the shared Laya auto-typing gate (backlog a147b63c): the
+    /// `memory_write` tool reads the shared classifier slot + the
+    /// `[general.laya] auto_type_memories` flag at call time. When not
+    /// wired, `memory_write` keeps its pre-auto-typing behavior.
+    pub fn with_auto_typing(mut self, handle: AutoTypingHandle) -> Self {
+        self.typing = Some(handle);
+        self
+    }
+
+    /// Flip the auto-typing enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this so the toggle reaches already-built
+    /// tools with no registry rebuild.
+    pub fn set_auto_typing_enabled(&self, on: bool) {
+        if let Some(handle) = &self.typing {
+            handle
+                .enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Wire the shared Laya failure-triage gate (backlog 1a4049c1): every
+    /// agent loop built after this call carries the handle, whose shared
+    /// classifier slot + `[general.laya] failure_triage` flag mirror are read
+    /// at FAILURE time — so a Settings save needs no rebuild. When not wired,
+    /// every failure-handling site keeps its pre-classifier behavior.
+    pub fn with_failure_triage(mut self, handle: FailureTriageHandle) -> Self {
+        self.failure_triage = Some(handle);
+        self
+    }
+
+    /// Flip the failure-triage enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this so the toggle reaches already-built
+    /// loops with no rebuild.
+    pub fn set_failure_triage_enabled(&self, on: bool) {
+        if let Some(handle) = &self.failure_triage {
+            handle
+                .enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Flip the kNN overlay's enable flag on the shared gate — the Settings
+    /// save path (rewire) calls this after `[general.laya]
+    /// failure_triage_knn` changes, so the toggle reaches already-built
+    /// loops with no rebuild. No-op when no gate is wired (the overlay is
+    /// then absent and the pre-classifier behavior stands).
+    pub fn set_failure_triage_knn_enabled(&self, on: bool) {
+        if let Some(handle) = &self.failure_triage {
+            handle
+                .knn_enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The shared MCP manager, when wired (the IPC layer's Settings/Test
@@ -402,6 +490,16 @@ impl AgentLoopFactory {
     /// `save_settings` call) is observed live without a registry rebuild.
     pub fn with_shell_filter_config(mut self, cfg: Arc<RwLock<ShellFilterConfig>>) -> Self {
         self.shell_filter = cfg;
+        self
+    }
+
+    /// Wire the shared `[general.optimizer]` config (token-optimizer
+    /// levers, backlog e4a50d22). Called once by the IPC layer at startup;
+    /// every lever-bearing tool built after this call shares the same
+    /// `Arc<RwLock<OptimizerConfig>>` (mirrors
+    /// [`with_shell_filter_config`](Self::with_shell_filter_config)).
+    pub fn with_optimizer_config(mut self, cfg: Arc<RwLock<OptimizerConfig>>) -> Self {
+        self.optimizer = cfg;
         self
     }
 
@@ -482,6 +580,17 @@ impl AgentLoopFactory {
             .shell_filter
             .write()
             .expect("shell_filter lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.optimizer]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every lever-bearing tool built from this factory shares
+    /// the same `Arc<RwLock<OptimizerConfig>>` (see
+    /// [`with_optimizer_config`](Self::with_optimizer_config)) and reads it per
+    /// call, so a Settings toggle lands on the next tool call — no registry
+    /// rebuild and no app restart.
+    pub fn set_optimizer_config(&self, cfg: OptimizerConfig) {
+        *self.optimizer.write().expect("optimizer lock poisoned") = cfg;
     }
 
     /// Swap in a new provider (e.g. when the user switches models from the
@@ -749,6 +858,10 @@ impl AgentLoopFactory {
             self.constitution_source.clone(),
         )
         .with_safety_mode_handle(Arc::clone(&self.safety_mode))
+        // Share the live `[general.optimizer]` handle (backlog e4a50d22) so
+        // the ingestion-time levers (progressive disclosure, compaction
+        // survival) see a config save without rebuilding the loop.
+        .with_optimizer(Arc::clone(&self.optimizer))
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).
@@ -800,6 +913,15 @@ impl AgentLoopFactory {
         // agent inherit the same root (spawn_agent_shared reads it).
         agent = agent.with_root_spec(root.cloned());
 
+        // Attach the failure-triage gate (backlog 1a4049c1): the loop's
+        // tool-dispatch site and both provider retry layers read the shared
+        // classifier slot + the `[general.laya] failure_triage` flag at
+        // failure time, so a Settings save lands on the next failure with no
+        // registry or loop rebuild.
+        if let Some(handle) = &self.failure_triage {
+            agent = agent.with_failure_triage(handle.clone());
+        }
+
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the
         // loop's no-override resolution branch reports it, so the status bar
         // shows the default model's effective effort (per-model override →
@@ -850,7 +972,15 @@ impl AgentLoopFactory {
         self.register_vision_tool(&mut registry, &sandbox);
         self.register_memory_tools(&mut registry, root);
         self.register_codegraph_tools(&mut registry, root);
-        self.register_spawn_tool(&mut registry, agent_id);
+        // The reviewer-round scope wiring (backlog 85313a7e) needs the project
+        // root the git reads run in — resolved the way `register_agent_tools`
+        // resolves it (the agent's own root when it has one, else the
+        // factory's).
+        let project_root = match root {
+            Some(spec) => spec.project_root.clone(),
+            None => self.project_root.clone(),
+        };
+        self.register_spawn_tool(&mut registry, workflow, &project_root, agent_id);
         #[cfg(feature = "browser")]
         self.register_browser_tools(&mut registry, &sandbox);
         // The reveal half of progressive disclosure — registered last so it
@@ -909,9 +1039,16 @@ impl AgentLoopFactory {
             None => self.project_root.clone(),
         };
         registry.register(Box::new(
-            ReadFilesTool::new(sandbox.clone()).with_codegraph(codegraph.clone()),
+            ReadFilesTool::new(sandbox.clone())
+                .with_codegraph(codegraph.clone())
+                .with_optimizer(Arc::clone(&self.optimizer)),
         ));
+        // Progressive disclosure (backlog e4a50d22 lever 3): serve back a
+        // tool result that was archived for size — by id, or by keyword. A
+        // `None` store just yields a helpful error on call.
+        registry.register(Box::new(ExpandResultTool::new(self.memory.clone())));
         registry.register(Box::new(FileEditTool::new(sandbox.clone())));
+        registry.register(Box::new(MultiEditTool::new(sandbox.clone())));
         registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
         registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
         registry.register(Box::new(
@@ -919,7 +1056,11 @@ impl AgentLoopFactory {
                 .with_filter_config(Arc::clone(&self.shell_filter))
                 // Same handle as GitTool: `shell git merge|push` must raise the
                 // always-on core-operation prompt too (follow-up A, 2027-01-11).
-                .with_core_operations(Arc::clone(&self.core_operations)),
+                .with_core_operations(Arc::clone(&self.core_operations))
+                // Token-optimizer lever 2 (backlog e4a50d22): the shared
+                // `[general.optimizer]` handle, read per call so a config
+                // save lands on the next command without a rebuild.
+                .with_optimizer(Arc::clone(&self.optimizer)),
         ));
         let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone());
         let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone());
@@ -936,7 +1077,7 @@ impl AgentLoopFactory {
             &project_root,
             self.core_operations.clone(),
         )));
-        // git_read is the read-only view into git (op = diff | log | show):
+        // git_read is the read-only view into git (op = diff | log | show | status):
         // the reviewer subagent's only way to see uncommitted changes (it has
         // no shell/git), and the bridge from a memory record's commit pointer
         // to shipped code. AutoRun by construction, which is exactly why it
@@ -945,8 +1086,9 @@ impl AgentLoopFactory {
         registry.register(Box::new(GitReadTool::new(&project_root)));
         // write_review_report is the reviewer subagent's single output channel
         // (writes only under .coding/reviews/). Always registered; gated by
-        // the workflow ToolFilter.
-        registry.register(Box::new(WriteReviewReportTool::new(self.reviews_dir())));
+        // the workflow ToolFilter, and built through the single construction
+        // point below so its provenance wiring cannot drift from its test.
+        registry.register(Box::new(self.build_write_review_report_tool(&project_root)));
         // list_models is read-only discovery (which models are configured) so
         // the agent can pick one for spawn_agent's `model` parameter. Omitted
         // when no model resolver is wired (tests / no `[models]` section) —
@@ -1190,16 +1332,25 @@ impl AgentLoopFactory {
             // reindexing. `None` (a plans dir that implies no root) keeps
             // the historical DB-only behavior.
             let knowledge = self.knowledge.clone();
-            let mk_write = |store: Arc<dyn MemoryStoreTrait>| match &knowledge {
-                Some(k) => MemoryWriteTool::with_knowledge(
-                    store.clone(),
-                    k.clone(),
-                    self.plans_dir.clone(),
-                )
-                // A worktree lane agent shares the factory-wide knowledge
-                // store (main tree) — the tool's result says so explicitly.
-                .with_agent_root(root.map(|r| r.project_root.clone())),
-                None => MemoryWriteTool::new(store.clone()),
+            let typing = self.typing.clone();
+            let mk_write = |store: Arc<dyn MemoryStoreTrait>| {
+                let tool = match &knowledge {
+                    Some(k) => MemoryWriteTool::with_knowledge(
+                        store.clone(),
+                        k.clone(),
+                        self.plans_dir.clone(),
+                    )
+                    // A worktree lane agent shares the factory-wide knowledge
+                    // store (main tree) — the tool's result says so explicitly.
+                    .with_agent_root(root.map(|r| r.project_root.clone())),
+                    None => MemoryWriteTool::new(store.clone()),
+                };
+                // The Laya auto-typing gate rides every memory_write —
+                // call-time reads keep Settings swaps/toggles live.
+                match &typing {
+                    Some(handle) => tool.with_auto_typing(handle.clone()),
+                    None => tool,
+                }
             };
             registry.register(Box::new(mk_write(store.clone())));
             // The single read path: search or browse, any record type, any
@@ -1285,15 +1436,37 @@ impl AgentLoopFactory {
         }
     }
 
+    /// The `write_review_report` tool with its provenance wiring attached
+    /// (backlog 85313a7e): a freshly created report then ends with the revision
+    /// the round reviewed.
+    ///
+    /// A SINGLE construction point, shared by the registration in
+    /// `register_agent_tools` and the reviewer-tools wiring test — the stamp's
+    /// behaviour needs a real git repository to witness (pinned instead by the
+    /// `FakeScoper` tests in the tool's own module), so the REGISTRATION is
+    /// asserted structurally. Dropping `with_review_scoper` here reverts the
+    /// stamp and fails that test (review round 1, LOW 3).
+    fn build_write_review_report_tool(&self, project_root: &Path) -> WriteReviewReportTool {
+        WriteReviewReportTool::new(self.reviews_dir()).with_review_scoper(
+            Arc::new(crate::agent::review_scope::GitReviewScoper),
+            project_root.to_path_buf(),
+        )
+    }
+
     /// Register the spawn-agent tool once the IPC layer has wired in a
     /// spawner. Without one there's no way to start a background agent, so the
     /// tool is omitted entirely (rather than erroring at call time). When this
     /// agent has a runtime id, the tool is made parent-aware so background
     /// agents it spawns are registered as its children (closing the
-    /// completion-notification feedback loop).
+    /// completion-notification feedback loop). The per-agent `workflow` and
+    /// `project_root` are wired in as the review-round scope (backlog
+    /// 85313a7e), so a reviewer spawn carries the harness-rendered preamble
+    /// and stamps its round on the plan frame.
     fn register_spawn_tool(
         &self,
         registry: &mut ToolRegistry,
+        workflow: &Arc<Mutex<Workflow>>,
+        project_root: &Path,
         agent_id: Option<crate::runtime::AgentId>,
     ) {
         if let Some(spawner) = self.spawner.read().expect("spawner lock poisoned").clone() {
@@ -1313,6 +1486,18 @@ impl AgentLoopFactory {
             if let Some(memory) = &self.memory {
                 tool = tool.with_memory(Arc::clone(memory));
             }
+            // The review-round scope (backlog 85313a7e): a reviewer spawn then
+            // gets the harness-rendered preamble appended to its task — the
+            // verdict contract, the one-line constitution checks, the
+            // `.coding/**` bookkeeping rule, and for round >= 2 the delta scope
+            // (the delta since `<base>`, named via the reviewer's own
+            // `git_read` ops, + the changed file set) — and stamps its round on
+            // the plan frame once the spawn succeeds.
+            tool = tool.with_review_scope(
+                Arc::clone(workflow),
+                project_root.to_path_buf(),
+                Arc::new(crate::agent::review_scope::GitReviewScoper),
+            );
             registry.register(Box::new(tool));
         }
     }
@@ -1656,6 +1841,90 @@ mod tests {
     /// Raising a ceiling is a legitimate outcome — but it should be a
     /// deliberate edit to this test, with the new tool justified, not a
     /// silent drift.
+    /// A spawner that records what it was asked to spawn (review round 1,
+    /// LOW 3: the factory's reviewer wiring had no witness).
+    struct RecordingSpawner {
+        calls: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    impl RecordingSpawner {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSpawner for RecordingSpawner {
+        async fn spawn(
+            &self,
+            name: &str,
+            task: &str,
+            role: Option<String>,
+        ) -> Result<crate::runtime::AgentId, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), task.to_string(), role));
+            Ok(1)
+        }
+    }
+
+    /// Backlog 85313a7e, review round 1 LOW 3: every behaviour test builds the
+    /// reviewer tools with their builders directly, so DROPPING a registration
+    /// call in the factory reverted the whole feature with a green suite. This
+    /// drives the tools through the REGISTRY instead.
+    #[tokio::test]
+    async fn registered_reviewer_tools_carry_their_wiring() {
+        let dir = tempdir().unwrap();
+        let factory = make_factory(dir.path());
+        let spawner = Arc::new(RecordingSpawner::new());
+        factory.set_spawner(spawner.clone());
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+
+        // The spawn path: a reviewer spawn through the REGISTERED tool must
+        // carry the harness-rendered contract even though the task supplies
+        // none of it — i.e. `with_review_scope` is wired at registration, and
+        // the registered tool is bound to the factory's own workflow + project
+        // root.
+        let tool = registry.get("spawn_agent").expect("spawn_agent registered");
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "review the diff",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        {
+            let calls = spawner.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                calls[0].1.contains("## Reviewer contract"),
+                "the registered spawn tool must render the harness contract: {}",
+                calls[0].1
+            );
+            assert!(
+                calls[0].1.contains("## Verdict: PASS"),
+                "the contract must carry the verdict contract: {}",
+                calls[0].1
+            );
+        }
+
+        // The report path: its provenance stamp needs a real git repository to
+        // witness (its behaviour is pinned by the `FakeScoper` tests in the
+        // tool's own module), so the REGISTRATION is asserted structurally —
+        // through the same construction point the registry uses.
+        assert!(
+            factory
+                .build_write_review_report_tool(dir.path())
+                .provenance_wired(),
+            "the registered report tool must carry its provenance scoper"
+        );
+    }
+
     #[test]
     fn tools_array_stays_within_context_budget() {
         use crate::tool::ToolFilter;
@@ -1766,7 +2035,42 @@ mod tests {
             // heading-strip documentation (backlog 488248ce) plus schema
             // drift from plans landed since that pass. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Planning, 18_200),
+            // 18_200 → 18_700 (2027-02-05): the search tool's description
+            // gains the ESCAPE-HATCH note (backlog 38040f12 — literal:true
+            // advertised as the remedy for metacharacter/backslash-dense
+            // patterns, plus the malformed-rejection reformulation rule,
+            // ~+247); measures Planning at 18_275 chars (workspace-unified;
+            // standalone 17_938). Ceiling = measured + headroom, deliberate
+            // raise.
+            // 18_700 holds (2027-02-05, round 2): the search/search_read
+            // ESCAPE-HATCH parity (~+330, same cause as the Executing raise)
+            // rides Planning too — measures 18_605, 95 under; no raise
+            // needed.
+            // 18_700 → 18_900 (2027-02-05): git_read gains op="status"
+            // (backlog 1aa7e456 — the description documents the new op and
+            // the enum grows, ~+122); measures Planning at 18_727 chars.
+            // Ceiling = measured + headroom, deliberate raise.
+            // 18_900 → 19_500 (2027-02-05): the empty-call sweep (backlog
+            // d9ad618e) — five of the six fumbled tools ride Planning
+            // (graph_search/graph_context/graph_path/git_read/memory_write;
+            // shell is Executing-side only), each description gaining the
+            // no-zero-argument rule + example + recovery rule (~+900 chars
+            // of description text). Workspace-unified measures Planning at
+            // 19_241 chars on the final tree (standalone 18_757 + ~484
+            // load_tools delta under browser-on unification — the
+            // standalone run alone stays green; the workspace matrix is
+            // what CI checks). Baseline note: the prior 18_727 figure's
+            // comment stack was re-chained after the fact (the
+            // git_read-status measurement stacked above the escape-hatch
+            // figures though 37540e0 landed before 6f363f8), so 19_241 −
+            // 18_727 = +514 understates the sweep — the pinned 19_241
+            // printout is the authoritative reference for future raises.
+            // Ceiling = measured + headroom, deliberate raise.
+            // 19_500 → 20_100 (2027-01-25): token-optimizer lever 3
+            // (backlog e4a50d22) adds the always-advertised expand_result
+            // schema (~+418, rides every filter); measures Planning at 19_659
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Planning, 20_100),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -1849,7 +2153,36 @@ mod tests {
             // automatic-restart behavior, ~+484); measures Executing at
             // 32_796 chars. Ceiling = measured + headroom, deliberate
             // raise.
-            (ToolFilter::Executing, 33_200),
+            // 33_200 → 33_900 (2027-02-05): the search/search_read
+            // ESCAPE-HATCH parity (backlog 38040f12 review round 1 —
+            // search_read gains the note + RECOMMENDED wording, search
+            // gains the inline literal example, ~+330); measures Executing
+            // at 33_385 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            // 33_900 → 34_600 (2027-02-05): the empty-call sweep (backlog
+            // d9ad618e) — all six fumbled tools ride Executing (shell +
+            // the graph trio + git_read + memory_write), each description
+            // gaining the no-zero-argument rule + example + recovery rule
+            // (~+1_050 chars of description text); workspace-unified
+            // measures Executing at 34_169 chars on the final tree
+            // (standalone 33_685 + ~484 load_tools delta; the pre-sweep
+            // baselines in this stack were re-chained — see the Planning
+            // note — so delta-vs-baseline arithmetic understates the
+            // sweep; the pinned printouts are authoritative). Ceiling =
+            // measured + headroom, deliberate raise.
+            // 34_600 → 36_300 (2026-09-23): the multi_edit tool (backlog
+            // 2e27f896 — atomic multi-file edits sharing file_edit's op
+            // engine) joins the Agent set, and file_edit's batch field became
+            // the polymorphic `ops` array (compact line ops + anchor objects,
+            // one field carrying both forms) — the pair measures Executing at
+            // 35_999 chars. multi_edit's schema keeps only a pointer to
+            // file_edit's grammar (both ride the same tools array); the rest
+            // is API surface. Ceiling = measured + headroom, deliberate
+            // raise.
+            // 36_300 → 37_300 (2027-01-11): same cause as the Planning raise
+            // above (expand_result, ~+418); measures Executing at 36_963
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 37_300),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -1888,7 +2221,26 @@ mod tests {
             // plan ec425270, ~+484; PlanFrozen = Executing ∪ finish);
             // measures PlanFrozen at 34_082 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 34_500),
+            // 34_500 → 35_200 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330; PlanFrozen = Executing ∪ finish);
+            // measures PlanFrozen at 34_671 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 35_200 → 35_900 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures PlanFrozen at 35_455
+            // chars (standalone 34_971 + ~484 load_tools delta). Ceiling
+            // = measured + headroom, deliberate raise.
+            // 35_900 → 37_600 (2026-09-23): same cause as the Executing raise
+            // above (multi_edit joins the Agent set + file_edit's polymorphic
+            // `ops` field; PlanFrozen = Executing ∪ finish); measures
+            // PlanFrozen at 37_285 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            // 37_600 → 38_900 (2027-01-11): same cause as the Planning raise
+            // above (expand_result, ~+418; PlanFrozen = Executing ∪ finish);
+            // measures PlanFrozen at 38_249 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::PlanFrozen, 38_900),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -1936,7 +2288,20 @@ mod tests {
             // that landed after this filter's 2027-01-24 baseline);
             // measures ExecutingResearch at 26_921 chars. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 27_300),
+            // 27_300 → 28_000 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330); measures ExecutingResearch at
+            // 27_510 chars. Ceiling = measured + headroom, deliberate
+            // raise.
+            // 28_000 → 28_600 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures ExecutingResearch at
+            // 28_294 chars (standalone 27_810 + ~484 load_tools delta).
+            // Ceiling = measured + headroom, deliberate raise.
+            // 28_600 → 29_100 (2027-01-11): same cause as the Planning raise
+            // above (expand_result, ~+418); measures ExecutingResearch at
+            // 28_652 chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::ExecutingResearch, 29_100),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -1993,7 +2358,25 @@ mod tests {
             // plan ec425270, ~+484 — the browser family rides Reviewing);
             // measures Reviewing at 28_060 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::Reviewing, 28_400),
+            // 28_400 → 29_200 (2027-02-05): same cause as the Executing
+            // raise above (the search/search_read ESCAPE-HATCH parity,
+            // backlog 38040f12, ~+330); measures Reviewing at 28_649
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            // 29_200 → 29_800 (2027-02-05): same cause as the Executing
+            // raise (backlog d9ad618e, the six-description empty-call
+            // sweep); workspace-unified measures Reviewing at 29_433
+            // chars (standalone 28_949 + ~484 load_tools delta). Ceiling
+            // = measured + headroom, deliberate raise.
+            // 29_800 → 31_600 (2026-09-23): same cause as the Executing raise
+            // above (multi_edit joins the set + file_edit's polymorphic `ops`
+            // field) — the Reviewer's read-only agent still carries the Agent
+            // file tools' SCHEMAS (it cannot call the mutation tools, but the
+            // advertised array is shared); measures Reviewing at 31_263
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            // 31_600 → 32_700 (2027-01-11): same cause as the Planning raise
+            // above (expand_result, ~+418); measures Reviewing at 32_227
+            // chars. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 32_700),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -2012,7 +2395,27 @@ mod tests {
             // chars — the same tool set, figures and cause as Planning
             // (create_plan rides Complete). Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::Complete, 18_200),
+            // 18_200 → 18_700 (2027-02-05): same cause as the Planning raise
+            // above (the search ESCAPE-HATCH note, backlog 38040f12, ~+247);
+            // measures Complete at 18_275 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 18_700 holds (2027-02-05, round 2): same +330 parity growth as
+            // Planning — measures Complete at 18_605, 95 under; no raise
+            // needed.
+            // 18_700 → 18_900 (2027-02-05): same cause as the Planning raise
+            // above (git_read op="status", backlog 1aa7e456, ~+122);
+            // measures Complete at 18_727 chars. Ceiling = measured +
+            // headroom, deliberate raise.
+            // 18_900 → 19_500 (2027-02-05): same cause as the Planning
+            // raise (backlog d9ad618e — Complete carries the same read-only
+            // set); workspace-unified measures Complete at 19_241 chars
+            // (standalone 18_757 + ~484 load_tools delta). Ceiling =
+            // measured + headroom, deliberate raise.
+            // 19_500 → 20_100 (2027-01-11): same cause as the Planning raise
+            // above (expand_result, ~+418; Complete carries the same read-only
+            // set as Planning); measures Complete at 19_659 chars. Ceiling =
+            // measured + headroom, deliberate raise.
+            (ToolFilter::Complete, 20_100),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(
@@ -2333,6 +2736,24 @@ mod tests {
     }
 
     #[test]
+    fn auto_typing_gate_flips_live_through_the_factory() {
+        // The gate's flag is the SAME Arc the rewire path flips via
+        // `set_auto_typing_enabled`, so a Settings toggle reaches
+        // already-built tools with no registry rebuild (backlog a147b63c).
+        let dir = tempdir().unwrap();
+        let handle = AutoTypingHandle {
+            classifier: Arc::new(std::sync::RwLock::new(None)),
+            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let flag = Arc::clone(&handle.enabled);
+        let factory = make_factory(dir.path()).with_auto_typing(handle);
+        factory.set_auto_typing_enabled(true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        factory.set_auto_typing_enabled(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn expected_tool_names_registered_when_fully_wired() {
         // Maint M5: a fully-wired factory (skills + memory + spawner) must
         // register the complete expected tool name set. This guards against a
@@ -2356,7 +2777,11 @@ mod tests {
         let expected = vec![
             // agent/file tools
             "read_files",
+            // progressive disclosure (backlog e4a50d22 lever 3): serves back a
+            // tool result that was archived for size
+            "expand_result",
             "file_edit",
+            "multi_edit",
             "file_write",
             "convert_line_endings",
             "shell",

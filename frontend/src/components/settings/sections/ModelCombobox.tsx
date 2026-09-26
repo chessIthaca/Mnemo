@@ -3,7 +3,7 @@
 // See LICENSE in the repository root.
 
 /**
- * Editable combobox for the Pricing section's model field (backlog
+ * Editable combobox for the Savings section's model field (backlog
  * 82dd66fc, user-reported): a dropdown listing the models available from
  * the configured endpoints (grouped/deduped across endpoints, annotated
  * with the endpoint names — see modelOptions.ts) PLUS free-text entry for

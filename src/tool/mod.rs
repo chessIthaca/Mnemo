@@ -668,6 +668,7 @@ impl ToolFilter {
                     !matches!(
                         name,
                         "file_edit" | "file_write" | "file_append" | "convert_line_endings"
+                            | "multi_edit"
                     ) && !name.starts_with("mcp__")
                 }
                 // Same surface as Executing, skill_create included: a skill
@@ -1980,6 +1981,7 @@ mod tests {
         // ~780 tokens per turn for schemas the plan must not use.
         for name in [
             "file_edit",
+            "multi_edit",
             "file_write",
             "file_append",
             "convert_line_endings",

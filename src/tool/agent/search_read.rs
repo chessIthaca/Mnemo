@@ -113,7 +113,10 @@ impl Tool for SearchReadTool {
              the top matched files' full numbered content — collapsing the search→read \
              round-trip. Literal queries use the content index when populated (engine: \
              index), walking otherwise. Build output and dependencies are always skipped. \
-              Returns a summary line, then the matched files (capped per-file and total). \
+              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+              prefer literal:true (it avoids escaping); if a call is rejected as \
+              malformed, do NOT resend it — reformulate. \
+               Returns a summary line, then the matched files (capped per-file and total). \
               For symbol questions — where is X defined, who calls X — call graph_search \
               (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
               symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
@@ -122,9 +125,9 @@ impl Tool for SearchReadTool {
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal)."},
+                    "pattern": {"type": "string", "description": "The pattern to search for (regex by default, or literal). Prefer literal:true for text with regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex)."},
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."},
                     "max_files": {"type": "integer", "description": "Maximum number of matched files to read (default 5, max 5)."}
                 },
                 "required": ["pattern"]
@@ -262,11 +265,12 @@ impl Tool for SearchReadTool {
             // populated (same guards as search.rs — a fallback-fired pattern
             // walks so "matched literally" stays exact, review B1); matched
             // files arrive in relevance (bm25) order instead of walk order.
-            // A stale index (F10) is repaired inline for a small staleness
+            // A stale index (F10) is repaired inline for a modest staleness
             // (search::try_index re-indexes at most STALE_REINDEX_CAP files
-            // and re-queries once) — the re-index is disclosed in the note;
-            // a Stale outcome falls through to the walk with the staleness
-            // merged into the prepended note.
+            // under the codegraph stale-reindex budget, then re-queries
+            // once) — the re-index is disclosed in the note; a Stale outcome
+            // falls through to the walk with the staleness merged into the
+            // prepended note.
             let mut stale_note: Option<String> = None;
             if args.literal && !args.pattern.contains('\n') {
                 if let Some(g) = &graph {
@@ -461,6 +465,49 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchReadTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    #[test]
+    fn schema_advertises_the_literal_escape_hatch() {
+        // Backlog f4d5e053: parity with search — the ESCAPE-HATCH note, the
+        // recovery rule, and the RECOMMENDED/pattern-param wording must
+        // stay advertised (the inline example lives in search's
+        // description). Mirrors the read_files collapse test (plan
+        // 9e0b266a).
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("ESCAPE-HATCH"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("prefer literal:true"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do NOT resend"),
+            "the recovery rule must ride the description: {}",
+            schema.description
+        );
+        let props = &schema.parameters["properties"];
+        assert!(
+            props["literal"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("RECOMMENDED"),
+            "the literal param must carry the RECOMMENDED wording: {}",
+            props["literal"]
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer literal:true"),
+            "the pattern param must carry the recommendation: {}",
+            props["pattern"]
+        );
     }
 
     #[tokio::test]
@@ -725,11 +772,20 @@ mod tests {
         // target/ — Rust build output (must be skipped).
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("target/built.rs"), "fn findme() {}").unwrap();
+        // .worktrees/ — app-managed run-all worktrees: duplicate copies of
+        // the tree, never project source.
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.rs"),
+            "fn findme() {}",
+        )
+        .unwrap();
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"pattern": "findme"})).await;
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("=== src.rs"));
         assert!(!result.output.contains("target/built.rs"));
+        assert!(!result.output.contains(".worktrees"));
         assert!(result.output.contains("skipped"));
     }
 

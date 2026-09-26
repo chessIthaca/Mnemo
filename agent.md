@@ -19,7 +19,7 @@ command.
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
 - Never commit to `main` — commit to the current feature branch.
-- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch. `git` core operations (`merge`/`push`) MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way.
+- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). `git` core operations (`merge`/`push`) MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way. The skill also writes its landing records BEFORE the final commit — never after the push (see the record-phrasing rule in Branch policy).
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,
@@ -77,22 +77,36 @@ command.
   to fix stray text in a record body) or (b) a verified file-tool freeze
   (repeated drift errors on verified-identical text after a genuine fresh
   read). State the justification when you fall back to it.
-- `file_edit` batch mode (`edits`) applies several edits to one file
-  atomically — one write, one combined diff; prefer it over N separate calls.
+- `file_edit` batch mode (`ops`) applies several edits to one file
+  atomically — compact line ops (`i`/`b`/`d`/`r` verbs with ranges and
+  payloads) and anchor items in one array, in order, one write, one combined
+  diff; prefer it over N separate calls. For edits spanning several files
+  under ONE approval, use `multi_edit` (`files: [{path, ops}]`,
+  all-or-nothing).
 
 ## Branch policy (working-branch topology)
 
-- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only ever receives merge commits (via the `merge_to_main` skill: `wt/*` → `main`; the `new_release` skill performs the same sanctioned merge inline as its step 2). The skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push), and only the sync runs on the shell tool; the merge and push stay on the approval-gated `git` tool. The old `develop` integration tier was removed (2026-08-24).
-- `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. `merge_to_main` deletes the merged branch after landing it, so no branches accumulate.
+- One `wt/*` working branch per agent directory (worktree), reused across plans — the working line; `main` is protected and only receives merges — directly via the `merge_to_main` skill on unprotected repos, or through the human's chosen PR merge method where a main-protection ruleset applies (this repo since 2026-09-21, ruleset 23755694: the skill detects it up-front, pushes the branch, opens the PR, and stops for the human approving review; the `new_release` skill performs the same ruleset-aware landing inline as its step 2). On the direct path the skill syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, before the branch merge — a stale `main` otherwise surfaces later as a rejected push); the sync runs on the shell tool, the merge and push on the approval-gated `git` tool (the PR path's branch push runs on the `git` tool, equally gated). The old `develop` integration tier was removed (2026-08-24).
+- **Landing bookkeeping is written BEFORE the commit (2026-09-26).** `merge_to_main` — and `new_release` inline, as its step 2 — writes its status records while still on the branch and commits them into that branch (order: write records → commit → land), because a write issued after the push can never land: protected `main` rejects it and the branch that could have carried it is merged and deleted, so it dangles uncommitted and rides an unrelated branch. For the same reason landing records are phrased on pre-landing facts — title tail `— MERGED into main (branch <name>, <date>)`, body naming the branch's work tip, never the merge sha (a commit cannot contain its own hash) and never the PR number (it exists only after `gh pr create`); on the PR path the record ships inside the PR, so it becomes true exactly when the human merges. The skill's final check is an empty `git status --short`.
+- `create_plan` auto-forks the per-directory `wt/*` branch from `main` when on `main` (no `branch` arg) and reuses the current branch when already on one — work never silently stays on `main`. The `branch` param is reserved for an explicit user request for a specific branch name; the agent never passes it automatically. On the direct path `merge_to_main` deletes the merged branch after landing it; on the PR path the branch is deleted after the human merges the PR — no branches accumulate either way.
 - `.coding/` is the mergeable side-car: knowledge files (`.coding/knowledge/`), plans, reviews, and `backlog.jsonl` (git union merge driver) travel with git and merge across instances; `memory.db`/`codegraph.db` (rebuildable caches) and `plans/stack.json` + `instance.json` (per-instance local state) are gitignored — never committed.
 - After a git merge, the memory index converges automatically at the next project open (startup reconciliation re-derives on content-hash drift); in-session, Settings → Memory → "Rebuild index from files".
 - Never commit to main — commit to the current feature branch.
 - Parallel run-all (plan ffd7a86f) adds per-item worktree branches
   (`wt/runall-<item8>`, forked from main into `.worktrees/runall-<item8>`)
   for concurrently dispatched backlog items. These are app-managed: the
-  app lands them via serialized `--no-ff` merges into main (the
-  merge_to_main skill cannot run from a linked worktree), so main still
-  only ever receives merge commits. Spawned items' reviewer reports land
+  app lands them itself (the merge_to_main skill cannot run from a linked
+  worktree), ruleset-aware since backlog b52b041a: an UNPROTECTED main
+  gets serialized `--no-ff` merges into local main (a local merge only —
+  it never pushed; the old "pushes main directly" note here was
+  inaccurate), so main still only ever receives merge commits; a
+  PROTECTED main (ACTIVE pull_request ruleset, detected up-front via
+  `gh api repos/{owner}/{repo}/rulesets`) gets the branch pushed + a PR
+  opened (`gh pr create --base main --head <branch>`), the URL reported
+  on the item, and the branch kept for the human merge — swept at the
+  next run-start once merged into `origin/main` (backlog 64662ef2) —
+  never bypass.
+  Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.
 
@@ -120,10 +134,30 @@ project-specific checks.
   (`Set-Content`/`Out-File`/`Add-Content`/`>>`/`sed -i`/`tee`/python scripts)
   in non-test, non-generated code where `file_edit`/`file_write` would work —
   and missing justification where a fallback was genuinely needed.
+- **Re-review rounds are delta-scoped (backlog 85313a7e).** Every reviewer
+  spawn carries a harness-rendered preamble: the verdict contract, the checks
+  above as one line each, and the `.coding/**` rule (an accuracy check in one
+  line — never a line review; generated/lockfile noise is out of scope). The
+  app stamps each round's base revision on the plan frame (`## Reviews` in
+  `.coding/plans/<id>.md`) and, from round 2 on, the preamble names that base,
+  the delta scope and the mechanically-derived changed file set —
+  so a re-review verifies the DELTA, not the whole tree. It narrows only when
+  verified work is committed: **commit code at step boundaries on `wt/*`** (the
+  closing sequence still commits last, with the report) so `git diff <base>` is
+  exactly the fix. Never hand-write the preamble or the scope — the spawn path
+  renders it, and re-writing it by hand only bloats the prompt.
+- **Pre-flight self-check before ANY reviewer spawn.** Run this section's
+  checklist against the diff yourself first — documentation sync, no
+  `cfg(windows)`-only additions outside the sanctioned gate, file-tools-first,
+  and a bug fix's regression test genuinely red before the fix — and fix what
+  it finds before spawning. Minutes of own work beats a whole review round
+  (plan febcd6f5 spent three rounds, ~33 min, on a 1-3 file fix). Keep the
+  reviewer's `task` to scope + acceptance criteria + risk focus; the preamble
+  already carries the boilerplate, and the reviewer can read the plan file.
 - **Reviewer tool surface + failed-reviewer protocol.** A `role:"reviewer"`
-  subagent is read-only by construction: reads + `git_diff`/`git_log`/
-  `git_show`/`web_fetch` + the graph tools + memory/backlog **query** tools +
-  `write_review_report`. It cannot ask questions (`ask_user`), mutate memory
+  subagent is read-only by construction: reads + `git_read` (op `diff`/`log`/
+  `show`/`status`), `web_fetch`, the graph tools, memory/backlog **query** tools
+  + `write_review_report`. It cannot ask questions (`ask_user`), mutate memory
   or backlog, run plan tools, or `finish`. **Reviewer-only authorship:** a
   review report can only ever be authored by a spawned `role:"reviewer"`
   agent — `write_review_report` is visible under no other filter, and

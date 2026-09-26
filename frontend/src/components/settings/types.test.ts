@@ -69,9 +69,9 @@ describe("dirtySectionIds", () => {
       appearance: false,
       safety: true,
       vision: undefined,
-      pricing: true,
+      savings: true,
     };
-    expect(dirtySectionIds(map)).toEqual(["providers", "safety", "pricing"]);
+    expect(dirtySectionIds(map)).toEqual(["providers", "safety", "savings"]);
   });
 
   it("ignores false and undefined values", () => {

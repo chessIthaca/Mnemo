@@ -47,7 +47,8 @@ describe("approval_request preview (UI H3)", () => {
     expect(pending).not.toBeNull();
     expect(pending?.preview?.kind).toBe("diff");
     expect(pending?.preview?.diff).toContain("+y");
-    expect(pending?.preview?.path).toBe("C:/proj/a.txt");
+    const preview = pending?.preview;
+    expect(preview?.kind === "diff" ? preview.path : null).toBe("C:/proj/a.txt");
   });
 
   it("carries unifiedDiff into lastDiff on tool_result", () => {

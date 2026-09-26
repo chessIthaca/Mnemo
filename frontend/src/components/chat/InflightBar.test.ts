@@ -195,3 +195,28 @@ describe("InflightBar reasoning panel is user-controlled", () => {
     expect(source.match(/setExpanded\(/g) ?? []).toHaveLength(1);
   });
 });
+
+describe("InflightBar ctx popup quality badge", () => {
+  it("renders the grade badge only when a quality report is present", () => {
+    // Lever 6 (backlog e4a50d22): the popup is byte-for-byte unchanged when
+    // the backend's quality flag is off — the whole block is guarded on the
+    // report itself, which the event omits in that case.
+    expect(source).toContain("{contextUsage.quality && (");
+  });
+
+  it("colour-codes every grade band, worst as the fallback", () => {
+    expect(source).toContain("function qualityColor");
+    for (const band of ["S", "A", "B", "C", "D", "F"]) {
+      expect(source).toContain(`case "${band}":`);
+    }
+    // An unrecognised letter must never render uncoloured.
+    expect(source).toContain("default:");
+  });
+
+  it("shows the fill, waste, stale-read and decision components", () => {
+    expect(source).toContain("contextUsage.quality.fill_pct");
+    expect(source).toContain("contextUsage.quality.waste_tokens");
+    expect(source).toContain("contextUsage.quality.stale_read_rate");
+    expect(source).toContain("contextUsage.quality.decision_density");
+  });
+});

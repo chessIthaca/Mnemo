@@ -107,6 +107,26 @@ pub struct GeneralSection {
     /// so `"hash"` is how a user says "I really want keyword-only".
     #[serde(default = "default_bundled_embedding_model")]
     pub bundled_embedding_model: Option<String>,
+    /// **Laya classifier (opt-in).** When enabled, the app may consult a
+    /// running `laya-serve` instance (see [`LayaConfig`]) for fast,
+    /// calibrated "System 1" decisions. Disabled by default — an absent or
+    /// disabled section changes nothing: no classifier calls, no startup
+    /// cost, no new failure modes. Omitted from the saved config while every
+    /// field holds its default, so configs that never touched Laya keep no
+    /// trace of it (mirrors `[ui.steering_notes]`).
+    #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
+    pub laya: LayaConfig,
+    /// **Token-optimizer levers (opt-in, all default-off; backlog
+    /// e4a50d22).** The context levers that cut re-reads and command-output
+    /// waste at the tool dispatch layer: delta/skeleton re-reads, semantic
+    /// command-output compression, archive/expand progressive disclosure,
+    /// compaction survival, the S-F quality score, and the lean-output
+    /// nudge. An absent section means every lever off — behavior stays
+    /// byte-identical. Omitted from the saved config while every field
+    /// holds its default, so untouched configs keep no optimizer trace
+    /// (mirrors `[general.laya]`).
+    #[serde(default, skip_serializing_if = "OptimizerConfig::is_default")]
+    pub optimizer: OptimizerConfig,
     /// **Agent browser inspection (opt-in, security tradeoff).** When `true`,
     /// the app exposes the WebView2 Chrome DevTools Protocol on
     /// `localhost:9222` (the next free port when several instances run) so
@@ -168,6 +188,260 @@ pub struct EmbeddingModel {
     pub endpoint: String,
     /// The embedding model id at that endpoint.
     pub model: String,
+}
+
+/// How the Laya backend is provided.
+///
+/// `external` (the default) keeps the original contract: the user runs
+/// `laya-serve` themselves and [`LayaConfig::endpoint`] names its base URL.
+/// `managed` has the app own the runtime — the Settings → Classifier section
+/// downloads a self-contained install (uv + venv + `laya[serve]` + the
+/// checkpoint) and Mnemo starts/stops a local `laya-serve` on `127.0.0.1`
+/// whenever Laya is enabled, mirroring the bundled embedding models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LayaMode {
+    /// A user-run `laya-serve` at [`LayaConfig::endpoint`] — the default,
+    /// and the only mode configs written before it existed know.
+    #[default]
+    External,
+    /// Mnemo downloads, starts, and stops the backend itself
+    /// (Settings → Classifier).
+    Managed,
+}
+
+/// Configuration for the Laya classifier — an opt-in "System 1" decision
+/// service (`convaiinnovations/laya`) served by `laya-serve` over HTTP.
+///
+/// Laya is a fast, calibrated text classifier (not a generator): the app
+/// asks it typed questions (choice / score / yes-no) and reads back
+/// calibrated probabilities. **Disabled by default** — when
+/// [`enabled`](Self::enabled) is false (or the `[general.laya]` section is
+/// absent) the app behaves exactly as before: no classifier calls, no
+/// startup cost, no new failure modes. In [`managed`](LayaMode::Managed)
+/// mode the app runs the server itself (downloaded from Settings); in
+/// [`external`](LayaMode::External) mode it talks to a user-run instance at
+/// [`endpoint`](Self::endpoint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LayaConfig {
+    /// Whether the Laya classifier is enabled. Off by default.
+    pub enabled: bool,
+    /// Base URL of a running `laya-serve` instance, e.g.
+    /// `"http://127.0.0.1:8000"`. Required when `enabled` is true in
+    /// [`external`](LayaMode::External) mode; `None` (or blank) means "not
+    /// configured" and the classifier stays unavailable. Ignored in
+    /// [`managed`](LayaMode::Managed) mode, where the app runs the server
+    /// itself.
+    pub endpoint: Option<String>,
+    /// How the backend is provided — a user-run server
+    /// ([`External`](LayaMode::External), the default) or the app-managed
+    /// runtime ([`Managed`](LayaMode::Managed)). Omitted from the saved
+    /// config while `external`, so untouched configs keep their exact
+    /// pre-managed shape.
+    #[serde(default, skip_serializing_if = "laya_mode_is_external")]
+    pub mode: LayaMode,
+    /// The managed-mode checkpoint to serve: `"english"` (the default when
+    /// `None`) or `"multilingual"`. Only read in
+    /// [`managed`](LayaMode::Managed) mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Opt in to Laya auto-typing of memory records: at `memory_write`
+    /// time the record's typed prefix (SPEC/DECISION/BUG/PLAN/HOW/REVIEW)
+    /// is classified, and a confident answer may correct the writer's
+    /// prefix (confidence-gated — a low-confidence or missing answer keeps
+    /// the writer's prefix). Off by default, and meant to be enabled only
+    /// against a **fine-tuned** checkpoint: base Laya checkpoints are
+    /// near-chance zero-shot on this task and over-confident until
+    /// fine-tuned (train on `seed_dataset`'s labeled set — it covers
+    /// SPEC/DECISION/BUG/HOW; PLAN/REVIEW ship without seed examples), so
+    /// this is a separate opt-in from [`enabled`](Self::enabled). Omitted
+    /// from the saved config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub auto_type_memories: bool,
+    /// Opt in to Laya FAILURE TRIAGE (backlog 1a4049c1): at every
+    /// failure-handling site (the tool-execution cap, the bad-JSON repair
+    /// loop, and BOTH provider retry layers) the error text is classified
+    /// transient/permanent/needs_user/flaky_test, and a confident answer
+    /// steers the harness — a transient READ-ONLY tool failure is re-run by
+    /// the harness without a model roundtrip, other classes ride classified
+    /// guidance on the fed-back error, and a needs-user/permanent provider
+    /// error skips the retry ladder outright. Confidence-gated (≥0.80): a
+    /// low-confidence or missing answer keeps the existing rules, and the
+    /// flag alone gates every classification + training-log write. Off by
+    /// default, and meant to be enabled only against a **fine-tuned**
+    /// checkpoint — base Laya checkpoints are near-chance zero-shot on this
+    /// task, which is exactly what [`auto_finetune`](Self::auto_finetune)
+    /// builds the labeled corpus for. Omitted from the saved config while
+    /// false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub failure_triage: bool,
+    /// Opt in to the kNN OVERLAY for failure triage (item 4b): on top of
+    /// the Laya checkpoint, a local kNN classifier retrieves the most
+    /// similar logged failures from the failure-triage training log
+    /// (embedding them with the app's existing embedding backend) and
+    /// majority-votes the class, with the vote share as the confidence.
+    /// Genuinely online learning — a disposition appended to the log is
+    /// retrievable on the next classification, no retraining needed — and
+    /// independent of the Laya endpoint: it rides the local embedder,
+    /// not `laya-serve`. Still gated by the master
+    /// [`failure_triage`](Self::failure_triage) flag and the same 0.80
+    /// confidence gate (a below-threshold or tied vote falls back to the
+    /// base classifier / the pre-classifier rules). Off by default, and
+    /// omitted from the saved config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub failure_triage_knn: bool,
+    /// Opt in to the startup failure-triage FINE-TUNE (managed mode only):
+    /// at startup the app compares the logged failure corpus against the
+    /// last run's marker and, when enough new labeled rows accumulated, runs
+    /// the Laya fine-tune on the managed venv and serves the fine-tuned
+    /// checkpoint. Off by default, and never blocking startup. A "check"
+    /// with no training surface installed (laya 0.3.20 ships none) exports
+    /// the labeled dataset and skips cleanly, leaving the marker untouched
+    /// so the next startup re-checks. Omitted from the saved config while
+    /// false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub auto_finetune: bool,
+}
+
+/// `skip_serializing_if` guard for [`LayaConfig::mode`]: `external` (the
+/// default) stays unwritten, mirroring the endpoint field's
+/// absence-while-unset behavior.
+fn laya_mode_is_external(mode: &LayaMode) -> bool {
+    matches!(mode, LayaMode::External)
+}
+
+/// `skip_serializing_if` guard for [`LayaConfig`]'s boolean opt-ins
+/// (`auto_type_memories`, `failure_triage`, `auto_finetune`): `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-consumer shape.
+fn laya_flag_off(off: &bool) -> bool {
+    !*off
+}
+
+impl LayaConfig {
+    /// True while both fields hold their defaults — the `[general.laya]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`SteeringNotesCfg`]'s empty-table skip), so untouched configs keep no
+    /// Laya trace.
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && self.endpoint.is_none()
+            && self.mode == LayaMode::External
+            && self.checkpoint.is_none()
+            && !self.auto_type_memories
+            && !self.failure_triage
+            && !self.failure_triage_knn
+            && !self.auto_finetune
+    }
+}
+
+/// The `[general.optimizer]` section — the token-optimizer levers (backlog
+/// e4a50d22), all default-off. Each flag is an independent opt-in: enabling
+/// one lever never turns on another, and a flag-off lever changes nothing
+/// (its code path is skipped entirely — tool/dispatch behavior stays
+/// byte-identical to the pre-lever build).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptimizerConfig {
+    /// **Lever 1 — delta + skeleton re-reads.** When `true`, `read_files`
+    /// serves a signature/import skeleton for re-reads of unchanged files
+    /// and a unified diff for changed ones, instead of the full content
+    /// every time. First reads and ranged reads still serve full content.
+    /// Off by default.
+    pub delta_reads: bool,
+    /// **Lever 2 — semantic command-output compression.** When `true`,
+    /// large shell-tool output from known command families (cargo, npm,
+    /// pytest, go) is collapsed to distinct error/warning lines + counts +
+    /// exit status before it reaches the context. Off by default.
+    pub compress_output: bool,
+    /// **Lever 3 — archive/expand progressive disclosure.** When `true`,
+    /// tool results above
+    /// [`archive_min_chars`](Self::archive_min_chars) are archived in full
+    /// to the per-project memory DB and the context carries a preview the
+    /// model can expand via the `expand_result` tool — instead of a lossy
+    /// head-only truncation. Off by default.
+    pub archive: bool,
+    /// **Lever 4 — compaction survival.** When `true`, compaction archives
+    /// a pre-compaction checkpoint, injects extracted decisions as a
+    /// must-preserve block, and appends a heuristic post-compaction digest
+    /// (no extra LLM call). Off by default.
+    pub compaction_survival: bool,
+    /// **Quality score.** When `true`, the S-F context-quality grade rides
+    /// the `ContextUsage` events for the ctx popup. Off by default.
+    pub quality_score: bool,
+    /// **Lean-output nudge.** When `true`, a cache-safe steering note
+    /// appended to the volatile tail at
+    /// [`lean_output_fill_pct`](Self::lean_output_fill_pct) context fill
+    /// nudges the model toward concise visible output. Off by default.
+    pub lean_output_nudge: bool,
+    /// Minimum length (chars) of a tool result before lever 3 archives
+    /// it. Results under the cap pass through the existing ingestion cap
+    /// unchanged.
+    pub archive_min_chars: usize,
+    /// Minimum length (chars) of filtered shell output before lever 2
+    /// attempts compression. Smaller outputs pass through untouched.
+    pub compress_min_chars: usize,
+    /// Context fill percentage that triggers the lean-output nudge.
+    pub lean_output_fill_pct: u8,
+    /// Requests between lean-output/quality nudges (a cooldown, so a long
+    /// session is not nagged on every turn).
+    pub nudge_cooldown_requests: u32,
+    /// User-extensible command patterns (regexes) eligible for lever 2
+    /// compression in addition to the built-in families, e.g.
+    /// `"dotnet build"` or `"make .*"`. Matched against the full command
+    /// line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compress_extra_commands: Vec<String>,
+}
+
+impl OptimizerConfig {
+    /// Default `archive_min_chars` — results this large (and up) get
+    /// archived by lever 3.
+    pub const DEFAULT_ARCHIVE_MIN_CHARS: usize = 20_000;
+    /// Default `compress_min_chars` — filtered output this large (and up)
+    /// is compressed by lever 2.
+    pub const DEFAULT_COMPRESS_MIN_CHARS: usize = 2_000;
+    /// Default `lean_output_fill_pct`.
+    pub const DEFAULT_LEAN_OUTPUT_FILL_PCT: u8 = 25;
+    /// Default `nudge_cooldown_requests`.
+    pub const DEFAULT_NUDGE_COOLDOWN_REQUESTS: u32 = 10;
+
+    /// True while every field holds its default — the
+    /// `[general.optimizer]` section is then omitted from `config.toml`,
+    /// so untouched configs keep no optimizer trace (mirrors
+    /// [`LayaConfig::is_default`]).
+    fn is_default(&self) -> bool {
+        !self.delta_reads
+            && !self.compress_output
+            && !self.archive
+            && !self.compaction_survival
+            && !self.quality_score
+            && !self.lean_output_nudge
+            && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
+            && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
+            && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
+            && self.nudge_cooldown_requests == Self::DEFAULT_NUDGE_COOLDOWN_REQUESTS
+            && self.compress_extra_commands.is_empty()
+    }
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            delta_reads: false,
+            compress_output: false,
+            archive: false,
+            compaction_survival: false,
+            quality_score: false,
+            lean_output_nudge: false,
+            archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
+            compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
+            lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
+            nudge_cooldown_requests: Self::DEFAULT_NUDGE_COOLDOWN_REQUESTS,
+            compress_extra_commands: Vec::new(),
+        }
+    }
 }
 
 /// A reference to a configured endpoint + model, used by per-context model
@@ -258,6 +532,8 @@ impl Default for GeneralSection {
             vision_model: None,
             embedding_model: None,
             bundled_embedding_model: default_bundled_embedding_model(),
+            laya: LayaConfig::default(),
+            optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
             auto_compact_on_plan_complete: false,
@@ -1063,6 +1339,258 @@ bundled_embedding_model = "all-MiniLM-L6-v2"
     }
 
     #[test]
+    fn laya_defaults_to_disabled() {
+        // Opt-in only: an absent [general.laya] section (fresh config and
+        // existing configs alike) means the classifier is disabled — zero
+        // behavior change.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.enabled);
+        assert!(cfg.general.laya.endpoint.is_none());
+        assert!(!cfg.general.laya.auto_type_memories);
+        assert!(!cfg.general.laya.failure_triage);
+        assert!(!cfg.general.laya.auto_finetune);
+    }
+
+    #[test]
+    fn laya_round_trips() {
+        let text = r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.enabled);
+        assert_eq!(
+            cfg.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+        // Re-serialize + re-parse.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.enabled);
+        assert_eq!(
+            cfg2.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+    }
+
+    #[test]
+    fn laya_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [ui.steering_notes]: an untouched (default)
+        // section is skipped in config.toml; enabling Laya (or a leftover
+        // endpoint) writes it, and it round-trips.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.laya"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.laya"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.laya.enabled);
+        assert_eq!(
+            back.general.laya.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000")
+        );
+    }
+
+    #[test]
+    fn laya_mode_and_checkpoint_default_like_an_absent_section() {
+        // An absent [general.laya] section means external mode + no
+        // checkpoint — exactly the pre-managed shape, so existing configs
+        // are unaffected.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.general.laya.mode, LayaMode::External);
+        assert!(cfg.general.laya.checkpoint.is_none());
+        // is_default covers the new fields: managed mode alone counts as
+        // touched, so the section gets written.
+        let managed = LayaConfig {
+            mode: LayaMode::Managed,
+            ..Default::default()
+        };
+        assert!(!managed.is_default());
+    }
+
+    #[test]
+    fn laya_auto_typing_defaults_off_and_round_trips() {
+        // Absent section ⇒ off (zero behavior change); the flag round-trips
+        // with the section; false never leaves a serialized trace; the flag
+        // alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.auto_type_memories);
+
+        let text = r#"
+[general.laya]
+enabled = true
+endpoint = "http://127.0.0.1:8000"
+auto_type_memories = true
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.auto_type_memories);
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.auto_type_memories);
+
+        let untouched = LayaConfig::default();
+        assert!(untouched.is_default());
+        assert!(!toml::to_string(&untouched).unwrap().contains("auto_type"));
+        let only_flag = LayaConfig {
+            auto_type_memories: true,
+            ..Default::default()
+        };
+        assert!(!only_flag.is_default());
+    }
+
+    #[test]
+    fn optimizer_levers_default_off_and_round_trip() {
+        // Absent section ⇒ every lever off (byte-identical behavior); the
+        // untouched section serializes away; flags + knobs round-trip; any
+        // flag alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.optimizer.delta_reads);
+        assert!(!cfg.general.optimizer.compress_output);
+        assert!(!cfg.general.optimizer.archive);
+        assert!(!cfg.general.optimizer.compaction_survival);
+        assert!(!cfg.general.optimizer.quality_score);
+        assert!(!cfg.general.optimizer.lean_output_nudge);
+        assert_eq!(
+            cfg.general.optimizer.archive_min_chars,
+            OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
+        );
+
+        let text = r#"
+[general.optimizer]
+delta_reads = true
+archive = true
+archive_min_chars = 5000
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.optimizer.delta_reads);
+        assert!(cfg.general.optimizer.archive);
+        assert_eq!(cfg.general.optimizer.archive_min_chars, 5000);
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.optimizer.delta_reads);
+        assert_eq!(cfg2.general.optimizer.archive_min_chars, 5000);
+
+        // Untouched: no serialized trace; touched: is_default flips.
+        assert!(OptimizerConfig::default().is_default());
+        assert!(!toml::to_string(&GeneralConfig::default())
+            .unwrap()
+            .contains("optimizer"));
+        let only_flag = OptimizerConfig {
+            delta_reads: true,
+            ..Default::default()
+        };
+        assert!(!only_flag.is_default());
+    }
+
+    #[test]
+    fn laya_failure_triage_flags_default_off_and_round_trip() {
+        // All three flags follow the same opt-in convention as auto-typing:
+        // absent ⇒ false, false leaves no serialized trace, and any flag
+        // alone counts as "touched" so the section gets written.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.failure_triage);
+        assert!(!cfg.general.laya.failure_triage_knn);
+        assert!(!cfg.general.laya.auto_finetune);
+
+        let text = r#"
+[general.laya]
+enabled = true
+failure_triage = true
+failure_triage_knn = true
+auto_finetune = true
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.failure_triage);
+        assert!(cfg.general.laya.failure_triage_knn);
+        assert!(cfg.general.laya.auto_finetune);
+        let back = toml::to_string(&cfg).unwrap();
+        assert!(back.contains("failure_triage"));
+        assert!(back.contains("failure_triage_knn"));
+        assert!(back.contains("auto_finetune"));
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.failure_triage);
+        assert!(cfg2.general.laya.failure_triage_knn);
+        assert!(cfg2.general.laya.auto_finetune);
+
+        let untouched = LayaConfig::default();
+        assert!(untouched.is_default());
+        let serialized = toml::to_string(&untouched).unwrap();
+        assert!(!serialized.contains("failure_triage"));
+        assert!(!serialized.contains("failure_triage_knn"));
+        assert!(!serialized.contains("auto_finetune"));
+        assert!(!LayaConfig {
+            failure_triage: true,
+            ..Default::default()
+        }
+        .is_default());
+        assert!(!LayaConfig {
+            failure_triage_knn: true,
+            ..Default::default()
+        }
+        .is_default());
+        assert!(!LayaConfig {
+            auto_finetune: true,
+            ..Default::default()
+        }
+        .is_default());
+    }
+
+    #[test]
+    fn laya_managed_mode_round_trips() {
+        let text = r#"
+[general.laya]
+enabled = true
+mode = "managed"
+checkpoint = "multilingual"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.enabled);
+        assert_eq!(cfg.general.laya.mode, LayaMode::Managed);
+        assert_eq!(
+            cfg.general.laya.checkpoint.as_deref(),
+            Some("multilingual")
+        );
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.enabled);
+        assert_eq!(cfg2.general.laya.mode, LayaMode::Managed);
+        assert_eq!(
+            cfg2.general.laya.checkpoint.as_deref(),
+            Some("multilingual")
+        );
+    }
+
+    #[test]
+    fn laya_mode_is_omitted_while_external() {
+        // The external default never writes `mode` — a serialized external
+        // config stays shape-compatible with pre-managed configs.
+        let external = LayaConfig {
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:8000".into()),
+            ..Default::default()
+        };
+        let text = toml::to_string(&external).unwrap();
+        assert!(!text.contains("mode"));
+        let managed = LayaConfig {
+            mode: LayaMode::Managed,
+            ..Default::default()
+        };
+        assert!(toml::to_string(&managed)
+            .unwrap()
+            .contains("mode = \"managed\""));
+    }
+
+    #[test]
     fn embedding_model_round_trips() {
         let cfg = GeneralConfig {
             general: GeneralSection {
@@ -1463,6 +1991,8 @@ chat_hover_timestamps = true
                     model: "nomic-embed-text".into(),
                 }),
                 bundled_embedding_model: None,
+                laya: LayaConfig::default(),
+                optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,
                 auto_compact_on_plan_complete: false,

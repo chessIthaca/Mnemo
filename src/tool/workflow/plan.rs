@@ -2210,10 +2210,11 @@ impl Tool for CurrentPlanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "current_plan",
-            "Read-only query of the active plan. Returns the active plan's id, title, total \
-             steps, completed count, and workflow state — use this when you're unsure which plan \
-             is active (e.g. after stacked sub-plans). Returns 'no active plan' when the workflow \
-             is in Planning with no plan. Available in every workflow state.",
+            "Takes NO arguments — call it with {}. Read-only query of the active plan. Returns \
+             the active plan's id, title, total steps, completed count, and workflow state — use \
+             this when you're unsure which plan is active (e.g. after stacked sub-plans). \
+             Returns 'no active plan' when the workflow is in Planning with no plan. Available \
+             in every workflow state.",
             json!({
                 "type": "object",
                 "properties": {}
@@ -4980,6 +4981,11 @@ mod tests {
         assert_eq!(data["completed"], 1);
         assert_eq!(data["total"], 3);
         assert!(data["id"].is_string(), "id is the plan's short hex handle");
+        assert!(
+            tool.schema().description.starts_with("Takes NO arguments"),
+            "the zero-arg note LEADS the description: {}",
+            tool.schema().description
+        );
     }
 
     #[tokio::test]

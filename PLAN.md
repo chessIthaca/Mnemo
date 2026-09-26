@@ -228,8 +228,12 @@ vitest (frontend), `tsc --noEmit` clean.
 
 - **Agent tools** — the coding tools the agent uses to do work: `file_read`,
   `read_files` (batch sibling), `file_edit` (EOL-agnostic literal/fuzzy
-  matching, atomic multi-edit batches via `edits`, append mode via `append`),
-  `file_write`, `file_append`, `shell`, `search`, `git`, `describe_image`.
+  matching, atomic multi-edit batches via `ops` — compact line ops (`i`/`b`/
+  `d`/`r` verbs with ranges and payloads) and anchor items sharing one array,
+  append mode via `append`), `multi_edit` (atomic multi-file edits,
+  `files: [{path, ops}]`, every file prepared before any write — one combined
+  diff, one approval), `file_write`, `file_append`, `shell`, `search`, `git`,
+  `describe_image`.
   Live in `tool/agent/`. Gated by
   workflow state. The two read tools cross-hint each other's argument shape
   in their invalid-args error when a model mixes up a call. `search`/
@@ -308,9 +312,9 @@ vitest (frontend), `tsc --noEmit` clean.
   text in a record body in place, `memory_amend` — appends a dated amendment
   paragraph to a knowledge record's file, stripping any leading `Amended …:`
   heading the caller supplies so exactly one heading lands, dated by the
-  tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
-  (`git_log`, `git_show` in
-  `tool/agent/git_read.rs`). `memory_search` is the single read path — one
+   tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
+   (`git_read`: diff/log/show/status, `tool/agent/git_read_tool.rs`).
+   `memory_search` is the single read path — one
   tool replaced the six former per-purpose read tools (they differed only by
   a record-type constant, a tier, or the presence of a query); its
   query-less browse mode (newest-first, narrowed by record_type/tier/prefix)
@@ -354,7 +358,7 @@ vitest (frontend), `tsc --noEmit` clean.
 | Multi-instance WebView2 profiles | **Per-instance user data folders (Windows): instance 1 keeps the persistent default (`%LOCALAPPDATA%\com.mnemo.desktop\EBWebView), every additional instance gets `...\WebView2\mnemo-<pid>`; same-project double-start warns** | A second mnemo instance passed an EMPTY user data folder like the first, so both resolved the same default UDF and the second could not start its WebView2 session — a live but blank white window (2027-01-13, user report; a UDF holds at most one WebView2 session and a differently-configured second environment fails to create objects — MS Learn). Decided by a Windows named mutex keyed on the resolved default-UDF path (fresh acquire = primary, else per-pid dir): `src-tauri/src/webview_udf.rs` (`apply` wraps all three WebviewBuilder sites; `install_default_data_dir` decides at startup after project resolution), pure helpers in `src/webview_args.rs`. Primary keeps the persistent profile so cookies/OS-SSO survive restarts; macOS untouched (apply is a pass-through). Same-project detection: `<project>/.coding/instance.json` {pid, started_at} + a PID-only liveness probe (`src/instance_marker.rs`, `instance_pid_alive`) → conflict flag on the startup snapshot → frontend InstanceConflictDialog with the ProjectPicker reachable — no more silent duplication. Guarded by `src-tauri/tests/webview_udf.rs` (four source-contract tests, fail without the fix). Gotcha: plain `cargo build` leaves the opt-in `custom-protocol` feature off, so debug binaries resolve the Vite devUrl and blank-screen even with the fix — acceptance binaries must be built `--features custom-protocol`. |
 | Agent event delivery | **Rust-side delta coalescing in the forwarder** (`src-tauri/src/ipc/events.rs` `DeltaBatcher`) | Per-token `TextDelta`/`ReasoningDelta`/`ToolCallArgDelta` are batched per (agent, kind, tool-call index) and emitted as concatenated events on a 16 ms timer / structural event / 64 KiB cap — cutting the per-token IPC/WebView2 chatter that drives the inbound SEND behind the tao deadlock and the posted-queue backlog symptom. The frontend already rAF-buffers deltas (`useAgentEvents.ts` hybrid flush policy), so the batching is UI-invisible. |
 | Typed records | **Knowledge-as-files: `.coding/knowledge/<type>/<date>-<slug>.md` (TOML front matter + unbounded body, [[wiki-links]]); DB is a rebuildable cache** | Typed records (SPEC/DECISION/BUG/HOW) live as git-tracked markdown — git IS the merge mechanism across instances. The indexer derives budgeted digest memories (UUIDv5 source keys + content hashes) so both worktrees converge with no import step; `memory.db`/`codegraph.db` are gitignored caches (startup reconciliation on content-hash drift, delete-to-rebuild). Superseded-by-merge-time-bundles decision (LWW updated_at + imports ledger) superseded — files make it unnecessary. |
-| Branch topology | **One `wt/*` working branch per agent directory (worktree), reused across plans → protected `main`** | Git can't check out one branch in two worktrees, so each instance gets its own `wt/*` line (named from the directory). `create_plan` auto-forks it from `main` when on `main` (no `branch` arg) and reuses the current branch otherwise — work never silently stays on `main`; the `branch` arg is reserved for an explicit user request. `merge_to_main` syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase`, so the landed merge is immediately pushable instead of leaving `main` diverged), merges the branch into `main`, and deletes it (no accumulation). Parallel run-all's app-managed landings sync `main` with `origin` the same way before their `--no-ff` merge (2027-01-11) — stale-main drift must not be left for a human to notice hours later. The sync is skipped when `main` tracks no upstream; once it tracks one, a fetch/pull failure is surfaced rather than swallowed. `plans/stack.json` is gitignored per-instance local state; `.coding/` (plans, reviews, knowledge, backlog) travels with git. |
+| Branch topology | **One `wt/*` working branch per agent directory (worktree), reused across plans → protected `main`** | Git can't check out one branch in two worktrees, so each instance gets its own `wt/*` line (named from the directory). `create_plan` auto-forks it from `main` when on `main` (no `branch` arg) and reuses the current branch otherwise — work never silently stays on `main`; the `branch` arg is reserved for an explicit user request. `merge_to_main` lands the branch into `main` — on unprotected repos directly (sync `main` with `origin` first (`git fetch` + `git pull --no-rebase`, so the landed merge is immediately pushable instead of leaving `main` diverged), merge, then delete the branch — no accumulation); where a main-protection ruleset applies (this repo since 2026-09-21, ruleset 23755694) the skill detects it up-front, pushes the branch, opens a PR, and stops for the human approving review (the branch is deleted after the human merges). Parallel run-all's app-managed landings are ruleset-aware the same way (backlog b52b041a): on an unprotected `main` they sync `main` with `origin` before their `--no-ff` merge (2027-01-11) — stale-main drift must not be left for a human to notice hours later — and on a protected `main` they push the worktree branch and open a PR (the URL reported on the item; the branch kept for the human merge, swept at the next run-start once merged into `origin/main` — backlog 64662ef2). The sync is skipped when `main` tracks no upstream; once it tracks one, a fetch/pull failure is surfaced rather than swallowed. `plans/stack.json` is gitignored per-instance local state; `.coding/` (plans, reviews, knowledge, backlog) travels with git. |
 | Backlog format | **`.coding/backlog.jsonl`: one JSON item per line, UUID string ids, git union merge driver** | Concurrent `backlog_add` on two branches must not collide — line-oriented jsonl makes git's `merge=union` concatenation correct, and UUID ids never collide across worktrees. Legacy `.coding/backlog.json` (envelope + numeric ids) is migrated on open. |
 | Link-time levers | **Feature-gated heavy deps (`browser` = chromiumoxide, `embeddings` = fastembed/ort), dep-side `debug = false`, one merged integration-test binary, Defender exclusions; CGU=1 measured and rejected** | Plan 1c712c30 (2026-12-19), from the link-time research doc. Library-only/light builds skip the browser + embeddings trees entirely (the app always selects both features, so the shipped app is unchanged); dependencies compile without debuginfo while workspace code keeps `line-tables-only` backtraces (smaller link input + PDBs); the four integration test targets merged into one `tests/integration` binary (one full-stack link per `cargo test` instead of four, same 1986 tests); Defender excludes `target\`, `~\.cargo`, `~\.rustup`. `codegen-units = 1` measured no warm-loop win (3.2s vs 3.21s — dev incremental dominates) and was not added. From-clean workspace build 91.4s; warm loop: check 2.3s, test --lib 13.2s, test --workspace 21.0s, app rebuild 8.8s. |
 
@@ -511,12 +515,13 @@ shot.
   only on this branch)` hint when the finish lands on a non-main branch),
   and supersedes the plan's crash markers.
 
-Merge hygiene: the `merge_to_main` skill's post-merge step supersedes the
-branch-status records citing the merged branch (memory tools are always
-available inside a skill — no allow-list entry needed), so stale "unmerged"
-hints stop recalling once the branch lands. The compiled prompt encodes the
+Merge hygiene: the `merge_to_main` skill supersedes the branch-status records
+citing the merged branch ON THE BRANCH, before the landing commit (memory
+tools are always available inside a skill — no allow-list entry needed), so the
+successors land with the merge and stale "unmerged" hints stop recalling once
+the branch lands. The compiled prompt encodes the
 default-assumption rule: a feature/bug with no live unmerged marker is
-assumed to be in main (verify with `git_log`/`git_show` when it matters).
+assumed to be in main (verify with `git_read` when it matters).
 
 ### Review verdict contract
 
@@ -534,7 +539,7 @@ never grown (fail closed), and the sandbox guards hold identically in both
 modes.
 
 A `role:"reviewer"` subagent is read-only by construction: read tools +
-`git_diff`/`git_log`/`git_show`/`web_fetch` + graph tools + memory/backlog
+`git_read` (op `diff`/`log`/`show`/`status`)/`web_fetch` + graph tools + memory/backlog
 QUERIES (`memory_search`, `backlog_list`) +
 `write_review_report` — no `ask_user`, no memory/backlog mutations, no plan
 tools, no `finish` (strict `ToolFilter::Reviewer` arm, `spawn.rs`
@@ -555,6 +560,62 @@ As the agent works, the conversation grows. A `ContextManager` counts tokens
 fill-rate threshold (default 50%), summarizes the oldest turns into a single
 system message, keeping recent turns + the system prompt verbatim. Large tool
 results (file reads, shell, git) are truncated with a note.
+
+#### Optimizer levers (token-optimizer parity, backlog e4a50d22)
+
+Six independent, **default-off** context-economy levers live behind
+`[general.optimizer]` in `config.toml` (`OptimizerConfig`, `src/config/general.rs`).
+With a flag off its code path is byte-identical to the pre-lever behaviour —
+which is exactly what keeps the existing truncation/compaction/cap tests green
+without modification.
+
+| Lever | Flag | What it does |
+|---|---|---|
+| Delta/skeleton re-reads | `delta_reads` | A `read_files` re-read of a file the agent already has serves a skeleton (unchanged) or a unified diff (small change) instead of the whole file. |
+| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every model-served surface. |
+| Archive + expand | `archive` | Tool results past `archive_min_chars` are archived (full text in SQLite) and replaced by a preview; the always-advertised `expand_result` tool retrieves any row by id or keyword. |
+| Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
+| Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
+| Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
+
+**Two tables** (`src/memory/schema.rs`) record what the levers do:
+`savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,
+tokens_saved, measured, created_at`) — one row per optimization event, kinds
+`truncation, compaction, delta_read, skeleton, compression, archive,
+archive_expand, compaction_checkpoint` — and `tool_result_archive`
+(`id, session_id, tool, detail, content, char_count, created_at`) with an FTS5
+index (`tool_result_archive_fts`) behind `expand_result`'s keyword search.
+
+**Quality formula**: a 0–100 score starts at 100 and subtracts a fill penalty
+(0/6/18/35/62/70 for <40/40–59/60–74/75–89/90–94/95+ %), a waste penalty over
+`waste_tokens / served_tokens` (0/3/8/18/30 for <5/5–9/10–24/25–49/50+ %) and a
+stale-read penalty (0/3/8/15 for <10/10–24/25–49/50+ %). Bands: `S` >=95,
+`A` >=85, `B` >=70, `C` >=55, `D` >=40, else `F`. Fill is deliberately
+dominant — waste or stale reads alone can only reach `B`/`A`, so a
+busy-but-roomy session never reads as critical. Deterministic, with every band
+boundary unit-tested (`src/agent/optimizer.rs`).
+
+**Invariants** (each pinned by a test):
+
+* Nothing is dropped before it is archived — the archive write always precedes
+the substitution, and every archive/store error is fail-open (pre-lever
+behaviour is the fallback), so no lever can lose data.
+* The already-sent conversation prefix is never mutated: the lean-output nudge
+rides the *volatile tail*, popped right after the request. The post-compaction
+digest is a **persistent** system note appended to the freshly-compacted
+conversation — the summary itself is that rewrite, so nothing already sent is
+changed. Either way the provider prefix cache stays valid.
+* Tools stay store-free — they emit `data.savings {kind, tokens_before,
+tokens_after}` on the result and the turn loop records the row, keeping the
+agent core the single writer to the ledger.
+* Tool-reported token counts are estimates (`chars / 4`, `measured = false`).
+* Credentials are redacted on every compressed surface the model sees.
+
+**Dashboard**: the savings dashboard, its aggregates and its IPC landed
+afterwards in plan `6494b738` (backlog `652ae094`) — `savings_stats()`
+aggregating this ledger, the `get_savings_stats` IPC command, and the Dashboard
+view (right panel, immediately before Memory). That work reused this ledger's
+schema unchanged.
 
 ### Error recovery
 
@@ -579,6 +640,17 @@ string (a live incident re-emitted the same missing-`message` git commit
 15 times while the error text repeated identically). The scan is
 history-based, so it works across turn boundaries and decays naturally at
 the compaction boundary; `MAX_RETRIES` semantics are unchanged.
+
+Bad-JSON repeats get a sibling mechanism (backlog 38040f12): when the same
+tool's arguments fail to parse as JSON twice, the per-call retry message
+switches from schema advice to a strategy-changing, harness-attributed
+correction naming a different formulation per tool — `literal: true` or a
+metacharacter-free pattern for search/search_read, chunking for
+file_write/file_edit, rebuild-from-scratch otherwise — because a repeat
+means the emission itself is failing (typically escaping), which the
+model already knows the schema for. The correction rides the Tool role
+(context-only, no Error event) and the `MAX_BAD_JSON_RETRIES = 8` backstop
+is unchanged.
 
 ### Path safety (sandbox)
 
@@ -920,7 +992,7 @@ toggle). The layout mirrors the original design but with web-grade rendering:
 |---|---|
 | **Md viewer** | Renders a markdown file readably — headings, lists, code blocks (Shiki-highlighted), wrapped prose, tables, task lists. Scrollable. Editable (toggle edit mode). |
 | **Plan progress** | The current plan with checkboxes, progress count, active step highlighted. Reflects `.coding/plans/` on disk. |
-| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` approvals. Auto-shown when an approval is pending. |
+| **Diff viewer** | Syntax-highlighted unified or side-by-side diff for `file_edit` / `file_write` / `multi_edit` approvals (`multi_edit` shows one combined diff covering every file it changes). Auto-shown when an approval is pending. |
 | **Tool output** | Live output from shell commands and search results. |
 | **File browser** | Navigable project file tree; opening a file switches to the md viewer. |
 
@@ -1120,6 +1192,63 @@ These capabilities are implemented and shipped but were not in the original
 PLAN.md scope. They are documented here so the PRD reflects the shipped
 product.
 
+- **Opt-in Laya classifier foundation** (`src/memory/classifier.rs`, mirrored
+  `build_classifier` in `src/provider/client_factory.rs`) — a `Classifier`
+  trait beside `Embedder` plus a Laya HTTP backend (`POST /v1/systemone`) for
+  fast, calibrated "System 1" decisions. Disabled by default: with Laya off (or
+  enabled without an endpoint) no client is built and no call is ever made, so
+  the app behaves exactly as before. Status surfaces via
+  `get_classifier_status` + the startup snapshot, and Settings → Classifier
+  carries the toggle, endpoint URL, install hints, and live status (2027-01-16,
+  backlog bb54bdcc; the consumer features — memory typing (shipped), model
+  routing, tool steering, failure triage — each confidence-gated).
+- **Managed Laya runtime** (`src-tauri/src/ipc/laya.rs`) — embedding-parity
+  UX for the classifier: Settings → Classifier downloads a self-contained
+  runtime (uv binary + virtualenv + `laya[serve]` + checkpoint, ~0.8–1 GB
+  plus the checkpoint, under the app config dir) with live progress, and
+  while managed mode is enabled the app automatically starts, monitors, and
+  stops the `laya-serve` sidecar on 127.0.0.1 (startup hook + save-driven
+  rewire + app-exit stop). No command line, no Python prerequisites;
+  external mode (user-run endpoint) is preserved.
+- **Laya memory auto-typing** (`src/memory/auto_typing.rs`) — the
+  classifier's first consumer: at `memory_write` time a choice question
+  over the six typed prefixes may correct the writer's prefix when the
+  calibrated confidence clears 0.80; a low-confidence or missing answer
+  keeps the writer's prefix, and with the separate `auto_type_memories`
+  opt-in off (the default) nothing changes at all. The tool reads the
+  shared classifier slot + a flag mirror at call time (Settings toggles
+  are live without a rebuild), and every correction or keep is noted in
+  the write's message + data. Base checkpoints are near-chance on this
+  task — enable it only against a checkpoint fine-tuned on the seed
+  labeled set `seed_dataset` builds from `.coding/knowledge/` (covers
+  SPEC/DECISION/BUG/HOW; PLAN/REVIEW ride untrained until those corpora
+  can seed them — follow-up) (backlog a147b63c).
+- **Laya failure triage + startup fine-tune** (`src/agent/failure_triage.rs`,
+  `src-tauri/src/ipc/finetune.rs`) — the classifier's second consumer: at
+  every failure-handling site (the tool-execution cap + bad-JSON repair loop
+  in `src/agent/turn.rs` and BOTH provider retry layers — the inner
+  `complete_with_retry` and the outer `run_turn_attempt`) the error text is
+  classified (transient / permanent / needs_user / flaky_test,
+  `TRIAGE_THRESHOLD` 0.80 inclusive) and a confident answer lets the harness
+  act: a transient READ-ONLY tool failure is auto-retried without a model
+  roundtrip (≤1 per call, ≤4 per turn, never mutating tools), other classes
+  ride targeted guidance on the fed-back error, and a confident
+  needs-user/permanent provider error skips both retry ladders immediately
+  (a marked error text makes the outer layer skip without re-classifying; a
+  429 is never classified). Every classified failure is logged with its true
+  disposition to a JSONL training log; the startup fine-tune (managed mode +
+  `auto_finetune`) re-trains the checkpoint from that log when ≥50 new
+  labeled rows accrued and hot-swaps the served checkpoint (an ineligible
+  run exports the dataset + skips cleanly — laya 0.3.20 ships no training
+  surface). The kNN overlay (`src/agent/failure_triage_knn.rs`, flag
+  `failure_triage_knn`) learns from that same log between fine-tunes: each
+  failure text is embedded with the live memory embedder, the five most
+  similar logged failures vote, and the vote share is the confidence (the
+  same 0.80 gate; consulted before the shared Laya slot, falling back to it
+  below threshold — no `laya-serve` needed, genuinely online: appended
+  dispositions are retrievable without a restart). All three flags are
+  separate opt-ins (default off); disabled behavior is byte-identical
+  (backlog 1a4049c1; the overlay is item 4b, backlog 057f7a34).
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the
@@ -1152,6 +1281,26 @@ product.
   The configured reviewing model is authoritative. `abandon_plan` is
   available in the Reviewing state as the escape hatch for an un-completable
   review (returns to Planning — the main agent is never stuck in Reviewing).
+- **Delta-scoped review rounds** (backlog 85313a7e, 2027-01) — a reviewer
+  spawn carries a harness-rendered preamble: the verdict contract
+  (`## Verdict: PASS` / `## Verdict: FINDINGS (n high, n low)` — the strings
+  `finish` validates), the constitution checks as one line each, and the
+  `.coding/**` rule (accuracy check in one line, never a line review). The
+  spawn path stamps each round's base revision (`git rev-parse HEAD`) onto the
+  plan frame (`PlanFile::reviews` → the `## Reviews` section of
+  `.coding/plans/<id>.md`, so scope survives a restart), and from round 2 on
+  the preamble names that base, the delta-scope instruction (naming the
+  reviewer's own `git_read` ops) and the changed file set (derived from
+  `git diff --name-status <base>` + untracked files) — a
+  re-review verifies the DELTA instead of re-reading the whole tree (plan
+  febcd6f5 burned three full-tree rounds, ~33 min, to verify a 1-3 file fix).
+  The stamp lands ONLY after a successful spawn, so a failed spawn can widen
+  the next round's scope but never narrow it to a diff nobody verified;
+  `write_review_report` appends a trailing `Reviewed-state: <sha>` to a fresh
+  report (trailing, not front matter — the verdict line must stay first).
+  Rendering lives in `src/agent/review_scope.rs` (`render_review_preamble`,
+  `ReviewScoper`), the git reads in `src/project/git_ops.rs`
+  (`head_commit_sha` / `changed_paths_since`).
 - **Extra workflow tools + sub-plan stack** — beyond `create_plan` /
   `complete_step`, the shipped workflow tools include `file_append`,
   `update_plan`, and `abandon_plan`. `create_plan` while already executing
@@ -1241,10 +1390,11 @@ product.
   alternation), a distinct "glob matched no files" hint, and a filename
   fallback on zero content hits; `current_plan` reports the active plan's
   on-disk file; FTS index hits are freshness-checked (on-disk mtime vs
-  as-of-index) so the edit→watcher gap repairs a small staleness inline (≤ 8
-  stale files re-indexed and the query re-served from the fresh index with a
-  "reindexed N stale file(s)" note) and serves the walk with a staleness note
-  only above that cap or while an index pass runs;
+  as-of-index) so the edit→watcher gap repairs a modest staleness inline
+  under an adaptive bound (up to 32 stale files re-indexed within a ~500 ms
+  budget, then the query re-served from the fresh index with a "reindexed N
+  stale file(s)" note) and serves the walk with a staleness note only beyond
+  that ceiling, once the budget is spent, or while an index pass runs;
   `create_plan`'s RECALLED CONTEXT rider title-term-boosts on-point rows;
   uuid-shaped search patterns earn a fired-only known-memory-hit note; a
   session crossing 15 working-memory events gets a once-per-session

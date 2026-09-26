@@ -51,8 +51,13 @@ use crate::tool::agent::pattern;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
-/// Directory names that are never searched — build output, dependencies, or
-/// VCS metadata. Searching these is slow and almost never what the user wants.
+/// Directory names that are never searched — build output, dependencies, VCS
+/// metadata, or app-managed worktrees. Searching these is slow and almost
+/// never what the user wants. `.worktrees/` (run-all item worktrees linked
+/// under the main tree) holds a duplicate copy of the project: indexing it
+/// would add duplicate rows, and its own continuously-written
+/// `.coding/codegraph.db` would otherwise trigger debounced passes on the
+/// MAIN tree's watcher.
 const IGNORED_DIRS: &[&str] = &[
     "target",       // Rust build output
     "node_modules", // JS dependencies
@@ -68,11 +73,45 @@ const IGNORED_DIRS: &[&str] = &[
     ".idea",        // JetBrains
     ".vscode",      // VS Code (keep config, skip nothing — but skip anyway)
     ".claude",      // Claude Code's own bookkeeping (plans, settings) — not project source
+    ".worktrees",   // app-managed run-all worktrees (wt/runall-<item8>)
 ];
 
 /// Whether a path component is an ignored directory.
 pub(crate) fn is_ignored_component(name: &str) -> bool {
     IGNORED_DIRS.contains(&name)
+}
+
+/// Whether a ROOT-RELATIVE path is one of the app's own SQLite stores under
+/// `.coding/` (the codegraph + memory DBs and their journal/WAL sidecars).
+///
+/// These are binary caches whose contents are meaningless as search results,
+/// and the graph DB is written DURING every index pass — indexing it into
+/// itself would re-index forever. This is the ONE predicate that keeps the
+/// content index's coverage and the file watcher's trigger set in agreement:
+/// the index skips these files and the watcher must not fire on them, so
+/// every OTHER `.coding/` file is both indexed and watched.
+///
+/// (A shared predicate rather than two rules: the sets drifted apart once —
+/// the watcher rejected `.coding/` wholesale while the index covered it, so
+/// knowledge/plan/review/backlog writes could never trigger the pass that
+/// would refresh their own rows.)
+pub(crate) fn is_coding_data_file(rel: &Path) -> bool {
+    const DATA_FILES: &[&str] = &[
+        "codegraph.db",
+        "codegraph.db-wal",
+        "codegraph.db-shm",
+        "codegraph.db-journal",
+        "memory.db",
+        "memory.db-wal",
+        "memory.db-shm",
+        "memory.db-journal",
+    ];
+    if rel.components().next().and_then(|c| c.as_os_str().to_str()) != Some(".coding") {
+        return false;
+    }
+    rel.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| DATA_FILES.contains(&name))
 }
 
 /// Whether a file should be searched: skip ignored dirs, the app's own data
@@ -97,30 +136,11 @@ pub(crate) fn should_search(path: &Path, root: &Path) -> bool {
             }
         }
     }
-    // Never scan the app's own SQLite stores under `.coding/` (codegraph +
-    // memory DBs and their journal/WAL sidecars): they are binary caches
-    // whose contents are meaningless as search results, and indexing the
-    // graph DB into itself is self-referential (the DB changes during every
-    // pass, so it would re-index forever). read_to_string only skips them
-    // opportunistically (when a page happens to be non-UTF-8) — excluded
-    // deterministically here so the walk engine and the FTS content index
-    // stay in exact agreement.
-    if rel.components().next().and_then(|c| c.as_os_str().to_str()) == Some(".coding") {
-        const DATA_FILES: &[&str] = &[
-            "codegraph.db",
-            "codegraph.db-wal",
-            "codegraph.db-shm",
-            "codegraph.db-journal",
-            "memory.db",
-            "memory.db-wal",
-            "memory.db-shm",
-            "memory.db-journal",
-        ];
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if DATA_FILES.contains(&name) {
-                return false;
-            }
-        }
+    // Never scan the app's own SQLite stores under `.coding/` — see
+    // `is_coding_data_file`, the predicate the file watcher SHARES so the
+    // index's coverage and the watcher's trigger set cannot drift apart.
+    if is_coding_data_file(rel) {
+        return false;
     }
     // Skip files over 1 MB — likely minified bundles or data files.
     if let Ok(meta) = std::fs::metadata(path) {
@@ -339,13 +359,16 @@ fn descend(
 const MAX_MATCHES: usize = 100;
 
 /// Maximum number of stale files re-indexed INLINE inside a search tool
-/// call (F10): a small staleness — the watcher's reindex lagging one or two
-/// edits — is repaired on the spot ([`CodeGraph::reindex_stale_files`]) and
-/// the query re-served from the fresh index. Above the cap (a checkout-scale
+/// call (F10): a staleness — the watcher's reindex lagging a burst of edits
+/// — is repaired on the spot ([`CodeGraph::reindex_stale_files`]) and the
+/// query re-served from the fresh index. This ceiling is an ADAPTIVE upper
+/// bound, NOT the latency guard itself: within it the repair runs under
+/// [`crate::codegraph::STALE_REINDEX_BUDGET`], whose pass stops between
+/// files once the budget is spent — a slow set therefore degrades to the
+/// walk instead of a slow tool call. Beyond the ceiling (a checkout-scale
 /// staleness), or while an index pass is running, the tree walk stays the
-/// answer: parsing dozens of files inside a tool call would blow the call's
-/// latency budget, and the walk is authoritative anyway.
-const STALE_REINDEX_CAP: usize = 8;
+/// answer: the walk is authoritative anyway.
+const STALE_REINDEX_CAP: usize = 32;
 
 /// Maximum number of bypassed delegation keys retained. Once a query has
 /// delegated, its identical re-issues never re-delegate in-session; the set
@@ -841,9 +864,11 @@ pub(crate) enum FtsOutcome {
     Hits(IndexHits),
     /// The FTS rows lag the working tree for `files` of the returned hits
     /// and the inline refresh did not clear it — above
-    /// [`STALE_REINDEX_CAP`], an index pass was already running, the
-    /// re-index failed, or the files were edited again during the retry.
-    /// The caller falls through to the walk and surfaces the staleness.
+    /// [`STALE_REINDEX_CAP`], [`crate::codegraph::STALE_REINDEX_BUDGET`]
+    /// spent before the last stale file was refreshed, an index pass was
+    /// already running, the re-index failed, or the files were edited again
+    /// during the retry. The caller falls through to the walk and surfaces
+    /// the staleness.
     Stale {
         files: usize,
     },
@@ -956,13 +981,15 @@ fn fts_page(
 /// F10 staleness (the FTS rows lag the working tree for some hit files) is
 /// REPAIRED, not just surfaced: when at most [`STALE_REINDEX_CAP`] files are
 /// stale and no index pass is running, they are re-indexed inline
-/// ([`crate::codegraph::CodeGraph::reindex_stale_files`]) and the query is
-/// re-run ONCE from the fresh index — the outcome then carries the number of
-/// refreshed files so the caller can disclose the side effect. A staleness
-/// above the cap, a busy index pass, a failed re-index, or files edited again
-/// during the retry yields [`FtsOutcome::Stale`] — the caller walks and
-/// surfaces the staleness. A re-index that empties the result set returns
-/// `None` (→ walk, no note): the walk is the authoritative answer.
+/// ([`crate::codegraph::CodeGraph::reindex_stale_files`], under
+/// [`crate::codegraph::STALE_REINDEX_BUDGET`]) and the query is re-run ONCE
+/// from the fresh index — the outcome then carries the number of files
+/// actually refreshed so the caller can disclose the side effect. A
+/// staleness above the ceiling, a budget that ran out with files still
+/// stale, a busy index pass, a failed re-index, or files edited again during
+/// the retry yields [`FtsOutcome::Stale`] — the caller walks and surfaces the
+/// staleness. A re-index that empties the result set returns `None` (→ walk,
+/// no note): the walk is the authoritative answer.
 pub(crate) fn try_index(
     graph: &crate::codegraph::CodeGraph,
     root: &Path,
@@ -980,14 +1007,19 @@ pub(crate) fn try_index(
                 reindexed,
             }));
         }
-        if attempt == 0
-            && page.stale_paths.len() <= STALE_REINDEX_CAP
-            && graph
-                .reindex_stale_files(&page.stale_paths)
-                .is_ok_and(|n| n > 0)
-        {
-            reindexed = page.stale_paths.len();
-            continue; // re-query once from the fresh index
+        if attempt == 0 && page.stale_paths.len() <= STALE_REINDEX_CAP {
+            // The budget-bounded pass: an Err (busy/failed) and a spent
+            // budget with nothing refreshed both land on 0 → walk below. A
+            // budget spent MID-set leaves the rest stale, so the re-query
+            // still trips and the caller walks — `reindexed` can never
+            // over-report.
+            let refreshed = graph
+                .reindex_stale_files(&page.stale_paths, crate::codegraph::STALE_REINDEX_BUDGET)
+                .unwrap_or(0);
+            if refreshed > 0 {
+                reindexed = refreshed;
+                continue; // re-query once from the fresh index
+            }
         }
         return Some(FtsOutcome::Stale {
             files: page.stale_paths.len(),
@@ -1203,19 +1235,23 @@ impl Tool for SearchTool {
              pointing at literal:true. A broken regex is matched literally with a note. \
              Returns matching lines with paths and line numbers. Build output and \
              dependencies (target/, node_modules/, .git/, dist/) are pruned from the walk. \
-              For symbol questions — where is X defined, who calls X, callers/callees/blast \
-              radius — call graph_search (then graph_context(id=...)) FIRST; this tool is for \
-              text occurrences (comments, string literals, config keys, log text). \
-              Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
-              an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
-              SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-              and the walk is skipped; re-issue the same search to get the plain file search.",
+              ESCAPE-HATCH: for text with regex metacharacters or backslashes \
+              prefer literal:true (it avoids escaping) — e.g. a search for the \
+              literal (?< is pattern (?< with literal true; if a call is \
+              rejected as malformed, do NOT resend it — reformulate. \
+               For symbol questions — where is X defined, who calls X, callers/callees/blast \
+               radius — call graph_search (then graph_context(id=...)) FIRST; this tool is for \
+               text occurrences (comments, string literals, config keys, log text). \
+               Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
+               an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
+               SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
+               and the walk is skipped; re-issue the same search to get the plain file search.",
             json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The pattern to search for."},
+                    "pattern": {"type": "string", "description": "The pattern to search for. Prefer literal:true for text with regex metacharacters or backslashes."},
                     "glob": {"type": "string", "description": "Glob pattern to filter files (e.g. \"**/*.rs\")."},
-                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex)."}
+                    "literal": {"type": "boolean", "description": "Treat pattern as literal text (default: false, regex). RECOMMENDED for text with regex metacharacters or backslashes — avoids escaping."}
                 },
                 "required": ["pattern"]
             }),
@@ -1361,10 +1397,11 @@ impl Tool for SearchTool {
             // queries token `foo`), matching MORE lines than the literal
             // promises — only the walk engine keeps "matched literally"
             // semantics exact (review B1). A stale index (F10) is repaired
-            // inline for a small staleness — try_index re-indexes at most
-            // STALE_REINDEX_CAP files and re-queries once — so a Stale
-            // outcome here means the repair was not attempted or did not
-            // clear it (above the cap, a pass running, or re-edited files).
+            // inline for a modest staleness — try_index re-indexes at most
+            // STALE_REINDEX_CAP files under the codegraph stale-reindex
+            // budget, then re-queries once — so a Stale outcome here means
+            // the repair was not attempted or did not clear it (beyond the
+            // ceiling, the budget spent, a pass running, or re-edited files).
             let mut stale_note: Option<String> = None;
             if args.literal && !args.pattern.contains('\n') {
                 if let Some(g) = &graph {
@@ -1540,6 +1577,57 @@ mod tests {
         let graph = crate::codegraph::CodeGraph::open_in_memory(dir.to_path_buf()).unwrap();
         graph.index(None).unwrap();
         SearchTool::new(Sandbox::new(dir).unwrap(), Some(std::sync::Arc::new(graph)))
+    }
+
+    #[test]
+    fn schema_advertises_the_literal_escape_hatch() {
+        // Backlog f4d5e053 (the 38040f12 incident's tool-description
+        // complement): a pattern dense in regex metacharacters or
+        // backslashes is exactly the emission class that degrades — the
+        // description must advertise `literal: true` as the remedy, the
+        // malformed-rejection recovery rule, and an inline example, so the
+        // first try succeeds instead of looping (plan 263a9e31: five
+        // consecutive failures on one escaped pattern). Mirrors the
+        // read_files collapse test (plan 9e0b266a).
+        let tool = make_tool(std::path::Path::new("."));
+        let schema = tool.schema();
+        assert!(
+            schema.description.contains("ESCAPE-HATCH"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("prefer literal:true"),
+            "{}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("do NOT resend"),
+            "the recovery rule must ride the description: {}",
+            schema.description
+        );
+        assert!(
+            schema.description.contains("pattern (?< with literal true"),
+            "the inline example must show the exact call shape: {}",
+            schema.description
+        );
+        let props = &schema.parameters["properties"];
+        assert!(
+            props["literal"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("RECOMMENDED"),
+            "the literal param must carry the RECOMMENDED wording: {}",
+            props["literal"]
+        );
+        assert!(
+            props["pattern"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Prefer literal:true"),
+            "the pattern param must carry the recommendation: {}",
+            props["pattern"]
+        );
     }
 
     #[tokio::test]
@@ -1951,6 +2039,16 @@ mod tests {
         // project source. Must be skipped like the other ignored dirs.
         std::fs::create_dir_all(dir.path().join(".claude/plans")).unwrap();
         std::fs::write(dir.path().join(".claude/plans/old.md"), "findme").unwrap();
+        // .worktrees/ — app-managed run-all worktrees (agent.md): linked
+        // worktrees under the main tree, each a duplicate copy of the
+        // project. Indexing them duplicates rows, and a worktree's own
+        // .coding/ DB writes must not churn the main index pass.
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.rs"),
+            "fn findme() {}",
+        )
+        .unwrap();
 
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"pattern": "findme"})).await;
@@ -1962,8 +2060,33 @@ mod tests {
         assert!(!result.output.contains("node_modules"));
         assert!(!result.output.contains(".git"));
         assert!(!result.output.contains(".claude"));
+        assert!(!result.output.contains(".worktrees"));
         // The summary reports skipped files.
         assert!(result.output.contains("skipped"));
+    }
+
+    /// Guard (NOT a regression pin — green before and after the
+    /// `.worktrees` fix): the ignore rules are ROOT-RELATIVE, so a project
+    /// root that IS itself a worktree path (a run-all item agent runs in
+    /// `.worktrees/runall-<id>`) stays fully searchable. If the predicate
+    /// were ever applied to absolute paths, the fix that stops the MAIN
+    /// tree indexing worktree duplicates would blind every worktree
+    /// instance's own search.
+    #[tokio::test]
+    async fn worktree_root_stays_searchable() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join(".worktrees/runall-abcd12");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/own.rs"), "fn findme() {}").unwrap();
+
+        let tool = make_tool(&root);
+        let result = tool.execute(json!({"pattern": "findme"})).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("src/own.rs"),
+            "a worktree instance's own root must stay searchable: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -2530,7 +2653,8 @@ mod tests {
     #[tokio::test]
     async fn pruned_walk_matches_the_index_engine_and_never_searches_ignored_dirs() {
         // Equivalence pin: over a tree WITH ignored dirs (node_modules,
-        // target, dist), the pruned walk engine reports the same totals as
+        // target, dist, .worktrees), the pruned walk engine reports the
+        // same totals as
         // the index engine (whose coverage walker prunes the same dirs),
         // and a needle planted inside an ignored dir never matches.
         let dir = tempdir().unwrap();
@@ -2541,6 +2665,12 @@ mod tests {
         std::fs::write(dir.path().join("target/built.rs"), "findme").unwrap();
         std::fs::create_dir_all(dir.path().join("dist")).unwrap();
         std::fs::write(dir.path().join("dist/out.js"), "findme").unwrap();
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.js"),
+            "findme",
+        )
+        .unwrap();
 
         let walker = make_tool(dir.path());
         let r_walk = walker
@@ -2553,7 +2683,7 @@ mod tests {
             r_walk.output
         );
         assert!(
-            r_walk.output.contains("skipped 3 ignored dirs"),
+            r_walk.output.contains("skipped 4 ignored dirs"),
             "pruned dirs are counted: {}",
             r_walk.output
         );
@@ -3223,12 +3353,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nine_stale_files_reindex_inline() {
+        // The live repro (backlog 9201704f, 2027-01-25): NINE stale hit files
+        // — one past the old cap of 8 — fell back to the tree walk with
+        // "content index stale for 9 file(s)". The adaptive bound repairs
+        // them inline and serves the fresh index instead. This boundary is
+        // hit routinely: the watcher deliberately does not watch .coding/,
+        // so an artifact-heavy session (plans, memories, reviews) reaches a
+        // nine-file staleness with nobody else touching the tree.
+        let dir = tempdir().unwrap();
+        let count = 9;
+        for i in 0..count {
+            std::fs::write(dir.path().join(format!("stale{i:02}.md")), "needle v1\n").unwrap();
+        }
+        let tool = make_indexed_tool(dir.path());
+        // Edit every file AFTER indexing + bump mtimes — the edit→watcher
+        // gap, at the exact size the old hard cap refused.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for i in 0..count {
+            let path = dir.path().join(format!("stale{i:02}.md"));
+            std::fs::write(&path, "needle v2\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.output.contains("reindexed 9 stale file(s)"),
+            "nine stale files are repaired inline: {}",
+            r.output
+        );
+        assert!(r.output.contains("engine: index"), "{}", r.output);
+        assert!(
+            !r.output.contains("engine: walk"),
+            "no walk fallback for a nine-file staleness: {}",
+            r.output
+        );
+        assert!(
+            !r.output.contains("note: note:"),
+            "single note prefix: {}",
+            r.output
+        );
+        assert!(r.output.contains("needle v2"), "{}", r.output);
+    }
+
+    #[tokio::test]
     async fn stale_above_the_reindex_cap_walks() {
-        // A checkout-scale staleness (more than STALE_REINDEX_CAP files)
-        // must NOT be repaired inline — parsing dozens of files inside a
-        // tool call would blow the latency budget. The walk stays the
-        // answer and the staleness is surfaced with a single "note: "
-        // prefix (the doubled "note: note:" bug, user request 2026-12-30).
+        // A staleness BEYOND the inline ceiling (more than
+        // STALE_REINDEX_CAP files) must NOT be repaired inline — the
+        // adaptive bound stops there and the walk stays the answer. The
+        // staleness is surfaced with a single "note: " prefix (the doubled
+        // "note: note:" bug, user request 2026-12-30).
         let dir = tempdir().unwrap();
         let cap = STALE_REINDEX_CAP;
         for i in 0..=cap {

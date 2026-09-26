@@ -15,6 +15,12 @@
 //!   indexed source (`source_key` like `plan:<id>` / `review:<file-stem>` /
 //!   `backlog:<id>`) with the content hash that produced its derived memory,
 //!   so re-runs skip unchanged sources entirely (no re-embed, no write)
+//! - `savings_events` — per-event token-savings ledger (backlog e4a50d22 /
+//!   652ae094): one row per context-optimization event with before/after
+//!   counts
+//! - `tool_result_archive` (+ `tool_result_archive_fts`) — full originals of
+//!   oversized tool results (backlog e4a50d22 lever 3), with an FTS5 index so
+//!   `expand_result` can search them by keyword
 
 use rusqlite::Connection;
 
@@ -122,6 +128,50 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_request_stats_model ON request_stats(model);
         CREATE INDEX IF NOT EXISTS idx_request_stats_created ON request_stats(created_at);
 
+        -- Per-event token-savings ledger (backlog e4a50d22 / 652ae094): one
+        -- row per context-optimization event — what would have entered the
+        -- context vs. what actually did. Kinds: the existing levers
+        -- `truncation`/`compaction` (instrumented by item 652ae094) + the
+        -- optimizer levers `delta_read`, `skeleton`, `compression`,
+        -- `archive`, `archive_expand`, `compaction_checkpoint`.
+        -- `measured` distinguishes provider-metered counts (1) from
+        -- estimates (0); `tokens_saved` is negative for re-expansions.
+        CREATE TABLE IF NOT EXISTS savings_events (
+            id            TEXT PRIMARY KEY,
+            session_id    TEXT,
+            kind          TEXT NOT NULL,
+            detail        TEXT,
+            tokens_before INTEGER NOT NULL,
+            tokens_after  INTEGER NOT NULL,
+            tokens_saved  INTEGER NOT NULL,
+            measured      INTEGER NOT NULL DEFAULT 0,
+            created_at    INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_savings_events_session
+            ON savings_events(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_savings_events_kind
+            ON savings_events(kind);
+
+        -- Progressive disclosure (backlog e4a50d22 lever 3): full originals of
+        -- tool results too large to keep in context. The context carries a
+        -- preview naming the row id; `expand_result` serves the archive back
+        -- (by id, or by FTS keyword search). Rows are immutable once written.
+        CREATE TABLE IF NOT EXISTS tool_result_archive (
+            id          TEXT PRIMARY KEY,
+            session_id  TEXT,
+            tool        TEXT,
+            detail      TEXT,
+            content     TEXT NOT NULL,
+            char_count  INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_result_archive_session
+            ON tool_result_archive(session_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tool_result_archive_tool
+            ON tool_result_archive(tool);
+
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER NOT NULL
         );
@@ -164,6 +214,30 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
                 VALUES('delete', old.rowid, old.title, old.content);
                 INSERT INTO memories_fts(rowid, title, content)
                 VALUES (new.rowid, new.title, new.content);
+            END;
+            "#,
+        )?;
+        // Progressive-disclosure archive (backlog e4a50d22 lever 3): an
+        // external-content FTS5 index over the archived originals so
+        // `expand_result` can find a dropped tool result by keyword. Archive
+        // rows are immutable once written, so INSERT/DELETE triggers suffice.
+        conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS tool_result_archive_fts USING fts5(
+                detail,
+                content,
+                content='tool_result_archive',
+                content_rowid='rowid'
+            );
+            CREATE TRIGGER IF NOT EXISTS tool_result_archive_fts_ai
+            AFTER INSERT ON tool_result_archive BEGIN
+                INSERT INTO tool_result_archive_fts(rowid, detail, content)
+                VALUES (new.rowid, new.detail, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS tool_result_archive_fts_ad
+            AFTER DELETE ON tool_result_archive BEGIN
+                INSERT INTO tool_result_archive_fts(tool_result_archive_fts, rowid, detail, content)
+                VALUES('delete', old.rowid, old.detail, old.content);
             END;
             "#,
         )?;

@@ -1,0 +1,7 @@
++++
+title = "Laya managed runtime — sidecar lifecycle + setup invariants"
+created = "2027-01-11"
+status = "superseded"
++++
+
+SPEC (plan d6fc659a, landed on wt/mnemo via commits 9de7e08..82dd8b6, round-5 review PASS): the Laya managed runtime lives in src-tauri/src/ipc/laya.rs. Setup pipeline: ensure_uv (GitHub release asset, sha256 digest verified BEFORE extraction, scratch-name extract + rename) → uv venv + `uv pip install laya[serve]` → checkpoint preload into the redirected HF cache with dir-size progress; all progress rides the shared ClassifierStatus (emitted classifier://status). Lifecycle invariants: (1) the child slot is `Mutex<Option<(Child, generation)>>` — spawn_server holds the lock across stop→spawn→record so concurrent starts serialize; failed readiness probes and the success path use stop_if_generation/owns_generation so only the winning start owns status + port. (2) spawn_setup_task re-derives (autostart, laya_off) from the LIVE config at completion via the pure setup_autostart_decision — mid-setup saves always win. (3) The completion-arm status restore is gated by the pure is_setup_progress predicate (Installing or Downloading labeled "uv"/checkpoint id) — never over a concurrent writer's terminal status. (4) Log is per-PID (server-<pid>.log). Rewire (rewire.rs) stops any child and restarts on a fresh port; startup hook + console twin + RunEvent::Exit/Drop share the same paths. Consumer features (model routing, tool steering, triage, memory typing) remain future work.

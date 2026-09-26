@@ -21,17 +21,21 @@
 //! Goes through approval — spawning an agent consumes model tokens and starts
 //! a concurrent actor, so it should be a deliberate, user-visible action.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex;
 
+use crate::agent::review_scope::{render_review_preamble, ReviewScope, ReviewScoper};
 use crate::memory::MemoryStoreTrait;
 use crate::model_resolver::ModelResolver;
 use crate::provider::ToolSchema;
 use crate::runtime::AgentSpawner;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
+use crate::workflow::Workflow;
 
 /// Arguments for `spawn_agent`.
 #[derive(Debug, Deserialize)]
@@ -49,7 +53,7 @@ struct SpawnAgentArgs {
     model: Option<String>,
     /// An optional role that constrains the spawned agent's tool surface.
     /// Currently the only supported value is `"reviewer"`: a read-only agent
-    /// that can read code + run `git_diff` + write its report via
+    /// that can read code + run `git_read` + write its report via
     /// `write_review_report`, but cannot edit project files, run shell, commit,
     /// spawn, or finish. Omit for an unrestricted sub-agent (the default).
     #[serde(default)]
@@ -110,6 +114,31 @@ pub struct SpawnAgentTool {
     /// (backlog 1d0332ca): their task must stay clean — byte-identical to
     /// the `task` argument.
     memory: Option<Arc<dyn MemoryStoreTrait>>,
+    /// The review-round scope wiring (backlog 85313a7e), when one is wired:
+    /// the workflow holding the plan frame's round stamps, the project root
+    /// the git reads run in, and the git-facing scoper. Reviewer spawns then
+    /// get the harness-rendered preamble appended to their task and stamp
+    /// their round on the plan frame after a successful spawn. `None` in
+    /// tests — the spawn then behaves exactly as before.
+    review_scope: Option<ReviewScopeWiring>,
+}
+
+/// The wiring that lets a REVIEWER spawn render the harness preamble and stamp
+/// its round (backlog 85313a7e).
+///
+/// Wired by the factory; absent in tests / store-less setups, where a reviewer
+/// spawn forwards the task verbatim exactly as it did before.
+pub struct ReviewScopeWiring {
+    /// The agent's workflow — its active plan frame carries the round stamps
+    /// ([`Workflow::review_rounds`]) and receives the new one.
+    workflow: Arc<Mutex<Workflow>>,
+    /// The repository the git reads run in (the agent's project root).
+    root: PathBuf,
+    /// The git-facing scope reader — [`GitReviewScoper`] in production, a
+    /// canned double in tests.
+    ///
+    /// [`GitReviewScoper`]: crate::agent::review_scope::GitReviewScoper
+    scoper: Arc<dyn ReviewScoper>,
 }
 
 impl SpawnAgentTool {
@@ -120,6 +149,7 @@ impl SpawnAgentTool {
             parent_id: None,
             model_resolver: None,
             memory: None,
+            review_scope: None,
         }
     }
 
@@ -148,6 +178,32 @@ impl SpawnAgentTool {
     /// construction (when a store is wired).
     pub fn with_memory(mut self, memory: Arc<dyn MemoryStoreTrait>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Wire in the review-round scope (backlog 85313a7e): the workflow whose
+    /// plan frame carries the round stamps, the project root the git reads run
+    /// in, and the git-facing [`ReviewScoper`]. A REVIEWER spawn then gets the
+    /// harness-rendered preamble appended to its task — the verdict contract,
+    /// the one-line constitution checks, the `.coding/**` bookkeeping rule,
+    /// and, for round >= 2, the delta scope (the delta since `<base>`, named
+    /// via the reviewer's own `git_read` ops, plus the mechanically-derived
+    /// changed file set) — and stamps its round once the
+    /// spawn succeeds. Every step is best-effort: a git failure degrades the
+    /// CHANGED-FILE SET to an instruction (the whole preamble to the contract
+    /// block on a first round) and never blocks a spawn. Returns `self` for
+    /// chaining — the factory calls this right after construction.
+    pub fn with_review_scope(
+        mut self,
+        workflow: Arc<Mutex<Workflow>>,
+        root: PathBuf,
+        scoper: Arc<dyn ReviewScoper>,
+    ) -> Self {
+        self.review_scope = Some(ReviewScopeWiring {
+            workflow,
+            root,
+            scoper,
+        });
         self
     }
 }
@@ -192,7 +248,7 @@ impl Tool for SpawnAgentTool {
                     "role": {
                         "type": "string",
                         "description": "Optional role constraining the agent's tools. \"reviewer\" = \
-                                         read-only: read tools, git_diff/git_log/git_show, \
+                                         read-only: read tools, git_read (op diff/log/show/status), \
                                          web_fetch, graph tools, memory/backlog QUERIES and \
                                          write_review_report — it cannot ask questions, mutate \
                                          memory/backlog, run plans, or finish. A reviewer \
@@ -226,7 +282,7 @@ impl Tool for SpawnAgentTool {
         }
 
         // Validate the optional `role`. "reviewer" constrains the spawned
-        // agent to a read-only tool surface (read tools + git_diff +
+        // agent to a read-only tool surface (read tools + git_read +
         // write_review_report); any other value is rejected so an unknown
         // role can't silently spawn an unrestricted agent.
         let role = match args.role.as_deref().map(str::trim) {
@@ -347,6 +403,65 @@ impl Tool for SpawnAgentTool {
             }
         };
 
+        // The harness-rendered reviewer preamble (backlog 85313a7e). The
+        // review contract — the verdict lines `finish` accepts, the one-line
+        // constitution checks, the `.coding/**` bookkeeping rule — is appended
+        // by the TOOL, so it holds on every reviewer spawn even when the
+        // dispatching agent's task omits it. For round >= 2 it also carries the
+        // DELTA SCOPE: the base revision the previous round verified, the
+        // delta-since-`<base>` instruction (naming the reviewer's own
+        // `git_read` ops), and the mechanically-derived changed file set — so a
+        // re-review verifies the delta instead of re-reading
+        // the whole tree (plan febcd6f5 burned three whole-tree rounds to
+        // verify a 1-3 file fix). NON-reviewer spawns are untouched: their task
+        // stays byte-identical (the 1d0332ca invariant above).
+        //
+        // Best-effort throughout: a git failure degrades the changed-file set to
+        // an instruction (contract-only preamble on a first round) and never
+        // blocks a spawn, and a missing stamp only ever means the NEXT round
+        // reviews full scope again — never a falsely narrower one.
+        let mut stamped_base: Option<String> = None;
+        let task = match (role.as_deref(), self.review_scope.as_ref()) {
+            (Some("reviewer"), Some(wiring)) => {
+                let (round, previous_base) = {
+                    // Snapshot-and-drop: the workflow lock is shared with every
+                    // workflow tool, so it is released before any git
+                    // round-trip (never held across I/O).
+                    let wf = wiring.workflow.lock().await;
+                    let rounds = wf.review_rounds();
+                    let round = rounds.len() as u32 + 1;
+                    let previous_base = if round >= 2 {
+                        rounds.last().map(|s| s.base.clone())
+                    } else {
+                        None
+                    };
+                    (round, previous_base)
+                };
+                // HEAD is this round's base: the dispatcher suspends while the
+                // reviewer works, so the tree it starts looking at is the tree
+                // this sha names.
+                let head = wiring.scoper.head(&wiring.root).await.ok();
+                let (changed, changed_note) = match previous_base.as_deref() {
+                    Some(base) => match wiring.scoper.changed_paths(&wiring.root, base).await {
+                        Ok(paths) => (paths, None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    },
+                    None => (Vec::new(), None),
+                };
+                let preamble = render_review_preamble(&ReviewScope {
+                    round,
+                    base: previous_base,
+                    changed,
+                    changed_note,
+                });
+                stamped_base = head;
+                format!("{task}\n\n{preamble}")
+            }
+            // Every other spawn (including a reviewer with no scope wiring
+            // and the unrestricted sub-agents) forwards the task verbatim.
+            _ => task,
+        };
+
         // Prefer the parent-aware spawn when the concrete spawner supports it
         // (the IPC layer's `IpcSpawner`) AND we know our owning agent's id, so
         // the child is registered as this agent's child and the completion-
@@ -378,6 +493,20 @@ impl Tool for SpawnAgentTool {
 
         match spawned {
             Ok(id) => {
+                // Stamp the round ONLY after a successful spawn: a rejected or
+                // failed spawn must never advance it, or a crashed reviewer
+                // would narrow the next round's scope to a diff it never
+                // verified. Best-effort — the agent is already spawned, and an
+                // unstamped round only WIDENS the next review (fail-safe).
+                let mut stamp_note: Option<String> = None;
+                if let (Some(base), Some(wiring)) =
+                    (stamped_base.as_deref(), self.review_scope.as_ref())
+                {
+                    let mut wf = wiring.workflow.lock().await;
+                    if let Err(e) = wf.record_review_round(base) {
+                        stamp_note = Some(e.to_string());
+                    }
+                }
                 let mut output = format!(
                     "Spawned background agent '{}' (id {id}) and started it on the task. \
                      Its events appear under that agent in the sidebar; you'll be notified \
@@ -392,6 +521,15 @@ impl Tool for SpawnAgentTool {
                          resolution.",
                     );
                 }
+                // Never silent: a failed stamp means the NEXT reviewer spawn
+                // will review full scope, which the agent should know before it
+                // reports the round as delta-scoped.
+                if let Some(note) = stamp_note {
+                    output.push_str(&format!(
+                        " Note: the review round was not stamped ({note}) — the next \
+                         reviewer spawn reviews full scope."
+                    ));
+                }
                 ToolResult::success(output)
             }
             Err(e) => ToolResult::error(format!("failed to spawn agent: {e}")),
@@ -402,6 +540,7 @@ impl Tool for SpawnAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::Mutex;
 
     /// A mock spawner that records calls and returns a canned id.
@@ -472,6 +611,266 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "reviewer");
         assert_eq!(calls[0].1, "review the last commit");
+    }
+
+    /// A canned [`ReviewScoper`] — no git subprocess, no temp repo.
+    struct FakeScoper {
+        head: Result<String, String>,
+        changed: Result<Vec<String>, String>,
+    }
+
+    impl FakeScoper {
+        /// A healthy repo: HEAD `head9999`, one changed file.
+        fn ok() -> Self {
+            Self {
+                head: Ok("head9999".to_string()),
+                changed: Ok(vec!["M src/a.rs".to_string()]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ReviewScoper for FakeScoper {
+        async fn head(&self, _root: &Path) -> Result<String, String> {
+            self.head.clone()
+        }
+
+        async fn changed_paths(&self, _root: &Path, _base: &str) -> Result<Vec<String>, String> {
+            self.changed.clone()
+        }
+    }
+
+    /// A workflow (tokio mutex — NOT the test module's `std` one) with one
+    /// active plan in a throwaway plans dir; the TempDir is returned so it
+    /// outlives the test.
+    fn workflow_with_plan() -> (tempfile::TempDir, Arc<tokio::sync::Mutex<Workflow>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wf = Workflow::new(dir.path().join("plans"));
+        wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
+        (dir, Arc::new(tokio::sync::Mutex::new(wf)))
+    }
+
+    #[tokio::test]
+    async fn reviewer_spawn_gets_the_contract_without_the_dispatcher_supplying_it() {
+        // Acceptance (b): the standard preamble rides every reviewer spawn even
+        // though this task mentions none of it — and round 1 has no delta scope
+        // (there is nothing to delta against yet).
+        let (_dir, workflow) = workflow_with_plan();
+        let spawner = Arc::new(MockSpawner::ok(1));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper::ok()),
+        );
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "review the uncommitted changes",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let task = spawner.calls.lock().unwrap()[0].1.clone();
+        assert!(
+            task.starts_with("review the uncommitted changes"),
+            "the dispatching agent's task must stay the head of the prompt: {task}"
+        );
+        assert!(task.contains("## Reviewer contract"), "{task}");
+        assert!(task.contains("## Verdict: PASS"), "{task}");
+        assert!(task.contains("## Verdict: FINDINGS (n high, n low)"), "{task}");
+        assert!(task.contains(".coding/**"), "{task}");
+        assert!(!task.contains("Re-review scope"), "{task}");
+        // The round is stamped once the spawn succeeded.
+        let rounds = workflow.lock().await.review_rounds().to_vec();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].base, "head9999");
+    }
+
+    #[tokio::test]
+    async fn second_reviewer_spawn_is_delta_scoped() {
+        // Acceptance (a): a 2nd reviewer spawn for a plan automatically names
+        // its base revision, the delta instruction and the changed file set —
+        // all mechanically derived, none supplied by the dispatching agent.
+        let (_dir, workflow) = workflow_with_plan();
+        workflow
+            .lock()
+            .await
+            .record_review_round("abc1234")
+            .unwrap();
+        let spawner = Arc::new(MockSpawner::ok(2));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper::ok()),
+        );
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "re-review after fixing the findings",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let task = spawner.calls.lock().unwrap()[0].1.clone();
+        assert!(task.contains("Re-review scope (round 2 of this plan)"), "{task}");
+        assert!(task.contains("Base revision: `abc1234`"), "{task}");
+        assert!(task.contains("the delta since `abc1234`"), "{task}");
+        assert!(task.contains("M src/a.rs"), "{task}");
+        let rounds = workflow.lock().await.review_rounds().to_vec();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[1].round, 2);
+        assert_eq!(rounds[1].base, "head9999");
+    }
+
+    #[tokio::test]
+    async fn a_head_failure_still_spawns_and_stamps_nothing() {
+        // Best-effort: an unreadable HEAD must never block a spawn, and must
+        // never leave a stamp behind — an unstamped round only WIDENS the next
+        // review (fail-safe), never narrows it. The delta block STILL renders:
+        // its lower bound is the PREVIOUS round's recorded base, not this
+        // round's HEAD.
+        let (_dir, workflow) = workflow_with_plan();
+        workflow
+            .lock()
+            .await
+            .record_review_round("abc1234")
+            .unwrap();
+        let spawner = Arc::new(MockSpawner::ok(3));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper {
+                head: Err("not a git repository".to_string()),
+                changed: Err("not a git repository".to_string()),
+            }),
+        );
+        let result = tool
+            .execute(json!({"name": "reviewer", "task": "t", "role": "reviewer"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let task = spawner.calls.lock().unwrap()[0].1.clone();
+        assert!(task.contains("## Reviewer contract"), "{task}");
+        assert!(task.contains("Re-review scope (round 2 of this plan)"), "{task}");
+        assert!(task.contains("Base revision: `abc1234`"), "{task}");
+        assert!(task.contains("Changed file set: unavailable"), "{task}");
+        // No new stamp: the round was never reviewed against a known state.
+        let rounds = workflow.lock().await.review_rounds().to_vec();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].base, "abc1234");
+    }
+
+    #[tokio::test]
+    async fn a_changed_paths_failure_degrades_to_the_command_not_a_file_list() {
+        // HEAD readable, diff not: the delta block still names the base and the
+        // command, and the round IS stamped (its base was readable).
+        let (_dir, workflow) = workflow_with_plan();
+        workflow
+            .lock()
+            .await
+            .record_review_round("abc1234")
+            .unwrap();
+        let spawner = Arc::new(MockSpawner::ok(4));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper {
+                head: Ok("head9999".to_string()),
+                changed: Err("fatal: bad revision".to_string()),
+            }),
+        );
+        let result = tool
+            .execute(json!({"name": "reviewer", "task": "t", "role": "reviewer"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let task = spawner.calls.lock().unwrap()[0].1.clone();
+        assert!(task.contains("Changed file set: unavailable"), "{task}");
+        assert!(task.contains("fatal: bad revision"), "{task}");
+        assert!(task.contains("the delta since `abc1234`"), "{task}");
+        assert_eq!(workflow.lock().await.review_rounds().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn non_reviewer_spawn_task_is_byte_identical() {
+        // The 1d0332ca invariant holds through this change: only reviewer
+        // spawns get a preamble.
+        let (_dir, workflow) = workflow_with_plan();
+        let spawner = Arc::new(MockSpawner::ok(5));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper::ok()),
+        );
+        let result = tool
+            .execute(json!({"name": "worker", "task": "do the thing"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(spawner.calls.lock().unwrap()[0].1, "do the thing");
+        assert!(workflow.lock().await.review_rounds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reviewer_spawn_without_scope_wiring_forwards_the_task_verbatim() {
+        // Backward compatibility: no wiring (tests / store-less setups) behaves
+        // exactly as it did before this change.
+        let spawner = Arc::new(MockSpawner::ok(6));
+        let tool = SpawnAgentTool::new(spawner.clone());
+        let result = tool
+            .execute(json!({
+                "name": "reviewer",
+                "task": "review the diff",
+                "role": "reviewer"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(spawner.calls.lock().unwrap()[0].1, "review the diff");
+    }
+
+    #[tokio::test]
+    async fn a_failed_spawn_stamps_no_round() {
+        // A failed spawn must never advance the round: a crashed reviewer
+        // would otherwise narrow the next round's scope to a diff it never
+        // verified.
+        let (_dir, workflow) = workflow_with_plan();
+        let spawner = Arc::new(MockSpawner {
+            calls: Mutex::new(vec![]),
+            result: Err("boom".to_string()),
+        });
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper::ok()),
+        );
+        let result = tool
+            .execute(json!({"name": "reviewer", "task": "t", "role": "reviewer"}))
+            .await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("failed to spawn agent"),
+            "{}",
+            result.output
+        );
+        assert!(workflow.lock().await.review_rounds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unstampable_round_is_reported_not_silent() {
+        // A reviewer spawned with no plan in flight: the preamble still rides,
+        // the spawn succeeds, and the failed stamp is surfaced to the agent
+        // (never a silent no-op).
+        let dir = tempfile::tempdir().unwrap();
+        let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let spawner = Arc::new(MockSpawner::ok(9));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
+            Arc::clone(&workflow),
+            PathBuf::from("."),
+            Arc::new(FakeScoper::ok()),
+        );
+        let result = tool
+            .execute(json!({"name": "reviewer", "task": "t", "role": "reviewer"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(result.output.contains("was not stamped"), "{}", result.output);
+        assert_eq!(spawner.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

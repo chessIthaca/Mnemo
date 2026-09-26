@@ -598,11 +598,17 @@ export function createAgentEventDispatcher(deps: DispatcherDeps): AgentEventDisp
         useAgentStore.getState().autoRevealPlan();
       } else if (evt.kind === "approval_request") {
         // Auto-reveal the Diff viewer for file tool approvals
-        // (file_edit / file_write / file_append). Mirrors the plan
-        // auto-reveal behavior: only when panel is hidden and the tab is
-        // enabled; never yank the user from a visible panel.
+        // (file_edit / file_write / file_append / multi_edit — the same
+        // family DiffViewer's `isFileEditTool` renders; review 1r). Mirrors
+        // the plan auto-reveal behavior: only when panel is hidden and the
+        // tab is enabled; never yank the user from a visible panel.
         const tool = evt.tool_name;
-        if (tool === "file_edit" || tool === "file_write" || tool === "file_append") {
+        if (
+          tool === "file_edit" ||
+          tool === "file_write" ||
+          tool === "file_append" ||
+          tool === "multi_edit"
+        ) {
           useAgentStore.getState().autoRevealDiff();
         }
         // Auto-switch to a subagent when it hits a security approval, so the

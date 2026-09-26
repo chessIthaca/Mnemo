@@ -1,0 +1,18 @@
+{
+  "kind": "context_usage",
+  "max": 8000,
+  "used": 6000,
+  "breakdown": {
+    "system": 500,
+    "user": 200,
+    "assistant": 200,
+    "tool": 100
+  },
+  "quality": {
+    "grade": "C",
+    "fill_pct": 75,
+    "waste_tokens": 1200,
+    "stale_read_rate": 30,
+    "decision_density": 50
+  }
+}

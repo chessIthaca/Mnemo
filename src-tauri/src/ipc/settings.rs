@@ -1022,7 +1022,8 @@ pub async fn save_settings(
     rewire_vision_embedder_and_classifier(&app, &state, &reloaded);
 
     // Push the reloaded config into the per-context model resolver so
-    // `[models]` overrides take effect on the next turn.
+    // `[models]` overrides take effect on the next request (per-request
+    // resolution, 2027-01-25).
     sync_model_resolver(&state, &reloaded);
 
     // Push the reloaded `[git].core_operations` into the factory's shared

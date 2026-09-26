@@ -1052,7 +1052,8 @@ pub(crate) struct Brain {
     safety_mode: Arc<RwLock<SafetyMode>>,
     /// The per-context model resolver (shared with the factory). The IPC layer
     /// pushes reloaded config into it after a Settings save so `[models]`
-    /// overrides take effect on the next turn.
+    /// overrides take effect on the next request (resolution runs per request,
+    /// 2027-01-25).
     model_resolver: Arc<mnemo::model_resolver::ConfigModelResolver>,
     /// The shared LLM request/response trace log — wired into the default
     /// provider + every resolver-built provider and exposed to the IPC layer

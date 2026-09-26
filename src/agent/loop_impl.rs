@@ -302,6 +302,19 @@ pub struct AgentLoop {
     /// a stale toolbar echo or the endpoint-level default (backlog
     /// 51dab4da).
     pub(crate) resolved_effort: std::sync::Mutex<Option<String>>,
+    /// The effective (model, endpoint, effort) triple that served the most
+    /// recent provider request — the last value announced to the UI as
+    /// `ModelChanged`. Unlike [`resolved_model`](Self::resolved_model) this
+    /// is never overwritten by a swap or a pick; it is written only when a
+    /// request is actually served, so the turn loop can tell a change that
+    /// just landed (2027-01-25: model/reasoning changes land before the next
+    /// call, like steers) from one still in flight. Seeded once from the
+    /// pre-serve display state
+    /// ([`seed_served_effective_if_empty`](Self::seed_served_effective_if_empty))
+    /// so the first request does not re-announce what `list_agents` already
+    /// reports.
+    pub(crate) served_effective:
+        std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>,
     /// The DISPLAY-space effort of the DEFAULT provider slot — set by the
     /// factory at construction (from the default `ModelRef`), by `set_model`
     /// swaps, and by Settings saves that rebuild the default. `None` when
@@ -747,6 +760,7 @@ impl AgentLoop {
             resolved_model: std::sync::Mutex::new(None),
             resolved_provider: std::sync::Mutex::new(None),
             resolved_effort: std::sync::Mutex::new(None),
+            served_effective: std::sync::Mutex::new(None),
             default_display_effort: std::sync::Mutex::new(None),
             pinned_display_effort: std::sync::Mutex::new(None),
             descendant_tracker: None,
@@ -1027,6 +1041,66 @@ impl AgentLoop {
             .clone()
     }
 
+    /// Seed the last-served effective (model, endpoint, effort) triple from
+    /// the current display state — the value `list_agents` would report —
+    /// when no request has served this loop yet. Called at the top of every
+    /// `run_turn`; idempotent (an already-seeded loop is left alone), so the
+    /// loop's FIRST serve is compared against the pre-serve belief: a change
+    /// that landed before the very first request (e.g. a deferred pick
+    /// completed at `run_turn` entry) still announces itself, while an
+    /// unchanged serve stays silent.
+    pub(crate) fn seed_served_effective_if_empty(&self) {
+        let mut slot = self
+            .served_effective
+            .lock()
+            .expect("served_effective lock poisoned");
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some((
+            self.resolved_model()
+                .unwrap_or_else(|| self.provider().model().to_string()),
+            self.effective_provider_name(),
+            self.resolved_effort().or_else(|| self.default_display_effort()),
+        ));
+    }
+
+    /// Record the effective (model, endpoint, effort) triple serving the
+    /// current provider request and report whether it differs from the
+    /// previous one — the turn loop emits `ModelChanged` exactly when this
+    /// returns `true`. Called from `resolve_iteration_provider` AFTER the
+    /// per-request resolution, so the announcement is tied to the request
+    /// actually served: a mid-run swap into the live default slot, a
+    /// completed deferred pick, and a mid-turn override flip all land here
+    /// (2027-01-25). An empty memory seeds silently and reports `false`.
+    pub(crate) fn note_served_effective(
+        &self,
+        model: &str,
+        endpoint: Option<&str>,
+        effort: Option<&str>,
+    ) -> bool {
+        let mut slot = self
+            .served_effective
+            .lock()
+            .expect("served_effective lock poisoned");
+        let next = (
+            model.to_string(),
+            endpoint.map(str::to_string),
+            effort.map(str::to_string),
+        );
+        match slot.as_ref() {
+            None => {
+                *slot = Some(next);
+                false
+            }
+            Some(prev) if *prev == next => false,
+            Some(_) => {
+                *slot = Some(next);
+                true
+            }
+        }
+    }
+
     /// Record the DISPLAY-space effort of the DEFAULT provider slot — set
     /// by the factory at construction (from the default `ModelRef`), by
     /// `set_model` swaps, and by Settings saves that rebuild the default.
@@ -1164,8 +1238,8 @@ impl AgentLoop {
     ///    live config `[models]` section (skill already handled in step 1).
     ///
     /// `skill_name` is the active skill's name (`Some` only while a skill is
-    /// active). The resolver reads the live config each call, so a Settings
-    /// save takes effect on the next turn.
+    /// active). The resolver reads the live config each call, and the call
+    /// runs per request, so a Settings save takes effect on the next request.
     ///
     /// Called at the top of EVERY `run_turn` loop iteration (i.e. per
     /// provider request, not once per turn) — so a mid-turn workflow change
@@ -1619,16 +1693,19 @@ impl AgentLoop {
     }
 
     /// Swap in a new provider + context manager (e.g. when the user switches
-    /// models from the status bar). Takes effect on the next turn — a turn
-    /// already in flight finishes against the provider it started with (each
-    /// turn snapshots the provider into a local at the start).
+    /// models from the status bar). Takes effect on the NEXT REQUEST — the
+    /// turn loop re-reads the live pair at the top of every iteration, so an
+    /// in-flight run issues its next request against the new provider
+    /// (2027-01-25: mid-run switches land before the next call, like steers;
+    /// they no longer wait for the next turn). A single request still talks
+    /// to one provider throughout.
     ///
     /// When this is an EXPLICIT per-agent picker switch (the
     /// [`set_explicit_provider`](Self::set_explicit_provider) variant), the
     /// new provider additionally pins THIS agent's turn resolution ahead of
     /// forced / subagent / workflow-state overrides, so the picker's choice
-    /// survives to the next turn (a configured skill override still beats
-    /// the pin). The pin is STATE-SCOPED (2026-12-20) — see
+    /// lands on the next request and survives to the next turn (a configured
+    /// skill override still beats the pin). The pin is STATE-SCOPED (2026-12-20) — see
     /// [`set_explicit_provider`] for where it yields to a configured
     /// `[models.*]` slot on a workflow-state change. Plain `set_provider`
     /// remains the *default* slot swap (factory rebuilds, global console
@@ -1668,8 +1745,10 @@ impl AgentLoop {
     /// — so the turn loop can summarize the conversation using the OLD provider
     /// before completing the swap. This prevents a too-large conversation from
     /// being sent to a smaller-context model (which would fail with a 400/502).
-    /// The turn loop calls [`take_pending_swap`](Self::take_pending_swap) at the
-    /// top of `run_turn` to complete the swap after summarization.
+    /// The turn loop completes it via [`take_pending_swap`](Self::take_pending_swap)
+    /// both at the top of `run_turn` and at the top of every loop iteration —
+    /// a deferred pick made mid-run therefore lands before the next request of
+    /// the same run.
     pub fn set_explicit_provider(
         &self,
         provider: Arc<dyn LlmClient>,

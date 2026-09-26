@@ -1427,7 +1427,8 @@ export async function saveEndpoints(
  * `agentId` selects the agent to switch; pass `null` for the legacy global
  * switch (factory + every live agent). The provider for the chosen endpoint +
  * model is rebuilt and swapped into that agent's loop only (takes effect on
- * its next turn); other agents keep their models.
+ * that agent's next request — a mid-run switch lands before the next call of
+ * the run already in flight); other agents keep their models.
  *
  * `reasoningEffort` is the raw dropdown value (`max`/`high`/`medium`/`low`/
  * `minimal`/`off`). The backend maps `"off"` to omitting the field from

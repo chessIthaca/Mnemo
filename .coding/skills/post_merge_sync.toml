@@ -19,7 +19,10 @@
 #   remote ref.
 # - `git branch -d`, never blindly -D (step 5): -D is justified ONLY by the
 #   step-4 content check (a squash/rebase merge rewrote the tip), and that check
-#   is recorded.
+#   is recorded. A branch checked out in a linked worktree (run-all branches
+#   live checked out in .worktrees/) refuses BOTH -d and -D - report it and
+#   move on; the run-all sweep owns those, and a sweep refusal never justifies
+#   abandoning the skill (round-1 review LOW-1).
 # - The containment check covers the merge method (step 4): a merge-commit PR
 #   keeps the branch tip an ancestor of main (exit 0); squash/rebase rewrites
 #   it - verify content instead. PR #7 (f7e1fa5) and PR #9 (7e83f10) both
@@ -49,7 +52,7 @@ Sync main after a PR merge and retire the merged working branch - no plan needed
 2. `git fetch --prune origin` on shell; check the remote ref with `git ls-remote origin refs/heads/<branch>` - the remote branch is NOT yours: the human deletes it on merge and the run-all sweep owns strays. Report only - never delete or push a remote ref, never force-push.
 3. `git checkout main` on the git tool. Uncommitted tree changes -> STOP and report (NEVER stash).
 4. Sync: shell `git pull --no-rebase` (the git tool has no fetch/pull). Verify `git rev-parse main origin/main` are EQUAL - unequal (a merge commit or divergence) -> STOP and report; never push main. Then `git merge-base --is-ancestor <branch-tip> main`: exit 0 = the merge kept the tip an ancestor; exit 1 (squash/rebase) -> verify content instead (`git show main:<a file the branch added>`, e.g. its landing-record file) and record which check passed.
-5. Retire the merged LOCAL branch: shell `git branch -d <branch>` (safe form). If `-d` refuses, ONLY the step-4 content check justifies `git branch -D` - record it. Optional sweep: for other `git branch --list 'wt/*'` branches, retire ONLY those whose tip passes `git merge-base --is-ancestor <tip> main` (exit 0); never blindly -D.
+5. Retire the merged LOCAL branch: shell `git branch -d <branch>` (safe form). If `-d` refuses, ONLY the step-4 content check justifies `git branch -D` - record it. Optional sweep: for other `git branch --list 'wt/*'` branches, retire ONLY those whose tip passes `git merge-base --is-ancestor <tip> main` (exit 0); never blindly -D. A branch checked out in another worktree (e.g. a run-all `wt/runall-*` branch in `.worktrees/`) cannot be deleted at all - `-d` and `-D` both refuse: report it and move on, the run-all sweep owns those, and a sweep refusal NEVER justifies `abandon_skill`.
 6. Record the closeout memory (semantic; safe here - post-merge, it rides the next branch): PR <n> merged into main at <merge sha> (<date>); main synced <old>..<new>; branches retired; worktree state.
 7. Report (main tip sha and subject, PR merge commit, remote-ref status, retired branches, `git status --short` - empty except untracked `.coding/` artifacts) and `skill_end` -> Planning; unresolvable -> `abandon_skill`.\
 """

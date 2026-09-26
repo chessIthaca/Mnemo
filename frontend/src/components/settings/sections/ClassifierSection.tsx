@@ -101,6 +101,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   // The auto-typing opt-in (`[general.laya] auto_type_memories`) — a
   // separate toggle from the classifier enable flag.
   const [autoType, setAutoType] = useState(false);
+  // The tool-choice opt-in (`[general.laya] steer_tool_choice`) — the search
+  // and search_read tools let a confident classifier pick the delegation
+  // class (symbol / text / memory).
+  const [steerToolChoice, setSteerToolChoice] = useState(false);
   // The failure-triage opt-in (`[general.laya] failure_triage`), its kNN
   // overlay (`[general.laya] failure_triage_knn`), and the startup
   // fine-tune opt-in (`[general.laya] auto_finetune`, managed mode only) —
@@ -133,6 +137,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         checkpoint: laya?.checkpoint ?? "english",
         endpoint: laya?.endpoint ?? "",
         autoTypeMemories: laya?.auto_type_memories ?? false,
+        steerToolChoice: laya?.steer_tool_choice ?? false,
         failureTriage: laya?.failure_triage ?? false,
         failureTriageKnn: laya?.failure_triage_knn ?? false,
         autoFinetune: laya?.auto_finetune ?? false,
@@ -142,6 +147,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setCheckpoint(next.checkpoint);
       setEndpoint(next.endpoint);
       setAutoType(next.autoTypeMemories);
+      setSteerToolChoice(next.steerToolChoice);
       setFailureTriage(next.failureTriage);
       setFailureTriageKnn(next.failureTriageKnn);
       setAutoFinetune(next.autoFinetune);
@@ -196,6 +202,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     checkpoint,
     endpoint,
     autoTypeMemories: autoType,
+    steerToolChoice,
     failureTriage,
     failureTriageKnn,
     autoFinetune,
@@ -234,6 +241,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         await saveSettings({
           laya_enabled: enabled,
           laya_auto_type_memories: autoType,
+          laya_steer_tool_choice: steerToolChoice,
           laya_failure_triage: failureTriage,
           laya_failure_triage_knn: failureTriageKnn,
           laya_auto_finetune: autoFinetune,
@@ -309,6 +317,25 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             BUG / PLAN / HOW / REVIEW prefix on write; low confidence keeps
             yours. Enable only against a fine-tuned checkpoint — base models
             mis-classify.
+          </span>
+        </span>
+      </label>
+
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <input
+          type="checkbox"
+          checked={steerToolChoice}
+          onChange={(e) => setSteerToolChoice(e.target.checked)}
+          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+        />
+        <span>
+          Steer search delegation with the classifier
+          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            — the search / search_read tools ask the classifier whether a
+            query wants the code graph (symbol), the file search (text), or
+            the memory store (memory), and a confident answer picks the
+            route; low confidence keeps today's heuristics. Enable only
+            against a fine-tuned checkpoint — base models mis-classify.
           </span>
         </span>
       </label>

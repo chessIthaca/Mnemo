@@ -489,6 +489,10 @@ pub struct LayaWire {
     /// opt-in from `enabled` (confidence-gated prefix correction at
     /// `memory_write` time; needs a fine-tuned checkpoint).
     pub auto_type_memories: bool,
+    /// Whether Laya TOOL-CHOICE steering is enabled — a separate opt-in from
+    /// `enabled` (the search/search_read tools let a confident classifier pick
+    /// the delegation class; needs a fine-tuned checkpoint).
+    pub steer_tool_choice: bool,
     /// Whether Laya FAILURE TRIAGE is enabled — a separate opt-in from
     /// `enabled` (at every failure-handling site the error text is
     /// classified and a confident answer steers the harness; needs a
@@ -915,6 +919,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 mode: config.general.general.laya.mode.clone(),
                 checkpoint: config.general.general.laya.checkpoint.clone(),
                 auto_type_memories: config.general.general.laya.auto_type_memories,
+                steer_tool_choice: config.general.general.laya.steer_tool_choice,
                 failure_triage: config.general.general.laya.failure_triage,
                 failure_triage_knn: config.general.general.laya.failure_triage_knn,
                 auto_finetune: config.general.general.laya.auto_finetune,
@@ -1419,6 +1424,7 @@ mod settings_dto_tests {
                     mode: LayaMode::External,
                     checkpoint: None,
                     auto_type_memories: false,
+                    steer_tool_choice: false,
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,
@@ -1580,6 +1586,7 @@ mod settings_dto_tests {
                     mode: LayaMode::External,
                     checkpoint: None,
                     auto_type_memories: false,
+                    steer_tool_choice: false,
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,

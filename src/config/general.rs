@@ -302,6 +302,16 @@ pub struct LayaConfig {
     /// false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub auto_finetune: bool,
+    /// Opt in to Laya TOOL-CHOICE STEERING (backlog e2c47d5f): the `search`
+    /// and `search_read` tools let a confident classifier pick which class a
+    /// query belongs to — symbol / text / memory — and route the winning
+    /// class into the existing delegation emitters; every fallback keeps the
+    /// regex heuristics byte-identically. Confidence-gated (>=0.80). Off by
+    /// default, and meant to be enabled only against a **fine-tuned**
+    /// checkpoint: base Laya checkpoints are near-chance zero-shot on this
+    /// task. Omitted from the saved config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub steer_tool_choice: bool,
 }
 
 /// `skip_serializing_if` guard for [`LayaConfig::mode`]: `external` (the
@@ -312,7 +322,8 @@ fn laya_mode_is_external(mode: &LayaMode) -> bool {
 }
 
 /// `skip_serializing_if` guard for [`LayaConfig`]'s boolean opt-ins
-/// (`auto_type_memories`, `failure_triage`, `auto_finetune`): `false` (the
+/// (`auto_type_memories`, `failure_triage`, `failure_triage_knn`,
+/// `auto_finetune`, `steer_tool_choice`): `false` (the
 /// default) stays unwritten, so untouched configs keep their exact
 /// pre-consumer shape.
 fn laya_flag_off(off: &bool) -> bool {

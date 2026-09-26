@@ -1468,6 +1468,12 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.auto_type_memories,
     ));
+    // The tool-choice flag (backlog e2c47d5f): the SAME classifier slot feeds
+    // the search/search_read tools; Settings saves flip this flag via
+    // `set_tool_choice_enabled`.
+    let tool_choice_flag = Arc::new(std::sync::atomic::AtomicBool::new(
+        config.general.general.laya.steer_tool_choice,
+    ));
     let store = match MemoryStore::open(&project.memory_db, embedder) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -2022,6 +2028,15 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     .with_auto_typing(mnemo::tool::memory::AutoTypingHandle {
         classifier: classifier_slot.clone(),
         enabled: auto_typing_flag.clone(),
+    })
+    // Wire the shared Laya tool-choice gate (backlog e2c47d5f): the search /
+    // search_read tools read the classifier slot + flag at call time, and a
+    // Settings save flips the flag via `set_tool_choice_enabled` — no rebuild.
+    .with_tool_choice(mnemo::tool::agent::tool_choice::ToolChoiceHandle {
+        classifier: classifier_slot.clone(),
+        enabled: tool_choice_flag.clone(),
+        // The app logs to the default `~/.mnemo/laya/training/` home.
+        log_path: None,
     })
     // Wire the shared Laya failure-triage gate (backlog 1a4049c1): every loop
     // the factory builds carries the classifier slot + flag, so the

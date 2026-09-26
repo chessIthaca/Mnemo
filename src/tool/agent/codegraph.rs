@@ -103,7 +103,10 @@ fn resolve_id(view: &GraphView, name_or_id: &str) -> Option<String> {
 /// steering metric keeps counting delegated answers, and the escape line
 /// tells the model that re-issuing the same query gets the plain file
 /// search. Best-effort: any store/view failure or a total resolution miss
-/// returns `None` and the caller falls through to the normal search.
+/// returns `None` and the caller falls through to the normal search. This is
+/// a pure EMITTER: the delegation DECISION (whether a pattern is a symbol
+/// hunt at all) lives in the caller and may be classifier-steered (backlog
+/// e2c47d5f) — the graph side adds no decision of its own.
 /// Exact-only resolution for the delegation path: an id form validates
 /// directly; a name must match a symbol's name EXACTLY — the same semantics
 /// as the advisory nudge's `CodeGraph::symbol_id`. Fuzzy substring

@@ -168,6 +168,10 @@ describe("classifier bindings stay wired to the backend names", () => {
       checkpoint: string | null;
       /** Whether memory auto-typing is enabled (opt-in). */
       auto_type_memories: boolean;
+      /** Whether Laya tool-choice steering is enabled (opt-in; the
+       *  search/search_read tools let a confident classifier pick the
+       *  delegation class; needs a fine-tuned checkpoint). */
+      steer_tool_choice: boolean;
       /** Whether failure triage is enabled (opt-in; needs a fine-tuned
        *  checkpoint). */
       failure_triage: boolean;
@@ -185,6 +189,7 @@ describe("classifier bindings stay wired to the backend names", () => {
     expect(tauriSource).toContain('laya_mode?: "external" | "managed";');
     expect(tauriSource).toContain("laya_checkpoint?: string;");
     expect(tauriSource).toContain("laya_auto_type_memories?: boolean;");
+    expect(tauriSource).toContain("laya_steer_tool_choice?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage_knn?: boolean;");
     expect(tauriSource).toContain("laya_auto_finetune?: boolean;");
@@ -202,6 +207,7 @@ describe("serializeClassifier", () => {
     checkpoint: "english",
     endpoint: "",
     autoTypeMemories: false,
+    steerToolChoice: false,
     failureTriage: false,
     failureTriageKnn: false,
     autoFinetune: false,
@@ -228,6 +234,9 @@ describe("serializeClassifier", () => {
       serializeClassifier({ ...base, autoTypeMemories: true }),
     );
     expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, steerToolChoice: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, failureTriage: true }),
     );
     expect(serializeClassifier(base)).not.toBe(
@@ -238,13 +247,14 @@ describe("serializeClassifier", () => {
     );
   });
 
-  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + triage + kNN overlay + fine-tune)", () => {
+  it("matches the persisted opt-in shape (enabled + mode + checkpoint + endpoint + auto-typing + tool-choice + triage + kNN overlay + fine-tune)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       mode: "managed",
       checkpoint: "english",
       endpoint: "",
       autoTypeMemories: false,
+      steerToolChoice: false,
       failureTriage: false,
       failureTriageKnn: false,
       autoFinetune: false,

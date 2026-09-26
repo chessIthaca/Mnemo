@@ -250,7 +250,12 @@ vitest (frontend), `tsc --noEmit` clean.
   pointer) rides above the output and the file walk is skipped entirely; a
   query targeting semantic memory (a glob under `.coding/knowledge`/
   `.coding/reviews` or a typed `SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/
-  `REVIEW:` prefix) delegates to `memory_search` the same way. The block
+  `REVIEW:` prefix) delegates to `memory_search` the same way. With the
+  opt-in `[general.laya] steer_tool_choice` flag on and a confident answer,
+  the Laya classifier picks that route itself — SYMBOL / TEXT / MEMORY —
+  instead of the shape heuristics (below threshold, and whenever Laya is
+  off, the heuristics stand byte-identically; backlog e2c47d5f; each steered
+  search is logged with its disposition to seed a fine-tune). The block
   opens with `AUTO-DELEGATED to …` and re-issuing the SAME query
   (pattern+glob+literal) skips delegation and runs the plain file search
   (the escape hatch — sticky per query: a bounded set of bypassed keys,

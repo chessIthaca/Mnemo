@@ -6,7 +6,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentStore } from "../../hooks/useAgentStore";
 import { errMsg, getProjectStats, getSavingsStats } from "../../lib/tauri";
 import type { PricingEntry, ProjectStats, SavingsStats } from "../../lib/tauri";
-import { fmtTokens } from "../../lib/format";
+import { fmtSavingsPct, fmtTokens } from "../../lib/format";
 
 /**
  * Right-panel Dashboard view (backlog 652ae094): what Mnemo's context-economy
@@ -211,9 +211,9 @@ export function DashboardBody({
         <div className={card}>
           <div className="text-slate-400">No savings recorded yet.</div>
           <div className="mt-1 text-slate-600">
-            Turn on context-economy levers in Settings → Savings (or{" "}
-            <code>[general.optimizer]</code> in <code>config.toml</code>), and Mnemo
-            will meter what they save here.
+            The context-economy levers are on by default, so nothing needs
+            switching on: Mnemo meters each saving here as the levers make one.
+            Tune them (or the model rates) in Settings → Savings.
           </div>
         </div>
       ) : null}
@@ -280,8 +280,11 @@ export function DashboardBody({
                 <span className="grow truncate text-slate-500" title={e.detail ?? undefined}>
                   {e.detail ?? "—"}
                 </span>
-                <span className="shrink-0 font-mono tabular-nums text-slate-400">
-                  {fmtTokens(e.tokens_before)} → {fmtTokens(e.tokens_after)}
+                <span
+                  className="shrink-0 font-mono tabular-nums text-slate-400"
+                  title={`${fmtTokens(e.tokens_before)} → ${fmtTokens(e.tokens_after)}`}
+                >
+                  {fmtSavingsPct(e.tokens_saved, e.tokens_before)}
                 </span>
                 <span className="w-16 shrink-0 text-right font-mono tabular-nums text-emerald-300">
                   {fmtTokens(e.tokens_saved)}

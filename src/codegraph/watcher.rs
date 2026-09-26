@@ -290,6 +290,30 @@ mod tests {
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("target/x.rs"), "fn x() {}").unwrap();
         assert!(!is_indexable_path(&root.join("target/x.rs"), root));
+        // .worktrees/ — app-managed run-all worktrees (linked worktrees
+        // under the main tree, each a duplicate copy). A worktree's own
+        // .coding/codegraph.db is written continuously by that worktree's
+        // index passes and must not trigger a main-tree pass.
+        std::fs::create_dir_all(root.join(".worktrees/runall-abcd12/.coding")).unwrap();
+        std::fs::create_dir_all(root.join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            root.join(".worktrees/runall-abcd12/.coding/codegraph.db"),
+            "db",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".worktrees/runall-abcd12/src/b.tsx"),
+            "export const B = 1;",
+        )
+        .unwrap();
+        assert!(
+            !is_indexable_path(&root.join(".worktrees/runall-abcd12/.coding/codegraph.db"), root),
+            "a worktree DB write must not trigger a main-tree pass"
+        );
+        assert!(
+            !is_indexable_path(&root.join(".worktrees/runall-abcd12/src/b.tsx"), root),
+            "no file under a worktree directory is watched from the main tree"
+        );
         // `.coding/` artifacts ARE watched — only the app's SQLite stores
         // are not (asserted above). Per-instance local state is written once
         // per launch (src/instance_marker.rs) or on plan-step transitions,
@@ -327,6 +351,16 @@ mod tests {
         // Outside root.
         let other = tempdir().unwrap();
         assert!(!is_indexable_path(&other.path().join("o.rs"), root));
+        // Root-relative guard (green before AND after the .worktrees fix):
+        // a root that IS itself a worktree path stays watched — the fix
+        // must not blind a run-all item instance's own watcher.
+        let wt_root = root.join(".worktrees/runall-abcd12");
+        std::fs::create_dir_all(wt_root.join("src")).unwrap();
+        std::fs::write(wt_root.join("src/own.tsx"), "export const O = 1;").unwrap();
+        assert!(
+            is_indexable_path(&wt_root.join("src/own.tsx"), &wt_root),
+            "a worktree instance's own root must stay watched"
+        );
     }
 
     /// Regression (macOS CI leg, run 35521221353): FSEvents delivers

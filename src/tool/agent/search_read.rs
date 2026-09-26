@@ -772,11 +772,20 @@ mod tests {
         // target/ — Rust build output (must be skipped).
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("target/built.rs"), "fn findme() {}").unwrap();
+        // .worktrees/ — app-managed run-all worktrees: duplicate copies of
+        // the tree, never project source.
+        std::fs::create_dir_all(dir.path().join(".worktrees/runall-abcd12/src")).unwrap();
+        std::fs::write(
+            dir.path().join(".worktrees/runall-abcd12/src/dup.rs"),
+            "fn findme() {}",
+        )
+        .unwrap();
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"pattern": "findme"})).await;
         assert!(result.success, "{}", result.output);
         assert!(result.output.contains("=== src.rs"));
         assert!(!result.output.contains("target/built.rs"));
+        assert!(!result.output.contains(".worktrees"));
         assert!(result.output.contains("skipped"));
     }
 

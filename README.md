@@ -57,7 +57,7 @@ The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the
 
 1. **Planning** — read tools only. The agent explores the codebase and must call `create_plan` (a goal, context, and ordered steps) before it can touch anything.
 2. **Executing** — all tools available, one step at a time; sub-plans stack and pop back exactly where they left off.
-3. **Reviewing** — implementation plans get a read-only reviewer agent that audits the full diff; every finding must be fixed or justified.
+3. **Reviewing** — implementation plans get a read-only reviewer agent that audits the diff, carrying a harness-rendered contract (verdict format, constitution checks, `.coding/**` bookkeeping rule); from round 2 the app scopes it to `git diff <base>` — only what changed since the round before. Every finding must be fixed or justified.
 4. **Complete** — the change lands on a working branch with the review report in the repo.
 
 That's the whole trick: **a tool-schema guardrail, not a suggestion**. The agent physically cannot write code without a plan on disk — which is what makes a smaller executor model viable.

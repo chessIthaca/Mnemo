@@ -520,7 +520,7 @@ branch-status records citing the merged branch (memory tools are always
 available inside a skill — no allow-list entry needed), so stale "unmerged"
 hints stop recalling once the branch lands. The compiled prompt encodes the
 default-assumption rule: a feature/bug with no live unmerged marker is
-assumed to be in main (verify with `git_log`/`git_show` when it matters).
+assumed to be in main (verify with `git_read` when it matters).
 
 ### Review verdict contract
 
@@ -538,7 +538,7 @@ never grown (fail closed), and the sandbox guards hold identically in both
 modes.
 
 A `role:"reviewer"` subagent is read-only by construction: read tools +
-`git_diff`/`git_log`/`git_show`/`web_fetch` + graph tools + memory/backlog
+`git_read` (op `diff`/`log`/`show`/`status`)/`web_fetch` + graph tools + memory/backlog
 QUERIES (`memory_search`, `backlog_list`) +
 `write_review_report` — no `ask_user`, no memory/backlog mutations, no plan
 tools, no `finish` (strict `ToolFilter::Reviewer` arm, `spawn.rs`
@@ -1280,6 +1280,26 @@ product.
   The configured reviewing model is authoritative. `abandon_plan` is
   available in the Reviewing state as the escape hatch for an un-completable
   review (returns to Planning — the main agent is never stuck in Reviewing).
+- **Delta-scoped review rounds** (backlog 85313a7e, 2027-01) — a reviewer
+  spawn carries a harness-rendered preamble: the verdict contract
+  (`## Verdict: PASS` / `## Verdict: FINDINGS (n high, n low)` — the strings
+  `finish` validates), the constitution checks as one line each, and the
+  `.coding/**` rule (accuracy check in one line, never a line review). The
+  spawn path stamps each round's base revision (`git rev-parse HEAD`) onto the
+  plan frame (`PlanFile::reviews` → the `## Reviews` section of
+  `.coding/plans/<id>.md`, so scope survives a restart), and from round 2 on
+  the preamble names that base, the delta-scope instruction (naming the
+  reviewer's own `git_read` ops) and the changed file set (derived from
+  `git diff --name-status <base>` + untracked files) — a
+  re-review verifies the DELTA instead of re-reading the whole tree (plan
+  febcd6f5 burned three full-tree rounds, ~33 min, to verify a 1-3 file fix).
+  The stamp lands ONLY after a successful spawn, so a failed spawn can widen
+  the next round's scope but never narrow it to a diff nobody verified;
+  `write_review_report` appends a trailing `Reviewed-state: <sha>` to a fresh
+  report (trailing, not front matter — the verdict line must stay first).
+  Rendering lives in `src/agent/review_scope.rs` (`render_review_preamble`,
+  `ReviewScoper`), the git reads in `src/project/git_ops.rs`
+  (`head_commit_sha` / `changed_paths_since`).
 - **Extra workflow tools + sub-plan stack** — beyond `create_plan` /
   `complete_step`, the shipped workflow tools include `file_append`,
   `update_plan`, and `abandon_plan`. `create_plan` while already executing

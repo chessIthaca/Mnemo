@@ -128,6 +128,98 @@ fn git_run_raw(git: &dyn GitRunner, root: &Path, args: &[&str]) -> Result<String
     git.run(root, args)
 }
 
+/// Validate a commit-ish used as a diff BASE (backlog 85313a7e).
+///
+/// The strictness mirrors the `git_read` tools' commit-ish guard: a leading
+/// `-` is option injection, and whitespace / shell metacharacters have no
+/// place in a revision. The reviewer-round base arrives from a value recorded
+/// on the plan frame (`.coding/plans/<id>.md`) — a file a hand-edit can
+/// change — so it is treated as untrusted input.
+pub(crate) fn validate_base_ref(base: &str) -> Result<(), String> {
+    if base.is_empty() {
+        return Err("base revision rejected — empty".to_string());
+    }
+    if base.starts_with('-') {
+        return Err(format!(
+            "base revision '{base}' rejected — a commit-ish may not start with '-' \
+             (option injection)"
+        ));
+    }
+    if base
+        .chars()
+        .any(|c| c.is_whitespace() || "|&;<>`$(){}*?\"'\\".contains(c))
+    {
+        return Err(format!(
+            "base revision '{base}' rejected — whitespace and shell metacharacters \
+             are not allowed in a commit-ish"
+        ));
+    }
+    Ok(())
+}
+
+/// The current HEAD sha in `root` — the base revision a reviewer round stamps
+/// when it is dispatched (see [`crate::workflow::Workflow::record_review_round`]).
+/// Runs on the blocking thread pool like every git op here and owns its
+/// argument so the closure is `'static + Send`.
+pub async fn head_commit_sha(root: PathBuf) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || head_commit_sha_impl(&RealGit, &root))
+        .await
+        .map_err(|e| format!("head-commit task failed: {e}"))?
+}
+
+/// The synchronous core of [`head_commit_sha`] — split out so tests can inject
+/// a [`GitRunner`] mock instead of spawning a real `git` process.
+fn head_commit_sha_impl(git: &dyn GitRunner, root: &Path) -> Result<String, String> {
+    git_run(git, root, &["rev-parse", "HEAD"])
+}
+
+/// Everything a reviewer must look at to verify what changed since `base`:
+/// `git diff --name-status <base>` (the working tree against the base —
+/// staged and unstaged together, which IS a reviewer's scope) plus every
+/// untracked file from `git status --porcelain -uall`.
+///
+/// One entry per line as `<status> <path>` (`M src/a.rs`, `?? docs/new.md`),
+/// so a caller can list them verbatim. Gitignored paths never appear —
+/// `status` omits them unless `--ignored` is passed.
+pub async fn changed_paths_since(root: PathBuf, base: String) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || changed_paths_since_impl(&RealGit, &root, &base))
+        .await
+        .map_err(|e| format!("changed-paths task failed: {e}"))?
+}
+
+/// The synchronous core of [`changed_paths_since`] — split out so tests can
+/// inject a [`GitRunner`] mock.
+fn changed_paths_since_impl(
+    git: &dyn GitRunner,
+    root: &Path,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    validate_base_ref(base)?;
+    let changed = git_run(git, root, &["diff", "--name-status", base])?;
+    // Raw (untrimmed): the two status columns of `--porcelain` are data.
+    let status = git_run_raw(git, root, &["status", "--porcelain", "-uall"])?;
+    let mut out: Vec<String> = Vec::new();
+    for line in changed.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            // `--name-status` separates the status from the path with a tab
+            // (and renames carry three fields) — keep the shape, lose the tab.
+            out.push(line.replace('\t', " "));
+        }
+    }
+    for line in status.lines() {
+        // `?? path` is the untracked marker. Tracked modifications are
+        // already covered by the diff above, so everything else is skipped.
+        if let Some(path) = line.strip_prefix("?? ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                out.push(format!("?? {path}"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Create a git checkpoint before dispatching a backlog item — on the
 /// per-directory wt/* working branch, never on main (backlog 04bd6977,
 /// security review MEDIUM: the Run-All tick used to commit the dirty tree
@@ -822,6 +914,12 @@ pub(crate) mod mock_git {
         calls: Vec<Vec<String>>,
         /// Simulate "not a git repo" — `rev-parse --abbrev-ref HEAD` fails.
         not_a_repo: bool,
+        /// Pre-programmed `diff --name-status <base>` output (tab-separated
+        /// lines) for `changed_paths_since` tests.
+        diff_name_status: String,
+        /// Make `diff --name-status` fail with this message, so error
+        /// propagation through `changed_paths_since` is testable.
+        diff_error: Option<String>,
     }
 
     impl MockGit {
@@ -837,6 +935,8 @@ pub(crate) mod mock_git {
                     commits: vec!["initial".to_string()],
                     calls: Vec::new(),
                     not_a_repo: false,
+                    diff_name_status: String::new(),
+                    diff_error: None,
                 }),
             }
         }
@@ -874,6 +974,19 @@ pub(crate) mod mock_git {
             s.not_a_repo = true;
         }
 
+        /// Set the `diff --name-status <base>` output (backlog 85313a7e's
+        /// reviewer scope). Tab-separated lines, as git emits them.
+        pub(crate) fn set_diff_name_status(&self, out: &str) {
+            let mut s = self.state.lock().unwrap();
+            s.diff_name_status = out.to_string();
+        }
+
+        /// Make `diff --name-status` fail with `msg`.
+        pub(crate) fn set_diff_error(&self, msg: &str) {
+            let mut s = self.state.lock().unwrap();
+            s.diff_error = Some(msg.to_string());
+        }
+
         /// The current HEAD sha.
         pub(crate) fn head_sha(&self) -> String {
             self.state.lock().unwrap().head_sha.clone()
@@ -906,6 +1019,26 @@ pub(crate) mod mock_git {
                 } else {
                     String::new()
                 });
+            }
+
+            // status --porcelain -uall (changed_paths_since_impl: untracked)
+            if args == ["status", "--porcelain", "-uall"] {
+                if !s.porcelain_status.is_empty() {
+                    return Ok(s.porcelain_status.clone());
+                }
+                return Ok(if s.dirty {
+                    " M file.txt\n".to_string()
+                } else {
+                    String::new()
+                });
+            }
+
+            // diff --name-status <base> (changed_paths_since_impl: tracked)
+            if args.len() == 3 && args[0] == "diff" && args[1] == "--name-status" {
+                if let Some(err) = s.diff_error.clone() {
+                    return Err(err);
+                }
+                return Ok(s.diff_name_status.clone());
             }
 
             // add -A
@@ -1887,5 +2020,70 @@ mod tests {
             branch_hint_impl(&git, Path::new("/tmp/mock")).is_none(),
             "master → no hint"
         );
+    }
+
+    #[test]
+    fn head_commit_sha_impl_reads_rev_parse_head() {
+        // The reviewer-round base revision (backlog 85313a7e) is HEAD at
+        // dispatch time.
+        let git = MockGit::new();
+        assert_eq!(
+            head_commit_sha_impl(&git, Path::new("/tmp/mock")).unwrap(),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn changed_paths_since_lists_tracked_changes_and_untracked_files() {
+        // A re-review's changed-file set = `git diff --name-status <base>`
+        // (staged + unstaged against the base) plus untracked files from
+        // `status --porcelain -uall`. Gitignored paths are absent by
+        // construction, so generated noise never reaches the prompt.
+        let git = MockGit::new();
+        git.set_diff_name_status("M\tsrc/a.rs\nA\tsrc/new.rs\nR100\told.rs\tnew2.rs\n");
+        git.set_porcelain("?? docs/new.md\n M src/a.rs\n");
+        let paths = changed_paths_since_impl(&git, Path::new("/tmp/mock"), "abc123").unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "M src/a.rs".to_string(),
+                "A src/new.rs".to_string(),
+                "R100 old.rs new2.rs".to_string(),
+                "?? docs/new.md".to_string(),
+            ],
+            "tracked changes (tab-normalized, rename fields kept), then untracked"
+        );
+    }
+
+    #[test]
+    fn changed_paths_since_is_empty_on_a_clean_tree() {
+        let git = MockGit::new();
+        assert!(changed_paths_since_impl(&git, Path::new("/tmp/mock"), "abc123")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn changed_paths_since_rejects_an_injected_base_before_running_git() {
+        // The base revision round-trips through the plan file, so it is
+        // untrusted input: a `-` prefix is option injection, whitespace /
+        // metacharacters are refused, and an empty base is refused — all
+        // before git is ever invoked.
+        let git = MockGit::new();
+        let err =
+            changed_paths_since_impl(&git, Path::new("/tmp/mock"), "--output=/tmp/x").unwrap_err();
+        assert!(err.contains("option injection"), "{err}");
+        let err = changed_paths_since_impl(&git, Path::new("/tmp/mock"), "abc 123").unwrap_err();
+        assert!(err.contains("metacharacters"), "{err}");
+        let err = changed_paths_since_impl(&git, Path::new("/tmp/mock"), "").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn changed_paths_since_propagates_a_git_failure() {
+        let git = MockGit::new();
+        git.set_diff_error("fatal: bad revision");
+        let err = changed_paths_since_impl(&git, Path::new("/tmp/mock"), "abc123").unwrap_err();
+        assert!(err.contains("bad revision"), "{err}");
     }
 }

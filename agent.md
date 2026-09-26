@@ -133,10 +133,30 @@ project-specific checks.
   (`Set-Content`/`Out-File`/`Add-Content`/`>>`/`sed -i`/`tee`/python scripts)
   in non-test, non-generated code where `file_edit`/`file_write` would work —
   and missing justification where a fallback was genuinely needed.
+- **Re-review rounds are delta-scoped (backlog 85313a7e).** Every reviewer
+  spawn carries a harness-rendered preamble: the verdict contract, the checks
+  above as one line each, and the `.coding/**` rule (an accuracy check in one
+  line — never a line review; generated/lockfile noise is out of scope). The
+  app stamps each round's base revision on the plan frame (`## Reviews` in
+  `.coding/plans/<id>.md`) and, from round 2 on, the preamble names that base,
+  the delta scope and the mechanically-derived changed file set —
+  so a re-review verifies the DELTA, not the whole tree. It narrows only when
+  verified work is committed: **commit code at step boundaries on `wt/*`** (the
+  closing sequence still commits last, with the report) so `git diff <base>` is
+  exactly the fix. Never hand-write the preamble or the scope — the spawn path
+  renders it, and re-writing it by hand only bloats the prompt.
+- **Pre-flight self-check before ANY reviewer spawn.** Run this section's
+  checklist against the diff yourself first — documentation sync, no
+  `cfg(windows)`-only additions outside the sanctioned gate, file-tools-first,
+  and a bug fix's regression test genuinely red before the fix — and fix what
+  it finds before spawning. Minutes of own work beats a whole review round
+  (plan febcd6f5 spent three rounds, ~33 min, on a 1-3 file fix). Keep the
+  reviewer's `task` to scope + acceptance criteria + risk focus; the preamble
+  already carries the boilerplate, and the reviewer can read the plan file.
 - **Reviewer tool surface + failed-reviewer protocol.** A `role:"reviewer"`
-  subagent is read-only by construction: reads + `git_diff`/`git_log`/
-  `git_show`/`web_fetch` + the graph tools + memory/backlog **query** tools +
-  `write_review_report`. It cannot ask questions (`ask_user`), mutate memory
+  subagent is read-only by construction: reads + `git_read` (op `diff`/`log`/
+  `show`/`status`), `web_fetch`, the graph tools, memory/backlog **query** tools
+  + `write_review_report`. It cannot ask questions (`ask_user`), mutate memory
   or backlog, run plan tools, or `finish`. **Reviewer-only authorship:** a
   review report can only ever be authored by a spawned `role:"reviewer"`
   agent — `write_review_report` is visible under no other filter, and

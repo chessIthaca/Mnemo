@@ -95,7 +95,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [steerToolChoice, setSteerToolChoice] = useState(false);
   // The failure-triage opt-in (`[general.laya] failure_triage`), its kNN
   // overlay (`[general.laya] failure_triage_knn`), and the startup
-  // fine-tune opt-in (`[general.laya] auto_finetune`, managed mode only) —
+  // fine-tune opt-in (`[general.laya] auto_finetune`, managed runtime only) —
   // separate toggles, same opt-in convention.
   const [failureTriage, setFailureTriage] = useState(false);
   const [failureTriageKnn, setFailureTriageKnn] = useState(false);
@@ -367,7 +367,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         <span>
           Fine-tune on startup from logged failures
           <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
-            — managed mode only: when enough new classified failures have
+            — managed runtime only: when enough new classified failures have
             accrued since the last fine-tune, the checkpoint is retrained in
             the background and hot-swapped. Never blocks startup.
           </span>

@@ -275,8 +275,8 @@ pub struct SettingsSaveDto {
     /// `failure_triage` itself is on). Absent = keep the current value.
     #[serde(default)]
     pub laya_failure_triage_knn: Option<bool>,
-    /// Startup failure-triage fine-tune (managed mode only, opt-in). Absent =
-    /// keep the current value.
+    /// Startup failure-triage fine-tune (managed runtime only, opt-in).
+    /// Absent = keep the current value.
     #[serde(default)]
     pub laya_auto_finetune: Option<bool>,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22 — all

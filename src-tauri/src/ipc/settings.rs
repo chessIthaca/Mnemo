@@ -495,7 +495,7 @@ pub struct LayaWire {
     /// only while `failure_triage` itself is on).
     pub failure_triage_knn: bool,
     /// Whether the startup failure-triage FINE-TUNE is enabled (managed
-    /// mode only; never blocks startup).
+    /// runtime only; never blocks startup).
     pub auto_finetune: bool,
 }
 

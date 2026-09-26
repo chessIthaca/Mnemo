@@ -402,10 +402,10 @@ impl LayaManager {
     /// Spawn the managed `laya-serve` serving `models` on the
     /// pre-allocated `port` (the one the classifier client was built
     /// against) and record the child tagged with a fresh generation.
-    /// `models` is the `LAYA_MODELS` value: a catalog checkpoint id in
-    /// managed mode, or a fine-tuned artifact directory path for the
-    /// startup fine-tune hot-swap (best-effort — a laya-serve that cannot
-    /// load it simply never gets ready).
+    /// `models` is the `LAYA_MODELS` value: a catalog checkpoint id, or a
+    /// fine-tuned artifact directory path for the startup fine-tune
+    /// hot-swap (best-effort — a laya-serve that cannot load it simply
+    /// never gets ready).
     /// Returns that generation — a caller whose readiness probe fails must
     /// pass it to [`LayaManager::stop_if_generation`] so a concurrent newer
     /// start survives. Does not wait for readiness (see
@@ -837,8 +837,8 @@ pub fn spawn_setup_task(
                     }
                 };
                 // Swap the live classifier slot to the fresh sidecar
-                // endpoint (until now it was None — managed mode without
-                // an install).
+                // endpoint (until now it was None — enabled without an
+                // install).
                 if let (Some(slot), Some(port)) = (&classifier_slot, started) {
                     *slot.write().expect("classifier slot lock poisoned") =
                         build_managed_classifier(port, Arc::clone(&status));

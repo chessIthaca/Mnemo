@@ -551,6 +551,54 @@ prompt = "Merge."
     }
 
     #[test]
+    fn post_merge_sync_parses_and_carries_the_closeout_order() {
+        // The closeout skill (user request 2026-09-26, replacing the ad-hoc
+        // closeout research plan 167f93bb): the repo's own `.coding/skills/*.toml`
+        // must never rot - a malformed file is only logged-and-skipped at
+        // startup, so the skill would silently vanish.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let sync = reg
+            .get("post_merge_sync")
+            .expect("post_merge_sync.toml parses and loads");
+        assert!(reg.is_available_in("post_merge_sync", WorkflowState::Complete));
+        assert!(reg.is_available_in("post_merge_sync", WorkflowState::Planning));
+        assert!(!reg.is_available_in("post_merge_sync", WorkflowState::Executing));
+        // ORDERING is the point: the fetch/prune must precede the pull, and the
+        // pull must precede retiring the branch - a stale remote-tracking ref or
+        // a delete against an unsynced main is exactly the failure this skill
+        // exists to prevent.
+        let fetch = sync
+            .prompt
+            .find("git fetch --prune origin")
+            .expect("post_merge_sync prompt carries the fetch/prune step");
+        let pull = sync
+            .prompt
+            .find("git pull --no-rebase")
+            .expect("post_merge_sync prompt carries the sync step");
+        let branch_delete = sync
+            .prompt
+            .find("git branch -d <branch>")
+            .expect("post_merge_sync prompt carries the branch retirement");
+        assert!(
+            fetch < pull,
+            "the fetch must precede the pull (fetch at {fetch}, pull at {pull})"
+        );
+        assert!(
+            pull < branch_delete,
+            "the sync must precede retiring the branch (pull at {pull}, delete at {branch_delete})"
+        );
+        assert!(
+            sync.prompt.contains("NEVER commit to main"),
+            "post_merge_sync prompt forbids commits to main"
+        );
+        assert!(
+            sync.prompt.contains("skill_end"),
+            "post_merge_sync prompt exits via skill_end"
+        );
+    }
+
+    #[test]
     fn merge_to_main_and_new_release_write_their_records_before_the_landing_commit() {
         // ORDERING, not mere presence (the 2026-09-26 defect): the landing
         // skill's bookkeeping step ran AFTER the branch content was frozen, so

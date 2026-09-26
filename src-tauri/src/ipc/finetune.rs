@@ -4,8 +4,8 @@
 
 //! The startup failure-triage fine-tune (managed Laya runtime only).
 //!
-//! Gated on `[general.laya] auto_finetune` (Laya enabled + MANAGED mode +
-//! the flag + the managed runtime and checkpoint installed — see
+//! Gated on `[general.laya] auto_finetune` (Laya enabled + the flag +
+//! the managed runtime and checkpoint installed — see
 //! [`startup_finetune_checkpoint`]). At startup (after the managed sidecar
 //! spawn) the gate spawns a background task that reads the failure-triage
 //! training log (`~/.mnemo/laya/training/failure_triage.jsonl`, written by
@@ -462,7 +462,7 @@ pub async fn run_startup_finetune(
     config: Arc<tokio::sync::Mutex<Config>>,
 ) {
     // The gate, read from the LIVE shared config (the same handle settings
-    // saves go through): enabled + managed mode + `auto_finetune` + the
+    // saves go through): enabled + `auto_finetune` + the
     // managed runtime and checkpoint installed. Anything else is a no-op —
     // byte-identical startup.
     let laya_cfg = config.lock().await.general.general.laya.clone();
@@ -579,9 +579,9 @@ pub async fn run_startup_finetune(
 
 /// Spawn the startup fine-tune (the startup hook calls this at every
 /// startup): the spawned task reads the live `[general.laya]` config and
-/// runs the gate — a no-op unless it opens (Laya enabled, managed mode,
-/// `auto_finetune` on, and the managed runtime + configured checkpoint
-/// installed). The task never blocks startup.
+/// runs the gate — a no-op unless it opens (Laya enabled, `auto_finetune`
+/// on, and the managed runtime + configured checkpoint installed). The task
+/// never blocks startup.
 pub fn spawn_startup_finetune(
     app: Option<AppHandle>,
     manager: Arc<LayaManager>,

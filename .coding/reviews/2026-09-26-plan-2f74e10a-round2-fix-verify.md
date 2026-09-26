@@ -1,0 +1,31 @@
+## Verdict: FINDINGS (0 high, 8 low)
+
+Round-2 delta re-review for plan 2f74e10a (base `12a65d1`, delta = commit `1d68462` [context per task, read via `git show`] + the uncommitted working tree, read in full via `git diff`). **All 9 round-1 fixes are present and correct**, the HIGH fix is sound end-to-end, and no functional problem was introduced. The 8 lows are a single stale-prose class that survives in touched files because round 1's removal sweep searched identifiers (`LayaMode|laya_mode|laya_endpoint|laya_checkpoint`), not the word "mode" in prose — so "managed mode"-era comments its own LOW-7 fixed only in `finetune.rs` persist in five sibling files, violating this round's stated acceptance ("no still-stale reference to the removed surfaces in the touched files"). All are comment-only; zero functional risk.
+
+## Verified fixes (read, not trusted)
+
+- **HIGH-1 — `laya_steer_tool_choice` save path: fixed, sound end-to-end.** Chain verified link-by-link: `ClassifierSection.tsx:221` sends it on every save (declared `tauri.ts:606` `SettingsSavePatch`) → `SettingsSaveDto.laya_steer_tool_choice` (`settings_dto.rs:268`, `#[serde(default)]` so absent = keep) → apply arm `:632-633` writes `general.general.laya.steer_tool_choice` → persistence is safe via the round-1 collateral `is_default()` including the flag (`general.rs:298`) → `rewire.rs:164 set_tool_choice_enabled(laya_cfg.steer_tool_choice)` reads the just-reloaded config → read side `LayaWire.steer_tool_choice` (`settings.rs:486`, mapping `:909`) + fixture `dto-get-settings.json:18` so the UI reflects it. **No remaining silent-drop path**: `save_settings` parses into exactly this DTO; with the field present there is no other drop point, and removing the field again breaks the test's compile — the regression cannot silently reappear. Test `laya_patch_applies_steer_tool_choice` (`settings_dto.rs:1001-1015`) asserts default-off, Some flips, absent keeps. Correct.
+- **LOWs 1–8 (stale comments): all present in the uncommitted diff and accurately reworded.** main.rs:1394 (endpoint qualifier gone), main.rs:1071, settings.rs `LayaWire` doc (→ "every opt-in false"), settings.rs `GetSettingsGeneral.laya` doc (→ "enabled + the opt-in flags"), rewire.rs:197 (→ "enable/disable change"), laya.rs:87 (checkpoint-id doc, "the config value" gone), laya.rs:793-797 (→ "a mid-setup disable must always win"), finetune.rs:7/:465/:582 (both "MANAGED mode" mentions gone), ClassifierSection.tsx:214 (→ "enable flag + the five Laya opt-ins" — count checks out: auto-type, tool-choice, failure-triage, kNN-overlay, auto-finetune ride the save; the parenthetical correctly names only the four live-rewired flags).
+- **No new problem in the fixes**: the delta is comment text + one additive DTO field/arm/test; nothing touches the rewire/startup logic. Docs need no update (README:43 + CONFIGURATION.md:11 already document `steer_tool_choice` as a Settings-edited opt-in — the fix completes what those docs already promised). Multi-platform neutral; no shell-based mutation; no `#[allow]`. `.coding/**` accuracy: the plan-file round-2 stamp (`2 1d68462…`) matches the actual delta; the knowledge records' claims (BUG: `is_default` fix at `general.rs:298` + test `:1520`, spec's six-key wire) match the shipped code.
+
+## Findings — LOW (8): stale "mode"-surface prose left in touched files (one incomplete sweep of the round-1 LOW-7 class)
+
+Round 1 flagged and the fix removed "managed mode"/"MANAGED mode" from `finetune.rs` — but the same phrase survives elsewhere in files this plan touched, now naming a deleted surface (the `LayaMode` dichotomy is gone; the config is mode-less per the landed decision, and there is no non-managed configuration to qualify against). Suggested sweep: drop the qualifier (or write "the managed runtime") at each site:
+
+1. `src-tauri/src/ipc/laya.rs:405-406` — "`models` is the `LAYA_MODELS` value: a catalog checkpoint id **in managed mode**, or a fine-tuned artifact directory path…" — there is no mode; it is simply the catalog checkpoint id.
+2. `src-tauri/src/ipc/laya.rs:840` — "until now it was None — **managed mode without** an install" — should be "enabled without an install".
+3. `src-tauri/src/ipc/settings.rs:497-498` — `LayaWire.auto_finetune` doc "the startup failure-triage FINE-TUNE is enabled (**managed mode only**; never blocks startup)".
+4. `src/config/settings_dto.rs:278` — `SettingsSaveDto.laya_auto_finetune` doc "Startup failure-triage fine-tune (**managed mode only**, opt-in)".
+5. `frontend/src/components/settings/sections/ClassifierSection.tsx:98` — "the fine-tune opt-in (`[general.laya] auto_finetune`, **managed mode only**)".
+6. `frontend/src/components/settings/sections/ClassifierSection.tsx:370` — "…**managed mode only**: when enough new classified failures have accrued…".
+7. `frontend/src/components/settings/sections/ClassifierSection.test.ts:12` — header claims the file pins "the managed-runtime controls (**mode toggle** + checkpoint catalog + download progress) stay wired" — factually wrong: the mode toggle no longer exists and no test pins one (the catalog + download pins at :64/:68 are correct and stay). "Checkpoint catalog" itself is fine — the single-entry catalog still ships.
+8. `frontend/src/components/settings/sections/ClassifierSection.test.ts:167-168` — the embedded `laya` block doc for `auto_finetune`: "(**managed mode only**, opt-in)".
+
+Out-of-delta note (not counted): `src-tauri/src/ipc/state.rs:165` carries the same phrase ("Inert until managed mode is enabled + set up"), but `state.rs` is untouched by this plan's delta — flagging for awareness only; it is outside this round's scope and predates the plan.
+
+## Process remarks
+
+- Committed context `1d68462` was not re-line-reviewed (per task); its tree was round-1-verified, and the only delta re-touching its files is the 9-fix uncommitted diff read above.
+- Suite evidence (root `cargo test` 2781/0, `mnemo-app` 328/0, `tsc` exit 0, `vitest` 92 files/1302 tests) is the dispatching agent's run; this reviewer is read-only and statically verified the fixes are consistent with those suites passing (no signature/type changes beyond the additive DTO field).
+
+Reviewed-state: 1d68462a20001da43b55866b46d716eae633e839

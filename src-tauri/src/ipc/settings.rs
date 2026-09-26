@@ -470,8 +470,8 @@ pub struct EmbeddingModelWire {
 
 /// The Laya classifier config (the `general.laya` value) — opt-in, disabled
 /// by default. Always emitted as a nested object (never `null`) so the
-/// frontend renders the opt-in state directly: `enabled` false + `endpoint`
-/// null when Laya is not configured.
+/// frontend renders the opt-in state directly: `enabled` false + every opt-in
+/// false when Laya is not configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct LayaWire {
     /// Whether the Laya classifier is enabled.
@@ -600,8 +600,7 @@ pub struct GetSettingsGeneral {
     /// Bundled in-process embedding model id (`null` = hash mode). Takes
     /// precedence over `embedding_model` (the legacy remote path).
     pub bundled_embedding_model: Option<String>,
-    /// Laya classifier (opt-in) — whether it is enabled + the configured
-    /// `laya-serve` base URL (`null` = not configured).
+    /// Laya classifier (opt-in) — whether it is enabled + the opt-in flags.
     pub laya: LayaWire,
     /// Whether the agent's `browser_*` browser-inspection tools are enabled
     /// (exposes an unauthenticated localhost CDP port — opt-in, off by

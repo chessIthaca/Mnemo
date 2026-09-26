@@ -582,6 +582,17 @@ impl AgentLoopFactory {
             .expect("shell_filter lock poisoned") = cfg;
     }
 
+    /// Update the live `[general.optimizer]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every lever-bearing tool built from this factory shares
+    /// the same `Arc<RwLock<OptimizerConfig>>` (see
+    /// [`with_optimizer_config`](Self::with_optimizer_config)) and reads it per
+    /// call, so a Settings toggle lands on the next tool call — no registry
+    /// rebuild and no app restart.
+    pub fn set_optimizer_config(&self, cfg: OptimizerConfig) {
+        *self.optimizer.write().expect("optimizer lock poisoned") = cfg;
+    }
+
     /// Swap in a new provider (e.g. when the user switches models from the
     /// status bar). Rebuilds the context manager from the new provider's max
     /// context so freshly built agents summarize at the right threshold.

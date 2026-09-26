@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::Value;
 
-use mnemo::config::{LayaMode, SafetyMode};
+use mnemo::config::{LayaMode, OptimizerConfig, SafetyMode};
 use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
@@ -251,6 +251,7 @@ fn dto_fixtures_match_serde() {
             },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,
+            optimizer: OptimizerConfig::default(),
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: 0.5,

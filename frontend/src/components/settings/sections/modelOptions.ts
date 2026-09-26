@@ -3,7 +3,7 @@
 // See LICENSE in the repository root.
 
 /**
- * Pure helpers for the Pricing section's model combobox (backlog 82dd66fc,
+ * Pure helpers for the Savings section's model combobox (backlog 82dd66fc,
  * user-reported): the model field of each [[pricing]] row offers a dropdown
  * of the models available from the configured endpoints in addition to free
  * typing. Pricing is keyed by exact model name (Config::pricing_for,

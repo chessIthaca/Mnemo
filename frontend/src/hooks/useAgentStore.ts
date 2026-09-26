@@ -411,7 +411,7 @@ interface AppState extends AppStateLike {
   /** Whether the Settings dialog is open. */
   settingsOpen: boolean;
   /**
-   * Deep-link section for Settings (e.g. "pricing"). Applied when the dialog
+   * Deep-link section for Settings (e.g. "savings"). Applied when the dialog
    * opens; null means use the dialog's default.
    */
   settingsSection: string | null;

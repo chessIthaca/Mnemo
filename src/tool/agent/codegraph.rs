@@ -322,8 +322,9 @@ impl Tool for GraphSearchTool {
         // symbol index): a TOTAL miss may be staleness, not absence — the
         // watcher's reindex is best-effort, and unlike the search tool
         // there is no walk to fall back on. Detect stale indexed source
-        // files (stats only), reindex up to STALE_REINDEX_CAP inline, and
-        // re-resolve ONCE from the fresh view. Best-effort: any error in
+        // files (stats only), reindex up to STALE_REINDEX_CAP inline under
+        // the shared stale-reindex budget, and re-resolve ONCE from the
+        // fresh view. Best-effort: any error in
         // the freshness path serves the plain miss — a lookup is never
         // failed by its own repair.
         let graph = self.graph.clone();
@@ -342,7 +343,7 @@ impl Tool for GraphSearchTool {
                             // the index shortly; Err = the reindex itself
                             // failed. Both leave the staleness unrepaired.
                             let repaired = graph
-                                .reindex_stale_files(&stale)
+                                .reindex_stale_files(&stale, crate::codegraph::STALE_REINDEX_BUDGET)
                                 .ok()
                                 .filter(|n| *n > 0);
                             match repaired {

@@ -22,6 +22,18 @@
       "failure_triage_knn": false,
       "auto_finetune": false
     },
+    "optimizer": {
+      "delta_reads": false,
+      "compress_output": false,
+      "archive": false,
+      "compaction_survival": false,
+      "quality_score": false,
+      "lean_output_nudge": false,
+      "archive_min_chars": 20000,
+      "compress_min_chars": 2000,
+      "lean_output_fill_pct": 25,
+      "nudge_cooldown_requests": 10
+    },
     "safety": "approve-each-action",
     "vision_model": null
   },

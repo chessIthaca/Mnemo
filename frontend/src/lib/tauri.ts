@@ -477,6 +477,41 @@ export interface AppSettings {
      *  dispatched). Run-All only — interactive completions never trigger
      *  it. Opt-in, off by default. */
     auto_compact_on_plan_complete: boolean;
+    /** Token-optimizer levers (`[general.optimizer]`) — every flag is opt-in
+     *  and off by default, and the knobs carry the documented defaults. Each
+     *  lever is read per tool call from a live mirror, so a Settings save
+     *  takes effect without an app restart. */
+    optimizer: {
+      /** Lever 1: `read_files` serves a signature/skeleton (or a diff)
+       *  instead of the full file on a re-read. */
+      delta_reads: boolean;
+      /** Lever 2: large shell output from known command families collapses to
+       *  distinct error/warning lines + counts. */
+      compress_output: boolean;
+      /** Lever 3: tool results over `archive_min_chars` are archived in full
+       *  and the context carries a preview the model can expand. */
+      archive: boolean;
+      /** Lever 4: a pre-compaction checkpoint + a must-preserve decisions
+       *  block + a post-compaction digest. */
+      compaction_survival: boolean;
+      /** The S-F context-quality grade in the ctx popup. */
+      quality_score: boolean;
+      /** A cache-safe note nudging concise visible output once context fill
+       *  passes `lean_output_fill_pct`. */
+      lean_output_nudge: boolean;
+      /** Minimum tool-result length (chars) before lever 3 archives it. */
+      archive_min_chars: number;
+      /** Minimum filtered shell-output length (chars) before lever 2 tries to
+       *  compress it. */
+      compress_min_chars: number;
+      /** Context fill percentage that triggers the lean-output nudge. */
+      lean_output_fill_pct: number;
+      /** Requests between nudges (a cooldown). */
+      nudge_cooldown_requests: number;
+      /** Extra command patterns eligible for lever 2. Skipped by serde while
+       *  empty, so optional on the wire. */
+      compress_extra_commands?: string[];
+    };
   };
   context: {
     summarize_at_fill_rate: number;
@@ -582,6 +617,28 @@ export interface SettingsSavePatch {
   laya_failure_triage_knn?: boolean;
   /** Startup failure-triage fine-tune (managed mode only, opt-in). */
   laya_auto_finetune?: boolean;
+  /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
+   *  is opt-in, off by default, and read per tool call from a live mirror, so
+   *  a flip lands on the next tool call (no restart). Absent = keep the
+   *  current value. */
+  optimizer_delta_reads?: boolean;
+  optimizer_compress_output?: boolean;
+  optimizer_archive?: boolean;
+  optimizer_compaction_survival?: boolean;
+  optimizer_quality_score?: boolean;
+  optimizer_lean_output_nudge?: boolean;
+  /** Minimum tool-result length (chars) before lever 3 archives it. */
+  optimizer_archive_min_chars?: number;
+  /** Minimum filtered shell-output length (chars) before lever 2 tries to
+   *  compress it. */
+  optimizer_compress_min_chars?: number;
+  /** Context fill percentage that triggers the lean-output nudge. */
+  optimizer_lean_output_fill_pct?: number;
+  /** Requests between nudges (a cooldown). */
+  optimizer_nudge_cooldown_requests?: number;
+  /** Extra command patterns for lever 2; `[]` clears the list, absent keeps
+   *  it. Entries are trimmed and blanks dropped by the backend. */
+  optimizer_compress_extra_commands?: string[];
   summarize_at_fill_rate?: number;
   proxy_cache_ceiling_tokens?: number | null;
   theme?: string;

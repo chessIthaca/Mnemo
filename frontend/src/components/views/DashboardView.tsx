@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentStore } from "../../hooks/useAgentStore";
 import { errMsg, getProjectStats, getSavingsStats } from "../../lib/tauri";
 import type { PricingEntry, ProjectStats, SavingsStats } from "../../lib/tauri";
@@ -22,6 +22,10 @@ import { fmtTokens } from "../../lib/format";
  * Token counts share `fmtTokens` with the Stats view (under 10K comma-grouped,
  * 10K–1M "12.3K", ≥1M "1.2M").
  */
+
+/** How often the Dashboard re-reads the savings ledger while its tab is open —
+ *  the same 2 s cadence `PlanProgress` polls its plan file at. */
+const POLL_MS = 2000;
 
 /** Format an integer count (events/requests) with US comma grouping. Mirrors
  *  StatsView's helper so the two views read identically. */
@@ -106,9 +110,39 @@ export function DashboardView() {
     }
   }, []);
 
+  // Live update while the tab is open (user report 2027-01-25): the ledger
+  // grows as the agent runs, so the mount-once fetch left the view stale until
+  // the tab was closed and reopened. Poll on PlanProgress's cadence, skip a
+  // tick while the window is hidden or a fetch is still in flight, and refresh
+  // at once when the app regains focus. Closing the panel or switching tabs
+  // unmounts this view (App.tsx gates RightPanel on `rightPanelVisible`, and
+  // RightPanel renders only the active tab's component), so the interval is
+  // bounded to this tab being open.
+  const inFlight = useRef(false);
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    let cancelled = false;
+    const tick = async () => {
+      if (cancelled || inFlight.current || document.hidden) return;
+      inFlight.current = true;
+      try {
+        await refresh();
+      } finally {
+        inFlight.current = false;
+      }
+    };
+    void tick();
+    const interval = setInterval(() => void tick(), POLL_MS);
+    const onFocus = () => void tick();
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onFocus);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onFocus);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once poll; refresh intentionally omitted
+  }, []);
 
   if (loading) {
     return <div className="p-3 text-xs text-slate-500">Loading savings…</div>;
@@ -177,8 +211,9 @@ export function DashboardBody({
         <div className={card}>
           <div className="text-slate-400">No savings recorded yet.</div>
           <div className="mt-1 text-slate-600">
-            Turn on context-economy levers in <code>config.toml</code> (
-            <code>[general.optimizer]</code>) and Mnemo will meter what they save here.
+            Turn on context-economy levers in Settings → Savings (or{" "}
+            <code>[general.optimizer]</code> in <code>config.toml</code>), and Mnemo
+            will meter what they save here.
           </div>
         </div>
       ) : null}

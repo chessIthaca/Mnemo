@@ -42,7 +42,7 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
 | **Optional Laya classifier** | An opt-in "System 1" text classifier: a managed `laya-serve` sidecar — downloaded in Settings, auto-started/stopped by the app on 127.0.0.1 — answers typed questions (choice / score / yes-no) with calibrated probabilities for cheap decisions. Off by default — while it is off, nothing is called. Optional memory auto-typing corrects a record's typed prefix when the classifier is confident (needs a fine-tuned checkpoint; seed examples cover SPEC/DECISION/BUG/HOW), and optional failure triage classifies every tool/provider failure (transient / permanent / needs-user / flaky-test) to steer retries — read-only calls auto-retry without a model roundtrip — while every classified failure is logged with its true outcome so a startup fine-tune can retrain the checkpoint from real dispositions (managed mode) — and an optional kNN overlay (`failure_triage_knn`) learns from that same log immediately, embedding each failure with the local memory embedder and majority-voting the most similar logged failures (vote share = confidence; needs no `laya-serve`). |
 | **Parallel agents** | Spawn sub-agents for research or review; a Run-All backlog dispatches queued plans into parallel worktrees. |
-| **Token-optimizer levers** | Six opt-in context-economy levers (`[general.optimizer]`, all off by default): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, and cache-safe lean-output nudges — each writing a `savings_events` row. |
+| **Token-optimizer levers** | Six opt-in context-economy levers (`[general.optimizer]`, all off by default): delta/skeleton re-reads, command-output compression with credential redaction, archive/expand progressive disclosure (`expand_result`), compaction survival (checkpoint + preserved decisions + digest), an S–F context-quality score in the ctx popup, and cache-safe lean-output nudges — each writing a `savings_events` row. Settable in **Settings → Savings**. |
 | **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
@@ -57,7 +57,7 @@ The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the
 
 1. **Planning** — read tools only. The agent explores the codebase and must call `create_plan` (a goal, context, and ordered steps) before it can touch anything.
 2. **Executing** — all tools available, one step at a time; sub-plans stack and pop back exactly where they left off.
-3. **Reviewing** — implementation plans get a read-only reviewer agent that audits the full diff; every finding must be fixed or justified.
+3. **Reviewing** — implementation plans get a read-only reviewer agent that audits the diff, carrying a harness-rendered contract (verdict format, constitution checks, `.coding/**` bookkeeping rule); from round 2 the app scopes it to `git diff <base>` — only what changed since the round before. Every finding must be fixed or justified.
 4. **Complete** — the change lands on a working branch with the review report in the repo.
 
 That's the whole trick: **a tool-schema guardrail, not a suggestion**. The agent physically cannot write code without a plan on disk — which is what makes a smaller executor model viable.
@@ -163,8 +163,10 @@ If you want fast, calibrated "System 1" decisions (opt-in, off by default), open
 ### Context economy — the `[general.optimizer]` levers
 
 Six independent context-economy levers, all **off by default**; with a flag
-off, the code path is byte-identical to pre-lever behaviour. Add the `[general.optimizer]`
-section to `config.toml` and turn on what you want to economise:
+off, the code path is byte-identical to pre-lever behaviour. Turn them on in
+**Settings → Savings** (each toggle takes effect on the next tool call — no
+restart; the Dashboard view meters what they save, per project), or add the
+`[general.optimizer]` section to `config.toml` by hand:
 
 ```toml
 [general.optimizer]
@@ -188,7 +190,8 @@ auditable. The always-advertised `expand_result` tool retrieves any archived
 result by id or keyword. The Dashboard view (right panel, immediately before
 Memory) reads the ledger back per project: metered tokens saved, per-kind and
 per-day breakdowns, the recent events, and a prompt-cache section whose dollar
-figures are labelled ESTIMATED.
+figures are labelled ESTIMATED. It re-reads the ledger every 2 s while the tab
+is open (and on window focus), so new savings appear without reopening it.
 
 Have fun and let me know where we can improve things.
 Pull requests gratefully considered.

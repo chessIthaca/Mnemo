@@ -20,13 +20,23 @@
 //! is protected from the file tools (`Sandbox::is_protected_write_target`) so
 //! a report cannot be fabricated through file writes either. A review report
 //! can only ever be authored by a spawned reviewer.
+//!
+//! **Provenance stamp (backlog 85313a7e):** on a fresh CREATE the tool appends
+//! a trailing `Reviewed-state: <sha>` line naming the revision the round
+//! reviewed, so a later round can delta-scope against it and a reader can
+//! `git show` the exact state. It is TRAILING because the verdict line must
+//! stay the file's first non-blank line (`starts_with_verdict`, re-read by
+//! `finish`), so front matter is impossible by construction. Best-effort: no
+//! scoper wiring, no git, or a git error simply omits the line.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::agent::review_scope::ReviewScoper;
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
@@ -100,8 +110,22 @@ struct WriteReviewReportArgs {
 /// Holds the reviews directory (`.coding/reviews/`). The reviewer subagent
 /// calls this to persist its findings; the main agent later reads the written
 /// path and passes it to `finish` to close out the review.
+/// The `write_review_report` tool.
+///
+/// Holds the reviews directory (`.coding/reviews/`). The reviewer subagent
+/// calls this to persist its findings; the main agent later reads the written
+/// path and passes it to `finish` to close out the review. Also holds the
+/// optional provenance wiring (backlog 85313a7e): a freshly created report
+/// ends with the revision the round reviewed, best-effort.
 pub struct WriteReviewReportTool {
     reviews_dir: PathBuf,
+    /// The repository root the provenance stamp's git read runs in. `None` in
+    /// tests / store-less setups — the report is then written without a
+    /// provenance line.
+    root: Option<PathBuf>,
+    /// The git-facing scope reader, used ONLY to stamp the reviewed revision.
+    /// `None` disables the stamp — never the write.
+    scoper: Option<Arc<dyn ReviewScoper>>,
 }
 
 impl WriteReviewReportTool {
@@ -109,7 +133,49 @@ impl WriteReviewReportTool {
     pub fn new(reviews_dir: impl Into<PathBuf>) -> Self {
         Self {
             reviews_dir: reviews_dir.into(),
+            root: None,
+            scoper: None,
         }
+    }
+
+    /// Wire in the provenance stamp (backlog 85313a7e): a freshly created
+    /// report then ends with `Reviewed-state: <sha>`, the revision the round
+    /// reviewed. TRAILING, deliberately not front matter — the verdict line
+    /// must stay the file's first non-blank line (`starts_with_verdict`,
+    /// re-read by `finish`), so provenance cannot sit above it. Best-effort:
+    /// no wiring, no git, or a git error simply omits the line; it never fails
+    /// a report write. Returns `self` for chaining.
+    pub fn with_review_scoper(
+        mut self,
+        scoper: Arc<dyn ReviewScoper>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
+        self.scoper = Some(scoper);
+        self.root = Some(root.into());
+        self
+    }
+
+    /// The trailing provenance line for a NEWLY created report, or `None` when
+    /// the stamp is unwired or git cannot name a revision.
+    async fn provenance_line(&self) -> Option<String> {
+        let (scoper, root) = (self.scoper.as_ref()?, self.root.as_ref()?);
+        let sha = scoper.head(root).await.ok()?;
+        let sha = sha.trim();
+        if sha.is_empty() {
+            return None;
+        }
+        Some(format!("Reviewed-state: {sha}"))
+    }
+
+    /// Whether the provenance stamp is wired (backlog 85313a7e).
+    ///
+    /// Exists for the factory's wiring test (review round 1, LOW 3): the
+    /// stamp's behaviour needs a real git repository to witness — pinned
+    /// separately here with a `FakeScoper` — so the REGISTRATION is asserted
+    /// structurally instead. Test-only: the fields stay private.
+    #[cfg(test)]
+    pub(crate) fn provenance_wired(&self) -> bool {
+        self.scoper.is_some() && self.root.is_some()
     }
 
     /// Resolve `path` against `reviews_dir` and confirm the canonicalized
@@ -355,7 +421,21 @@ impl Tool for WriteReviewReportTool {
                         first_non_blank_line(&args.content)
                     ));
                 }
-                args.content.clone()
+                let mut body = args.content.clone();
+                // Trailing provenance (backlog 85313a7e): the revision this
+                // round reviewed, so a later round can delta-scope against it
+                // and a reader can `git show` the exact state. Only on CREATE
+                // (an append must not re-stamp), and only when the scoper
+                // yields a sha — a git error just omits the line.
+                if let Some(line) = self.provenance_line().await {
+                    if !body.ends_with('\n') {
+                        body.push('\n');
+                    }
+                    body.push('\n');
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+                body
             }
         };
         if let Err(e) = std::fs::write(&target, &body) {
@@ -431,6 +511,117 @@ mod tests {
             "the success message must carry the project-relative path: {}",
             result.output
         );
+    }
+
+    /// A canned [`ReviewScoper`] for the provenance tests — no git.
+    struct FakeScoper(Result<String, String>);
+
+    #[async_trait]
+    impl ReviewScoper for FakeScoper {
+        async fn head(&self, _root: &Path) -> Result<String, String> {
+            self.0.clone()
+        }
+
+        async fn changed_paths(&self, _root: &Path, _base: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The single report written under the tool's reviews dir.
+    fn read_report(tool: &WriteReviewReportTool) -> String {
+        let mut entries: Vec<_> = std::fs::read_dir(&tool.reviews_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1, "expected exactly one report");
+        std::fs::read_to_string(entries.pop().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_fresh_report_ends_with_the_reviewed_revision() {
+        // Backlog 85313a7e: a newly created report names the revision its round
+        // reviewed — TRAILING, so the verdict stays the file's first non-blank
+        // line (`finish` re-reads it).
+        let (tool, _dir) = tool_in_temp();
+        let tool = tool.with_review_scoper(Arc::new(FakeScoper(Ok("abc1234".into()))), ".");
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "x-review.md",
+                "content": "## Verdict: PASS\n\nno findings"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let content = read_report(&tool);
+        assert!(
+            content.starts_with("## Verdict: PASS"),
+            "the verdict must stay first: {content}"
+        );
+        assert!(
+            content.ends_with("Reviewed-state: abc1234\n"),
+            "provenance must be trailing: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unwired_scoper_leaves_the_report_unstamped() {
+        // Tests / store-less setups: no wiring, no provenance line, and (of
+        // course) no failure.
+        let (tool, _dir) = tool_in_temp();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "x-review.md",
+                "content": "## Verdict: PASS\n\nno findings"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let content = read_report(&tool);
+        assert!(!content.contains("Reviewed-state"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn a_git_failure_omits_provenance_and_still_writes() {
+        // Best-effort by design: the stamp must never turn a report write into
+        // an error — a reviewer's findings must always reach disk.
+        let (tool, _dir) = tool_in_temp();
+        let tool = tool.with_review_scoper(
+            Arc::new(FakeScoper(Err("not a git repository".into()))),
+            ".",
+        );
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "x-review.md",
+                "content": "## Verdict: PASS\n\nno findings"
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let content = read_report(&tool);
+        assert!(content.starts_with("## Verdict: PASS"), "{content}");
+        assert!(!content.contains("Reviewed-state"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn an_append_does_not_re_stamp() {
+        // Only CREATE stamps: appending a finding section must not add a second
+        // provenance line.
+        let (tool, _dir) = tool_in_temp();
+        let tool = tool.with_review_scoper(Arc::new(FakeScoper(Ok("abc1234".into()))), ".");
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "x-review.md",
+                "content": "## Verdict: FINDINGS (1 high, 0 low)\n\nsummary"
+            }))
+            .await;
+        assert!(first.success, "output: {}", first.output);
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "x-review.md",
+                "content": "\n## High\n\n- finding",
+                "mode": "append"
+            }))
+            .await;
+        assert!(second.success, "output: {}", second.output);
+        let content = read_report(&tool);
+        assert_eq!(content.matches("Reviewed-state:").count(), 1, "{content}");
     }
 
     #[tokio::test]

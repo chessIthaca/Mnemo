@@ -1,6 +1,7 @@
 +++
 title = "Token Dashboard — savings aggregates + get_savings_stats IPC + Dashboard tab"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 SPEC (plan 6494b738, backlog 652ae094; committed dd76b9f on wt/mnemo — NOT yet merged to main). Read-only savings dashboard over the `savings_events` ledger that landed in 1a37d2f (schema/writer untouched — `src/memory/schema.rs` + `src/agent/turn.rs` are outside this change).

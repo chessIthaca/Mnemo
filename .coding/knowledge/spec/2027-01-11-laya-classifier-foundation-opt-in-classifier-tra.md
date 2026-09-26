@@ -1,6 +1,7 @@
 +++
 title = "Laya classifier foundation — opt-in Classifier trait + LayaClassifier + status + Settings (commit 9a8b39c)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Shipped in commit 9a8b39c on branch wt/mnemo (NOT yet merged to main; plan 9295aa31, backlog bb54bdcc). The opt-in Laya "System 1" classifier foundation — item 1 of the 5-item Laya chain.

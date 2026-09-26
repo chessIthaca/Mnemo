@@ -1,6 +1,7 @@
 +++
 title = "Laya managed-only English-only clean-up — landed design (plan 2f74e10a)"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed 2027-02 on branch wt/mnemo (plan 2f74e10a; commit follows this session's closing sequence). Laya is now MANAGED-ONLY + ENGLISH-ONLY: `[general.laya]` carries only `enabled` + the consumer flags (`auto_type_memories`, `steer_tool_choice`, `failure_triage`, `failure_triage_knn`, `auto_finetune`).

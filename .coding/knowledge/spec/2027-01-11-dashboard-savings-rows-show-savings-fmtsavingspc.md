@@ -1,6 +1,7 @@
 +++
 title = "Dashboard savings rows show % savings (fmtSavingsPct) + levers default ON"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 Landed 2027-01-25 (plan 4bab94c1, commit 12a65d1 on wt/mnemo). Two durable contracts for this change; (1) the levers themselves are recorded in the DECISION memory "[general.optimizer] levers default ON, not off":

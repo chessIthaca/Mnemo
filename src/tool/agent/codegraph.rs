@@ -32,12 +32,13 @@
 //! `graph_search` total misses are staleness-aware (backlog 95f21af0 — the
 //! F10 pattern for the symbol index): the watcher's reindex is best-effort
 //! and unlike the search tool there is no walk to fall back on, so a miss
-//! first sweeps the indexed source files' mtimes (stats only), reindexes
-//! up to 8 stale files inline, and re-resolves once from the fresh view,
-//! disclosing the side effect ("reindexed N stale file(s)"); unrepaired
-//! staleness (above the cap, or a pass already running) carries a
-//! staleness note instead. Files not yet in the index (brand-new) remain
-//! watcher-dependent.
+//! first sweeps the indexed source files' mtimes (stats only), reindexes up
+//! to `STALE_REINDEX_CAP` (32) stale files inline under the shared 500 ms
+//! stale-reindex budget — the budget, not the ceiling, is the latency guard —
+//! and re-resolves once from the fresh view, disclosing the side effect
+//! ("reindexed N stale file(s)"); unrepaired staleness (above the ceiling, or
+//! a pass already running) carries a staleness note instead. Files not yet in
+//! the index (brand-new) remain watcher-dependent.
 //!
 //! Indexed languages: Rust (`.rs`) and TypeScript/TSX (`.ts`/`.tsx`). The
 //! tool descriptions state this explicitly so the agent reaches for the
@@ -231,12 +232,19 @@ fn miss_hint(query: &str, candidates: usize) -> String {
     }
 }
 
-/// Cap on graph_search's inline staleness repair (backlog 95f21af0 — the
-/// F10 pattern for the symbol index, mirroring the search tool's cap): a
-/// total miss with MORE stale files than this serves the staleness note
-/// instead of a large inline re-index — the watcher's next pass covers the
-/// rest.
-const STALE_REINDEX_CAP: usize = 8;
+/// Ceiling on graph_search's inline staleness repair (backlog 95f21af0 — the
+/// F10 pattern for the symbol index, mirroring the search tool's cap): an
+/// ADAPTIVE upper bound, NOT the latency guard itself. Within it the repair
+/// runs under [`crate::codegraph::STALE_REINDEX_BUDGET`], whose pass stops
+/// between files once the budget is spent, so a slow set degrades to the
+/// plain miss instead of a slow lookup. A total miss with MORE stale files
+/// than this (or a pass already running) serves the staleness note — the
+/// watcher's next pass covers the rest. Raised 8 → 32 on 2026-09-26 to match
+/// the content index's adaptive ceiling (commit 06276aa, backlog 9201704f):
+/// the old 8 left a checkout-scale drift (61 files) unrepaired and this
+/// plan's own regression-test symbol unindexed — accurate results matter
+/// more than the note.
+const STALE_REINDEX_CAP: usize = 32;
 
 /// Shared arg shape for the single-symbol tools: either an exact `id` or a
 /// `name` to resolve.
@@ -1054,13 +1062,60 @@ mod tests {
 
     #[tokio::test]
     async fn stale_above_the_reindex_cap_notes_instead_of_reindexing() {
-        // Backlog 95f21af0 (review LOW 2): staleness ABOVE the cap is not
+        // Backlog 95f21af0 (review LOW 2): staleness ABOVE the ceiling is not
         // repaired inline — the miss is served with the staleness note
         // (pinning the note string + the no-inline-reindex-above-cap
         // behavior, mirroring the search tool's
-        // stale_above_the_reindex_cap_walks).
+        // stale_above_the_reindex_cap_walks). The ceiling is now the content
+        // index's adaptive 32 (raised 8 → 32 on 2026-09-26), so this needs
+        // ceiling + 1 stale files.
         let (dir, graph) = indexed_graph();
-        // 9 stale source files (cap is 8): the 2 fixture files + 7 more.
+        // STALE_REINDEX_CAP + 1 stale source files: the 2 fixture files plus
+        // ceiling - 1 extras.
+        let mut stale_names = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        for i in 0..(STALE_REINDEX_CAP - 1) {
+            let name = format!("src/extra{i}.rs");
+            std::fs::write(
+                dir.path().join(&name),
+                format!("pub fn extra_{i}() -> u32 {{ {i} }}\n"),
+            )
+            .unwrap();
+            stale_names.push(name);
+        }
+        graph.index(None).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for name in &stale_names {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(name))
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let tool = GraphSearchTool::new(graph);
+        let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
+        assert_eq!(out["count"], 0);
+        let note = out["note"].as_str().expect("the staleness note is served");
+        assert!(
+            note.contains(&format!(
+                "symbol index may be stale — {} file(s) on disk are newer than the index",
+                STALE_REINDEX_CAP + 1
+            )),
+            "note pins the stale count: {note}"
+        );
+        assert!(!note.contains("reindexed"), "no inline reindex above the cap");
+        assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
+    }
+
+    #[tokio::test]
+    async fn stale_within_the_reindex_ceiling_repairs_inline() {
+        // 2026-09-26 (user directive: accurate results matter more than the
+        // note): a drift WITHIN the adaptive ceiling must be REPAIRED inline
+        // and the lookup re-served from the fresh view. Nine stale files is
+        // exactly the case the old ceiling of 8 mishandled — the live
+        // 61-file drift left this plan's own regression-test symbol
+        // unindexed and forced the manual reindex detour.
+        let (dir, graph) = indexed_graph();
         for i in 0..7 {
             std::fs::write(
                 dir.path().join(format!("src/extra{i}.rs")),
@@ -1069,6 +1124,13 @@ mod tests {
             .unwrap();
         }
         graph.index(None).unwrap();
+        // src/extra0.rs gains a symbol the index has never seen — only a
+        // re-read of the stale file can answer the query below.
+        std::fs::write(
+            dir.path().join("src/extra0.rs"),
+            "pub fn fresh_symbol_xyz() -> u32 { 7 }\n",
+        )
+        .unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         for name in [
             "src/lib.rs",
@@ -1089,15 +1151,20 @@ mod tests {
                 .unwrap();
         }
         let tool = GraphSearchTool::new(graph);
-        let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
-        assert_eq!(out["count"], 0);
-        let note = out["note"].as_str().expect("the staleness note is served");
-        assert!(
-            note.contains("symbol index may be stale — 9 file(s) on disk are newer than the index"),
-            "note pins the stale count: {note}"
+        let out = payload(tool.execute(json!({ "query": "fresh_symbol_xyz" })).await);
+        assert_eq!(
+            out["count"], 1,
+            "the repaired view resolves the symbol: {out}"
         );
-        assert!(!note.contains("reindexed"), "no inline reindex above the cap");
-        assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
+        let note = out["note"].as_str().expect("the repair is disclosed");
+        assert!(
+            note.contains("reindexed") && note.contains("serving fresh graph results"),
+            "inline repair is disclosed: {note}"
+        );
+        assert!(
+            !note.contains("may be stale"),
+            "no staleness note within the ceiling: {note}"
+        );
     }
 
     #[test]

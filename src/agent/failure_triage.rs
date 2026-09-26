@@ -34,7 +34,7 @@
 //! gap between fine-tunes: it learns from the training log itself — every
 //! resolved disposition is retrievable on the next classification — and
 //! rides the app's local embedding backend, not `laya-serve`, so it is
-//! independent of the Laya endpoint.
+//! independent of the laya-serve sidecar.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

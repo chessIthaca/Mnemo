@@ -257,20 +257,6 @@ pub struct SettingsSaveDto {
     /// current value (see `GeneralSection::laya`).
     #[serde(default)]
     pub laya_enabled: Option<bool>,
-    /// Laya `laya-serve` base URL, e.g. `"http://127.0.0.1:8000"`. Absent =
-    /// keep; a blank string clears it (the classifier then reports
-    /// unavailable when enabled).
-    #[serde(default)]
-    pub laya_endpoint: Option<String>,
-    /// Laya provisioning mode: `external` (a user-run `laya-serve` at
-    /// `laya_endpoint`) or `managed` (the app downloads + runs it — see
-    /// Settings → Classifier). Absent = keep.
-    #[serde(default)]
-    pub laya_mode: Option<super::general::LayaMode>,
-    /// Managed-mode checkpoint id (`"english"` | `"multilingual"`). Absent
-    /// = keep; a blank string clears it to the `"english"` default.
-    #[serde(default)]
-    pub laya_checkpoint: Option<String>,
     /// Laya auto-typing of memory records (opt-in; enable only against a
     /// fine-tuned checkpoint — base checkpoints mis-classify). Absent =
     /// keep the current value.
@@ -636,25 +622,6 @@ pub fn validate_and_apply_settings_patch(
     if let Some(enabled) = patch.laya_enabled {
         general.general.laya.enabled = enabled;
     }
-    if let Some(endpoint) = &patch.laya_endpoint {
-        let trimmed = endpoint.trim();
-        general.general.laya.endpoint = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
-    if let Some(mode) = patch.laya_mode {
-        general.general.laya.mode = mode;
-    }
-    if let Some(checkpoint) = &patch.laya_checkpoint {
-        let trimmed = checkpoint.trim();
-        general.general.laya.checkpoint = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
     if let Some(auto_type) = patch.laya_auto_type_memories {
         general.general.laya.auto_type_memories = auto_type;
     }
@@ -990,65 +957,19 @@ mod tests {
     }
 
     #[test]
-    fn laya_patch_applies_enabled_and_endpoint() {
+    fn laya_patch_applies_enabled() {
         // The opt-in Laya classifier rides the save path: Some flips the
-        // enable flag, Some(endpoint) sets the base URL (trimmed), a blank
-        // endpoint clears it, and absent fields keep the current values.
+        // enable flag, absent fields keep the current values.
         let current = Config::default();
         let patch = SettingsSaveDto {
             laya_enabled: Some(true),
-            laya_endpoint: Some("  http://127.0.0.1:8000  ".into()),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert!(next.general.general.laya.enabled);
-        assert_eq!(
-            next.general.general.laya.endpoint.as_deref(),
-            Some("http://127.0.0.1:8000")
-        );
-        // A blank endpoint clears it; the enable flag is untouched.
-        let patch = SettingsSaveDto {
-            laya_endpoint: Some("   ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert!(next.general.general.laya.enabled);
-        assert_eq!(next.general.general.laya.endpoint, None);
         // Defaults: nothing set, nothing enabled.
         let empty = Config::default();
         assert!(!empty.general.general.laya.enabled);
-        assert!(empty.general.general.laya.endpoint.is_none());
-    }
-
-    #[test]
-    fn laya_patch_applies_mode_and_checkpoint() {
-        // Managed-mode fields ride the same save path: Some(mode) flips the
-        // provisioning mode, Some(checkpoint) sets it (trimmed), a blank
-        // checkpoint clears it to the english default, absent keeps current.
-        let current = Config::default();
-        assert_eq!(
-            current.general.general.laya.mode,
-            crate::config::LayaMode::External
-        );
-        let patch = SettingsSaveDto {
-            laya_mode: Some(crate::config::LayaMode::Managed),
-            laya_checkpoint: Some("  multilingual  ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
-        assert_eq!(
-            next.general.general.laya.checkpoint.as_deref(),
-            Some("multilingual")
-        );
-        // A blank checkpoint clears it; the mode is untouched.
-        let patch = SettingsSaveDto {
-            laya_checkpoint: Some("   ".into()),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert_eq!(next.general.general.laya.mode, crate::config::LayaMode::Managed);
-        assert_eq!(next.general.general.laya.checkpoint, None);
     }
 
     #[test]

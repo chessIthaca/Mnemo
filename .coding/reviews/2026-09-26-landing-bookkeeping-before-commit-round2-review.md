@@ -1,0 +1,49 @@
+## Verdict: PASS
+
+All four round-1 findings are fixed in commit 0a32445 exactly as prescribed, the fixes disturbed nothing round 1 verified, and the delta introduced no new problem. The only uncommitted change is the harness's round-2 stamp on the plan frame.
+
+## Scope — what was actually read
+
+- Delta enumeration (`git log` + `git status` + `git diff`): the delta since base f7e1fa5 is exactly ONE commit, **0a32445** (30 files, +326/−25), plus one uncommitted line — the `## Reviews` round-2 stamp `2 0a32445…` in `.coding/plans/ced9308a.md`, harness bookkeeping, not a review target. This is not an empty-diff review.
+- Read in full: `.coding/skills/merge_to_main.toml` (all 94 lines — header comment block + the 7-step prompt), `.coding/skills/new_release.toml` (all 57 lines), the round-1 report (all 66 lines), both added plan files (`.coding/plans/ced9308a.md`, `.coding/plans/fc41c5aa.md`), and the commit message + stat of 0a32445.
+- Read targeted: `PLAN.md` :500-539 (the reworded merge-hygiene paragraph + surrounding context) and :296-311 (PLAN.md's other merge_to_main mention); `src/skill/mod.rs` :440-683 (both contract tests in full, comment through final assertion); `docs/FEATURES.md` :28-42; `src/memory/finish_capture.rs` :20-44.
+- Sweeps on the current tree: `post-merge` across `PLAN.md`, `agent.md`, `docs/**/*.md`, `src/**/*.rs` — **0 hits in every one**; `after the landing` repo-wide — only the two correct no-write-rule assertion lines in `src/skill/mod.rs`; `at merge time` in src — one unrelated indexer test fixture string; `once the branch lands` in PLAN.md — wraps across :523-524 of the new paragraph itself (verified by direct read; a single-line literal search can't match across the wrap).
+
+Since the working tree is clean except the plan-frame line, the file contents read above ARE commit 0a32445's contents — the fixes are genuinely in the delta, not just in the tree.
+
+Reviewed-state: 0a32445876cb7015a72ffd809227369d34e86b49
+## The four fixes — each verified
+
+**1. LOW 1 — PLAN.md :518-524.** Carries the prescribed rewording verbatim: "the `merge_to_main` skill supersedes the branch-status records citing the merged branch ON THE BRANCH, before the landing commit (memory tools are always available inside a skill — no allow-list entry needed), so the successors land with the merge and stale "unmerged" hints stop recalling once the branch lands." It matches the shipped prompt: step 2 is "Write this branch's landing records NOW, before anything is committed", step 3 is "Commit ALL uncommitted work on that branch, `.coding/` included … this step carries the step-2 records into the merge", and step 5 closes the PR path with "The step-2 records ship inside this PR and become part of main exactly when the human merges." No other PLAN.md text implies the old ordering: `post-merge` has 0 hits in PLAN.md, and the file's other merge_to_main mention (:305, skill_create never rewriting a shipped skill) is ordering-neutral.
+
+**2. LOW 2 — merge_to_main.toml header, three renumbered references.** :7-8 "the landing hygiene is step 2 (records) plus step 6 (the no-write rule + clean-tree check)"; :14 "NEVER stash (step 3)"; :38 "step 5's gh pr create". Each checked against the actual 7-step prompt — 1 ruleset check, 2 records, 3 commit + NEVER stash, 4 direct path, 5 PR path (`gh pr create`), 6 no-write rule + empty `git status --short`, 7 `skill_end` — all correct. I read the entire 94-line file: the only other step references are :48 "(new_release step 3)" (the tag push — correct) and new_release.toml's own header refs (:12 step 1 manifests, :15 step 3 tag-on-merged-main, :18 step 4 never-create-release, :23 step 4 API check, :26 step 2 ruleset detection, :30 step 3 tag push not blocked), each correct against its 5-step prompt. No stale reference remains in either header.
+
+**3. LOW 3 — src/skill/mod.rs :480-483.** The comment now reads "branch-status records are superseded on the branch, BEFORE the landing commit, so the successors land with the merge (memory tools are always available inside a skill, so the tools list needs no entry)". It matches the assertion directly below (:484-487 — prompt contains `MERGED into main`, the record title tail step 2 writes) and agrees with, rather than contradicts, the sibling regression test's comment ~70 lines down (:555-562: "Landing records must be written — and committed — on the branch BEFORE it is pushed, and nothing may be written after").
+
+**4. LOW 4 — new_release.toml step 2 (:53).** Now carries "on the PR path add `a PR against main is opened from this branch, awaiting human review`" — byte-identical to merge_to_main step 2's clause (:88). The two skills' landing-record formats now agree: same title tail `— MERGED into main (branch <branch>, <YYYY-MM-DD>)`; same body fields (branch + WORK TIP via `git rev-parse HEAD` captured before the commit); same no-sha/no-PR-number rule; same conditional PR-path note. The order contract is unbroken in both prompts: merge_to_main "Write this branch's landing records NOW" (step 2) precedes "Commit ALL uncommitted work" (step 3), with the opening line pinning "step 2 precedes step 3"; new_release step 2 is "FIRST `Write this branch's landing records NOW` … THEN `commit ALL uncommitted work (.coding/ included)` — that commit carries the records into the merge", closed by "No memory or knowledge write after the landing … check `git status --short` is clean before `skill_end`".
+
+## No-new-problem checks
+
+- **Both TOMLs still parse.** Static inspection of both full files found no syntax hazard: triple-quoted basic strings whose only backslashes are the legal trailing line-continuation escapes before the closing `"""`, valid keys, no stray backslashes inside the prompt bodies. Runtime parse proof rides on the parent's post-fix unpiped full-suite run: `shipped_skill_files_parse_and_merge_to_main_cleans_up_memories` and the regression test both load these files from `.coding/skills`, and the embedded `include_str!` copies are parsed by `shipped_skills_embedded_entries_parse_and_carry_their_name`.
+- **No pinned ordering assertion weakened.** I read both tests in full (:440-683). The existing contract test keeps every round-1-verified pin — `git fetch origin` < `git pull --no-rebase` < `--no-ff <branch>`; ruleset-check < `git checkout main`; `git push` on the git tool < `git branch -d <branch>`; contains `MERGED into main`, `gh pr create --base main`, `NEVER bypass`. The regression test keeps `record < commit < push` (merge_to_main), the no-write-rule and `git status --short` contains-checks, and `release_record < release_commit` (new_release). The fix round's only mod.rs change is the :480-483 comment text; the clause inserted into new_release sits between the record markers and the commit marker, so both index-order pins still hold textually.
+- **No doc/comment left describing the old post-merge ordering.** Sweeps above are clean. The remaining `post-merge` occurrences inside `.coding/**` are accurate history, not behavior descriptions: fc41c5aa's title and its step 4 ("Supersede the branch's post-merge status memories") describe the emergency closeout that genuinely ran after PR #7 merged, and ced9308a's root-cause section describes the old ordering as the defect being fixed — required content for a bug plan.
+- **Round-1-verified surfaces undisturbed.** merge_to_main's prompt retains all pre-existing contracts verbatim (sync-first, conflict-union, both-builds, GH013 recovery with the 4→5 renumbering, no-bypass, push-before-delete, author-cannot-self-approve, PR-exists→report URL); `docs/FEATURES.md:36` and `src/memory/finish_capture.rs:28-29` carry the new on-the-branch-before-the-landing-commit wording; agent.md's Environment and Branch-policy bullets are present with the new ordering + record-phrasing rules (confirmed via the loaded constitution rendering of the live agent.md; 0 `post-merge` hits in the file).
+
+## Standard checks
+
+- **Documentation sync:** the fix round was itself four documentation corrections, and the sweeps confirm nothing further is stale.
+- **Multi-platform neutrality:** text/comment-only delta; the tests use the same cross-platform `env!("CARGO_MANIFEST_DIR")` + `Path::join` pattern as their sibling. Nothing platform-specific added.
+- **File-tools-first:** no shell-based file mutation anywhere in the delta.
+- **Warning-free build:** the only Rust change is comment text — no warning source introduced; covered by the parent's green `#![deny(warnings)]` suite run.
+
+## `.coding/` bookkeeping — accuracy check (one line)
+
+The swept bookkeeping matches what shipped: the added bug/decision/how knowledge files are live in the memory index with matching content (BUG 26393595, DECISION 4048f19a, HOW 6bbe439a), the -3/-4 supersede/successor pairs and flipped backlog rows are consistent with the PR #7 / closeout-fc41c5aa story, and the plan frame's only uncommitted line is the expected round-2 stamp.
+
+## Evidence note
+
+I am read-only and could not run `cargo test`. The only claims that lean on runtime evidence are (a) TOML parseability and (b) the tests being green with the markers in the pinned byte order — both statically verified here by direct full reads of the TOMLs and the tests, and both exercised by the parent's post-fix unpiped full-suite run (exit 0, per the dispatch evidence note). No fix requires runtime evidence beyond that.
+
+## Process remark (one line)
+
+Round 1 reviewed the whole change set while it sat uncommitted, and that material was never committed separately — it all rides in 0a32445 together with the four fixes; the fix regions were byte-verified here, and the round-1-verified regions were spot-checked (contract pins re-verified against the current prompt; doc hunks re-read) rather than re-line-reviewed, per the delta protocol.

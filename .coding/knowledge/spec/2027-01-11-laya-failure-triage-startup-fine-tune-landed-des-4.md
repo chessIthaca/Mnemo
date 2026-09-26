@@ -5,3 +5,5 @@ created = "2027-01-11"
 +++
 
 MERGED into main at f7e1fa5 (f7e1fa5d052c93068097a8078bf6e326ad935ce2) on 2026-09-26 via PR #7 (merge_to_main skill, PR path); branch wt/mnemo deleted both remotely (by the human) and locally (post-merge closeout step 3); pre-merge tip 2203439. Subject of this record: Laya failure triage + startup fine-tune landed design (plan 02deea7c) — its landed work was already in main via PR #6 (merge 614c42f); PR #7 carried the branch's remaining work plus the bookkeeping records. Nothing is pending on this record.
+
+Amended 2027-01-11: The startup fine-tune gate no longer requires MANAGED mode or a configured checkpoint (plan 2f74e10a, 2027-02): `startup_finetune_checkpoint` gates on `laya.enabled && laya.auto_finetune && manager.is_checkpoint_installed(english_checkpoint().id)` and returns the English catalog id (test: `ipc::finetune::tests::startup_gate_requires_the_enabled_flag_and_an_install`). The hot-swap/restore behavior and the failure-triage surface above are unchanged.

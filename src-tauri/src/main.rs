@@ -19,7 +19,7 @@ use mnemo::memory::embedder::HashEmbedder;
 use mnemo::memory::MemoryStore;
 use mnemo::project::Project;
 use mnemo::provider::client_factory::{
-    build_classifier, build_client, build_embedder, build_vision_client, embedder_startup_plan,
+    build_client, build_embedder, build_vision_client, embedder_startup_plan,
     EmbedderStartupPlan,
 };
 use mnemo::provider::openai::{OpenAiClient, OpenAiClientConfig};
@@ -569,11 +569,11 @@ fn main() {
                         let _ = app_handle.emit("embedder://status", &status);
                     }
 
-                    // The classifier status was already determined by
-                    // `build_classifier` during brain construction (Disabled
-                    // unless Laya is enabled with an endpoint, Ready
-                    // otherwise). Emit it once so the Settings → Classifier
-                    // section reflects the real state on mount.
+                    // The classifier status was already determined during
+                    // brain construction (Starting when the managed sidecar
+                    // was spawned, Disabled otherwise). Emit it once so the
+                    // Settings → Classifier section reflects the real state
+                    // on mount.
                     {
                         let app_handle = app.handle().clone();
                         let status_lock = app.state::<IpcState>().runtime.classifier_status.clone();
@@ -621,10 +621,10 @@ fn main() {
                     // the pre-allocated loopback port (build_brain); spawn
                     // the sidecar now and drive the status to Ready/Failed
                     // (progress on classifier://status).
-                    if let Some((checkpoint_id, port)) = &brain.pending_laya_start {
+                    if let Some((_checkpoint_id, port)) = &brain.pending_laya_start {
                         let app_handle = Some(app.handle().clone());
                         let manager = brain.laya.clone();
-                        let checkpoint = ipc::laya::find_checkpoint(checkpoint_id);
+                        let checkpoint = ipc::laya::english_checkpoint();
                         let port = *port;
                         tauri::async_runtime::spawn(async move {
                             ipc::laya::start_managed_server(
@@ -1397,67 +1397,46 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     let classifier_status = Arc::new(RwLock::new(
         mnemo::memory::classifier::ClassifierStatus::Disabled,
     ));
-    let classifier = build_classifier(&config, classifier_status.clone());
     // The managed-runtime owner sharing the same status — inert until the
-    // startup hook / Settings rewire enable managed mode.
+    // startup hook / Settings rewire enable Laya.
     let laya = Arc::new(ipc::laya::LayaManager::new(classifier_status.clone()));
 
-    // Managed mode (`mode = "managed"`): the app owns the runtime. When
-    // enabled + the checkpoint is installed, the classifier client points
-    // at the loopback sidecar the startup hook spawns right after this
-    // (status Starting until the probe answers). Enabled but not installed
-    // ⇒ a hint is logged and no client exists (the Settings → Classifier
-    // setup completes it; `laya_setup` then starts the server and swaps
-    // the client in). External mode is untouched — `build_classifier`
-    // above handled it and returned None here.
+    // Laya is managed-only (the external-endpoint mode is gone): the app owns
+    // the runtime. When enabled + the English checkpoint is installed, the
+    // classifier client points at the loopback sidecar the startup hook
+    // spawns right after this (status Starting until the probe answers).
+    // Enabled but not installed ⇒ a hint is logged and no client exists (the
+    // Settings → Classifier setup completes it; `laya_setup` then starts the
+    // server and swaps the client in).
     let mut pending_laya_start = None;
-    let managed_classifier = match (
-        config.general.general.laya.mode,
-        config.general.general.laya.enabled,
-    ) {
-        (mnemo::config::LayaMode::Managed, true) => {
-            let checkpoint = ipc::laya::find_checkpoint(
-                config
-                    .general
-                    .general
-                    .laya
-                    .checkpoint
-                    .as_deref()
-                    .unwrap_or("english"),
-            );
-            if laya.is_checkpoint_installed(checkpoint.id) {
-                match ipc::laya::LayaManager::alloc_free_port() {
-                    Some(port) => {
-                        pending_laya_start = Some((checkpoint.id.to_string(), port));
-                        *classifier_status.write().expect("classifier status lock poisoned") =
-                            mnemo::memory::classifier::ClassifierStatus::Starting;
-                        ipc::laya::build_managed_classifier(port, classifier_status.clone())
-                    }
-                    None => {
-                        eprintln!(
-                            "warning: no free loopback port for the managed laya-serve; \
-                             the classifier stays disabled"
-                        );
-                        None
-                    }
+    let classifier = if config.general.general.laya.enabled {
+        let checkpoint = ipc::laya::english_checkpoint();
+        if laya.is_checkpoint_installed(checkpoint.id) {
+            match ipc::laya::LayaManager::alloc_free_port() {
+                Some(port) => {
+                    pending_laya_start = Some((checkpoint.id.to_string(), port));
+                    *classifier_status.write().expect("classifier status lock poisoned") =
+                        mnemo::memory::classifier::ClassifierStatus::Starting;
+                    ipc::laya::build_managed_classifier(port, classifier_status.clone())
                 }
-            } else {
-                eprintln!(
-                    "info: [general.laya] managed mode is enabled but the '{}' \
-                     checkpoint is not downloaded — run the setup in Settings → Classifier",
-                    checkpoint.id
-                );
-                None
+                None => {
+                    eprintln!(
+                        "warning: no free loopback port for the managed laya-serve; \
+                         the classifier stays disabled"
+                    );
+                    None
+                }
             }
+        } else {
+            eprintln!(
+                "info: [general.laya] is enabled but the '{}' checkpoint is not \
+                 downloaded — run the setup in Settings → Classifier",
+                checkpoint.id
+            );
+            None
         }
-        _ => None,
-    };
-    // Managed mode owns the classifier: a stale external `endpoint` must not
-    // back-door a live classifier in at startup that any later save would
-    // drop (the rewire never falls back to the endpoint either).
-    let classifier = match config.general.general.laya.mode {
-        mnemo::config::LayaMode::Managed => managed_classifier,
-        _ => managed_classifier.or(classifier),
+    } else {
+        None
     };
     // The shared classifier SLOT + the auto-typing flag (backlog a147b63c):
     // one Arc pair feeds the factory's memory_write tools (call-time read)

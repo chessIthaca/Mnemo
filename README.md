@@ -158,7 +158,7 @@ In the config dialog download a semantic model that runs locally on your machine
 
 If you want in browser debugging you have to enable it in the advanced section of the config dialog.
 
-If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and pick Managed: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites. Advanced: run `laya-serve` yourself and point the section at its endpoint URL instead.
+If you want fast, calibrated "System 1" decisions (opt-in, off by default), open Settings → Classifier and enable it: Mnemo downloads a self-contained Laya runtime (uv + virtualenv + `laya[serve]` + the English checkpoint — roughly 0.8–1 GB plus the checkpoint) with a live progress bar, then automatically starts, monitors, and stops the local `laya-serve` sidecar on 127.0.0.1. No command line, no Python prerequisites, and nothing to point at an endpoint.
 
 ### Context economy — the `[general.optimizer]` levers
 

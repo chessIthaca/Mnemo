@@ -433,17 +433,12 @@ export function serializeChat(d: ChatDraft): string {
 }
 
 /**
- * Snapshot of the Laya classifier draft (for dirty / discard). `mode` picks
- * managed (Mnemo downloads + runs laya-serve) vs external; `checkpoint` is
- * the managed-mode checkpoint id; `endpoint` is the raw external-mode input
- * value; "" means "not configured" (the backend clears the stored URL when
- * the save patch carries a blank string).
+ * Snapshot of the Laya classifier draft (for dirty / discard) — Laya is
+ * managed-only now: no mode, no endpoint, one English checkpoint, so the
+ * draft is just the opt-in flags below.
  */
 export interface ClassifierDraft {
   enabled: boolean;
-  mode: "external" | "managed";
-  checkpoint: string;
-  endpoint: string;
   /** The `auto_type_memories` opt-in — a separate toggle from `enabled`
    * (confidence-gated prefix correction; needs a fine-tuned checkpoint). */
   autoTypeMemories: boolean;

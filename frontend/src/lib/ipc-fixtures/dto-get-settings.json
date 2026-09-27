@@ -18,7 +18,8 @@
       "steer_tool_choice": false,
       "failure_triage": false,
       "failure_triage_knn": false,
-      "auto_finetune": false
+      "auto_finetune": false,
+      "routing": false
     },
     "optimizer": {
       "delta_reads": true,
@@ -32,6 +33,12 @@
       "compress_min_chars": 2000,
       "lean_output_fill_pct": 25,
       "nudge_cooldown_requests": 10
+    },
+    "routing": {
+      "capable": null,
+      "cheap": null,
+      "enforce": false,
+      "threshold": 0.8
     },
     "safety": "approve-each-action",
     "vision_model": null

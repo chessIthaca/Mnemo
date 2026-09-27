@@ -4,7 +4,7 @@
 
 /** Shared types and constants for the Settings dialog. */
 
-import type { EndpointEditable, ModelConfigEditable, VisionModelInfo } from "../../lib/tauri";
+import type { EndpointEditable, ModelConfigEditable, ModelRefConfig, VisionModelInfo } from "../../lib/tauri";
 import type { McpServer, McpServerStatus } from "../../lib/types";
 import type { SteeringNoteKey } from "../../lib/delegationNotes";
 
@@ -455,6 +455,22 @@ export interface ClassifierDraft {
   failureTriageKnn: boolean;
   /** The `auto_finetune` opt-in — the startup fine-tune (managed only). */
   autoFinetune: boolean;
+  /** The `routing` opt-in — pre-prompt model routing (backlog 091e694d: each
+   *  main-agent turn's task text is classified trivial vs architectural;
+   *  needs a fine-tuned checkpoint). Ships shadow-first — decisions are
+   *  classified + logged and the model switches only once `routingEnforce`
+   *  is on. */
+  routing: boolean;
+  /** Whether a confident routing decision actually switches the turn's model
+   *  (false = shadow: classify + log only). */
+  routingEnforce: boolean;
+  /** The model a confidently-trivial task routes to (null = unset). */
+  routingCheap: ModelRefConfig | null;
+  /** The model a confidently-architectural task routes to (null = unset). */
+  routingCapable: ModelRefConfig | null;
+  /** The calibrated-probability gate (0–1): a decision routes only at or
+   *  above it; below it today's model runs. */
+  routingThreshold: number;
 }
 
 /** Serialize the classifier draft for dirty comparison. */

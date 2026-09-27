@@ -13,6 +13,7 @@
 use std::sync::{Arc, RwLock};
 
 use super::failure_triage;
+use super::model_routing;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -388,6 +389,15 @@ pub struct AgentLoop {
     /// in tests / when the Laya foundation is not wired — those sites then
     /// keep their pre-classifier behavior byte-for-byte.
     pub(crate) failure_triage: Option<failure_triage::FailureTriageHandle>,
+    /// The optional pre-prompt routing gate (the Laya classifier's
+    /// task-complexity consumer, `[general.laya] routing`, backlog 091e694d):
+    /// the SAME shared classifier slot the other Laya consumers read. `None`
+    /// in tests / when the Laya foundation is not wired -- the turn then never
+    /// classifies, and model selection is byte-identical to today. The opt-in
+    /// flag and the `[general.routing]` threshold / `enforce` are read from the
+    /// live config by the model resolver per turn, so no flag mirror is needed
+    /// here.
+    pub(crate) routing: Option<model_routing::RoutingGate>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -796,6 +806,7 @@ impl AgentLoop {
             plans_dir: std::path::PathBuf::new(),
             root_spec: None,
             failure_triage: None,
+            routing: None,
         }
     }
 
@@ -864,6 +875,19 @@ impl AgentLoop {
     /// in tests that don't exercise triage.
     pub fn with_failure_triage(mut self, handle: failure_triage::FailureTriageHandle) -> Self {
         self.failure_triage = Some(handle);
+        self
+    }
+
+    /// Attach the pre-prompt routing gate (the Laya classifier's
+    /// task-complexity consumer, `[general.laya] routing`, backlog 091e694d).
+    /// The gate carries the shared classifier slot; the opt-in flag and the
+    /// `[general.routing]` threshold / `enforce` ride the live config the
+    /// model resolver reads per turn, so a Settings save needs no rebuild.
+    /// Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise routing.
+    pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
+        self.routing = Some(gate);
         self
     }
 
@@ -1273,11 +1297,35 @@ impl AgentLoop {
     /// (`skill_start`/`skill_end`, or a state transition from any workflow
     /// tool) switches the next request within the same turn to the
     /// configured per-context model. See [`AgentLoop::run_turn`].
+    ///
+    /// This variant threads no routing decision; use
+    /// [`resolve_turn_provider_routed`](Self::resolve_turn_provider_routed)
+    /// for the turn's pre-prompt routing arm (backlog 091e694d).
     pub(crate) fn resolve_turn_provider(
         &self,
         workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
         plan_kind: Option<crate::workflow::PlanKind>,
+    ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
+        self.resolve_turn_provider_routed(workflow_state, skill_name, plan_kind, None)
+    }
+
+    /// [`resolve_turn_provider`](Self::resolve_turn_provider) with the turn's
+    /// pre-prompt ROUTING decision threaded in (backlog 091e694d).
+    ///
+    /// `route` is `Some` only when the turn's classification cleared the
+    /// confidence gate AND enforcement is on. The arm sits BELOW the three
+    /// explicit-pin arms above (a skill, the picker pin, a forced model keep
+    /// their model) and ABOVE the state/subagent chain it replaces: a routed
+    /// target that is unset, dangling, or refused by
+    /// [`resolve_routed`](crate::model_resolver::ModelResolver::resolve_routed)
+    /// falls through to that chain, unchanged.
+    pub(crate) fn resolve_turn_provider_routed(
+        &self,
+        workflow_state: crate::workflow::WorkflowState,
+        skill_name: Option<&str>,
+        plan_kind: Option<crate::workflow::PlanKind>,
+        route: Option<model_routing::RouteTarget>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
         // 1. Configured skill override beats everything — including the
         // picker pin. Skill runs are deliberate context switches that carry
@@ -1459,6 +1507,38 @@ impl AgentLoop {
             return None;
         };
         let is_subagent = self.is_subagent();
+        // Pre-prompt ROUTING (backlog 091e694d): a confident classification of
+        // this turn's task text may run it on the configured cheap / capable
+        // target instead of the state/subagent chain below. The explicit-pin
+        // arms above already returned, and `resolve_routed` refuses the skill,
+        // subagent and bug-fixing contexts itself -- so an arm that did not
+        // fire cannot smuggle routing past an explicit choice. Unset, dangling
+        // or refused -> `None` -> the chain below runs exactly as before.
+        if let Some(target) = route {
+            let ctx = crate::model_resolver::ModelContext::new(
+                workflow_state,
+                skill_name,
+                is_subagent,
+                plan_kind,
+            );
+            if let Some(model_ref) = resolver.resolve_routed(target, ctx) {
+                // Same endpoint stickiness as every other arm: a recorded 429
+                // fallback reroutes the ENDPOINT of this model, never the
+                // routed model choice itself.
+                let model_ref = self.sticky_endpoint(&model_ref).unwrap_or(model_ref);
+                let built = resolver.build_turn_provider(&model_ref, self.fill_rate);
+                // Record the effective model so the UI reports what actually
+                // ran (the routed target beats the state/subagent chain).
+                self.set_resolved_model(built.as_ref().map(|(p, _)| p.model().to_string()));
+                self.set_resolved_provider(
+                    built.as_ref().map(|(p, _)| p.provider_name().to_string()),
+                );
+                self.set_resolved_effort(
+                    built.as_ref().and_then(|_| resolver.display_effort_for(&model_ref)),
+                );
+                return built;
+            }
+        }
         let model_ref = resolver.resolve(crate::model_resolver::ModelContext::new(
             workflow_state,
             skill_name,

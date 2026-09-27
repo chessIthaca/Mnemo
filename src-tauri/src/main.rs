@@ -1496,6 +1496,13 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
         config.general.general.laya.failure_triage_knn,
     );
 
+    // The pre-prompt routing gate (backlog 091e694d): the SAME shared
+    // classifier slot. The `[general.laya] routing` opt-in and the
+    // `[general.routing]` threshold / enforce are read from the live config
+    // by the model resolver per turn, so this gate carries no flag mirror and
+    // a Settings save needs no rewire.
+    let routing_gate = mnemo::agent::model_routing::RoutingGate::new(classifier_slot.clone());
+
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per
     // call. Settings saves update it via rewire_vision_embedder_and_classifier.
@@ -2024,6 +2031,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // confident classifications — and a Settings save flips the flag live via
     // `set_failure_triage_enabled` (no rebuild).
     .with_failure_triage(failure_triage_handle)
+    // Wire the shared Laya pre-prompt routing gate (backlog 091e694d): every
+    // loop the factory builds reads the classifier slot at turn start; the
+    // opt-in flag + the [general.routing] threshold/enforce ride the live
+    // config the resolver reads per turn (no rebuild, no flag mirror).
+    .with_routing_gate(routing_gate)
     // Share the headless debug browser with the IPC layer (Browser tab).
     .with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —

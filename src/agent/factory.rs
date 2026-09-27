@@ -73,6 +73,7 @@ use crate::tool::agent::{
     write_review_report::WriteReviewReportTool,
 };
 use super::failure_triage::FailureTriageHandle;
+use super::model_routing::RoutingGate;
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::{
     AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
@@ -193,6 +194,12 @@ pub struct AgentLoopFactory {
     /// loop built after the call, so the tool-dispatch and provider retry
     /// layers read it at failure time.
     failure_triage: Option<FailureTriageHandle>,
+    /// The shared Laya pre-prompt routing gate (backlog 091e694d) -- `None`
+    /// until the IPC layer wires it via `with_routing_gate` (the SAME shared
+    /// classifier slot; the opt-in flag + threshold ride the live config the
+    /// resolver reads per turn). Attached to every loop built after the call,
+    /// so each turn's pre-prompt classification reads it.
+    routing: Option<RoutingGate>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -392,6 +399,7 @@ impl AgentLoopFactory {
             // `with_failure_triage` (backlog 1a4049c1). Until then every
             // failure-handling site keeps its pre-classifier behavior.
             failure_triage: None,
+            routing: None,
             // No tool-choice gate at construction — wired via
             // `with_tool_choice` (backlog e2c47d5f). Until then the search
             // tools keep their regex auto-delegation heuristics byte-identically.
@@ -456,6 +464,18 @@ impl AgentLoopFactory {
     /// every failure-handling site keeps its pre-classifier behavior.
     pub fn with_failure_triage(mut self, handle: FailureTriageHandle) -> Self {
         self.failure_triage = Some(handle);
+        self
+    }
+
+    /// Wire the shared Laya pre-prompt routing gate (backlog 091e694d): every
+    /// agent loop built after this call carries the handle, whose shared
+    /// classifier slot is read at turn start. The `[general.laya] routing`
+    /// opt-in and the `[general.routing]` threshold / `enforce` ride the LIVE
+    /// config the model resolver reads per turn, so a Settings save needs no
+    /// rebuild (and there is no flag mirror to keep in sync). When not wired,
+    /// no turn ever classifies.
+    pub fn with_routing_gate(mut self, gate: RoutingGate) -> Self {
+        self.routing = Some(gate);
         self
     }
 
@@ -968,6 +988,15 @@ impl AgentLoopFactory {
         // registry or loop rebuild.
         if let Some(handle) = &self.failure_triage {
             agent = agent.with_failure_triage(handle.clone());
+        }
+
+        // Attach the pre-prompt routing gate (backlog 091e694d): each turn's
+        // pre-prompt classification reads the shared classifier slot; the
+        // `[general.laya] routing` flag and the `[general.routing]` threshold /
+        // enforce ride the live config the resolver reads per turn, so a
+        // Settings save lands on the next turn with no rebuild.
+        if let Some(gate) = &self.routing {
+            agent = agent.with_routing_gate(gate.clone());
         }
 
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the

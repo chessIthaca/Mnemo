@@ -16,7 +16,9 @@ import {
 } from "../../../lib/tauri";
 import type {
   ClassifierStatusWire,
+  EndpointInfo,
   LayaCheckpointInfo,
+  ModelRefConfig,
 } from "../../../lib/tauri";
 import { useAgentStore } from "../../../hooks/useAgentStore";
 import {
@@ -24,6 +26,7 @@ import {
   type ClassifierDraft,
   type SettingsSectionHandle,
 } from "../types";
+import { ModelPickerBody } from "./ModelsSection";
 
 
 
@@ -100,6 +103,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [failureTriage, setFailureTriage] = useState(false);
   const [failureTriageKnn, setFailureTriageKnn] = useState(false);
   const [autoFinetune, setAutoFinetune] = useState(false);
+  // Pre-prompt model routing (backlog 091e694d, `[general.laya] routing` +
+  // the `[general.routing]` block): the opt-in, its enforce switch (shadow vs
+  // enforce), the two targets, and the confidence gate.
+  const [routing, setRouting] = useState(false);
+  const [routingEnforce, setRoutingEnforce] = useState(false);
+  const [routingCheap, setRoutingCheap] = useState<ModelRefConfig | null>(null);
+  const [routingCapable, setRoutingCapable] = useState<ModelRefConfig | null>(null);
+  const [routingThreshold, setRoutingThreshold] = useState(0.8);
+  // Endpoint catalog for the target pickers (rides the settings payload).
+  const [endpoints, setEndpoints] = useState<EndpointInfo[]>([]);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
   const [snapshot, setSnapshot] = useState<string>("");
   const [status, setStatus] = useState<ClassifierStatusWire>("disabled");
@@ -119,6 +132,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     try {
       const s = await getSettings();
       const laya = s.general.laya;
+      const routingWire = s.general.routing;
       const next: ClassifierDraft = {
         enabled: laya?.enabled ?? false,
         autoTypeMemories: laya?.auto_type_memories ?? false,
@@ -126,6 +140,11 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         failureTriage: laya?.failure_triage ?? false,
         failureTriageKnn: laya?.failure_triage_knn ?? false,
         autoFinetune: laya?.auto_finetune ?? false,
+        routing: laya?.routing ?? false,
+        routingEnforce: routingWire?.enforce ?? false,
+        routingCheap: routingWire?.cheap ?? null,
+        routingCapable: routingWire?.capable ?? null,
+        routingThreshold: routingWire?.threshold ?? 0.8,
       };
       setEnabled(next.enabled);
       setAutoType(next.autoTypeMemories);
@@ -133,6 +152,12 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setFailureTriage(next.failureTriage);
       setFailureTriageKnn(next.failureTriageKnn);
       setAutoFinetune(next.autoFinetune);
+      setRouting(next.routing);
+      setRoutingEnforce(next.routingEnforce);
+      setRoutingCheap(next.routingCheap);
+      setRoutingCapable(next.routingCapable);
+      setRoutingThreshold(next.routingThreshold);
+      setEndpoints(s.endpoints ?? []);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
       // Read the live status directly (not from the startup snapshot) so the
@@ -185,6 +210,11 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     failureTriage,
     failureTriageKnn,
     autoFinetune,
+    routing,
+    routingEnforce,
+    routingCheap,
+    routingCapable,
+    routingThreshold,
   };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
 
@@ -222,6 +252,17 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           laya_failure_triage: failureTriage,
           laya_failure_triage_knn: failureTriageKnn,
           laya_auto_finetune: autoFinetune,
+          // Pre-prompt model routing (backlog 091e694d): the opt-in flag plus
+          // the [general.routing] targets + policy. A target sent as null
+          // clears the stored one — the draft mirrors what the section shows,
+          // so an untouched block round-trips its loaded values.
+          laya_routing: routing,
+          routing: {
+            cheap: routingCheap,
+            capable: routingCapable,
+            threshold: routingThreshold,
+            enforce: routingEnforce,
+          },
         });
         setSnapshot(serializeClassifier(draft));
         // The save rewires the live backend + status; pick it up right away.
@@ -373,6 +414,114 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           </span>
         </span>
       </label>
+
+      <div className="space-y-2 rounded-lg border border-border bg-bg-primary p-3">
+        <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+          <input
+            type="checkbox"
+            checked={routing}
+            onChange={(e) => setRouting(e.target.checked)}
+            className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          />
+          <span>
+            Route turns by task complexity
+            <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+              — the task text of every main-agent turn is classified
+              (trivial / architectural) and, once enforcement is on, a
+              confident answer runs the turn on the matching model below.
+              Below-threshold answers, unknown labels and unset targets keep
+              today's model; skills, subagents and the bug-fixing slot are
+              never overridden. Enable only against a fine-tuned checkpoint —
+              base models are near-chance on this task.
+            </span>
+          </span>
+        </label>
+
+        {routing && (
+          <div className="space-y-3">
+            <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+              Shadow-first: every classified turn is logged to
+              <code> routing.jsonl</code> (the <code>laya/training/</code>{" "}
+              dir under the app config dir) and no model is switched until
+              enforcement is on.
+            </div>
+            <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+              <input
+                type="checkbox"
+                checked={routingEnforce}
+                disabled={status !== "ready" && !routingEnforce}
+                onChange={(e) => setRoutingEnforce(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)] disabled:opacity-50"
+              />
+              <span>
+                Switch the model on a confident decision
+                <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+                  {status === "ready"
+                    ? "— off = shadow: classify + log only. Flip it once the routing log has enough labelled turns to trust."
+                    : "— locked until the classifier is ready (install the checkpoint above); a near-chance base model must not steer the model choice."}
+                </span>
+              </span>
+            </label>
+            <div className="space-y-1">
+              <div className="text-xs font-medium text-[color:var(--text-primary)]">
+                Trivial tasks
+              </div>
+              <ModelPickerBody
+                endpoints={endpoints}
+                value={
+                  routingCheap ?? {
+                    endpoint: "",
+                    model: "",
+                    reasoning_effort: null,
+                  }
+                }
+                onChange={(v) => setRoutingCheap(v)}
+              />
+              <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+                A small, local, mechanical change — typo, rename, version
+                bump, one-line fix. Leave it unset to keep today's model.
+              </div>
+            </div>
+            <div className="space-y-1">
+              <div className="text-xs font-medium text-[color:var(--text-primary)]">
+                Architectural tasks
+              </div>
+              <ModelPickerBody
+                endpoints={endpoints}
+                value={
+                  routingCapable ?? {
+                    endpoint: "",
+                    model: "",
+                    reasoning_effort: null,
+                  }
+                }
+                onChange={(v) => setRoutingCapable(v)}
+              />
+              <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+                Design-level work — a new feature, a cross-module refactor, a
+                new dependency, a data-model or concurrency change.
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-[0.7rem] text-[color:var(--text-muted)]">
+                Confidence gate
+              </label>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={routingThreshold}
+                onChange={(e) => setRoutingThreshold(Number(e.target.value))}
+                className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              />
+              <span className="text-[0.7rem] text-[color:var(--text-muted)]">
+                a decision routes only at or above it (default 0.80)
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="space-y-2">
         {catalog.map((c) => (

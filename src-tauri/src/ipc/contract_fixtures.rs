@@ -28,6 +28,8 @@ use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
 
+use crate::ipc::settings::RoutingWire;
+
 use crate::ipc::agent::{ActiveSkillInfo, AgentInfo, PlanAncestorInfo, WorkflowStateInfo};
 use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllProgress};
 use crate::ipc::codegraph_cmds::{CodegraphGraph, CodegraphStatus};
@@ -246,10 +248,17 @@ fn dto_fixtures_match_serde() {
                 failure_triage: false,
                 failure_triage_knn: false,
                 auto_finetune: false,
+                routing: false,
             },
             enable_browser_inspection: false,
             auto_compact_on_plan_complete: false,
             optimizer: OptimizerConfig::default(),
+            routing: RoutingWire {
+                cheap: None,
+                capable: None,
+                threshold: 0.80,
+                enforce: false,
+            },
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: 0.5,

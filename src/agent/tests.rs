@@ -9975,6 +9975,93 @@ impl LlmClient for BranchMock {
     }
 }
 
+/// A provider for the compaction-raise regression test. The summarizer's prompt
+/// (it contains "summar") gets a short summary; the first `tool_rounds` model
+/// requests ask for a `file_read` of the TINY test file (so each round keeps the
+/// conversation size roughly constant — the raised limit can therefore catch up
+/// with it), and every later request gets a plain text answer that ends the
+/// turn. What the test watches is that a session whose compaction cannot bring
+/// the count under the fill-rate dial RAISES the effective limit and keeps
+/// going, instead of re-compacting until the bounded abort fires.
+struct BoundaryMock {
+    caps: Capabilities,
+    tool_rounds: usize,
+    summarizer_calls: StdMutex<usize>,
+    model_calls: StdMutex<usize>,
+}
+
+#[async_trait]
+impl LlmClient for BoundaryMock {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        ""
+    }
+    fn record_tools_phase_ms(&self, _ms: u32) {}
+
+    async fn complete(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        let is_summarizer = messages
+            .last()
+            .map(|m| m.content.as_text().to_lowercase().contains("summar"))
+            .unwrap_or(false);
+        let events = if is_summarizer {
+            *self.summarizer_calls.lock().unwrap() += 1;
+            vec![
+                LlmEvent::TextDelta {
+                    text: "## Conversation summary\n\ncompacted.".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]
+        } else {
+            let n = {
+                let mut calls = self.model_calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if n > self.tool_rounds {
+                vec![
+                    LlmEvent::TextDelta {
+                        text: "done.".into(),
+                    },
+                    LlmEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]
+            } else {
+                vec![
+                    LlmEvent::ToolCallStart {
+                        index: 0,
+                        id: format!("call_{n}"),
+                        name: "file_read".into(),
+                    },
+                    LlmEvent::ToolCallArgumentDelta {
+                        index: 0,
+                        fragment: r#"{"path":"test.txt"}"#.into(),
+                    },
+                    LlmEvent::Finish {
+                        reason: FinishReason::ToolCalls,
+                    },
+                ]
+            }
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 #[tokio::test]
 async fn over_threshold_turn_bounds_compaction_attempts() {
     // Regression (2027-01-07 live incident): a turn whose context stays
@@ -10091,6 +10178,135 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
         finished_events, 0,
         "the abort path must be Error-only — no trailing Finished (the \
          MAX_RETRIES terminal-exclusivity contract)"
+    );
+    assert_eq!(outcome.finish_reason, FinishReason::Stop);
+}
+
+#[tokio::test]
+async fn boundary_session_raises_the_limit_instead_of_aborting() {
+    // Backlog 11513ee5 (the fallback lever): when compaction cannot bring the
+    // conversation under the fill-rate dial — the kept-verbatim tail dominates —
+    // the turn must RAISE the effective limit by +10% and carry on, instead of
+    // re-compacting every iteration until the bounded abort fires (the
+    // 2027-01-07 shape: ~114 requests, no new work).
+    //
+    // Sizing: window 40_000 at fill 0.25 -> base trigger 10_000, with an
+    // 8_000-token output headroom -> the raise may climb to 32_000. The seed
+    // ends with a ~52K-char log message (~11K tokens), so the kept tail alone is
+    // over the trigger; the mock's tool rounds read a TINY file, so a round does
+    // not grow the conversation and the +10% steps can cover the tail.
+    let dir = tempdir().unwrap();
+    let phrase = "The quick brown fox jumps over the lazy dog. ";
+    std::fs::write(dir.path().join("test.txt"), "ok").unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    let provider = Arc::new(BoundaryMock {
+        caps: Capabilities {
+            supports_tool_choice: true,
+            supports_strict_schema: true,
+            supports_parallel_tools: true,
+            reliable_finish_reason: true,
+            max_context: 40_000,
+            max_output_tokens: 4_096,
+            multimodal: false,
+        },
+        tool_rounds: 6,
+        summarizer_calls: StdMutex::new(0),
+        model_calls: StdMutex::new(0),
+    });
+
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: provider.clone(),
+            tools: registry,
+            workflow,
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(40_000, 0.25)
+                .with_preflight(true, 8_000),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // Small exchanges first so the compaction cut lands in the text region
+    // (Rule 4 refuses to trim inside an open tool loop), then the big log message
+    // that keeps the compacted result at/over the trigger.
+    let big = format!("BIGLOG {}", phrase.repeat(1_150));
+    let mut messages = vec![Message::user_text("summarize the log below")];
+    for i in 0..3 {
+        messages.push(Message::text(
+            Role::Assistant,
+            format!("note {i}: {}", phrase.repeat(20)),
+        ));
+        messages.push(Message::user_text(format!("ack {i}")));
+    }
+    messages.push(Message::user_text(big));
+
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let mut raise_notes = Vec::new();
+    let mut abort_notes = 0usize;
+    let mut finished_events = 0usize;
+    let mut compacted_events = 0usize;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        match ev {
+            AgentEvent::Error { error, .. } => {
+                let is_raise = error.contains("temporarily raising the effective limit");
+                let is_abort = error.contains("context stuck over threshold")
+                    || error.contains("unbounded re-compaction loop");
+                if is_raise {
+                    raise_notes.push(error);
+                }
+                if is_abort {
+                    abort_notes += 1;
+                }
+            }
+            AgentEvent::Compacted { .. } => compacted_events += 1,
+            AgentEvent::Finished { .. } => finished_events += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        !raise_notes.is_empty(),
+        "a compaction that still does not fit must raise the effective limit and \
+         say so; got no raise note (abort notes: {abort_notes})"
+    );
+    assert_eq!(
+        abort_notes, 0,
+        "the boundary session must continue — no stuck/ceiling abort; raises: {raise_notes:?}"
+    );
+    assert!(
+        finished_events >= 1,
+        "the turn must finish normally after the raise(s)"
+    );
+    assert!(
+        compacted_events <= super::turn::MAX_COMPACTIONS_PER_TURN as usize,
+        "compaction count stays bounded, got {compacted_events}"
+    );
+    assert!(
+        *provider.summarizer_calls.lock().unwrap()
+            <= super::turn::MAX_COMPACTIONS_PER_TURN as usize,
+        "summarizer calls stay bounded"
+    );
+    // The ladder's whole point: the recent content survives. A stuck
+    // keep_recent=1 escalation would have dropped the over-threshold tail into
+    // the summary; the raised limit keeps it verbatim.
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content.as_text().contains("BIGLOG")),
+        "the recent over-threshold tail must survive the compaction cycles"
     );
     assert_eq!(outcome.finish_reason, FinishReason::Stop);
 }

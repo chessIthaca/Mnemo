@@ -112,6 +112,16 @@ pub struct AgentLoop {
     /// The context manager (token counting + summarization threshold). Swapped
     /// alongside the provider so the new model's context window takes effect.
     pub(crate) context_manager: Arc<RwLock<super::context::ContextManager>>,
+    /// The SESSION's temporary compaction raise (backlog 11513ee5): the
+    /// cumulative +10% ladder applied when a compaction pass still does not
+    /// fit. Owned by the loop — NOT by the context manager — because the turn
+    /// loop takes a fresh manager clone per iteration and the workflow-state
+    /// resolver builds a fresh one per iteration, so a field on the manager
+    /// would lose the ladder mid-turn; both hand-outs get this handle installed
+    /// ([`context_manager`](Self::context_manager),
+    /// `resolve_iteration_provider`). Created per loop, so every agent/session
+    /// starts at 1.0 and `/new` resets it.
+    pub(crate) compaction_raise: Arc<super::context::CompactionRaise>,
     /// The live token count of the most recent request iteration — recorded
     /// at the top of every iteration in `run_turn` right after the
     /// token-accounting update, so [`try_429_fallback`](Self::try_429_fallback)
@@ -740,9 +750,16 @@ impl AgentLoop {
             memory,
             vision,
         } = config;
+        // The session's compaction-raise ladder: ONE handle for the loop, shared
+        // by the stored manager and by every manager the loop hands out (see
+        // the field docs). Created here, so each agent/session starts at 1.0.
+        let compaction_raise = Arc::new(super::context::CompactionRaise::default());
         Self {
             provider: Arc::new(RwLock::new(provider)),
-            context_manager: Arc::new(RwLock::new(context_manager)),
+            context_manager: Arc::new(RwLock::new(
+                context_manager.with_compaction_raise(Arc::clone(&compaction_raise)),
+            )),
+            compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
             tools,
             workflow,
@@ -1694,12 +1711,21 @@ impl AgentLoop {
 
     /// A handle to the context manager, for manual compaction (`/compact`).
     /// Clones the `ContextManager` (cheap — two `usize`s) so the caller can
-    /// call `summarize_with_interrupt` without holding the lock.
+    /// call `summarize_with_interrupt` without holding the lock. The clone
+    /// carries the SESSION's compaction-raise handle, so a raise applied on the
+    /// manual path is the same ladder the turn loop reads.
     pub fn context_manager(&self) -> super::context::ContextManager {
         self.context_manager
             .read()
             .expect("context_manager lock poisoned")
             .clone()
+            .with_compaction_raise(Arc::clone(&self.compaction_raise))
+    }
+
+    /// Clear the session's temporary compaction raise — a fresh session must
+    /// start at 1.0 (`/new`).
+    pub fn reset_compaction_raise(&self) {
+        self.compaction_raise.reset();
     }
 
     /// Swap in a new provider + context manager (e.g. when the user switches
@@ -1729,7 +1755,12 @@ impl AgentLoop {
         *self
             .context_manager
             .write()
-            .expect("context_manager lock poisoned") = context_manager;
+            .expect("context_manager lock poisoned") = context_manager
+            .with_compaction_raise(Arc::clone(&self.compaction_raise));
+        // A different model means a different window and a different
+        // trigger — the ladder restarts at 1.0 (it is recomputed against the
+        // new window's cap on the next failed compaction).
+        self.compaction_raise.reset();
     }
 
     /// Pin an explicit provider + context manager for THIS agent — the

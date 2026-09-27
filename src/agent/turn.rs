@@ -467,8 +467,11 @@ impl AgentLoop {
             // as system messages below.
             // The effective trigger respects the proxy cache ceiling (when
             // set) so compaction fires before the request crosses the ~340K
-            // cliff where proxies drop whole-conversation prefix caching.
-            if token_count >= context_manager.effective_summarize_at() {
+            // cliff where proxies drop whole-conversation prefix caching. It
+            // also carries the session's temporary raise (backlog 11513ee5),
+            // so a session that compaction could not bring under the fill-rate
+            // dial is not re-triggered on every iteration.
+            if token_count >= context_manager.effective_limit() {
                 if let Some(outcome) = self
                     .maybe_compact(
                         &mut state,
@@ -2030,6 +2033,13 @@ impl AgentLoop {
                 None => (Arc::clone(&default_provider), default_context_manager.clone()),
             }
         };
+        // Whatever built this iteration's manager — the live default clone or a
+        // freshly built per-context one — it gets the SESSION's raise ladder
+        // (backlog 11513ee5): a resolver-built manager is thrown away at the
+        // end of the iteration, so a ladder held only by the manager would be
+        // lost mid-turn and the raise would never take effect.
+        let context_manager =
+            context_manager.with_compaction_raise(Arc::clone(&self.compaction_raise));
         // The wf guard is dropped above — safe to await the fan-in send.
         // Announce the effective model/effort at the moment it SERVES a
         // request — the per-request "landing" seam. The display state
@@ -2480,15 +2490,40 @@ impl AgentLoop {
         let used = used as u32;
         let max = context_manager.max_tokens() as u32;
         *breakdown = bd;
-        // A compaction that brought the count back under the threshold is the
-        // legitimate path (a long turn legitimately crossing the fill rate
-        // repeatedly) — reset the attempt budget. Still over: the kept-verbatim
-        // tail dominates and the next iteration re-compacts (the counter climbs
-        // toward the abort above). The per-turn TOTAL ceiling is what keeps
-        // this reset from becoming an unbounded loop now that compaction always
-        // succeeds.
-        if (used as usize) < context_manager.effective_summarize_at() {
-            state.compact_attempts = 0;
+        // The session's temporary raise (backlog 11513ee5). Fits -> re-arm the
+        // attempt budget (a long turn legitimately crossing the fill rate
+        // repeatedly is the normal path), and clear the ladder when the result
+        // also fits the un-raised trigger. Still over -> raise the effective
+        // limit by one +10% step and surface it, so the NEXT iteration is not
+        // immediately over again and the session continues instead of burning
+        // the attempt ladder to the abort. When neither the step budget nor the
+        // window cap has room left (`StillOver`), nothing is raised and the
+        // bounded abort ladder stays in charge — the per-turn TOTAL ceiling also
+        // still bounds the burn.
+        match context_manager.compaction_fit(used as usize) {
+            context::CompactionFit::Fits => state.compact_attempts = 0,
+            context::CompactionFit::Raised {
+                steps,
+                factor,
+                limit,
+            } => {
+                state.compact_attempts = 0;
+                eprintln!(
+                    "[context] compaction still over the summarize limit — raising the effective \
+                     limit by {}% (x{factor:.1}) to {limit} tokens",
+                    steps * context::COMPACTION_RAISE_STEP_PERCENT
+                );
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Error {
+                            error: context::compaction_raise_note(steps, factor, limit),
+                            retrying: true,
+                        },
+                    ))
+                    .await;
+            }
+            context::CompactionFit::StillOver { .. } => {}
         }
         let _ = fanin_tx
             .send((

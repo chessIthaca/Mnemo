@@ -829,6 +829,31 @@ quality rather than the session (and the downgrade is recorded); pick a cheap
 model with a large window, and note the budget comes from the *advertised*
 window — only the mechanical fallback catches a wrongly advertised one.
 
+**Compaction-limit fallback (2027-01, backlog 11513ee5).** The summarize
+trigger is a fill-rate dial, and a compaction whose result still sits at/over it
+(the kept-verbatim tail dominates the compaction budget) used to mean the turn
+re-compacted every iteration until the bounded abort (attempt ladder / per-turn
+ceiling) fired. The lever in between is a per-session, bounded raise:
+`CompactionRaise` (src/agent/context.rs) is a shared +10% ladder (x1.1, x1.2,
+... cumulatively, at most `MAX_COMPACTION_RAISE_STEPS` steps) capped by
+`raise_cap()` = `max_tokens - max(compact_headroom_tokens, 1)` (the one-token
+floor holds even for a degenerate `compact_headroom_tokens = 0`), so the
+provider's true
+window stays hard. It is owned by the SESSION (`AgentLoop::compaction_raise` in
+src/agent/loop_impl.rs), not by the context manager, because the turn loop
+clones the manager per iteration and the workflow-state resolver builds a fresh
+one per iteration - both hand-outs get the handle installed
+(`AgentLoop::context_manager`, `resolve_iteration_provider`). Both compaction
+paths complete through `ContextManager::compaction_fit`: under the un-raised
+trigger the ladder clears (under the raised one it is KEPT - it is still
+load-bearing), still over it escalates one step and the caller surfaces the
+raise as a transcript note + stderr line (`maybe_compact` in src/agent/turn.rs,
+`compact_context` in src/runtime/agent.rs), and when neither the step budget nor
+the cap has room left the existing bounded abort ladder stays in charge. `/new`
+and a provider swap reset it to 1.0. In-loop trigger checks read
+`effective_limit()` (the raised limit), not `effective_summarize_at()` (the
+base dial).
+
 **Subagent role state (2026-01-03).** A parented sub-agent's `Workflow` loads
 the main plan's stack from the shared plans dir (the read-only mirror that
 feeds `current_plan` for reviewers and the UI staircase) but is stamped

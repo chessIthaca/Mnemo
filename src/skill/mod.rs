@@ -283,13 +283,27 @@ impl SkillLibrary {
 /// starts with the same baseline skill set as the main installation, without
 /// depending on the app's source tree being present at runtime.
 ///
+/// The baseline is `merge_to_main` (landing a working branch) plus
+/// `create_skill` (plan-free skill authoring — its prompt is written to read
+/// correctly OUTSIDE the app repo too, so a seeded copy is never misleading).
+/// The skills that deliberately do NOT ship are declared in
+/// [`REPO_LOCAL_SKILLS`], and the guard test
+/// `every_repo_skill_is_shipped_or_declared_repo_local` makes every future
+/// repo skill pick a side instead of silently never shipping.
+///
 /// Adding a shipped skill takes TWO edits: drop the TOML into the repo's own
 /// `.coding/skills/<name>.toml` AND add one entry here (the file is embedded
 /// at compile time; nothing is read from disk at runtime).
-pub const SHIPPED_SKILLS: &[(&str, &str)] = &[(
-    "merge_to_main",
-    include_str!("../../.coding/skills/merge_to_main.toml"),
-)];
+pub const SHIPPED_SKILLS: &[(&str, &str)] = &[
+    (
+        "merge_to_main",
+        include_str!("../../.coding/skills/merge_to_main.toml"),
+    ),
+    (
+        "create_skill",
+        include_str!("../../.coding/skills/create_skill.toml"),
+    ),
+];
 
 /// Is `name` one of the skills shipped with the app ([`SHIPPED_SKILLS`])?
 ///
@@ -302,6 +316,27 @@ pub const SHIPPED_SKILLS: &[(&str, &str)] = &[(
 pub fn is_shipped_skill(name: &str) -> bool {
     SHIPPED_SKILLS.iter().any(|(n, _)| *n == name)
 }
+
+/// The repo's own skills that deliberately do NOT ship with the app, each with
+/// the reason it stays here ([`SHIPPED_SKILLS`] is the complement).
+///
+/// Declared rather than implied: the guard test
+/// `every_repo_skill_is_shipped_or_declared_repo_local` fails on a repo skill
+/// that is on neither list, so a newly authored skill has to decide whether
+/// every project should get it or whether it is specific to this repo —
+/// instead of silently never reaching a project.
+pub const REPO_LOCAL_SKILLS: &[(&str, &str)] = &[
+    (
+        "new_release",
+        "Mnemo's own release flow: five manifests, the Tauri bundle config and the \
+         GitHub release workflow are app-specific and useless in a user's project",
+    ),
+    (
+        "post_merge_sync",
+        "this repo's PR/ruleset closeout after a human merges — repo-local by the \
+         2026-09-26 decision (memory f4b6d203)",
+    ),
+];
 
 /// Seed the [`SHIPPED_SKILLS`] into `skills_dir` (a project's
 /// `.coding/skills/`): the directory is created when missing and each shipped
@@ -750,6 +785,47 @@ prompt = "Merge."
             SHIPPED_SKILLS.iter().any(|(n, _)| *n == "merge_to_main"),
             "merge_to_main must be embedded in SHIPPED_SKILLS"
         );
+        // create_skill ships too (/project seeding audit): plan-free skill
+        // authoring is useful in ANY project, and its prompt is written to read
+        // correctly outside this repo — so a seeded copy is never misleading.
+        assert!(
+            SHIPPED_SKILLS.iter().any(|(n, _)| *n == "create_skill"),
+            "create_skill must be embedded in SHIPPED_SKILLS"
+        );
+    }
+
+    #[test]
+    fn every_repo_skill_is_shipped_or_declared_repo_local() {
+        // The gap this guard closes: a skill file living in the repo's own
+        // `.coding/skills/` that is on NEITHER list silently never reaches a
+        // new project (the SHIPPED_SKILLS edit is the only thing that seeds
+        // it). Every repo skill must pick a side — ship it, or say why it
+        // stays here. The count equality also catches the reverse: a
+        // declaration whose skill file was deleted or renamed.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let names: Vec<String> = reg.iter().map(|spec| spec.name.clone()).collect();
+        assert_eq!(
+            names.len(),
+            SHIPPED_SKILLS.len() + REPO_LOCAL_SKILLS.len(),
+            "a repo skill is neither shipped nor declared repo-local: {names:?}"
+        );
+        for name in &names {
+            let shipped = SHIPPED_SKILLS.iter().any(|(n, _)| n == name);
+            let repo_local = REPO_LOCAL_SKILLS.iter().any(|(n, _)| n == name);
+            assert!(
+                shipped || repo_local,
+                "'{name}' is on neither list — add it to SHIPPED_SKILLS so every new \
+                 project gets it, or to REPO_LOCAL_SKILLS with the reason it stays here"
+            );
+        }
+        // A declaration without a reason is not reviewable.
+        for (name, reason) in REPO_LOCAL_SKILLS {
+            assert!(
+                reason.len() > 20,
+                "REPO_LOCAL_SKILLS entry '{name}' needs a real reason"
+            );
+        }
     }
 
     /// A one-skill TOML body for the library tests (`prompt` is the dial that
@@ -764,6 +840,15 @@ prompt = "Merge."
     #[test]
     fn shipped_skill_names_are_recognized() {
         assert!(is_shipped_skill("merge_to_main"));
+        assert!(is_shipped_skill("create_skill"));
+        assert!(
+            !is_shipped_skill("new_release"),
+            "new_release stays repo-local — not seeded into user projects"
+        );
+        assert!(
+            !is_shipped_skill("post_merge_sync"),
+            "post_merge_sync stays repo-local (memory f4b6d203)"
+        );
         assert!(!is_shipped_skill("merge_to_main_v2"));
         assert!(!is_shipped_skill(""));
     }

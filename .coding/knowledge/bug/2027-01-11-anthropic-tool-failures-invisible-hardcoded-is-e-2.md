@@ -1,0 +1,7 @@
++++
+title = "Anthropic tool failures invisible — hardcoded is_error:false + Stop fallback on missing stop_reason — MERGED into main (branch wt/mnemo, 2026-09-27)"
+supersedes = "2027-01-11-anthropic-tool-failures-invisible-hardcoded-is-e"
+created = "2027-01-11"
++++
+
+Symptom: on the native Anthropic path the model re-issued the identical failed tool call in a loop — tool failures and tool-turn endings were invisible to it. Root cause: Message (src/provider/mod.rs:189-254) had no failure bit, so packaging dropped result.success; anthropic.rs hardcoded "is_error": false; a missing message_delta fell back to Stop, misreading a tool turn as end_turn. Fix: Message.tool_is_error set at ALL production sites (failed and not-run results flagged, synthesize_not_run_results included), anthropic.rs serializes "is_error": m.tool_is_error, missing stop_reason with tool_use infers ToolCalls. Regression tests: failed_tool_result_is_serialized_for_the_provider_as_an_error, missing_message_delta_still_reports_a_tool_turn, hard_stop_synthesis_marks_not_run_results_as_errors. Detail: .coding/knowledge/bug/2027-01-11-anthropic-tool-failures-invisible-hardcoded-is-e.md + .coding/knowledge/bug/49f53bf5.md. Review: PASS — .coding/reviews/2026-09-27-49f53bf5-round2-delta-re-review.md. Branch wt/mnemo @ 3ca47f7952fed4d51a32a01dc394766c5d57eb87 (work tip, 2026-09-27) — a PR against main is opened from this branch, awaiting human review; the landing becomes part of main when the human merges.

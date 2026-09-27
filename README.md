@@ -93,7 +93,7 @@ PLAN.md               the technical-decisions log
 
 **The lib/app split.** `mnemo` is a plain Rust library — the state machine, memory, graph, and tools all work headless. `mnemo-app` is the Tauri 2 shell that embeds it, always selecting the heavier optional features (embedded browser, embeddings).
 
-**`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded.
+**`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded. Creating a project seeds those ignore rules (and the backlog's union-merge attribute) into the new project's `.gitignore`/`.gitattributes`, appending only what is missing — existing user lines are never touched.
 
 **Vendored patches.** `vendor/` carries small, documented patches to `tao` (Windows IME self-deadlock fix) and `wry` (SSO + hard-reload for the embedded browser), each guarded by source-contract tests in `src-tauri/tests/`.
 

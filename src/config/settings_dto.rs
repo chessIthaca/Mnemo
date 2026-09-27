@@ -85,6 +85,28 @@ pub struct ModelsConfigDto {
     pub skill: Option<std::collections::HashMap<String, ModelRefDto>>,
 }
 
+/// The `[general.routing]` section patch (pre-prompt model routing, backlog
+/// 091e694d). When present, the fields it carries replace the stored values;
+/// each is optional so the dialog can send only what it manages. For the two
+/// targets the outer `None` keeps the existing override and an explicit
+/// `null` clears it (the double-Option semantics of [`ModelsConfigDto`]);
+/// `threshold` / `enforce` absent = keep.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoutingConfigDto {
+    /// The model a confidently-TRIVIAL task routes to.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub cheap: Option<Option<ModelRefDto>>,
+    /// The model a confidently-ARCHITECTURAL task routes to.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub capable: Option<Option<ModelRefDto>>,
+    /// The calibrated-probability gate (`0.0..=1.0`; validated).
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Whether a confident decision actually switches the turn's model.
+    #[serde(default)]
+    pub enforce: Option<bool>,
+}
+
 /// Deserialize an `Option<Option<T>>` so that a field **absent** from the JSON
 /// yields `None` (outer — "keep the existing value"), while an explicit `null`
 /// yields `Some(None)` (inner — "clear the override"). A present object yields
@@ -279,6 +301,11 @@ pub struct SettingsSaveDto {
     /// Absent = keep the current value.
     #[serde(default)]
     pub laya_auto_finetune: Option<bool>,
+    /// Laya pre-prompt MODEL ROUTING (opt-in; enable only against a
+    /// fine-tuned checkpoint, and expect shadow mode first). Absent = keep
+    /// the current value.
+    #[serde(default)]
+    pub laya_routing: Option<bool>,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22 — all
     /// ON by default since 2027-01-25; uncheck to opt out). Absent = keep the
     /// current value, so a dialog that never touched a lever leaves the section
@@ -376,6 +403,10 @@ pub struct SettingsSaveDto {
     pub sound_stopped_errors: Option<bool>,
     #[serde(default)]
     pub models: Option<ModelsConfigDto>,
+    /// Pre-prompt model routing (`[general.routing]`, backlog 091e694d).
+    /// Absent = keep the stored section; see [`RoutingConfigDto`].
+    #[serde(default)]
+    pub routing: Option<RoutingConfigDto>,
     #[serde(default)]
     pub pricing: Option<Vec<PricingDto>>,
     #[serde(default)]
@@ -586,6 +617,35 @@ pub fn validate_and_apply_settings_patch(
             }
         }
     }
+    if let Some(routing) = &patch.routing {
+        if let Some(threshold) = routing.threshold {
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(format!(
+                    "routing threshold must be between 0.0 and 1.0 (got {threshold})"
+                ));
+            }
+        }
+        let check = |m: &ModelRefDto| -> Result<(), String> {
+            let ep = m.endpoint.trim();
+            if ep.is_empty() {
+                return Err("routing target endpoint must not be empty".into());
+            }
+            if m.model.trim().is_empty() {
+                return Err("routing target model must not be empty".into());
+            }
+            if has_endpoints && !current.endpoints.iter().any(|e| e.name == ep) {
+                return Err(format!(
+                    "routing target endpoint '{ep}' does not match any configured endpoint"
+                ));
+            }
+            Ok(())
+        };
+        for field in [&routing.cheap, &routing.capable] {
+            if let Some(Some(m)) = field {
+                check(m)?;
+            }
+        }
+    }
 
     // ── 3. Apply patch into a new Config ──────────────────────────────────
     let mut general = current.general.clone();
@@ -645,6 +705,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(finetune) = patch.laya_auto_finetune {
         general.general.laya.auto_finetune = finetune;
+    }
+    if let Some(routing) = patch.laya_routing {
+        general.general.laya.routing = routing;
     }
     // Token-optimizer levers ([general.optimizer]): absent = keep, so an
     // untouched dialog never rewrites the section — and a config still on
@@ -810,17 +873,21 @@ pub fn validate_and_apply_settings_patch(
     if let Some(on) = patch.auto_compact_on_plan_complete {
         general.general.auto_compact_on_plan_complete = on;
     }
+    // Model-ref conversion shared by the [models] and [general.routing]
+    // patches: a trimmed endpoint + model and an optional trimmed effort (an
+    // absent or whitespace-only effort normalizes to None = the model's own
+    // default).
+    let to_ref = |m: &ModelRefDto| ModelRef {
+        endpoint: m.endpoint.trim().to_string(),
+        model: m.model.trim().to_string(),
+        reasoning_effort: m
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_string),
+    };
     if let Some(models) = &patch.models {
-        let to_ref = |m: &ModelRefDto| ModelRef {
-            endpoint: m.endpoint.trim().to_string(),
-            model: m.model.trim().to_string(),
-            reasoning_effort: m
-                .reasoning_effort
-                .as_deref()
-                .map(str::trim)
-                .filter(|e| !e.is_empty())
-                .map(str::to_string),
-        };
         if let Some(p) = &models.planning {
             general.models.planning = p.as_ref().map(|m| to_ref(m));
         }
@@ -847,6 +914,21 @@ pub fn validate_and_apply_settings_patch(
                 .iter()
                 .map(|(k, v)| (k.clone(), to_ref(v)))
                 .collect();
+        }
+    }
+
+    if let Some(routing) = &patch.routing {
+        if let Some(cheap) = &routing.cheap {
+            general.general.routing.cheap = cheap.as_ref().map(|m| to_ref(m));
+        }
+        if let Some(capable) = &routing.capable {
+            general.general.routing.capable = capable.as_ref().map(|m| to_ref(m));
+        }
+        if let Some(threshold) = routing.threshold {
+            general.general.routing.threshold = threshold;
+        }
+        if let Some(enforce) = routing.enforce {
+            general.general.routing.enforce = enforce;
         }
     }
 
@@ -1314,5 +1396,107 @@ mod tests {
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         let e = next.general.models.executing.expect("executing set");
         assert_eq!(e.reasoning_effort, None);
+    }
+
+    #[test]
+    fn routing_patch_set_clear_keep_and_threshold_validation() {
+        // The [general.routing] patch mirrors the [models] double-Option
+        // semantics for its two targets, plain Option for the scalars, and
+        // rejects an out-of-range threshold rather than clamping it.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            laya_routing: Some(true),
+            routing: Some(RoutingConfigDto {
+                cheap: Some(Some(ModelRefDto {
+                    endpoint: "  ep  ".into(),
+                    model: "  tiny  ".into(),
+                    reasoning_effort: Some(" minimal ".into()),
+                })),
+                capable: Some(Some(ModelRefDto {
+                    endpoint: "ep".into(),
+                    model: "big".into(),
+                    reasoning_effort: None,
+                })),
+                threshold: Some(0.9),
+                enforce: Some(true),
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.laya.routing);
+        assert!(next.general.general.routing.enforce);
+        assert!((next.general.general.routing.threshold - 0.9).abs() < 1e-9);
+        let cheap = next.general.general.routing.cheap.clone().expect("cheap set");
+        assert_eq!(cheap.endpoint, "ep");
+        assert_eq!(cheap.model, "tiny");
+        assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
+        assert_eq!(
+            next.general
+                .general
+                .routing
+                .capable
+                .as_ref()
+                .expect("capable set")
+                .model,
+            "big"
+        );
+
+        // Clear: Some(None) empties the slot; fields absent from the patch
+        // keep their stored values.
+        let patch = SettingsSaveDto {
+            routing: Some(RoutingConfigDto {
+                cheap: Some(None),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.routing.cheap.is_none());
+        assert!(next.general.general.routing.capable.is_some());
+        assert!(next.general.general.routing.enforce);
+
+        // Keep: an all-default patch changes nothing at all.
+        let patch = SettingsSaveDto {
+            routing: Some(RoutingConfigDto::default()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
+        assert!(next.general.general.routing.capable.is_some());
+        assert!(next.general.general.laya.routing);
+
+        // Validation: an out-of-range threshold is an error, and the stored
+        // config is left untouched.
+        for bad in [-0.1_f64, 1.5_f64] {
+            let patch = SettingsSaveDto {
+                routing: Some(RoutingConfigDto {
+                    threshold: Some(bad),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
+            assert!(err.contains("routing threshold"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn routing_patch_distinguishes_absent_from_null() {
+        // The wire contract the dialog relies on: an absent target keeps the
+        // stored override, an explicit null clears it.
+        let dto: SettingsSaveDto = serde_json::from_str(
+            r#"{"routing":{"cheap":null,"capable":{"endpoint":"ep","model":"m"}}}"#,
+        )
+        .expect("patch parses");
+        let routing = dto.routing.expect("routing present");
+        assert!(matches!(routing.cheap, Some(None)));
+        assert!(matches!(routing.capable, Some(Some(_))));
+        assert!(routing.threshold.is_none());
+        assert!(routing.enforce.is_none());
+
+        let dto: SettingsSaveDto =
+            serde_json::from_str(r#"{"routing":{"threshold":0.75}}"#).expect("patch parses");
+        let routing = dto.routing.expect("routing present");
+        assert!(routing.cheap.is_none()); // absent = keep
+        assert!(matches!(routing.threshold, Some(t) if (t - 0.75).abs() < 1e-9));
     }
 }

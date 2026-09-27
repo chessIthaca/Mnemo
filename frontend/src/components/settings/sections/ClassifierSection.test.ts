@@ -121,6 +121,21 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("checked={autoFinetune}");
   });
 
+  it("renders the pre-prompt routing block (opt-in + shadow/enforce + targets + gate)", () => {
+    expect(classifierSource).toContain("Route turns by task complexity");
+    expect(classifierSource).toContain(
+      "Switch the model on a confident decision",
+    );
+    expect(classifierSource).toContain("Confidence gate");
+    expect(classifierSource).toContain("Trivial tasks");
+    expect(classifierSource).toContain("Architectural tasks");
+    // The target pickers reuse the Models section's endpoint/model/effort
+    // control; the shadow-first contract is spelled out in the block.
+    expect(classifierSource).toContain("ModelPickerBody");
+    expect(classifierSource).toContain("routing.jsonl");
+    expect(classifierSource).toContain("Shadow-first");
+  });
+
   it("renders the fine-tuning status shape (the startup fine-tune hot-swap)", () => {
     expect(classifierSource).toContain(
       "fine-tuning ${status.finetuning.label}",
@@ -167,6 +182,12 @@ describe("classifier bindings stay wired to the backend names", () => {
       /** Whether the startup failure-triage fine-tune is enabled (managed
        *  runtime only, opt-in). */
       auto_finetune: boolean;
+      /** Whether pre-prompt model routing is enabled (opt-in; backlog
+       *  091e694d; needs a fine-tuned checkpoint — base models are near-chance
+       *  on this task). Shadow-first: decisions are classified + logged, and
+       *  the turn's model only switches once \`[general.routing] enforce\` is
+       *  on. */
+      routing: boolean;
     };`
     );
     expect(tauriSource).toContain("laya_enabled?: boolean;");
@@ -175,6 +196,8 @@ describe("classifier bindings stay wired to the backend names", () => {
     expect(tauriSource).toContain("laya_failure_triage?: boolean;");
     expect(tauriSource).toContain("laya_failure_triage_knn?: boolean;");
     expect(tauriSource).toContain("laya_auto_finetune?: boolean;");
+    expect(tauriSource).toContain("laya_routing?: boolean;");
+    expect(tauriSource).toContain("enforce?: boolean;");
   });
 
   it("the startup snapshot type carries classifier_status", () => {
@@ -190,6 +213,11 @@ describe("serializeClassifier", () => {
     failureTriage: false,
     failureTriageKnn: false,
     autoFinetune: false,
+    routing: false,
+    routingEnforce: false,
+    routingCheap: null,
+    routingCapable: null,
+    routingThreshold: 0.8,
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
@@ -215,9 +243,24 @@ describe("serializeClassifier", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, autoFinetune: true }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, routing: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, routingEnforce: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingCheap: { endpoint: "local", model: "tiny" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, routingThreshold: 0.9 }),
+    );
   });
 
-  it("matches the persisted opt-in shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune)", () => {
+  it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       autoTypeMemories: false,
@@ -225,6 +268,33 @@ describe("serializeClassifier", () => {
       failureTriage: false,
       failureTriageKnn: false,
       autoFinetune: false,
+      routing: false,
+      routingEnforce: false,
+      routingCheap: null,
+      routingCapable: null,
+      routingThreshold: 0.8,
     });
+  });
+});
+
+describe("routing block guards its two unsafe edits (review L3/L4)", () => {
+  it("never reads a cleared confidence input as 0", () => {
+    // `Number("")` is 0 — an empty `type="number"` edit would silently open
+    // the gate to every classified answer, so the handler rejects an empty /
+    // non-finite / out-of-range edit and snaps the field back to the
+    // committed gate instead.
+    expect(classifierSource).toContain('raw === "" ? Number.NaN : Number(raw)');
+    expect(classifierSource).toContain(
+      "e.target.value = String(routingThreshold)",
+    );
+  });
+
+  it("can always switch enforcement back OFF while the classifier is not ready", () => {
+    // The switch is disabled for the ON direction only: a dead classifier can
+    // never trap a turn in enforce mode, and the hint says so.
+    expect(classifierSource).toContain(
+      'disabled={status !== "ready" && !routingEnforce}',
+    );
+    expect(classifierSource).toContain("switching it back off always works");
   });
 });

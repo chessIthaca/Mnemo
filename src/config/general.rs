@@ -116,6 +116,15 @@ pub struct GeneralSection {
     /// trace of it (mirrors `[ui.steering_notes]`).
     #[serde(default, skip_serializing_if = "LayaConfig::is_default")]
     pub laya: LayaConfig,
+    /// **Pre-prompt model routing (opt-in; backlog 091e694d).** The targets
+    /// (cheap / capable) and the policy (confidence threshold, shadow vs
+    /// enforce) for running a turn on a different model based on a Laya
+    /// classification of the task text. Gated by [`LayaConfig::routing`]:
+    /// with that flag off the section is inert. Omitted from the saved
+    /// config while every field holds its default, so configs that never
+    /// touched routing keep no trace of it (mirrors `[general.laya]`).
+    #[serde(default, skip_serializing_if = "RoutingConfig::is_default")]
+    pub routing: RoutingConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
     /// context levers that cut re-reads and command-output waste at the tool
     /// dispatch layer: delta/skeleton re-reads, semantic command-output
@@ -273,13 +282,31 @@ pub struct LayaConfig {
     /// task. Omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub steer_tool_choice: bool,
+    /// Opt in to pre-prompt MODEL ROUTING (backlog 091e694d): at the start of
+    /// a user turn the task text is classified trivial vs architectural (a
+    /// calibrated choice question), and, only with a confident answer, a
+    /// configured target and [`enforce`](RoutingConfig::enforce) on, the
+    /// turn runs on [`cheap`](RoutingConfig::cheap) or
+    /// [`capable`](RoutingConfig::capable) instead of the state/default
+    /// model. **Shadow-first**: while `enforce` is off every turn is still
+    /// classified and its decision + outcome logged to `routing.jsonl`, but
+    /// model choice is byte-identical to today. Confidence-gated (a
+    /// below-threshold or missing answer, an unknown label, or an unset or
+    /// dangling target all keep today's model), and never overriding a
+    /// skill, subagent or bug-fixing slot. Off by default, and meant to be
+    /// enabled only against a **fine-tuned** checkpoint: base Laya
+    /// checkpoints are near-chance zero-shot on this task, which is exactly
+    /// what the routing log's labeled corpus is for. Omitted from the saved
+    /// config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub routing: bool,
 }
 
-/// `skip_serializing_if` guard for [`LayaConfig`]'s boolean opt-ins
-/// (`auto_type_memories`, `failure_triage`, `failure_triage_knn`,
-/// `auto_finetune`, `steer_tool_choice`): `false` (the
-/// default) stays unwritten, so untouched configs keep their exact
-/// pre-consumer shape.
+/// `skip_serializing_if` guard for the Laya-gated boolean opt-ins
+/// ([`LayaConfig`]'s `auto_type_memories`, `failure_triage`,
+/// `failure_triage_knn`, `auto_finetune`, `steer_tool_choice`, `routing`,
+/// and [`RoutingConfig::enforce`]): `false` (the default) stays unwritten,
+/// so untouched configs keep their exact pre-consumer shape.
 fn laya_flag_off(off: &bool) -> bool {
     !*off
 }
@@ -296,7 +323,90 @@ impl LayaConfig {
             && !self.failure_triage_knn
             && !self.auto_finetune
             && !self.steer_tool_choice
+            && !self.routing
     }
+}
+
+/// The `[general.routing]` section (backlog 091e694d, item 2 of the Laya
+/// chain): the targets and the policy for pre-prompt model routing.
+///
+/// Gated by the [`LayaConfig::routing`] opt-in: with that flag off (or Laya
+/// disabled, or no classifier installed) this section is inert and model
+/// selection is byte-identical to today. When it is on, each main-agent user
+/// turn's task text is classified trivial vs architectural, and:
+///
+/// * [`enforce`](Self::enforce) `false` (the default) = **shadow**: the
+///   decision is logged (with the turn's outcome) to
+///   `~/.mnemo/laya/training/routing.jsonl`, and the model is not switched.
+/// * `true` = **enforce**: a confident `trivial` answer runs the turn on
+///   [`cheap`](Self::cheap), `architectural` on [`capable`](Self::capable).
+///
+/// Every fallback keeps today's model: an answer below
+/// [`threshold`](Self::threshold), a missing answer, an unknown label, or an
+/// unset or dangling target. Routing never overrides a skill, subagent or
+/// bug-fixing slot, and never applies to spawned agents, reviewer subagents
+/// or compaction summaries. Omitted from the saved config while every field
+/// holds its default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// The endpoint + model a confidently-TRIVIAL task routes to (a small,
+    /// local, mechanical change). `None` (the default) keeps today's model.
+    pub cheap: Option<ModelRef>,
+    /// The endpoint + model a confidently-ARCHITECTURAL task routes to
+    /// (design-level work: a new feature, cross-module refactor, a new
+    /// dependency, a data-model or concurrency change). `None` keeps today's.
+    pub capable: Option<ModelRef>,
+    /// The calibrated-probability gate: a decision routes only at
+    /// `confidence >= threshold`. Defaults to `0.80`, the same gate the
+    /// other Laya consumers use; a below-threshold answer keeps today's
+    /// model, so a too-high threshold is simply inert. Omitted while default.
+    #[serde(skip_serializing_if = "routing_threshold_is_default")]
+    pub threshold: f64,
+    /// Whether a confident decision actually switches the turn's model.
+    /// `false` (the default) = shadow: classify + log only, model unchanged.
+    /// Flipping this is the post-fine-tune step: a config edit, never a code
+    /// change. Omitted while false.
+    #[serde(skip_serializing_if = "laya_flag_off")]
+    pub enforce: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            cheap: None,
+            capable: None,
+            threshold: default_routing_threshold(),
+            enforce: false,
+        }
+    }
+}
+
+impl RoutingConfig {
+    /// True while every field holds its default - the `[general.routing]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`LayaConfig::is_default`]), so untouched configs keep no routing
+    /// trace.
+    fn is_default(&self) -> bool {
+        self.cheap.is_none()
+            && self.capable.is_none()
+            && routing_threshold_is_default(&self.threshold)
+            && !self.enforce
+    }
+}
+
+/// The out-of-box routing confidence gate: the same `0.80` the other Laya
+/// consumers use. Named fn so the serde default, the `Default` impl and the
+/// `skip_serializing_if` guard agree.
+fn default_routing_threshold() -> f64 {
+    0.80
+}
+
+/// `skip_serializing_if` guard for [`RoutingConfig::threshold`]: the default
+/// stays unwritten, so a section touched only by `enforce` or a target keeps
+/// its minimal shape.
+fn routing_threshold_is_default(threshold: &f64) -> bool {
+    (*threshold - default_routing_threshold()).abs() < f64::EPSILON
 }
 
 /// The `[general.optimizer]` section — the token-optimizer levers (backlog
@@ -512,6 +622,7 @@ impl Default for GeneralSection {
             embedding_model: None,
             bundled_embedding_model: default_bundled_embedding_model(),
             laya: LayaConfig::default(),
+            routing: RoutingConfig::default(),
             optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
@@ -1366,6 +1477,87 @@ enabled = true
     }
 
     #[test]
+    fn routing_defaults_off_and_round_trips() {
+        // Opt-in only, shadow-first: an absent [general.routing] section (and
+        // the routing flag off) means no classification, no log writes, and
+        // today's model selection exactly.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.routing);
+        assert!(!cfg.general.routing.enforce);
+        assert!(cfg.general.routing.cheap.is_none());
+        assert!(cfg.general.routing.capable.is_none());
+        assert!((cfg.general.routing.threshold - 0.80).abs() < 1e-9);
+
+        let text = r#"
+[general.laya]
+enabled = true
+routing = true
+
+[general.routing]
+threshold = 0.9
+enforce = true
+
+[general.routing.cheap]
+endpoint = "local"
+model = "tiny-model"
+
+[general.routing.capable]
+endpoint = "anthropic"
+model = "claude-opus-4-6"
+reasoning_effort = "max"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.laya.routing);
+        assert!(cfg.general.routing.enforce);
+        assert!((cfg.general.routing.threshold - 0.9).abs() < 1e-9);
+        assert_eq!(cfg.general.routing.cheap.as_ref().unwrap().model, "tiny-model");
+        assert_eq!(
+            cfg.general
+                .routing
+                .capable
+                .as_ref()
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+
+        // Re-serialize + re-parse: every field survives.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.laya.routing);
+        assert!(cfg2.general.routing.enforce);
+        assert!((cfg2.general.routing.threshold - 0.9).abs() < 1e-9);
+        assert_eq!(cfg2.general.routing.cheap.unwrap().endpoint, "local");
+        assert_eq!(cfg2.general.routing.capable.unwrap().model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn routing_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [general.laya]: an untouched (default)
+        // section is skipped in config.toml; touching one field writes only
+        // that field.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.routing"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.routing]
+enforce = true
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.routing"));
+        // The untouched threshold stays unwritten.
+        assert!(!text.contains("threshold"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.routing.enforce);
+        assert!((back.general.routing.threshold - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
     fn laya_removed_mode_endpoint_and_checkpoint_keys_are_ignored() {
         // External-endpoint mode and the multilingual checkpoint choice were
         // removed (managed-only, English-only). A config written before that
@@ -1969,6 +2161,7 @@ chat_hover_timestamps = true
                 }),
                 bundled_embedding_model: None,
                 laya: LayaConfig::default(),
+                routing: RoutingConfig::default(),
                 optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,

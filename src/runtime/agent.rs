@@ -1371,6 +1371,37 @@ impl AgentTask {
                     },
                 ))
                 .await;
+            // The session's temporary raise (backlog 11513ee5): a manual or
+            // run-all between-items compaction that STILL leaves the
+            // conversation over the summarize limit raises the effective limit
+            // by one +10% step (surface it, don't do it silently), so the next
+            // auto-compaction cycle runs with headroom instead of firing
+            // immediately; a compaction that fits clears the ladder. The
+            // `CompactOutcome` enum deliberately gains no variant — the note is
+            // the surface, and the outcome stays a plain success/failure.
+            if let crate::agent::context::CompactionFit::Raised {
+                steps,
+                factor,
+                limit,
+            } = context_manager.compaction_fit(used as usize)
+            {
+                eprintln!(
+                    "[context] manual compaction left the conversation over the summarize limit \
+                     — temporarily raising the effective limit by {}% (x{factor:.1}) to {limit} tokens",
+                    steps * crate::agent::context::COMPACTION_RAISE_STEP_PERCENT
+                );
+                let _ = fanin_tx
+                    .send((
+                        self.id,
+                        AgentEvent::Error {
+                            error: crate::agent::context::compaction_raise_note(
+                                steps, factor, limit,
+                            ),
+                            retrying: true,
+                        },
+                    ))
+                    .await;
+            }
         } else {
             let _ = fanin_tx
                 .send((
@@ -1393,6 +1424,10 @@ impl AgentTask {
     /// by `/new`.
     async fn clear_context(&mut self, fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>) {
         self.messages.clear();
+        // A fresh session must not inherit the previous one's temporary raise
+        // (backlog 11513ee5) — the ladder is session state, and /new starts a
+        // new session.
+        self.agent_loop.reset_compaction_raise();
         let max = self.agent_loop.context_manager().max_tokens() as u32;
         let _ = fanin_tx
             .send((

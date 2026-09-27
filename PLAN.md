@@ -483,6 +483,22 @@ onto a substantive context passes; a thin replacement fails), and one
 actionable error names every violation so the retry fixes all of them in one
 shot.
 
+Since 2027-01-11 the gate also enforces the **evidence rule** (backlog
+5b232b8d): a context line asserting a symbol is callable or reachable — a
+dotted member call like `ext._evaluator.clashOf()`, or the phrases `exists
+at` / `is callable` / `callable from` / `is reachable` / `reachable from` —
+must carry a probe marker (verified / probe / probed / observed / measured /
+confirmed / reproduced / checked) or be explicitly labelled an assumption
+(assumption / assumed / unverified / unproven / not verified / to verify /
+hypothesis). A plan must encode findings, not assumptions: the ShapeGraph
+session assumed `ext._evaluator.clashOf()` was callable from `/agent.html`
+and a 30-second probe answered `typeof ext._evaluator` -> `undefined`, so the
+plan had to be rewritten before any code was written. A bare call
+(`boil()`), a `::` path, a `self.`-rooted call and a `/`-preceded path segment
+before `(` (`src/kettle.rs(42)`) are ordinary mentions or locators, not
+claims. `update_plan` applies the rule to the appended text only, so a plan
+accepted before the rule stays updatable.
+
 ### Plan kinds
 
 `create_plan` takes a `kind` (persisted as the `## Kind` section):
@@ -828,6 +844,33 @@ slot to a model that mis-advertises its window therefore degrades the SUMMARY
 quality rather than the session (and the downgrade is recorded); pick a cheap
 model with a large window, and note the budget comes from the *advertised*
 window — only the mechanical fallback catches a wrongly advertised one.
+
+**Compaction-limit fallback (2027-01, backlog 11513ee5).** The summarize
+trigger is a fill-rate dial, and a compaction whose result still sits at/over it
+(the kept-verbatim tail dominates the compaction budget) used to mean the turn
+re-compacted every iteration until the bounded abort (attempt ladder / per-turn
+ceiling) fired. The lever in between is a per-session, bounded raise:
+`CompactionRaise` (src/agent/context.rs) is a shared +10% ladder (x1.1, x1.2,
+... cumulatively, at most `MAX_COMPACTION_RAISE_STEPS` steps) capped by
+`raise_cap()` = `max_tokens - max(compact_headroom_tokens, 1)` (the one-token
+floor holds even for a degenerate `compact_headroom_tokens = 0`), so the
+provider's true
+window stays hard. It is owned by the SESSION (`AgentLoop::compaction_raise` in
+src/agent/loop_impl.rs), not by the context manager, because the turn loop
+clones the manager per iteration and the workflow-state resolver builds a fresh
+one per iteration - both hand-outs get the handle installed
+(`AgentLoop::context_manager`, `resolve_iteration_provider`). Both compaction
+paths complete through `ContextManager::compaction_fit`: under the un-raised
+trigger the ladder clears (under the raised one it is KEPT - it is still
+load-bearing), still over it escalates one step and the caller surfaces the
+raise as a transcript note + stderr line (`maybe_compact` in src/agent/turn.rs,
+`compact_context` in src/runtime/agent.rs), and when neither the step budget nor
+the cap has room left the existing bounded abort ladder stays in charge. `/new`
+and a provider swap reset it to 1.0. In-loop trigger checks read
+`effective_limit()` (the raised limit), not `effective_summarize_at()` (the
+base dial).
+
+**Pre-prompt model routing (2027-01, backlog 091e694d).** Item 2 of the Laya chain: the routing lever classifies each main-agent turn's task text ONCE — at `run_turn`'s head, before the first request is built — as `trivial` vs `architectural` (one calibrated `Question::Choice`; the text is capped at `ROUTING_TEXT_MAX_CHARS` = 2 000 chars) and, only with the `[general.laya] routing` opt-in on, enforcement on (`[general.routing] enforce`), a confident answer and a configured target, runs the turn on it. `RouteTarget::{Cheap,Capable}`, `RoutingDecision`, the question, the log rows and the gate live in `src/agent/model_routing.rs`; the arm sits in `AgentLoop::resolve_turn_provider_routed` (src/agent/loop_impl.rs) BELOW the three explicit-pin arms (skill, picker pin, forced model) and ABOVE the state/subagent chain it replaces — `resolve_turn_provider` is the plain wrapper that passes no route — and `ModelResolver::resolve_routed` (src/model_resolver.rs) is the single guard that refuses the skill, subagent and bug-fixing contexts, so an arm that did not fire cannot smuggle routing past an explicit choice and an unset, dangling or refused target falls through to the chain unchanged. The classifier handle is the app runtime's ONE shared slot, read through `RoutingGate` (which also owns the log path — `RoutingGate::with_log_path` is the test seam, `routing_log_path()` = `~/.mnemo/laya/training/routing.jsonl`, beside the failure-triage log); the opt-in flag, threshold and mode ride the LIVE config, read per turn by `ModelResolver::routing_policy`, so a Settings save lands on the next turn with no rewire and no flag mirror. Shadow-first is the contract: with `enforce: false` every classified turn writes a decision row (at turn start) and an outcome row (from `TurnRoute`'s `Drop` — the one hook every exit path of the turn runs, `?` unwind included) without touching the model. Invariants: below-threshold, no-answer, unknown-label and unset-or-dangling-target all keep today's model; subagents, reviewers and compaction summaries are never routed; exactly one classification per turn, never per iteration; every classifier and log call is best-effort and can never fail a turn. Covered by 7 turn-level tests in src/agent/tests.rs (the enforcement path red-checked by neutralizing the arm), 8 unit tests in src/agent/model_routing.rs and 5 in src/model_resolver.rs.
 
 **Subagent role state (2026-01-03).** A parented sub-agent's `Workflow` loads
 the main plan's stack from the shared plans dir (the read-only mirror that

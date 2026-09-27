@@ -234,6 +234,66 @@ impl Error {
             || s.contains("limit exhausted")
     }
 
+    /// Whether this error is a deterministic client rejection: an HTTP 4xx
+    /// status other than 408 (Request Timeout — genuinely transient) and 429
+    /// (rate limit — [`is_rate_limited`](Self::is_rate_limited) owns it).
+    ///
+    /// A 400/401/403/404/422 … means the provider refused THIS request:
+    /// re-sending the identical payload cannot succeed, so the same-provider
+    /// retry ladder must not burn its attempts and backoff sleeps on a
+    /// verdict it already has. Live 2027-01: after a mid-session switch to
+    /// z.ai/GLM, all three ladder attempts re-sent the identical body and got
+    /// the identical `HTTP 400 … code 1214 "messages[8].content[0].type type
+    /// error"` back — ~5s of backoff for an answer already known.
+    ///
+    /// Like [`is_rate_limited`](Self::is_rate_limited) this is NOT
+    /// [`is_non_retryable`](Self::is_non_retryable): it skips only the
+    /// same-provider ladder. The turn-level layer (`run_turn_attempt`) still
+    /// owns endpoint switching — another endpoint's validation rules can
+    /// differ.
+    ///
+    /// The check is string-based for the same reason as the others: the
+    /// provider clients fold the status into the message text (e.g.
+    /// `HTTP 400 Bad Request from <url> — <body>`, LiteLLM's
+    /// `Error code: 404. …`), and the status is scanned back out.
+    pub fn is_deterministic_4xx(&self) -> bool {
+        matches!(
+            self.provider_http_status(),
+            Some(status) if (400..500).contains(&status) && status != 408 && status != 429
+        )
+    }
+
+    /// The HTTP status folded into a provider error message, when one is
+    /// present.
+    ///
+    /// Scans the status out of the status-line shapes the provider clients
+    /// emit: `HTTP <status> <reason> from <url>` (native and
+    /// OpenAI-compatible), LiteLLM's `Error code: <status>.`, and the plain
+    /// `status: <status>` / `status code: <status>` variants. Exactly three
+    /// digits must follow the prefix — an HTTP status is always three digits,
+    /// and the guard keeps body numbers (`"status": 4000`, `max_tokens: 400`)
+    /// from being read as one.
+    fn provider_http_status(&self) -> Option<u16> {
+        let Error::Provider(msg) = self else {
+            return None;
+        };
+        let s = msg.to_lowercase();
+        for prefix in ["http ", "error code: ", "status code: ", "status: "] {
+            let mut rest = s.as_str();
+            while let Some(pos) = rest.find(prefix) {
+                let after = &rest[pos + prefix.len()..];
+                let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if digits.len() == 3 {
+                    if let Ok(status) = digits.parse::<u16>() {
+                        return Some(status);
+                    }
+                }
+                rest = after;
+            }
+        }
+        None
+    }
+
     /// Whether this error is a reasoning-state serialization bug (Rule 6).
     ///
     /// These 400s mean the request builder dropped or mutated a reasoning
@@ -515,6 +575,62 @@ mod tests {
             !e.is_non_retryable(),
             "429 must NOT be non-retryable (it gets the fallback path)"
         );
+    }
+
+    // --- is_deterministic_4xx --------------------------------------------
+
+    #[test]
+    fn http_4xx_status_is_deterministic() {
+        // The live 2027-01 shape: z.ai refusing the Anthropic-born body with
+        // a hard 400 (code 1214 "messages[8].content[0].type type error").
+        let e = Error::Provider(
+            "provider error: stream request: HTTP 400 Bad Request from \
+             https://api.z.ai/api/coding/paas/v4/chat/completions"
+                .into(),
+        );
+        assert!(e.is_deterministic_4xx(), "HTTP 400 must be deterministic");
+        let e = Error::Provider("HTTP 401 — {\"error\":{\"message\":\"Unauthorized\"}}".into());
+        assert!(e.is_deterministic_4xx(), "HTTP 401 must be deterministic");
+        // LiteLLM's status shape (no "HTTP" token).
+        let e = Error::Provider(
+            "litellm.NotFoundError: Error code: 404. Received Model Group=glm-5.2".into(),
+        );
+        assert!(
+            e.is_deterministic_4xx(),
+            "LiteLLM 'Error code: 404' must be deterministic"
+        );
+        let e = Error::Provider("HTTP 422 Unprocessable Entity".into());
+        assert!(e.is_deterministic_4xx(), "HTTP 422 must be deterministic");
+    }
+
+    #[test]
+    fn transient_errors_are_not_deterministic_4xx() {
+        // 408 (timeout) and 429 (rate limit) are genuinely worth retrying /
+        // owned by the fallback path; 5xx and network errors are transient.
+        let cases = [
+            "stream request: HTTP 408 Request Timeout",
+            "stream request: HTTP 429 from https://api.example.com/v1/chat/completions",
+            "HTTP 500 from gateway — internal server error",
+            "HTTP 502 from gateway — bad gateway",
+            "HTTP 503 Service Unavailable",
+            "failed to start stream: error sending request for url",
+            "flaky failure",
+            // A body number must not read as a status.
+            "{\"error\":{\"message\":\"max_tokens: 4000 exceeds the limit\"}}",
+        ];
+        for msg in cases {
+            let e = Error::Provider(msg.into());
+            assert!(
+                !e.is_deterministic_4xx(),
+                "must stay retryable (not deterministic-4xx): {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_provider_errors_are_not_deterministic_4xx() {
+        assert!(!Error::Tool("HTTP 400 whatever".into()).is_deterministic_4xx());
+        assert!(!Error::Config("HTTP 400 whatever".into()).is_deterministic_4xx());
     }
 
     // ── Serialization-bug classification (Rule 6) ─────────────────────────

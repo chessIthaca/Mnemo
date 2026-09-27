@@ -39,7 +39,7 @@ name = "post_merge_sync"
 available_in = ["complete", "planning"]
 target_state = "planning"
 tools = [
-  "file_read",
+  "read_files",  # live name; `file_read` is a legacy shim (backlog 834ec126)
   "shell",
   "search",
   "git",

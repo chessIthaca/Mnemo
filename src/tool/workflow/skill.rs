@@ -14,7 +14,9 @@
 //! `abandon_skill` rolls back to the pre-skill state. `skill_reload` re-reads
 //! the skills dir into the live library (available in every workflow state, so
 //! a file the user hand-edited never needs an app restart); `skill_create`
-//! authors a new skill file and hot-adds it (Executing only).
+//! authors a new skill file and hot-adds it (Executing-only in the base
+//! states; under a skill it needs an explicit allow-list entry — the
+//! `create_skill` overlay grants it from Complete/Planning).
 //!
 //! All five are `AutoRun` (not approval-gated) — protection is on the
 //! *operations* inside the skill, not the entry or the authoring. Core
@@ -395,7 +397,9 @@ struct SkillCreateArgs {
 /// same class as a plan or a knowledge file), the path is derived from a
 /// validated name, and every tool the new skill names is still gated by its own
 /// approval rule when it is finally called. Visibility is the real guard here:
-/// the tool is Executing-only.
+/// the tool is Executing-only in the base states, and inside a skill it is
+/// reachable only when that skill's allow-list names it (the `create_skill`
+/// overlay does — that is the plan-free authoring path).
 ///
 pub struct SkillCreateTool {
     library: Arc<SkillLibrary>,
@@ -429,7 +433,7 @@ impl Tool for SkillCreateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "skill_create",
-            "Author a new skill: writes .coding/skills/<name>.toml and registers it live, so it can be started with skill_start immediately. A skill is a named workflow overlay — skill_start enters it, injecting `prompt` into the system prompt EVERY turn while it runs and narrowing the visible tools to `tools`. Available in Executing only. The write is sandbox-mediated: a planted symlink or hardlink at the target is refused, and a skill shipped with the app (e.g. merge_to_main) is never rewritten — edit those with the approval-gated file tools. Keep `prompt` a terse operative checklist (rationale belongs in the file's header comment, which is never parsed). The memory tools, ask_user, current_plan, skill_reload, the backlog tools and the exits skill_end/abandon_skill are always available inside a skill and need not be listed in `tools`.",
+            "Author a new skill: writes .coding/skills/<name>.toml and registers it live, so it can be started with skill_start immediately. A skill is a named workflow overlay — skill_start enters it, injecting `prompt` into the system prompt EVERY turn while it runs and narrowing the visible tools to `tools`. Available in Executing only in the base states; inside a skill only when its allow-list names it (the `create_skill` overlay grants it, so a skill can be authored plan-free from Complete/Planning). The write is sandbox-mediated: a planted symlink or hardlink at the target is refused, and a skill shipped with the app (e.g. merge_to_main) is never rewritten — edit those with the approval-gated file tools. Keep `prompt` a terse operative checklist (rationale belongs in the file's header comment, which is never parsed). The memory tools, ask_user, current_plan, skill_reload, the backlog tools and the exits skill_end/abandon_skill are always available inside a skill and need not be listed in `tools`.",
             json!({
                 "type": "object",
                 "properties": {

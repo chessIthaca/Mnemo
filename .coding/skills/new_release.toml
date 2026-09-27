@@ -40,7 +40,7 @@ name = "new_release"
 available_in = ["complete", "planning"]
 target_state = "planning"
 tools = [
-  "file_read",
+  "read_files",   # live name; `file_read` is a legacy shim (backlog 834ec126)
   "file_edit",
   "shell",
   "git",

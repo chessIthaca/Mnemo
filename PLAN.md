@@ -46,7 +46,9 @@ vitest (frontend), `tsc --noEmit` clean.
   a live `SkillLibrary` (the `.coding/skills/` dir + the registry loaded from
   it): `skill_reload` re-reads it into the running app (every workflow state,
   an active skill included) and `skill_create` authors a validated skill file
-  (Executing only), hot-adding it so it is startable immediately.
+  (Executing-only in the base states; a skill grants it by naming it in its
+  allow-list — the `create_skill` overlay authors skills plan-free from
+  Complete/Planning), hot-adding it so it is startable immediately.
 - **Backlog + Run-All.** A persistent prompt backlog (`.coding/backlog.jsonl` —
   one JSON item per line, UUID string ids, git union merge driver for
   concurrent multi-instance adds) feeds the main agent one item at a time.
@@ -302,9 +304,11 @@ vitest (frontend), `tsc --noEmit` clean.
   library tools: `skill_reload` (re-read `.coding/skills/*.toml` into the live
   `SkillLibrary`; allowed in every workflow state, an active skill included,
   and inside a skill's always-available set) and `skill_create` (author +
-  validate a new skill file, hot-added to the registry; Executing only —
-  PlanFrozen advertises it, and the constructor-granted allow-lists deny it by
-  name so a skill file cannot widen the rule; its write is sandbox-mediated —
+  validate a new skill file, hot-added to the registry; Executing-only in the
+  base states — PlanFrozen advertises it, and under a skill it is granted ONLY
+  by an explicit allow-list entry (the `create_skill` overlay, available_in
+  Complete + Planning, so authoring needs no plan); the Reviewer surface never
+  gets it; its write is sandbox-mediated —
   a planted symlink or hardlink at the target is refused, and a link at the
   skills dir itself is refused when it leaves the project or resolves into a
   protected tree, and a skill shipped with the app such as `merge_to_main` is

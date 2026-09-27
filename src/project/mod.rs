@@ -7,9 +7,15 @@
 //! A project is a directory whose `.coding/` subdir holds its config, memory,
 //! and plans. The `agent.md` constitution lives at the project root (visible,
 //! like `CLAUDE.md` / `AGENTS.md`). All project state is self-contained.
+//!
+//! [`Project::init`] seeds what every project needs on top of that: the
+//! shipped skills (`.coding/skills/`, write-if-missing) and the app-owned
+//! `.gitignore` / `.gitattributes` entries its own state depends on (merged,
+//! never clobbering user lines — see [`scaffold`]).
 
 pub mod agent_md;
 pub mod git_ops;
+pub mod scaffold;
 pub mod worktrees;
 
 pub use agent_md::{Constitution, ConstitutionSource};
@@ -133,10 +139,11 @@ impl Project {
     /// and config) + the root-level `agent.md` constitution template.
     ///
     /// If `.coding/` already exists, this re-scaffolds only the missing
-    /// pieces: a missing `agent.md` is re-written and the shipped skills
-    /// (`.coding/skills/`, compile-embedded) are re-seeded write-if-missing
-    /// so deleted skill files self-heal — user-modified files are never
-    /// overwritten.
+    /// pieces: a missing `agent.md` is re-written, the shipped skills
+    /// (`.coding/skills/`, compile-embedded) are re-seeded write-if-missing so
+    /// deleted skill files self-heal, and the app-owned `.gitignore` /
+    /// `.gitattributes` entries are re-merged so a deleted ignore rule
+    /// self-heals too — user-modified files are never overwritten.
     pub fn init(dir: &Path) -> Result<Self> {
         let project = Self::from_root(dir);
         if project.is_initialized() {
@@ -144,34 +151,48 @@ impl Project {
             if !project.agent_md.exists() {
                 std::fs::write(&project.agent_md, agent_md::DEFAULT_PROJECT_TEMPLATE)?;
             }
-            // Self-heal the skills dir too: a project whose shipped skill
-            // files (or the whole .coding/skills/ directory) were deleted
-            // gets them back on the next init — write-if-missing, so existing
-            // user-modified skills are never touched.
-            crate::skill::seed_skills(&project.skills_dir).map_err(|e| {
-                Error::Project(format!(
-                    "failed to seed skills into {}: {e}",
-                    project.skills_dir.display()
-                ))
-            })?;
+            // Self-heal the seeded artifacts too: a project whose shipped
+            // skill files (or the whole .coding/skills/ directory) or managed
+            // .gitignore / .gitattributes entries were deleted gets them back
+            // on the next init — write-if-missing / merge-append, so existing
+            // user-modified files are never touched.
+            Self::seed_init_artifacts(&project)?;
             return Ok(project);
         }
         std::fs::create_dir_all(&project.coding_dir)?;
         std::fs::create_dir_all(&project.plans_dir)?;
         // Seed the shipped skills (compile-embedded TOMLs, write-if-missing)
-        // so a fresh project starts with the same baseline skill set as the
-        // main installation.
+        // and merge the app-owned git-file entries into the project's
+        // .gitignore / .gitattributes, so a fresh project starts with the
+        // baseline skill set AND the cache/merge hygiene its .coding/ state
+        // depends on.
+        Self::seed_init_artifacts(&project)?;
+        // Write the agent.md template at the project root if it doesn't exist.
+        if !project.agent_md.exists() {
+            std::fs::write(&project.agent_md, agent_md::DEFAULT_PROJECT_TEMPLATE)?;
+        }
+        Ok(project)
+    }
+
+    /// Seed the init artifacts, re-run on every init so each one self-heals:
+    /// the shipped skills (write-if-missing — a deleted skill file comes back,
+    /// a user-modified one is never touched) and the app-owned `.gitignore` /
+    /// `.gitattributes` entries (merge-append — a deleted ignore rule comes
+    /// back, existing user lines are never reordered or overwritten).
+    fn seed_init_artifacts(project: &Project) -> Result<()> {
         crate::skill::seed_skills(&project.skills_dir).map_err(|e| {
             Error::Project(format!(
                 "failed to seed skills into {}: {e}",
                 project.skills_dir.display()
             ))
         })?;
-        // Write the agent.md template at the project root if it doesn't exist.
-        if !project.agent_md.exists() {
-            std::fs::write(&project.agent_md, agent_md::DEFAULT_PROJECT_TEMPLATE)?;
-        }
-        Ok(project)
+        scaffold::seed_git_files(&project.root).map_err(|e| {
+            Error::Project(format!(
+                "failed to seed git files into {}: {e}",
+                project.root.display()
+            ))
+        })?;
+        Ok(())
     }
 
     /// Eagerly seed the project's on-disk stores after scaffolding: create
@@ -316,6 +337,72 @@ prompt = "Custom project-specific merge flow."
                 .join(format!("{name}.toml"));
             assert!(path.is_file(), "shipped skill {name} self-healed");
         }
+    }
+
+    /// How many lines of `text` cover `entry` — trimmed with a leading `/`
+    /// stripped, mirroring the scaffolder's normalized presence rule.
+    fn count_covered(text: &str, entry: &str) -> usize {
+        text.lines()
+            .filter(|line| line.trim().trim_start_matches('/') == entry)
+            .count()
+    }
+
+    #[test]
+    fn init_seeds_git_ignore_and_git_attributes() {
+        // The git-file entries the app's own state depends on: without them a
+        // fresh project's first commit sweeps .coding/memory.db +
+        // .coding/codegraph.db (multi-MB caches) into the user's repo, and
+        // .coding/backlog.jsonl conflicts across run-all worktrees instead of
+        // merging by union.
+        let dir = tempdir().unwrap();
+        Project::init(dir.path()).unwrap();
+        let ignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let attrs = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+        for entry in scaffold::MANAGED_GITIGNORE_ENTRIES {
+            assert_eq!(count_covered(&ignore, entry), 1, ".gitignore covers {entry}");
+        }
+        for entry in scaffold::MANAGED_GITATTRIBUTES_ENTRIES {
+            assert_eq!(count_covered(&attrs, entry), 1, ".gitattributes covers {entry}");
+        }
+    }
+
+    #[test]
+    fn init_merges_git_files_without_clobbering_user_lines() {
+        // A project that already has its own .gitignore/.gitattributes keeps
+        // every line it had; the app-owned entries are merged around them.
+        let dir = tempdir().unwrap();
+        let user_ignore = "# my rules\n/target\n/.coding/memory.db\n";
+        let user_attrs = "*.png binary\n";
+        std::fs::write(dir.path().join(".gitignore"), user_ignore).unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), user_attrs).unwrap();
+
+        Project::init(dir.path()).unwrap();
+
+        let ignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let attrs = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
+        assert!(ignore.starts_with(user_ignore), "user .gitignore intact:\n{ignore}");
+        assert!(attrs.starts_with(user_attrs), "user .gitattributes intact:\n{attrs}");
+        assert_eq!(
+            count_covered(&ignore, ".coding/memory.db"),
+            1,
+            "the leading-slash form already covered it — not duplicated"
+        );
+        assert_eq!(count_covered(&attrs, ".coding/backlog.jsonl merge=union"), 1);
+    }
+
+    #[test]
+    fn init_self_heals_git_file_entries() {
+        // Deleting a git file (or one entry) is repaired on the next init — the
+        // same self-heal contract as the agent.md template and the seeded
+        // skills.
+        let dir = tempdir().unwrap();
+        Project::init(dir.path()).unwrap();
+        let ignore_path = dir.path().join(".gitignore");
+        std::fs::remove_file(&ignore_path).unwrap();
+        Project::init(dir.path()).unwrap();
+        let recreated = std::fs::read_to_string(&ignore_path).unwrap();
+        assert_eq!(count_covered(&recreated, ".coding/memory.db"), 1);
+        assert_eq!(count_covered(&recreated, ".worktrees/"), 1);
     }
 
     #[test]

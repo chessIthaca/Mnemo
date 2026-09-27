@@ -32,6 +32,11 @@
 # - A repo skill ships with its pinning test (src/skill/mod.rs, the
 #   CARGO_MANIFEST_DIR repo-TOML tests) + docs — that is what keeps the flow it
 #   documents from silently rotting; a `skill_create` call alone is not enough.
+# - This file IS app-shipped (SHIPPED_SKILLS, src/skill/mod.rs): Project::init
+#   seeds it into every project's .coding/skills/ write-if-missing, so the
+#   prompt must read correctly OUTSIDE the app repo as well — step 4 says which
+#   guard to pin where. post_merge_sync and new_release stay repo-local
+#   (REPO_LOCAL_SKILLS), so their instructions may mention app-repo specifics.
 
 name = "create_skill"
 available_in = ["complete", "planning"]
@@ -51,6 +56,6 @@ Author or revise a skill WITHOUT a plan. Steps:
 1. Author with the `skill_create` tool — it validates, writes `.coding/skills/<name>.toml` and hot-registers it (never hand-write the TOML with the file tools; never restart the app): `name` lowercase letters/digits/`_`/`-` matching the filename; `available_in`/`target_state` ∈ planning|executing|complete; `tools` = LIVE registry names for the MUTATING surface (file_write, file_edit, multi_edit, shell, git, ...) — the whole read-only surface (read_files, search, git_read, web_fetch, graph_*, ...) is always available inside a skill, so do not list it; NEVER the legacy shims (file_read/file_append — the model calls read_files/file_write); no memory tools, ask_user, current_plan, skill_reload or the exits (always available); `write_review_report` is refused. `prompt` = terse injected checklist; the rationale goes in the TOML header comment (never injected). Revising (`overwrite: true`) → refresh its header comment and its pinned test too. App-shipped skills are refused — edit those with the approval-gated file tools.
 2. Validate: read the file back (`read_files`), confirm every allow-list name is a live tool, then `skill_reload` — the output must report the skill added/unchanged, never skipped (a malformed TOML is logged and dropped at load).
 3. Smoke it: `skill_end` first (no nesting), then `skill_start` with the skill's name, run its surface once, `skill_end`.
-4. Repo skill (this project's `.coding/skills/`): pin the prompt in `src/skill/mod.rs` (CARGO_MANIFEST_DIR repo-TOML tests: the load + the load-bearing prompt anchors), update `docs/FEATURES.md` when the flow narrative changed, run `cargo test`, and commit on the current `wt/*` branch with the `git` tool (approval-gated). NEVER commit to main — landing stays with merge_to_main.
+4. Pin it with this project's own guard: in the Mnemo app repo that is the CARGO_MANIFEST_DIR repo-TOML test in `src/skill/mod.rs` (the load + the load-bearing prompt anchors), with `docs/FEATURES.md` updated when the flow narrative changed and `cargo test` run; in another project, whatever regression test its suite supports (or none). Then commit on the current `wt/*` branch with the `git` tool (approval-gated). NEVER commit to main — landing stays with merge_to_main.
 5. Report the path, allow-list, smoke result, test result; `skill_end` → Planning. Stuck, or it turns out to need app code → `abandon_skill`, then a plan.\
 """

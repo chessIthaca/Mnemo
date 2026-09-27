@@ -13949,3 +13949,146 @@ async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route
     assert_eq!(d.model, None, "no model was routed onto");
     assert_eq!(outcomes[0].outcome, "ok");
 }
+
+/// The harness knows when a tool call FAILED (`ToolResult::error`), and the
+/// provider request must say so: the Anthropic builder maps a failed result to
+/// the `tool_result` block's `is_error: true` — Anthropic's first-class "this
+/// call failed, change approach" signal. Without it the model reads a bare
+/// failure text as an odd success and re-issues the identical call (the live
+/// retry loop this test pins). Asserted on the SERIALIZED message: the
+/// property under test is what the provider is handed, not an internal field.
+#[tokio::test]
+async fn failed_tool_result_is_serialized_for_the_provider_as_an_error() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+
+    let scripted = MockProvider::sequence(vec![
+        // Round 1: read a file that does not exist — a deterministic failure.
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_missing".into(),
+                name: "file_read".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"path":"missing-does-not-exist.txt"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        // Round 2: the model's follow-up turn, ending normally.
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: provider,
+            tools: registry,
+            workflow: workflow,
+            sandbox: sandbox.clone(),
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let requests = probe
+        .requests
+        .lock()
+        .expect("request capture lock poisoned");
+    let second = requests
+        .get(1)
+        .expect("two provider requests: the tool round, then the follow-up");
+    let tool_msg = second
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .expect("the failed tool result was fed back to the provider");
+    assert!(
+        tool_msg.content.as_text().starts_with("[tool error]"),
+        "scenario sanity: the tool really failed, got: {}",
+        tool_msg.content.as_text()
+    );
+    let serialized = serde_json::to_value(tool_msg).unwrap();
+    assert_eq!(
+        serialized["tool_is_error"],
+        serde_json::json!(true),
+        "a failed tool result must reach the provider as an error, not as a success"
+    );
+}
+
+/// A hard stop that cuts a tool batch short must still tell the provider the
+/// truth about the calls that never ran. `synthesize_not_run_results` feeds
+/// back one "interrupted: not run (turn stopped)" result per remaining call;
+/// each must carry the structured failure flag, or the Anthropic wire says
+/// `is_error: false` while the text says not-run -- the exact mismatch that
+/// lets the model build on a result that never happened (review finding 1,
+/// plan 49f53bf5: this was the last unflagged not-run path).
+#[tokio::test]
+async fn hard_stop_synthesis_marks_not_run_results_as_errors() {
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(16);
+    let calls = vec![
+        crate::provider::ToolCall::new("c1", "file_write", r#"{"path":"a.txt","content":"one"}"#),
+        crate::provider::ToolCall::new("c2", "file_write", r#"{"path":"b.txt","content":"two"}"#),
+    ];
+    let mut messages: Vec<Message> = vec![Message::user_text("write both files")];
+
+    crate::agent::synthesize_not_run_results_for_test(&mut messages, &fanin_tx, 1, &calls).await;
+
+    // N calls -> N results, so the history stays valid for the next request.
+    let tool_msgs: Vec<&Message> = messages.iter().filter(|m| m.role == Role::Tool).collect();
+    assert_eq!(tool_msgs.len(), 2, "one synthesized result per unrun call");
+    for (m, call) in tool_msgs.iter().zip(calls.iter()) {
+        assert_eq!(
+            m.tool_call_id.as_deref(),
+            Some(call.id.as_str()),
+            "the result answers its own call"
+        );
+        assert!(
+            m.content.as_text().contains("not run"),
+            "the text explains why nothing ran, got: {}",
+            m.content.as_text()
+        );
+        assert!(
+            m.tool_is_error,
+            "a not-run result must be flagged as an error, not as a success"
+        );
+        let serialized = serde_json::to_value(m).unwrap();
+        assert_eq!(
+            serialized["tool_is_error"],
+            serde_json::json!(true),
+            "the serialized form is what the provider sees"
+        );
+    }
+
+    // Terminal events: the UI cards end instead of spinning "running" forever.
+    let mut terminal_events = 0;
+    while let Ok((_agent_id, event)) = fanin_rx.try_recv() {
+        if let AgentEvent::ToolResult { .. } = event {
+            terminal_events += 1;
+        }
+    }
+    assert_eq!(
+        terminal_events, 2,
+        "one terminal ToolResult event per unrun call"
+    );
+}

@@ -32,8 +32,9 @@
 #   post-merge on main - the record rides the next branch and answers the
 #   branch-status question for the next session.
 # - Project-local, not app-shipped (like new_release.toml): SHIPPED_SKILLS
-#   (src/skill/mod.rs) stays merge_to_main-only; this file travels via git
-#   (the .coding/ side-car) to the repo's other instances and checkouts.
+#   (src/skill/mod.rs) carries merge_to_main + create_skill; this file is
+#   declared in REPO_LOCAL_SKILLS and travels via git (the .coding/ side-car)
+#   to the repo's other instances and checkouts instead.
 
 name = "post_merge_sync"
 available_in = ["complete", "planning"]

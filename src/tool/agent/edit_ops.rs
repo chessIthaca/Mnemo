@@ -192,11 +192,19 @@ pub(crate) fn validate_emission_artifacts_braces(
 /// the before → after numbers, the op(s) that grew the deficit (empty for the
 /// single-path callers — one replacement, no op indices), and the remedy.
 fn brace_growth_detail(before: usize, after: usize, offenders: &[String]) -> String {
-    let mut detail = format!(
-        "unbalanced delimiters after the edit — the brace/bracket/paren deficit \
-         grew by {} ({before} → {after})",
-        after.saturating_sub(before)
-    );
+    // `rust_brace_deficit` bails to `usize::MAX` on an unterminated raw
+    // string — name that cause instead of printing the sentinel (review note).
+    let mut detail = if after == usize::MAX {
+        "unbalanced delimiters after the edit — the brace/bracket/paren \
+         deficit grew and the file ends inside an unterminated raw string"
+            .to_string()
+    } else {
+        format!(
+            "unbalanced delimiters after the edit — the brace/bracket/paren \
+             deficit grew by {} ({before} → {after})",
+            after.saturating_sub(before)
+        )
+    };
     if !offenders.is_empty() {
         const NAMED: usize = 3;
         detail.push_str(&format!(
@@ -218,7 +226,16 @@ fn brace_growth_detail(before: usize, after: usize, offenders: &[String]) -> Str
              rustfmt --check)",
         );
     }
-    detail.push_str(" — the truncation artifact: the payload was cut off");
+    if offenders.is_empty() {
+        // The single-path shape (no op indices): the truncation claim fits a
+        // lone replacement.
+        detail.push_str(" — the truncation artifact: the payload was cut off");
+    } else {
+        // The named-op shape is ALSO the deliberate-restructure case the
+        // escape hatch exists for — asserting truncation here would be false
+        // (review LOW-1).
+        detail.push_str(" — either a truncated payload or a deliberately unbalanced restructure");
+    }
     detail
 }
 
@@ -255,11 +272,15 @@ fn validate_ops_brace_delta(
         .enumerate()
         .filter(|(_, pair)| pair[1] > pair[0])
         .map(|(idx, pair)| {
-            format!(
-                "ops[{idx}] ({}) grows it by +{}",
-                op_label(ops.get(idx)),
-                pair[1] - pair[0]
-            )
+            // A step into `usize::MAX` (an unterminated raw string) has no
+            // printable delta — say so instead of printing the sentinel
+            // (review note).
+            let delta = if pair[1] == usize::MAX {
+                "an unbounded amount".to_string()
+            } else {
+                format!("+{}", pair[1] - pair[0])
+            };
+            format!("ops[{idx}] ({}) grows it by {delta}", op_label(ops.get(idx)))
         })
         .collect();
     Err(artifact_rejection(brace_growth_detail(
@@ -1733,6 +1754,28 @@ mod tests {
         assert!(err.contains("unbalanced delimiters"), "{err}");
         assert!(err.contains("ops[0]"), "names the offender: {err}");
         assert!(err.contains("0 → 1"), "reports before → after: {err}");
+        assert!(
+            !err.contains("the payload was cut off"),
+            "the ops variant must not assert truncation: {err}"
+        );
+        assert!(
+            err.contains("either a truncated payload or a deliberately unbalanced restructure"),
+            "the ops variant names both readings: {err}"
+        );
+        // The single-path shape keeps the truncation claim (no op indices).
+        let err = validate_emission_artifacts_braces("a.rs", "fn f() {}\n", "fn new() {\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the payload was cut off"), "{err}");
+        // A payload ending inside an unterminated raw string names the cause
+        // instead of printing usize::MAX (review note).
+        let err = apply_err(
+            "a.rs",
+            "fn f() {}\n",
+            &line_ops(&["r1:fn new() { let s = r#\"open"]),
+        );
+        assert!(err.contains("unterminated raw string"), "{err}");
+        assert!(!err.contains("18446744073709551615"), "{err}");
         // (b) the same shape WITH a compensating deletion nets to zero.
         let (out, _) = apply(
             "a.rs",

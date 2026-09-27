@@ -52,6 +52,19 @@
 //!   `as_text()`, so an image-heavy context trips the threshold it always
 //!   should have — the ctx readout's numbers move for vision turns as a result.
 //!
+//! - **Temporary raise.** A compaction pass that still leaves the conversation
+//!   at/over the effective trigger (the kept-verbatim tail dominates) raises
+//!   the effective limit by +10% per failed pass (cumulative, at most
+//!   [`MAX_COMPACTION_RAISE_STEPS`] steps, capped by [`ContextManager::raise_cap`]
+//!   = window minus the output headroom, so the provider's true limit stays
+//!   hard) and clears the ladder as soon as a compaction fits at the un-raised
+//!   trigger. Both compaction paths surface every raise
+//!   ([`compaction_raise_note`]) and read [`ContextManager::effective_limit`], so
+//!   a boundary session continues instead of re-compacting until the bounded
+//!   abort. The ladder lives on the SESSION (`AgentLoop`, src/agent/loop_impl.rs)
+//!   and is installed on every manager hand-out via
+//!   [`ContextManager::with_compaction_raise`].
+//!
 //! ## Compaction prompt design
 //!
 //! The summarization prompt (see [`ContextManager::build_summary_prompt`]) uses
@@ -90,6 +103,9 @@
 //!    exceeding a rough budget. The model is told the recent messages are kept
 //!    verbatim, so it should focus on the older context that will be dropped.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use crate::error::Result;
 use crate::provider::{ContentPart, LlmClient, LlmEvent, Message, MessageContent, Role};
 
@@ -123,6 +139,108 @@ pub struct ContextManager {
     /// `ceiling - PROXY_CACHE_PRESSURE_MARGIN_TOKENS` so long sessions
     /// summarize before crossing the cliff. `None` disables the guard.
     proxy_cache_ceiling: Option<usize>,
+    /// The per-session temporary raise of the effective trigger
+    /// ([`Self::effective_limit`]): the cumulative +10% ladder applied when a
+    /// compaction pass still does not fit (see [`CompactionRaise`]). Shared by
+    /// every clone of ONE session's manager — the turn loop takes a fresh
+    /// clone per iteration and the workflow-state resolver builds a fresh
+    /// manager per iteration, so the ladder cannot live in a plain field.
+    compaction_raise: Arc<CompactionRaise>,
+}
+
+/// The percentage added to the effective summarize trigger by each
+/// [`CompactionRaise`] step — one +10% step per compaction pass that still did
+/// not fit (x1.1, x1.2, ... cumulatively).
+pub const COMPACTION_RAISE_STEP_PERCENT: usize = 10;
+
+/// The hard bound on the raise ladder: at most this many +10% steps, so the
+/// temporary raise tops out at x2.0 even if the window cap
+/// ([`ContextManager::raise_cap`]) would allow more.
+pub const MAX_COMPACTION_RAISE_STEPS: usize = 10;
+
+/// The per-session temporary raise of the effective summarize trigger.
+///
+/// A compaction pass whose result is STILL at or over the trigger (the
+/// kept-verbatim tail dominates the compaction budget) used to mean the turn
+/// re-compacted every iteration until the bounded abort fired. This ladder is
+/// the lever in between: each failed pass raises the effective limit by one
+/// [`COMPACTION_RAISE_STEP_PERCENT`] step so the next cycle has headroom and
+/// the session continues.
+///
+/// Bounded twice over: [`MAX_COMPACTION_RAISE_STEPS`] steps, and the cap
+/// [`ContextManager::raise_cap`] (the model's window minus the output headroom)
+/// — the provider's true limit stays hard, so a provider length error remains a
+/// genuine error. The ladder resets to 1.0 as soon as a compaction fits again,
+/// and a fresh session starts at 1.0 by construction.
+#[derive(Debug, Default)]
+pub struct CompactionRaise {
+    steps: AtomicUsize,
+}
+
+impl CompactionRaise {
+    /// The number of +10% steps currently applied (`0` = no raise).
+    pub fn steps(&self) -> usize {
+        self.steps.load(Ordering::Relaxed)
+    }
+
+    /// The current raise factor: `1.0` with no steps, `1.1` after one, `1.2`
+    /// after two, ...
+    pub fn factor(&self) -> f64 {
+        1.0 + (COMPACTION_RAISE_STEP_PERCENT as f64 / 100.0) * self.steps() as f64
+    }
+
+    /// Advance one step; returns the new step count.
+    fn escalate(&self) -> usize {
+        self.steps.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Drop back to 1.0 — called whenever a compaction fits, and by a fresh
+    /// session/`/new`.
+    pub fn reset(&self) {
+        self.steps.store(0, Ordering::Relaxed);
+    }
+}
+
+/// What a completed compaction pass did to the temporary raise ladder
+/// ([`ContextManager::compaction_fit`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactionFit {
+    /// The result is under the effective limit — the session continues, and the
+    /// attempt budget is re-armed. The ladder is cleared when the result also
+    /// fits the un-raised trigger, and kept when only the raise makes it fit
+    /// (it is still load-bearing, so clearing it would re-trigger compaction).
+    Fits,
+    /// Still over, and the limit was raised by one +10% step: the next cycle
+    /// runs against `limit`. The caller surfaces this
+    /// ([`compaction_raise_note`]) so the raise is visible.
+    Raised {
+        /// The number of +10% steps now applied.
+        steps: usize,
+        /// The resulting factor (`1.1`, `1.2`, ...).
+        factor: f64,
+        /// The raised effective limit, in tokens.
+        limit: usize,
+    },
+    /// Still over with no room left to raise (the step budget or the window cap
+    /// binds) — the caller's own bounded abort ladder is the only recourse.
+    StillOver {
+        /// The current effective limit, in tokens.
+        limit: usize,
+    },
+}
+
+/// The transcript note announcing a temporary raise: what happened, by how
+/// much the effective limit moved, and that it resets itself. Emitted by every
+/// path that completes a compaction pass (the auto path in `turn.rs`, the
+/// manual `/compact` + run-all path in `runtime/agent.rs`) so the lever is
+/// visible instead of silently changing how full the context is allowed to get.
+pub(crate) fn compaction_raise_note(steps: usize, factor: f64, limit: usize) -> String {
+    format!(
+        "Context still over the summarize threshold after compaction — temporarily raising the \
+         effective limit by {}% (x{factor:.1}, now {limit} tokens) so the session can continue. \
+         The raise is capped below the model's window and resets once a compaction fits.",
+        steps * COMPACTION_RAISE_STEP_PERCENT
+    )
 }
 
 impl ContextManager {
@@ -142,6 +260,7 @@ impl ContextManager {
             preflight_compact: true,
             compact_headroom_tokens: 32_000,
             proxy_cache_ceiling: None,
+            compaction_raise: Arc::new(CompactionRaise::default()),
         }
     }
 
@@ -175,12 +294,107 @@ impl ContextManager {
     /// set, otherwise the raw fill-rate product. Both summarize check sites
     /// (preflight and the turn loop) consult this so compaction fires before
     /// the request crosses the proxy cliff.
+    ///
+    /// The BASE trigger — before any temporary raise. In-loop trigger checks
+    /// read [`effective_limit`](Self::effective_limit), which scales this by
+    /// the session's raise ladder.
     pub fn effective_summarize_at(&self) -> usize {
         Self::effective_summarize_threshold(
             self.max_tokens,
             self.fill_rate,
             self.proxy_cache_ceiling,
         )
+    }
+
+    /// Builder: install the SESSION's raise ladder so every clone of this
+    /// manager — the turn loop's per-iteration copies, the manual `/compact`
+    /// handle, the resolver's freshly built per-context manager — shares one
+    /// ladder. The agent loop owns the canonical handle; a manager built
+    /// without this call owns a fresh ladder (the standalone/test case).
+    pub fn with_compaction_raise(mut self, raise: Arc<CompactionRaise>) -> Self {
+        self.compaction_raise = raise;
+        self
+    }
+
+    /// The session's raise ladder handle.
+    pub fn compaction_raise(&self) -> &Arc<CompactionRaise> {
+        &self.compaction_raise
+    }
+
+    /// The highest value the raised trigger may reach: the model's window
+    /// minus the output/overhead headroom ([`hard_ceiling`](Self::hard_ceiling))
+    /// — never the true window, so the provider's length limit stays hard — and
+    /// never BELOW the un-raised trigger: a headroom larger than the window
+    /// saturates the ceiling, and the raise must not shrink the trigger.
+    fn raise_cap(&self) -> usize {
+        // The `.max(1)` floor keeps the invariant that matters: the raised limit
+        // stays STRICTLY below the model's advertised window. `compact_headroom_tokens
+        // = 0` is a degenerate but reachable config (there is no load-time clamp
+        // for it), and without the floor a fill rate >= 0.5 would let the full
+        // ladder land on `max_tokens` exactly — handing the provider a
+        // zero-headroom request (round-1 review L1).
+        let headroom = self.compact_headroom_tokens.max(1);
+        self.max_tokens
+            .saturating_sub(headroom)
+            .max(self.effective_summarize_at())
+    }
+
+    /// The effective summarize trigger IN FORCE: the fill-rate trigger
+    /// ([`effective_summarize_at`](Self::effective_summarize_at)) scaled by the
+    /// session's temporary raise, clamped to [`raise_cap`](Self::raise_cap).
+    /// Every in-loop trigger check reads this; a fresh session — or a
+    /// compaction that fit — is back at the base trigger.
+    pub fn effective_limit(&self) -> usize {
+        let base = self.effective_summarize_at();
+        if self.compaction_raise.steps() == 0 {
+            return base;
+        }
+        let raised = (base as f64 * self.compaction_raise.factor()).round() as usize;
+        raised.min(self.raise_cap()).max(base)
+    }
+
+    /// Account for a completed compaction pass whose result was `used` tokens.
+    ///
+    /// Fits -> clear the ladder when the result also fits the UN-RAISED trigger
+    /// (a genuine reduction), and KEEP it when only the raise makes it fit —
+    /// clearing that one would re-arm the fill-rate trigger on the very next
+    /// iteration and compaction would run again for the same result. Either way
+    /// the session continues ([`CompactionFit::Fits`]). Still over -> escalate
+    /// ONE +10% step when the step budget and the window cap leave room, so the
+    /// next cycle runs against the raised limit ([`CompactionFit::Raised`]);
+    /// when neither does, return [`CompactionFit::StillOver`] and the caller's
+    /// bounded abort ladder stays in charge.
+    pub fn compaction_fit(&self, used: usize) -> CompactionFit {
+        let base = self.effective_summarize_at();
+        let limit = self.effective_limit();
+        if used < base {
+            // Fits at the un-raised trigger — the raise (if any) is no longer
+            // load-bearing.
+            self.compaction_raise.reset();
+            return CompactionFit::Fits;
+        }
+        if used < limit {
+            // Fits only because of the raise: keep it. The session is under its
+            // limit, so the caller re-arms its attempt budget exactly as it does
+            // for a plain fit.
+            return CompactionFit::Fits;
+        }
+        // Still over: escalate one step if the ladder has room.
+        if self.compaction_raise.steps() >= MAX_COMPACTION_RAISE_STEPS {
+            return CompactionFit::StillOver { limit };
+        }
+        let steps = self.compaction_raise.escalate();
+        let next = self.effective_limit();
+        if next <= limit {
+            // The window cap (or a saturated headroom) binds — the raise
+            // cannot make progress, so the bounded abort ladder applies.
+            return CompactionFit::StillOver { limit };
+        }
+        CompactionFit::Raised {
+            steps,
+            factor: self.compaction_raise.factor(),
+            limit: next,
+        }
     }
 
     /// The effective summarize trigger for a `(max_tokens, fill_rate,
@@ -271,10 +485,13 @@ impl ContextManager {
         (total, breakdown)
     }
 
-    /// Whether the conversation should be summarized.
+    /// Whether the conversation should be summarized. Reads the effective limit
+    /// IN FORCE ([`effective_limit`](Self::effective_limit)), so a session
+    /// carrying a temporary raise is not re-triggered while it sits between the
+    /// base trigger and the raised one.
     pub fn should_summarize(&self, messages: &[Message]) -> bool {
         let count = Self::count_tokens(messages);
-        count >= self.effective_summarize_at()
+        count >= self.effective_limit()
     }
 
     /// Summarize the oldest messages into a single system message.
@@ -2184,6 +2401,210 @@ mod tests {
         // When headroom >= max_tokens, hard_ceiling is 0 (not underflow).
         let cm = ContextManager::new(10_000, 0.5).with_preflight(true, 20_000);
         assert_eq!(cm.hard_ceiling(), 0);
+    }
+
+    #[test]
+    fn compaction_raise_lifts_the_effective_limit_by_ten_percent() {
+        // Window 200_000, fill 0.5 -> base trigger 100_000; preflight headroom
+        // 32_000 -> the raised limit may climb to 168_000 at most.
+        let cm = ContextManager::new(200_000, 0.5).with_preflight(true, 32_000);
+        assert_eq!(cm.effective_limit(), 100_000);
+        assert_eq!(cm.effective_limit(), cm.effective_summarize_at());
+        match cm.compaction_fit(105_000) {
+            CompactionFit::Raised {
+                steps,
+                factor,
+                limit,
+            } => {
+                assert_eq!(steps, 1);
+                assert!((factor - 1.1).abs() < 1e-9, "factor was {factor}");
+                assert_eq!(limit, 110_000);
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+        assert_eq!(cm.effective_limit(), 110_000);
+        assert_eq!(cm.compaction_raise().steps(), 1);
+        let note = compaction_raise_note(1, 1.1, 110_000);
+        assert!(note.contains("10%"), "note was {note}");
+        assert!(note.contains("110000"), "note was {note}");
+    }
+
+    #[test]
+    fn compaction_raise_is_cumulative_and_grows_the_limit() {
+        let cm = ContextManager::new(200_000, 0.5).with_preflight(true, 32_000);
+        let mut limits = vec![cm.effective_limit()];
+        for expected_step in 1..=3 {
+            // Each pass lands just over the CURRENT limit, so it escalates again.
+            let used = cm.effective_limit() + 1;
+            match cm.compaction_fit(used) {
+                CompactionFit::Raised { steps, factor, .. } => {
+                    assert_eq!(steps, expected_step);
+                    let expected_factor = 1.0 + 0.1 * expected_step as f64;
+                    assert!(
+                        (factor - expected_factor).abs() < 1e-9,
+                        "factor was {factor}, expected {expected_factor}"
+                    );
+                }
+                other => panic!("expected raise {expected_step}, got {other:?}"),
+            }
+            limits.push(cm.effective_limit());
+        }
+        // x1.1, x1.2, x1.3 of the base trigger — cumulative, not compounding.
+        assert_eq!(limits, vec![100_000, 110_000, 120_000, 130_000]);
+    }
+
+    #[test]
+    fn compaction_raise_resets_when_a_compaction_fits() {
+        let cm = ContextManager::new(200_000, 0.5).with_preflight(true, 32_000);
+        assert!(matches!(
+            cm.compaction_fit(150_000),
+            CompactionFit::Raised { .. }
+        ));
+        assert!(matches!(
+            cm.compaction_fit(150_000),
+            CompactionFit::Raised { .. }
+        ));
+        assert_eq!(cm.effective_limit(), 120_000);
+        // A compaction under the BASE trigger is a genuine fit: the raise is no
+        // longer load-bearing and the ladder drops back to 1.0.
+        assert_eq!(cm.compaction_fit(90_000), CompactionFit::Fits);
+        assert_eq!(cm.compaction_raise().steps(), 0);
+        assert_eq!(cm.compaction_raise().factor(), 1.0);
+        assert_eq!(cm.effective_limit(), cm.effective_summarize_at());
+        assert_eq!(cm.effective_limit(), 100_000);
+    }
+
+    #[test]
+    fn compaction_raise_keeps_a_load_bearing_raise() {
+        // The result fits the RAISED limit but not the base trigger: the raise is
+        // exactly what keeps the session under its limit, so it must be KEPT —
+        // clearing it here would re-arm the fill-rate trigger on the very next
+        // iteration and compaction would run again for the same result.
+        let cm = ContextManager::new(200_000, 0.5).with_preflight(true, 32_000);
+        assert!(matches!(
+            cm.compaction_fit(105_000),
+            CompactionFit::Raised { .. }
+        ));
+        assert_eq!(cm.effective_limit(), 110_000);
+        assert_eq!(cm.compaction_fit(105_000), CompactionFit::Fits);
+        assert_eq!(cm.compaction_raise().steps(), 1);
+        assert_eq!(cm.effective_limit(), 110_000);
+    }
+
+    #[test]
+    fn compaction_raise_is_capped_below_the_window() {
+        // Window 10_000, headroom 2_000 -> base 5_000, cap 8_000. The ladder
+        // climbs +10% per failed pass and stops at the cap — never at the window.
+        let cm = ContextManager::new(10_000, 0.5).with_preflight(true, 2_000);
+        let mut raises = 0usize;
+        let mut last = cm.effective_limit();
+        loop {
+            match cm.compaction_fit(last + 1) {
+                CompactionFit::Raised { limit, .. } => {
+                    raises += 1;
+                    assert!(limit <= 8_000, "limit {limit} exceeded the cap");
+                    last = limit;
+                }
+                CompactionFit::StillOver { limit } => {
+                    assert_eq!(limit, 8_000);
+                    break;
+                }
+                CompactionFit::Fits => panic!("count is over the limit — must not fit"),
+            }
+        }
+        assert_eq!(raises, 6); // 5_000 -> 5_500 -> ... -> 8_000, then the cap binds
+        assert_eq!(cm.effective_limit(), 8_000);
+        assert!(cm.effective_limit() < cm.max_tokens());
+    }
+
+    #[test]
+    fn compaction_raise_stops_at_the_step_budget() {
+        // A window so large that the cap can never bind: the +10% step budget is
+        // the only bound, and the ladder stops there (the caller then falls back
+        // to its own bounded abort ladder).
+        let cm = ContextManager::new(10_000_000, 0.5).with_preflight(true, 1_000);
+        let mut raises = 0usize;
+        let mut last = cm.effective_limit();
+        loop {
+            match cm.compaction_fit(last + 1) {
+                CompactionFit::Raised { limit, .. } => {
+                    raises += 1;
+                    last = limit;
+                }
+                CompactionFit::StillOver { limit } => {
+                    last = limit;
+                    break;
+                }
+                CompactionFit::Fits => panic!("count is over the limit — must not fit"),
+            }
+        }
+        assert_eq!(raises, MAX_COMPACTION_RAISE_STEPS);
+        assert_eq!(cm.compaction_raise().steps(), MAX_COMPACTION_RAISE_STEPS);
+        assert!(last < cm.max_tokens());
+    }
+
+    #[test]
+    fn compaction_raise_is_shared_across_clones_and_handles() {
+        // The turn loop clones the manager per iteration and the resolver builds
+        // a fresh one per iteration — every clone must observe ONE session ladder.
+        let cm = ContextManager::new(200_000, 0.5).with_preflight(true, 32_000);
+        let clone = cm.clone();
+        assert!(matches!(
+            cm.compaction_fit(150_000),
+            CompactionFit::Raised { .. }
+        ));
+        assert_eq!(clone.compaction_raise().steps(), 1);
+        assert_eq!(clone.effective_limit(), 110_000);
+        // An explicitly installed session handle (the AgentLoop's) is shared
+        // across separately built managers too.
+        let handle = Arc::new(CompactionRaise::default());
+        let a = ContextManager::new(200_000, 0.5).with_compaction_raise(Arc::clone(&handle));
+        let b = ContextManager::new(200_000, 0.5).with_compaction_raise(Arc::clone(&handle));
+        assert!(matches!(
+            a.compaction_fit(150_000),
+            CompactionFit::Raised { .. }
+        ));
+        assert_eq!(b.compaction_raise().steps(), 1);
+        assert_eq!(b.effective_limit(), 110_000);
+        b.compaction_raise().reset();
+        assert_eq!(a.compaction_raise().steps(), 0);
+        assert_eq!(a.effective_limit(), a.effective_summarize_at());
+    }
+
+    #[test]
+    fn compaction_raise_never_shrinks_a_degenerate_trigger() {
+        // Headroom larger than the window saturates hard_ceiling to 0; the raise
+        // must not pull the trigger BELOW the fill-rate product.
+        let cm = ContextManager::new(10_000, 0.5).with_preflight(true, 20_000);
+        assert_eq!(cm.effective_limit(), 5_000);
+        assert_eq!(
+            cm.compaction_fit(9_000),
+            CompactionFit::StillOver { limit: 5_000 }
+        );
+        assert_eq!(cm.effective_limit(), 5_000);
+    }
+
+    #[test]
+    fn compaction_raise_stays_strictly_below_the_window_without_headroom() {
+        // Round-1 review L1: `compact_headroom_tokens = 0` is reachable (no
+        // load-time clamp), and the raised limit must still stay strictly below
+        // the advertised window — the provider's length limit stays hard.
+        let cm = ContextManager::new(10_000, 0.9).with_preflight(true, 0);
+        assert!(cm.effective_limit() < cm.max_tokens());
+        let mut last = cm.effective_limit();
+        loop {
+            match cm.compaction_fit(last + 1) {
+                CompactionFit::Raised { limit, .. } => {
+                    assert!(limit < cm.max_tokens(), "limit {limit} reached the window");
+                    last = limit;
+                }
+                CompactionFit::StillOver { limit } => {
+                    assert!(limit < cm.max_tokens(), "cap {limit} reached the window");
+                    break;
+                }
+                CompactionFit::Fits => panic!("count is over the limit — must not fit"),
+            }
+        }
     }
 
     #[test]

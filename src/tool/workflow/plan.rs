@@ -278,13 +278,19 @@ fn referenced_module_dirs(texts: &[&str]) -> usize {
 
 /// The context-side resumability issues — substance (symptom/root-cause,
 /// file anchors, verification commands) plus, for `bug_fixing` plans, the
-/// regression-test design. Shared by create_plan (via
-/// [`validate_plan_resumability`]) and update_plan (which validates the
-/// effective post-update context). Returns the first violation, if any.
+/// regression-test design, plus (when `check_evidence`) the evidence rule: a
+/// line claiming a symbol is callable/reachable must carry an evidence marker
+/// or an explicit assumption label ([`reachability_evidence_issue`], backlog
+/// 5b232b8d). Shared by create_plan (via [`validate_plan_resumability`]) and
+/// update_plan (which validates the effective post-update context — it passes
+/// `check_evidence = false` and runs the rule over the APPENDED text alone, so
+/// a plan accepted before the rule stays updatable). Returns the first
+/// violation, if any.
 fn context_issue(
     context: &str,
     kind: PlanKind,
     detailed_steps: Option<&str>,
+    check_evidence: bool,
 ) -> Option<String> {
     let ctx = context.trim();
     if ctx.chars().count() < MIN_CONTEXT_CHARS {
@@ -309,6 +315,11 @@ fn context_issue(
                  defect gets a regression test)"
                     .to_string(),
             );
+        }
+    }
+    if check_evidence {
+        if let Some(issue) = reachability_evidence_issue(ctx) {
+            return Some(issue);
         }
     }
     None
@@ -344,6 +355,157 @@ fn step_issue(steps: &[String], bug_skeleton_exempt: bool) -> Option<String> {
     ))
 }
 
+/// Whether `line` holds a DOTTED member call — an identifier chain with at
+/// least one `.` immediately followed by `(` — whose root identifier is not
+/// `self`, `this`, `crate` or `super`. That is the shape a reachability claim
+/// takes (`ext._evaluator.clashOf()`, `doc.getElementById("x")`), while a bare
+/// `boil()` or a `::`-qualified path (`RoutingGate::with_log_path`) is an
+/// ordinary mention of the code being edited. Tightened from the plan's
+/// original call-shape rule after the 2027-01-11 fixture evidence — the broad
+/// rule flagged the legitimate bug context `divide-by-zero in boil() at
+/// src/kettle.rs:42` — pinned by `validator_ignores_plain_symbol_mentions`; see the amendment in plan 0011b40b.
+fn holds_dotted_call(line: &str) -> bool {
+    const ROOTS: [&str; 4] = ["self", "this", "crate", "super"];
+    let bytes = line.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b != b'(' {
+            continue;
+        }
+        // Walk back over the identifier/qualifier run (`.` only — a `::`
+        // path is the codebase's own vocabulary, never a member call).
+        let mut start = i;
+        while start > 0 {
+            let c = bytes[start - 1];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        let run = &bytes[start..i];
+        // A `/` immediately before the run means a path segment
+        // (`src/kettle.rs(42)`), never a member-call root.
+        if start > 0 && bytes[start - 1] == b'/' {
+            continue;
+        }
+        // A dotted member call needs a dot AND an identifier after it.
+        let Some(dot) = run.iter().copied().rposition(|c| c == b'.') else {
+            continue;
+        };
+        let member = &run[dot + 1..];
+        if member.len() < 2 || !(member[0].is_ascii_alphabetic() || member[0] == b'_') {
+            continue;
+        }
+        // Root identifier before the first dot; `self.foo()` and friends
+        // describe the code being edited, not a cross-context reachability
+        // question.
+        let root_end = run.iter().position(|c| *c == b'.').unwrap_or(0);
+        let root: String = run[..root_end]
+            .iter()
+            .map(|c| (*c as char).to_ascii_lowercase())
+            .collect();
+        if root.is_empty() || ROOTS.contains(&root.as_str()) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Whether `haystack_lower` contains `needle` at a word start (the char before
+/// it, if any, is not alphanumeric) — so `unverified` does not read as the
+/// `verified` marker and `unchecked` does not read as `checked`.
+fn contains_marker(haystack_lower: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(idx) = haystack_lower[from..].find(needle) {
+        let at = from + idx;
+        let at_word_start = at == 0
+            || !haystack_lower[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric());
+        if at_word_start {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
+}
+
+/// Whether the line explicitly labels its claim an assumption — the honest
+/// escape hatch for a fact that genuinely cannot be probed at planning time.
+fn carries_assumption_label(line_lower: &str) -> bool {
+    const LABELS: [&str; 7] = [
+        "assumption",
+        "assumed",
+        "unverified",
+        "unproven",
+        "not verified",
+        "to verify",
+        "hypothesis",
+    ];
+    LABELS.iter().any(|label| contains_marker(line_lower, label))
+}
+
+/// Whether the line carries evidence that something was actually probed —
+/// the vocabulary a plan uses for findings (the 2027-01-11 doctrine).
+fn carries_evidence_marker(line_lower: &str) -> bool {
+    const MARKERS: [&str; 8] = [
+        "verified",
+        "probe",
+        "probed",
+        "observed",
+        "measured",
+        "confirmed",
+        "reproduced",
+        "checked",
+    ];
+    MARKERS.iter().any(|marker| contains_marker(line_lower, marker))
+}
+
+/// The evidence-side resumability issue — a context line claiming a symbol is
+/// callable/reachable without saying how it was checked. A plan carries
+/// FINDINGS, not assumptions: the 2027-01-11 ShapeGraph session assumed
+/// `ext._evaluator.clashOf()` was callable from /agent.html, the live probe
+/// answered `typeof ext._evaluator` -> "undefined" (the ShapeGraph extension is
+/// never loaded there), and the plan had to be rewritten before step 1 wrote
+/// any code (backlog 5b232b8d). A line is a CLAIM when [`holds_dotted_call`]
+/// holds for it or it carries one of the existence phrases below; it is
+/// satisfied by an assumption label or an evidence marker on the SAME line
+/// (assumption first — "unverified" must not read as "verified"). Returns the
+/// first offender with both remedies, bounded to a 60-char preview (the
+/// [`step_issue`] style) so the one-shot retry fixes everything.
+fn reachability_evidence_issue(text: &str) -> Option<String> {
+    const PHRASES: [&str; 5] = [
+        "exists at",
+        "is callable",
+        "callable from",
+        "is reachable",
+        "reachable from",
+    ];
+    let mut offenders: Vec<(usize, &str)> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if carries_assumption_label(&lower) || carries_evidence_marker(&lower) {
+            continue;
+        }
+        if holds_dotted_call(line) || PHRASES.iter().any(|p| lower.contains(*p)) {
+            offenders.push((i + 1, line.trim()));
+        }
+    }
+    let (line_no, first) = *offenders.first()?;
+    let preview: String = first.chars().take(60).collect();
+    Some(format!(
+        "context line {line_no} asserts a symbol is callable/reachable without evidence ({} \
+         such line(s) in the context) — a plan carries findings, not assumptions: probe it \
+         during planning and attach the result (a 'verified:' line with the probe and its \
+         output, e.g. \"verified: typeof ext._evaluator -> undefined on /agent.html\"), or \
+         label the line an assumption ('assumption: ...') so it cannot pass as a finding: \
+         '{preview}'",
+        offenders.len(),
+    ))
+}
+
 /// Structural resumability validation for a plan document — the plan
 /// resumability gate (2027-01-09). A plan too thin to resume from after a
 /// recompile+restart is rejected at the tool boundary with one actionable
@@ -363,7 +525,7 @@ fn validate_plan_resumability(
     detailed_steps: Option<&str>,
 ) -> Vec<String> {
     let mut issues = Vec::new();
-    if let Some(issue) = context_issue(context, kind, detailed_steps) {
+    if let Some(issue) = context_issue(context, kind, detailed_steps, true) {
         issues.push(issue);
     }
     if let Some(issue) = step_issue(steps, kind == PlanKind::BugFixing) {
@@ -528,13 +690,13 @@ impl Tool for CreatePlanTool {
              it left off when it completes (sub-plans always pop to the parent regardless of \
              `kind`); abandon_plan discards the active plan back to the parent. For a VERY \
              long plan, create it with the first few steps and extend via update_plan with \
-             append=true — several small calls instead of one huge body.",
+             append=true — several small calls instead of one huge body. Context carries FINDINGS, not assumptions: probe reachability during planning (is this symbol callable/reachable HERE — this page, this layer?) and write the result with its evidence attached (`verified: typeof ext._evaluator -> undefined on /agent.html`). An unevidenced reachability claim is rejected by the gate; label it 'assumption: ...' if it truly cannot be probed without writing code — a first step that only says 'verify X' is legitimate only then.",
             json!({
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "A short title for the plan. MUST be non-blank (whitespace-only is rejected) — write the full title/goal/steps content in your reply FIRST, then emit the call carrying it; the call body is never where content gets drafted."},
                     "goal": {"type": "string", "description": "What we're building. MUST be non-blank (whitespace-only is rejected)."},
-                    "context": {"type": ["string", "null"], "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands."},
+                    "context": {"type": ["string", "null"], "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands — and it carries FINDINGS, not assumptions. Any line claiming a symbol is callable/reachable (a dotted member call such as ext._evaluator.clashOf(), or the phrases 'exists at'/'is callable'/'callable from'/'is reachable'/'reachable from') must carry evidence — one of verified/probe/probed/observed/measured/confirmed/reproduced/checked, e.g. 'verified: typeof ext._evaluator -> undefined on /agent.html' — or be labelled an assumption (assumption/assumed/unverified/unproven/not verified/to verify/hypothesis)."},
                     "steps": {
                         "type": "array",
                         "items": {
@@ -945,7 +1107,7 @@ impl Tool for UpdatePlanTool {
                 "properties": {
                     "title": {"type": ["string", "null"], "description": "New title (omit or empty to keep current)."},
                     "goal": {"type": ["string", "null"], "description": "New goal (omit or empty to keep current)."},
-                    "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars)."},
+                    "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars), and the evidence rule (see create_plan's context) applies to the text you write here."},
                     "regression_test": {"type": ["string", "null"], "description": "The regression test name recorded by a bug_fixing plan's verify step (finish is blocked without it; validated against the code graph)."},
                     "landed_design": {"type": "boolean", "description": "Set true when a bug_fixing fix turned out feature-scale (new pub types / cross-module surface) — the finish gate then requires a 'Landed design' context amendment (agent.md 'Documentation expectations')."},
                     "steps": {
@@ -1036,7 +1198,12 @@ impl Tool for UpdatePlanTool {
                 new_ctx.to_string()
             };
             let detailed = active.and_then(|p| p.detailed_steps.clone());
-            if let Some(issue) = context_issue(&effective, kind, detailed.as_deref()) {
+            // The evidence rule (backlog 5b232b8d) is scoped to the text being
+            // WRITTEN, never the merged whole context — a plan accepted before
+            // the rule existed stays updatable.
+            if let Some(issue) = context_issue(&effective, kind, detailed.as_deref(), false)
+                .or_else(|| reachability_evidence_issue(new_ctx))
+            {
                 issues.push(issue);
             }
         }
@@ -2525,6 +2692,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validator_flags_unevidenced_reachability_claim() {
+        // The 2027-01-11 ShapeGraph case (backlog 5b232b8d): a dotted member
+        // call asserted as a fact without a probe.
+        let issues = validate_plan_resumability(
+            "Rework the clash scan: ext._evaluator.clashOf() already handles the \
+             whole-model pass, so reuse it in src/agent/scan.rs. Verify with cargo test.",
+            &["edit src/agent/scan.rs".to_string()],
+            PlanKind::Implementation,
+            None,
+        );
+        assert_eq!(issues.len(), 1, "one issue: {issues:?}");
+        assert!(
+            issues[0].contains("callable/reachable without evidence"),
+            "issue: {}",
+            issues[0]
+        );
+        assert!(
+            issues[0].contains("clashOf"),
+            "names the offender: {}",
+            issues[0]
+        );
+        assert!(
+            issues[0].contains("verified:"),
+            "offers the evidence remedy: {}",
+            issues[0]
+        );
+        assert!(
+            issues[0].contains("assumption"),
+            "offers the assumption remedy: {}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn validator_accepts_evidenced_reachability_claim() {
+        // The same claim, now a finding: the marker plus the probe's output.
+        let issues = validate_plan_resumability(
+            "Rework the clash scan: verified: typeof ext._evaluator -> undefined on \
+             /agent.html, so ext._evaluator.clashOf() is not reachable there — the pass \
+             lives in src/agent/scan.rs. Re-run with cargo test.",
+            &["edit src/agent/scan.rs".to_string()],
+            PlanKind::Implementation,
+            None,
+        );
+        assert!(issues.is_empty(), "evidenced claim passes: {issues:?}");
+    }
+
+    #[test]
+    fn validator_accepts_assumption_labelled_claim() {
+        // The honest escape hatch: a fact that genuinely cannot be probed at
+        // planning time, explicitly labelled so it cannot pass as a finding.
+        let issues = validate_plan_resumability(
+            "Rework the clash scan; assumption: ext._evaluator.clashOf() may cover the \
+             whole-model pass — probe it before editing src/agent/scan.rs. Verify with \
+             cargo test.",
+            &["edit src/agent/scan.rs".to_string()],
+            PlanKind::Implementation,
+            None,
+        );
+        assert!(issues.is_empty(), "a labelled assumption passes: {issues:?}");
+    }
+
+    #[test]
+    fn validator_ignores_plain_symbol_mentions() {
+        // False-positive pins for the tightened rule (plan 0011b40b amendment):
+        // a bare call (`boil()` — the fixture that disproved the broad rule), a
+        // `::` path, and a self-rooted call are ordinary mentions of the code
+        // being edited, never cross-context reachability claims.
+        let issues = validate_plan_resumability(
+            "The kettle crashes on empty water; root cause: divide-by-zero in boil() at \
+             src/kettle.rs:42, reached via self.boiler.running(). The same guard sits in \
+             static/scripts/tools.js(862). Wire RoutingGate::with_log_path in \
+             src/agent/mod.rs. Verify with cargo test.",
+            &["edit src/kettle.rs".to_string()],
+            PlanKind::Implementation,
+            None,
+        );
+        assert!(issues.is_empty(), "plain mentions must not flag: {issues:?}");
+    }
+
     #[tokio::test]
     async fn create_plan_works() {
         let dir = tempdir().unwrap();
@@ -3455,6 +3703,55 @@ mod tests {
             "names the path-free step: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn create_plan_rejects_an_unevidenced_reachability_claim() {
+        // The evidence rule at the tool boundary (backlog 5b232b8d): the first
+        // call is rejected and names both remedies; the same plan with the
+        // probe attached passes.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let tool = CreatePlanTool::new(wf);
+        let rejected = tool
+            .execute(json!({
+                "title": "Rework the clash scan",
+                "goal": "reuse the whole-model pass where it exists",
+                "context": "Rework the clash scan: ext._evaluator.clashOf() handles the \
+                            whole-model pass on /agent.html, so reuse it in \
+                            src/agent/scan.rs. Verify with cargo test.",
+                "steps": ["edit src/agent/scan.rs"]
+            }))
+            .await;
+        assert!(!rejected.success, "{}", rejected.output);
+        assert!(
+            rejected.output.starts_with("plan rejected by the resumability gate"),
+            "gate error: {}",
+            rejected.output
+        );
+        assert!(
+            rejected.output.contains("callable/reachable without evidence"),
+            "names the rule: {}",
+            rejected.output
+        );
+        assert!(
+            rejected.output.contains("verified:"),
+            "names the evidence remedy: {}",
+            rejected.output
+        );
+
+        let accepted = tool
+            .execute(json!({
+                "title": "Rework the clash scan",
+                "goal": "reuse the whole-model pass where it exists",
+                "context": "Rework the clash scan: verified: typeof ext._evaluator -> \
+                            undefined on /agent.html, so ext._evaluator.clashOf() is not \
+                            reachable there — the pass lives in src/agent/scan.rs. Re-run \
+                            with cargo test.",
+                "steps": ["edit src/agent/scan.rs"]
+            }))
+            .await;
+        assert!(accepted.success, "evidenced claim passes: {}", accepted.output);
     }
 
     #[tokio::test]

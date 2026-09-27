@@ -483,6 +483,21 @@ onto a substantive context passes; a thin replacement fails), and one
 actionable error names every violation so the retry fixes all of them in one
 shot.
 
+Since 2027-01-11 the gate also enforces the **evidence rule** (backlog
+5b232b8d): a context line asserting a symbol is callable or reachable — a
+dotted member call like `ext._evaluator.clashOf()`, or the phrases `exists
+at` / `is callable` / `callable from` / `is reachable` / `reachable from` —
+must carry a probe marker (verified / probe / probed / observed / measured /
+confirmed / reproduced / checked) or be explicitly labelled an assumption
+(assumption / assumed / unverified / unproven / not verified / to verify /
+hypothesis). A plan must encode findings, not assumptions: the ShapeGraph
+session assumed `ext._evaluator.clashOf()` was callable from `/agent.html`
+and a 30-second probe answered `typeof ext._evaluator` -> `undefined`, so the
+plan had to be rewritten before any code was written. A bare call
+(`boil()`), a `::` path and a `self.`-rooted call are ordinary mentions, not
+claims. `update_plan` applies the rule to the appended text only, so a plan
+accepted before the rule stays updatable.
+
 ### Plan kinds
 
 `create_plan` takes a `kind` (persisted as the `## Kind` section):

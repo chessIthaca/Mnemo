@@ -270,6 +270,13 @@ pub struct AgentLoopFactory {
     /// [`with_optimizer_config`](Self::with_optimizer_config) from the
     /// loaded config at startup (mirrors `shell_filter`).
     optimizer: Arc<RwLock<OptimizerConfig>>,
+    /// The persistent index-staleness log (backlog fc1d57fe) handed to every
+    /// search/graph tool this factory builds: each stale-index repair appends
+    /// one record per file, and the freshness note points at it. Defaults to
+    /// the global config dir; tests override with
+    /// [`with_staleness_log`](Self::with_staleness_log) so no test writes the
+    /// real one.
+    staleness_log: crate::index_staleness::StalenessLog,
 }
 
 impl AgentLoopFactory {
@@ -372,6 +379,9 @@ impl AgentLoopFactory {
             // the IPC layer overrides via `with_optimizer_config` from the
             // loaded config at startup (mirrors `shell_filter`).
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
+            // The global index-staleness log (backlog fc1d57fe) unless a test
+            // overrides it.
+            staleness_log: crate::index_staleness::StalenessLog::global(),
             mcp: None,
             // No auto-typing gate at construction — the IPC layer wires it
             // via `with_auto_typing` once the app runtime's classifier slot
@@ -484,6 +494,14 @@ impl AgentLoopFactory {
     /// built **after** this call (the library is read per `build`), so the IPC
     /// layer sets it before building the main agent. When `None`, the skill
     /// tools are omitted (no skills available).
+    /// Point the index-staleness log at an explicit directory (backlog
+    /// fc1d57fe) — tests pass a tempdir so no test writes the real config
+    /// dir; production keeps the global default.
+    pub fn with_staleness_log(mut self, log: crate::index_staleness::StalenessLog) -> Self {
+        self.staleness_log = log;
+        self
+    }
+
     pub fn with_skills(mut self, skills: Arc<SkillLibrary>) -> Self {
         self.skills = Some(skills);
         self
@@ -1092,8 +1110,10 @@ impl AgentLoopFactory {
                 // save lands on the next command without a rebuild.
                 .with_optimizer(Arc::clone(&self.optimizer)),
         ));
-        let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone());
-        let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone());
+        let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone())
+            .with_staleness_log(self.staleness_log.clone());
+        let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone())
+            .with_staleness_log(self.staleness_log.clone());
         // F9: the memory store powers the known-memory-hit note on
         // uuid-shaped search patterns.
         if let Some(store) = &self.memory {
@@ -1469,7 +1489,9 @@ impl AgentLoopFactory {
             use crate::tool::agent::codegraph::{
                 GraphContextTool, GraphImpactTool, GraphPathTool, GraphSearchTool,
             };
-            registry.register(Box::new(GraphSearchTool::new(graph.clone())));
+            registry.register(Box::new(
+                GraphSearchTool::new(graph.clone()).with_staleness_log(self.staleness_log.clone()),
+            ));
             registry.register(Box::new(GraphContextTool::new(graph.clone())));
             registry.register(Box::new(GraphImpactTool::new(graph.clone())));
             registry.register(Box::new(GraphPathTool::new(graph.clone())));
@@ -1639,6 +1661,11 @@ mod tests {
             dir.join("plans"),
             vision,
         )
+        // Test hygiene (backlog fc1d57fe): the staleness log lives in the
+        // temp dir — no test may write the real ~/.mnemo.
+        .with_staleness_log(crate::index_staleness::StalenessLog::at(
+            dir.join(".mnemo-staleness"),
+        ))
     }
 
     /// A mock vision model for registration tests — never makes a network call.

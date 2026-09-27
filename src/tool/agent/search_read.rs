@@ -78,9 +78,21 @@ pub struct SearchReadTool {
     /// The optional Laya tool-choice gate (backlog e2c47d5f) — same semantics
     /// as [`SearchTool`](search::SearchTool)'s.
     tool_choice: Option<crate::tool::agent::tool_choice::ToolChoiceHandle>,
+    /// The persistent staleness log (backlog fc1d57fe), when wired — same
+    /// as [`SearchTool`](search::SearchTool)'s: one record per stale file,
+    /// and the F10 note points at it.
+    staleness_log: Option<crate::index_staleness::StalenessLog>,
 }
 
 impl SearchReadTool {
+    /// Wire the persistent staleness log (backlog fc1d57fe) — the factory
+    /// passes the global config dir; tests pass a tempdir so no test ever
+    /// writes the real one.
+    pub fn with_staleness_log(mut self, log: crate::index_staleness::StalenessLog) -> Self {
+        self.staleness_log = Some(log);
+        self
+    }
+
     /// Create the tool, bound to a sandbox. `graph` (when present) enables
     /// the index-backed path for literal queries.
     pub fn new(
@@ -90,6 +102,7 @@ impl SearchReadTool {
         Self {
             sandbox,
             graph,
+            staleness_log: None,
             memory: None,
             delegation_state: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             tool_choice: None,
@@ -185,6 +198,7 @@ impl Tool for SearchReadTool {
         let sandbox = self.sandbox.clone();
         let root = sandbox.root().to_path_buf();
         let graph = self.graph.clone();
+        let staleness_log = self.staleness_log.clone();
         let delegation_state = self.delegation_state.clone();
         // F9: known-backlog-item note — fired only when the pattern is
         // uuid-shaped AND a derived row knows it (best-effort, one SELECT).
@@ -342,11 +356,23 @@ impl Tool for SearchReadTool {
                             // tool mutated the index DB — the note rides
                             // ABOVE the results (truncation-safe).
                             let note = if ix.reindexed > 0 {
+                                let sample = search::log_stale(
+                                    staleness_log.as_ref(),
+                                    "search_read",
+                                    &root,
+                                    &ix.stale,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
                                 search::push_note(
                                     note,
                                     format!(
-                                        "reindexed {} stale file(s) — serving fresh index results",
-                                        ix.reindexed
+                                        "reindexed {} stale file(s){} — serving fresh index results",
+                                        ix.reindexed,
+                                        search::stale_detail(
+                                            &sample,
+                                            ix.stale.len(),
+                                            staleness_log.is_some()
+                                        )
                                     ),
                                 )
                             } else {
@@ -354,9 +380,18 @@ impl Tool for SearchReadTool {
                             };
                             return build_index_output(ix, max_files, &sandbox, &note);
                         }
-                        Some(search::FtsOutcome::Stale { files }) => {
+                        Some(search::FtsOutcome::Stale { stale }) => {
+                            let sample = search::log_stale(
+                                staleness_log.as_ref(),
+                                "search_read",
+                                &root,
+                                &stale,
+                                crate::index_staleness::Action::SurfacedOnly,
+                            );
                             stale_note = Some(format!(
-                                "content index stale for {files} file(s) — serving tree-walk results"
+                                "content index stale for {} file(s){} — serving tree-walk results",
+                                stale.len(),
+                                search::stale_detail(&sample, stale.len(), staleness_log.is_some())
                             ));
                         }
                         None => {}
@@ -639,9 +674,11 @@ mod tests {
         // content, and the side effect is disclosed with a single
         // "note: " prefix (the doubled "note: note:" bug).
         let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "fn old_marker() {}\n").unwrap();
-        let tool = make_indexed_tool(dir.path());
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         // Simulate the edit→watcher gap: rewrite + bump mtime, no reindex.
         std::fs::write(&path, "fn old_marker() {}\nfn fresh_marker() {}\n").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -656,8 +693,10 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.contains("reindexed 1 stale file(s)"),
-            "the inline re-index is disclosed: {}",
+            r.output.contains(
+                "reindexed 1 stale file(s) (a.rs); full list: index-staleness.jsonl"
+            ),
+            "the note names the stale file and points at the log: {}",
             r.output
         );
         assert!(r.output.contains("engine: index"), "{}", r.output);

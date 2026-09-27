@@ -39,7 +39,7 @@ name = "post_merge_sync"
 available_in = ["complete", "planning"]
 target_state = "planning"
 tools = [
-  "read_files",  # live name; `file_read` is a legacy shim (backlog 834ec126)
+  "read_files",  # redundant-but-explicit: the Skill state grants the read surface (backlog 834ec126)
   "shell",
   "search",
   "git",

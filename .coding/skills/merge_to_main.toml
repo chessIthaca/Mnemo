@@ -72,7 +72,7 @@ name = "merge_to_main"
 available_in = ["complete", "planning"]
 target_state = "planning"
 tools = [
-  "read_files",      # the live read tool — `file_read` is a legacy shim, use of it denied reads (backlog 834ec126)
+  "read_files",      # redundant-but-explicit: the Skill state already grants the whole read-only surface (backlog 834ec126)
   "file_edit",
   "file_write",
   "shell",

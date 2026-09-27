@@ -2949,6 +2949,88 @@ mod tests {
     }
 
     #[test]
+    fn skills_get_the_whole_read_surface_at_the_registry_level() {
+        // backlog 834ec126: the Skill state grants the full read-only surface
+        // wholesale (Agent + AutoRun). Audit that classification against the
+        // REAL wired registry: every Agent+AutoRun tool must be reachable
+        // inside a skill with an EMPTY allow-list, and every Agent+NeedsApproval
+        // tool must stay invisible there — so a newly added read tool is
+        // granted automatically, and a mutating tool mis-declared AutoRun fails
+        // loudly instead of leaking into every skill.
+        use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
+
+        let dir = tempdir().unwrap();
+        let mut factory = make_factory(dir.path());
+        factory = factory.with_skills(Arc::new(SkillLibrary::from_registry(
+            dir.path().join(".coding/skills"),
+            crate::skill::SkillRegistry::new(),
+        )));
+        factory.set_spawner(Arc::new(MockSpawner));
+        factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
+            crate::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
+        )));
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+
+        let skill_filter = ToolFilter::Skill(vec![]);
+        let mut reads = Vec::new();
+        for tool in registry.iter() {
+            let name = tool.name().to_string();
+            let (category, safety) = (tool.category(), tool.safety());
+            // write_review_report is Agent+AutoRun but is NOT a read tool: the
+            // guard at the top of `ToolFilter::allows` keeps it reviewer-only.
+            if name == "write_review_report" {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "write_review_report stays reviewer-only, whatever a skill lists"
+                );
+                continue;
+            }
+            // A TRUSTED MCP tool is AutoRun for APPROVAL only — excluded from
+            // the read grant by name, exactly as in the base-state arms
+            // (trust ≠ state visibility), so it can never ride into a skill.
+            if name.starts_with("mcp__") {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "{name}: per-server trust must never widen a skill's surface"
+                );
+                continue;
+            }
+            if category == ToolCategory::Agent && safety == SafetyLevel::AutoRun {
+                assert!(
+                    skill_filter.allows(category, safety, &name),
+                    "{name} is read-only (Agent + AutoRun) — a skill must reach it without naming it"
+                );
+                reads.push(name);
+            } else if category == ToolCategory::Agent && safety == SafetyLevel::NeedsApproval {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "{name} mutates (NeedsApproval) — it must stay behind the skill allow-list"
+                );
+            }
+        }
+        // The Agent+AutoRun set IS the documented read surface: assert it
+        // EXACTLY, so a newly added read tool must be classified here
+        // consciously and a mutating tool mis-declared AutoRun fails loudly
+        // (the factory registry is deterministic in this harness).
+        reads.sort();
+        assert_eq!(
+            reads,
+            vec![
+                "expand_result",
+                "git_read",
+                "load_tools",
+                "read_files",
+                "search",
+                "search_read",
+                "web_fetch",
+            ],
+            "the Agent+AutoRun set IS the read surface a skill gets — classify a new tool here \
+             consciously"
+        );
+    }
+
+    #[test]
     fn the_factory_snapshot_captures_the_deferred_tools() {
         // The snapshot wiring is load-bearing: if a register_* call drifts
         // past the snapshot, the tool silently drops from the reveal

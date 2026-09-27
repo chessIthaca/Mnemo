@@ -46,7 +46,9 @@ pub struct SkillSpec {
     pub available_in: Vec<WorkflowState>,
     /// Where the workflow lands after `skill_end`.
     pub target_state: WorkflowState,
-    /// The tool allow-list active while the skill runs. Memory tools are
+    /// The tool allow-list active while the skill runs — it scopes the
+    /// MUTATING tools. Memory tools and the full read-only surface (every
+    /// `SafetyLevel::AutoRun` agent tool except trusted `mcp__` ones) are
     /// always available regardless of this list.
     pub tools: Vec<String>,
     /// The goal the agent drives toward while the skill is active.

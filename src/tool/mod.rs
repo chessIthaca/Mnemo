@@ -472,9 +472,16 @@ pub enum ToolFilter {
     /// set (`skill_reload`, ask_user, current_plan, the backlog tools, and the
     /// skill's exits `skill_end`/`abandon_skill` — a skill file that forgets
     /// to list them must never trap the agent) is visible regardless of the
-    /// list. `skill_create` is NOT always available — it needs an explicit
-    /// allow-list entry (the create_skill overlay); when the file names it,
-    /// the entry IS the grant.
+    /// list. The full READ-ONLY surface rides it too (backlog 834ec126): every
+    /// `ToolCategory::Agent` + `SafetyLevel::AutoRun` tool is auto-granted —
+    /// AutoRun is the codebase's read-only contract, and a hand-maintained read
+    /// list is exactly what drifted (it silently denied `read_files` inside
+    /// merge_to_main). TRUSTED `mcp__` tools are excluded by name: they are
+    /// AutoRun for APPROVAL only, and per-server trust never widens a skill's
+    /// surface (the base-state arms exclude them the same way). `skill_create`
+    /// is NOT always available — it needs an
+    /// explicit allow-list entry (the create_skill overlay); when the file
+    /// names it, the entry IS the grant.
     Skill(Vec<String>),
     /// A read-only reviewer sub-agent — a STRICT allow-list: only the named
     /// tools (+ `current_plan`, a read-only orientation query on the shared
@@ -836,7 +843,8 @@ impl ToolFilter {
                 ToolCategory::Memory => true,
             },
             ToolFilter::Skill(allowed) => match category {
-                // Only the tools named in the skill's allow-list are visible.
+                // Only the tools named in the skill's allow-list are visible,
+                // EXCEPT for the always-available sets below.
                 // Memory tools + ask_user + current_plan + the backlog tools
                 // are always available regardless of the list (asking a
                 // question, reading the active plan, or touching the user's
@@ -850,6 +858,30 @@ impl ToolFilter {
                 // load_tools rides it too (backlog 77efc1b7) — see its
                 // comment below.
                 ToolCategory::Memory => true,
+                // The FULL read-only surface is always available inside a skill
+                // (backlog 834ec126). Pre-fix every read needed an allow-list
+                // entry, and the hand-maintained lists silently missed the live
+                // names — `read_files` was REJECTED inside merge_to_main,
+                // forcing a Get-Content shell workaround while reading
+                // `.coding/knowledge/**` (the incident this grant closes).
+                // Wholesale by category+safety on purpose: a name list is
+                // exactly what drifted; this is the read surface a
+                // `role: "reviewer"` sub-agent gets. Every mutating tool is
+                // NeedsApproval, so an Agent+AutoRun tool reads and nothing
+                // else — EXCEPT a TRUSTED MCP tool, which is AutoRun for
+                // APPROVAL only; its name stays excluded here exactly as in
+                // the Planning/Complete arms, so per-server trust never widens
+                // a skill's surface (review: trust ≠ state visibility).
+                // `write_review_report` is Agent+AutoRun too, but the guard at
+                // the top of `allows` keeps it reviewer-only. The write side is
+                // untouched: shell/git/file_edit/file_write/multi_edit/
+                // file_append/convert_line_endings/spawn_agent are
+                // NeedsApproval and still require their allow-list entry.
+                ToolCategory::Agent
+                    if safety == SafetyLevel::AutoRun && !name.starts_with("mcp__") =>
+                {
+                    true
+                }
                 _ => {
                     name == "ask_user"
                         || name == "current_plan"
@@ -2404,6 +2436,70 @@ mod tests {
         assert!(
             !v(ToolFilter::Reviewer(vec!["skill_create".into()])),
             "the reviewer never authors skills"
+        );
+    }
+
+    /// The FULL read-only surface is ALWAYS available inside a skill — with an
+    /// EMPTY allow-list (backlog 834ec126). Pre-fix the Skill arm granted only
+    /// `ToolCategory::Memory` wholesale, so every read tool (category Agent,
+    /// safety AutoRun) needed an explicit allow-list entry — and `read_files`
+    /// was REJECTED inside merge_to_main, forcing a Get-Content shell workaround
+    /// while reading `.coding/knowledge/**` for landing-record supersedes. Reads
+    /// are the same surface a `role: "reviewer"` sub-agent gets. The write side
+    /// (every mutating tool is NeedsApproval) stays behind the allow-list.
+    #[test]
+    fn skill_state_grants_the_full_read_surface() {
+        let read = |name: &str| {
+            ToolFilter::Skill(vec![]).allows(ToolCategory::Agent, SafetyLevel::AutoRun, name)
+        };
+        for name in [
+            "read_files",
+            "search",
+            "search_read",
+            "expand_result",
+            "git_read",
+            "web_fetch",
+            "list_models",
+            "graph_search",
+            "graph_context",
+            "graph_impact",
+            "graph_path",
+        ] {
+            assert!(
+                read(name),
+                "{name} is read-only (Agent + AutoRun) and must be allowed inside a skill \
+                 even with an EMPTY allow-list"
+            );
+        }
+        // The write side is unchanged: mutating tools stay NeedsApproval and
+        // still need their allow-list entry.
+        let write = |name: &str| {
+            ToolFilter::Skill(vec![]).allows(ToolCategory::Agent, SafetyLevel::NeedsApproval, name)
+        };
+        for name in [
+            "file_edit",
+            "multi_edit",
+            "file_write",
+            "file_append",
+            "convert_line_endings",
+            "shell",
+            "git",
+            "spawn_agent",
+        ] {
+            assert!(
+                !write(name),
+                "{name} mutates and must stay behind the allow-list inside a skill"
+            );
+        }
+        // The reviewer-report channel keeps its own guard: naming it in a
+        // skill allow-list must still not grant it.
+        // A TRUSTED MCP tool is AutoRun for APPROVAL only: the name stays
+        // excluded from the read grant, exactly as in the base-state arms
+        // (Planning/Complete) — per-server trust must never widen a skill's
+        // tool surface (review: trust ≠ state visibility).
+        assert!(
+            !read("mcp__server__tool"),
+            "a trusted mcp__ tool is AutoRun for approval only — never auto-granted by state"
         );
     }
 

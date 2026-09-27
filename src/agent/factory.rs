@@ -489,11 +489,6 @@ impl AgentLoopFactory {
         self.mcp.clone()
     }
 
-    /// Wire in the [`SkillLibrary`] (the `.coding/skills/` dir + the registry
-    /// loaded from it). Called once by the IPC layer at startup. Affects agents
-    /// built **after** this call (the library is read per `build`), so the IPC
-    /// layer sets it before building the main agent. When `None`, the skill
-    /// tools are omitted (no skills available).
     /// Point the index-staleness log at an explicit directory (backlog
     /// fc1d57fe) — tests pass a tempdir so no test writes the real config
     /// dir; production keeps the global default.
@@ -502,6 +497,11 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire in the [`SkillLibrary`] (the `.coding/skills/` dir + the registry
+    /// loaded from it). Called once by the IPC layer at startup. Affects agents
+    /// built **after** this call (the library is read per `build`), so the IPC
+    /// layer sets it before building the main agent. When `None`, the skill
+    /// tools are omitted (no skills available).
     pub fn with_skills(mut self, skills: Arc<SkillLibrary>) -> Self {
         self.skills = Some(skills);
         self

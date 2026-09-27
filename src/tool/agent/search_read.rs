@@ -380,7 +380,18 @@ impl Tool for SearchReadTool {
                             };
                             return build_index_output(ix, max_files, &sandbox, &note);
                         }
-                        Some(search::FtsOutcome::Stale { stale }) => {
+                        Some(search::FtsOutcome::Stale { stale, repaired }) => {
+                            // A budget spent mid-set refreshed part of the set
+                            // before the re-query still tripped — those files
+                            // were repaired inline and keep their records
+                            // (review LOW 2); the rest is surfaced below.
+                            search::log_stale(
+                                staleness_log.as_ref(),
+                                "search_read",
+                                &root,
+                                &repaired,
+                                crate::index_staleness::Action::InlineReindex,
+                            );
                             let sample = search::log_stale(
                                 staleness_log.as_ref(),
                                 "search_read",

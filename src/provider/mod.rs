@@ -251,6 +251,17 @@ pub struct Message {
     /// messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Whether the tool call this message answers FAILED (or never ran).
+    ///
+    /// The Anthropic builder maps it to the `tool_result` block's `is_error`
+    /// flag: the API's structured "this call failed, change approach" signal,
+    /// which the `[tool error]` text prefix alone does not carry. Set by the
+    /// turn loop from the tool's own success verdict.
+    ///
+    /// Skipped when false (the common case) and defaulted on deserialize, so
+    /// history stored before the field existed reads as success.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_is_error: bool,
 }
 
 /// Serde helper: skip `reasoning_stripped` when false (the common case).
@@ -274,6 +285,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 
@@ -292,6 +304,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 
@@ -310,6 +323,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 
@@ -328,6 +342,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 
@@ -346,6 +361,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 
@@ -368,6 +384,7 @@ impl Message {
             origin_model: None,
             reasoning_stripped: false,
             response_id: None,
+            tool_is_error: false,
         }
     }
 

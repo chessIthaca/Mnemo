@@ -2037,7 +2037,14 @@ impl AgentLoop {
                 pending_correction = Some((tc.name.clone(), tool_content.clone()));
             }
 
-            let tool_message = Message::tool_result(tc.id.clone(), tc.name.clone(), feed_content);
+            // Tell the provider the truth about the outcome: a failed result
+            // carries the structured error signal (Anthropic's `is_error` on
+            // the tool_result block) instead of a bare error text that reads
+            // as an odd success - the retry-loop root cause.
+            let tool_message = Message {
+                tool_is_error: !result.success,
+                ..Message::tool_result(tc.id.clone(), tc.name.clone(), feed_content)
+            };
             messages.push(tool_message);
 
             let _ = fanin_tx
@@ -4141,11 +4148,16 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     ..Message::assistant(record_text, sanitized_calls)
                 });
                 for tc in &orphaned {
-                    messages.push(Message::tool_result(
-                        tc.id.clone(),
-                        tc.name.clone(),
-                        "interrupted: not run (turn stopped)",
-                    ));
+                    // The call never ran: the same structured failure signal
+                    // the tool loop sets for a failed execution.
+                    messages.push(Message {
+                        tool_is_error: true,
+                        ..Message::tool_result(
+                            tc.id.clone(),
+                            tc.name.clone(),
+                            "interrupted: not run (turn stopped)",
+                        )
+                    });
                 }
             }
             // Backlog 63cbc20f: a tool call the model already announced
@@ -4398,11 +4410,12 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             } else {
                 failed_content
             };
-            messages.push(Message::tool_result(
-                tc.id.clone(),
-                tc.name.clone(),
-                guidance,
-            ));
+            // Malformed arguments: the call was not run, so it carries the
+            // structured failure signal too (this is a retry, not a success).
+            messages.push(Message {
+                tool_is_error: true,
+                ..Message::tool_result(tc.id.clone(), tc.name.clone(), guidance)
+            });
         }
         // UI-only (backlog 63cbc20f): end the announced card — the
         // turn keeps going (this is a retry, not a stop), so no later
@@ -4454,7 +4467,14 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
 /// their execution): pushes a tool-result message per call AND emits the
 /// terminal ToolResult event per call, so the conversation has N results
 /// for N calls and no UI card spins "running" forever (backlog 63cbc20f).
-async fn synthesize_not_run_results(
+///
+/// Each synthesized message carries `tool_is_error`: the call did not run,
+/// so the provider's structured signal matches the text instead of claiming
+/// a success the model would then build on.
+///
+/// `pub(crate)` for the sibling regression test in `src/agent/tests.rs` (a
+/// `#[cfg(test)]`-gated re-export mirrors `turn_denial_for_test`).
+pub(crate) async fn synthesize_not_run_results(
     messages: &mut Vec<Message>,
     fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
     agent_id: AgentId,
@@ -4462,7 +4482,12 @@ async fn synthesize_not_run_results(
 ) {
     for tc in calls {
         let not_run = "interrupted: not run (turn stopped)";
-        messages.push(Message::tool_result(tc.id.clone(), tc.name.clone(), not_run));
+        // The call never ran: the same structured failure signal the other
+        // not-run paths carry, so the provider is never told it succeeded.
+        messages.push(Message {
+            tool_is_error: true,
+            ..Message::tool_result(tc.id.clone(), tc.name.clone(), not_run)
+        });
         let _ = fanin_tx
             .send((
                 agent_id,

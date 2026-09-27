@@ -227,7 +227,7 @@ impl AnthropicClient {
     ///   [`Role::System`] message's text is hoisted and concatenated;
     /// - `max_tokens` is required;
     /// - content is a blocks array (`text` / `image` / `tool_use` /
-    ///   `tool_result`) — tool results ride on `user`-role messages;
+    ///   `tool_result`) — tool results ride on `user`-role messages (a failed result carries `is_error: true`, sourced from the harness's own success verdict);
     /// - tool `input` is a JSON *object*, not a JSON string.
     fn build_request_json(
         &self,
@@ -573,6 +573,11 @@ impl AnthropicClient {
     }
 
     /// Build one `tool_result` content block for a tool-role message.
+    ///
+    /// `is_error` rides through from the message's own verdict (set by the
+    /// turn loop from the tool's success), so the model receives the API's
+    /// structured failure signal instead of reading a bare error text as an
+    /// odd success and re-issuing the identical call.
     fn tool_result_block(&self, m: &Message) -> Result<serde_json::Value> {
         let id = m.tool_call_id.clone().ok_or_else(|| {
             Error::Provider("cannot send request: tool message has no tool_call_id".into())
@@ -581,7 +586,7 @@ impl AnthropicClient {
             "type": "tool_result",
             "tool_use_id": id,
             "content": m.content.as_text(),
-            "is_error": false,
+            "is_error": m.tool_is_error,
         }))
     }
 
@@ -666,6 +671,10 @@ fn parse_sse_event(
                 state.content_blocks[idx] = build_raw_content_block(block);
                 match block.get("type").and_then(|t| t.as_str()) {
                     Some("tool_use") => {
+                        // Any tool_use block counts for the end-of-stream
+                        // inference below, even one carrying an unusable id
+                        // (the block is still what the model asked for).
+                        state.saw_tool_use = true;
                         let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         if !id.is_empty() && !name.is_empty() {
@@ -780,6 +789,12 @@ fn parse_sse_event(
                 Some("tool_use") => FinishReason::ToolCalls,
                 Some("max_tokens") => FinishReason::Length,
                 Some(other) => FinishReason::Other(other.to_string()),
+                // No message_delta ever arrived (a cut stream, or a gateway
+                // that omits the event), so there is no explicit stop_reason
+                // to trust: fall back on what the stream DID carry. tool_use
+                // blocks mean a tool turn, and reporting Stop here would end
+                // the turn and drop the model's calls entirely.
+                None if state.saw_tool_use => FinishReason::ToolCalls,
                 None => FinishReason::Stop,
             };
             events.push(LlmEvent::Finish { reason });
@@ -836,6 +851,13 @@ struct StreamState {
     /// prompt tokens; folded into the Usage event's `prompt_tokens`.
     cache_creation_tokens: u32,
     stop_reason: Option<String>,
+    /// Whether any `tool_use` block was emitted in this stream.
+    ///
+    /// Used at `message_stop` to infer a TOOL turn when `stop_reason` never
+    /// arrived (a cut stream, or a gateway that omits the event): falling
+    /// back to `Stop` would report the tool turn as finished, and the
+    /// model's calls would never run.
+    saw_tool_use: bool,
     /// Index of the currently-open text block (unused beyond tracking — text
     /// deltas already carry their block's index).
     text_block_index: Option<u32>,
@@ -2513,7 +2535,32 @@ mod tests {
         assert_eq!(block["type"], serde_json::json!("tool_result"));
         assert_eq!(block["tool_use_id"], serde_json::json!("toolu_01"));
         assert_eq!(block["content"], serde_json::json!("file contents here"));
+        // The constructor default: a result nobody flagged is a success.
         assert_eq!(block["is_error"], serde_json::json!(false));
+    }
+
+    /// A tool result the harness marked FAILED must reach Anthropic as
+    /// `is_error: true` — the structured signal that steers the model off a
+    /// failing call instead of letting it re-issue the identical request.
+    /// Guards the mapping against a silent revert to the hardcoded `false`
+    /// this bug was made of: flip the builder back and this test fails.
+    #[test]
+    fn a_failed_tool_result_maps_to_is_error_true() {
+        let m = Message {
+            tool_is_error: true,
+            ..Message::tool_result("toolu_01", "file_read", "[tool error] no such file")
+        };
+        let body = client(false)
+            .build_request_json(&[Message::user_text("hi"), m], &[], None)
+            .unwrap();
+        let block = &body["messages"][1]["content"][0];
+        assert_eq!(block["type"], serde_json::json!("tool_result"));
+        assert_eq!(block["tool_use_id"], serde_json::json!("toolu_01"));
+        assert_eq!(
+            block["is_error"],
+            serde_json::json!(true),
+            "a failed tool result must be reported to the model as an error"
+        );
     }
 
     #[test]
@@ -2713,6 +2760,49 @@ mod tests {
             })
             .collect();
         (events, state)
+    }
+
+    /// A tool-use turn whose `message_delta` never arrived (a cut stream, a
+    /// gateway that omits the event) must still be reported as a TOOL turn:
+    /// the `tool_use` blocks are on the wire, so falling back to `Stop` would
+    /// tell the harness the turn ended — the model's calls are then dropped
+    /// and the tool loop stalls instead of running them.
+    #[test]
+    fn missing_message_delta_still_reports_a_tool_turn() {
+        let raw = sse(&[
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            ),
+            (
+                "content_block_start",
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_09","name":"file_read","input":{}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x.txt\"}"}}"#,
+            ),
+            ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let (events, state) = parse_all(&raw);
+
+        assert!(
+            state.stop_reason.is_none(),
+            "no message_delta arrived — stop_reason was never reported"
+        );
+        let reason = events
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::Finish { reason } => Some(reason),
+                _ => None,
+            })
+            .expect("the stream emitted a Finish event");
+        assert_eq!(
+            *reason,
+            FinishReason::ToolCalls,
+            "a tool_use block was emitted, so the missing stop_reason must infer a TOOL turn"
+        );
     }
 
     #[test]

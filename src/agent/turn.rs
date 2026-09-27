@@ -4211,7 +4211,14 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// (None — the caller continues the request loop). A pending
     /// steer short-circuits the retry (Some outcome) so the user's
     /// message is not delayed behind a retry. Extracted from run_turn
-    /// (quality review HIGH 1); behavior unchanged.
+    /// (quality review HIGH 1).
+    ///
+    /// Batch isolation (plan d3aedfee): the retry arm partitions the batch
+    /// — well-formed calls execute through `execute_tool_batch` (the whole
+    /// sanitized batch is recorded once, only the valid subset runs) and
+    /// only the malformed calls get the error + guidance + escalation. The
+    /// triage-permanent and cap abort arms stay whole-batch: they discard
+    /// the batch from history and nothing runs.
     async fn handle_bad_json(
         &self,
         state: &mut TurnState,

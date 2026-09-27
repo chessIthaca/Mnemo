@@ -633,14 +633,51 @@ fn short_context_line(text: &str, budget: usize) -> String {
 pub fn format_recall_context(memories: &[ScoredMemory]) -> String {
     let mut out = String::new();
     for sm in memories {
-        out.push_str(&format!(
-            "[{}] {} (id: {}, score: {:.2})\n  {}\n\n",
-            sm.memory.tier,
-            sm.memory.title,
-            sm.memory.id,
-            sm.score,
-            sm.memory.content.chars().take(160).collect::<String>(),
-        ));
+        out.push_str(&format_recall_entry(sm));
+    }
+    out
+}
+
+/// One full recalled-memory entry: tier, title, stable id, score, and the
+/// first 160 chars of content.
+fn format_recall_entry(sm: &ScoredMemory) -> String {
+    format!(
+        "[{}] {} (id: {}, score: {:.2})\n  {}\n\n",
+        sm.memory.tier,
+        sm.memory.title,
+        sm.memory.id,
+        sm.score,
+        sm.memory.content.chars().take(160).collect::<String>(),
+    )
+}
+
+/// Format recalled memories with the `recall_delta` lever applied: an entry
+/// the caller marks as already injected renders as a compact reference instead
+/// of re-sending its content snippet (backlog 30bacfa2).
+///
+/// `elide` is consulted per entry, in input order, with the entry's index;
+/// `None` renders the entry exactly as [`format_recall_context`] does, while
+/// `Some(turn)` renders the reference stamped with the session turn whose
+/// request carried the full snippet. Keeping the decision in the caller leaves
+/// this function pure.
+///
+/// The volatile tail is popped from the conversation after every request (see
+/// `install_system_messages`), so the reference is a pointer, not a
+/// replacement: it names the memory (tier, title, stable id) and tells the
+/// model to `memory_search` when it needs the text.
+pub fn format_recall_context_delta(
+    memories: &[ScoredMemory],
+    elide: &dyn Fn(usize, &ScoredMemory) -> Option<u64>,
+) -> String {
+    let mut out = String::new();
+    for (i, sm) in memories.iter().enumerate() {
+        match elide(i, sm) {
+            Some(turn) => out.push_str(&format!(
+                "[{}] {} (id: {}, score: {:.2}) — unchanged since injection (turn {}); re-read with memory_search if needed.\n\n",
+                sm.memory.tier, sm.memory.title, sm.memory.id, sm.score, turn,
+            )),
+            None => out.push_str(&format_recall_entry(sm)),
+        }
     }
     out
 }
@@ -1911,6 +1948,64 @@ mod tests {
                 "[semantic] some title (id: {memory_id}, score: 0.75)"
             )),
             "header line carries the stable id first: {out}"
+        );
+    }
+
+    #[test]
+    fn recall_delta_renders_a_reference_instead_of_the_snippet() {
+        // The tail is popped from the conversation after every request, so a
+        // repeat recall renders a pointer (tier, title, id, score + the turn
+        // that carried the text) rather than re-sending the 160-char snippet.
+        let content = format!("{}UNIQUE-SNIPPET-MARKER", "alpha ".repeat(50));
+        let memory = crate::memory::Memory::new(
+            crate::memory::MemoryTier::Semantic,
+            "some title",
+            content,
+            0,
+        );
+        let id = memory.id.clone();
+        let scored = crate::memory::ScoredMemory { memory, score: 0.75 };
+
+        let elided = format_recall_context_delta(std::slice::from_ref(&scored), &|_, _| Some(4));
+        assert!(
+            elided.contains(&format!(
+                "[semantic] some title (id: {id}, score: 0.75) — unchanged since injection (turn 4)"
+            )),
+            "reference carries tier, title, id, score and the turn: {elided}"
+        );
+        assert!(
+            !elided.contains("alpha"),
+            "the content snippet is not re-sent: {elided}"
+        );
+        assert!(
+            elided.contains("memory_search"),
+            "the reference points at the re-read tool: {elided}"
+        );
+
+        // An entry the caller does not elide keeps today's exact bytes.
+        let full = format_recall_context_delta(std::slice::from_ref(&scored), &|_, _| None);
+        assert_eq!(full, format_recall_context(std::slice::from_ref(&scored)));
+
+        // Mixed input: only the elided entry loses its snippet.
+        let other = crate::memory::ScoredMemory {
+            memory: crate::memory::Memory::new(
+                crate::memory::MemoryTier::Procedural,
+                "other title",
+                "other body".to_string(),
+                0,
+            ),
+            score: 0.5,
+        };
+        let mixed =
+            format_recall_context_delta(&[scored.clone(), other], &|i, _| (i == 0).then_some(2));
+        assert!(
+            mixed.contains("unchanged since injection (turn 2)"),
+            "the repeat renders as a reference: {mixed}"
+        );
+        assert!(mixed.contains("[procedural] other title"));
+        assert!(
+            mixed.contains("other body"),
+            "the newly recalled entry still arrives full: {mixed}"
         );
     }
 

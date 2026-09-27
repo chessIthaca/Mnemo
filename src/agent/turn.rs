@@ -29,11 +29,12 @@ use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::prompt;
+use super::recall_delta::DeltaDecision;
 use super::StopReason;
 use super::MAX_BAD_JSON_RETRIES;
 use super::MAX_RETRIES;
 use super::REVIEW_REPORT_MAX_FAILURES;
-use crate::memory::{Memory, MemoryTier};
+use crate::memory::{Memory, MemoryTier, ScoredMemory};
 use crate::provider::{
     DeltaAccumulator, FinishReason, LlmClient, LlmEvent, Message, MessageContent, Role, ToolCall,
     ToolSchema,
@@ -302,6 +303,13 @@ impl AgentLoop {
         // while an unchanged serve stays silent.
         self.seed_served_effective_if_empty();
 
+        // Recall-delta lever (backlog 30bacfa2): advance the session's
+        // recall-injection clock so a compact reference can be stamped with
+        // the turn whose request carried the full snippet.
+        if let Ok(mut cache) = self.session.recall_delta.lock() {
+            cache.begin_turn();
+        }
+
         // Pending provider swap (deferred so the OLD provider can summarize
         // first when the new window is smaller) — handled in its own method;
         // Some(outcome) means an interrupt during the pre-swap summarization
@@ -499,7 +507,7 @@ impl AgentLoop {
             // message and inject them into the system prompt (per-turn
             // cache, non-bumping peek) — see auto_recall.
             let memory_context = self
-                .auto_recall(&mut state, messages, fanin_tx, agent_id)
+                .auto_recall(&mut state, messages, fanin_tx, agent_id, session_id)
                 .await;
 
             // Build + install the system prompt (stable head + volatile
@@ -1079,6 +1087,12 @@ impl AgentLoop {
                     );
                 }
                 *messages = summarized;
+                // Recall-delta lever (backlog 30bacfa2): the summary replaced
+                // the conversation, so an earlier injection is no longer in
+                // the model's context — the next recall renders in full.
+                if let Ok(mut cache) = self.session.recall_delta.lock() {
+                    cache.invalidate();
+                }
                 // Drop any steers the user dismissed (the "x" on a pending
                 // steer) before re-injecting buffered commands as system
                 // messages (mirrors the main-loop summarization path).
@@ -2398,6 +2412,12 @@ impl AgentLoop {
             );
         }
         *messages = summarized;
+        // Recall-delta lever (backlog 30bacfa2): the summary replaced the
+        // conversation, so an earlier injection is no longer in the model's
+        // context — the next recall renders in full again.
+        if let Ok(mut cache) = self.session.recall_delta.lock() {
+            cache.invalidate();
+        }
         // Token-optimizer lever 4 (backlog e4a50d22): one post-compaction
         // digest note so the model keeps a map of what the summary elided,
         // plus the pointer to the archived checkpoint when one was written.
@@ -2551,6 +2571,7 @@ impl AgentLoop {
         messages: &[Message],
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
+        session_id: Option<&str>,
     ) -> Option<String> {
         // Auto-recall: fetch relevant memories based on the latest user
         // message and inject them into the system prompt. Uses the
@@ -2640,7 +2661,7 @@ impl AgentLoop {
                             ))
                             .await;
                     }
-                    Some(prompt::format_recall_context(&results))
+                    Some(self.recall_block(&results, session_id))
                 } else {
                     None
                 }
@@ -2650,6 +2671,81 @@ impl AgentLoop {
         } else {
             None
         }
+    }
+
+    /// Render the volatile tail's auto-recall block with the `recall_delta`
+    /// lever applied (backlog 30bacfa2).
+    ///
+    /// With the lever ON, a memory whose id AND content hash were already
+    /// injected in this session — and whose injection survived compaction —
+    /// renders as a compact reference instead of re-sending its 160-char
+    /// snippet, and the elision is recorded in the savings ledger. The lever
+    /// OFF path is byte-identical to [`prompt::format_recall_context`].
+    ///
+    /// `session_id` is the turn's authoritative id (the `run_turn`
+    /// parameter, mirroring `record_stats_row`'s convention) — never the
+    /// `SessionState` mirror, which can lag when a caller passes an id
+    /// without calling `set_session_id`.
+    ///
+    /// The tail is popped right after every request (see
+    /// `install_system_messages`), so an elided entry is a pointer the model
+    /// dereferences with `memory_search`, not a replacement for text still in
+    /// the conversation.
+    fn recall_block(&self, results: &[ScoredMemory], session_id: Option<&str>) -> String {
+        let full = prompt::format_recall_context(results);
+        let delta_on = self
+            .optimizer
+            .as_ref()
+            .map(|c| c.read().map(|c| c.recall_delta).unwrap_or(false))
+            .unwrap_or(false);
+        if !delta_on {
+            return full;
+        }
+        let decisions: Vec<Option<u64>> = {
+            let mut cache = match self.session.recall_delta.lock() {
+                Ok(cache) => cache,
+                // A poisoned lock just means this request serves the full
+                // block — never a reason to fail the turn.
+                Err(_) => return full,
+            };
+            results
+                .iter()
+                .map(|sm| {
+                    let hash = crate::agent::recall_delta::content_hash(
+                        sm.memory.tier.as_str(),
+                        &sm.memory.title,
+                        &sm.memory.content,
+                    );
+                    match cache.decide(&sm.memory.id, hash) {
+                        DeltaDecision::Elide { injected_turn } => Some(injected_turn),
+                        DeltaDecision::Full => None,
+                    }
+                })
+                .collect()
+        };
+        let elided = decisions.iter().filter(|d| d.is_some()).count();
+        if elided == 0 {
+            // Nothing to elide: keep today's bytes and record no savings.
+            return full;
+        }
+        let delta = prompt::format_recall_context_delta(results, &|i, _| decisions[i]);
+        let before = crate::tool::agent::optimizer::estimate_tokens(&full);
+        let after = crate::tool::agent::optimizer::estimate_tokens(&delta);
+        if after >= before {
+            // A reference block that is not smaller is pure loss. The full
+            // snippet is what this request serves, so the cache entries
+            // recorded above stay accurate.
+            return full;
+        }
+        self.record_savings_event(
+            session_id,
+            "recall_delta",
+            Some(format!("{} memories ({} elided)", results.len(), elided)),
+            before,
+            after,
+            false,
+        );
+        delta
     }
 
     /// Whether this provider's request must end with USER-role messages instead

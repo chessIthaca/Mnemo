@@ -297,6 +297,13 @@ impl CodeGraph {
         self.store().stored_mtimes()
     }
 
+    /// Indexed file paths with their as-of-index mtime AND content hash — the
+    /// staleness log's classification evidence (backlog fc1d57fe). One SELECT
+    /// for the whole tree, like [`Store::stored_mtimes`].
+    pub fn stored_file_meta(&self) -> Result<HashMap<String, FileMeta>> {
+        self.store().stored_file_meta()
+    }
+
     /// Whether any indexed symbol is named exactly `name` (case-sensitive) —
     /// the search tools' symbol nudge: when a bare-identifier pattern names
     /// an indexed symbol, `search`/`search_read` prepend a one-line note
@@ -646,9 +653,7 @@ impl CodeGraph {
                 eprintln!("codegraph: skipping {rel}: outside the project root");
                 continue;
             }
-            let mut hasher = DefaultHasher::new();
-            hasher.write(&bytes);
-            let hash = format!("{:x}", hasher.finish());
+            let hash = content_hash(&bytes);
             let is_source = abs
                 .extension()
                 .and_then(|e| e.to_str())
@@ -808,9 +813,7 @@ impl CodeGraph {
                 capped = true;
                 continue;
             }
-            let mut hasher = DefaultHasher::new();
-            hasher.write(&bytes);
-            let hash = format!("{:x}", hasher.finish());
+            let hash = content_hash(&bytes);
             match self.reindex_one(&path, &rel, &hash, &bytes) {
                 Ok(()) => {
                     reparsed += 1;
@@ -902,9 +905,7 @@ impl CodeGraph {
     pub(crate) fn simulate_partial_write_for_test(&self, rel: &str) -> Result<()> {
         let abs = self.root.join(rel);
         let bytes = std::fs::read(&abs)?;
-        let mut hasher = DefaultHasher::new();
-        hasher.write(&bytes);
-        let hash = format!("{:x}", hasher.finish());
+        let hash = content_hash(&bytes);
         let source = String::from_utf8_lossy(&bytes).into_owned();
         let data = FileData {
             symbols: Vec::new(),
@@ -991,9 +992,7 @@ fn extract_job(
         eprintln!("codegraph: skipping unreadable file {}", path.display());
         return None;
     };
-    let mut hasher = DefaultHasher::new();
-    hasher.write(&bytes);
-    let hash = format!("{:x}", hasher.finish());
+    let hash = content_hash(&bytes);
 
     // Re-parse when the content changed OR when the file predates
     // the content index (no cg_content_meta row). The latter makes a
@@ -1871,4 +1870,16 @@ mod tests {
             stats.elapsed_ms
         );
     }
+}
+
+/// The content hash the index stores for a file: std `DefaultHasher` over the
+/// raw bytes, hex-formatted — the same hasher the indexer has always used,
+/// and what [`Store::stored_file_meta`]'s `content_hash` carries. Kept as ONE
+/// function so the indexer and the staleness log's disk probe can never drift
+/// apart (backlog fc1d57fe): the probe's classification compares like for
+/// like.
+pub fn content_hash(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    format!("{:x}", hasher.finish())
 }

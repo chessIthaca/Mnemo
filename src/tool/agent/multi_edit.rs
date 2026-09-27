@@ -11,7 +11,9 @@
 //! compact line ops (`i`/`b`/`d`/`r` verbs, ranges, payloads) and anchor
 //! objects (plan 2e27f896, engine in [`crate::tool::agent::edit_ops`]) — and
 //! the approval prompt renders ONE combined diff covering every changed file
-//! ([`ApprovalPreview::MultiDiff`]).
+//! ([`ApprovalPreview::MultiDiff`]). The emission-artifact guard is the same
+//! one `file_edit` runs (so the verdict for a given op is identical), and
+//! `artifact_check: false` skips it for the whole call (backlog 08d2125d).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,13 @@ pub struct MultiEditArgs {
     /// The files to edit, each with its own ops array.
     #[serde(default)]
     pub files: Option<Vec<MultiEditFile>>,
+    /// Escape hatch (backlog 08d2125d): when explicitly `false`, skip the
+    /// emission-artifact validation for EVERY file in the call — the last
+    /// resort for a legitimate edit the guard false-tripped. Verify the
+    /// result yourself first (`cargo check`, `rustfmt --check <file>`); the
+    /// call stays approval-gated as usual. Default: validate.
+    #[serde(default)]
+    pub artifact_check: Option<bool>,
 }
 
 /// One file entry in a `multi_edit` call.
@@ -175,8 +184,14 @@ fn prepare_files(sandbox: &Sandbox, args: &MultiEditArgs) -> Result<Vec<Prepared
             }
             Err(e) => return Err(file_error(idx, &path, crate::error::Error::Io(e))),
         };
-        let (new_content, notes) =
-            apply_ops(&path, &content, &ops, false).map_err(|e| file_error(idx, &path, e))?;
+        let (new_content, notes) = apply_ops(
+            &path,
+            &content,
+            &ops,
+            false,
+            args.artifact_check != Some(false),
+        )
+        .map_err(|e| file_error(idx, &path, e))?;
         let diff = compute_diff(&path, &content, &new_content);
         prepared.push(PreparedFile {
             path,
@@ -267,7 +282,8 @@ impl Tool for MultiEditTool {
                     "files": {"type": "array", "description": "The files to edit, each with its own ops. Nothing is written until ALL files succeed — a failing op aborts the whole call with no write anywhere.", "items": {"type": "object", "properties": {
                         "path": {"type": "string", "description": "Path to the file, relative to the project root."},
                         "ops": {"type": "array", "description": "The ops to apply IN ORDER — the same forms as file_edit's ops array: compact line-op strings (e.g. 'i101:text' insert after line 101, 'b101:text' insert before, 'd202-205' delete, 'd100-' to EOF, 'r102:text' replace; {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed) or anchor objects {old_string, new_string, count?, fuzzy_whitespace?} (an anchor must match exactly once unless it sets count). Line numbers refer to the content as left by the preceding ops.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default false)."}}, "required": ["old_string", "new_string"]}]}}
-                    }, "required": ["path", "ops"]}}
+                    }, "required": ["path", "ops"]}},
+                    "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation for every file in this call (see the rejection message)."}
                 },
                 "required": ["files"]
             }),
@@ -431,6 +447,140 @@ mod tests {
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
             b_before
         );
+    }
+
+    #[tokio::test]
+    async fn twenty_op_net_zero_array_applies_through_both_tools() {
+        // Acceptance (backlog 08d2125d): a 20-op array with a net-zero
+        // delimiter delta applies — through file_edit AND multi_edit, with
+        // both producing byte-identical content (the parity proof).
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let src = r#"fn main() {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    let e = 5;
+    let f = 6;
+    let g = 7;
+    let h = 8;
+    let i = 9;
+    let j = 10;
+    let k = 11;
+    let l = 12;
+    let m = 13;
+    let n = 14;
+    let o = 15;
+    let p = 16;
+    let q = 17;
+    let r = 18;
+    let s = 19;
+    let t = 20;
+}
+"#;
+        // 20 ops, mixed verbs: 6 descending inserts (below the r-targets, so
+        // numbering stays put), 10 replacing r-ops, 4 descending d-ops.
+        let ops = json!([
+            "i21:    // tail note",
+            "i19:    // note after r",
+            "i17:    // note after p",
+            "i15:    // note after n",
+            "i13:    // note after l",
+            "i11:    // note after j",
+            "r2:    let a = scale(a_raw, 1) + a_offset;",
+            "r3:    let b = scale(b_raw, 2) + b_offset;",
+            "r4:    let c = scale(c_raw, 3) + c_offset;",
+            "r5:    let d = scale(d_raw, 4) + d_offset;",
+            "r6:    let e = scale(e_raw, 5) + e_offset;",
+            "r7:    let f = scale(f_raw, 6) + f_offset;",
+            "r8:    let g = scale(g_raw, 7) + g_offset;",
+            "r9:    let h = scale(h_raw, 8) + h_offset;",
+            "r10:    let i = scale(i_raw, 9) + i_offset;",
+            "r11:    let j = scale(j_raw, 10) + j_offset;",
+            "d20",
+            "d18",
+            "d16",
+            "d14",
+        ]);
+        let fe_args: crate::tool::agent::file_edit::FileEditArgs =
+            serde_json::from_value(json!({"path": "a.rs", "ops": ops.clone()})).unwrap();
+        let prepared = crate::tool::agent::file_edit::prepare_edit(&fe_args, src)
+            .expect("file_edit accepts the net-zero array");
+        assert!(
+            prepared.new_content.contains("scale(a_raw, 1)"),
+            "{}",
+            prepared.new_content
+        );
+        std::fs::write(dir.path().join("a.rs"), src).unwrap();
+        let result = tool
+            .execute(json!({"files": [{"path": "a.rs", "ops": ops}]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        let written = std::fs::read_to_string(dir.path().join("a.rs")).unwrap();
+        assert_eq!(
+            written, prepared.new_content,
+            "both tools apply the array byte-identically"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_check_false_is_the_escape_hatch() {
+        // Backlog 08d2125d: the guard rejects a growing delimiter balance by
+        // default (naming the offending op); artifact_check=false applies
+        // the same array — the explicit last-resort opt-out.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.rs"), "fn f() {\n    a();\n}\n").unwrap();
+        let result = tool
+            .execute(json!({
+                "files": [{"path": "a.rs", "ops": ["r3:    } else {"]}]
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("unbalanced delimiters"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("ops[0]"), "{}", result.output);
+        let result = tool
+            .execute(json!({
+                "files": [{"path": "a.rs", "ops": ["r3:    } else {"]}],
+                "artifact_check": false
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "fn f() {\n    a();\n    } else {\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_growing_delta_is_rejected_by_both_tools_with_the_op_named() {
+        // Parity (backlog 08d2125d): the SAME +1-delta array is rejected by
+        // both tools, and both name the offending op and the deficit numbers.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let src = "fn main() {\n    let alpha = 1;\n}\n";
+        let ops = json!(["r2:    if enabled {"]);
+        let fe_args: crate::tool::agent::file_edit::FileEditArgs =
+            serde_json::from_value(json!({"path": "a.rs", "ops": ops.clone()})).unwrap();
+        let err = crate::tool::agent::file_edit::prepare_edit(&fe_args, src)
+            .expect_err("file_edit rejects the growth")
+            .to_string();
+        assert!(err.contains("ops[0]"), "{err}");
+        assert!(err.contains("0 → 1"), "{err}");
+        std::fs::write(dir.path().join("a.rs"), src).unwrap();
+        let result = tool
+            .execute(json!({"files": [{"path": "a.rs", "ops": ops}]}))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(result.output.contains("ops[0]"), "{}", result.output);
+        assert!(result.output.contains("0 → 1"), "{}", result.output);
+        // Atomicity: the rejected call left the file untouched.
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), src);
     }
 
     #[tokio::test]

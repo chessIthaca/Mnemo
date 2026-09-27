@@ -342,6 +342,15 @@ pub struct OptimizerConfig {
     /// [`lean_output_fill_pct`](Self::lean_output_fill_pct) context fill
     /// nudges the model toward concise visible output. On by default.
     pub lean_output_nudge: bool,
+    /// **Recall delta.** When `true`, auto-recall renders a compact
+    /// reference (tier, title, stable id, score, "unchanged since injection
+    /// (turn N)") for a memory whose id AND content hash were already
+    /// injected in this session's volatile tail, instead of re-sending its
+    /// 160-char content snippet; a new, changed, or post-compaction recall
+    /// still injects the full snippet. The tail is popped after every
+    /// request, so the reference is a pointer the model dereferences with
+    /// `memory_search`. On by default.
+    pub recall_delta: bool,
     /// Minimum length (chars) of a tool result before lever 3 archives
     /// it. Results under the cap pass through the existing ingestion cap
     /// unchanged.
@@ -386,6 +395,7 @@ impl OptimizerConfig {
             && self.compaction_survival
             && self.quality_score
             && self.lean_output_nudge
+            && self.recall_delta
             && self.archive_min_chars == Self::DEFAULT_ARCHIVE_MIN_CHARS
             && self.compress_min_chars == Self::DEFAULT_COMPRESS_MIN_CHARS
             && self.lean_output_fill_pct == Self::DEFAULT_LEAN_OUTPUT_FILL_PCT
@@ -403,6 +413,7 @@ impl Default for OptimizerConfig {
             compaction_survival: true,
             quality_score: true,
             lean_output_nudge: true,
+            recall_delta: true,
             archive_min_chars: Self::DEFAULT_ARCHIVE_MIN_CHARS,
             compress_min_chars: Self::DEFAULT_COMPRESS_MIN_CHARS,
             lean_output_fill_pct: Self::DEFAULT_LEAN_OUTPUT_FILL_PCT,
@@ -1411,6 +1422,11 @@ auto_type_memories = true
             ..Default::default()
         };
         assert!(!only_flag.is_default());
+        let only_recall = OptimizerConfig {
+            recall_delta: false,
+            ..Default::default()
+        };
+        assert!(!only_recall.is_default());
     }
 
     #[test]
@@ -1426,6 +1442,7 @@ auto_type_memories = true
         assert!(cfg.general.optimizer.compaction_survival);
         assert!(cfg.general.optimizer.quality_score);
         assert!(cfg.general.optimizer.lean_output_nudge);
+        assert!(cfg.general.optimizer.recall_delta);
         assert_eq!(
             cfg.general.optimizer.archive_min_chars,
             OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
@@ -1450,6 +1467,23 @@ archive_min_chars = 5000
         let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
         assert!(!cfg2.general.optimizer.delta_reads);
         assert_eq!(cfg2.general.optimizer.archive_min_chars, 5000);
+
+        let only_recall = r#"
+[general.optimizer]
+recall_delta = false
+"#;
+        let cfg: GeneralConfig = toml::from_str(only_recall).unwrap();
+        assert!(
+            !cfg.general.optimizer.recall_delta,
+            "an explicit opt-out is honoured"
+        );
+        assert!(
+            cfg.general.optimizer.delta_reads,
+            "an unnamed lever keeps its default"
+        );
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(!cfg2.general.optimizer.recall_delta);
 
         // Untouched: no serialized trace; touched: is_default flips.
         assert!(OptimizerConfig::default().is_default());

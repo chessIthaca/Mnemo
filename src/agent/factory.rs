@@ -270,6 +270,13 @@ pub struct AgentLoopFactory {
     /// [`with_optimizer_config`](Self::with_optimizer_config) from the
     /// loaded config at startup (mirrors `shell_filter`).
     optimizer: Arc<RwLock<OptimizerConfig>>,
+    /// The persistent index-staleness log (backlog fc1d57fe) handed to every
+    /// search/graph tool this factory builds: each stale-index repair appends
+    /// one record per file, and the freshness note points at it. Defaults to
+    /// the global config dir; tests override with
+    /// [`with_staleness_log`](Self::with_staleness_log) so no test writes the
+    /// real one.
+    staleness_log: crate::index_staleness::StalenessLog,
 }
 
 impl AgentLoopFactory {
@@ -372,6 +379,9 @@ impl AgentLoopFactory {
             // the IPC layer overrides via `with_optimizer_config` from the
             // loaded config at startup (mirrors `shell_filter`).
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
+            // The global index-staleness log (backlog fc1d57fe) unless a test
+            // overrides it.
+            staleness_log: crate::index_staleness::StalenessLog::global(),
             mcp: None,
             // No auto-typing gate at construction — the IPC layer wires it
             // via `with_auto_typing` once the app runtime's classifier slot
@@ -477,6 +487,14 @@ impl AgentLoopFactory {
     /// commands reuse it).
     pub fn mcp_manager(&self) -> Option<Arc<crate::mcp::McpManager>> {
         self.mcp.clone()
+    }
+
+    /// Point the index-staleness log at an explicit directory (backlog
+    /// fc1d57fe) — tests pass a tempdir so no test writes the real config
+    /// dir; production keeps the global default.
+    pub fn with_staleness_log(mut self, log: crate::index_staleness::StalenessLog) -> Self {
+        self.staleness_log = log;
+        self
     }
 
     /// Wire in the [`SkillLibrary`] (the `.coding/skills/` dir + the registry
@@ -1092,8 +1110,10 @@ impl AgentLoopFactory {
                 // save lands on the next command without a rebuild.
                 .with_optimizer(Arc::clone(&self.optimizer)),
         ));
-        let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone());
-        let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone());
+        let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone())
+            .with_staleness_log(self.staleness_log.clone());
+        let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone())
+            .with_staleness_log(self.staleness_log.clone());
         // F9: the memory store powers the known-memory-hit note on
         // uuid-shaped search patterns.
         if let Some(store) = &self.memory {
@@ -1237,7 +1257,9 @@ impl AgentLoopFactory {
     /// by ToolFilter), `skill_end` + `abandon_skill` (only meaningful while a
     /// skill is active; exposed by the Skill filter unconditionally),
     /// `skill_reload` (every workflow state, an active skill included) and
-    /// `skill_create` (Executing only). All AutoRun — protection is on the
+    /// `skill_create` (Executing-only in the base states; under a skill it
+    /// needs an explicit allow-list entry — the `create_skill` overlay grants
+    /// it, so authoring needs no plan). All AutoRun — protection is on the
     /// operations inside the skill (e.g. git merge/push are never_auto_for),
     /// not the entry or the authoring. Omitted entirely when no skill library
     /// is configured (tests).
@@ -1467,7 +1489,9 @@ impl AgentLoopFactory {
             use crate::tool::agent::codegraph::{
                 GraphContextTool, GraphImpactTool, GraphPathTool, GraphSearchTool,
             };
-            registry.register(Box::new(GraphSearchTool::new(graph.clone())));
+            registry.register(Box::new(
+                GraphSearchTool::new(graph.clone()).with_staleness_log(self.staleness_log.clone()),
+            ));
             registry.register(Box::new(GraphContextTool::new(graph.clone())));
             registry.register(Box::new(GraphImpactTool::new(graph.clone())));
             registry.register(Box::new(GraphPathTool::new(graph.clone())));
@@ -1637,6 +1661,11 @@ mod tests {
             dir.join("plans"),
             vision,
         )
+        // Test hygiene (backlog fc1d57fe): the staleness log lives in the
+        // temp dir — no test may write the real ~/.mnemo.
+        .with_staleness_log(crate::index_staleness::StalenessLog::at(
+            dir.join(".mnemo-staleness"),
+        ))
     }
 
     /// A mock vision model for registration tests — never makes a network call.
@@ -2220,7 +2249,13 @@ mod tests {
             // 36_300 → 37_300 (2027-01-11): same cause as the Planning raise
             // above (expand_result, ~+418); measures Executing at 36_963
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 37_300),
+            // 37_300 → 37_900 (2026-09-27): file_edit and multi_edit gain the
+            // `artifact_check` escape-hatch property (backlog 08d2125d) — the
+            // property must stay DECLARED because strict providers validate
+            // args against the schema, so the terse ~+280 chars cannot move to
+            // the rejection message alone; measures Executing at 37_600 chars.
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 37_900),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2414,7 +2449,12 @@ mod tests {
             // 31_600 → 32_700 (2027-01-11): same cause as the Planning raise
             // above (expand_result, ~+418); measures Reviewing at 32_227
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 32_700),
+            // 32_700 → 33_100 (2026-09-27): same cause as the Executing raise
+            // above (the `artifact_check` property rides file_edit + multi_edit
+            // schemas, shared with the Reviewer's advertised array); measures
+            // Reviewing at 32_864 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Reviewing, 33_100),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -2875,7 +2915,7 @@ mod tests {
             "skill_start",
             "skill_end",
             "abandon_skill",
-            // skill library tools (reload: every state; create: Executing only)
+            // skill library tools (reload: every state; create: Executing-only in the base states, grantable via a skill allow-list)
             "skill_reload",
             "skill_create",
             // vision (always) — the 7 image_* tools (replacing describe_image)
@@ -2943,6 +2983,88 @@ mod tests {
             registry.iter().count(),
             expected.len(),
             "registered tool count should match the expected set exactly"
+        );
+    }
+
+    #[test]
+    fn skills_get_the_whole_read_surface_at_the_registry_level() {
+        // backlog 834ec126: the Skill state grants the full read-only surface
+        // wholesale (Agent + AutoRun). Audit that classification against the
+        // REAL wired registry: every Agent+AutoRun tool must be reachable
+        // inside a skill with an EMPTY allow-list, and every Agent+NeedsApproval
+        // tool must stay invisible there — so a newly added read tool is
+        // granted automatically, and a mutating tool mis-declared AutoRun fails
+        // loudly instead of leaking into every skill.
+        use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
+
+        let dir = tempdir().unwrap();
+        let mut factory = make_factory(dir.path());
+        factory = factory.with_skills(Arc::new(SkillLibrary::from_registry(
+            dir.path().join(".coding/skills"),
+            crate::skill::SkillRegistry::new(),
+        )));
+        factory.set_spawner(Arc::new(MockSpawner));
+        factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
+            crate::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
+        )));
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+
+        let skill_filter = ToolFilter::Skill(vec![]);
+        let mut reads = Vec::new();
+        for tool in registry.iter() {
+            let name = tool.name().to_string();
+            let (category, safety) = (tool.category(), tool.safety());
+            // write_review_report is Agent+AutoRun but is NOT a read tool: the
+            // guard at the top of `ToolFilter::allows` keeps it reviewer-only.
+            if name == "write_review_report" {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "write_review_report stays reviewer-only, whatever a skill lists"
+                );
+                continue;
+            }
+            // A TRUSTED MCP tool is AutoRun for APPROVAL only — excluded from
+            // the read grant by name, exactly as in the base-state arms
+            // (trust ≠ state visibility), so it can never ride into a skill.
+            if name.starts_with("mcp__") {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "{name}: per-server trust must never widen a skill's surface"
+                );
+                continue;
+            }
+            if category == ToolCategory::Agent && safety == SafetyLevel::AutoRun {
+                assert!(
+                    skill_filter.allows(category, safety, &name),
+                    "{name} is read-only (Agent + AutoRun) — a skill must reach it without naming it"
+                );
+                reads.push(name);
+            } else if category == ToolCategory::Agent && safety == SafetyLevel::NeedsApproval {
+                assert!(
+                    !skill_filter.allows(category, safety, &name),
+                    "{name} mutates (NeedsApproval) — it must stay behind the skill allow-list"
+                );
+            }
+        }
+        // The Agent+AutoRun set IS the documented read surface: assert it
+        // EXACTLY, so a newly added read tool must be classified here
+        // consciously and a mutating tool mis-declared AutoRun fails loudly
+        // (the factory registry is deterministic in this harness).
+        reads.sort();
+        assert_eq!(
+            reads,
+            vec![
+                "expand_result",
+                "git_read",
+                "load_tools",
+                "read_files",
+                "search",
+                "search_read",
+                "web_fetch",
+            ],
+            "the Agent+AutoRun set IS the read surface a skill gets — classify a new tool here \
+             consciously"
         );
     }
 

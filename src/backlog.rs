@@ -609,13 +609,20 @@ impl BacklogStore {
     /// - `Pending → InFlight` — execution entry (the forwarder stamps the
     ///   in-flight item when the workflow enters `Executing` — the
     ///   `create_plan` moment, which also records the item↔plan linkage;
-    ///   dispatch itself leaves the item `Pending`).
+    ///   dispatch itself leaves the item `Pending`). The agent's own
+    ///   `backlog_status` stamp lands here too: with no dispatch pointer, the
+    ///   `Executing` entry links the one hand-stamped `InFlight` item that has
+    ///   no `plan_id` yet, so a chat-driven item carries the same linkage a
+    ///   dispatched one does.
     /// - `Pending → Done / Failed / CantResolve` — resolved before ever being
     ///   dispatched (agent marking; the harness no longer stamps here — a
     ///   checkpoint failure leaves the item `Pending`).
     /// - `InFlight → Done / Failed / CantResolve` — turn resolution: `Done`
     ///   via the plan-loop gate (the plan finished), `Failed` on root-plan
-    ///   abandonment, `CantResolve` only as the agent's explicit dead end.
+    ///   abandonment, `CantResolve` only as the agent's explicit dead end. A
+    ///   session with no dispatch pointer (a chat-driven plan) resolves `Done`
+    ///   by the linkage alone: exactly one live `InFlight` item whose `plan_id`
+    ///   is the completed plan.
     /// - `InFlight → Pending` — intervention requeue / deferral (the item
     ///   re-waits, checkpoint sha preserved in the note).
     /// - `Done / Failed / CantResolve → Pending` — requeue (the user's retry).
@@ -698,9 +705,10 @@ impl BacklogStore {
     /// f45513b2) — WITHOUT touching its status. Called when the workflow
     /// enters `Executing` (the `create_plan` moment) alongside the
     /// `InFlight` stamp — and again whenever a fresh plan replaces an
-    /// abandoned one mid-dispatch, so the linkage always names the plan the
-    /// item's status is derived from (finish → `Done`, root abandon →
-    /// `Failed`). Returns `false` (no-op, no persist) for an unknown id.
+    /// abandoned one, on the dispatched path and on the pointer-less chat path
+    /// alike, so the linkage always names the plan the item's status is
+    /// derived from (finish → `Done`, root abandon → `Failed`). Returns
+    /// `false` (no-op, no persist) for an unknown id.
     pub fn set_plan_id(
         &mut self,
         id: &str,

@@ -477,9 +477,10 @@ describe("IPC contract — DTO fixture field shapes", () => {
     // vision_model must be emitted as null (not skipped) when unconfigured.
     expect(dtoGetSettings.general.vision_model).toBeNull();
     // The token-optimizer block rides `general` (Settings → Savings reads it):
-    // the six levers are booleans, the knobs are numbers.
+    // the seven levers are booleans, the knobs are numbers.
     expect(typeof dtoGetSettings.general.optimizer.archive).toBe("boolean");
     expect(typeof dtoGetSettings.general.optimizer.delta_reads).toBe("boolean");
+    expect(typeof dtoGetSettings.general.optimizer.recall_delta).toBe("boolean");
     expect(typeof dtoGetSettings.general.optimizer.archive_min_chars).toBe("number");
     expect(typeof dtoGetSettings.general.optimizer.nudge_cooldown_requests).toBe("number");
     expect(typeof dtoGetSettings.context.summarize_at_fill_rate).toBe("number");

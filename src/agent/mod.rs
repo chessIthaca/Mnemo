@@ -16,6 +16,9 @@
 //!
 //! - [`loop_impl`] — the `AgentLoop` struct, constructors, and public handles.
 //! - [`turn`] — the `run_turn` driver (streaming, summarization, auto-recall).
+//! - [`recall_delta`] — the `recall_delta` lever's per-session cache: what the
+//!   volatile tail has already injected, so a repeat recall renders as a
+//!   reference instead of re-sending the snippet.
 //! - [`dispatch`] — tool-call dispatch, the approval gate, provider retry.
 //! - [`failure_triage`] — the Laya classifier's failure-classification
 //!   decision layer (classes, confidence gate, auto-retry policy, the
@@ -39,6 +42,7 @@ pub mod steering_stats;
 
 mod dispatch;
 mod loop_impl;
+mod recall_delta;
 mod turn;
 
 pub use loop_impl::{drop_cancelled_steers, AgentLoop, AgentLoopConfig, StopReason, TurnOutcome};

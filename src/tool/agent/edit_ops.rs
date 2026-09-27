@@ -6,7 +6,9 @@
 //!
 //! Home of the machinery both `file_edit` and `multi_edit` share: the
 //! EOL-agnostic literal match/splice core (with the escape-normalization
-//! fallbacks and near-miss diagnostics), the emission-artifact validators,
+//! fallbacks and near-miss diagnostics), the emission-artifact validators
+//! (a growing delimiter balance is attributed to the exact op(s) that caused
+//! it, and the whole family can be opted out per call via `artifact_check`),
 //! and the unified-diff helper. An anchor edit behaves identically whichever
 //! tool carries it, because both route through here.
 
@@ -166,27 +168,124 @@ pub(crate) fn validate_emission_artifacts_lines(
 }
 
 /// The delimiter-balance emission-artifact check (d) — delta-scoped to
-/// (content, new_content), `.rs` only. The batch path runs it ONCE on the
-/// combined result (the delta's right scope); truncation leaves unbalanced
-/// braces, and a file that was unbalanced before the edit is not this
-/// edit's fault.
+/// (content, new_content), `.rs` only. The batch path runs the attribution
+/// variant ONCE on the combined result (the delta's right scope); truncation
+/// leaves unbalanced braces, and a file that was unbalanced before the edit
+/// is not this edit's fault. The rejection reports the deficit's before →
+/// after numbers (backlog 08d2125d).
 pub(crate) fn validate_emission_artifacts_braces(
     path: &str,
     content: &str,
     new_content: &str,
 ) -> crate::error::Result<()> {
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if ext == "rs" && rust_brace_deficit(new_content) > rust_brace_deficit(content) {
-        return Err(artifact_rejection(
-            "unbalanced delimiters after the edit (the brace/bracket/paren \
-             deficit grew) — the truncation artifact: the payload was cut off",
-        ));
+    if checks_brace_balance(path) {
+        let before = rust_brace_deficit(content);
+        let after = rust_brace_deficit(new_content);
+        if after > before {
+            return Err(artifact_rejection(brace_growth_detail(before, after, &[])));
+        }
     }
     Ok(())
+}
+
+/// The actionable detail for a delimiter-deficit growth (backlog 08d2125d):
+/// the before → after numbers, the op(s) that grew the deficit (empty for the
+/// single-path callers — one replacement, no op indices), and the remedy.
+fn brace_growth_detail(before: usize, after: usize, offenders: &[String]) -> String {
+    // `rust_brace_deficit` bails to `usize::MAX` on an unterminated raw
+    // string — name that cause instead of printing the sentinel (review note).
+    let mut detail = if after == usize::MAX {
+        "unbalanced delimiters after the edit — the brace/bracket/paren \
+         deficit grew and the file ends inside an unterminated raw string"
+            .to_string()
+    } else {
+        format!(
+            "unbalanced delimiters after the edit — the brace/bracket/paren \
+             deficit grew by {} ({before} → {after})",
+            after.saturating_sub(before)
+        )
+    };
+    if !offenders.is_empty() {
+        const NAMED: usize = 3;
+        detail.push_str(&format!(
+            "; {}",
+            offenders
+                .iter()
+                .take(NAMED)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if offenders.len() > NAMED {
+            detail.push_str(&format!(" (+{} more ops grow it)", offenders.len() - NAMED));
+        }
+        detail.push_str(
+            " — rebalance each named op in the SAME call (pair it with its \
+             compensating op), or split the array; set artifact_check:false \
+             when you have verified the result yourself (cargo check / \
+             rustfmt --check)",
+        );
+    }
+    if offenders.is_empty() {
+        // The single-path shape (no op indices): the truncation claim fits a
+        // lone replacement.
+        detail.push_str(" — the truncation artifact: the payload was cut off");
+    } else {
+        // The named-op shape is ALSO the deliberate-restructure case the
+        // escape hatch exists for — asserting truncation here would be false
+        // (review LOW-1).
+        detail.push_str(" — either a truncated payload or a deliberately unbalanced restructure");
+    }
+    detail
+}
+
+/// A short one-line label for one op in an attribution message: the compact
+/// op's raw text, or the anchor's old_string excerpt.
+fn op_label(op: Option<&EditOp>) -> String {
+    match op {
+        Some(EditOp::Line(l)) => format!("'{}'", anchor_excerpt(&l.raw)),
+        Some(EditOp::Anchor(a)) => format!("anchor '{}'", anchor_excerpt(&a.old_string)),
+        None => "unknown op".to_string(),
+    }
+}
+
+/// The batch path's brace-delta guard: reject a combined deficit growth and
+/// name the exact op(s) that caused it (backlog 08d2125d). `trail[i]` is the
+/// deficit after the i-th op (`trail[0]` = before the array) — the exact
+/// running balance, so attribution never guesses from op fragments (a
+/// fragment's own count is wrong when a closer closes an earlier opener).
+fn validate_ops_brace_delta(
+    path: &str,
+    trail: &[usize],
+    ops: &[EditOp],
+) -> crate::error::Result<()> {
+    if !checks_brace_balance(path) || trail.len() < 2 {
+        return Ok(());
+    }
+    let before = trail[0];
+    let after = trail[trail.len() - 1];
+    if after <= before {
+        return Ok(());
+    }
+    let offenders: Vec<String> = trail
+        .windows(2)
+        .enumerate()
+        .filter(|(_, pair)| pair[1] > pair[0])
+        .map(|(idx, pair)| {
+            // A step into `usize::MAX` (an unterminated raw string) has no
+            // printable delta — say so instead of printing the sentinel
+            // (review note).
+            let delta = if pair[1] == usize::MAX {
+                "an unbounded amount".to_string()
+            } else {
+                format!("+{}", pair[1] - pair[0])
+            };
+            format!("ops[{idx}] ({}) grows it by {delta}", op_label(ops.get(idx)))
+        })
+        .collect();
+    Err(artifact_rejection(brace_growth_detail(
+        before, after, &offenders,
+    )))
 }
 
 /// The emission-artifact rejection error (backlog e8b39d72 H2): deliberately
@@ -318,6 +417,16 @@ fn rust_brace_deficit(source: &str) -> usize {
         }
     }
     deficit + stack.len()
+}
+
+/// Whether the brace/bracket/paren deficit guard applies to `path` — the
+/// `.rs`-only scope shared by the single-path and batch validators.
+fn checks_brace_balance(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .eq_ignore_ascii_case("rs")
 }
 
 /// Normalize whitespace for fuzzy matching: strip trailing whitespace from
@@ -1101,17 +1210,29 @@ pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
 /// against the content AS LEFT by the preceding ops — the same contract the
 /// anchors have, so a mixed array's line numbers reflect every earlier op.
 /// Emission artifacts are validated per op on its payload and once on the
-/// combined result's brace delta; the diff itself is the caller's job.
+/// combined result's brace delta — a growth names the offending op(s) from
+/// the deficit trail (backlog 08d2125d); the diff itself is the caller's job.
+/// `artifact_check=false` skips the whole emission-artifact family — the
+/// explicit escape hatch for a legitimate edit the guard false-tripped
+/// (verify the result yourself first: `cargo check` / `rustfmt --check`).
 pub(crate) fn apply_ops(
     path: &str,
     content: &str,
     ops: &[EditOp],
     fuzzy_default: bool,
+    artifact_check: bool,
 ) -> Result<(String, Vec<String>)> {
     let le = detect_line_ending(content);
     let total = ops.len();
+    let track = artifact_check && checks_brace_balance(path);
     let mut current = content.to_string();
     let mut notes: Vec<String> = Vec::new();
+    // The running brace/bracket/paren deficit after each op — the exact
+    // attribution trail for a positive combined delta (backlog 08d2125d).
+    let mut deficits: Vec<usize> = Vec::new();
+    if track {
+        deficits.push(rust_brace_deficit(content));
+    }
     for (idx, op) in ops.iter().enumerate() {
         match op {
             EditOp::Anchor(item) => {
@@ -1176,27 +1297,33 @@ pub(crate) fn apply_ops(
                 current = apply_line_op(&current, &le, line_op, idx)?;
             }
         }
+        if track {
+            deficits.push(rust_brace_deficit(&current));
+        }
     }
     // Per-op line-scoped emission checks (review L2): the ops' join would
     // weaken the sentinel exact-match (a longer join escapes it) and
     // false-positive the dup-doc-line check across op boundaries (two ops'
     // boundary lines are adjacent in the join but not in the spliced
     // result).
-    for op in ops {
-        match op {
-            EditOp::Anchor(item) => validate_emission_artifacts_lines(path, &item.new_string)?,
-            EditOp::Line(line_op) => {
-                if let Some(payload) = line_op.payload.as_deref() {
-                    if !payload.is_empty() {
-                        validate_emission_artifacts_lines(path, payload)?;
+    if artifact_check {
+        for op in ops {
+            match op {
+                EditOp::Anchor(item) => validate_emission_artifacts_lines(path, &item.new_string)?,
+                EditOp::Line(line_op) => {
+                    if let Some(payload) = line_op.payload.as_deref() {
+                        if !payload.is_empty() {
+                            validate_emission_artifacts_lines(path, payload)?;
+                        }
                     }
                 }
             }
         }
     }
     // One combined brace-delta check for the whole array (delta-scoped, so
-    // the combined result is the right scope).
-    validate_emission_artifacts_braces(path, content, &current)?;
+    // the combined result is the right scope) — attributed per op from the
+    // deficit trail (backlog 08d2125d).
+    validate_ops_brace_delta(path, &deficits, ops)?;
     if current == content {
         return Err(crate::error::Error::InvalidInput(
             "the ops produced no change — the result equals the current content".into(),
@@ -1357,7 +1484,7 @@ mod tests {
         values: &[serde_json::Value],
     ) -> Result<(String, Vec<String>)> {
         let ops = parse_ops(values)?;
-        apply_ops(path, content, &ops, false)
+        apply_ops(path, content, &ops, false, true)
     }
 
     fn apply_ok(content: &str, values: &[serde_json::Value]) -> String {
@@ -1619,5 +1746,59 @@ mod tests {
         assert!(err.contains("emission artifact"), "{err}");
         let err = apply_err("a.rs", "fn main() {}\n", &line_ops(&["i1:if x {"]));
         assert!(err.contains("unbalanced delimiters"), "{err}");
+        // Backlog 08d2125d: a positive delimiter delta is attributed to the
+        // exact op(s) that caused it, with the call's before → after deficit
+        // — the agent can rebalance in one shot instead of guessing.
+        // (a) a lone unbalancing op names its op and the numbers.
+        let err = apply_err("a.rs", "fn f() {\n    a();\n}\n", &line_ops(&["r3:    } else {"]));
+        assert!(err.contains("unbalanced delimiters"), "{err}");
+        assert!(err.contains("ops[0]"), "names the offender: {err}");
+        assert!(err.contains("0 → 1"), "reports before → after: {err}");
+        assert!(
+            !err.contains("the payload was cut off"),
+            "the ops variant must not assert truncation: {err}"
+        );
+        assert!(
+            err.contains("either a truncated payload or a deliberately unbalanced restructure"),
+            "the ops variant names both readings: {err}"
+        );
+        // The single-path shape keeps the truncation claim (no op indices).
+        let err = validate_emission_artifacts_braces("a.rs", "fn f() {}\n", "fn new() {\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the payload was cut off"), "{err}");
+        // A payload ending inside an unterminated raw string names the cause
+        // instead of printing usize::MAX (review note).
+        let err = apply_err(
+            "a.rs",
+            "fn f() {}\n",
+            &line_ops(&["r1:fn new() { let s = r#\"open"]),
+        );
+        assert!(err.contains("unterminated raw string"), "{err}");
+        assert!(!err.contains("18446744073709551615"), "{err}");
+        // (b) the same shape WITH a compensating deletion nets to zero.
+        let (out, _) = apply(
+            "a.rs",
+            "fn f() {\n    match m {\n        1 => a(),\n    }\n}\n",
+            &line_ops(&["r2:    if m == 1 {", "r4:    } else {", "d1"]),
+        )
+        .expect("a compensated array applies");
+        assert_eq!(out, "    if m == 1 {\n        1 => a(),\n    } else {\n}\n");
+        // (c) a genuinely truncated payload stays rejected.
+        let err = apply_err("a.rs", "fn f() {}\n", &line_ops(&["r1:fn new() {"]));
+        assert!(err.contains("unbalanced delimiters"), "{err}");
+        assert!(err.contains("emission artifact"), "{err}");
+        assert!(err.contains("0 → 1"), "{err}");
+        // (d) only the offending op is named (3 ops, op 2 grows it).
+        let values = vec![
+            json!({"old_string": "a();", "new_string": "b();"}),
+            json!("r3:    } else {"),
+            json!({"old_string": "fn f()", "new_string": "fn g()"}),
+        ];
+        let err = apply_err("a.rs", "fn f() {\n    a();\n}\n", &values);
+        assert!(err.contains("ops[1]"), "names op 2: {err}");
+        assert!(!err.contains("ops[0]"), "op 1 is not blamed: {err}");
+        assert!(!err.contains("ops[2]"), "op 3 is not blamed: {err}");
+        assert!(err.contains("0 → 1"), "{err}");
     }
 }

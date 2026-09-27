@@ -1077,6 +1077,19 @@ impl AgentLoop {
                     if e.is_non_retryable() || e.is_rate_limited() {
                         return Err(e);
                     }
+                    // A deterministic client rejection (HTTP 4xx other than
+                    // 408/429) is the same dead end as the 429 arm above: the
+                    // provider refused THIS payload, and re-sending it
+                    // byte-identical cannot change the verdict. Live 2027-01:
+                    // z.ai answered all three ladder attempts with `HTTP 400
+                    // ... code 1214 "messages[8].content[0].type type error"`
+                    // — ~5s of backoff for an answer already known. Fails
+                    // fast BEFORE triage (mirroring the 429 arm, which also
+                    // never reaches it); the turn-level layer still owns
+                    // endpoint switching.
+                    if e.is_deterministic_4xx() {
+                        return Err(e);
+                    }
                     // Failure triage (Laya, opt-in; plan 02deea7c): classify
                     // BEFORE burning this inner ladder. A confident needs-user
                     // / permanent reading fails the layer immediately with the

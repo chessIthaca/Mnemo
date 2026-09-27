@@ -4506,6 +4506,79 @@ async fn complete_with_retry_does_not_retry_rate_limit() {
     );
 }
 
+/// A provider that always returns a deterministic HTTP 400 — the shape a
+/// strict gateway rejects a malformed body with (live 2027-01: z.ai's
+/// `code 1214 "messages[8].content[0].type type error"`, the body of the
+/// status line below).
+struct BadRequestProvider {
+    caps: Capabilities,
+    calls: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait]
+impl LlmClient for BadRequestProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-400"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::error::Error::Provider(
+            "provider error: stream request: HTTP 400 Bad Request from \
+             https://api.z.ai/api/coding/paas/v4/chat/completions"
+                .into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn complete_with_retry_does_not_retry_deterministic_4xx() {
+    // Live 2027-01: after the mid-session switch to z.ai/GLM, every attempt
+    // of the 3-attempt ladder re-sent the identical body and got the
+    // identical `HTTP 400 ... code 1214` back — ~5s of backoff sleeps for a
+    // verdict already known. A deterministic client rejection (4xx other
+    // than 408/429) must fail fast: exactly ONE provider call, then Err.
+    // The turn-level ladder (run_turn_attempt) still owns endpoint
+    // switching.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let provider: Arc<dyn LlmClient> = Arc::new(BadRequestProvider {
+        caps: Capabilities::openai(),
+        calls: Arc::clone(&calls),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let provider = agent.provider();
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let result = agent
+        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .await;
+    assert!(result.is_err(), "a deterministic 400 must produce Err");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a deterministic 4xx must fail fast (1 call, not 3): the identical \
+         payload cannot become acceptable on a retry"
+    );
+}
+
 /// A mid-stream provider error (e.g. a connection reset / unexpected EOF)
 /// that arrives *before* any text or tool-call deltas must surface as an
 /// `Err` from `run_turn` — not an `Ok` with empty output — so the outer

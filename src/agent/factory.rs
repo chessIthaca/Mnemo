@@ -2249,7 +2249,13 @@ mod tests {
             // 36_300 → 37_300 (2027-01-11): same cause as the Planning raise
             // above (expand_result, ~+418); measures Executing at 36_963
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 37_300),
+            // 37_300 → 37_900 (2026-09-27): file_edit and multi_edit gain the
+            // `artifact_check` escape-hatch property (backlog 08d2125d) — the
+            // property must stay DECLARED because strict providers validate
+            // args against the schema, so the terse ~+280 chars cannot move to
+            // the rejection message alone; measures Executing at 37_600 chars.
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 37_900),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2443,7 +2449,12 @@ mod tests {
             // 31_600 → 32_700 (2027-01-11): same cause as the Planning raise
             // above (expand_result, ~+418); measures Reviewing at 32_227
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Reviewing, 32_700),
+            // 32_700 → 33_100 (2026-09-27): same cause as the Executing raise
+            // above (the `artifact_check` property rides file_edit + multi_edit
+            // schemas, shared with the Reviewer's advertised array); measures
+            // Reviewing at 32_864 chars. Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::Reviewing, 33_100),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —

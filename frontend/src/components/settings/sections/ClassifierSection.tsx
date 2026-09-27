@@ -458,7 +458,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
                   {status === "ready"
                     ? "— off = shadow: classify + log only. Flip it once the routing log has enough labelled turns to trust."
-                    : "— locked until the classifier is ready (install the checkpoint above); a near-chance base model must not steer the model choice."}
+                    : "— locked ON until the classifier is ready (install the checkpoint above); a near-chance base model must not steer the model choice, and switching it back off always works."}
                 </span>
               </span>
             </label>
@@ -512,7 +512,18 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 max={1}
                 step={0.05}
                 value={routingThreshold}
-                onChange={(e) => setRoutingThreshold(Number(e.target.value))}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  // Review L4: clearing the field must never read as 0 ("route
+                  // everything") — an empty, non-finite or out-of-range edit
+                  // keeps the committed gate and snaps the field back to it.
+                  const next = raw === "" ? Number.NaN : Number(raw);
+                  if (!Number.isFinite(next) || next < 0 || next > 1) {
+                    e.target.value = String(routingThreshold);
+                    return;
+                  }
+                  setRoutingThreshold(next);
+                }}
                 className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
               />
               <span className="text-[0.7rem] text-[color:var(--text-muted)]">

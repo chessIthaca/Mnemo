@@ -211,7 +211,10 @@ pub struct RouteDecisionRow {
     /// below threshold, unset or dangling target). The per-iteration arm
     /// re-checks the same guard, so a mid-turn context switch (a skill
     /// starting, say) is the one case where a turn keeps its chain model
-    /// despite a resolved target here.
+    /// despite a resolved target here. A target re-pointed mid-turn is
+    /// re-resolved by later iterations, which can then run on the new model
+    /// while this row keeps the turn-start fact; a target that did NOT resolve
+    /// here is never armed, so it cannot start routing mid-turn either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// The task text handed to the classifier, capped at

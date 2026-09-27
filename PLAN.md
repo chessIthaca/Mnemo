@@ -494,7 +494,8 @@ hypothesis). A plan must encode findings, not assumptions: the ShapeGraph
 session assumed `ext._evaluator.clashOf()` was callable from `/agent.html`
 and a 30-second probe answered `typeof ext._evaluator` -> `undefined`, so the
 plan had to be rewritten before any code was written. A bare call
-(`boil()`), a `::` path and a `self.`-rooted call are ordinary mentions, not
+(`boil()`), a `::` path, a `self.`-rooted call and a `/`-preceded path segment
+before `(` (`src/kettle.rs(42)`) are ordinary mentions or locators, not
 claims. `update_plan` applies the rule to the appended text only, so a plan
 accepted before the rule stays updatable.
 

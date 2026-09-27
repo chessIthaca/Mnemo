@@ -825,6 +825,7 @@ impl AgentLoop {
                         agent_id,
                         cmd_rx,
                         session_id,
+                        &tool_schemas,
                     )
                     .await
                 {
@@ -4228,6 +4229,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // subset through the normal tool path (execute_tool_batch).
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         session_id: Option<&str>,
+        // The request's advertised tool schemas — the one-liner's required
+        // list comes from the matching tool's `parameters.required`.
+        tool_schemas: &[crate::provider::ToolSchema],
     ) -> Option<TurnOutcome> {
         // Bad JSON is an LLM output issue the model can recover from by
         // emitting valid JSON — it does NOT count toward MAX_RETRIES
@@ -4461,7 +4465,11 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // BEFORE this result is pushed (same ordering rule as the
             // tool-execution circuit breaker), so a match is always
             // against a PRIOR failure.
-            let failed_content = bad_json_retry_message();
+            let failed_content = bad_json_retry_message(
+                &tc.name,
+                &required_fields(tool_schemas, &tc.name),
+                tc.arguments.trim().is_empty(),
+            );
             let guidance = if repeated_tool_failure(messages, &tc.name, &failed_content) {
                 repeated_bad_json_correction(&tc.name, &failed_content)
             } else {
@@ -4631,25 +4639,51 @@ pub(crate) fn last_user_query(messages: &[Message]) -> Option<String> {
         .map(|m| m.content.as_text())
 }
 
-/// The per-call bad-JSON retry guidance (the FIRST failure): the model is
-/// told the arguments did not parse, that an empty argument object is a
-/// mistake, and to re-read the schema and re-emit the complete call. This
-/// is the right advice for the dropped-required-field class (plan
-/// 4fa222cc); it is deliberately NOT used on a repeat, where the problem
-/// is the emission itself (see [`repeated_bad_json_correction`]).
-fn bad_json_retry_message() -> String {
-    "error: arguments JSON was malformed or truncated — \
-     please retry with valid, complete JSON. An empty \
-     argument object is a mistake (except genuine no-arg \
-     tools like current_plan/backlog_list): re-read the \
-     tool's schema, rewrite the COMPLETE call with every \
-     required field present and non-blank — content \
-     first, never emit a call to discover fields — and \
-     emit the corrected call once; never resend the \
-     broken call unchanged. For large file writes, split \
-     the content into smaller chunks or use multiple \
-     file_edit calls."
-        .to_string()
+/// The per-call bad-JSON retry guidance (the FIRST failure): it NAMES the
+/// call that failed and the fields its schema requires, so the model sees
+/// the specific gap instead of a generic lecture. Two deterministic
+/// variants — empty arguments vs arguments that are not valid JSON — and
+/// NO call id: repeat detection ([`repeated_tool_failure`]) matches on
+/// byte-identical content, so the text must stay a pure function of
+/// (tool, variant). This is the right advice for the dropped-required-field
+/// class (plan 4fa222cc); it is deliberately NOT used on a repeat, where
+/// the problem is the emission itself (see [`repeated_bad_json_correction`]).
+///
+/// Replaced the generic ~85-word preamble (plan d3aedfee, 2027-01): the long
+/// version was empirically ineffective — it told the model to "re-read the
+/// schema" without naming what was actually missing.
+fn bad_json_retry_message(tool_name: &str, required: &[String], empty_args: bool) -> String {
+    let failure = if empty_args {
+        "went out with no arguments"
+    } else {
+        "went out with arguments that are not valid JSON"
+    };
+    let required_clause = if required.is_empty() {
+        String::new()
+    } else {
+        format!(" — required: {}", required.join(", "))
+    };
+    format!(
+        "error: `{tool_name}` {failure}{required_clause}. Re-emit the complete \
+         call once with valid JSON; never resend it unchanged."
+    )
+}
+
+/// Required field names the tool's schema declares (`parameters.required`) —
+/// empty when the tool has no schema in the current request or requires
+/// nothing, in which case the guidance omits the clause rather than guessing.
+fn required_fields(tool_schemas: &[crate::provider::ToolSchema], tool_name: &str) -> Vec<String> {
+    tool_schemas
+        .iter()
+        .find(|s| s.name == tool_name)
+        .and_then(|s| s.parameters.get("required"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the strategy-changing guidance for a REPEATED bad-JSON failure

@@ -1240,25 +1240,37 @@ async fn error_recovery_malformed_json() {
         .find(|m| m.role == Role::Tool)
         .expect("should have a tool message");
     assert!(
-        tool_msg.content.as_text().contains("malformed")
-            || tool_msg.content.as_text().contains("truncated"),
-        "expected malformed/truncated error, got: {}",
+        tool_msg.content.as_text().contains("not valid JSON"),
+        "expected an invalid-JSON error, got: {}",
+        tool_msg.content.as_text()
+    );
+    // Plan d3aedfee: the first-failure guidance is a per-call one-liner:
+    // it NAMES the failing tool and the fields its schema requires
+    // (`file_read` is registered here; its schema requires `path`).
+    assert!(
+        tool_msg.content.as_text().contains("`file_read`"),
+        "feedback should name the failing tool, got: {}",
+        tool_msg.content.as_text()
+    );
+    assert!(
+        tool_msg.content.as_text().contains("required: path"),
+        "feedback should list the schema's required fields, got: {}",
         tool_msg.content.as_text()
     );
     assert!(
         tool_msg
             .content
             .as_text()
-            .contains("rewrite the COMPLETE call"),
-        "malformed-JSON feedback should teach rewrite-complete (content first), got: {}",
+            .contains("Re-emit the complete call once"),
+        "malformed-JSON feedback should teach re-emit-complete, got: {}",
         tool_msg.content.as_text()
     );
     assert!(
         tool_msg
             .content
             .as_text()
-            .contains("never resend the broken call unchanged"),
-        "malformed-JSON feedback should forbid resending the broken call, got: {}",
+            .contains("never resend it unchanged"),
+        "malformed-JSON feedback should forbid resending the call unchanged, got: {}",
         tool_msg.content.as_text()
     );
 
@@ -12146,10 +12158,89 @@ async fn bad_json_batch_isolation_runs_valid_siblings() {
         "the malformed call must surface an error result"
     );
     assert!(
+        result_b.content.as_text().contains("`search`"),
+        "the malformed call's guidance must name the failing tool — \
+         got: {}",
+        result_b.content.as_text()
+    );
+    assert!(
         result_b.content.as_text().contains("JSON"),
         "the malformed call's guidance must describe the JSON failure — \
          got: {}",
         result_b.content.as_text()
+    );
+}
+/// Regression (plan d3aedfee, correction one-liner): the FIRST bad-JSON
+/// failure names the failing tool and the fields its schema requires —
+/// replacing the ~85-word generic preamble ("re-read the tool's schema"),
+/// which was empirically ineffective in the 2027-01 live session. A call
+/// that lands with NO arguments at all is the live shape.
+#[tokio::test]
+async fn bad_json_first_failure_names_the_tool_and_its_required_fields() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // One call, no ArgumentDelta at all: `memory_write` (registered, with a
+    // required-field schema) lands with empty arguments.
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_w".into(),
+                name: "memory_write".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("remember this decision")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let guidance = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_w"))
+        .expect("the malformed call must have a tool result")
+        .content
+        .as_text();
+    assert!(
+        guidance.contains("`memory_write`"),
+        "the guidance must name the failing tool — got: {guidance}"
+    );
+    assert!(
+        guidance.contains("no arguments"),
+        "the empty-arguments variant must be named — got: {guidance}"
+    );
+    assert!(
+        guidance.contains("tier")
+            && guidance.contains("title")
+            && guidance.contains("content"),
+        "the guidance must list the schema's required fields — got: {guidance}"
+    );
+    assert!(
+        guidance.len() < 240,
+        "the correction must stay a one-liner (the old preamble was ~470 chars) — \
+         got {} chars: {guidance}",
+        guidance.len()
     );
 }
 /// A `file_read` tool-call event pair (Start + ArgumentDelta) for the given

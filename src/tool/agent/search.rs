@@ -933,7 +933,13 @@ pub(crate) enum FtsOutcome {
     /// during the retry. The caller falls through to the walk and surfaces
     /// the staleness.
     Stale {
+        /// The still-stale files the caller surfaces (the walk answers).
         stale: Vec<StaleFile>,
+        /// The set the refresh DID repair before the re-query still tripped
+        /// (empty when nothing was refreshed) — a budget spent mid-set must
+        /// not drop those files' log records: the caller logs them as
+        /// `inline-reindex`, then `stale` as `surfaced-only`.
+        repaired: Vec<StaleFile>,
     },
 }
 
@@ -1054,7 +1060,9 @@ fn fts_page(
 /// ([`crate::codegraph::CodeGraph::reindex_stale_files`], under
 /// [`crate::codegraph::STALE_REINDEX_BUDGET`]) and the query is re-run ONCE
 /// from the fresh index — the outcome then carries the number of files
-/// actually refreshed so the caller can disclose the side effect. A
+/// actually refreshed so the caller can disclose the side effect; a repair
+/// the re-query still trips over (a budget spent mid-set) carries the
+/// refreshed set on [`FtsOutcome::Stale`], so those records survive. A
 /// staleness above the ceiling, a budget that ran out with files still
 /// stale, a busy index pass, a failed re-index, or files edited again during
 /// the retry yields [`FtsOutcome::Stale`] — the caller walks and surfaces the
@@ -1097,6 +1105,7 @@ pub(crate) fn try_index(
         }
         return Some(FtsOutcome::Stale {
             stale: page.stale,
+            repaired: std::mem::take(&mut last_stale),
         });
     }
     None
@@ -1695,7 +1704,18 @@ impl Tool for SearchTool {
                             };
                             return ToolResult::success(with_note(body, &note));
                         }
-                        Some(FtsOutcome::Stale { stale }) => {
+                        Some(FtsOutcome::Stale { stale, repaired }) => {
+                            // A budget spent mid-set refreshed part of the set
+                            // before the re-query still tripped — those files
+                            // were repaired inline and keep their records
+                            // (review LOW 2); the rest is surfaced below.
+                            log_stale(
+                                staleness_log.as_ref(),
+                                "search",
+                                &root,
+                                &repaired,
+                                crate::index_staleness::Action::InlineReindex,
+                            );
                             let sample = log_stale(
                                 staleness_log.as_ref(),
                                 "search",

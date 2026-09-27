@@ -612,7 +612,7 @@ pub struct GetSettingsGeneral {
     /// it. Opt-in, off by default.
     pub auto_compact_on_plan_complete: bool,
     /// Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — the
-    /// six flags plus their knobs, rendered as a nested object like `laya`.
+    /// seven flags plus their knobs, rendered as a nested object like `laya`.
     /// `OptimizerConfig` serializes directly (its `compress_extra_commands`
     /// list is skipped while empty), so the Settings → Savings section reads
     /// every current value and only sends what the user changed.
@@ -1480,6 +1480,7 @@ mod settings_dto_tests {
         // documented constants, so a default change cannot desync the wire.
         assert_eq!(v["general"]["optimizer"]["archive"], true);
         assert_eq!(v["general"]["optimizer"]["delta_reads"], true);
+        assert_eq!(v["general"]["optimizer"]["recall_delta"], true);
         assert_eq!(v["general"]["optimizer"]["quality_score"], true);
         assert_eq!(
             v["general"]["optimizer"]["archive_min_chars"],

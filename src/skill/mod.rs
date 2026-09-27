@@ -15,7 +15,10 @@
 //! Skills are defined as TOML files in `.coding/skills/<name>.toml` and loaded
 //! into a [`SkillLibrary`] — the skills dir plus the LIVE registry. Adding a
 //! skill is dropping a file (or authoring one with the `skill_create` tool)
-//! and calling `skill_reload`: no recompile, no app restart. Normal security
+//! and calling `skill_reload`: no recompile, no app restart. Authoring is not
+//! plan-gated either: the `create_skill` overlay (available_in Complete +
+//! Planning) grants `skill_create` through its allow-list, so a skill file can
+//! be written from Complete or Planning with no plan around it. Normal security
 //! controls (the approval gate, per safety mode) apply to every tool call
 //! inside a skill exactly as outside it.
 
@@ -43,7 +46,9 @@ pub struct SkillSpec {
     pub available_in: Vec<WorkflowState>,
     /// Where the workflow lands after `skill_end`.
     pub target_state: WorkflowState,
-    /// The tool allow-list active while the skill runs. Memory tools are
+    /// The tool allow-list active while the skill runs — it scopes the
+    /// MUTATING tools. Memory tools and the full read-only surface (every
+    /// `SafetyLevel::AutoRun` agent tool except trusted `mcp__` ones) are
     /// always available regardless of this list.
     pub tools: Vec<String>,
     /// The goal the agent drives toward while the skill is active.
@@ -547,6 +552,120 @@ prompt = "Merge."
         assert!(
             direct_push < branch_delete,
             "the direct path must push BEFORE deleting the branch — the GH013 recovery needs the ref (push at {direct_push}, delete at {branch_delete})"
+        );
+    }
+
+    #[test]
+    fn shipped_skills_name_live_tools_and_create_skill_ships_the_authoring_grant() {
+        // The create_skill overlay (backlog 1b4dfad3) is the plan-free
+        // authoring entry point: startable from Complete + Planning with no
+        // plan, landing back in Planning. Its allow-list is the ONLY thing
+        // that makes `skill_create` reachable from Complete (the allow-list
+        // grant pinned in src/tool/mod.rs,
+        // `skill_create_is_executing_only_unless_a_skill_names_it`) — a silent
+        // drop of that entry would quietly re-break plan-free authoring.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let create = reg
+            .get("create_skill")
+            .expect("create_skill.toml parses and loads");
+        assert_eq!(create.target_state, WorkflowState::Planning);
+        assert!(reg.is_available_in("create_skill", WorkflowState::Complete));
+        assert!(reg.is_available_in("create_skill", WorkflowState::Planning));
+        assert!(
+            create.tools.iter().any(|t| t == "skill_create"),
+            "the overlay must carry the authoring grant in its allow-list"
+        );
+        assert!(
+            create.tools.iter().any(|t| t == "read_files"),
+            "the overlay reads the file back with the LIVE read tool"
+        );
+        // The prompt is injected every turn — pin its load-bearing steps.
+        for anchor in [
+            "skill_create",
+            "skill_reload",
+            "skill_end",
+            "skill_start",
+            "cargo test",
+            "merge_to_main",
+        ] {
+            assert!(
+                create.prompt.contains(anchor),
+                "create_skill prompt carries the {anchor} step"
+            );
+        }
+        // The incident that motivated the rename: merge_to_main listed the
+        // `file_read` shim, so the model's `read_files` call was DENIED inside
+        // the skill (backlog 834ec126).
+        assert!(
+            reg.get("merge_to_main")
+                .expect("merge_to_main.toml parses and loads")
+                .tools
+                .iter()
+                .any(|t| t == "read_files"),
+            "merge_to_main must name the live read tool"
+        );
+        // Live tool names everywhere, never the legacy redirect shims:
+        // `file_read`/`file_append` are folded into read_files/file_write
+        // (src/agent/approval.rs), and the model calls the live names — so a
+        // shim entry is silently useless. Pinned repo-wide so the next
+        // hand-authored skill file cannot reintroduce the trap.
+        for spec in reg.iter() {
+            for shim in ["file_read", "file_append"] {
+                assert!(
+                    !spec.tools.iter().any(|t| t == shim),
+                    "{} names the legacy shim {shim} — use the live tool name",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_merge_sync_parses_and_carries_the_closeout_order() {
+        // The closeout skill (user request 2026-09-26, replacing the ad-hoc
+        // closeout research plan 167f93bb): the repo's own `.coding/skills/*.toml`
+        // must never rot - a malformed file is only logged-and-skipped at
+        // startup, so the skill would silently vanish.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let sync = reg
+            .get("post_merge_sync")
+            .expect("post_merge_sync.toml parses and loads");
+        assert!(reg.is_available_in("post_merge_sync", WorkflowState::Complete));
+        assert!(reg.is_available_in("post_merge_sync", WorkflowState::Planning));
+        assert!(!reg.is_available_in("post_merge_sync", WorkflowState::Executing));
+        // ORDERING is the point: the fetch/prune must precede the pull, and the
+        // pull must precede retiring the branch - a stale remote-tracking ref or
+        // a delete against an unsynced main is exactly the failure this skill
+        // exists to prevent.
+        let fetch = sync
+            .prompt
+            .find("git fetch --prune origin")
+            .expect("post_merge_sync prompt carries the fetch/prune step");
+        let pull = sync
+            .prompt
+            .find("git pull --no-rebase")
+            .expect("post_merge_sync prompt carries the sync step");
+        let branch_delete = sync
+            .prompt
+            .find("git branch -d <branch>")
+            .expect("post_merge_sync prompt carries the branch retirement");
+        assert!(
+            fetch < pull,
+            "the fetch must precede the pull (fetch at {fetch}, pull at {pull})"
+        );
+        assert!(
+            pull < branch_delete,
+            "the sync must precede retiring the branch (pull at {pull}, delete at {branch_delete})"
+        );
+        assert!(
+            sync.prompt.contains("NEVER commit to main"),
+            "post_merge_sync prompt forbids commits to main"
+        );
+        assert!(
+            sync.prompt.contains("skill_end"),
+            "post_merge_sync prompt exits via skill_end"
         );
     }
 

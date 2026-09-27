@@ -11,7 +11,7 @@ import type { SettingsSectionHandle } from "../types";
 import { ModelCombobox } from "./ModelCombobox";
 import { buildModelOptions, type ModelOption } from "./modelOptions";
 
-/** The six boolean levers ([general.optimizer]) — the knobs ride separately. */
+/** The seven boolean levers ([general.optimizer]) — the knobs ride separately. */
 const BOOL_FIELDS = [
   "delta_reads",
   "compress_output",
@@ -19,6 +19,7 @@ const BOOL_FIELDS = [
   "compaction_survival",
   "quality_score",
   "lean_output_nudge",
+  "recall_delta",
 ] as const;
 type BoolField = (typeof BOOL_FIELDS)[number];
 
@@ -62,6 +63,11 @@ const LEVERS: { field: BoolField; label: string; hint: string }[] = [
     label: "Lean-output nudge",
     hint: "A cache-safe note nudging concise visible output past the fill threshold below.",
   },
+  {
+    field: "recall_delta",
+    label: "Recall delta",
+    hint: "A repeat auto-recall renders a compact reference instead of re-sending the memory snippet.",
+  },
 ];
 
 /** The numeric knob rows: field, label, and the input's step. */
@@ -91,7 +97,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState(false);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
-  // Token-optimizer levers: the six flags, the four knobs, and the
+  // Token-optimizer levers: the seven flags, the four knobs, and the
   // extra-command list as newline-separated text (converted on load/save).
   const [flags, setFlags] = useState<Record<BoolField, boolean> | null>(null);
   const [knobs, setKnobs] = useState<Knobs | null>(null);
@@ -105,7 +111,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
       const p = (s.pricing ?? []).map((r) => ({ ...r }));
       setRows(p);
       setPricingStore(p);
-      // The optimizer block: six flags + four knobs + the extra-command list
+      // The optimizer block: seven flags + four knobs + the extra-command list
       // (edited as newline-separated text).
       const o = s.general.optimizer;
       const f = {} as Record<BoolField, boolean>;
@@ -183,6 +189,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
         optimizer_compaction_survival: flags.compaction_survival,
         optimizer_quality_score: flags.quality_score,
         optimizer_lean_output_nudge: flags.lean_output_nudge,
+        optimizer_recall_delta: flags.recall_delta,
         optimizer_archive_min_chars: knobs.archive_min_chars,
         optimizer_compress_min_chars: knobs.compress_min_chars,
         optimizer_lean_output_fill_pct: knobs.lean_output_fill_pct,

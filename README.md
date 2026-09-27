@@ -179,6 +179,7 @@ archive = false              # opt out: large tool results are not archived
 compaction_survival = false  # opt out: no checkpoint or preserved decisions
 quality_score = false        # opt out: no S–F grade in the ctx hover popup
 lean_output_nudge = false    # opt out: no lean-output steering line
+recall_delta = false         # opt out: repeat recalls re-send the full snippet
 
 # knobs (defaults shown)
 archive_min_chars = 20000    # only results at least this large are archived

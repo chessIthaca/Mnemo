@@ -48,6 +48,13 @@ pub(crate) struct SessionState {
     /// a `merge_to_main` skill that starts and ends in Complete). `None` until
     /// the first capture.
     pub captured_complete_plan_id: std::sync::Mutex<Option<String>>,
+    /// The recall-delta cache (token-optimizer lever `recall_delta`, backlog
+    /// 30bacfa2): what the volatile tail has already injected in this
+    /// session, so a repeat recall of an unchanged memory renders as a
+    /// compact reference instead of a fresh 160-char snippet. Cleared
+    /// whenever compaction rewrites the conversation (the earlier injection
+    /// is gone with it).
+    pub recall_delta: std::sync::Mutex<super::recall_delta::RecallDeltaCache>,
 }
 
 impl SessionState {
@@ -58,6 +65,9 @@ impl SessionState {
             session_id: std::sync::Mutex::new(None),
             primer: std::sync::Mutex::new(None),
             captured_complete_plan_id: std::sync::Mutex::new(None),
+            recall_delta: std::sync::Mutex::new(
+                super::recall_delta::RecallDeltaCache::default(),
+            ),
         }
     }
 }

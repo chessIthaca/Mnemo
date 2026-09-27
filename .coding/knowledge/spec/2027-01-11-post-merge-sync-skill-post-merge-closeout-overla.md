@@ -1,0 +1,6 @@
++++
+title = "post_merge_sync skill — post-merge closeout overlay (plan 7ef0eb71)"
+created = "2027-01-11"
++++
+
+New repo-local skill `.coding/skills/post_merge_sync.toml` (NOT app-shipped; mirrors new_release; SHIPPED_SKILLS untouched): available in Complete/Planning, target_state planning. Runs the post-merge closeout with NO plan: verify PR merged (`gh pr view` - not merged -> STOP) -> `git fetch --prune origin` + remote-ref check (report only; never touch/force-push a remote ref) -> `git checkout main` (dirty tree -> STOP, never stash) -> `git pull --no-rebase` + `git rev-parse main origin/main` equality + `git merge-base --is-ancestor` containment (exit 1 = squash/rebase -> content check) -> `git branch -d <branch>` (-D only with the recorded content check; a branch checked out in a linked worktree refuses both -d and -D -> report and move on, a sweep refusal never justifies abandon_skill) -> closeout memory -> report + skill_end. Guard: prompt-pinning test `skill::tests::post_merge_sync_parses_and_carries_the_closeout_order` in src/skill/mod.rs; docs/FEATURES.md:35 clause. Reviews: round-1 FINDINGS (0 high/1 low, worktree sweep escape) fixed; round-2 delta PASS. Commits 1d3f121 + 6f2be7b on branch wt/mnemo - UNMERGED (lands with the next merge_to_main run). Related: backlog #1b4dfad3 (plan-free create_skill overlay), #834ec126 (read ops for skills).

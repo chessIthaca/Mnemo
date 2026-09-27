@@ -52,6 +52,11 @@
 //! when the factory has the shared store wired (GUI mode); in console mode
 //! (`-console`) no store is opened, so the tool is omitted there too —
 //! headless agents have no Backlog tab.
+//!
+//! The tools own the item's STATUS only. The item↔plan linkage (`plan_id` /
+//! `plan_title`) is recorded by the app layer when the main agent's workflow
+//! enters `Executing` — the tool has no plan context — and a pointer-less
+//! (chat-driven) session is resolved by that linkage alone.
 
 use std::sync::Arc;
 

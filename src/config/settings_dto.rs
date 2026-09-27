@@ -313,6 +313,11 @@ pub struct SettingsSaveDto {
     /// default.
     #[serde(default)]
     pub optimizer_lean_output_nudge: Option<bool>,
+    /// **Recall delta**: a repeat auto-recall of an unchanged memory renders a
+    /// compact reference instead of re-sending its content snippet. On by
+    /// default.
+    #[serde(default)]
+    pub optimizer_recall_delta: Option<bool>,
     /// Minimum tool-result length (chars) before lever 3 archives it.
     /// Default 20000.
     #[serde(default)]
@@ -661,6 +666,9 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(v) = patch.optimizer_lean_output_nudge {
         general.general.optimizer.lean_output_nudge = v;
+    }
+    if let Some(v) = patch.optimizer_recall_delta {
+        general.general.optimizer.recall_delta = v;
     }
     if let Some(v) = patch.optimizer_archive_min_chars {
         general.general.optimizer.archive_min_chars = v;
@@ -1051,6 +1059,7 @@ mod tests {
         // omitted from config.toml entirely.
         let current = Config::default();
         assert!(current.general.general.optimizer.delta_reads);
+        assert!(current.general.general.optimizer.recall_delta);
         assert!(current.general.general.optimizer.archive);
         let patch = SettingsSaveDto {
             optimizer_delta_reads: Some(false),
@@ -1065,19 +1074,24 @@ mod tests {
         assert!(next.general.general.optimizer.compaction_survival);
         assert!(next.general.general.optimizer.quality_score);
         assert!(next.general.general.optimizer.lean_output_nudge);
-        // Flip one back on; the other stays off.
+        assert!(next.general.general.optimizer.recall_delta);
+        // Flip delta reads back on and the recall delta off; a lever the patch
+        // does not name keeps its current value.
         let patch = SettingsSaveDto {
             optimizer_delta_reads: Some(true),
+            optimizer_recall_delta: Some(false),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.optimizer.delta_reads);
+        assert!(!next.general.general.optimizer.recall_delta);
         assert!(!next.general.general.optimizer.archive);
         // An empty patch changes nothing at all.
         let patch = SettingsSaveDto::default();
         let after = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(!after.general.general.optimizer.archive);
         assert!(after.general.general.optimizer.delta_reads);
+        assert!(!after.general.general.optimizer.recall_delta);
     }
 
     #[test]

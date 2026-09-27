@@ -106,6 +106,69 @@ impl MockProvider {
     }
 }
 
+/// A `MockProvider` that records every request it was handed: the
+/// recall-delta tests read the volatile tail (the second-to-last message,
+/// before the CONTEXT_FOOTER sentinel) back out of it.
+///
+/// A wrapper rather than a field on `MockProvider` — the struct is built with
+/// struct-literal syntax in ~20 tests, and a new field would churn all of
+/// them for one test's sake.
+struct RecordingProvider {
+    inner: MockProvider,
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
+impl RecordingProvider {
+    /// Wrap a scripted provider, recording every request it serves.
+    fn new(inner: MockProvider) -> Self {
+        Self {
+            inner,
+            requests: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The volatile tail of every request served, in order.
+    fn request_tails(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("request capture lock poisoned")
+            .iter()
+            .map(|messages| {
+                let index = messages.len().saturating_sub(2);
+                messages
+                    .get(index)
+                    .map(|m| m.content.as_text())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LlmClient for RecordingProvider {
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    fn kind(&self) -> ProviderKind {
+        self.inner.kind()
+    }
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+    async fn complete(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        self.requests
+            .lock()
+            .expect("request capture lock poisoned")
+            .push(messages.to_vec());
+        self.inner.complete(messages, tools, tool_choice).await
+    }
+}
+
 #[async_trait]
 impl LlmClient for MockProvider {
     fn capabilities(&self) -> &Capabilities {
@@ -10210,6 +10273,115 @@ async fn legitimate_long_turn_compactions_reset_budget() {
 }
 
 #[tokio::test]
+async fn compaction_invalidates_the_recall_delta_cache() {
+    // Recall-delta lever (backlog 30bacfa2): a compaction rewrites the
+    // conversation, so whatever the volatile tail injected earlier is gone —
+    // the same (id, content hash) must render in FULL again afterwards.
+    // Without the epoch bump the model would get a reference to text that is
+    // nowhere in the request.
+    use crate::agent::recall_delta::{content_hash, DeltaDecision};
+
+    let dir = tempdir().unwrap();
+    let phrase = "The quick brown fox jumps over the lazy dog. ";
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let provider = Arc::new(BranchMock {
+        caps: Capabilities {
+            supports_tool_choice: true,
+            supports_strict_schema: true,
+            supports_parallel_tools: true,
+            reliable_finish_reason: true,
+            max_context: 40_000,
+            max_output_tokens: 4096,
+            multimodal: false,
+        },
+        summarizer_calls: StdMutex::new(0),
+        model_calls: StdMutex::new(0),
+    });
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: provider.clone(),
+            tools: registry,
+            workflow,
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(40_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    let dyn_provider: Arc<dyn LlmClient> = provider.clone();
+    let context_manager = context::ContextManager::new(40_000, 0.5);
+    let (fanin_tx, _fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut state = super::turn::TurnState::fresh();
+    let mut messages = vec![Message::user_text("hello")];
+
+    let hash = content_hash("semantic", "Title", "body");
+    {
+        let mut cache = agent.session.recall_delta.lock().unwrap();
+        assert_eq!(cache.decide("id-1", hash), DeltaDecision::Full);
+        assert_eq!(
+            cache.decide("id-1", hash),
+            DeltaDecision::Elide { injected_turn: 0 },
+            "the same (id, hash) is elidable before any compaction"
+        );
+    }
+
+    for i in 0..6 {
+        messages.push(Message::text(
+            Role::Assistant,
+            format!("note {i}: {}", phrase.repeat(2500)),
+        ));
+        messages.push(Message::user_text(format!("ack {i}")));
+    }
+    let mut rewrote = false;
+    for _ in 0..6 {
+        let count = context::ContextManager::count_tokens(&messages);
+        if count < context_manager.effective_summarize_at() {
+            break;
+        }
+        let before_calls = *provider.summarizer_calls.lock().unwrap();
+        let mut breakdown = context::ContextManager::count_tokens_by_role(&messages);
+        let outcome = agent
+            .maybe_compact(
+                &mut state,
+                &mut messages,
+                &dyn_provider,
+                &context_manager,
+                &fanin_tx,
+                1,
+                None,
+                &mut cmd_rx,
+                count,
+                &mut breakdown,
+            )
+            .await;
+        assert!(outcome.is_none(), "the compaction must not abort");
+        if *provider.summarizer_calls.lock().unwrap() > before_calls {
+            rewrote = true;
+            break;
+        }
+    }
+    assert!(
+        rewrote,
+        "the scenario must actually summarize (no summary ran), otherwise this \
+         test proves nothing"
+    );
+
+    let mut cache = agent.session.recall_delta.lock().unwrap();
+    assert_eq!(
+        cache.decide("id-1", hash),
+        DeltaDecision::Full,
+        "a compaction must retire the epoch so the next recall renders in full"
+    );
+}
+
+#[tokio::test]
 async fn skill_override_beats_explicit_picker_pin() {
     // Regression (2026-09-04 user report): after the 2026-08-22 picker-pin fix,
     // `resolve_turn_provider` returned the explicit picker pin BEFORE any
@@ -10926,6 +11098,210 @@ async fn no_model_override_no_model_changed_events() {
     assert_eq!(
         model_changed_count, 0,
         "no override in play → no ModelChanged events"
+    );
+}
+
+#[tokio::test]
+async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
+    // Recall-delta lever, end-to-end (backlog 30bacfa2): turn 1 injects the
+    // recalled memory in FULL; turn 2 recalls the same (id, content hash) and
+    // renders the compact reference instead of the snippet — while a memory
+    // written between the turns arrives in full, and the elision is recorded
+    // in the savings ledger. With the lever OFF, turn 2 re-sends the snippet
+    // exactly as before.
+    // M1 is deliberately LONGER than the 160-char render cap: swapping a
+    // full-length snippet for the reference only pays off when the snippet is
+    // near the cap — for a short memory the reference is no smaller, and the
+    // lever's `after >= before` guard correctly keeps the full form.
+    const M1: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path so the history stays linear and the protected branch is never pushed directly";
+    const M1_HEAD: &str = "how to merge feature branches into main safely";
+    const M2: &str = "steps to merge a release branch into main";
+
+    async fn two_turns(
+        enable_lever: bool,
+        add_second_memory: bool,
+    ) -> (Arc<dyn crate::memory::MemoryStoreTrait>, Vec<String>) {
+        let dir = tempdir().unwrap();
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+        let registry = make_registry((*sandbox).clone(), workflow.clone());
+        let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+        let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+        store
+            .write(crate::memory::Memory::new(
+                MemoryTier::Semantic,
+                "merge instructions",
+                M1,
+                1_700_000_000,
+            ))
+            .await
+            .unwrap();
+
+        let scripted = MockProvider::sequence(vec![
+            vec![
+                LlmEvent::TextDelta {
+                    text: "one".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta {
+                    text: "two".into(),
+                },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ],
+        ]);
+        let provider = Arc::new(RecordingProvider::new(scripted));
+        let probe = provider.clone();
+        let agent = AgentLoop::new(
+            AgentLoopConfig {
+                provider: provider,
+                tools: registry,
+                workflow: workflow,
+                sandbox: sandbox,
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: context::ContextManager::new(128_000, 0.5),
+                memory: Some(store.clone()),
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        );
+        let agent = if enable_lever {
+            agent.with_optimizer(Arc::new(std::sync::RwLock::new(
+                crate::config::OptimizerConfig::default(),
+            )))
+        } else {
+            agent
+        };
+
+        let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let mut messages = vec![Message::user_text("merge it")];
+        agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+
+        // A second, equally-matching memory can land between the turns: the
+        // lever-ON run uses it to prove a newly recalled memory arrives in
+        // full. The lever-OFF run leaves it out so both of its turns see the
+        // same corpus, which is what makes its byte-equality check exact.
+        if add_second_memory {
+            store
+                .write(crate::memory::Memory::new(
+                    MemoryTier::Procedural,
+                    "merge checklist",
+                    M2,
+                    1_700_000_100,
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Turn 2 — a fresh turn, so the per-turn recall cache does not carry.
+        messages.push(Message::user_text("merge it"));
+        agent
+            .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+
+        (store, probe.request_tails())
+    }
+
+    let (store_on, tails_on) = two_turns(true, true).await;
+    assert_eq!(tails_on.len(), 2, "one provider request per turn");
+    let turn1 = &tails_on[0];
+    let turn2 = &tails_on[1];
+    assert!(
+        turn1.contains(M1_HEAD),
+        "turn 1 injects the full snippet: {turn1}"
+    );
+    assert!(
+        !turn1.contains("unchanged since injection"),
+        "nothing is elidable on the first sighting: {turn1}"
+    );
+    assert!(
+        turn2.contains("unchanged since injection (turn 1)"),
+        "turn 2 renders the compact reference: {turn2}"
+    );
+    assert!(
+        !turn2.contains(M1_HEAD),
+        "the repeat recall must not re-send the snippet: {turn2}"
+    );
+    assert!(
+        turn2.contains("merge instructions"),
+        "the reference still names the memory: {turn2}"
+    );
+    assert!(
+        turn2.contains(M2),
+        "a newly recalled memory arrives in full: {turn2}"
+    );
+    assert!(
+        turn2.contains("memory_search"),
+        "the reference points at the re-read tool: {turn2}"
+    );
+
+    // The elision reaches the savings ledger (the write is spawned, so poll).
+    let mut row = None;
+    for _ in 0..50 {
+        let rows = store_on.savings_events_rows(None).await.unwrap();
+        if let Some(found) = rows.into_iter().find(|r| r.kind == "recall_delta") {
+            row = Some(found);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = row.expect("a recall_delta savings row must reach the ledger");
+    assert!(
+        row.tokens_before > row.tokens_after,
+        "the reference block must be the smaller form: {row:?}"
+    );
+
+    // Lever OFF: turn 2 re-sends the snippet byte-for-byte as it did before,
+    // and nothing reaches the ledger.
+    let (store_off, tails_off) = two_turns(false, false).await;
+    let turn1_off = &tails_off[0];
+    let turn2_off = &tails_off[1];
+    assert!(
+        turn1_off.contains(M1_HEAD),
+        "the first sighting serves the snippet: {turn1_off}"
+    );
+    assert!(
+        turn2_off.contains(M1_HEAD),
+        "the lever OFF path keeps re-sending the snippet: {turn2_off}"
+    );
+    assert!(
+        !turn2_off.contains("unchanged since injection"),
+        "no reference is rendered when the lever is off: {turn2_off}"
+    );
+    // Byte equality, not containment: the repeat serves the exact entry the
+    // first sighting served, so the OFF path is today's rendering untouched.
+    fn m1_entry(tail: &str) -> &str {
+        let start = tail
+            .find("[semantic] merge instructions")
+            .expect("the recalled entry is present");
+        let rest = &tail[start..];
+        let end = rest.find("\n\n").expect("the entry ends with a blank line") + 2;
+        &rest[..end]
+    }
+    assert_eq!(
+        m1_entry(turn1_off),
+        m1_entry(turn2_off),
+        "with the lever off the repeat is byte-identical to the first serve"
+    );
+    assert!(
+        store_off
+            .savings_events_rows(None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.kind != "recall_delta"),
+        "the lever OFF path records no savings row"
     );
 }
 

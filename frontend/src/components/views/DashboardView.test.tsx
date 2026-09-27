@@ -62,6 +62,7 @@ const savings: SavingsStats = {
   per_kind: [
     { kind: "skeleton", event_count: 2, saved_tokens: 111_456 },
     { kind: "archive_expand", event_count: 1, saved_tokens: -4_000 },
+    { kind: "recall_delta", event_count: 2, saved_tokens: 150 },
   ],
   per_day: [{ day: 19_675, event_count: 3, saved_tokens: 12_345 }],
   recent: [
@@ -75,6 +76,17 @@ const savings: SavingsStats = {
       tokens_saved: 11_100,
       measured: false,
       created_at: 1_700_000_000,
+    },
+    {
+      id: "e2",
+      session_id: "s1",
+      kind: "recall_delta",
+      detail: "5 memories (3 elided)",
+      tokens_before: 400,
+      tokens_after: 250,
+      tokens_saved: 150,
+      measured: false,
+      created_at: 1_700_000_100,
     },
   ],
   cache: {
@@ -124,6 +136,7 @@ describe("DashboardBody (backlog 652ae094)", () => {
     const card = cardMarkup(render(), "dashboard-per-kind");
     expect(card).toContain("skeleton");
     expect(card).toContain("archive_expand");
+    expect(card).toContain("recall_delta");
     expect(card).toContain(fmtTokens(111_456));
     // The signed rendering that makes a re-expansion read as a subtraction.
     expect(card).toContain(fmtTokens(-4_000));
@@ -137,6 +150,7 @@ describe("DashboardBody (backlog 652ae094)", () => {
     // sizes in the cell's title so the numbers stay reachable on hover.
     const html = render();
     expect(html).toContain("src/agent/turn.rs");
+    expect(html).toContain("5 memories (3 elided)");
     expect(html).toContain(fmtSavingsPct(11_100, 12_000)); // "92.5%"
     expect(html).toContain(`title="${fmtTokens(12_000)} → ${fmtTokens(900)}"`);
     expect(html).not.toContain(`${fmtTokens(12_000)} → ${fmtTokens(900)}</span>`);

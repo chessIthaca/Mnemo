@@ -46,7 +46,9 @@ vitest (frontend), `tsc --noEmit` clean.
   a live `SkillLibrary` (the `.coding/skills/` dir + the registry loaded from
   it): `skill_reload` re-reads it into the running app (every workflow state,
   an active skill included) and `skill_create` authors a validated skill file
-  (Executing only), hot-adding it so it is startable immediately.
+  (Executing-only in the base states; a skill grants it by naming it in its
+  allow-list — the `create_skill` overlay authors skills plan-free from
+  Complete/Planning), hot-adding it so it is startable immediately.
 - **Backlog + Run-All.** A persistent prompt backlog (`.coding/backlog.jsonl` —
   one JSON item per line, UUID string ids, git union merge driver for
   concurrent multi-instance adds) feeds the main agent one item at a time.
@@ -301,10 +303,16 @@ vitest (frontend), `tsc --noEmit` clean.
 - **Skill tools** — `skill_start`, `skill_end`, `abandon_skill` plus the
   library tools: `skill_reload` (re-read `.coding/skills/*.toml` into the live
   `SkillLibrary`; allowed in every workflow state, an active skill included,
-  and inside a skill's always-available set) and `skill_create` (author +
-  validate a new skill file, hot-added to the registry; Executing only —
-  PlanFrozen advertises it, and the constructor-granted allow-lists deny it by
-  name so a skill file cannot widen the rule; its write is sandbox-mediated —
+  and inside a skill's always-available set; the Skill state also grants the
+  whole read-only surface wholesale — every `ToolCategory::Agent` +
+  `SafetyLevel::AutoRun` tool (trusted `mcp__` ones excluded — trust ≠ state
+  visibility), backlog 834ec126 — so a skill's allow-list
+  scopes only the MUTATING tools) and `skill_create` (author +
+  validate a new skill file, hot-added to the registry; Executing-only in the
+  base states — PlanFrozen advertises it, and under a skill it is granted ONLY
+  by an explicit allow-list entry (the `create_skill` overlay, available_in
+  Complete + Planning, so authoring needs no plan); the Reviewer surface never
+  gets it; its write is sandbox-mediated —
   a planted symlink or hardlink at the target is refused, and a link at the
   skills dir itself is refused when it leaves the project or resolves into a
   protected tree, and a skill shipped with the app such as `merge_to_main` is
@@ -585,12 +593,13 @@ green, now that they opt a lever out explicitly.
 | Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
 | Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
 | Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
+| Recall delta | `recall_delta` | A repeat auto-recall of a memory whose id AND content hash were already injected in the same compaction epoch renders a compact reference — tier, title, stable id, score, `unchanged since injection (turn N)` — instead of re-sending the 160-char snippet; a new, changed, or post-compaction recall still arrives in full. |
 
 **Two tables** (`src/memory/schema.rs`) record what the levers do:
 `savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,
 tokens_saved, measured, created_at`) — one row per optimization event, kinds
 `truncation, compaction, delta_read, skeleton, compression, archive,
-archive_expand, compaction_checkpoint` — and `tool_result_archive`
+archive_expand, compaction_checkpoint, recall_delta` — and `tool_result_archive`
 (`id, session_id, tool, detail, content, char_count, created_at`) with an FTS5
 index (`tool_result_archive_fts`) behind `expand_result`'s keyword search.
 
@@ -1401,7 +1410,10 @@ product.
   as-of-index) so the edit→watcher gap repairs a modest staleness inline
   under an adaptive bound (up to 32 stale files re-indexed within a ~500 ms
   budget, then the query re-served from the fresh index with a "reindexed N
-  stale file(s)" note) and serves the walk with a staleness note only beyond
+  stale file(s)" note naming the first three paths and pointing at the
+  persistent `index-staleness.jsonl` log — one record per stale file with its
+  cause class, written for every stale path, above the cap included) and
+  serves the walk with a staleness note only beyond
   that ceiling, once the budget is spent, or while an index pass runs;
   `create_plan`'s RECALLED CONTEXT rider title-term-boosts on-point rows;
   uuid-shaped search patterns earn a fired-only known-memory-hit note; a

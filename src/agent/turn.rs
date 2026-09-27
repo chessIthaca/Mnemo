@@ -21,6 +21,7 @@
 //! private state; all fields they touch are `pub(crate)` within the agent
 //! module (see [`super::loop_impl`]).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -28,6 +29,7 @@ use tokio::sync::mpsc;
 use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
+use super::model_routing;
 use super::prompt;
 use super::recall_delta::DeltaDecision;
 use super::StopReason;
@@ -110,6 +112,52 @@ pub(crate) const CORRECTION_SCHEMA_CAP: usize = 1536;
 /// circuit breaker). Shared by the correction builder and the auto-recall
 /// query lookup so the correction never hijacks the recall query.
 pub(crate) const HARNESS_CORRECTION_PREFIX: &str = "[harness tool-call correction";
+
+/// The pre-prompt routing state for one `run_turn` call (backlog 091e694d):
+/// the target an enforced classification selected, plus the counters its
+/// outcome row needs.
+///
+/// `Drop` writes the outcome row, so every exit path of `run_turn` lands it:
+/// a normal return, any of the early returns, and a `?` unwind alike. The
+/// write is best-effort (a log failure never affects a turn).
+pub(crate) struct TurnRoute {
+    /// The target an ENFORCED decision selected -- read by every iteration's
+    /// provider resolution. `None` in shadow mode, below the confidence
+    /// threshold, or for a label the question never offered.
+    target: Option<model_routing::RouteTarget>,
+    /// Joins the decision row this turn already wrote.
+    turn_id: String,
+    /// The agent the turn ran on (the routing log's `agent_id`).
+    agent_id: String,
+    /// Provider-request iterations this turn ran.
+    iterations: u32,
+    /// Tool calls the model requested this turn.
+    tool_calls: u32,
+    /// Consecutive-tool-error count as of the last dispatch batch.
+    tool_errors: u32,
+    /// The terminal failure the harness recorded (see
+    /// [`model_routing::RouteOutcomeRow::outcome`]); `None` = none seen.
+    failure: Option<&'static str>,
+    /// Where the outcome row is appended (the routing gate's log path).
+    log_path: PathBuf,
+}
+
+impl Drop for TurnRoute {
+    fn drop(&mut self) {
+        model_routing::append_row(
+            &self.log_path,
+            &model_routing::RouteOutcomeRow {
+                ts: model_routing::now_millis(),
+                turn_id: self.turn_id.clone(),
+                agent_id: self.agent_id.clone(),
+                outcome: self.failure.unwrap_or("ok").to_string(),
+                iterations: self.iterations as usize,
+                tool_calls: self.tool_calls as usize,
+                tool_errors: self.tool_errors,
+            },
+        );
+    }
+}
 
 /// Loop-carried state for one [`AgentLoop::run_turn`] call: the counters,
 /// signals, and per-turn caches that survive across loop iterations. The
@@ -210,6 +258,13 @@ pub(crate) struct TurnState {
     /// counter) — a mismatch with the live version invalidates the cache
     /// even when the query text is unchanged.
     last_recall_store_version: u64,
+    /// Pre-prompt routing for THIS turn (backlog 091e694d): `Some` when the
+    /// turn was classified -- it carries the target every iteration's provider
+    /// resolution reads, and its `Drop` writes the outcome half of the routing
+    /// log. `None` (routing off or unwired, or the classifier answered
+    /// nothing) = no arm fires, no row is written, and model selection is
+    /// exactly today's.
+    route: Option<TurnRoute>,
 }
 
 impl TurnState {
@@ -234,6 +289,7 @@ impl TurnState {
             last_recalled_user_query: None,
             last_recall_results: None,
             last_recall_store_version: 0,
+            route: None,
         }
     }
 }
@@ -349,7 +405,20 @@ impl AgentLoop {
         // the field docs). The phase methods thread it as `&mut`.
         let mut state = TurnState::fresh();
 
+        // Pre-prompt routing (backlog 091e694d): classify this turn's task
+        // text ONCE, here, before the first request is built -- a trivial
+        // first message does not become architectural at iteration 7, and
+        // re-classifying per iteration would thrash models mid-turn. The
+        // decision lives in `state.route`; each iteration's provider
+        // resolution reads its target.
+        state.route = self.route_turn_start(messages, agent_id).await;
+
         loop {
+            // Routing log (backlog 091e694d): count this provider iteration.
+            if let Some(route) = state.route.as_mut() {
+                route.iterations = route.iterations.saturating_add(1);
+            }
+
             // A swap deferred mid-run (a smaller-context model pick) is
             // completed HERE too — before this iteration's provider
             // resolution — so it lands on the very next request of the same
@@ -391,8 +460,13 @@ impl AgentLoop {
 
             // The provider + context manager for THIS iteration's request
             // (re-resolved every iteration — see resolve_iteration_provider).
-            let (provider, context_manager) =
-                self.resolve_iteration_provider(fanin_tx, agent_id).await;
+            let (provider, context_manager) = self
+                .resolve_iteration_provider(
+                    state.route.as_ref().and_then(|r| r.target),
+                    fanin_tx,
+                    agent_id,
+                )
+                .await;
             // The workflow tool filter, read at the TOP of the iteration: the
             // token accounting must see the tools-schema overhead before its
             // first consumer this iteration (the update() below feeds the ctx
@@ -593,7 +667,18 @@ impl AgentLoop {
             if state.stop_reason.is_none() && !buffered_steers.is_empty() {
                 state.stop_reason = Some(StopReason::Steer(buffered_steers));
             }
-            let (stream, estimated_prompt_tokens) = stream_result?;
+            let (stream, estimated_prompt_tokens) = match stream_result {
+                Ok(ok) => ok,
+                Err(err) => {
+                    // Routing log (backlog 091e694d): the provider stream failed
+                    // before producing output -- the `Err` the caller retries.
+                    // Record it before unwinding.
+                    if let Some(route) = state.route.as_mut() {
+                        route.failure = Some("error");
+                    }
+                    return Err(err);
+                }
+            };
 
             // Consume the provider stream (deltas, tool-call assembly, usage
             // stats, command folds) — see consume_stream.
@@ -860,6 +945,9 @@ impl AgentLoop {
             // MAX_RETRIES abort so the distinct message wins when both trip
             // (three consecutive report failures with nothing in between).
             if state.review_report_failures >= REVIEW_REPORT_MAX_FAILURES {
+                if let Some(route) = state.route.as_mut() {
+                    route.failure = Some("aborted");
+                }
                 let _ = fanin_tx
                     .send((
                         agent_id,
@@ -892,6 +980,9 @@ impl AgentLoop {
             // forwarder also latches against that, but the emission contract
             // is: one terminal outcome per turn failure.
             if state.tool_error_count >= MAX_RETRIES {
+                if let Some(route) = state.route.as_mut() {
+                    route.failure = Some("aborted");
+                }
                 // Failure triage: the turn aborts with classified failures
                 // whose retry never landed — resolve them as `cap_reached`,
                 // and name the last classified class in the abort message
@@ -930,6 +1021,103 @@ impl AgentLoop {
 
             // Loop again — the model will see the tool results and continue.
         }
+    }
+
+    /// Classify this turn's task text for pre-prompt routing (backlog
+    /// 091e694d) and return the turn's routing state.
+    ///
+    /// Runs ONCE per turn, before the first request is built. All gates must
+    /// hold: the loop carries a routing gate with a live classifier in the
+    /// shared slot, the `[general.laya] routing` opt-in is on (the resolver's
+    /// live policy), and the conversation has a user message to classify. The
+    /// decision row is written here; the outcome row is written by the
+    /// returned state's `Drop`.
+    ///
+    /// `None` -- no classification, no row -- when any gate is off or the
+    /// classifier gives no usable answer. Never fails or blocks a turn: the
+    /// classifier call answers `None` on every failure path and the log write
+    /// is best-effort.
+    async fn route_turn_start(&self, messages: &[Message], agent_id: AgentId) -> Option<TurnRoute> {
+        // Never classify a spawned agent's turn: subagents, reviewers and
+        // compaction calls are not routed, and a spawned task text is not a
+        // user turn — the corpus stays user-task text. The resolver's own
+        // guard would refuse the model switch anyway; this keeps the LOG clean
+        // too (no decision/outcome rows for spawned turns).
+        if self.is_subagent() {
+            return None;
+        }
+        let policy = self.model_resolver.as_ref()?.routing_policy()?;
+        let gate = self.routing.as_ref()?;
+        let classifier = gate.classifier()?;
+        let log_path = gate.log_path().to_path_buf();
+        let text = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.as_text())?;
+        let decision =
+            model_routing::classify_task_text(classifier.as_ref(), &text, policy.threshold).await?;
+        let shadow = !policy.enforce;
+        // Shadow mode never selects a target: the decision is logged, the
+        // model is untouched. Enforce mode resolves the target NOW so the
+        // decision row can name the model this turn is routed onto; the
+        // per-iteration arm re-resolves (and re-guards) with the same
+        // resolver call, so a state change mid-turn still wins.
+        let arm_target = if shadow { None } else { decision.target };
+        let routed = match arm_target {
+            Some(target) => self.resolve_routed_model(target).await,
+            None => None,
+        };
+        let agent = agent_id.to_string();
+        let turn_id = model_routing::new_turn_id(&agent);
+        model_routing::append_row(
+            &log_path,
+            &model_routing::RouteDecisionRow {
+                ts: model_routing::now_millis(),
+                turn_id: turn_id.clone(),
+                agent_id: agent.clone(),
+                shadow,
+                label: decision.label.clone(),
+                confidence: decision.confidence,
+                threshold: policy.threshold,
+                target: decision.target.map(|t| t.label().to_string()),
+                enforced: routed.is_some(),
+                model: routed
+                    .as_ref()
+                    .map(|m| format!("{}/{}", m.endpoint, m.model)),
+                task_text: model_routing::cap_task_text(&text),
+                probabilities: decision.probabilities.clone(),
+            },
+        );
+        Some(TurnRoute {
+            target: arm_target,
+            turn_id,
+            agent_id: agent,
+            iterations: 0,
+            tool_calls: 0,
+            tool_errors: 0,
+            failure: None,
+            log_path,
+        })
+    }
+
+    /// Resolve a routing target against the CURRENT workflow context (backlog
+    /// 091e694d) -- the same resolver call the per-iteration arm makes, so the
+    /// decision row's `enforced` / `model` describe what the arm will do unless
+    /// the context changes mid-turn.
+    async fn resolve_routed_model(
+        &self,
+        target: model_routing::RouteTarget,
+    ) -> Option<crate::config::ModelRef> {
+        let resolver = self.model_resolver.as_ref()?;
+        let wf = self.workflow.lock().await;
+        let ctx = crate::model_resolver::ModelContext::new(
+            wf.state(),
+            wf.active_skill().map(|s| s.name.as_str()),
+            self.is_subagent(),
+            wf.active_plan_kind(),
+        );
+        resolver.resolve_routed(target, ctx)
     }
 
     /// Handle a pending provider swap: the model picker deferred it so the
@@ -1887,6 +2075,15 @@ impl AgentLoop {
             }
         }
 
+        // Routing log (backlog 091e694d): this batch's requested tool calls
+        // and the running consecutive-error count -- the corpus's effort and
+        // failure gradient.
+        let batch_errors = state.tool_error_count;
+        if let Some(route) = state.route.as_mut() {
+            route.tool_calls = route.tool_calls.saturating_add(tool_calls.len() as u32);
+            route.tool_errors = batch_errors;
+        }
+
         // Apply the per-interaction error accounting ONCE per batch
         // (backlog 7f72d3d7): any non-denial failure makes the batch ONE
         // error interaction (+1 — same-time identical failing calls must
@@ -2009,6 +2206,7 @@ impl AgentLoop {
     /// model/effort changes. Extracted from run_turn (quality review HIGH 1).
     async fn resolve_iteration_provider(
         &self,
+        route: Option<model_routing::RouteTarget>,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
     ) -> (Arc<dyn LlmClient>, context::ContextManager) {
@@ -2028,7 +2226,17 @@ impl AgentLoop {
             let wf = self.workflow.lock().await;
             let skill_name = wf.active_skill().map(|s| s.name.as_str());
             let plan_kind = wf.active_plan_kind();
-            match self.resolve_turn_provider(wf.state(), skill_name, plan_kind) {
+            // `route` is the turn's pre-prompt routing decision (backlog
+            // 091e694d): the routed variant applies it above the
+            // state/subagent chain and below the explicit-pin arms; with no
+            // route the plain chain runs unchanged.
+            let resolved = match route {
+                Some(target) => {
+                    self.resolve_turn_provider_routed(wf.state(), skill_name, plan_kind, Some(target))
+                }
+                None => self.resolve_turn_provider(wf.state(), skill_name, plan_kind),
+            };
+            match resolved {
                 Some((p, cm)) => (p, cm),
                 None => (Arc::clone(&default_provider), default_context_manager.clone()),
             }

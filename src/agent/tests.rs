@@ -13319,3 +13319,529 @@ async fn mid_run_default_swap_never_overrides_a_forced_model() {
         "a mid-run default swap must never serve/announce for a forced-model loop: {events:?}"
     );
 }
+
+use crate::agent::model_routing;
+use crate::agent::TurnOutcome;
+
+// --- Pre-prompt model routing (backlog 091e694d) ---------------------------
+
+/// A classifier with one canned answer that counts how many times it was
+/// asked -- `None` models a no-answer backend (disabled / unreachable).
+struct CountingClassifier {
+    answer: Option<Answer>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for CountingClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.answer.clone()
+    }
+}
+
+/// Build a routing gate answering `answer` (a `(label, confidence)` pair, or
+/// `None` for a no-answer backend), counting its calls, logging to `log_path`
+/// -- always a tempdir file, never the real `~/.mnemo` routing log.
+fn routing_gate(
+    answer: Option<(&str, f64)>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    log_path: std::path::PathBuf,
+) -> model_routing::RoutingGate {
+    let answer = answer.map(|(label, confidence)| Answer::Choice {
+        label: label.to_string(),
+        confidence,
+        probabilities: std::collections::BTreeMap::new(),
+    });
+    let classifier: Arc<dyn Classifier> = Arc::new(CountingClassifier { answer, calls });
+    model_routing::RoutingGate::new(Arc::new(std::sync::RwLock::new(Some(classifier))))
+        .with_log_path(log_path)
+}
+
+/// A routing target's provider stand-in: streams one text naming the model it
+/// represents, then stops. Never touches the network.
+struct RoutedProvider {
+    model: String,
+    text: String,
+    caps: Capabilities,
+}
+
+#[async_trait::async_trait]
+impl LlmClient for RoutedProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        Ok(Box::pin(futures::stream::iter(vec![
+            LlmEvent::TextDelta {
+                text: self.text.clone(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])))
+    }
+}
+
+/// The provider a `RoutingStubResolver` hands out for a routed target.
+fn routed_provider(model: &str, text: &str) -> Arc<dyn LlmClient> {
+    Arc::new(RoutedProvider {
+        model: model.to_string(),
+        text: text.to_string(),
+        caps: Capabilities::openai(),
+    })
+}
+
+/// A model ref on the stub endpoint the routing tests configure.
+fn stub_model_ref(model: &str) -> crate::config::ModelRef {
+    crate::config::ModelRef {
+        endpoint: "stub".into(),
+        model: model.into(),
+        reasoning_effort: None,
+    }
+}
+
+/// A routing-only resolver: `resolve` declines (so the turn's default provider
+/// serves), `routing_policy` reports the caller's policy, and `resolve_routed`
+/// answers with the configured target. No HTTP client is ever built.
+struct RoutingStubResolver {
+    policy: Option<model_routing::RoutingPolicy>,
+    cheap: Option<crate::config::ModelRef>,
+    capable: Option<crate::config::ModelRef>,
+    /// When set, every routed target builds THIS provider (a scripted mock for
+    /// multi-iteration turns); otherwise a one-shot provider naming the model.
+    routed_provider: Option<Arc<dyn LlmClient>>,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for RoutingStubResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.policy
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        match target {
+            model_routing::RouteTarget::Cheap => self.cheap.clone(),
+            model_routing::RouteTarget::Capable => self.capable.clone(),
+        }
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        let provider = match &self.routed_provider {
+            Some(p) => p.clone(),
+            None => routed_provider(&model.model, &format!("from-{}", model.model)),
+        };
+        Some((provider, context::ContextManager::new(128_000, 0.5)))
+    }
+}
+
+/// Build a routing test agent: `default_provider` serves unless a route fires,
+/// `resolver` carries the policy + targets, `gate` holds the classifier and the
+/// temp routing log.
+fn routing_agent(
+    dir: &std::path::Path,
+    default_provider: Arc<dyn LlmClient>,
+    resolver: Arc<RoutingStubResolver>,
+    gate: model_routing::RoutingGate,
+) -> AgentLoop {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(default_provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_model_resolver(resolver)
+    .with_routing_gate(gate)
+}
+
+/// Read a routing log into its (decision rows, outcome rows). The file is
+/// JSONL, one row per line; the two shapes are told apart by their required
+/// fields.
+fn read_routing_log(
+    path: &std::path::Path,
+) -> (Vec<model_routing::RouteDecisionRow>, Vec<model_routing::RouteOutcomeRow>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut decisions = Vec::new();
+    let mut outcomes = Vec::new();
+    for line in text.lines() {
+        if let Ok(row) = serde_json::from_str::<model_routing::RouteDecisionRow>(line) {
+            decisions.push(row);
+        } else if let Ok(row) = serde_json::from_str::<model_routing::RouteOutcomeRow>(line) {
+            outcomes.push(row);
+        }
+    }
+    (decisions, outcomes)
+}
+
+/// Drive one turn with a single user message and return its outcome plus text.
+async fn run_routing_turn(agent: &AgentLoop, prompt: &str) -> TurnOutcome {
+    let (fanin_tx, _fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes")
+}
+
+#[tokio::test]
+async fn routing_disabled_never_classifies_and_keeps_todays_model() {
+    // The regression pin for the whole feature: with the `[general.laya]
+    // routing` opt-in OFF (the resolver reports no policy) a turn is not
+    // classified, nothing is logged, and the model is exactly today's.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: None,
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-default", "model selection is unchanged");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no classification without the opt-in"
+    );
+    assert!(
+        !log_path.exists(),
+        "no routing log is written without the opt-in"
+    );
+}
+
+#[tokio::test]
+async fn routing_with_an_empty_classifier_slot_keeps_todays_model() {
+    // Laya disabled / unconfigured = an EMPTY shared slot. Routing is opted in
+    // and a target is configured, but with no classifier the turn must not
+    // classify, must not log, and must keep today's model.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let empty_slot = Arc::new(std::sync::RwLock::new(None));
+    let gate = model_routing::RoutingGate::new(empty_slot).with_log_path(log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert!(!log_path.exists(), "no classifier means no rows at all");
+}
+
+#[tokio::test]
+async fn routing_enforced_trivial_runs_the_turn_on_the_cheap_model() {
+    // The acceptance path: routing on, enforcement on, a stub classifier
+    // answering a confident "trivial", and a configured cheap target -> the
+    // turn runs on the cheap model, and both log rows land.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-cheap-model",
+        "the routed cheap target served the turn"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "classified exactly once"
+    );
+
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1, "one decision row");
+    assert_eq!(outcomes.len(), 1, "one outcome row");
+    let d = &decisions[0];
+    assert_eq!(d.label, "trivial");
+    assert!((d.confidence - 0.93).abs() < 1e-9);
+    assert!((d.threshold - 0.80).abs() < 1e-9);
+    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert!(d.enforced, "enforcement was in effect");
+    assert!(!d.shadow);
+    assert_eq!(d.model.as_deref(), Some("stub/cheap-model"));
+    assert_eq!(d.task_text, "bump the version to 1.1.1");
+    assert_eq!(outcomes[0].turn_id, d.turn_id, "rows join on turn_id");
+    assert_eq!(outcomes[0].outcome, "ok");
+    assert!(outcomes[0].iterations >= 1);
+}
+
+#[tokio::test]
+async fn routing_below_threshold_keeps_the_default_model_but_logs_the_answer() {
+    // Low confidence must never change the model -- and the answer still lands
+    // in the log, because a below-threshold pick is the calibration signal.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.50)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-default", "low confidence changes nothing");
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(outcomes.len(), 1);
+    let d = &decisions[0];
+    assert_eq!(d.label, "trivial");
+    assert!((d.confidence - 0.50).abs() < 1e-9);
+    assert_eq!(d.target, None, "below the gate no target is selected");
+    assert!(!d.enforced);
+    assert_eq!(d.model, None);
+}
+
+#[tokio::test]
+async fn routing_no_answer_writes_nothing_and_keeps_todays_model() {
+    // A dead classifier (disabled backend / timeout / malformed) answers
+    // nothing: no target, no switch, and not a single row -- there is no label
+    // to learn from.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(None, calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the classifier WAS asked (it just had no answer)"
+    );
+    assert!(!log_path.exists(), "no answer means no rows");
+}
+
+#[tokio::test]
+async fn routing_shadow_logs_the_decision_but_never_switches_the_model() {
+    // Shadow mode (enforce off) is the shipping default: the decision --
+    // including the target it WOULD have used -- is logged, the model is not.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-default", "shadow never switches the model");
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(outcomes.len(), 1);
+    let d = &decisions[0];
+    assert!(d.shadow);
+    assert!(!d.enforced);
+    assert_eq!(d.model, None);
+    assert_eq!(
+        d.target.as_deref(),
+        Some("cheap"),
+        "the log records what shadow WOULD have used"
+    );
+    assert_eq!(outcomes[0].turn_id, d.turn_id);
+    assert_eq!(outcomes[0].outcome, "ok");
+}
+
+#[tokio::test]
+async fn routing_classifies_once_per_turn_across_iterations() {
+    // A turn with two provider iterations (a tool round, then a stop) must
+    // classify exactly ONCE -- the decision belongs to the turn, not to the
+    // iteration -- and write exactly one decision + one outcome row, with the
+    // iteration count on the outcome.
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("x.txt"), "ok").unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
+    let scripted: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(vec![
+        one_call_batch("call_1", "file_read"),
+        text_stop("from-cheap-model"),
+    ]));
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: Some(scripted),
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(outcome.text, "from-cheap-model");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one classification per turn, however many iterations it runs"
+    );
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        outcomes[0].iterations >= 2,
+        "the turn really ran multiple iterations (got {})",
+        outcomes[0].iterations
+    );
+    assert_eq!(outcomes[0].outcome, "ok");
+}
+
+#[tokio::test]
+async fn routing_never_classifies_a_subagent_turn() {
+    // The invariant is that spawned agents are not routed -- and the routing
+    // log stays user-task text: a subagent loop carrying the gate must not
+    // classify and must not write rows, even with routing configured and
+    // enforcement on.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(RoutingStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        cheap: Some(stub_model_ref("cheap-model")),
+        capable: Some(stub_model_ref("capable-model")),
+        routed_provider: None,
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+    );
+    agent.set_is_subagent(true);
+
+    let outcome = run_routing_turn(&agent, "bump the version to 1.1.1").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "a spawned turn keeps its model"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a spawned turn is never classified"
+    );
+    assert!(
+        !log_path.exists(),
+        "a spawned turn writes no routing rows"
+    );
+}

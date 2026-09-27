@@ -467,6 +467,27 @@ export interface AppSettings {
       /** Whether the startup failure-triage fine-tune is enabled (managed
        *  runtime only, opt-in). */
       auto_finetune: boolean;
+      /** Whether pre-prompt model routing is enabled (opt-in; backlog
+       *  091e694d; needs a fine-tuned checkpoint — base models are near-chance
+       *  on this task). Shadow-first: decisions are classified + logged, and
+       *  the turn's model only switches once `[general.routing] enforce` is
+       *  on. */
+      routing: boolean;
+    };
+    /** Pre-prompt model routing targets + policy (`[general.routing]`, backlog
+     *  091e694d). Gated by the laya `routing` opt-in; absent = the section is
+     *  at its defaults (no targets, threshold 0.80, shadow). */
+    routing?: {
+      /** The model a confidently-trivial task routes to (null = unset). */
+      cheap: ModelRefConfig | null;
+      /** The model a confidently-architectural task routes to (null = unset). */
+      capable: ModelRefConfig | null;
+      /** The calibrated-probability gate: a decision routes only at or above
+       *  it; below it today's model runs. */
+      threshold: number;
+      /** Whether a confident decision switches the turn's model (false =
+       *  shadow: classify + log only). */
+      enforce: boolean;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
@@ -615,6 +636,19 @@ export interface SettingsSavePatch {
   laya_failure_triage_knn?: boolean;
   /** Startup failure-triage fine-tune (managed runtime only, opt-in). */
   laya_auto_finetune?: boolean;
+  /** Pre-prompt model routing (opt-in; backlog 091e694d; needs a fine-tuned
+   *  checkpoint). Shadow-first: enable the flag to collect decisions, then
+   *  flip `routing.enforce` to actually switch models. */
+  laya_routing?: boolean;
+  /** `[general.routing]` patch (backlog 091e694d). Each target is `null` to
+   *  clear it, an object to set it, or absent to keep it; `threshold` /
+   *  `enforce` are plain optional scalars (absent = keep). */
+  routing?: {
+    cheap?: ModelRefConfig | null;
+    capable?: ModelRefConfig | null;
+    threshold?: number;
+    enforce?: boolean;
+  };
   /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
    *  is opt-in, off by default, and read per tool call from a live mirror, so
    *  a flip lands on the next tool call (no restart). Absent = keep the

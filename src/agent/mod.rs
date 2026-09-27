@@ -25,6 +25,9 @@
 //!   training log).
 //! - [`failure_triage_knn`] — the kNN overlay for failure triage (online
 //!   learning from the training log, independent of the laya-serve sidecar).
+//! - [`model_routing`] — the Laya classifier's pre-prompt model-routing
+//!   decision layer (task complexity -> cheap/capable target, confidence-
+//!   gated and shadow-first, plus the routing training log).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!
@@ -36,6 +39,7 @@ pub mod context;
 pub mod factory;
 pub mod failure_triage;
 pub mod failure_triage_knn;
+pub mod model_routing;
 pub mod prompt;
 pub mod review_scope;
 pub mod steering_stats;

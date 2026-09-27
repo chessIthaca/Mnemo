@@ -497,6 +497,31 @@ pub struct LayaWire {
     /// Whether the startup failure-triage FINE-TUNE is enabled (managed
     /// runtime only; never blocks startup).
     pub auto_finetune: bool,
+    /// Whether PRE-PROMPT MODEL ROUTING is enabled — a separate opt-in from
+    /// `enabled` (backlog 091e694d: each main-agent turn's task text is
+    /// classified trivial vs architectural and, with `routing.enforce` on, a
+    /// confident answer may run the turn on the configured target; needs a
+    /// fine-tuned checkpoint — base models are near-chance on this task).
+    pub routing: bool,
+}
+
+/// Pre-prompt model routing (`general.routing`, backlog 091e694d) — the
+/// targets + policy the Laya classifier's task-complexity routing uses. Always
+/// emitted as a nested object (like `laya`), so the frontend renders the
+/// current targets directly; the section is inert while the `laya` `routing`
+/// opt-in is off.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutingWire {
+    /// The model a confidently-TRIVIAL task routes to (`null` = unset).
+    pub cheap: Option<ModelRefWire>,
+    /// The model a confidently-ARCHITECTURAL task routes to (`null` = unset).
+    pub capable: Option<ModelRefWire>,
+    /// The calibrated-probability gate: a confident answer routes only at or
+    /// above it; below it today's model runs.
+    pub threshold: f64,
+    /// Whether a confident decision switches the turn's model (`false` =
+    /// shadow: classify + log only).
+    pub enforce: bool,
 }
 
 /// A per-context model override (one entry of the `[models]` section). Emitted
@@ -602,6 +627,9 @@ pub struct GetSettingsGeneral {
     pub bundled_embedding_model: Option<String>,
     /// Laya classifier (opt-in) — whether it is enabled + the opt-in flags.
     pub laya: LayaWire,
+    /// Pre-prompt model routing targets + policy (`general.routing`, backlog
+    /// 091e694d) — inert while the `laya` `routing` opt-in is off.
+    pub routing: RoutingWire,
     /// Whether the agent's `browser_*` browser-inspection tools are enabled
     /// (exposes an unauthenticated localhost CDP port — opt-in, off by
     /// default; debug builds always expose it regardless).
@@ -800,6 +828,16 @@ fn model_ref_wire(m: &mnemo::config::ModelRef) -> ModelRefWire {
 }
 
 /// Convert the `[models]` section to its wire form (shared by `get_settings`).
+/// The wire shape of the `[general.routing]` section (backlog 091e694d).
+fn routing_wire(routing: &mnemo::config::RoutingConfig) -> RoutingWire {
+    RoutingWire {
+        cheap: routing.cheap.as_ref().map(model_ref_wire),
+        capable: routing.capable.as_ref().map(model_ref_wire),
+        threshold: routing.threshold,
+        enforce: routing.enforce,
+    }
+}
+
 fn models_config_wire(models: &mnemo::config::ModelsConfig) -> ModelsConfigWire {
     ModelsConfigWire {
         planning: models.planning.as_ref().map(model_ref_wire),
@@ -910,7 +948,9 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 failure_triage: config.general.general.laya.failure_triage,
                 failure_triage_knn: config.general.general.laya.failure_triage_knn,
                 auto_finetune: config.general.general.laya.auto_finetune,
+                routing: config.general.general.laya.routing,
             },
+            routing: routing_wire(&config.general.general.routing),
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
             optimizer: config.general.general.optimizer.clone(),
@@ -1412,10 +1452,17 @@ mod settings_dto_tests {
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,
+                    routing: false,
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
                 optimizer: OptimizerConfig::default(),
+                routing: RoutingWire {
+                    cheap: None,
+                    capable: None,
+                    threshold: 0.80,
+                    enforce: false,
+                },
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.3,
@@ -1568,10 +1615,17 @@ mod settings_dto_tests {
                     failure_triage: false,
                     failure_triage_knn: false,
                     auto_finetune: false,
+                    routing: false,
                 },
                 enable_browser_inspection: false,
                 auto_compact_on_plan_complete: false,
                 optimizer: OptimizerConfig::default(),
+                routing: RoutingWire {
+                    cheap: None,
+                    capable: None,
+                    threshold: 0.80,
+                    enforce: false,
+                },
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.4,

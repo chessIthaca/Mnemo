@@ -36,9 +36,11 @@
 //! to `STALE_REINDEX_CAP` (32) stale files inline under the shared 500 ms
 //! stale-reindex budget — the budget, not the ceiling, is the latency guard —
 //! and re-resolves once from the fresh view, disclosing the side effect
-//! ("reindexed N stale file(s)"); unrepaired staleness (above the ceiling, or
-//! a pass already running) carries a staleness note instead. Files not yet in
-//! the index (brand-new) remain watcher-dependent.
+//! ("reindexed N stale file(s)" — the note names the first few stale paths and
+//! points at the persistent staleness log, which records every stale path with
+//! its cause, above the ceiling included); unrepaired staleness (above the
+//! ceiling, or a pass already running) carries a staleness note instead. Files
+//! not yet in the index (brand-new) remain watcher-dependent.
 //!
 //! Indexed languages: Rust (`.rs`) and TypeScript/TSX (`.ts`/`.tsx`). The
 //! tool descriptions state this explicitly so the agent reaches for the
@@ -262,13 +264,61 @@ struct SymbolArgs {
 /// `graph_search` — resolve a name to candidate symbols with file + line.
 pub struct GraphSearchTool {
     graph: Arc<CodeGraph>,
+    /// The persistent staleness log (backlog fc1d57fe), when wired — the
+    /// same contract as the search tools': one record per stale file and a
+    /// note that points at it. `None` → the note still names the files,
+    /// nothing is persisted.
+    staleness_log: Option<crate::index_staleness::StalenessLog>,
 }
 
 impl GraphSearchTool {
     /// Create the tool over the shared graph handle.
     pub fn new(graph: Arc<CodeGraph>) -> Self {
-        Self { graph }
+        Self {
+            graph,
+            staleness_log: None,
+        }
     }
+
+    /// Wire the persistent staleness log (backlog fc1d57fe) — the factory
+    /// passes the global config dir; tests pass a tempdir so no test ever
+    /// writes the real one.
+    pub fn with_staleness_log(mut self, log: crate::index_staleness::StalenessLog) -> Self {
+        self.staleness_log = Some(log);
+        self
+    }
+}
+
+/// Build the staleness-log entries' evidence for a set of stale source paths
+/// (backlog fc1d57fe) — the graph sweep's counterpart of the search tool's
+/// freshness evidence. The disk-hash probe happens later in
+/// [`crate::tool::agent::search::log_stale`], bounded by the same
+/// inline-repair cap.
+fn stale_files_for(
+    graph: &CodeGraph,
+    paths: &[String],
+) -> Vec<crate::tool::agent::search::StaleFile> {
+    let meta = graph.stored_file_meta().ok();
+    let root = graph.root();
+    paths
+        .iter()
+        .map(|p| {
+            let entry = meta.as_ref().and_then(|m| m.get(p));
+            let stat = std::fs::metadata(root.join(p)).ok();
+            let mtime_disk = stat
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64);
+            crate::tool::agent::search::StaleFile {
+                path: p.clone(),
+                mtime_index: entry.and_then(|m| m.mtime),
+                stored_hash: entry.and_then(|m| m.content_hash.clone()),
+                mtime_disk,
+                size_disk: stat.map(|m| m.len()),
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -339,15 +389,22 @@ impl Tool for GraphSearchTool {
         // the freshness path serves the plain miss — a lookup is never
         // failed by its own repair.
         let graph = self.graph.clone();
+        let staleness_log = self.staleness_log.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
             let view = graph.view().map_err(|e| e.to_string())?;
             let mut matches = view.resolve(&args.query);
             let mut reindexed: Option<usize> = None;
             let mut unrepaired_stale: Option<usize> = None;
+            // The note sample (backlog fc1d57fe): the first few paths, so the
+            // disclosure names files instead of a bare count.
+            let mut stale_sample: Vec<String> = Vec::new();
+            let mut stale_total: usize = 0;
             if matches.is_empty() {
                 // Best-effort sweep: an error here leaves the plain miss.
                 if let Ok(stale) = graph.stale_source_files() {
                     if !stale.is_empty() {
+                        stale_total = stale.len();
+                        let files = stale_files_for(&graph, &stale);
                         if stale.len() <= STALE_REINDEX_CAP {
                             // Ok(0) = a pass was already running (the
                             // indexing flag was claimed) — it will refresh
@@ -369,11 +426,34 @@ impl Tool for GraphSearchTool {
                                         matches = fresh.resolve(&args.query);
                                     }
                                     reindexed = Some(n);
+                                    stale_sample = crate::tool::agent::search::log_stale(
+                                        staleness_log.as_ref(),
+                                        "graph_search",
+                                        graph.root(),
+                                        &files,
+                                        crate::index_staleness::Action::InlineReindex,
+                                    );
                                 }
-                                None => unrepaired_stale = Some(stale.len()),
+                                None => {
+                                    unrepaired_stale = Some(stale.len());
+                                    stale_sample = crate::tool::agent::search::log_stale(
+                                        staleness_log.as_ref(),
+                                        "graph_search",
+                                        graph.root(),
+                                        &files,
+                                        crate::index_staleness::Action::SurfacedOnly,
+                                    );
+                                }
                             }
                         } else {
                             unrepaired_stale = Some(stale.len());
+                            stale_sample = crate::tool::agent::search::log_stale(
+                                staleness_log.as_ref(),
+                                "graph_search",
+                                graph.root(),
+                                &files,
+                                crate::index_staleness::Action::SurfacedOnly,
+                            );
                         }
                     }
                 }
@@ -408,11 +488,21 @@ impl Tool for GraphSearchTool {
             // tool's F10 note).
             if let Some(n) = reindexed {
                 out["note"] = json!(format!(
-                    "reindexed {n} stale file(s) — serving fresh graph results"
+                    "reindexed {n} stale file(s){} — serving fresh graph results",
+                    crate::tool::agent::search::stale_detail(
+                        &stale_sample,
+                        stale_total,
+                        staleness_log.is_some()
+                    )
                 ));
             } else if let Some(n) = unrepaired_stale {
                 out["note"] = json!(format!(
-                    "symbol index may be stale — {n} file(s) on disk are newer than the index"
+                    "symbol index may be stale — {n} file(s) on disk are newer than the index{}",
+                    crate::tool::agent::search::stale_detail(
+                        &stale_sample,
+                        stale_total,
+                        staleness_log.is_some()
+                    )
                 ));
             }
             Ok(out)
@@ -998,6 +1088,7 @@ mod tests {
         // files are re-indexed, the query re-resolved once from the fresh
         // view, and the side effect disclosed.
         let (dir, graph) = indexed_graph();
+        let log_dir = tempfile::tempdir().unwrap();
         // Simulate the edit→watcher gap: add a new symbol to an EXISTING
         // indexed source file, bump its mtime, no reindex.
         let path = dir.path().join("src/lib.rs");
@@ -1013,7 +1104,8 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        let tool = GraphSearchTool::new(graph);
+        let tool = GraphSearchTool::new(graph)
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         let out = payload(tool.execute(json!({ "query": "fresh_symbol" })).await);
         // The miss self-healed: the new symbol is served from the fresh
         // index, with the reindex disclosed.
@@ -1021,8 +1113,10 @@ mod tests {
         assert_eq!(out["symbols"][0]["name"], "fresh_symbol");
         let note = out["note"].as_str().expect("the reindex is disclosed");
         assert!(
-            note.contains("reindexed 1 stale file(s)"),
-            "note discloses the inline re-index: {note}"
+            note.contains(
+                "reindexed 1 stale file(s) (src/lib.rs); full list: index-staleness.jsonl"
+            ),
+            "the note names the stale file and points at the log: {note}"
         );
     }
 
@@ -1049,16 +1143,20 @@ mod tests {
         // rows, and the lookup still serves the normal miss — the repair
         // path never breaks the query (best-effort).
         let (dir, graph) = indexed_graph();
+        let log_dir = tempfile::tempdir().unwrap();
         std::fs::remove_file(dir.path().join("src/main.rs")).unwrap();
-        let tool = GraphSearchTool::new(graph);
+        let tool = GraphSearchTool::new(graph)
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
         assert_eq!(out["count"], 0);
         // The vanished file was pruned (reindexed 1) — disclosed, not an
         // error; the miss is served normally.
         let note = out["note"].as_str().expect("the prune is disclosed");
         assert!(
-            note.contains("reindexed 1 stale file(s)"),
-            "note discloses the prune: {note}"
+            note.contains(
+                "reindexed 1 stale file(s) (src/main.rs); full list: index-staleness.jsonl"
+            ),
+            "the note names the pruned file and points at the log: {note}"
         );
         assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
     }
@@ -1073,6 +1171,7 @@ mod tests {
         // index's adaptive 32 (raised 8 → 32 on 2026-09-26), so this needs
         // ceiling + 1 stale files.
         let (dir, graph) = indexed_graph();
+        let log_dir = tempfile::tempdir().unwrap();
         // STALE_REINDEX_CAP + 1 stale source files: the 2 fixture files plus
         // ceiling - 1 extras.
         let mut stale_names = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
@@ -1095,7 +1194,8 @@ mod tests {
                 .set_modified(later)
                 .unwrap();
         }
-        let tool = GraphSearchTool::new(graph);
+        let tool = GraphSearchTool::new(graph)
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         let out = payload(tool.execute(json!({ "query": "nonexistent_xyz" })).await);
         assert_eq!(out["count"], 0);
         let note = out["note"].as_str().expect("the staleness note is served");
@@ -1106,7 +1206,26 @@ mod tests {
             )),
             "note pins the stale count: {note}"
         );
+        assert!(
+            note.contains(&format!(
+                ", +{} more); full list: index-staleness.jsonl",
+                STALE_REINDEX_CAP + 1 - crate::tool::agent::search::NOTE_SAMPLE_PATHS
+            )),
+            "the note samples the stale files and points at the log: {note}"
+        );
         assert!(!note.contains("reindexed"), "no inline reindex above the cap");
+        // Every stale path reaches the log even above the cap (surfaced-only).
+        let logged = std::fs::read_to_string(
+            log_dir
+                .path()
+                .join(crate::index_staleness::STALENESS_LOG_FILE),
+        )
+        .unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            STALE_REINDEX_CAP + 1,
+            "every stale path is logged"
+        );
         assert!(out["hint"].as_str().unwrap().contains("nonexistent_xyz"));
     }
 
@@ -1119,6 +1238,7 @@ mod tests {
         // 61-file drift left this plan's own regression-test symbol
         // unindexed and forced the manual reindex detour.
         let (dir, graph) = indexed_graph();
+        let log_dir = tempfile::tempdir().unwrap();
         for i in 0..7 {
             std::fs::write(
                 dir.path().join(format!("src/extra{i}.rs")),
@@ -1153,7 +1273,8 @@ mod tests {
                 .set_modified(later)
                 .unwrap();
         }
-        let tool = GraphSearchTool::new(graph);
+        let tool = GraphSearchTool::new(graph)
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         let out = payload(tool.execute(json!({ "query": "fresh_symbol_xyz" })).await);
         assert_eq!(
             out["count"], 1,
@@ -1163,6 +1284,10 @@ mod tests {
         assert!(
             note.contains("reindexed") && note.contains("serving fresh graph results"),
             "inline repair is disclosed: {note}"
+        );
+        assert!(
+            note.contains("+6 more); full list: index-staleness.jsonl"),
+            "the note samples the stale files and points at the log: {note}"
         );
         assert!(
             !note.contains("may be stale"),

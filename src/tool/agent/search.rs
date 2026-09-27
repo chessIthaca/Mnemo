@@ -450,15 +450,29 @@ pub struct SearchTool {
     /// (symbol/text/memory) and overrides the regex heuristics; otherwise the
     /// heuristics run exactly as before.
     tool_choice: Option<crate::tool::agent::tool_choice::ToolChoiceHandle>,
+    /// The persistent staleness log (backlog fc1d57fe), when wired: every
+    /// stale-index repair appends one record per file, and the F10 note
+    /// points at it. `None` (tests, memory-only builds) → the note still
+    /// names the files, but nothing is persisted.
+    staleness_log: Option<crate::index_staleness::StalenessLog>,
 }
 
 impl SearchTool {
+    /// Wire the persistent staleness log (backlog fc1d57fe) — the factory
+    /// passes the global config dir; tests pass a tempdir so no test ever
+    /// writes the real one.
+    pub fn with_staleness_log(mut self, log: crate::index_staleness::StalenessLog) -> Self {
+        self.staleness_log = Some(log);
+        self
+    }
+
     /// Create the tool, bound to a sandbox. `graph` (when present) enables
     /// the index-backed path for literal queries.
     pub fn new(sandbox: Sandbox, graph: Option<Arc<crate::codegraph::CodeGraph>>) -> Self {
         Self {
             sandbox,
             graph,
+            staleness_log: None,
             memory: None,
             delegation_state: Arc::new(std::sync::Mutex::new(Vec::new())),
             tool_choice: None,
@@ -499,6 +513,27 @@ pub(crate) struct IndexHits {
     /// effect ("reindexed N stale file(s)") because a read tool mutated
     /// the index DB.
     pub reindexed: usize,
+    /// The stale files behind `reindexed` — the repaired set, with the
+    /// evidence the staleness log classifies from (backlog fc1d57fe). The
+    /// caller logs them and names the first few in the note.
+    pub stale: Vec<StaleFile>,
+}
+
+/// One stale file the F10 freshness sweep flagged: the index-side evidence
+/// (as-of-index mtime + content hash) and the cheap on-disk stats. The
+/// staleness log classifies the cause from these (backlog fc1d57fe).
+#[derive(Debug, Clone)]
+pub(crate) struct StaleFile {
+    /// Project-relative path with `/` separators (the index's key).
+    pub path: String,
+    /// The as-of-index mtime (unix millis); `None` when the file has no row.
+    pub mtime_index: Option<i64>,
+    /// The indexed content hash; `None` when the file has no row.
+    pub stored_hash: Option<String>,
+    /// The on-disk mtime (unix millis); `None` when the file is unreadable.
+    pub mtime_disk: Option<i64>,
+    /// The on-disk size in bytes; `None` when the file is unreadable.
+    pub size_disk: Option<u64>,
 }
 
 /// Whether the literal can produce FTS tokens: the unicode61 tokenizer
@@ -898,7 +933,7 @@ pub(crate) enum FtsOutcome {
     /// during the retry. The caller falls through to the walk and surfaces
     /// the staleness.
     Stale {
-        files: usize,
+        stale: Vec<StaleFile>,
     },
 }
 
@@ -908,7 +943,7 @@ struct FtsPage {
     hits: Vec<crate::codegraph::store::ContentHit>,
     total: usize,
     files: std::collections::HashSet<String>,
-    stale_paths: Vec<String>,
+    stale: Vec<StaleFile>,
 }
 
 /// Run one FTS query page: fetch, glob post-filter, and the F10 freshness
@@ -972,28 +1007,35 @@ fn fts_page(
     // `mtime_of`). Any mismatch — an unreadable/vanished file, or a hit
     // without a cg_files row — makes the page stale; the paths are
     // collected so a small staleness can be re-indexed inline.
-    let stored = graph.stored_mtimes().ok()?;
-    let mut stale_paths = Vec::new();
+    let stored = graph.stored_file_meta().ok()?;
+    let mut stale = Vec::new();
     for path in &files {
-        let Some(&stored_mtime) = stored.get(path) else {
-            stale_paths.push(path.clone());
-            continue;
-        };
-        let on_disk = std::fs::metadata(root.join(path))
-            .and_then(|m| m.modified())
-            .ok()
+        let meta = std::fs::metadata(root.join(path)).ok();
+        let mtime_disk = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        if on_disk != stored_mtime {
-            stale_paths.push(path.clone());
+            .map(|d| d.as_millis() as i64);
+        let size_disk = meta.map(|m| m.len());
+        let entry = stored.get(path);
+        let mtime_index = entry.and_then(|m| m.mtime);
+        // Same rule as before: a hit without a row, or a moved mtime, is
+        // stale (an unreadable file reads as `None != Some(..)`).
+        if mtime_index.is_none() || mtime_disk != mtime_index {
+            stale.push(StaleFile {
+                path: path.clone(),
+                mtime_index,
+                stored_hash: entry.and_then(|m| m.content_hash.clone()),
+                mtime_disk,
+                size_disk,
+            });
         }
     }
     Some(FtsPage {
         hits,
         total,
         files,
-        stale_paths,
+        stale,
     })
 }
 
@@ -1025,35 +1067,161 @@ pub(crate) fn try_index(
     glob: Option<&str>,
 ) -> Option<FtsOutcome> {
     let mut reindexed = 0usize;
+    let mut last_stale: Vec<StaleFile> = Vec::new();
     for attempt in 0..2 {
         let page = fts_page(graph, root, pattern, glob)?;
-        if page.stale_paths.is_empty() {
+        if page.stale.is_empty() {
             return Some(FtsOutcome::Hits(IndexHits {
                 hits: page.hits,
                 total: page.total,
                 files: page.files.len(),
                 reindexed,
+                stale: std::mem::take(&mut last_stale),
             }));
         }
-        if attempt == 0 && page.stale_paths.len() <= STALE_REINDEX_CAP {
+        if attempt == 0 && page.stale.len() <= STALE_REINDEX_CAP {
             // The budget-bounded pass: an Err (busy/failed) and a spent
             // budget with nothing refreshed both land on 0 → walk below. A
             // budget spent MID-set leaves the rest stale, so the re-query
             // still trips and the caller walks — `reindexed` can never
             // over-report.
+            let paths: Vec<String> = page.stale.iter().map(|s| s.path.clone()).collect();
             let refreshed = graph
-                .reindex_stale_files(&page.stale_paths, crate::codegraph::STALE_REINDEX_BUDGET)
+                .reindex_stale_files(&paths, crate::codegraph::STALE_REINDEX_BUDGET)
                 .unwrap_or(0);
             if refreshed > 0 {
                 reindexed = refreshed;
+                last_stale = page.stale;
                 continue; // re-query once from the fresh index
             }
         }
         return Some(FtsOutcome::Stale {
-            files: page.stale_paths.len(),
+            stale: page.stale,
         });
     }
     None
+}
+
+/// Probe one stale file's disk evidence for the staleness log: mtime, size,
+/// and the raw + LF-normalized content hashes the classifier compares against
+/// the index. `None` when the file cannot be read (vanished/unreadable).
+fn probe_disk(root: &Path, rel: &str) -> Option<crate::index_staleness::DiskProbe> {
+    let abs = root.join(rel);
+    let bytes = std::fs::read(&abs).ok()?;
+    let meta = std::fs::metadata(&abs).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let raw_hash = crate::codegraph::content_hash(&bytes);
+    let lf_hash = if bytes.contains(&b'\r') {
+        crate::codegraph::content_hash(&lf_normalized(&bytes))
+    } else {
+        raw_hash.clone()
+    };
+    Some(crate::index_staleness::DiskProbe {
+        mtime,
+        size: meta.len(),
+        raw_hash,
+        lf_hash,
+    })
+}
+
+/// `bytes` with CRLF pairs normalized to LF — the line-ending-flip probe (a
+/// lone CR is left alone: classic-Mac endings are not a thing in this
+/// project).
+fn lf_normalized(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i += 1; // drop the CR, keep the LF on the next round
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// How many stale paths a note names before "+N more" (and the log pointer)
+/// takes over.
+pub(crate) const NOTE_SAMPLE_PATHS: usize = 3;
+
+/// Classify, log, and sample the stale files behind an index note (backlog
+/// fc1d57fe). The disk-hash probe runs only for sets small enough to be
+/// repaired inline (≤ `STALE_REINDEX_CAP`) — the log must never out-cost the
+/// cap it explains. Returns the ≤ [`NOTE_SAMPLE_PATHS`] paths the note names;
+/// the full list lives in the log.
+pub(crate) fn log_stale(
+    log: Option<&crate::index_staleness::StalenessLog>,
+    tool: &str,
+    root: &Path,
+    stale: &[StaleFile],
+    action: crate::index_staleness::Action,
+) -> Vec<String> {
+    use crate::index_staleness::{classify, Cause, StaleEntry};
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    // The probe exists for the log's cause classification only — with no log
+    // wired the entries are dropped unread, so skip the disk reads.
+    let probe_hashes = log.is_some() && stale.len() <= STALE_REINDEX_CAP;
+    let entries: Vec<StaleEntry> = stale
+        .iter()
+        .map(|s| {
+            let probe = if probe_hashes {
+                probe_disk(root, &s.path)
+            } else {
+                None
+            };
+            let cause = if probe_hashes {
+                classify(s.stored_hash.as_deref(), probe.as_ref())
+            } else if s.mtime_index.is_none() {
+                Cause::Unindexed
+            } else {
+                Cause::MtimeDrift
+            };
+            StaleEntry {
+                path: s.path.clone(),
+                cause,
+                mtime_index: s.mtime_index,
+                mtime_disk: s.mtime_disk,
+                size_disk: s.size_disk,
+            }
+        })
+        .collect();
+    if let Some(log) = log {
+        log.record(tool, &entries, action);
+    }
+    entries
+        .iter()
+        .take(NOTE_SAMPLE_PATHS)
+        .map(|e| e.path.clone())
+        .collect()
+}
+
+/// The note detail naming the first stale files: ` (a.rs, b.rs, +2 more)`
+/// plus, when the log is wired, where the full list went. Empty when there is
+/// nothing to name (the note keeps its bare count then).
+pub(crate) fn stale_detail(sample: &[String], total: usize, logged: bool) -> String {
+    if sample.is_empty() {
+        return String::new();
+    }
+    let mut names = sample.join(", ");
+    if total > sample.len() {
+        names.push_str(&format!(", +{} more", total - sample.len()));
+    }
+    if logged {
+        format!(
+            " ({names}); full list: {}",
+            crate::index_staleness::STALENESS_LOG_FILE
+        )
+    } else {
+        format!(" ({names})")
+    }
 }
 
 /// Prepend the literal-fallback note (if any) so the model sees "these are
@@ -1380,6 +1548,7 @@ impl Tool for SearchTool {
         // (a PathBuf), moved in by value.
         let root = self.sandbox.root().to_path_buf();
         let graph = self.graph.clone();
+        let staleness_log = self.staleness_log.clone();
         let delegation_state = self.delegation_state.clone();
         tokio::task::spawn_blocking(move || {
             // Compile via the shared helper: a broken regex degrades to
@@ -1506,11 +1675,19 @@ impl Tool for SearchTool {
                             // tool mutated the index DB — the note rides
                             // ABOVE the results (truncation-safe).
                             let note = if ix.reindexed > 0 {
+                                let sample = log_stale(
+                                    staleness_log.as_ref(),
+                                    "search",
+                                    &root,
+                                    &ix.stale,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
                                 push_note(
                                     note,
                                     format!(
-                                        "reindexed {} stale file(s) — serving fresh index results",
-                                        ix.reindexed
+                                        "reindexed {} stale file(s){} — serving fresh index results",
+                                        ix.reindexed,
+                                        stale_detail(&sample, ix.stale.len(), staleness_log.is_some())
                                     ),
                                 )
                             } else {
@@ -1518,9 +1695,18 @@ impl Tool for SearchTool {
                             };
                             return ToolResult::success(with_note(body, &note));
                         }
-                        Some(FtsOutcome::Stale { files }) => {
+                        Some(FtsOutcome::Stale { stale }) => {
+                            let sample = log_stale(
+                                staleness_log.as_ref(),
+                                "search",
+                                &root,
+                                &stale,
+                                crate::index_staleness::Action::SurfacedOnly,
+                            );
                             stale_note = Some(format!(
-                                "content index stale for {files} file(s) — serving tree-walk results"
+                                "content index stale for {} file(s){} — serving tree-walk results",
+                                stale.len(),
+                                stale_detail(&sample, stale.len(), staleness_log.is_some())
                             ));
                         }
                         None => {}
@@ -3457,9 +3643,11 @@ mod tests {
         // with a single "note: " prefix (the doubled "note: note:" bug,
         // user request 2026-12-30).
         let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
         let path = dir.path().join("readme.md");
         std::fs::write(&path, "old bullet list\n").unwrap();
-        let tool = make_indexed_tool(dir.path());
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         // Simulate the edit→watcher gap: rewrite + bump mtime, no reindex.
         std::fs::write(&path, "old bullet list\nnew bullet (fresh)\n").unwrap();
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -3474,8 +3662,10 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.contains("reindexed 1 stale file(s)"),
-            "the inline re-index is disclosed: {}",
+            r.output.contains(
+                "reindexed 1 stale file(s) (readme.md); full list: index-staleness.jsonl"
+            ),
+            "the note names the stale file and points at the log: {}",
             r.output
         );
         assert!(r.output.contains("new bullet (fresh)"), "{}", r.output);
@@ -3504,6 +3694,7 @@ mod tests {
         // served fresh from the index (the weak file itself ranks below
         // the 100 displayed hits, so its line is not shown).
         let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
         // 100 strong-match files (3× term frequency, tiny bodies) rank
         // above the weak file everywhere; the display cap is MAX_MATCHES
         // (100), so the weak file is fetched and counted but not shown.
@@ -3518,7 +3709,8 @@ mod tests {
         let weak = dir.path().join("a-stale-tail.md");
         let filler = "filler ".repeat(40);
         std::fs::write(&weak, format!("{filler}needle tail-v1\n")).unwrap();
-        let tool = make_indexed_tool(dir.path());
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         // Edit AFTER indexing + bump mtime past the as-of-index stamp —
         // the edit→watcher gap.
         std::fs::write(&weak, format!("{filler}needle tail-refreshed\n")).unwrap();
@@ -3534,8 +3726,10 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.contains("reindexed 1 stale file(s)"),
-            "the beyond-cap stale file must trip the freshness check: {}",
+            r.output.contains(
+                "reindexed 1 stale file(s) (a-stale-tail.md); full list: index-staleness.jsonl"
+            ),
+            "the note names the repaired file and points at the log: {}",
             r.output
         );
         assert!(r.output.contains("engine: index"), "{}", r.output);
@@ -3556,11 +3750,13 @@ mod tests {
         // so an artifact-heavy session (plans, memories, reviews) reaches a
         // nine-file staleness with nobody else touching the tree.
         let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
         let count = 9;
         for i in 0..count {
             std::fs::write(dir.path().join(format!("stale{i:02}.md")), "needle v1\n").unwrap();
         }
-        let tool = make_indexed_tool(dir.path());
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         // Edit every file AFTER indexing + bump mtimes — the edit→watcher
         // gap, at the exact size the old hard cap refused.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -3579,8 +3775,13 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.contains("reindexed 9 stale file(s)"),
+            r.output.contains("reindexed 9 stale file(s) ("),
             "nine stale files are repaired inline: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains(", +6 more); full list: index-staleness.jsonl"),
+            "the note samples three paths and points at the log: {}",
             r.output
         );
         assert!(r.output.contains("engine: index"), "{}", r.output);
@@ -3605,12 +3806,14 @@ mod tests {
         // staleness is surfaced with a single "note: " prefix (the doubled
         // "note: note:" bug, user request 2026-12-30).
         let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
         let cap = STALE_REINDEX_CAP;
         for i in 0..=cap {
             std::fs::write(dir.path().join(format!("stale{i:02}.md")), "needle v1\n").unwrap();
         }
         std::fs::write(dir.path().join("steady.md"), "needle steady\n").unwrap();
-        let tool = make_indexed_tool(dir.path());
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
         // Edit every stale file AFTER indexing + bump mtimes — the
         // edit→watcher gap at checkout scale.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
@@ -3630,8 +3833,16 @@ mod tests {
         assert!(r.success, "{}", r.output);
         assert!(r.output.contains("engine: walk"), "{}", r.output);
         assert!(
-            r.output.contains(&format!("index stale for {} file(s)", cap + 1)),
-            "the staleness is surfaced: {}",
+            r.output.contains(&format!("index stale for {} file(s) (", cap + 1)),
+            "the staleness is surfaced with named files: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains(&format!(
+                ", +{} more); full list: index-staleness.jsonl",
+                cap + 1 - NOTE_SAMPLE_PATHS
+            )),
+            "the note samples the stale files and points at the log: {}",
             r.output
         );
         assert!(
@@ -3642,6 +3853,176 @@ mod tests {
         // The walk serves the fresh content.
         assert!(r.output.contains("needle v2"), "{}", r.output);
         assert!(r.output.contains("needle steady"), "{}", r.output);
+    }
+
+    /// Parse the JSONL staleness log under `dir` — empty when no record has
+    /// been written (the log file is created on the first record only).
+    fn read_staleness_log(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = dir.join(crate::index_staleness::STALENESS_LOG_FILE);
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each log line is JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stale_edits_are_logged_per_file_with_a_cause() {
+        // Backlog fc1d57fe: an inline repair leaves one record per stale file
+        // naming WHICH file went stale and WHY (here: real content edits).
+        let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
+        for name in ["a.md", "b.md"] {
+            std::fs::write(dir.path().join(name), "needle v1\n").unwrap();
+        }
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
+        // Edit both files after indexing — the edit→watcher gap.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for name in ["a.md", "b.md"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "needle v2\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        let records = read_staleness_log(log_dir.path());
+        assert_eq!(records.len(), 2, "one record per stale file: {records:?}");
+        let mut paths: Vec<&str> = records
+            .iter()
+            .map(|rec| rec["path"].as_str().expect("a path"))
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["a.md", "b.md"], "records name the files");
+        for rec in &records {
+            assert_eq!(rec["cause"], "content-edit", "the edit is classified: {rec}");
+            assert_eq!(rec["action"], "inline-reindex", "{rec}");
+            assert_eq!(rec["tool"], "search", "{rec}");
+            assert!(rec["ts"].as_i64().unwrap() > 0, "timestamped: {rec}");
+            assert!(rec["mtime_index"].as_i64().is_some(), "{rec}");
+            assert!(rec["mtime_disk"].as_i64().is_some(), "{rec}");
+            assert!(rec["size_disk"].as_u64().unwrap() > 0, "{rec}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_search_writes_no_log_records() {
+        // The log records STALENESS, not searches: a no-edit search leaves no
+        // log file at all (a no-edit session must add no records).
+        let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), "needle here\n").unwrap();
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("engine: index"), "{}", r.output);
+        assert!(
+            !log_dir
+                .path()
+                .join(crate::index_staleness::STALENESS_LOG_FILE)
+                .exists(),
+            "a no-edit search writes no log file"
+        );
+    }
+
+    #[tokio::test]
+    async fn above_cap_staleness_logs_every_path() {
+        // Acceptance (backlog fc1d57fe): staleness the inline repair refuses
+        // is still answerable from the log alone — EVERY stale path is
+        // recorded (surfaced-only), and the note points at the log.
+        let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
+        let cap = STALE_REINDEX_CAP;
+        for i in 0..=cap {
+            std::fs::write(dir.path().join(format!("stale{i:02}.md")), "needle v1\n").unwrap();
+        }
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        for i in 0..=cap {
+            let path = dir.path().join(format!("stale{i:02}.md"));
+            std::fs::write(&path, "needle v2\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(later)
+                .unwrap();
+        }
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("engine: walk"), "{}", r.output);
+        assert!(
+            r.output.contains("full list: index-staleness.jsonl"),
+            "the note points at the log: {}",
+            r.output
+        );
+        let records = read_staleness_log(log_dir.path());
+        assert_eq!(records.len(), cap + 1, "every stale path is logged");
+        for rec in &records {
+            assert_eq!(rec["action"], "surfaced-only", "no repair above the cap: {rec}");
+            assert!(rec["cause"].as_str().is_some(), "a cause class: {rec}");
+            assert!(rec["mtime_disk"].as_i64().is_some(), "{rec}");
+        }
+        for i in 0..=cap {
+            let name = format!("stale{i:02}.md");
+            assert!(
+                records.iter().any(|rec| rec["path"] == name.as_str()),
+                "{name} is in the log"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_log_rotates_before_the_new_record() {
+        // The log is size-capped: a file already past the cap moves to `.1`
+        // and the record that trips the rotation opens the fresh live log.
+        let dir = tempdir().unwrap();
+        let log_dir = tempdir().unwrap();
+        let log_path = log_dir
+            .path()
+            .join(crate::index_staleness::STALENESS_LOG_FILE);
+        let big = "x".repeat(crate::index_staleness::STALENESS_LOG_CAP_BYTES as usize + 1);
+        std::fs::write(&log_path, &big).unwrap();
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "needle v1\n").unwrap();
+        let tool = make_indexed_tool(dir.path())
+            .with_staleness_log(crate::index_staleness::StalenessLog::at(log_dir.path()));
+        // Edit after indexing — the edit→watcher gap.
+        std::fs::write(&path, "needle v2\n").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let r = tool
+            .execute(json!({"pattern": "needle", "literal": true}))
+            .await;
+        assert!(r.success, "{}", r.output);
+        let records = read_staleness_log(log_dir.path());
+        assert_eq!(records.len(), 1, "the new record opens the fresh log");
+        assert_eq!(records[0]["path"], "a.md");
+        let backup = std::fs::read_to_string(log_dir.path().join(format!(
+            "{}{}",
+            crate::index_staleness::STALENESS_LOG_FILE,
+            crate::index_staleness::ROTATED_SUFFIX
+        )))
+        .unwrap();
+        assert_eq!(backup, big, "the oversized log is the backup");
     }
 
     #[tokio::test]

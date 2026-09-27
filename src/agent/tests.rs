@@ -12041,6 +12041,117 @@ async fn repeated_bad_json_for_same_tool_changes_strategy() {
          `(?<`; got: {repeat_guidance}"
     );
 }
+/// Regression (plan d3aedfee, batch isolation): a malformed tool call must
+/// not fail its well-formed siblings. Before the fix, `has_bad_json` routed
+/// the WHOLE batch through `handle_bad_json`, which errored EVERY call with
+/// "arguments malformed or truncated — not run": the valid sibling never
+/// ran, its work was wasted for a round-trip, and the visible failure count
+/// doubled (live 2027-01 shape).
+#[tokio::test]
+async fn bad_json_batch_isolation_runs_valid_siblings() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // One batch, two calls: `memory_search` with valid no-arg arguments
+    // ("{}" — a genuine no-arg tool, registered in make_registry), and
+    // `search` whose arguments are malformed (the live shape from the
+    // strategy test above). `search` need not be registered: the bad-JSON
+    // path never dispatches a malformed call.
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_a".into(),
+                name: "memory_search".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: "{}".into(),
+            },
+            LlmEvent::ToolCallStart {
+                index: 1,
+                id: "call_b".into(),
+                name: "search".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 1,
+                fragment: r#"{"pattern":"\\(\\?<"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("look for the lookbehind")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // The recorded batch: exactly ONE assistant message carrying both calls
+    // (N calls -> N results), the malformed call's arguments sanitized to
+    // "{}" in history (the H2 sanitize contract).
+    let batches: Vec<&Message> = messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant && m.tool_calls.len() == 2)
+        .collect();
+    assert_eq!(
+        batches.len(),
+        1,
+        "the batch must be recorded exactly once"
+    );
+    assert_eq!(batches[0].tool_calls[0].name, "memory_search");
+    assert_eq!(batches[0].tool_calls[1].name, "search");
+    assert_eq!(
+        batches[0].tool_calls[1].arguments, "{}",
+        "the malformed call's arguments must be sanitized in history"
+    );
+
+    // The VALID sibling RAN: its tool result is a real result, not the
+    // malformed-arguments error.
+    let result_a = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_a"))
+        .expect("the valid sibling must have a tool result");
+    assert!(
+        !result_a.tool_is_error,
+        "the well-formed sibling must have run — got: {}",
+        result_a.content.as_text()
+    );
+
+    // The malformed call did NOT run: it carries the malformed-arguments
+    // error so the model can repair it.
+    let result_b = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_b"))
+        .expect("the malformed call must have a tool result");
+    assert!(
+        result_b.tool_is_error,
+        "the malformed call must surface an error result"
+    );
+    assert!(
+        result_b.content.as_text().contains("JSON"),
+        "the malformed call's guidance must describe the JSON failure — \
+         got: {}",
+        result_b.content.as_text()
+    );
+}
 /// A `file_read` tool-call event pair (Start + ArgumentDelta) for the given
 /// index/id/path — the building block of the tool-loop regression tests
 /// (backlog 7f72d3d7).

@@ -2166,7 +2166,17 @@ mod tests {
             // (backlog e4a50d22) adds the always-advertised expand_result
             // schema (~+418, rides every filter); measures Planning at 19_659
             // chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Planning, 20_100),
+            // 20_100 → 21_800 (2027-01-11): the probe-evidence gate (backlog
+            // 5b232b8d) — create_plan's description gains the
+            // findings-not-assumptions doctrine, its `context` property the
+            // evidence rule + marker vocabulary, update_plan's `context` the
+            // append-scoping note (~+1_300 together, all schema text that
+            // rides Planning); measures Planning at 21_402 chars
+            // (workspace-unified) on the final tree. The remaining ~+440 of
+            // the delta over the 19_659 figure pinned at the 2027-01-25 pass
+            // is schema drift from plans landed since. Ceiling = measured +
+            // headroom, deliberate raise.
+            (ToolFilter::Planning, 21_800),
             // 23_600 → 24_200 (2026-12-08): measured with the `browser`
             // feature enabled — Executing carries the browser tool family
             // (offscreen_browser_* + browser_*, incl. the file:// navigation
@@ -2284,7 +2294,14 @@ mod tests {
             // args against the schema, so the terse ~+280 chars cannot move to
             // the rejection message alone; measures Executing at 37_600 chars.
             // Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::Executing, 37_900),
+            // 37_900 → 39_600 (2027-01-11): the probe-evidence gate (backlog
+            // 5b232b8d) — the same create_plan description + `context` property
+            // and update_plan `context` growth that raised Planning above
+            // (~+1_300) rides Executing, on top of drift since the 37_600
+            // figure pinned at the 2026-09-27 pass; measures Executing at
+            // 39_150 chars (workspace-unified, 26 tools on the final tree).
+            // Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Executing, 39_600),
             // PlanFrozen joins the budget guard with this change (2027-01-10):
             // it is the production surface for every implementation/bug_fixing
             // plan — the largest array the app sends (Executing ∪ finish) —
@@ -2342,7 +2359,14 @@ mod tests {
             // above (expand_result, ~+418; PlanFrozen = Executing ∪ finish);
             // measures PlanFrozen at 38_249 chars. Ceiling = measured +
             // headroom, deliberate raise.
-            (ToolFilter::PlanFrozen, 38_900),
+            // 38_900 → 40_900 (2027-01-11): the probe-evidence gate (backlog
+            // 5b232b8d) — PlanFrozen advertises create_plan + update_plan, so
+            // the same schema growth that raised Planning and Executing
+            // (~+1_300) rides this filter too, on top of drift since the last
+            // pass; measures PlanFrozen at 40_436 chars (workspace-unified,
+            // 27 tools on the final tree). Ceiling = measured + headroom,
+            // deliberate raise.
+            (ToolFilter::PlanFrozen, 40_900),
             // 20_400 → 21_100 (2026-12-08): same browser-feature measurement
             // as Executing above — research filters carry the browser tools.
             // 21_100 → 21_600 (2027-01-07): same change (plan 4405d82d /
@@ -2403,7 +2427,14 @@ mod tests {
             // 28_600 → 29_100 (2027-01-11): same cause as the Planning raise
             // above (expand_result, ~+418); measures ExecutingResearch at
             // 28_652 chars. Ceiling = measured + headroom, deliberate raise.
-            (ToolFilter::ExecutingResearch, 29_100),
+            // 29_100 → 30_900 (2027-01-11): the probe-evidence gate (backlog
+            // 5b232b8d) — create_plan rides the research filters too, so the
+            // same schema growth that raised Planning and Executing (~+1_300)
+            // rides here, on top of drift since the last pass; measures
+            // ExecutingResearch at 30_481 chars (workspace-unified, 22 tools
+            // on the final tree). Ceiling = measured + headroom, deliberate
+            // raise.
+            (ToolFilter::ExecutingResearch, 30_900),
             // 20_700 → 21_300 (2026-12-08): Reviewing likewise carries the
             // browser tool family (the reviewer drives the visible Browser
             // tab), so the feature-gated array was ~410 over. Deliberate
@@ -2483,7 +2514,13 @@ mod tests {
             // schemas, shared with the Reviewer's advertised array); measures
             // Reviewing at 32_864 chars. Ceiling = measured + headroom,
             // deliberate raise.
-            (ToolFilter::Reviewing, 33_100),
+            // 33_100 → 33_900 (2027-01-11): the probe-evidence gate (backlog
+            // 5b232b8d) — Reviewing advertises update_plan, whose `context`
+            // property gained the append-scoping note (~+150), on top of drift
+            // since the 32_864 figure pinned at the 2026-09-27 pass; measures
+            // Reviewing at 33_434 chars (workspace-unified, 25 tools on the
+            // final tree). Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Reviewing, 33_900),
             // 15_000 → 15_300 (2026-09-08): same workspace-unification
             // measurement pass as Executing above (load_tools, +431);
             // measures Complete at 15_241 chars (standalone: 14_810 —
@@ -2522,7 +2559,13 @@ mod tests {
             // above (expand_result, ~+418; Complete carries the same read-only
             // set as Planning); measures Complete at 19_659 chars. Ceiling =
             // measured + headroom, deliberate raise.
-            (ToolFilter::Complete, 20_100),
+            // 20_100 → 21_800 (2027-01-11): same cause as the Planning raise
+            // above (backlog 5b232b8d — create_plan's description + `context`
+            // property and update_plan's `context`, ~+1_300); the same tool
+            // set as Planning, so it measures Complete at 21_402 chars, plus
+            // the same drift since the 19_659 figure pinned at the 2027-02-05
+            // pass. Ceiling = measured + headroom, deliberate raise.
+            (ToolFilter::Complete, 21_800),
         ] {
             let (n, chars) = tools_array_chars(&registry, &filter);
             println!(

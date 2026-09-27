@@ -1,0 +1,6 @@
++++
+title = "tool calls arrive with empty {} arguments + dropped text fragments in one session (2027-01, Anthropic path)"
+created = "2027-01-11"
++++
+
+Observed 2027-01 in a single session on the native Anthropic path: about 10 tool calls failed with arguments JSON was malformeuncated. Every failed call had an EMPTY argument object even for tools with required fields (memory_search, read_files, search, ask_user). Additional evidence that this is NOT only model-side: (a) one read_files spec arrived with a truncated key (sta instead of start_line) yet the call ran, (b) a search glob arrived garbled (docRES.md instead of docs/FEATURES.md), (c) the assistant prose iame turns had visibly dropped fragments mid-sentence. Failures clustered in parallel (2-call) batches but also hit single calls. Hypotheses to test: stream delta loss in src/provider/stream.rs Delulator or the Anthropic input_json_delta handling for multi-block tool_use; gateway-side truncation. Harness improvement regardless: handle_bad_json (src/agent/turn.rs:4206) fails the WHOLEwhen one call is malformed (cap arm ~4306, retry arm ~4428) — parsable siblings should run. Also log raw per-tool-call argument fragments to .coding/logs to settle model-vs-stream in one session.

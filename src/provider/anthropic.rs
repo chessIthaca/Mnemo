@@ -861,6 +861,16 @@ struct StreamState {
     /// Index of the currently-open text block (unused beyond tracking — text
     /// deltas already carry their block's index).
     text_block_index: Option<u32>,
+    /// The `event:` name of a frame whose `data:` line has not yet arrived.
+    ///
+    /// Persisted across `parse_sse_buffer` calls: a network chunk boundary can
+    /// fall between the two lines, and every `data:` line is parsed under the
+    /// name of the most recent `event:` line. A per-call local loses the name,
+    /// the `data:` line is then processed under an empty name, and
+    /// `parse_sse_event`'s forward-compatible catch-all drops the frame
+    /// silently (2027-01 bug: vanished tool-argument fragments and text
+    /// deltas).
+    pending_event: Option<String>,
     /// The verbatim assistant content array, assembled from `content_block_*`
     /// events (Rule 1 raw). Each entry is a block object (text / thinking /
     /// redacted_thinking / tool_use) with its `signature` / `data` preserved
@@ -1072,16 +1082,14 @@ fn accumulate_raw_block_delta(
 /// trailing newline) is left in the buffer for the next chunk.
 ///
 /// Unlike the OpenAI parser, the `event:` line is significant here (Anthropic
-/// names every data frame), so the current event name is tracked across lines
-/// within the buffer; only `data:` lines carry payload. Uses
+/// names every data frame), so the event name is tracked across both lines and
+/// calls (a network chunk boundary can fall between a frame's `event:` line and
+/// its `data:` line — `StreamState::pending_event`); only `data:` lines carry
+/// payload. Uses
 /// `String::drain()` to drop processed bytes in-place — O(1) amortized per
 /// line instead of the O(n²) re-copy of `buffer = buffer[pos+1..].to_string()`.
 fn parse_sse_buffer(buffer: &mut String, state: &mut StreamState) -> Vec<SseOutcome> {
     let mut outcomes = Vec::new();
-    // The event name of the data frame currently being assembled. SSE frames
-    // can span lines (event: X\n data: {...}), so a `data:` line may follow an
-    // `event:` line in a later buffer chunk.
-    let mut current_event: Option<String> = None;
     while let Some(pos) = buffer.find('\n') {
         // Extract the line up to (but not including) the newline, then drop
         // the processed bytes (line + newline) in-place via drain().
@@ -1092,11 +1100,13 @@ fn parse_sse_buffer(buffer: &mut String, state: &mut StreamState) -> Vec<SseOutc
             continue;
         }
         if let Some(name) = line.strip_prefix("event: ") {
-            current_event = Some(name.to_string());
+            state.pending_event = Some(name.to_string());
             continue;
         }
         if let Some(data) = line.strip_prefix("data: ") {
-            let event_name = current_event.take().unwrap_or_default();
+            // The name may have arrived in an EARLIER chunk (a boundary right
+            // after the `event:` line) — it lives on the stream state.
+            let event_name = state.pending_event.take().unwrap_or_default();
             match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(json) => {
                     for event in parse_sse_event(&event_name, &json, state) {
@@ -3051,6 +3061,89 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert!(buffer.is_empty(), "buffer fully drained");
         assert_eq!(state.input_tokens, 3);
+    }
+
+    /// Regression (2027-01 live bug, BUG memory 93b01d1b): a network chunk
+    /// boundary falling between a frame's `event:` line and its `data:` line
+    /// must not drop the frame. The event name is stream state — with a
+    /// per-call local it is lost, and the `data:` line is then processed
+    /// under an empty name, which `parse_sse_event`'s forward-compatible
+    /// catch-all ignores. The live symptoms were vanished `input_json_delta`
+    /// fragments (the accumulated arguments then failed to parse and the
+    /// turn loop sanitized them to `{}`) and vanished `text_delta`s.
+    #[test]
+    fn event_name_persists_across_chunk_boundary() {
+        fn collect(outcomes: Vec<SseOutcome>) -> Vec<LlmEvent> {
+            outcomes
+                .into_iter()
+                .map(|o| match o {
+                    SseOutcome::Event(e) => e,
+                    SseOutcome::ParseError(e) => panic!("parse error: {e}"),
+                })
+                .collect()
+        }
+        let frame = |name: &str, data: serde_json::Value| format!("event: {name}\ndata: {data}\n");
+
+        let mut state = StreamState::default();
+        let mut buffer = String::new();
+
+        // Chunk 1 ends exactly after an `event:` line — the split point.
+        buffer.push_str(&frame(
+            "message_start",
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+        ));
+        buffer.push_str(&frame(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_files","input":{}}}),
+        ));
+        buffer.push_str("event: content_block_delta\n");
+        let first = collect(parse_sse_buffer(&mut buffer, &mut state));
+        assert_eq!(first.len(), 1, "chunk 1 carries only the ToolCallStart");
+        assert!(buffer.is_empty(), "chunk 1 is fully consumed");
+
+        // Chunk 2 opens with the orphaned `data:` line, then a complete
+        // sibling frame for the same call.
+        buffer.push_str(&format!(
+            "data: {}\n",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}})
+        ));
+        buffer.push_str(&frame(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.txt\"}"}}),
+        ));
+        let second = collect(parse_sse_buffer(&mut buffer, &mut state));
+
+        // Chunk 3 splits a text frame the same way.
+        buffer.push_str(&frame(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        ));
+        buffer.push_str("event: content_block_delta\n");
+        let _ = parse_sse_buffer(&mut buffer, &mut state);
+        buffer.push_str(&format!(
+            "data: {}\n",
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}})
+        ));
+        let third = collect(parse_sse_buffer(&mut buffer, &mut state));
+
+        let mut args = String::new();
+        let mut text = String::new();
+        for event in second.into_iter().chain(third) {
+            match event {
+                LlmEvent::ToolCallArgumentDelta { fragment, .. } => args.push_str(&fragment),
+                LlmEvent::TextDelta { text: t } => text.push_str(&t),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            args, "{\"path\":\"a.txt\"}",
+            "fragments around the split must survive in order"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&args).is_ok(),
+            "accumulated arguments must be valid JSON: {args}"
+        );
+        assert_eq!(text, "Hi", "the split text delta must survive too");
     }
 
     #[test]

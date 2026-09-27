@@ -303,7 +303,11 @@ vitest (frontend), `tsc --noEmit` clean.
 - **Skill tools** — `skill_start`, `skill_end`, `abandon_skill` plus the
   library tools: `skill_reload` (re-read `.coding/skills/*.toml` into the live
   `SkillLibrary`; allowed in every workflow state, an active skill included,
-  and inside a skill's always-available set) and `skill_create` (author +
+  and inside a skill's always-available set; the Skill state also grants the
+  whole read-only surface wholesale — every `ToolCategory::Agent` +
+  `SafetyLevel::AutoRun` tool (trusted `mcp__` ones excluded — trust ≠ state
+  visibility), backlog 834ec126 — so a skill's allow-list
+  scopes only the MUTATING tools) and `skill_create` (author +
   validate a new skill file, hot-added to the registry; Executing-only in the
   base states — PlanFrozen advertises it, and under a skill it is granted ONLY
   by an explicit allow-list entry (the `create_skill` overlay, available_in

@@ -1,6 +1,7 @@
 +++
 title = "new-project seeding — shipped skills (write-if-missing) + merged .gitignore/.gitattributes entries"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 New-project seeding contract (plan 8ff77e5d, landed 3f286a2 on wt/mnemo; src/project/scaffold.rs + src/skill/mod.rs + src/project/mod.rs::seed_init_artifacts). Two seed paths run on BOTH Project::init branches (fresh scaffold AND the is_initialized self-heal path):

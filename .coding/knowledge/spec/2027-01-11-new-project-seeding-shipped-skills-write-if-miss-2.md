@@ -1,0 +1,7 @@
++++
+title = "new-project seeding — shipped skills (write-if-missing) + merged .gitignore/.gitattributes entries — MERGED into main (branch wt/mnemo, 2026-09-27)"
+supersedes = "2027-01-11-new-project-seeding-shipped-skills-write-if-miss"
+created = "2027-01-11"
++++
+
+New-project seeding contract (plan 8ff77e5d, landed 3f286a2 on wt/mnemo; src/project/scaffold.rs + src/skill/mod.rs + src/project/mod.rs::seed_init_artifacts). Two seed paths run on BOTH Project::init branches (fresh init + self-heal): SHIPPED_SKILLS (merge_to_main + create_skill — its prompt reads correctly outside the app repo) seeded write-if-missing; .gitignore/.gitattributes seeded by MERGING the app-owned entries (append missing lines only — never clobber or reorder user lines, preserve CRLF, skip non-UTF-8 files byte-untouched) via <name>.seed-tmp + rename (write_preserving). REPO_LOCAL_SKILLS (new_release, post_merge_sync) is deliberately repo-local, guarded by every_repo_skill_is_shipped_or_declared_repo_local so a future repo skill must pick a side. Detail: .coding/knowledge/spec/2027-01-11-new-project-seeding-shipped-skills-write-if-miss.md. Review: PASS — .coding/reviews/2026-09-27-8ff77e5d-round2-delta-review.md. Branch wt/mnemo @ 3ca47f7952fed4d51a32a01dc394766c5d57eb87 (work tip, 2026-09-27) — a PR against main is opened from this branch, awaiting human review; the landing becomes part of main when the human merges.

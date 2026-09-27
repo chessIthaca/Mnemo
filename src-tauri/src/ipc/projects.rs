@@ -58,8 +58,10 @@ pub async fn get_needs_project(state: State<'_, IpcState>) -> Result<bool, IpcEr
 
 /// Create a project at `path`: scaffold `.coding/` + the root `agent.md`
 /// template (idempotent — a directory that is already a project is left
-/// as-is, except a missing `agent.md` and missing shipped skill files are
-/// re-scaffolded, write-if-missing),
+/// as-is, except a missing `agent.md`, missing shipped skill files, and
+/// missing app-owned `.gitignore` / `.gitattributes` entries are
+/// re-scaffolded — write-if-missing / merge-append, existing user lines never
+/// overwritten or reordered),
 /// eagerly seed the on-disk stores (create `memory.db` with its schema and,
 /// when the codegraph is enabled, run the first source index) so the first
 /// session after switching starts with semantic + source search ready,
@@ -95,10 +97,11 @@ pub async fn create_project(
         .into());
     }
 
-    // Scaffold .coding/ + agent.md. Idempotent: a directory that is already a
-    // project is left untouched (a missing agent.md is still written, and
-    // missing shipped skill files are re-seeded — user-modified files are
-    // never overwritten).
+    // Scaffold .coding/ + agent.md and merge the app-owned git-file entries.
+    // Idempotent: a directory that is already a project is left untouched (a
+    // missing agent.md is still written, missing shipped skill files are
+    // re-seeded, and missing .gitignore / .gitattributes entries are appended
+    // — user-modified files are never overwritten).
     let project =
         Project::init(dir).map_err(|e| format!("failed to initialize project at '{path}': {e}"))?;
 

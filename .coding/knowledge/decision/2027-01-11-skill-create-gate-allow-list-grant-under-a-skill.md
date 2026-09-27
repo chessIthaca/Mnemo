@@ -1,0 +1,6 @@
++++
+title = "skill_create gate — allow-list grant under a skill (create_skill overlay)"
+created = "2027-01-11"
++++
+
+Plan-free skill authoring (backlog 1b4dfad3, branch wt/mnemo): `skill_create` stays EXECUTING-ONLY in the base states (Planning/Reviewing/Complete deny; Executing/ExecutingResearch/PlanFrozen allow), but under `ToolFilter::Skill(allowed)` it is now granted IFF the skill's allow-list names it — implemented by narrowing the top-of-`allows` guard in src/tool/mod.rs (~:546-556) from `matches!(self, Skill(_) | Reviewer(_))` to Reviewer-only, leaving the Skill arm's `allowed.iter().any(...)` to decide. Rationale: an allow-list entry is a deliberate, file-based, reviewable grant (same shape as merge_to_main granting git/file_edit from Complete); blanket always-availability (the skill_reload shape) was rejected — it re-opens the implicit back door in every state the user closed in 2026 (memory 296b3c9c). Reviewer allow-lists still never get it. Delivered with the `.coding/skills/create_skill.toml` overlay (available_in complete+planning, target_state planning) whose prompt carries the authoring checklist; repo-skill allow-lists must use LIVE tool names (read_files/file_write — never the legacy file_read/file_append shims, which the model never calls; cf. backlog 834ec126).

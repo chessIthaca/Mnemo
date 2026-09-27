@@ -1237,7 +1237,9 @@ impl AgentLoopFactory {
     /// by ToolFilter), `skill_end` + `abandon_skill` (only meaningful while a
     /// skill is active; exposed by the Skill filter unconditionally),
     /// `skill_reload` (every workflow state, an active skill included) and
-    /// `skill_create` (Executing only). All AutoRun — protection is on the
+    /// `skill_create` (Executing-only in the base states; under a skill it
+    /// needs an explicit allow-list entry — the `create_skill` overlay grants
+    /// it, so authoring needs no plan). All AutoRun — protection is on the
     /// operations inside the skill (e.g. git merge/push are never_auto_for),
     /// not the entry or the authoring. Omitted entirely when no skill library
     /// is configured (tests).
@@ -2875,7 +2877,7 @@ mod tests {
             "skill_start",
             "skill_end",
             "abandon_skill",
-            // skill library tools (reload: every state; create: Executing only)
+            // skill library tools (reload: every state; create: Executing-only in the base states, grantable via a skill allow-list)
             "skill_reload",
             "skill_create",
             // vision (always) — the 7 image_* tools (replacing describe_image)

@@ -392,7 +392,8 @@ pub enum ToolFilter {
     Planning,
     /// Executing: all agent tools + `complete_step`/`create_plan`/`update_plan`/
     /// `abandon_plan` + all memory tools. `skill_create` (authoring a skill
-    /// file) is Executing-only; `skill_reload` is available in every state.
+    /// file) is Executing-only in the base states — under a skill it needs an
+    /// explicit allow-list entry; `skill_reload` is available in every state.
     Executing,
     /// Reviewing: all agent tools (so the closing sequence — spawn_agent,
     /// git, file_edit, file_append, shell — can run) + `finish`/`ask_user`/
@@ -471,8 +472,9 @@ pub enum ToolFilter {
     /// set (`skill_reload`, ask_user, current_plan, the backlog tools, and the
     /// skill's exits `skill_end`/`abandon_skill` — a skill file that forgets
     /// to list them must never trap the agent) is visible regardless of the
-    /// list; `skill_create` is denied here by name — a skill file must not
-    /// widen the Executing-only authoring rule.
+    /// list. `skill_create` is NOT always available — it needs an explicit
+    /// allow-list entry (the create_skill overlay); when the file names it,
+    /// the entry IS the grant.
     Skill(Vec<String>),
     /// A read-only reviewer sub-agent — a STRICT allow-list: only the named
     /// tools (+ `current_plan`, a read-only orientation query on the shared
@@ -543,15 +545,19 @@ impl ToolFilter {
         if name == "write_review_report" && !matches!(self, ToolFilter::Reviewer(_)) {
             return false;
         }
-        // `skill_create` is EXECUTING-ONLY (the authoring gate). The base-state
-        // arms below allow it in Executing / ExecutingResearch / PlanFrozen;
-        // the constructor-granted allow-lists (Skill, Reviewer) deny it by name
-        // so a skill file listing it — or a subagent allow-list carrying it —
-        // can never become a back door around that. Same shape as the
-        // reviewer-only rule above, mirrored.
-        if name == "skill_create"
-            && matches!(self, ToolFilter::Skill(_) | ToolFilter::Reviewer(_))
-        {
+        // `skill_create` (authoring a skill file) is EXECUTING-ONLY in the base
+        // states: the arms below allow it in Executing / ExecutingResearch /
+        // PlanFrozen, and Planning/Reviewing/Complete deny it. Under a SKILL it
+        // requires an EXPLICIT allow-list entry (the create_skill overlay,
+        // backlog 1b4dfad3): a reviewed, file-based grant — the same shape as
+        // merge_to_main's `git`/`file_edit` entries, which grant landing writes
+        // from Complete. Making it always-available (the skill_reload shape)
+        // was rejected as the grant path: it would re-open an implicit
+        // authoring back door in every state (the rule the user set in 2026,
+        // memory 296b3c9c). The subagent surface (Reviewer) never gets it —
+        // query, never mutate. Same shape as the reviewer-only rule above,
+        // narrowed to that surface.
+        if name == "skill_create" && matches!(self, ToolFilter::Reviewer(_)) {
             return false;
         }
         match self {
@@ -851,9 +857,12 @@ impl ToolFilter {
                         // is a read + in-memory swap, and mid-skill is exactly
                         // when a hand-edited skill file may need picking up
                         // (e.g. a run-all item in merge_to_main). skill_create
-                        // deliberately does NOT — the guard at the top of
-                        // `allows` denies it under every allow-list, so a skill
-                        // file naming it cannot widen the Executing-only rule.
+                        // deliberately does NOT — it stays Executing-only in the
+                        // base states and is reachable here only by an explicit
+                        // allow-list entry (the create_skill overlay; the guard
+                        // at the top of `allows` still denies the Reviewer
+                        // surface). The entry below is that grant path, and it
+                        // is deliberate: a skill file in the repo is reviewed.
                         || name == "skill_reload"
                         // The skill's exits are ALWAYS available — a skill
                         // file that forgets to list them must never trap the
@@ -2363,14 +2372,15 @@ mod tests {
         );
     }
 
-    /// `skill_create` — authoring a skill file — is EXECUTING ONLY (the user's
-    /// requirement). PlanFrozen carries it because that IS the advertised
-    /// surface while a plan is active; the per-state arms are what decide (a
-    /// call during Reviewing is rejected at dispatch with the state named).
-    /// The constructor-granted allow-lists deny it by name, so a skill file (or
-    /// a subagent list) naming it cannot widen the rule.
+    /// `skill_create` — authoring a skill file — is EXECUTING-ONLY in the base
+    /// states (the user's requirement). PlanFrozen carries it because that IS
+    /// the advertised surface while a plan is active; the per-state arms are
+    /// what decide (a call during Reviewing is rejected at dispatch with the
+    /// state named). A SKILL may grant it, but only by naming it in its
+    /// allow-list (the create_skill overlay, backlog 1b4dfad3) — an unlisted
+    /// skill gets nothing, and the subagent surface never gets it at all.
     #[test]
-    fn skill_create_allowed_only_in_the_executing_surfaces() {
+    fn skill_create_is_executing_only_unless_a_skill_names_it() {
         let v = |f: ToolFilter| {
             f.allows(ToolCategory::Workflow, SafetyLevel::AutoRun, "skill_create")
         };
@@ -2385,11 +2395,11 @@ mod tests {
         assert!(!v(ToolFilter::Complete), "hidden in Complete");
         assert!(
             !v(ToolFilter::Skill(vec![])),
-            "hidden inside a skill — an overlay is not the Executing state"
+            "hidden inside a skill that does not name it — an overlay is not the Executing state"
         );
         assert!(
-            !v(ToolFilter::Skill(vec!["skill_create".into()])),
-            "naming it in a skill allow-list must NOT grant it (the Executing-only guard)"
+            v(ToolFilter::Skill(vec!["skill_create".into()])),
+            "an explicit allow-list entry IS the grant (the create_skill overlay, backlog 1b4dfad3)"
         );
         assert!(
             !v(ToolFilter::Reviewer(vec!["skill_create".into()])),

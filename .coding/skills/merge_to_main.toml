@@ -72,10 +72,9 @@ name = "merge_to_main"
 available_in = ["complete", "planning"]
 target_state = "planning"
 tools = [
-  "file_read",
+  "read_files",      # the live read tool — `file_read` is a legacy shim, use of it denied reads (backlog 834ec126)
   "file_edit",
   "file_write",
-  "file_append",
   "shell",
   "search",
   "git",

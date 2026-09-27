@@ -414,11 +414,6 @@ impl AgentLoop {
         state.route = self.route_turn_start(messages, agent_id).await;
 
         loop {
-            // Routing log (backlog 091e694d): count this provider iteration.
-            if let Some(route) = state.route.as_mut() {
-                route.iterations = route.iterations.saturating_add(1);
-            }
-
             // A swap deferred mid-run (a smaller-context model pick) is
             // completed HERE too — before this iteration's provider
             // resolution — so it lands on the very next request of the same
@@ -429,6 +424,14 @@ impl AgentLoop {
                 .await;
             if let Some(outcome) = swap.early {
                 return Ok(outcome);
+            }
+
+            // Routing log (backlog 091e694d): count this provider iteration —
+            // placed after the deferred-swap early exit above, so a swap that
+            // ends the turn before any request is built never counts as one
+            // (review L1: the row reports provider-request iterations).
+            if let Some(route) = state.route.as_mut() {
+                route.iterations = route.iterations.saturating_add(1);
             }
             if swap.rewrote {
                 // The pre-swap summary replaced `messages` inside the
@@ -1062,12 +1065,16 @@ impl AgentLoop {
         // model is untouched. Enforce mode resolves the target NOW so the
         // decision row can name the model this turn is routed onto; the
         // per-iteration arm re-resolves (and re-guards) with the same
-        // resolver call, so a state change mid-turn still wins.
-        let arm_target = if shadow { None } else { decision.target };
-        let routed = match arm_target {
-            Some(target) => self.resolve_routed_model(target).await,
-            None => None,
+        // resolver call, so a context change mid-turn still wins.
+        let routed = match (shadow, decision.target) {
+            (false, Some(target)) => self.resolve_routed_model(target).await,
+            _ => None,
         };
+        // Memoize the MISS (review L2): a target that does not resolve at turn
+        // start is not armed at all, so a Settings save mid-turn cannot route
+        // the remaining iterations onto a model the decision row already
+        // recorded as not applying (`enforced: false, model: None`).
+        let arm_target = if routed.is_some() { decision.target } else { None };
         let agent = agent_id.to_string();
         let turn_id = model_routing::new_turn_id(&agent);
         model_routing::append_row(

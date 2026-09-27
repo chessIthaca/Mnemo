@@ -276,3 +276,25 @@ describe("serializeClassifier", () => {
     });
   });
 });
+
+describe("routing block guards its two unsafe edits (review L3/L4)", () => {
+  it("never reads a cleared confidence input as 0", () => {
+    // `Number("")` is 0 — an empty `type="number"` edit would silently open
+    // the gate to every classified answer, so the handler rejects an empty /
+    // non-finite / out-of-range edit and snaps the field back to the
+    // committed gate instead.
+    expect(classifierSource).toContain('raw === "" ? Number.NaN : Number(raw)');
+    expect(classifierSource).toContain(
+      "e.target.value = String(routingThreshold)",
+    );
+  });
+
+  it("can always switch enforcement back OFF while the classifier is not ready", () => {
+    // The switch is disabled for the ON direction only: a dead classifier can
+    // never trap a turn in enforce mode, and the hint says so.
+    expect(classifierSource).toContain(
+      'disabled={status !== "ready" && !routingEnforce}',
+    );
+    expect(classifierSource).toContain("switching it back off always works");
+  });
+});

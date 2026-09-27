@@ -13468,7 +13468,7 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
 fn routing_agent(
     dir: &std::path::Path,
     default_provider: Arc<dyn LlmClient>,
-    resolver: Arc<RoutingStubResolver>,
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
     gate: model_routing::RoutingGate,
 ) -> AgentLoop {
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
@@ -13844,4 +13844,108 @@ async fn routing_never_classifies_a_subagent_turn() {
         !log_path.exists(),
         "a spawned turn writes no routing rows"
     );
+}
+
+/// A resolver whose routed target only appears AFTER the turn-start probe:
+/// `resolve_routed` answers `None` on its first call (the turn-start
+/// resolution inside `route_turn_start`) and `cheap` on every later call --
+/// the mid-turn Settings save that must not route a turn whose decision row
+/// already recorded `enforced: false, model: None` (review L2).
+struct LateTargetResolver {
+    calls: std::sync::atomic::AtomicUsize,
+    cheap: crate::config::ModelRef,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for LateTargetResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        })
+    }
+
+    fn resolve_routed(
+        &self,
+        _target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        // Call 1 = the turn-start resolution; later calls = the per-iteration
+        // arm re-resolving after the target appeared mid-turn.
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0 {
+            None
+        } else {
+            Some(self.cheap.clone())
+        }
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model.model, &format!("from-{}", model.model)),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn routing_memoizes_an_unresolved_target_so_a_mid_turn_target_cannot_route() {
+    // Review L2: the turn-start resolution finds no target (first call ->
+    // None), so the decision row records `enforced: false, model: None`. A
+    // target that appears afterwards (a Settings save mid-turn, visible to the
+    // arm's re-resolution) must NOT route this turn -- the miss is memoized,
+    // so the whole turn stays on today's model and matches its own row.
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("routing.jsonl");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = routing_gate(Some(("trivial", 0.99)), calls.clone(), log_path.clone());
+    let resolver = Arc::new(LateTargetResolver {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        cheap: stub_model_ref("cheap-model"),
+    });
+    let agent = routing_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver.clone(),
+        gate,
+    );
+
+    let outcome = run_routing_turn(&agent, "say hi briefly").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "a target that only resolved after turn start never serves the turn"
+    );
+    assert_eq!(
+        resolver.calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the arm never re-resolved: the memoized miss kept the turn off routing"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "classified exactly once"
+    );
+
+    let (decisions, outcomes) = read_routing_log(&log_path);
+    assert_eq!(decisions.len(), 1, "one decision row");
+    assert_eq!(outcomes.len(), 1, "one outcome row");
+    let d = &decisions[0];
+    assert_eq!(d.target.as_deref(), Some("cheap"));
+    assert!(!d.enforced, "the row records the miss: nothing was enforced");
+    assert_eq!(d.model, None, "no model was routed onto");
+    assert_eq!(outcomes[0].outcome, "ok");
 }

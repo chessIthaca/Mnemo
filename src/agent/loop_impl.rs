@@ -13,6 +13,7 @@
 use std::sync::{Arc, RwLock};
 
 use super::failure_triage;
+use super::model_routing;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -112,6 +113,16 @@ pub struct AgentLoop {
     /// The context manager (token counting + summarization threshold). Swapped
     /// alongside the provider so the new model's context window takes effect.
     pub(crate) context_manager: Arc<RwLock<super::context::ContextManager>>,
+    /// The SESSION's temporary compaction raise (backlog 11513ee5): the
+    /// cumulative +10% ladder applied when a compaction pass still does not
+    /// fit. Owned by the loop — NOT by the context manager — because the turn
+    /// loop takes a fresh manager clone per iteration and the workflow-state
+    /// resolver builds a fresh one per iteration, so a field on the manager
+    /// would lose the ladder mid-turn; both hand-outs get this handle installed
+    /// ([`context_manager`](Self::context_manager),
+    /// `resolve_iteration_provider`). Created per loop, so every agent/session
+    /// starts at 1.0 and `/new` resets it.
+    pub(crate) compaction_raise: Arc<super::context::CompactionRaise>,
     /// The live token count of the most recent request iteration — recorded
     /// at the top of every iteration in `run_turn` right after the
     /// token-accounting update, so [`try_429_fallback`](Self::try_429_fallback)
@@ -378,6 +389,15 @@ pub struct AgentLoop {
     /// in tests / when the Laya foundation is not wired — those sites then
     /// keep their pre-classifier behavior byte-for-byte.
     pub(crate) failure_triage: Option<failure_triage::FailureTriageHandle>,
+    /// The optional pre-prompt routing gate (the Laya classifier's
+    /// task-complexity consumer, `[general.laya] routing`, backlog 091e694d):
+    /// the SAME shared classifier slot the other Laya consumers read. `None`
+    /// in tests / when the Laya foundation is not wired -- the turn then never
+    /// classifies, and model selection is byte-identical to today. The opt-in
+    /// flag and the `[general.routing]` threshold / `enforce` are read from the
+    /// live config by the model resolver per turn, so no flag mirror is needed
+    /// here.
+    pub(crate) routing: Option<model_routing::RoutingGate>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -740,9 +760,16 @@ impl AgentLoop {
             memory,
             vision,
         } = config;
+        // The session's compaction-raise ladder: ONE handle for the loop, shared
+        // by the stored manager and by every manager the loop hands out (see
+        // the field docs). Created here, so each agent/session starts at 1.0.
+        let compaction_raise = Arc::new(super::context::CompactionRaise::default());
         Self {
             provider: Arc::new(RwLock::new(provider)),
-            context_manager: Arc::new(RwLock::new(context_manager)),
+            context_manager: Arc::new(RwLock::new(
+                context_manager.with_compaction_raise(Arc::clone(&compaction_raise)),
+            )),
+            compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
             tools,
             workflow,
@@ -779,6 +806,7 @@ impl AgentLoop {
             plans_dir: std::path::PathBuf::new(),
             root_spec: None,
             failure_triage: None,
+            routing: None,
         }
     }
 
@@ -847,6 +875,19 @@ impl AgentLoop {
     /// in tests that don't exercise triage.
     pub fn with_failure_triage(mut self, handle: failure_triage::FailureTriageHandle) -> Self {
         self.failure_triage = Some(handle);
+        self
+    }
+
+    /// Attach the pre-prompt routing gate (the Laya classifier's
+    /// task-complexity consumer, `[general.laya] routing`, backlog 091e694d).
+    /// The gate carries the shared classifier slot; the opt-in flag and the
+    /// `[general.routing]` threshold / `enforce` ride the live config the
+    /// model resolver reads per turn, so a Settings save needs no rebuild.
+    /// Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise routing.
+    pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
+        self.routing = Some(gate);
         self
     }
 
@@ -1256,11 +1297,35 @@ impl AgentLoop {
     /// (`skill_start`/`skill_end`, or a state transition from any workflow
     /// tool) switches the next request within the same turn to the
     /// configured per-context model. See [`AgentLoop::run_turn`].
+    ///
+    /// This variant threads no routing decision; use
+    /// [`resolve_turn_provider_routed`](Self::resolve_turn_provider_routed)
+    /// for the turn's pre-prompt routing arm (backlog 091e694d).
     pub(crate) fn resolve_turn_provider(
         &self,
         workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
         plan_kind: Option<crate::workflow::PlanKind>,
+    ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
+        self.resolve_turn_provider_routed(workflow_state, skill_name, plan_kind, None)
+    }
+
+    /// [`resolve_turn_provider`](Self::resolve_turn_provider) with the turn's
+    /// pre-prompt ROUTING decision threaded in (backlog 091e694d).
+    ///
+    /// `route` is `Some` only when the turn's classification cleared the
+    /// confidence gate AND enforcement is on. The arm sits BELOW the three
+    /// explicit-pin arms above (a skill, the picker pin, a forced model keep
+    /// their model) and ABOVE the state/subagent chain it replaces: a routed
+    /// target that is unset, dangling, or refused by
+    /// [`resolve_routed`](crate::model_resolver::ModelResolver::resolve_routed)
+    /// falls through to that chain, unchanged.
+    pub(crate) fn resolve_turn_provider_routed(
+        &self,
+        workflow_state: crate::workflow::WorkflowState,
+        skill_name: Option<&str>,
+        plan_kind: Option<crate::workflow::PlanKind>,
+        route: Option<model_routing::RouteTarget>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
         // 1. Configured skill override beats everything — including the
         // picker pin. Skill runs are deliberate context switches that carry
@@ -1442,6 +1507,38 @@ impl AgentLoop {
             return None;
         };
         let is_subagent = self.is_subagent();
+        // Pre-prompt ROUTING (backlog 091e694d): a confident classification of
+        // this turn's task text may run it on the configured cheap / capable
+        // target instead of the state/subagent chain below. The explicit-pin
+        // arms above already returned, and `resolve_routed` refuses the skill,
+        // subagent and bug-fixing contexts itself -- so an arm that did not
+        // fire cannot smuggle routing past an explicit choice. Unset, dangling
+        // or refused -> `None` -> the chain below runs exactly as before.
+        if let Some(target) = route {
+            let ctx = crate::model_resolver::ModelContext::new(
+                workflow_state,
+                skill_name,
+                is_subagent,
+                plan_kind,
+            );
+            if let Some(model_ref) = resolver.resolve_routed(target, ctx) {
+                // Same endpoint stickiness as every other arm: a recorded 429
+                // fallback reroutes the ENDPOINT of this model, never the
+                // routed model choice itself.
+                let model_ref = self.sticky_endpoint(&model_ref).unwrap_or(model_ref);
+                let built = resolver.build_turn_provider(&model_ref, self.fill_rate);
+                // Record the effective model so the UI reports what actually
+                // ran (the routed target beats the state/subagent chain).
+                self.set_resolved_model(built.as_ref().map(|(p, _)| p.model().to_string()));
+                self.set_resolved_provider(
+                    built.as_ref().map(|(p, _)| p.provider_name().to_string()),
+                );
+                self.set_resolved_effort(
+                    built.as_ref().and_then(|_| resolver.display_effort_for(&model_ref)),
+                );
+                return built;
+            }
+        }
         let model_ref = resolver.resolve(crate::model_resolver::ModelContext::new(
             workflow_state,
             skill_name,
@@ -1694,12 +1791,21 @@ impl AgentLoop {
 
     /// A handle to the context manager, for manual compaction (`/compact`).
     /// Clones the `ContextManager` (cheap — two `usize`s) so the caller can
-    /// call `summarize_with_interrupt` without holding the lock.
+    /// call `summarize_with_interrupt` without holding the lock. The clone
+    /// carries the SESSION's compaction-raise handle, so a raise applied on the
+    /// manual path is the same ladder the turn loop reads.
     pub fn context_manager(&self) -> super::context::ContextManager {
         self.context_manager
             .read()
             .expect("context_manager lock poisoned")
             .clone()
+            .with_compaction_raise(Arc::clone(&self.compaction_raise))
+    }
+
+    /// Clear the session's temporary compaction raise — a fresh session must
+    /// start at 1.0 (`/new`).
+    pub fn reset_compaction_raise(&self) {
+        self.compaction_raise.reset();
     }
 
     /// Swap in a new provider + context manager (e.g. when the user switches
@@ -1729,7 +1835,12 @@ impl AgentLoop {
         *self
             .context_manager
             .write()
-            .expect("context_manager lock poisoned") = context_manager;
+            .expect("context_manager lock poisoned") = context_manager
+            .with_compaction_raise(Arc::clone(&self.compaction_raise));
+        // A different model means a different window and a different
+        // trigger — the ladder restarts at 1.0 (it is recomputed against the
+        // new window's cap on the next failed compaction).
+        self.compaction_raise.reset();
     }
 
     /// Pin an explicit provider + context manager for THIS agent — the

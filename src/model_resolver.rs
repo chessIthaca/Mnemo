@@ -38,6 +38,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 
 use crate::agent::context::ContextManager;
+use crate::agent::model_routing::{RouteTarget, RoutingPolicy};
 use crate::config::{Config, ModelRef};
 use crate::provider::LlmClient;
 use crate::workflow::{PlanKind, WorkflowState};
@@ -122,6 +123,36 @@ pub trait ModelResolver: Send + Sync {
     /// next link. The default returns `None` (no config access) so test and
     /// mocked resolvers stay simple.
     fn resolve_reviewer_model(&self) -> Option<ModelRef> {
+        None
+    }
+
+    /// Resolve a pre-prompt ROUTING target for a turn (backlog 091e694d): the
+    /// model a confident `trivial`/`architectural` classification selects
+    /// (`[general.routing]` `cheap` / `capable`).
+    ///
+    /// `None` whenever an explicit pin wins -- a skill override, a subagent,
+    /// or the bug-fixing plan-kind slot -- when the target is unset, or when
+    /// its endpoint no longer exists: the caller then keeps the
+    /// [`resolve`](Self::resolve) result, exactly as before routing existed.
+    /// The default returns `None` (no config access) so test and mocked
+    /// resolvers stay simple.
+    fn resolve_routed(
+        &self,
+        _target: RouteTarget,
+        _context: ModelContext<'_>,
+    ) -> Option<ModelRef> {
+        None
+    }
+
+    /// The live pre-prompt routing policy (backlog 091e694d): the
+    /// `[general.routing]` threshold + shadow-vs-enforce switch, or `None`
+    /// while the `[general.laya] routing` opt-in is off -- the caller then
+    /// does no classification at all, exactly today's behavior.
+    ///
+    /// Read per turn (like [`resolve`](Self::resolve)), so a Settings save
+    /// lands on the next turn. The default returns `None` (no config access)
+    /// so test and mocked resolvers stay simple.
+    fn routing_policy(&self) -> Option<RoutingPolicy> {
         None
     }
 
@@ -382,6 +413,57 @@ impl ModelResolver for ConfigModelResolver {
         config.resolve_model_ref(models.summarize.as_ref())
     }
 
+    fn resolve_routed(&self, target: RouteTarget, context: ModelContext<'_>) -> Option<ModelRef> {
+        // Explicit pins beat a routing decision: a skill (a deliberate context
+        // switch), a subagent (its own role slot), and the bug-fixing
+        // plan-kind slot all keep their model. This mirrors resolve()'s own
+        // priority order and is the single place the guard lives, so every
+        // caller gets it.
+        if context.skill_name.is_some() || context.workflow_state == WorkflowState::Skill {
+            return None;
+        }
+        if context.is_subagent || context.workflow_state == WorkflowState::Subagent {
+            return None;
+        }
+        if context.plan_kind == Some(PlanKind::BugFixing)
+            && matches!(
+                context.workflow_state,
+                WorkflowState::Executing | WorkflowState::Reviewing
+            )
+        {
+            return None;
+        }
+        let config = self
+            .config
+            .read()
+            .expect("ConfigModelResolver config lock poisoned");
+        let routing = &config.general.general.routing;
+        let target_ref = match target {
+            RouteTarget::Cheap => routing.cheap.as_ref(),
+            RouteTarget::Capable => routing.capable.as_ref(),
+        };
+        // Validated as its own link: unset or dangling (endpoint deleted)
+        // falls through to None, and the caller keeps the resolve() model.
+        config.resolve_model_ref(target_ref)
+    }
+
+    fn routing_policy(&self) -> Option<RoutingPolicy> {
+        let config = self
+            .config
+            .read()
+            .expect("ConfigModelResolver config lock poisoned");
+        // The opt-in gate: flag off (the default) = no policy = no classifier
+        // call anywhere, which is the strictest "behaves exactly as before".
+        if !config.general.general.laya.routing {
+            return None;
+        }
+        let routing = &config.general.general.routing;
+        Some(RoutingPolicy {
+            threshold: routing.threshold,
+            enforce: routing.enforce,
+        })
+    }
+
     fn display_effort_for(&self, model: &ModelRef) -> Option<String> {
         let config = self
             .config
@@ -519,7 +601,7 @@ impl ModelResolver for ConfigModelResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Endpoint, GeneralConfig, ModelsConfig};
+    use crate::config::{Endpoint, GeneralConfig, ModelsConfig, RoutingConfig};
     use std::collections::HashMap;
 
     /// Build a Config with two endpoints ("openai" + "deepseek") so overrides
@@ -556,6 +638,166 @@ mod tests {
             Arc::new(RwLock::new(config)),
             Arc::new(crate::provider::trace::LlmRequestLog::new()),
         )
+    }
+
+    /// A config whose only difference from a plain default is
+    /// `[general.routing]` -- the routing tests key off this.
+    fn config_with_routing(routing: RoutingConfig) -> Config {
+        let mut config = config_with_endpoints(ModelsConfig::default());
+        config.general.general.routing = routing;
+        config
+    }
+
+    fn cheap_ref() -> ModelRef {
+        ModelRef {
+            endpoint: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            reasoning_effort: Some("minimal".into()),
+        }
+    }
+
+    fn capable_ref() -> ModelRef {
+        ModelRef {
+            endpoint: "openai".into(),
+            model: "o3".into(),
+            reasoning_effort: Some("max".into()),
+        }
+    }
+
+    #[test]
+    fn routed_targets_resolve_when_configured() {
+        let r = resolver(config_with_routing(RoutingConfig {
+            cheap: Some(cheap_ref()),
+            capable: Some(capable_ref()),
+            ..RoutingConfig::default()
+        }));
+        let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
+        let cheap = r
+            .resolve_routed(RouteTarget::Cheap, ctx)
+            .expect("cheap target");
+        assert_eq!(cheap.endpoint, "deepseek");
+        assert_eq!(cheap.model, "deepseek-v4-flash");
+        assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
+        let capable = r
+            .resolve_routed(RouteTarget::Capable, ctx)
+            .expect("capable target");
+        assert_eq!(capable.endpoint, "openai");
+        assert_eq!(capable.model, "o3");
+        assert_eq!(capable.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn routed_targets_fall_back_when_unset_or_dangling() {
+        let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
+        // Unset: no routing config at all (the default config shape).
+        let plain = resolver(config_with_endpoints(ModelsConfig::default()));
+        assert!(plain.resolve_routed(RouteTarget::Cheap, ctx).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Capable, ctx).is_none());
+
+        // Dangling: the endpoint no longer exists -> today's model.
+        let dangling = resolver(config_with_routing(RoutingConfig {
+            cheap: Some(ModelRef {
+                endpoint: "gone".into(),
+                model: "tiny".into(),
+                reasoning_effort: None,
+            }),
+            capable: Some(capable_ref()),
+            ..RoutingConfig::default()
+        }));
+        assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx).is_none());
+        assert!(dangling.resolve_routed(RouteTarget::Capable, ctx).is_some());
+    }
+
+    #[test]
+    fn explicit_pins_beat_routing() {
+        let r = resolver(config_with_routing(RoutingConfig {
+            cheap: Some(cheap_ref()),
+            capable: Some(capable_ref()),
+            ..RoutingConfig::default()
+        }));
+        // A skill is a deliberate context switch.
+        let skill = ModelContext::new(WorkflowState::Skill, Some("merge_to_main"), false, None);
+        assert!(r.resolve_routed(RouteTarget::Cheap, skill).is_none());
+        // Subagents have their own role slot.
+        let sub = ModelContext::new(WorkflowState::Subagent, None, true, None);
+        assert!(r.resolve_routed(RouteTarget::Capable, sub).is_none());
+        // The bug-fixing plan-kind slot wins in its active lifecycle.
+        let bug = ModelContext::new(
+            WorkflowState::Executing,
+            None,
+            false,
+            Some(PlanKind::BugFixing),
+        );
+        assert!(r.resolve_routed(RouteTarget::Capable, bug).is_none());
+        // ... but not in Complete (the plan is finished, no slot engaged).
+        let done = ModelContext::new(
+            WorkflowState::Complete,
+            None,
+            false,
+            Some(PlanKind::BugFixing),
+        );
+        assert!(r.resolve_routed(RouteTarget::Capable, done).is_some());
+    }
+
+    #[test]
+    fn routing_policy_follows_the_flag_and_carries_the_knobs() {
+        // Flag off (the default config shape): no policy, so the turn never
+        // classifies and model selection is today's exactly.
+        let off = resolver(config_with_endpoints(ModelsConfig::default()));
+        assert!(off.routing_policy().is_none());
+
+        // Flag on: the policy carries the configured threshold + mode.
+        let mut config = config_with_routing(RoutingConfig {
+            threshold: 0.9,
+            enforce: true,
+            ..RoutingConfig::default()
+        });
+        config.general.general.laya.routing = true;
+        let on = resolver(config);
+        assert_eq!(
+            on.routing_policy(),
+            Some(RoutingPolicy {
+                threshold: 0.9,
+                enforce: true,
+            })
+        );
+    }
+
+    #[test]
+    fn routing_config_never_changes_the_resolve_chain() {
+        // The regression pin for the whole feature: with routing configured
+        // and enforcing, resolve() is byte-for-byte today's chain.
+        let models = || ModelsConfig {
+            executing: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "o3".into(),
+                reasoning_effort: None,
+            }),
+            ..ModelsConfig::default()
+        };
+        let baseline = resolver(config_with_endpoints(models()));
+        let mut routed_config = config_with_endpoints(models());
+        routed_config.general.general.routing = RoutingConfig {
+            cheap: Some(cheap_ref()),
+            capable: Some(capable_ref()),
+            threshold: 0.9,
+            enforce: true,
+        };
+        let routed = resolver(routed_config);
+        for ctx in [
+            ModelContext::new(WorkflowState::Planning, None, false, None),
+            ModelContext::new(WorkflowState::Executing, None, false, None),
+            ModelContext::new(WorkflowState::Reviewing, None, false, None),
+            ModelContext::new(WorkflowState::Complete, None, false, None),
+            ModelContext::new(WorkflowState::Subagent, None, true, None),
+            ModelContext::new(WorkflowState::Skill, Some("new_release"), false, None),
+        ] {
+            assert_eq!(
+                baseline.resolve(ctx),
+                routed.resolve(ctx),
+                "routing must not touch resolve()"
+            );
+        }
     }
 
     #[test]

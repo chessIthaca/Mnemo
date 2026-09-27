@@ -92,6 +92,11 @@ pub(crate) const MAX_BAD_JSON_RETRIES: u32 = 8;
 /// Test-only re-export of the denial classifier used by `run_turn` (review H1).
 #[cfg(test)]
 pub(crate) use turn::is_user_denial_tool_output as turn_denial_for_test;
+/// Test-only re-export of the hard-stop not-run synthesis (review finding 1,
+/// plan 49f53bf5): the sibling test pins that every synthesized result carries
+/// `tool_is_error`, so the wire never claims an unrun call succeeded.
+#[cfg(test)]
+pub(crate) use turn::synthesize_not_run_results as synthesize_not_run_results_for_test;
 pub(crate) use turn::StatsRow;
 
 #[cfg(test)]

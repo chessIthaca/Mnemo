@@ -27,7 +27,10 @@
 //! decay classes pre-write (markdown headings in code files, sentinel
 //! whole-values, duplicated adjacent doc lines, a delimiter-balance
 //! regression) with a re-emit/smaller-fragments message — deliberately not
-//! the drift nudge. Large payloads (~700+ chars) carry an advisory
+//! the drift nudge. A growing ops-array balance names the offending op(s)
+//! and the before → after deficit (backlog 08d2125d); `artifact_check: false`
+//! is the explicit last-resort opt-out (verify with `cargo check` first).
+//! Large payloads (~700+ chars) carry an advisory
 //! emission-fragility NOTE on success.
 
 use std::path::Path;
@@ -123,6 +126,20 @@ pub struct FileEditArgs {
     /// the file is missing — use `file_write` to create it.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub append: bool,
+    /// Escape hatch (backlog 08d2125d): when explicitly `false`, skip the
+    /// emission-artifact validation (the markdown-heading / sentinel /
+    /// dup-doc-line / delimiter-balance classes) — the last resort for a
+    /// legitimate edit the guard false-tripped. Verify the result yourself
+    /// first (`cargo check`, `rustfmt --check <file>`); the call stays
+    /// approval-gated as usual. Default: validate.
+    #[serde(default)]
+    pub artifact_check: Option<bool>,
+}
+
+/// Whether the emission-artifact validation runs for this call:
+/// `artifact_check=false` is the explicit escape hatch (backlog 08d2125d).
+fn artifact_checks_enabled(args: &FileEditArgs) -> bool {
+    args.artifact_check != Some(false)
 }
 
 /// The `file_edit` tool.
@@ -322,7 +339,9 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         ));
     }
 
-    validate_emission_artifacts(&args.path, content, &new_string, &new_content)?;
+    if artifact_checks_enabled(args) {
+        validate_emission_artifacts(&args.path, content, &new_string, &new_content)?;
+    }
     let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
@@ -393,7 +412,9 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
     // splice; the validator wants the same replacement text).
     let le = detect_line_ending(content);
     let new_string = denormalize_literal_newlines(&normalize_line_endings(&args.new_string, le));
-    validate_emission_artifacts(&args.path, content, &new_string, &new_content)?;
+    if artifact_checks_enabled(args) {
+        validate_emission_artifacts(&args.path, content, &new_string, &new_content)?;
+    }
     let diff = compute_diff(&args.path, content, &new_content);
     let notes = origin
         .note()
@@ -420,7 +441,13 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
 /// unbalanced mid-apply); the diff is one combined diff.
 fn prepare_edit_ops(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
     let ops = validate_ops(args)?;
-    let (new_content, notes) = apply_ops(&args.path, content, &ops, args.fuzzy_whitespace)?;
+    let (new_content, notes) = apply_ops(
+        &args.path,
+        content,
+        &ops,
+        args.fuzzy_whitespace,
+        artifact_checks_enabled(args),
+    )?;
     let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
@@ -511,7 +538,9 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
     new_content.push_str(content);
     new_content.push_str(&appended);
 
-    validate_emission_artifacts(&args.path, content, &appended, &new_content)?;
+    if artifact_checks_enabled(args) {
+        validate_emission_artifacts(&args.path, content, &appended, &new_content)?;
+    }
     let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
@@ -635,7 +664,9 @@ fn prepare_edit_regex_with_le(
             "regex old_string matched nothing (or produced no change)",
         ));
     }
-    validate_emission_artifacts(&args.path, content, &replacement, &new_content)?;
+    if artifact_checks_enabled(args) {
+        validate_emission_artifacts(&args.path, content, &replacement, &new_content)?;
+    }
     let diff = compute_diff(&args.path, content, &new_content);
     Ok(PreparedEdit {
         path: args.path.clone(),
@@ -688,7 +719,8 @@ impl Tool for FileEditTool {
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
                     "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
                     "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}]}},
-                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."}
+                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
+                    "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
                 "required": ["path"]
             }),
@@ -921,6 +953,7 @@ mod tests {
             fuzzy_whitespace: false,
             ops: None,
             append: false,
+            artifact_check: None,
         }
     }
 
@@ -943,6 +976,7 @@ mod tests {
             fuzzy_whitespace: false,
             ops: None,
             append: false,
+            artifact_check: None,
         }
     }
 
@@ -959,6 +993,7 @@ mod tests {
             fuzzy_whitespace: false,
             ops: None,
             append: false,
+            artifact_check: None,
         }
     }
 
@@ -1789,6 +1824,7 @@ mod tests {
             fuzzy_whitespace: true,
             ops: None,
             append: false,
+            artifact_check: None,
         }
     }
 
@@ -1880,6 +1916,7 @@ mod tests {
             fuzzy_whitespace: true, // ignored in regex mode
             ops: None,
             append: false,
+            artifact_check: None,
         };
         let prepared = prepare_edit(&args, "a1 b2\n").unwrap();
         assert_eq!(prepared.new_content, "aN b2\n");
@@ -1960,7 +1997,26 @@ mod tests {
             fuzzy_whitespace: false,
             ops: Some(items.iter().map(|i| serde_json::to_value(i).unwrap()).collect()),
             append: false,
+            artifact_check: None,
         }
+    }
+
+    #[test]
+    fn artifact_check_false_is_the_escape_hatch() {
+        // Backlog 08d2125d: a legitimate restructure that grows the delimiter
+        // balance is rejected by default (with the per-op attribution), and
+        // the explicit artifact_check=false applies the same array.
+        let content = "fn f() {\n    a();\n}\n";
+        let mut args = batch_args("a.rs", vec![]);
+        args.ops = Some(vec![json!("r3:    } else {")]);
+        let err = prepare_edit(&args, content)
+            .expect_err("the guard trips by default")
+            .to_string();
+        assert!(err.contains("unbalanced delimiters"), "{err}");
+        assert!(err.contains("ops[0]"), "{err}");
+        args.artifact_check = Some(false);
+        let prepared = prepare_edit(&args, content).unwrap();
+        assert_eq!(prepared.new_content, "fn f() {\n    a();\n    } else {\n");
     }
 
     #[test]
@@ -2182,6 +2238,7 @@ mod tests {
             fuzzy_whitespace: false,
             ops: None,
             append: true,
+            artifact_check: None,
         }
     }
 

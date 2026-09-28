@@ -593,7 +593,7 @@ results (file reads, shell, git) are truncated with a note.
 
 #### Optimizer levers (token-optimizer parity, backlog e4a50d22)
 
-Six independent context-economy levers live behind `[general.optimizer]` in
+Seven independent context-economy levers live behind `[general.optimizer]` in
 `config.toml` (`OptimizerConfig`, `src/config/general.rs`) — **on by default
 since 2027-01-25** (saving tokens is the expected behaviour; a config that never
 wrote the section runs every lever, and an explicit `false` is honoured as
@@ -604,7 +604,7 @@ green, now that they opt a lever out explicitly.
 | Lever | Flag | What it does |
 |---|---|---|
 | Delta/skeleton re-reads | `delta_reads` | A `read_files` re-read of a file the agent already has serves a skeleton (unchanged) or a unified diff (small change) instead of the whole file. |
-| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every model-served surface. |
+| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every line the compactor serves (output it never sees passes through verbatim). |
 | Archive + expand | `archive` | Tool results past `archive_min_chars` are archived (full text in SQLite) and replaced by a preview; the always-advertised `expand_result` tool retrieves any row by id or keyword. |
 | Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
 | Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |

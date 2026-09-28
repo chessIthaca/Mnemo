@@ -111,9 +111,12 @@ pub struct Endpoint {
     /// everyone else omits the field). Set it explicitly when a renamed,
     /// aliased, or fine-tuned DeepSeek model needs the mapping the
     /// name-based policy can't see — resolution is by config, never by
-    /// model name. Model-level entries override this. Ignored on
-    /// `anthropic` endpoints (the Messages API has no `reasoning_effort`
-    /// field).
+    /// model name. Model-level entries override this. On `anthropic`
+    /// endpoints this field has no effect: the Messages API has no
+    /// `reasoning_effort` field, depth is controlled with
+    /// `output_config.effort`, and omission is the only `"off"` encoding
+    /// that is valid across model generations — so `"off"` always resolves
+    /// to `None` (omit) there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_off_wire: Option<String>,
     /// Optional Anthropic workspace id (e.g. `ws_...`). When set on an
@@ -474,7 +477,9 @@ impl Endpoint {
     /// allow-list clamp — but `"off"` stays `"off"`: the off-wire encoding
     /// (`"none"` on DeepSeek-family models, or a configured
     /// `reasoning_effort_off_wire`) is a WIRE concern; the UI vocabulary is
-    /// always `"off" | "low" | "medium" | "high" | "max"`.
+    /// always `"off" | "minimal" | "low" | "medium" | "high" | "max" |
+    /// "xhigh"` (a configured value passes through unclamped unless the
+    /// model's own allow-list narrows it).
     pub fn display_reasoning_effort_for(&self, model_id: Option<&str>) -> String {
         if !self.supports_reasoning_effort {
             return "off".to_string();
@@ -602,8 +607,9 @@ impl Endpoint {
     /// (unset everywhere) means callers fall back to the built-in provider
     /// policy ([`reasoning_effort_off_wire_value`]: DeepSeek-family model
     /// names → `"none"`, others omit the field). Anthropic-kind endpoints
-    /// always resolve `None` — the Messages API has no `reasoning_effort`
-    /// field to encode. This is the config escape hatch for renamed,
+    /// always resolve `None`: the Messages API has no `reasoning_effort`
+    /// field, depth rides `output_config.effort` instead, and omission is the
+    /// only `"off"` encoding valid across model generations. This is the config escape hatch for renamed,
     /// aliased, or fine-tuned models the name-based policy can't see.
     pub fn reasoning_effort_off_wire_for(&self, model_id: &str) -> Option<String> {
         if provider_kind(self.kind) == ProviderKind::Anthropic {

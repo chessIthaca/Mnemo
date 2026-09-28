@@ -1240,25 +1240,37 @@ async fn error_recovery_malformed_json() {
         .find(|m| m.role == Role::Tool)
         .expect("should have a tool message");
     assert!(
-        tool_msg.content.as_text().contains("malformed")
-            || tool_msg.content.as_text().contains("truncated"),
-        "expected malformed/truncated error, got: {}",
+        tool_msg.content.as_text().contains("not valid JSON"),
+        "expected an invalid-JSON error, got: {}",
+        tool_msg.content.as_text()
+    );
+    // Plan d3aedfee: the first-failure guidance is a per-call one-liner:
+    // it NAMES the failing tool and the fields its schema requires
+    // (`file_read` is registered here; its schema requires `path`).
+    assert!(
+        tool_msg.content.as_text().contains("`file_read`"),
+        "feedback should name the failing tool, got: {}",
+        tool_msg.content.as_text()
+    );
+    assert!(
+        tool_msg.content.as_text().contains("required: path"),
+        "feedback should list the schema's required fields, got: {}",
         tool_msg.content.as_text()
     );
     assert!(
         tool_msg
             .content
             .as_text()
-            .contains("rewrite the COMPLETE call"),
-        "malformed-JSON feedback should teach rewrite-complete (content first), got: {}",
+            .contains("Re-emit the complete call once"),
+        "malformed-JSON feedback should teach re-emit-complete, got: {}",
         tool_msg.content.as_text()
     );
     assert!(
         tool_msg
             .content
             .as_text()
-            .contains("never resend the broken call unchanged"),
-        "malformed-JSON feedback should forbid resending the broken call, got: {}",
+            .contains("never resend it unchanged"),
+        "malformed-JSON feedback should forbid resending the call unchanged, got: {}",
         tool_msg.content.as_text()
     );
 
@@ -4503,6 +4515,79 @@ async fn complete_with_retry_does_not_retry_rate_limit() {
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "rate-limited error must not be retried against the same provider (1 call, not 3)"
+    );
+}
+
+/// A provider that always returns a deterministic HTTP 400 — the shape a
+/// strict gateway rejects a malformed body with (live 2027-01: z.ai's
+/// `code 1214 "messages[8].content[0].type type error"`, the body of the
+/// status line below).
+struct BadRequestProvider {
+    caps: Capabilities,
+    calls: Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait]
+impl LlmClient for BadRequestProvider {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "mock-400"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<crate::provider::ToolChoice>,
+    ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(crate::error::Error::Provider(
+            "provider error: stream request: HTTP 400 Bad Request from \
+             https://api.z.ai/api/coding/paas/v4/chat/completions"
+                .into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn complete_with_retry_does_not_retry_deterministic_4xx() {
+    // Live 2027-01: after the mid-session switch to z.ai/GLM, every attempt
+    // of the 3-attempt ladder re-sent the identical body and got the
+    // identical `HTTP 400 ... code 1214` back — ~5s of backoff sleeps for a
+    // verdict already known. A deterministic client rejection (4xx other
+    // than 408/429) must fail fast: exactly ONE provider call, then Err.
+    // The turn-level ladder (run_turn_attempt) still owns endpoint
+    // switching.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let provider: Arc<dyn LlmClient> = Arc::new(BadRequestProvider {
+        caps: Capabilities::openai(),
+        calls: Arc::clone(&calls),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+    let provider = agent.provider();
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let result = agent
+        .complete_with_retry(&provider, &[], &[], &fanin_tx, 1, None)
+        .await;
+    assert!(result.is_err(), "a deterministic 400 must produce Err");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a deterministic 4xx must fail fast (1 call, not 3): the identical \
+         payload cannot become acceptable on a retry"
     );
 }
 
@@ -11966,6 +12051,196 @@ async fn repeated_bad_json_for_same_tool_changes_strategy() {
         repeat_guidance.contains("[(][?][<]"),
         "the remedy must show the correct character class for the literal \
          `(?<`; got: {repeat_guidance}"
+    );
+}
+/// Regression (plan d3aedfee, batch isolation): a malformed tool call must
+/// not fail its well-formed siblings. Before the fix, `has_bad_json` routed
+/// the WHOLE batch through `handle_bad_json`, which errored EVERY call with
+/// "arguments malformed or truncated — not run": the valid sibling never
+/// ran, its work was wasted for a round-trip, and the visible failure count
+/// doubled (live 2027-01 shape).
+#[tokio::test]
+async fn bad_json_batch_isolation_runs_valid_siblings() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // One batch, two calls: `memory_search` with valid no-arg arguments
+    // ("{}" — a genuine no-arg tool, registered in make_registry), and
+    // `search` whose arguments are malformed (the live shape from the
+    // strategy test above). `search` need not be registered: the bad-JSON
+    // path never dispatches a malformed call.
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_a".into(),
+                name: "memory_search".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: "{}".into(),
+            },
+            LlmEvent::ToolCallStart {
+                index: 1,
+                id: "call_b".into(),
+                name: "search".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 1,
+                fragment: r#"{"pattern":"\\(\\?<"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("look for the lookbehind")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // The recorded batch: exactly ONE assistant message carrying both calls
+    // (N calls -> N results), the malformed call's arguments sanitized to
+    // "{}" in history (the H2 sanitize contract).
+    let batches: Vec<&Message> = messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant && m.tool_calls.len() == 2)
+        .collect();
+    assert_eq!(
+        batches.len(),
+        1,
+        "the batch must be recorded exactly once"
+    );
+    assert_eq!(batches[0].tool_calls[0].name, "memory_search");
+    assert_eq!(batches[0].tool_calls[1].name, "search");
+    assert_eq!(
+        batches[0].tool_calls[1].arguments, "{}",
+        "the malformed call's arguments must be sanitized in history"
+    );
+
+    // The VALID sibling RAN: its tool result is a real result, not the
+    // malformed-arguments error.
+    let result_a = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_a"))
+        .expect("the valid sibling must have a tool result");
+    assert!(
+        !result_a.tool_is_error,
+        "the well-formed sibling must have run — got: {}",
+        result_a.content.as_text()
+    );
+
+    // The malformed call did NOT run: it carries the malformed-arguments
+    // error so the model can repair it.
+    let result_b = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_b"))
+        .expect("the malformed call must have a tool result");
+    assert!(
+        result_b.tool_is_error,
+        "the malformed call must surface an error result"
+    );
+    assert!(
+        result_b.content.as_text().contains("`search`"),
+        "the malformed call's guidance must name the failing tool — \
+         got: {}",
+        result_b.content.as_text()
+    );
+    assert!(
+        result_b.content.as_text().contains("JSON"),
+        "the malformed call's guidance must describe the JSON failure — \
+         got: {}",
+        result_b.content.as_text()
+    );
+}
+/// Regression (plan d3aedfee, correction one-liner): the FIRST bad-JSON
+/// failure names the failing tool and the fields its schema requires —
+/// replacing the ~85-word generic preamble ("re-read the tool's schema"),
+/// which was empirically ineffective in the 2027-01 live session. A call
+/// that lands with NO arguments at all is the live shape.
+#[tokio::test]
+async fn bad_json_first_failure_names_the_tool_and_its_required_fields() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+
+    // One call, no ArgumentDelta at all: `memory_write` (registered, with a
+    // required-field schema) lands with empty arguments.
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_w".into(),
+                name: "memory_write".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("remember this decision")];
+
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let guidance = messages
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_w"))
+        .expect("the malformed call must have a tool result")
+        .content
+        .as_text();
+    assert!(
+        guidance.contains("`memory_write`"),
+        "the guidance must name the failing tool — got: {guidance}"
+    );
+    assert!(
+        guidance.contains("no arguments"),
+        "the empty-arguments variant must be named — got: {guidance}"
+    );
+    assert!(
+        guidance.contains("tier")
+            && guidance.contains("title")
+            && guidance.contains("content"),
+        "the guidance must list the schema's required fields — got: {guidance}"
+    );
+    assert!(
+        guidance.len() < 240,
+        "the correction must stay a one-liner (the old preamble was ~470 chars) — \
+         got {} chars: {guidance}",
+        guidance.len()
     );
 }
 /// A `file_read` tool-call event pair (Start + ArgumentDelta) for the given

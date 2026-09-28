@@ -67,9 +67,21 @@ Thumbs.db
 .worktrees/
 .claude/
 
+# ===== Local marketing artifacts =====
+# Social cards, launch posts and the card render harness are local-only
+# publishing material — never tracked (plan 5df6b409). The files stay on
+# disk under assets/social/ and docs/marketing/ for hand-publishing.
+assets/social/
+docs/marketing/
+
 # Temp/cache artifacts — never commit
 __pycache__/
 ~$*
 
 # Patch-tool backup files — never commit
 *.orig
+
+# ===== Local-only architecture draft =====
+# docs/costsaving.md — cost-saving orchestration prompt working draft, kept
+# local for an architecture discussion (see the backlog). Never tracked.
+docs/costsaving.md

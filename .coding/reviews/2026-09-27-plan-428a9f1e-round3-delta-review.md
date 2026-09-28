@@ -1,0 +1,44 @@
+## Verdict: PASS
+
+Delta review of plan 428a9f1e (wt/mnemo, round 3 — retry after two reportless runs): commits 5b7f99b, ad9c76f, c19e79b read in full via `git_read op=show`; surrounding pre/post code read targeted (anthropic.rs parser + StreamState, openai/request.rs echo gate + raw_is_usable, error.rs classifiers, dispatch.rs ladder, provider/mod.rs ProviderKind). All three regression tests are genuinely red-first; the new code holds on every edge case checked; no regressions, no new sensitive logging, constitution items clean. The uncommitted remainder is `.coding` bookkeeping only (out of scope; matches what shipped).
+
+Reviewed-state: c19e79b694293abc3254a762b495464f71c5c245
+## Check 1 — red-first regression tests (reasoned from pre-fix code)
+
+**(a) `event_name_persists_across_chunk_boundary` — genuinely red pre-fix.** Pre-fix, `current_event` was a function-local of `parse_sse_buffer`, reset to `None` on every call. The test's chunk 1 ends by consuming the `event: content_block_delta` line (buffer asserted empty), so pre-fix the name died with the call's return. Chunk 2 then opens with the orphaned `data:` line, which pre-fix parsed under `""` — and `parse_sse_event`'s `_ =>` catch-all (anthropic.rs:830-832, "unknown event types are ignored") drops it silently. Pre-fix the accumulated args would be only the sibling frame's fragment (`"a.txt"}`), failing both the ordered-fragment equality assert and the JSON-validity assert; the chunk-3 text split fails the `text == "Hi"` assert the same way. Post-fix `state.pending_event.take()` recovers the name → green.
+
+**(b) `foreign_anthropic_raw_is_not_echoed_into_an_openai_compat_body` — genuinely red pre-fix.** Pre-fix the gate was `raw_is_usable(raw)` alone (request.rs:559-571 before the commit). On the test's Anthropic raw: `has_content` = true (the `content` key exists — as an array, which `raw_is_usable` does not type-check, request.rs:1108), no `tool_calls` key → H2/H3 skipped → returns **true** → `echo_assistant_raw` shipped the thinking/tool_use array verbatim → the `!has_anthropic_block` assert fails pre-fix. Post-fix the origin gate (`origin_provider = "anthropic"` ≠ client kind `openai`) falls through to field construction, and the asserts pin the rebuild: content as the string, `tool_calls[0]` with id/type/name/arguments from the structured `ToolCall`.
+
+**(c) `complete_with_retry_does_not_retry_deterministic_4xx` — genuinely red pre-fix.** The mock provider's message ("stream request: HTTP 400 Bad Request from https://api.z.ai/...") matches none of the pre-existing early-exit predicates, verified against each: `is_serialization_bug` (error.rs:312-321) needs paired needles (thought_signature+missing etc.) — absent; `is_non_retryable` (error.rs:102-138) needs unauthorized/auth_error/notfounderror/model+"not found" — absent; `is_rate_limited` (error.rs:226-234) needs http 429/too many requests/rate limit/limit exhausted — absent. So pre-fix the ladder fell through to 3 attempts + backoff and the `calls == 1` assert fails. Green post-fix via the new `is_deterministic_4xx` arm.
+
+## Check 2 — correctness / edge cases of the new code
+
+- **`pending_event` lifecycle:** `StreamState::default()` is constructed inside the per-request `tokio::spawn` stream loop (anthropic.rs:1400-1401) — one state per request, so no stale event name can leak across requests. `.take()` per `data:` line preserves the per-frame drain semantics (a second `data:` without a new `event:` still parses under `""`, identical to pre-fix within one buffer); an `event:` line overwrites any pending one. Genuinely-unnamed `data:` frames still hit the forward-compatible catch-all, unchanged by design.
+- **`raw_origin_allows_echo`:** `None → true` (legacy saves / synthetic constructions keep the Rule-1 default, pinned by the existing echo tests); `Some(origin)` → `ProviderKind::from_str(origin) == Some(kind)`. `from_str` (mod.rs:138-145) is the exact lowercase inverse of `as_str` ("openai"/"local"/"anthropic"), so same-kind echoes and a foreign or unparseable origin falls through to the field-construction path (verified at request.rs:584+ — content rebuilt as string, `tool_calls` from structured fields).
+- **`provider_http_status`:** exactly-3-digits guard present (`digits.len() == 3`), so body numbers like `max_tokens: 4000` cannot read as a status (pinned in the transient test); `"https"` cannot match the `"http "` prefix — the prefix requires a space after "http" and `https://` has an "s" (the pinned live shape "HTTP 400 Bad Request from https://…" resolves at the status line, not the URL); first 3-digit status wins via early return (favorable: a 502 gateway wrapping an upstream 400 quote resolves to 502 → stays retryable); `let Error::Provider(..) = self else { return None }` makes non-Provider variants `None`, pinned by `non_provider_errors_are_not_deterministic_4xx`. The string-scan approximation is consistent with the file's established string-based classifiers and documented as such in the doc comment.
+## Check 3 — regressions
+
+- **Same-family echo:** pinned by `same_family_origin_raw_still_echoes_verbatim` — an "openai"-origin raw echoes with the unknown `vendor_extension` key intact; the `None`-origin default echo is unchanged (gate returns `true`) and still pinned by the pre-existing echo tests. Gate order (`raw_origin_allows_echo && raw_is_usable`) preserves the H1-H3 defense checks for the cases that do echo.
+- **Retryability untouched elsewhere:** 408 and 429 are explicitly excluded from `is_deterministic_4xx`; 5xx statuses land outside `(400..500)`; network/parse/plain errors yield `provider_http_status() == None` — all still retryable, covered by `transient_errors_are_not_deterministic_4xx` (408, 429, 500, 502, 503, network, plain, body-number false-positive cases).
+- **Triage / other arms:** the new dispatch arm sits AFTER `is_serialization_bug` / `is_non_retryable` / `is_rate_limited` and BEFORE failure triage. Rule-6 serialization 400s therefore keep their specialized surfaced message; context-overflow and auth 4xx still take the earlier `is_non_retryable` arm; every non-4xx error class still reaches triage unchanged. Deterministic-4xx now skips triage (never classified/logged) — deliberate, mirrors the pre-existing 429 arm, and documented in the code comment; the outcome (immediate `Err`, turn-level endpoint switching preserved) is the same either way.
+
+## Check 4 — security
+
+No new logging of request bodies, prompts, or API keys anywhere in the three deltas — the additions are gate logic, doc comments, and tests. The mock URL in the dispatch test carries no key. The "offending request body is in the Trace tab" string in the Rule-6 arm is pre-existing, unchanged code.
+
+## Check 5 — constitution
+
+- **Docs:** `parse_sse_buffer`'s module doc updated to state the event name persists across chunks (in the 5b7f99b hunk); new `pub fn is_deterministic_4xx` carries a full doc comment; private helpers (`provider_http_status`, `raw_origin_allows_echo`) documented. No README/PLAN.md change needed — internal parser/builder/retry fixes with no user-facing config or feature surface.
+- **Multi-platform:** no Windows-only APIs, paths, or shell syntax in any delta — pure Rust library logic.
+- **File-tools-first:** all diffs are clean targeted edits; no shell-based mutation.
+- **Regression tests:** each defect carries its named red-first test (A/B/C verified red above); the suite's green `cargo test` under `#![deny(warnings)]` covers the warning-free rule.
+- **Bookkeeping (accuracy line, out of scope per task):** the plan frame's step checkboxes and the three new BUG knowledge files match the three shipped fixes; the uncommitted carry-over is `.coding` bookkeeping only.
+
+## Remarks (not findings)
+
+- The plan's step-1 test design said "two parallel tool_use blocks"; the shipped test uses one tool_use block (two argument fragments) plus a text block. The defect mechanism — the `event:`/`data:` chunk-boundary split — is exercised identically at three split points, so the pin is sound; the deviation is cosmetic.
+- Process: this is round 3 after two reportless reviewer runs; the report protocol (verdict-first write, evidence appended after) was followed as mandated.
+
+## What I read
+
+`git_read op=log` (branch head c19e79b, fork at 61c2956) and `op=show` full diffs for 5b7f99b, ad9c76f, c19e79b; targeted reads: anthropic.rs 620-840 (parse_sse_event incl. catch-all) and 1393-1412 (StreamState per-request construction), openai/request.rs 540-633 (gate + fall-through field construction) and 1078-1175 (raw_is_usable + gate fn), error.rs 75-329 (is_non_retryable, is_rate_limited, is_deterministic_4xx, provider_http_status, is_serialization_bug), dispatch.rs 1040-1129 (ladder arms around the new gate), provider/mod.rs 120-159 (ProviderKind::from_str).

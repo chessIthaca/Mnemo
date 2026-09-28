@@ -60,6 +60,19 @@ pub struct AnthropicClientConfig {
     /// attributed to that workspace. Empty/unset omits the header entirely —
     /// it is NEVER sent empty (some gateways reject an empty header value).
     pub workspace_id: Option<String>,
+    /// The resolved reasoning-effort value from the endpoint config (display
+    /// space: `off`/`minimal`/`low`/`medium`/`high`/`max`/`xhigh`), translated
+    /// into the Messages API's `output_config.effort` at the serialization
+    /// choke point. `None`, `off`, and any value outside the ladder omit the
+    /// field entirely — the model's own default then applies.
+    ///
+    /// A `thinking` field is NEVER sent from here: `{"type":"enabled"}` is
+    /// deprecated on Claude 4.6 and rejected with a 400 by 4.7+, while
+    /// `{"type":"disabled"}` is a 400 on models whose thinking is always on
+    /// (e.g. Opus 5.5 at every effort level). Omission is the only encoding
+    /// that is valid across model generations — and it is exactly what `off`
+    /// means.
+    pub reasoning_effort: Option<String>,
 }
 
 /// A native Anthropic Messages API LLM client (`/v1/messages`).
@@ -406,6 +419,42 @@ impl AnthropicClient {
             "max_tokens": max_tokens,
             "stream": true,
         });
+
+        // Reasoning depth: the harness's display-space effort lands on the
+        // Messages API's `output_config.effort` (low/medium/high/max/xhigh) —
+        // the documented, no-beta-header control, and the recommended one
+        // wherever adaptive thinking is available. Effort shapes the whole
+        // response (text, tool calls, thinking) and applies whether or not
+        // thinking is active.
+        //
+        // No `thinking` field is ever sent (see
+        // [`AnthropicClientConfig::reasoning_effort`]): both of its variants
+        // are 400s on some current model generation, so omission is the only
+        // encoding that travels. `off`/unset/unknown therefore leave the
+        // request byte-for-byte as it was before effort was wired.
+        const EFFORT_LEVELS: &[(&str, &str)] = &[
+            // The API has no level below `low`; `minimal` is our floor.
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "xhigh"),
+        ];
+        if let Some(level) = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .and_then(|e| {
+                EFFORT_LEVELS
+                    .iter()
+                    .find(|(display, _)| display.eq_ignore_ascii_case(e))
+            })
+            .map(|(_, wire)| *wire)
+        {
+            body["output_config"] = serde_json::json!({ "effort": level });
+        }
         if !system_blocks.is_empty() {
             body["system"] = serde_json::json!(system_blocks);
         }
@@ -861,6 +910,16 @@ struct StreamState {
     /// Index of the currently-open text block (unused beyond tracking — text
     /// deltas already carry their block's index).
     text_block_index: Option<u32>,
+    /// The `event:` name of a frame whose `data:` line has not yet arrived.
+    ///
+    /// Persisted across `parse_sse_buffer` calls: a network chunk boundary can
+    /// fall between the two lines, and every `data:` line is parsed under the
+    /// name of the most recent `event:` line. A per-call local loses the name,
+    /// the `data:` line is then processed under an empty name, and
+    /// `parse_sse_event`'s forward-compatible catch-all drops the frame
+    /// silently (2027-01 bug: vanished tool-argument fragments and text
+    /// deltas).
+    pending_event: Option<String>,
     /// The verbatim assistant content array, assembled from `content_block_*`
     /// events (Rule 1 raw). Each entry is a block object (text / thinking /
     /// redacted_thinking / tool_use) with its `signature` / `data` preserved
@@ -1072,16 +1131,14 @@ fn accumulate_raw_block_delta(
 /// trailing newline) is left in the buffer for the next chunk.
 ///
 /// Unlike the OpenAI parser, the `event:` line is significant here (Anthropic
-/// names every data frame), so the current event name is tracked across lines
-/// within the buffer; only `data:` lines carry payload. Uses
+/// names every data frame), so the event name is tracked across both lines and
+/// calls (a network chunk boundary can fall between a frame's `event:` line and
+/// its `data:` line — `StreamState::pending_event`); only `data:` lines carry
+/// payload. Uses
 /// `String::drain()` to drop processed bytes in-place — O(1) amortized per
 /// line instead of the O(n²) re-copy of `buffer = buffer[pos+1..].to_string()`.
 fn parse_sse_buffer(buffer: &mut String, state: &mut StreamState) -> Vec<SseOutcome> {
     let mut outcomes = Vec::new();
-    // The event name of the data frame currently being assembled. SSE frames
-    // can span lines (event: X\n data: {...}), so a `data:` line may follow an
-    // `event:` line in a later buffer chunk.
-    let mut current_event: Option<String> = None;
     while let Some(pos) = buffer.find('\n') {
         // Extract the line up to (but not including) the newline, then drop
         // the processed bytes (line + newline) in-place via drain().
@@ -1092,11 +1149,13 @@ fn parse_sse_buffer(buffer: &mut String, state: &mut StreamState) -> Vec<SseOutc
             continue;
         }
         if let Some(name) = line.strip_prefix("event: ") {
-            current_event = Some(name.to_string());
+            state.pending_event = Some(name.to_string());
             continue;
         }
         if let Some(data) = line.strip_prefix("data: ") {
-            let event_name = current_event.take().unwrap_or_default();
+            // The name may have arrived in an EARLIER chunk (a boundary right
+            // after the `event:` line) — it lives on the stream state.
+            let event_name = state.pending_event.take().unwrap_or_default();
             match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(json) => {
                     for event in parse_sse_event(&event_name, &json, state) {
@@ -1861,7 +1920,63 @@ mod tests {
             max_output_tokens: None,
             multimodal,
             workspace_id: None,
+            reasoning_effort: None,
         })
+    }
+
+    /// The [`client`] helper with a resolved reasoning effort on the config.
+    fn client_with_effort(effort: Option<&str>) -> AnthropicClient {
+        AnthropicClient::new(AnthropicClientConfig {
+            reasoning_effort: effort.map(str::to_string),
+            ..client(false).config.clone()
+        })
+    }
+
+    #[test]
+    fn effort_maps_onto_output_config_effort_levels() {
+        // The display ladder → the API's effort levels (`minimal` has no API
+        // level and maps to `low`). Everything rides on `output_config.effort`;
+        // no request ever carries a `thinking` field.
+        for (display, wire) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "xhigh"),
+        ] {
+            let client = client_with_effort(Some(display));
+            let body = client
+                .build_request_json(&[Message::user_text("hi")], &[], None)
+                .unwrap();
+            assert_eq!(
+                body["output_config"]["effort"],
+                serde_json::json!(wire),
+                "{display} must wire as {wire}"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "no request may carry a thinking field"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_off_none_and_unknown_omit_the_field() {
+        // Fail-safe: `off`, an unset value, and an unrecognized value all
+        // leave the request exactly as it was before effort was wired — the
+        // model's own default applies, and we never send `thinking`.
+        for effort in [None, Some("off"), Some("nonsense"), Some("   ")] {
+            let client = client_with_effort(effort);
+            let body = client
+                .build_request_json(&[Message::user_text("hi")], &[], None)
+                .unwrap();
+            assert!(
+                body.get("output_config").is_none(),
+                "{effort:?} must omit output_config"
+            );
+            assert!(body.get("thinking").is_none());
+        }
     }
 
     #[test]
@@ -1961,6 +2076,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let raw_content = serde_json::json!([
             { "type": "thinking", "thinking": "reasoning", "signature": "sig" },
@@ -2019,6 +2135,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let msg = Message {
             raw: Some(serde_json::json!({
@@ -2060,6 +2177,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let assistant1 = Message {
             raw: Some(serde_json::json!({
@@ -2183,6 +2301,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: Some("ws_abc".into()),
+            reasoning_effort: None,
         });
         let headers = with.workspace_headers();
         assert_eq!(
@@ -2220,6 +2339,7 @@ mod tests {
             max_output_tokens: Some(131_072),
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let body = client.build_request_json(&[Message::user_text("hi")], &[], None).unwrap();
         assert_eq!(
@@ -2240,6 +2360,7 @@ mod tests {
             max_output_tokens: Some(8_000),
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         // 6000 chars -> prompt_est 1504 -> context_budget = 10000 - 1504 - 1024 = 7472 -> quantized 6144
         let body = client
@@ -3053,6 +3174,89 @@ mod tests {
         assert_eq!(state.input_tokens, 3);
     }
 
+    /// Regression (2027-01 live bug, BUG memory 93b01d1b): a network chunk
+    /// boundary falling between a frame's `event:` line and its `data:` line
+    /// must not drop the frame. The event name is stream state — with a
+    /// per-call local it is lost, and the `data:` line is then processed
+    /// under an empty name, which `parse_sse_event`'s forward-compatible
+    /// catch-all ignores. The live symptoms were vanished `input_json_delta`
+    /// fragments (the accumulated arguments then failed to parse and the
+    /// turn loop sanitized them to `{}`) and vanished `text_delta`s.
+    #[test]
+    fn event_name_persists_across_chunk_boundary() {
+        fn collect(outcomes: Vec<SseOutcome>) -> Vec<LlmEvent> {
+            outcomes
+                .into_iter()
+                .map(|o| match o {
+                    SseOutcome::Event(e) => e,
+                    SseOutcome::ParseError(e) => panic!("parse error: {e}"),
+                })
+                .collect()
+        }
+        let frame = |name: &str, data: serde_json::Value| format!("event: {name}\ndata: {data}\n");
+
+        let mut state = StreamState::default();
+        let mut buffer = String::new();
+
+        // Chunk 1 ends exactly after an `event:` line — the split point.
+        buffer.push_str(&frame(
+            "message_start",
+            serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+        ));
+        buffer.push_str(&frame(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read_files","input":{}}}),
+        ));
+        buffer.push_str("event: content_block_delta\n");
+        let first = collect(parse_sse_buffer(&mut buffer, &mut state));
+        assert_eq!(first.len(), 1, "chunk 1 carries only the ToolCallStart");
+        assert!(buffer.is_empty(), "chunk 1 is fully consumed");
+
+        // Chunk 2 opens with the orphaned `data:` line, then a complete
+        // sibling frame for the same call.
+        buffer.push_str(&format!(
+            "data: {}\n",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}})
+        ));
+        buffer.push_str(&frame(
+            "content_block_delta",
+            serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"a.txt\"}"}}),
+        ));
+        let second = collect(parse_sse_buffer(&mut buffer, &mut state));
+
+        // Chunk 3 splits a text frame the same way.
+        buffer.push_str(&frame(
+            "content_block_start",
+            serde_json::json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        ));
+        buffer.push_str("event: content_block_delta\n");
+        let _ = parse_sse_buffer(&mut buffer, &mut state);
+        buffer.push_str(&format!(
+            "data: {}\n",
+            serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}})
+        ));
+        let third = collect(parse_sse_buffer(&mut buffer, &mut state));
+
+        let mut args = String::new();
+        let mut text = String::new();
+        for event in second.into_iter().chain(third) {
+            match event {
+                LlmEvent::ToolCallArgumentDelta { fragment, .. } => args.push_str(&fragment),
+                LlmEvent::TextDelta { text: t } => text.push_str(&t),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            args, "{\"path\":\"a.txt\"}",
+            "fragments around the split must survive in order"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&args).is_ok(),
+            "accumulated arguments must be valid JSON: {args}"
+        );
+        assert_eq!(text, "Hi", "the split text delta must survive too");
+    }
+
     #[test]
     fn parse_errors_report_raw_data() {
         let mut buffer = String::from("event: message_start\ndata: {not valid json}\n");
@@ -3360,6 +3564,7 @@ mod tests {
                 max_output_tokens: None,
                 multimodal: false,
                 workspace_id: None,
+                reasoning_effort: None,
             },
             Some(log.clone()),
         );

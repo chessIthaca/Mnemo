@@ -181,10 +181,10 @@ memory_search browse) — a blank required field means the content was never \
 written.
 - ESCAPE TRAPS — a lone backslash starts an illegal JSON escape (\\x, \\d): \
 write Windows paths with forward slashes, C:/repo/path.
-- MALFORMED-JSON RECOVERY — \"arguments JSON was malformed or truncated\" \
-means the argument object was empty, cut off, or carried an illegal escape. \
-It is NOT a hint to shrink the call or tweak one field: re-read the tool's \
-schema, rewrite the COMPLETE call with every required field, and emit the \
+- MALFORMED-JSON RECOVERY — the error NAMES the failing call and its \
+required fields: the call went out with no arguments, or with arguments \
+that are not valid JSON. It is NOT a hint to shrink the call or tweak one \
+field: rewrite the COMPLETE call with every required field, and emit the \
 corrected call once.
 - TWO IDENTICAL FAILURES IN A ROW = STOP EMITTING — you are stuck in a loop: \
 re-read the tool's schema, re-draft the complete arguments from scratch, then \

@@ -46,29 +46,43 @@ pub struct ModelWithVision {
     pub vision_capable: bool,
     /// The model's context window in tokens as reported by the provider
     /// (Ollama `context_length`, LM Studio `max_context_length`, vLLM
-    /// `max_model_len`, OpenRouter `top_provider.context_length`). `None`
-    /// when the `/models` entry exposes no such field (vanilla OpenAI / z.ai)
-    /// or the value is malformed — best-effort discovery, never an error.
+    /// `max_model_len`, OpenRouter `top_provider.context_length`, Anthropic
+    /// `max_input_tokens`). `None` when the `/models` entry exposes no such
+    /// field (vanilla OpenAI / z.ai) or the value is malformed — best-effort
+    /// discovery, never an error.
     pub context_length: Option<u64>,
     /// The model's per-request output-token cap as reported by the provider
-    /// (`max_completion_tokens`, OpenRouter `top_provider.max_completion_tokens`).
-    /// `None` when not exposed or malformed.
+    /// (`max_completion_tokens`, OpenRouter `top_provider.max_completion_tokens`,
+    /// Anthropic `max_tokens`). `None` when not exposed or malformed.
     pub max_output_tokens: Option<u64>,
+    /// The reasoning-effort levels the provider reports as supported,
+    /// highest first (`max`, `high`, `medium`, `low`, `minimal`) —
+    /// from Anthropic's per-level `capabilities.effort` flags. The order is
+    /// load-bearing: the backend clamps a value outside the list to the
+    /// list's FIRST entry. `None` for
+    /// providers that expose no such object; the settings UI reads `None` as
+    /// "nothing discovered" (no allow-list written), never as "this model has
+    /// no effort".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_levels: Option<Vec<String>>,
 }
 
 /// Fetch the models served by an Anthropic-compatible `/models` endpoint
 /// (Anthropic itself, OpenRouter, gateways), each annotated with whether the
-/// provider reports it as vision-capable and with the token caps the provider
-/// exposes.
+/// provider reports it as vision-capable, with the token caps the provider
+/// exposes, and with the reasoning-effort levels it reports as supported.
 ///
 /// HTTP contract: GET `{base}/models`, `x-api-key` + `anthropic-version`
 /// headers, 10s connect / 15s total timeout, gzip/brotli/deflate. The
-/// response shape is `{ data: [{ id, display_name, created_at }] }` — parsed
-/// via [`parse_models_with_vision`] (which reads `data[].id`); `display_name`
-/// and per-model caps are not exposed by the Anthropic endpoint, so
-/// `vision_capable` is always `false` and both caps `None`. This makes the
-/// Settings picker list the served model ids (click-to-choose works); the
-/// vision picker simply falls back to its "all models with a note" behavior.
+/// response shape is `{ data: [{ id, display_name, created_at,
+/// max_input_tokens, max_tokens, capabilities }] }` — parsed via
+/// [`parse_models_with_vision`] (which reads `data[].id`). Anthropic reports
+/// the context window as `max_input_tokens`, the output cap as `max_tokens`,
+/// image input as `capabilities.image_input.supported`, and the supported
+/// reasoning-effort levels as `capabilities.effort` — so the Settings picker
+/// can list the served ids (click-to-choose) AND auto-fill the caps and the
+/// per-model effort allow-list for the chosen model. `display_name` is not
+/// carried (the id is the config key).
 pub async fn fetch_models_anthropic(base_url: &str, api_key: &str) -> Result<Vec<ModelWithVision>> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
 
@@ -170,41 +184,115 @@ pub async fn fetch_models_with_vision(
 
     // De-duplicate by id, OR-ing the vision flag and taking the max of each
     // reported cap across duplicate entries so a model reported as capable
-    // (or with a larger window) in any one entry wins. BTreeMap keeps the
-    // output sorted by id.
-    let mut unique: std::collections::BTreeMap<String, (bool, ModelCaps)> =
+    // (or with a larger window) in any one entry wins, and unioning the
+    // discovered effort levels. BTreeMap keeps the output sorted by id.
+    let mut unique: std::collections::BTreeMap<String, (bool, ModelCaps, Option<Vec<String>>)> =
         std::collections::BTreeMap::new();
     for m in models {
         let id = m.id.trim().to_string();
         if id.is_empty() {
             continue;
         }
-        let entry = unique.entry(id).or_insert((false, ModelCaps::default()));
+        let entry = unique
+            .entry(id)
+            .or_insert((false, ModelCaps::default(), None));
         entry.0 = entry.0 || m.vision_capable;
         entry.1.context_length = entry.1.context_length.max(m.context_length);
         entry.1.max_output_tokens = entry.1.max_output_tokens.max(m.max_output_tokens);
+        if let Some(levels) = m.effort_levels {
+            let merged = entry.2.get_or_insert_with(Vec::new);
+            for level in levels {
+                if !merged.contains(&level) {
+                    merged.push(level);
+                }
+            }
+        }
     }
     Ok(unique
         .into_iter()
-        .map(|(id, (vision_capable, caps))| ModelWithVision {
-            id,
-            vision_capable,
-            context_length: caps.context_length,
-            max_output_tokens: caps.max_output_tokens,
+        .map(|(id, (vision_capable, caps, mut effort_levels))| {
+            if let Some(levels) = effort_levels.as_mut() {
+                // Highest first — the backend clamps to the list's first entry.
+                levels.sort_by_key(|level| std::cmp::Reverse(effort_ladder_index(level)));
+            }
+            ModelWithVision {
+                id,
+                vision_capable,
+                context_length: caps.context_length,
+                max_output_tokens: caps.max_output_tokens,
+                effort_levels,
+            }
         })
         .collect())
 }
 
+/// The reasoning-effort levels, lowest → highest.
+///
+/// This is exactly the UI ladder (`REASONING_EFFORTS` in the settings
+/// frontend) minus `"off"`: discovery must never advertise a level the dialog
+/// cannot select. `xhigh` is deliberately absent for that reason — the
+/// Anthropic wire table still passes it through (a hand-edited
+/// `endpoints.toml` may carry it), but it is not a selectable level and the
+/// value travels verbatim to other kinds, so probing it would only ever
+/// produce phantom allow-list entries.
+///
+/// The probe order for `/models` discovery and the sort key for the duplicate
+/// merge. Discovered allow-lists are emitted highest-first (`max` →
+/// `minimal`) because the backend clamps an out-of-list value to the list's
+/// FIRST entry (the highest supported) — the order is load-bearing, and it
+/// matches the settings input's `max,high,…` convention. `minimal` is our
+/// floor: Anthropic has no level below `low`, but other providers expose the
+/// word, so it is probed too.
+const EFFORT_LADDER: &[&str] = &["minimal", "low", "medium", "high", "max"];
+
+/// The reasoning-effort levels a single `/models` entry reports as supported,
+/// highest first.
+///
+/// Anthropic exposes `capabilities.effort` with one `{ supported: bool }`
+/// entry per level; the supported ones are returned highest-first — a
+/// `reasoning_efforts` allow-list is clamped to its FIRST entry, so the order
+/// decides which level an out-of-list request lands on. `None` when the entry
+/// carries no usable effort object at all (every other provider today) — the
+/// UI must distinguish "nothing discovered" from "an empty allow-list" and
+/// only ever write the former.
+fn model_effort_levels(entry: &serde_json::Value) -> Option<Vec<String>> {
+    let effort = entry.get("capabilities")?.get("effort")?;
+    let levels: Vec<String> = EFFORT_LADDER
+        .iter()
+        .rev()
+        .filter(|level| {
+            effort
+                .get(**level)
+                .and_then(|l| l.get("supported"))
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false)
+        })
+        .map(|level| (*level).to_string())
+        .collect();
+    (!levels.is_empty()).then_some(levels)
+}
+
+/// Sort key for one discovered effort level within [`EFFORT_LADDER`] (lowest
+/// first — callers reverse it); a level outside the ladder sorts last
+/// (defensive — [`model_effort_levels`] can only ever produce ladder members).
+fn effort_ladder_index(level: &str) -> usize {
+    EFFORT_LADDER
+        .iter()
+        .position(|l| *l == level)
+        .unwrap_or(EFFORT_LADDER.len())
+}
+
 /// Whether a single `/models` entry explicitly reports image input modality.
 ///
-/// Returns `true` only when the entry exposes an `architecture.input_modalities`
-/// array containing the string `"image"` (the OpenRouter shape). Returns `false`
+/// Returns `true` when the entry exposes an `architecture.input_modalities`
+/// array containing the string `"image"` (the OpenRouter shape) or an
+/// Anthropic-style `capabilities.image_input.supported: true`. Returns `false`
 /// for any other shape — including vanilla OpenAI/Ollama entries that carry no
 /// modality field at all (conservatively "unknown", not "incapable"). The UI
 /// uses the absence of *any* vision-capable model to fall back to showing all
 /// models with a note, rather than silently hiding them.
 fn model_supports_vision(entry: &serde_json::Value) -> bool {
-    entry
+    let openrouter = entry
         .get("architecture")
         .and_then(|a| a.get("input_modalities"))
         .and_then(|m| m.as_array())
@@ -213,7 +301,14 @@ fn model_supports_vision(entry: &serde_json::Value) -> bool {
                 .iter()
                 .any(|m| m.as_str().is_some_and(|s| s == "image"))
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let anthropic = entry
+        .get("capabilities")
+        .and_then(|c| c.get("image_input"))
+        .and_then(|i| i.get("supported"))
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    openrouter || anthropic
 }
 
 /// The per-model token caps discovered from a single `/models` entry.
@@ -233,8 +328,10 @@ struct ModelCaps {
 ///
 /// Key precedence per provider convention, first hit wins:
 /// - context: `context_length` (Ollama), `max_context_length` (LM Studio),
-///   `max_model_len` (vLLM), nested `top_provider.context_length` (OpenRouter).
-/// - output: `max_completion_tokens`, nested `top_provider.max_completion_tokens`.
+///   `max_model_len` (vLLM), `max_input_tokens` (Anthropic), nested
+///   `top_provider.context_length` (OpenRouter).
+/// - output: `max_completion_tokens`, `max_tokens` (Anthropic), nested
+///   `top_provider.max_completion_tokens`.
 ///
 /// Non-numeric, negative, or zero values read as `None` (a zero/negative cap
 /// is meaningless, so treat it as unreported rather than poisoning the
@@ -253,7 +350,12 @@ fn model_reported_caps(entry: &serde_json::Value) -> ModelCaps {
 
     let context_length = first_positive_u64(
         entry,
-        &["context_length", "max_context_length", "max_model_len"],
+        &[
+            "context_length",
+            "max_context_length",
+            "max_model_len",
+            "max_input_tokens",
+        ],
     )
     .or_else(|| {
         top.and_then(|t| {
@@ -263,7 +365,7 @@ fn model_reported_caps(entry: &serde_json::Value) -> ModelCaps {
             )
         })
     });
-    let max_output_tokens = first_positive_u64(entry, &["max_completion_tokens"])
+    let max_output_tokens = first_positive_u64(entry, &["max_completion_tokens", "max_tokens"])
         .or_else(|| top.and_then(|t| first_positive_u64(t, &["max_completion_tokens"])));
 
     ModelCaps {
@@ -296,6 +398,7 @@ fn parse_models_with_vision(body: &serde_json::Value) -> Option<Vec<ModelWithVis
                         vision_capable: model_supports_vision(m),
                         context_length: caps.context_length,
                         max_output_tokens: caps.max_output_tokens,
+                        effort_levels: model_effort_levels(m),
                     }
                 })
             })
@@ -324,6 +427,7 @@ fn parse_models_with_vision(body: &serde_json::Value) -> Option<Vec<ModelWithVis
                             vision_capable: model_supports_vision(m),
                             context_length: caps.context_length,
                             max_output_tokens: caps.max_output_tokens,
+                            effort_levels: model_effort_levels(m),
                         }
                     })
             })
@@ -360,7 +464,8 @@ mod tests {
                 id: "a".into(),
                 vision_capable: false,
                 context_length: None,
-                max_output_tokens: None
+                max_output_tokens: None,
+                effort_levels: None
             }])
         );
     }
@@ -409,13 +514,15 @@ mod tests {
                     id: "gpt-4o".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
                 ModelWithVision {
                     id: "  spaced  ".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
             ]
         );
@@ -439,13 +546,15 @@ mod tests {
                     id: "gpt-4o".into(),
                     vision_capable: true,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
                 ModelWithVision {
                     id: "gpt-3.5".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
             ]
         );
@@ -466,13 +575,15 @@ mod tests {
                     id: "gpt-4o".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
                 ModelWithVision {
                     id: "gpt-3.5".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
             ]
         );
@@ -495,13 +606,15 @@ mod tests {
                     id: "llama3:latest".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
                 ModelWithVision {
                     id: "qwen2:7b".into(),
                     vision_capable: false,
                     context_length: None,
-                    max_output_tokens: None
+                    max_output_tokens: None,
+                    effort_levels: None
                 },
             ]
         );
@@ -602,6 +715,140 @@ mod tests {
         for m in &models {
             assert_eq!(m.context_length, None, "id {}", m.id);
         }
+    }
+
+    #[test]
+    fn model_caps_anthropic_shape_fills_caps_vision_and_effort() {
+        // The live Anthropic /models shape: `max_input_tokens` is the context
+        // window, `max_tokens` the output cap, and `capabilities` carries the
+        // modality + reasoning-effort facts. Everything the endpoint card
+        // auto-fills for a Claude model comes from here.
+        let body = serde_json::json!({
+            "data": [{
+                "id": "claude-opus-5-5",
+                "display_name": "Claude Opus 5.5",
+                "created_at": "2026-01-01T00:00:00Z",
+                "max_input_tokens": 200_000,
+                "max_tokens": 64_000,
+                "capabilities": {
+                    "image_input": { "supported": true },
+                    "effort": {
+                        "low": { "supported": true },
+                        "medium": { "supported": true },
+                        "high": { "supported": true },
+                        "max": { "supported": true },
+                        "xhigh": { "supported": false }
+                    },
+                    "thinking": {
+                        "supported": true,
+                        "types": { "adaptive": { "supported": true } }
+                    }
+                }
+            }]
+        });
+        let models = parse_models_with_vision(&body).expect("anthropic shape");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_length, Some(200_000));
+        assert_eq!(models[0].max_output_tokens, Some(64_000));
+        assert!(
+            models[0].vision_capable,
+            "capabilities.image_input.supported:true is the Anthropic vision signal"
+        );
+        assert_eq!(
+            models[0].effort_levels,
+            Some(vec![
+                "max".to_string(),
+                "high".to_string(),
+                "medium".to_string(),
+                "low".to_string()
+            ]),
+            "supported levels only, highest first (xhigh reported false)"
+        );
+    }
+
+    #[test]
+    fn vision_from_anthropic_capabilities_flag() {
+        assert!(model_supports_vision(&serde_json::json!({
+            "id": "claude-opus-5-5",
+            "capabilities": { "image_input": { "supported": true } }
+        })));
+        assert!(
+            !model_supports_vision(&serde_json::json!({
+                "id": "claude-haiku",
+                "capabilities": { "image_input": { "supported": false } }
+            })),
+            "an explicit false must stay false (conservative fallback path)"
+        );
+    }
+
+    #[test]
+    fn effort_levels_absent_partial_and_malformed_shapes() {
+        // No capabilities object (every non-Anthropic provider today) → None,
+        // not an empty list: the UI must not write an empty allow-list.
+        assert_eq!(
+            model_effort_levels(&serde_json::json!({ "id": "gpt-4o" })),
+            None
+        );
+        // capabilities present but no effort object: None.
+        assert_eq!(
+            model_effort_levels(&serde_json::json!({
+                "id": "m",
+                "capabilities": { "image_input": { "supported": true } }
+            })),
+            None
+        );
+        // Every level false, or a malformed (non-bool) flag → None.
+        assert_eq!(
+            model_effort_levels(&serde_json::json!({
+                "id": "m",
+                "capabilities": { "effort": {
+                    "low": { "supported": false },
+                    "high": { "supported": "yes" }
+                } }
+            })),
+            None
+        );
+        // One supported level is enough, and order is highest-first rather
+        // than JSON key order (the allow-list clamp target is list[0]).
+        assert_eq!(
+            model_effort_levels(&serde_json::json!({
+                "id": "m",
+                "capabilities": { "effort": {
+                    "high": { "supported": true },
+                    "low": { "supported": true }
+                } }
+            })),
+            Some(vec!["high".to_string(), "low".to_string()])
+        );
+    }
+
+    #[test]
+    fn vanilla_openai_entry_reports_no_effort_levels() {
+        let body = serde_json::json!({
+            "data": [{ "id": "glm-5.3", "object": "model", "owned_by": "z.ai" }]
+        });
+        let models = parse_models_with_vision(&body).expect("openai shape");
+        assert_eq!(models[0].effort_levels, None);
+        assert_eq!(models[0].context_length, None);
+        assert_eq!(models[0].max_output_tokens, None);
+    }
+
+    #[test]
+    fn xhigh_only_effort_support_is_not_discovered() {
+        // Regression (review LOW 2): `xhigh` sits outside the settings ladder
+        // (`REASONING_EFFORTS` offers max..off), so discovery must not
+        // advertise it — a model reporting only xhigh yields no allow-list at
+        // all rather than a phantom entry the dialog cannot offer.
+        assert_eq!(
+            model_effort_levels(&serde_json::json!({
+                "id": "m",
+                "capabilities": { "effort": {
+                    "xhigh": { "supported": true },
+                    "low": { "supported": false }
+                } }
+            })),
+            None
+        );
     }
 
     #[test]

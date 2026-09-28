@@ -144,6 +144,10 @@ export function EndpointCard({
     : null;
   const refEffortsFillable =
     capsRefModel != null && effortAutofillEligible(endpoint, capsRefModel, refEfforts);
+  // The effort actually in play for the reference model: the configured value,
+  // else the app default "max" (mirroring the backend chain), so the clamp
+  // hint below also covers a fresh endpoint where nothing is configured yet.
+  const refResolvedEffort = refEffectiveEffort ?? "max";
 
   // Auto-fill empty cap fields with the provider-reported values for the
   // reference model, once per (model + caps) so manually clearing a field
@@ -614,10 +618,7 @@ ${refEffectiveEffort ?? "-"}`;
                 ((refModelEfforts.length > 0 &&
                   (refModelEfforts.length !== refEfforts.length ||
                     refEfforts.some((e) => !refModelEfforts.includes(e)))) ||
-                  (refModelEfforts.length === 0 &&
-                    !refEffortsFillable &&
-                    refEffectiveEffort != null &&
-                    refEffectiveEffort !== "off")) && (
+                  (refModelEfforts.length === 0 && !refEffortsFillable)) && (
                   <span className="text-amber-400">
                     {refModelEfforts.length > 0 ? (
                       <>
@@ -629,7 +630,7 @@ ${refEffectiveEffort ?? "-"}`;
                       <>
                         Endpoint reports {refEfforts.join(", ")} reasoning-effort
                         levels for "{capsRefModel}", but applying them would clamp
-                        the effective effort ({refEffectiveEffort} is not in the
+                        the effective effort ({refResolvedEffort} is not in the
                         list).{" "}
                       </>
                     )}

@@ -1419,8 +1419,17 @@ product.
   auto-appended on save and load).
 - **Per-context reasoning-effort overrides** — `[models]` slots (`ModelRef`,
   `src/config/general.rs`) carry an optional `reasoning_effort` (Settings →
-  Models, one effort dropdown per context row; hidden for anthropic hosts,
-  disabled when the endpoint rejects effort). The slots span the workflow
+  Models, one effort dropdown per context row; shown for every kind, disabled
+  when the endpoint rejects effort). On Anthropic-kind endpoints the value is
+  sent as the Messages API's `output_config.effort` (`minimal` maps to `low`;
+  `off`/unset omit the field) — never as a `thinking` block, because
+  `{"type":"enabled"}` is deprecated on Claude 4.6 and rejected with a 400 by
+  4.7+, while `{"type":"disabled"}` is a 400 on models whose thinking is
+  always on. The same applies to the endpoint- and model-level effort
+  dropdowns in Settings → Providers, and to the per-model `reasoning_efforts`
+  allow-list, which `/models` discovery can auto-fill from Anthropic's
+  `capabilities.effort` flags (highest first — the clamp target is the list's
+  first entry). The slots span the workflow
   states plus the `bug_fixing` plan-kind override (active while the active
   plan's kind is `bug_fixing` in Executing/Reviewing — wins over `executing`)
   and the subagent role. `build_provider_for` resolves

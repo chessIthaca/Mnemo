@@ -97,10 +97,12 @@ async fn fetch_by_kind(
 /// can auto-fill empty Max context / Max output fields with the values the
 /// provider reports (Ollama `context_length`, LM Studio
 /// `max_context_length`, vLLM `max_model_len`, OpenRouter
-/// `top_provider.context_length`). Providers that expose no cap fields
-/// (vanilla OpenAI / z.ai) report `null` for both — discovery is a no-op
-/// there. Anthropic-kind endpoints get no caps (the Anthropic `/models`
-/// response exposes none) — the picker lists the served ids only.
+/// `top_provider.context_length`, Anthropic `max_input_tokens` /
+/// `max_tokens`). Providers that expose no cap fields (vanilla OpenAI / z.ai)
+/// report `null` for both — discovery is a no-op there. An Anthropic
+/// response additionally carries `capabilities` (image input modality and the
+/// supported reasoning-effort levels), which the card uses to auto-fill a
+/// per-model effort allow-list.
 ///
 /// Resolution (mirrors the provider's key fallback chain in
 /// [`build_client`]):

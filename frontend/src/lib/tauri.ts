@@ -380,6 +380,13 @@ export interface VisionModelInfo {
   context_length?: number | null;
   /** Per-request output-token cap as reported by the provider; null = unreported. */
   max_output_tokens?: number | null;
+  /**
+   * The reasoning-effort levels as reported by the provider, highest first
+   * (Anthropic's per-level `capabilities.effort` flags); null/absent = the
+   * provider exposes no such object. The order matters: the backend clamps a
+   * value outside a model's allow-list to the list's first entry.
+   */
+  effort_levels?: string[] | null;
 }
 
 /** Per-model pricing ($ per 1M tokens). From the [[pricing]] table in endpoints.toml. */

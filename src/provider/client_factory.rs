@@ -114,11 +114,21 @@ pub fn openai_client_config(
 /// `ANTHROPIC_API_KEY` over `OPENAI_API_KEY`). `multimodal` overrides the
 /// endpoint's flag. The model's per-model caps override the endpoint-level
 /// values.
+///
+/// `reasoning_effort` is the value resolved by
+/// [`Endpoint::effective_reasoning_effort_for`](crate::config::Endpoint::effective_reasoning_effort_for)
+/// (the model's override wins, the model's allow-list clamps; `off` normally
+/// resolves to `None` for this kind — a hand-configured
+/// `reasoning_effort_off_wire` can instead yield its wire value, which the
+/// client's effort table then drops, so `off` still sends nothing). It lands
+/// on the Messages API's `output_config.effort` — the client never sends a
+/// `thinking` field.
 pub fn anthropic_client_config(
     config: &Config,
     endpoint: &Endpoint,
     model: &str,
     multimodal: bool,
+    reasoning_effort: Option<String>,
 ) -> AnthropicClientConfig {
     AnthropicClientConfig {
         base_url: endpoint.base_url.clone(),
@@ -129,6 +139,7 @@ pub fn anthropic_client_config(
         max_output_tokens: endpoint.max_output_tokens_for(model),
         multimodal,
         workspace_id: endpoint.workspace_id.clone(),
+        reasoning_effort,
     }
 }
 
@@ -153,7 +164,7 @@ pub fn build_client(
             build_openai_client(config, endpoint, model, multimodal, reasoning_effort, trace)
         }
         EndpointKind::Anthropic => Arc::new(AnthropicClient::new_with_trace(
-            anthropic_client_config(config, endpoint, model, multimodal),
+            anthropic_client_config(config, endpoint, model, multimodal, reasoning_effort),
             trace,
         )),
     }
@@ -230,7 +241,8 @@ fn resolve_effort(endpoint: &Endpoint, model: &ModelRef) -> Option<String> {
 /// model's own default chain) but display-normalized — `"off"` stays
 /// `"off"` (no off-wire encoding). This is what the status bar shows: the
 /// effective effort of the model serving the current context, in UI
-/// vocabulary (`"off" | "low" | "medium" | "high" | "max"`).
+/// vocabulary (`"off" | "minimal" | "low" | "medium" | "high" | "max" |
+/// "xhigh"`).
 pub fn resolve_display_effort(endpoint: &Endpoint, model: &ModelRef) -> String {
     match model.reasoning_effort.as_deref() {
         Some(e) => endpoint.display_normalize_reasoning_effort_for(&model.model, e),
@@ -517,7 +529,7 @@ mod tests {
             ..Config::default()
         };
         let ep = endpoint(EndpointKind::Anthropic);
-        let cfg = anthropic_client_config(&config, &ep, "claude-sonnet-4-5", false);
+        let cfg = anthropic_client_config(&config, &ep, "claude-sonnet-4-5", false, None);
         assert_eq!(
             cfg.api_key, "stored-secret",
             "stored key wins for Anthropic too"

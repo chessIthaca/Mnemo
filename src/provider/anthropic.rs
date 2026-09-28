@@ -60,6 +60,19 @@ pub struct AnthropicClientConfig {
     /// attributed to that workspace. Empty/unset omits the header entirely —
     /// it is NEVER sent empty (some gateways reject an empty header value).
     pub workspace_id: Option<String>,
+    /// The resolved reasoning-effort value from the endpoint config (display
+    /// space: `off`/`minimal`/`low`/`medium`/`high`/`max`/`xhigh`), translated
+    /// into the Messages API's `output_config.effort` at the serialization
+    /// choke point. `None`, `off`, and any value outside the ladder omit the
+    /// field entirely — the model's own default then applies.
+    ///
+    /// A `thinking` field is NEVER sent from here: `{"type":"enabled"}` is
+    /// deprecated on Claude 4.6 and rejected with a 400 by 4.7+, while
+    /// `{"type":"disabled"}` is a 400 on models whose thinking is always on
+    /// (e.g. Opus 5.5 at every effort level). Omission is the only encoding
+    /// that is valid across model generations — and it is exactly what `off`
+    /// means.
+    pub reasoning_effort: Option<String>,
 }
 
 /// A native Anthropic Messages API LLM client (`/v1/messages`).
@@ -406,6 +419,42 @@ impl AnthropicClient {
             "max_tokens": max_tokens,
             "stream": true,
         });
+
+        // Reasoning depth: the harness's display-space effort lands on the
+        // Messages API's `output_config.effort` (low/medium/high/max/xhigh) —
+        // the documented, no-beta-header control, and the recommended one
+        // wherever adaptive thinking is available. Effort shapes the whole
+        // response (text, tool calls, thinking) and applies whether or not
+        // thinking is active.
+        //
+        // No `thinking` field is ever sent (see
+        // [`AnthropicClientConfig::reasoning_effort`]): both of its variants
+        // are 400s on some current model generation, so omission is the only
+        // encoding that travels. `off`/unset/unknown therefore leave the
+        // request byte-for-byte as it was before effort was wired.
+        const EFFORT_LEVELS: &[(&str, &str)] = &[
+            // The API has no level below `low`; `minimal` is our floor.
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "xhigh"),
+        ];
+        if let Some(level) = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .and_then(|e| {
+                EFFORT_LEVELS
+                    .iter()
+                    .find(|(display, _)| display.eq_ignore_ascii_case(e))
+            })
+            .map(|(_, wire)| *wire)
+        {
+            body["output_config"] = serde_json::json!({ "effort": level });
+        }
         if !system_blocks.is_empty() {
             body["system"] = serde_json::json!(system_blocks);
         }
@@ -1871,7 +1920,63 @@ mod tests {
             max_output_tokens: None,
             multimodal,
             workspace_id: None,
+            reasoning_effort: None,
         })
+    }
+
+    /// The [`client`] helper with a resolved reasoning effort on the config.
+    fn client_with_effort(effort: Option<&str>) -> AnthropicClient {
+        AnthropicClient::new(AnthropicClientConfig {
+            reasoning_effort: effort.map(str::to_string),
+            ..client(false).config.clone()
+        })
+    }
+
+    #[test]
+    fn effort_maps_onto_output_config_effort_levels() {
+        // The display ladder → the API's effort levels (`minimal` has no API
+        // level and maps to `low`). Everything rides on `output_config.effort`;
+        // no request ever carries a `thinking` field.
+        for (display, wire) in [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("xhigh", "xhigh"),
+        ] {
+            let client = client_with_effort(Some(display));
+            let body = client
+                .build_request_json(&[Message::user_text("hi")], &[], None)
+                .unwrap();
+            assert_eq!(
+                body["output_config"]["effort"],
+                serde_json::json!(wire),
+                "{display} must wire as {wire}"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "no request may carry a thinking field"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_off_none_and_unknown_omit_the_field() {
+        // Fail-safe: `off`, an unset value, and an unrecognized value all
+        // leave the request exactly as it was before effort was wired — the
+        // model's own default applies, and we never send `thinking`.
+        for effort in [None, Some("off"), Some("nonsense"), Some("   ")] {
+            let client = client_with_effort(effort);
+            let body = client
+                .build_request_json(&[Message::user_text("hi")], &[], None)
+                .unwrap();
+            assert!(
+                body.get("output_config").is_none(),
+                "{effort:?} must omit output_config"
+            );
+            assert!(body.get("thinking").is_none());
+        }
     }
 
     #[test]
@@ -1971,6 +2076,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let raw_content = serde_json::json!([
             { "type": "thinking", "thinking": "reasoning", "signature": "sig" },
@@ -2029,6 +2135,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let msg = Message {
             raw: Some(serde_json::json!({
@@ -2070,6 +2177,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let assistant1 = Message {
             raw: Some(serde_json::json!({
@@ -2193,6 +2301,7 @@ mod tests {
             max_output_tokens: None,
             multimodal: false,
             workspace_id: Some("ws_abc".into()),
+            reasoning_effort: None,
         });
         let headers = with.workspace_headers();
         assert_eq!(
@@ -2230,6 +2339,7 @@ mod tests {
             max_output_tokens: Some(131_072),
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         let body = client.build_request_json(&[Message::user_text("hi")], &[], None).unwrap();
         assert_eq!(
@@ -2250,6 +2360,7 @@ mod tests {
             max_output_tokens: Some(8_000),
             multimodal: false,
             workspace_id: None,
+            reasoning_effort: None,
         });
         // 6000 chars -> prompt_est 1504 -> context_budget = 10000 - 1504 - 1024 = 7472 -> quantized 6144
         let body = client
@@ -3453,6 +3564,7 @@ mod tests {
                 max_output_tokens: None,
                 multimodal: false,
                 workspace_id: None,
+                reasoning_effort: None,
             },
             Some(log.clone()),
         );

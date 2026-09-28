@@ -24,6 +24,7 @@ import {
   type DiscoveredCaps,
   discoveredCapsById,
   effectiveCaps,
+  effortAutofillEligible,
   effortFromSelectValue,
   effortToSelectValue,
   modelConfigFor,
@@ -126,6 +127,24 @@ export function EndpointCard({
     ? effectiveCaps(endpoint, capsRefModel)
     : { ctx: null, out: null };
 
+  // The reference model's effort allow-list (per-model only — there is no
+  // endpoint-level equivalent) and the levels the provider reported for it.
+  // Drive both the auto-fill (empty list) and the conflict hint below.
+  const refModelEfforts = capsRefModel
+    ? modelConfigFor(endpoint, capsRefModel).reasoning_efforts
+    : [];
+  const refEfforts = refCaps?.efforts ?? null;
+  // The effort that would actually be sent for the reference model, and
+  // whether the autofill will fill the allow-list at all: the notes below may
+  // only promise what capsAutofillPatch really does (review LOW 1).
+  const refEffectiveEffort = capsRefModel
+    ? (modelConfigFor(endpoint, capsRefModel).reasoning_effort ??
+      endpoint.reasoning_effort ??
+      null)
+    : null;
+  const refEffortsFillable =
+    capsRefModel != null && effortAutofillEligible(endpoint, capsRefModel, refEfforts);
+
   // Auto-fill empty cap fields with the provider-reported values for the
   // reference model, once per (model + caps) so manually clearing a field
   // afterwards keeps it cleared. The value lands in the PER-MODEL entry
@@ -135,7 +154,14 @@ export function EndpointCard({
   // button on the conflict warning instead).
   useEffect(() => {
     if (!capsRefModel || !refCaps) return;
-    const guardKey = `${capsRefModel}\n${refCaps.ctx ?? "-"}\n${refCaps.out ?? "-"}`;
+    // The effective effort joins the key so a declined effort fill gets a
+    // fresh chance once the user changes which effort is in play (the
+    // eligibility check depends on it; review LOW 1).
+    const guardKey = `${capsRefModel}
+${refCaps.ctx ?? "-"}
+${refCaps.out ?? "-"}
+${refCaps.efforts?.join(",") ?? "-"}
+${refEffectiveEffort ?? "-"}`;
     if (filledForRef.current === guardKey) return;
     const patch = capsAutofillPatch(endpoint, capsRefModel, refCaps);
     if (patch) {
@@ -396,19 +422,20 @@ export function EndpointCard({
           </div>
 
           <div className="grid grid-cols-2 gap-2">
-            {endpoint.kind !== "anthropic" && (
-              <label className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
-                <input
-                  type="checkbox"
-                  checked={endpoint.supports_reasoning_effort}
-                  onChange={(e) =>
-                    onEndpointChange({ supports_reasoning_effort: e.target.checked })
-                  }
-                  className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
-                />
-                Supports reasoning effort
-              </label>
-            )}
+            <label
+              className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]"
+              title="Unchecked = omit the reasoning control entirely (on Anthropic that field is output_config.effort, so nothing is sent)."
+            >
+              <input
+                type="checkbox"
+                checked={endpoint.supports_reasoning_effort}
+                onChange={(e) =>
+                  onEndpointChange({ supports_reasoning_effort: e.target.checked })
+                }
+                className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+              />
+              Supports reasoning effort
+            </label>
             <label
               className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]"
               title="Endpoint-level default. Per-model Vision checkboxes (under each model row) override this — e.g. a text-only GLM and a vision-capable GLM flash on one Ollama endpoint."
@@ -423,44 +450,44 @@ export function EndpointCard({
             </label>
           </div>
 
-          {endpoint.kind !== "anthropic" && (
-            <div className="flex items-center gap-2">
-              <label
-                className="shrink-0 text-xs text-[color:var(--text-muted)]"
-                htmlFor={effortId}
-              >
-                Effort
-              </label>
-              <select
-                id={effortId}
-                value={effortToSelectValue(endpoint.reasoning_effort)}
-                onChange={(e) =>
-                  onEndpointChange({
-                    reasoning_effort: effortFromSelectValue(e.target.value),
-                  })
-                }
-                disabled={!endpoint.supports_reasoning_effort}
-                title={
-                  endpoint.supports_reasoning_effort
-                    ? "Default reasoning effort for this endpoint"
-                    : "Disabled — models at this endpoint do not accept reasoning_effort"
-                }
-                className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <option value={REASONING_EFFORT_DEFAULT}>Default (max)</option>
-                {REASONING_EFFORTS.map((r) => (
-                  <option key={r} value={r}>
-                    {r}
-                  </option>
-                ))}
-              </select>
-              {!endpoint.supports_reasoning_effort && (
-                <span className="shrink-0 text-[0.7rem] text-[color:var(--text-muted)]">
-                  field omitted
-                </span>
-              )}
-            </div>
-          )}
+          <div className="flex items-center gap-2">
+            <label
+              className="shrink-0 text-xs text-[color:var(--text-muted)]"
+              htmlFor={effortId}
+            >
+              Effort
+            </label>
+            <select
+              id={effortId}
+              value={effortToSelectValue(endpoint.reasoning_effort)}
+              onChange={(e) =>
+                onEndpointChange({
+                  reasoning_effort: effortFromSelectValue(e.target.value),
+                })
+              }
+              disabled={!endpoint.supports_reasoning_effort}
+              title={
+                !endpoint.supports_reasoning_effort
+                  ? "Disabled — the reasoning control is omitted from requests"
+                  : endpoint.kind === "anthropic"
+                    ? "Default reasoning effort for this endpoint — sent as output_config.effort (the Messages API has no reasoning_effort field)"
+                    : "Default reasoning effort for this endpoint"
+              }
+              className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value={REASONING_EFFORT_DEFAULT}>Default (max)</option>
+              {REASONING_EFFORTS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            {!endpoint.supports_reasoning_effort && (
+              <span className="shrink-0 text-[0.7rem] text-[color:var(--text-muted)]">
+                field omitted
+              </span>
+            )}
+          </div>
 
           {endpoint.kind === "anthropic" && (
             <div className="flex items-center gap-2">
@@ -582,11 +609,57 @@ export function EndpointCard({
                     </button>
                   </span>
                 )}
+              {refEfforts != null &&
+                refEfforts.length > 0 &&
+                ((refModelEfforts.length > 0 &&
+                  (refModelEfforts.length !== refEfforts.length ||
+                    refEfforts.some((e) => !refModelEfforts.includes(e)))) ||
+                  (refModelEfforts.length === 0 &&
+                    !refEffortsFillable &&
+                    refEffectiveEffort != null &&
+                    refEffectiveEffort !== "off")) && (
+                  <span className="text-amber-400">
+                    {refModelEfforts.length > 0 ? (
+                      <>
+                        Endpoint reports {refEfforts.join(", ")} reasoning-effort
+                        levels for "{capsRefModel}" (configured{" "}
+                        {refModelEfforts.join(", ")}).{" "}
+                      </>
+                    ) : (
+                      <>
+                        Endpoint reports {refEfforts.join(", ")} reasoning-effort
+                        levels for "{capsRefModel}", but applying them would clamp
+                        the effective effort ({refEffectiveEffort} is not in the
+                        list).{" "}
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onEndpointChange({
+                          model_configs: upsertModelConfig(endpoint, capsRefModel, {
+                            reasoning_efforts: refEfforts,
+                          }),
+                        })
+                      }
+                      className="underline underline-offset-2 hover:text-[color:var(--accent-color)]"
+                    >
+                      Apply discovered
+                    </button>
+                  </span>
+                )}
               {((refCaps.ctx != null && effCapsCtx == null) ||
                 (refCaps.out != null && effCapsOut == null)) && (
                 <span className="text-[color:var(--text-muted)]">
-                  Caps detected from endpoint for “{capsRefModel}” — empty
+                  Values detected from endpoint for “{capsRefModel}” — empty
                   per-model fields auto-fill with these values; Save to persist.
+                </span>
+              )}
+              {refEffortsFillable && (
+                <span className="text-[color:var(--text-muted)]">
+                  Reasoning-effort levels detected for “{capsRefModel}” — the
+                  empty per-model effort list auto-fills with them; Save to
+                  persist.
                 </span>
               )}
             </div>
@@ -840,33 +913,31 @@ function ModelRowConfig({
       {/* Per-model reasoning-effort default (backlog 5b099aef): the
           persisted default for THIS model — the toolbar dropdown stays the
           runtime override on top. "endpoint default" = inherit the
-          endpoint's Effort value (then the app default "max"). Hidden for
-          anthropic, like the endpoint-level Effort control. */}
-      {endpoint.kind !== "anthropic" && (
-        <label className="flex items-center gap-1">
-          effort
-          <select
-            value={effortToSelectValue(config.reasoning_effort ?? null)}
-            onChange={(e) =>
-              onChange({ reasoning_effort: effortFromSelectValue(e.target.value) })
-            }
-            disabled={disabled}
-            title={
-              disabled
-                ? "This endpoint does not accept reasoning_effort"
-                : "Default reasoning effort for this model (unset = the endpoint's Effort value)"
-            }
-            className="rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <option value={REASONING_EFFORT_DEFAULT}>endpoint default</option>
-            {REASONING_EFFORTS.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
-        </label>
-      )}
+          endpoint's Effort value (then the app default "max"). Shown for
+          every kind, Anthropic included (= output_config.effort). */}
+      <label className="flex items-center gap-1">
+        effort
+        <select
+          value={effortToSelectValue(config.reasoning_effort ?? null)}
+          onChange={(e) =>
+            onChange({ reasoning_effort: effortFromSelectValue(e.target.value) })
+          }
+          disabled={disabled}
+          title={
+            disabled
+              ? "This endpoint does not accept a reasoning control"
+              : "Default reasoning effort for this model (unset = the endpoint's Effort value)"
+          }
+          className="rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <option value={REASONING_EFFORT_DEFAULT}>endpoint default</option>
+          {REASONING_EFFORTS.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+      </label>
       {/* Per-model multimodal (vision) override: checked sends image blocks
           to THIS model (a vision-capable model also stops the vision-model
           fallback at runtime); unchecked inherits the endpoint's Multimodal

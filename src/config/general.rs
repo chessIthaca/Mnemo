@@ -551,8 +551,9 @@ pub struct ModelRef {
     /// `"medium"`, `"low"`, `"minimal"`, or `"off"`). When set, the provider
     /// built for this context runs at this effort instead of the model's own
     /// default chain (`ModelSpec::reasoning_effort` → the endpoint's value →
-    /// the app default `"max"`). Ignored on Anthropic-kind endpoints (the
-    /// Messages API has no reasoning-effort field).
+    /// the app default `"max"`). On Anthropic-kind endpoints the value lands
+    /// on the Messages API's `output_config.effort` — the `reasoning_effort`
+    /// request field does not exist there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }

@@ -316,31 +316,92 @@ export function upsertModelConfig(
 }
 
 /**
- * The auto-fill patch for one model's discovered token caps: fills ONLY the
+ * The auto-fill patch for one model's discovered capabilities: fills ONLY the
  * per-model fields whose effective value is currently unset (per-model null
- * AND endpoint-level null) — an explicit value at either level is never
- * silently overwritten (the conflict hint in the card offers a one-click
- * Apply for disagreements instead). The value lands in the per-model entry
- * so a multi-model endpoint keeps each model's own caps. Returns the
- * `model_configs` patch for `onEndpointChange`, or null when nothing needs
- * filling (or the model isn't in `ep.models`).
+ * AND endpoint-level null for the caps; an empty list for the effort
+ * allow-list) — an explicit value is never silently overwritten (the conflict
+ * hints in the card offer a one-click Apply for disagreements instead). The
+ * value lands in the per-model entry so a multi-model endpoint keeps each
+ * model's own caps/efforts. Returns the `model_configs` patch for
+ * `onEndpointChange`, or null when nothing needs filling (or the model isn't
+ * in `ep.models`).
  */
 export function capsAutofillPatch(
   ep: EndpointEditable,
   modelId: string,
-  caps: { ctx: number | null; out: number | null },
+  caps: { ctx: number | null; out: number | null; efforts?: string[] | null },
 ): Partial<EndpointEditable> | null {
   if (!ep.models.some((m) => m.trim() === modelId)) return null;
   const current = modelConfigFor(ep, modelId);
-  const patch: Partial<{ max_context: number | null; max_output_tokens: number | null }> = {};
+  const patch: Partial<{
+    max_context: number | null;
+    max_output_tokens: number | null;
+    reasoning_efforts: string[];
+  }> = {};
   if (caps.ctx != null && current.max_context == null && ep.max_context == null) {
     patch.max_context = caps.ctx;
   }
   if (caps.out != null && current.max_output_tokens == null && ep.max_output_tokens == null) {
     patch.max_output_tokens = caps.out;
   }
+  if (caps.efforts != null && effortAutofillEligible(ep, modelId, caps.efforts)) {
+    patch.reasoning_efforts = caps.efforts;
+  }
   if (Object.keys(patch).length === 0) return null;
   return { model_configs: upsertModelConfig(ep, modelId, patch) };
+}
+
+/**
+ * Whether [`capsAutofillPatch`] will fill this model's effort allow-list from
+ * `efforts` (non-empty, the model's list currently empty, and the effective
+ * effort surviving it). Exported so the endpoint card's auto-fill note can
+ * only promise what the autofill really does — the patch itself calls this, so
+ * the note and the write can never disagree (review LOW 1).
+ */
+export function effortAutofillEligible(
+  ep: EndpointEditable,
+  modelId: string,
+  efforts: string[] | null,
+): boolean {
+  if (efforts == null || efforts.length === 0) return false;
+  const current = modelConfigFor(ep, modelId);
+  return (
+    current.reasoning_efforts.length === 0 &&
+    effortSurvivesAllowList(effectiveReasoningEffort(ep, modelId), efforts)
+  );
+}
+
+/**
+ * The reasoning effort that would actually be sent for a model, in UI
+ * vocabulary: the model's own value, else the endpoint's, else the app default
+ * `"max"` — and `"off"` while the endpoint's supports-effort switch is off,
+ * because that switch is the backend's FIRST gate (nothing is sent then, so no
+ * allow-list can clamp anything). Mirrors `Endpoint`'s resolution chain in
+ * `src/config/endpoints.rs`; every frontend consumer resolves through here so
+ * the UI can never disagree with the wire.
+ */
+export function effectiveReasoningEffort(ep: EndpointEditable, modelId: string): string {
+  if (!ep.supports_reasoning_effort) return "off";
+  const current = modelConfigFor(ep, modelId);
+  return current.reasoning_effort ?? ep.reasoning_effort ?? "max";
+}
+
+/**
+ * Whether the model's currently-effective reasoning effort survives an
+ * allow-list of `levels` unchanged. `false` means writing that list would make
+ * the backend CLAMP the effort (a value outside the list resolves to the
+ * list's first entry), i.e. a silent reasoning downgrade — the caller must not
+ * auto-fill then; the card's conflict hint offers a one-click Apply instead.
+ *
+ * `off` always survives: the backend resolves it before the clamp (to "send
+ * nothing"), and a model whose list names `off` encodes it per provider.
+ * The `"max"` fallback mirrors the backend's app default; callers resolve the
+ * value upstream with [`effectiveReasoningEffort`], which also folds in the
+ * endpoint's supports-effort switch.
+ */
+function effortSurvivesAllowList(effective: string | null, levels: string[]): boolean {
+  const value = effective ?? "max";
+  return value === "off" || levels.includes(value);
 }
 
 /**
@@ -761,14 +822,23 @@ export function validateMcpDraft(list: McpServer[]): string | null {
   return null;
 }
 
-/** Discovered token caps for one model id (null = provider didn't report). */
-export type DiscoveredCaps = { ctx: number | null; out: number | null };
+/**
+ * Discovered capabilities for one model id (null = provider didn't report).
+ * `efforts` is the provider-reported reasoning-effort allow-list, highest
+ * first.
+ */
+export type DiscoveredCaps = {
+  ctx: number | null;
+  out: number | null;
+  efforts: string[] | null;
+};
 
 /**
- * Map a fetched /models list to the per-model discovered-caps record: each
- * model id → its reported context/output caps (absent fields → null).
- * Discovery is best-effort — a provider exposing no cap fields yields an
- * empty record.
+ * Map a fetched /models list to the per-model discovered record: each model id
+ * → its reported context/output caps and reasoning-effort levels (absent
+ * fields → null; an empty effort list is normalized to null so "nothing
+ * discovered" stays distinguishable from "no level supported"). Discovery is
+ * best-effort — a provider exposing none of these fields yields nulls.
  */
 export function discoveredCapsById(list: VisionModelInfo[]): Record<string, DiscoveredCaps> {
   const caps: Record<string, DiscoveredCaps> = {};
@@ -776,6 +846,7 @@ export function discoveredCapsById(list: VisionModelInfo[]): Record<string, Disc
     caps[m.id] = {
       ctx: m.context_length ?? null,
       out: m.max_output_tokens ?? null,
+      efforts: m.effort_levels?.length ? m.effort_levels : null,
     };
   }
   return caps;

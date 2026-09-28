@@ -823,6 +823,9 @@ impl AgentLoop {
                         &provider,
                         fanin_tx,
                         agent_id,
+                        cmd_rx,
+                        session_id,
+                        &tool_schemas,
                     )
                     .await
                 {
@@ -900,6 +903,7 @@ impl AgentLoop {
             // then record the tools-phase duration and compact old tool
             // results — see execute_tool_batch.
             self.execute_tool_batch(
+                &tool_calls,
                 &tool_calls,
                 &text,
                 &assistant_reasoning,
@@ -1557,6 +1561,7 @@ impl AgentLoop {
     async fn execute_tool_batch(
         &self,
         tool_calls: &[ToolCall],
+        recorded_calls: &[ToolCall],
         text: &str,
         assistant_reasoning: &Option<String>,
         msg_meta: Option<serde_json::Map<String, serde_json::Value>>,
@@ -1600,7 +1605,11 @@ impl AgentLoop {
         // row for it (either the tier-1 retry row or the tier-2 guidance
         // row), never both.
         let mut batch_triage_logged = false;
-        // Add the assistant message with tool calls.
+        // Add the assistant message with tool calls. `recorded_calls` is what
+        // history records; `tool_calls` is what actually runs — a mixed
+        // bad-JSON batch (plan d3aedfee) records the whole sanitized batch
+        // while executing only the well-formed subset. Every other caller
+        // passes the same slice for both.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
             provider_meta: msg_meta,
@@ -1608,7 +1617,7 @@ impl AgentLoop {
             response_id: response_id.take(),
             origin_provider: Some(provider.kind().as_str().to_string()),
             origin_model: Some(provider.model().to_string()),
-            ..Message::assistant(text.to_string(), tool_calls.to_vec())
+            ..Message::assistant(text.to_string(), recorded_calls.to_vec())
         });
 
         // Execute each tool call. `deny_all_latched` (set when the user
@@ -4202,7 +4211,14 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// (None — the caller continues the request loop). A pending
     /// steer short-circuits the retry (Some outcome) so the user's
     /// message is not delayed behind a retry. Extracted from run_turn
-    /// (quality review HIGH 1); behavior unchanged.
+    /// (quality review HIGH 1).
+    ///
+    /// Batch isolation (plan d3aedfee): the retry arm partitions the batch
+    /// — well-formed calls execute through `execute_tool_batch` (the whole
+    /// sanitized batch is recorded once, only the valid subset runs) and
+    /// only the malformed calls get the error + guidance + escalation. The
+    /// triage-permanent and cap abort arms stay whole-batch: they discard
+    /// the batch from history and nothing runs.
     async fn handle_bad_json(
         &self,
         state: &mut TurnState,
@@ -4216,6 +4232,13 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         provider: &Arc<dyn LlmClient>,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
+        // Batch isolation (plan d3aedfee): needed to execute the well-formed
+        // subset through the normal tool path (execute_tool_batch).
+        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        session_id: Option<&str>,
+        // The request's advertised tool schemas — the one-liner's required
+        // list comes from the matching tool's `parameters.required`.
+        tool_schemas: &[crate::provider::ToolSchema],
     ) -> Option<TurnOutcome> {
         // Bad JSON is an LLM output issue the model can recover from by
         // emitting valid JSON — it does NOT count toward MAX_RETRIES
@@ -4223,6 +4246,22 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // MAX_BAD_JSON_RETRIES cap so three strikes doesn't stop a
         // model that can self-correct.
         state.bad_json_count += 1;
+        // Batch isolation (plan d3aedfee): split the batch ONCE into the
+        // calls whose arguments parse (dispatchable on the retry path) and
+        // the malformed ones (error-only). The two abort arms below still
+        // close the WHOLE batch — they discard it from history, so nothing
+        // runs; only the retry arm partitions. With a single malformed call
+        // and no well-formed siblings this is behaviorally identical to the
+        // pre-fix whole-batch path (empty `valid_subset` -> the inline push).
+        let mut valid_subset: Vec<ToolCall> = Vec::new();
+        let mut bad_calls: Vec<&ToolCall> = Vec::new();
+        for tc in tool_calls {
+            if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
+                valid_subset.push(tc.clone());
+            } else {
+                bad_calls.push(tc);
+            }
+        }
         // Failure triage (Laya, opt-in; plan 02deea7c): a confident
         // `permanent` reading of the malformed-arguments failure aborts the
         // repair loop EARLY — the model roundtrip IS the bad-JSON retry, so
@@ -4233,7 +4272,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // abort skips any further repair attempt — off-policy for the
         // trainer, same as the provider skip).
         if let Some(gate) = &self.failure_triage {
-            let error_text = match tool_calls.first() {
+            let error_text = match bad_calls.first() {
                 Some(tc) => format!(
                     "tool-call arguments failed to parse as JSON (finish reason \
                      {finish_reason:?}): {}",
@@ -4251,7 +4290,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             {
                 let pending = gate.log_failure(
                     failure_triage::FailureSite::BadJsonRepair,
-                    tool_calls.first().map(|tc| tc.name.as_str()),
+                    bad_calls.first().map(|tc| tc.name.as_str()),
                     &error_text,
                     failure_triage::FailureClass::Permanent,
                     confidence,
@@ -4379,19 +4418,48 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 }
             })
             .collect();
-        messages.push(Message {
-            reasoning_content: assistant_reasoning.clone(),
-            provider_meta: msg_meta.clone(),
-            // H2: clear raw — the sanitized tool_calls are in the
-            // structured fields; echoing the verbatim raw would resend
-            // the malformed arguments the sanitization just fixed.
-            raw: None,
-        response_id: response_id.take(),
-            origin_provider: Some(provider.kind().as_str().to_string()),
-            origin_model: Some(provider.model().to_string()),
-            ..Message::assistant(text, sanitized_calls)
-        });
-        for tc in tool_calls {
+        if valid_subset.is_empty() {
+            // All-bad batch: the pre-fix path, unchanged — the sanitized
+            // assistant turn is recorded and every call gets its guidance
+            // below.
+            messages.push(Message {
+                reasoning_content: assistant_reasoning.clone(),
+                provider_meta: msg_meta.clone(),
+                // H2: clear raw — the sanitized tool_calls are in the
+                // structured fields; echoing the verbatim raw would resend
+                // the malformed arguments the sanitization just fixed.
+                raw: None,
+                response_id: response_id.take(),
+                origin_provider: Some(provider.kind().as_str().to_string()),
+                origin_model: Some(provider.model().to_string()),
+                ..Message::assistant(text, sanitized_calls)
+            });
+        } else {
+            // Mixed batch (plan d3aedfee): record the WHOLE sanitized batch
+            // (N calls) and execute only the well-formed subset through the
+            // normal tool path — results, safe points, interrupt synthesis,
+            // and phase events all come from execute_tool_batch. The
+            // malformed calls are not dispatched; the guidance loop below
+            // errors them, so history still holds N results for N calls.
+            self.execute_tool_batch(
+                &valid_subset,
+                &sanitized_calls,
+                text,
+                assistant_reasoning,
+                msg_meta.clone(),
+                &mut None,
+                response_id,
+                messages,
+                fanin_tx,
+                agent_id,
+                cmd_rx,
+                session_id,
+                provider,
+                state,
+            )
+            .await;
+        }
+        for tc in &bad_calls {
             // Strategy-changing guidance on a REPEAT (backlog 38040f12):
             // a bad-JSON failure is usually an EMISSION problem, and the
             // generic "re-read the schema" advice below does not address
@@ -4404,7 +4472,11 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // BEFORE this result is pushed (same ordering rule as the
             // tool-execution circuit breaker), so a match is always
             // against a PRIOR failure.
-            let failed_content = bad_json_retry_message();
+            let failed_content = bad_json_retry_message(
+                &tc.name,
+                &required_fields(tool_schemas, &tc.name),
+                tc.arguments.trim().is_empty(),
+            );
             let guidance = if repeated_tool_failure(messages, &tc.name, &failed_content) {
                 repeated_bad_json_correction(&tc.name, &failed_content)
             } else {
@@ -4425,7 +4497,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // doom streak (a failed call the model must fix; the paired
         // retrying error event already does) and are invisible to
         // the backend's MAX_RETRIES exclusion (review F3, 2026-09-18).
-        for tc in tool_calls {
+        for tc in &bad_calls {
             let _ = fanin_tx
                 .send((
                     agent_id,
@@ -4574,25 +4646,51 @@ pub(crate) fn last_user_query(messages: &[Message]) -> Option<String> {
         .map(|m| m.content.as_text())
 }
 
-/// The per-call bad-JSON retry guidance (the FIRST failure): the model is
-/// told the arguments did not parse, that an empty argument object is a
-/// mistake, and to re-read the schema and re-emit the complete call. This
-/// is the right advice for the dropped-required-field class (plan
-/// 4fa222cc); it is deliberately NOT used on a repeat, where the problem
-/// is the emission itself (see [`repeated_bad_json_correction`]).
-fn bad_json_retry_message() -> String {
-    "error: arguments JSON was malformed or truncated — \
-     please retry with valid, complete JSON. An empty \
-     argument object is a mistake (except genuine no-arg \
-     tools like current_plan/backlog_list): re-read the \
-     tool's schema, rewrite the COMPLETE call with every \
-     required field present and non-blank — content \
-     first, never emit a call to discover fields — and \
-     emit the corrected call once; never resend the \
-     broken call unchanged. For large file writes, split \
-     the content into smaller chunks or use multiple \
-     file_edit calls."
-        .to_string()
+/// The per-call bad-JSON retry guidance (the FIRST failure): it NAMES the
+/// call that failed and the fields its schema requires, so the model sees
+/// the specific gap instead of a generic lecture. Two deterministic
+/// variants — empty arguments vs arguments that are not valid JSON — and
+/// NO call id: repeat detection ([`repeated_tool_failure`]) matches on
+/// byte-identical content, so the text must stay a pure function of
+/// (tool, variant). This is the right advice for the dropped-required-field
+/// class (plan 4fa222cc); it is deliberately NOT used on a repeat, where
+/// the problem is the emission itself (see [`repeated_bad_json_correction`]).
+///
+/// Replaced the generic ~85-word preamble (plan d3aedfee, 2027-01): the long
+/// version was empirically ineffective — it told the model to "re-read the
+/// schema" without naming what was actually missing.
+fn bad_json_retry_message(tool_name: &str, required: &[String], empty_args: bool) -> String {
+    let failure = if empty_args {
+        "went out with no arguments"
+    } else {
+        "went out with arguments that are not valid JSON"
+    };
+    let required_clause = if required.is_empty() {
+        String::new()
+    } else {
+        format!(" — required: {}", required.join(", "))
+    };
+    format!(
+        "error: `{tool_name}` {failure}{required_clause}. Re-emit the complete \
+         call once with valid JSON; never resend it unchanged."
+    )
+}
+
+/// Required field names the tool's schema declares (`parameters.required`) —
+/// empty when the tool has no schema in the current request or requires
+/// nothing, in which case the guidance omits the clause rather than guessing.
+fn required_fields(tool_schemas: &[crate::provider::ToolSchema], tool_name: &str) -> Vec<String> {
+    tool_schemas
+        .iter()
+        .find(|s| s.name == tool_name)
+        .and_then(|s| s.parameters.get("required"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the strategy-changing guidance for a REPEATED bad-JSON failure

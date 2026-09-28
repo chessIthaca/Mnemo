@@ -558,7 +558,19 @@ impl OpenAiClient {
                 // loop) — the structured fields carry the corrected values.
                 if m.role == Role::Assistant {
                     if let Some(raw) = &m.raw {
-                        if raw_is_usable(raw) {
+                        // Rule 5 origin gate (live bug 2027-01): a raw born
+                        // in another wire family — e.g. an Anthropic
+                        // content-block array after a mid-session switch to
+                        // this OpenAI-compatible endpoint — must not be
+                        // echoed. z.ai rejects such a body outright with
+                        // HTTP 400 code 1214 "content[0].type type error",
+                        // and the identical retry never heals it. Falling
+                        // through rebuilds the message from the structured
+                        // fields (the `raw_is_usable` trade, applied for the
+                        // same reason).
+                        if raw_origin_allows_echo(m.origin_provider.as_deref(), self.config.kind)
+                            && raw_is_usable(raw)
+                        {
                             return echo_assistant_raw(
                                 raw,
                                 &policy,
@@ -1146,6 +1158,38 @@ fn raw_is_usable(raw: &serde_json::Value) -> bool {
         }
     }
     true
+}
+
+/// The Rule-5 origin gate for the Rule-1 raw echo: may THIS
+/// (OpenAI-compatible) builder echo `m`'s verbatim raw back?
+///
+/// The raw is the exact JSON some provider returned, and only its own wire
+/// family is guaranteed to accept it back. Echoing an Anthropic-native raw —
+/// a `content` ARRAY of typed blocks (`thinking` / `tool_use` / …) — into an
+/// OpenAI chat-completions body is a hard, deterministic 400 (live bug
+/// 2027-01: z.ai `code 1214 "messages[8].content[0].type type error"`, after
+/// a mid-session switch from Anthropic to GLM; retried identically until the
+/// session died).
+///
+/// Allowed when:
+/// - `origin_provider` is absent — legacy saves and synthetic constructions:
+///   the Rule-1 echo stays the default (pinned by the existing echo tests);
+/// - it parses to exactly this client's [`ProviderKind`] — every
+///   OpenAI-compatible endpoint speaks the same message shape, so a raw from
+///   its own family round-trips byte-identical (unknown vendor keys
+///   included).
+///
+/// Denied otherwise — a different kind, or a name this build cannot parse:
+/// the caller falls through to field construction, which rebuilds content
+/// and `tool_calls` from the structured fields. Same accepted cost as
+/// [`raw_is_usable`]: unknown keys and `ToolCall::provider_meta` on that one
+/// message are dropped — deliberately, against a request that would
+/// otherwise fail outright.
+fn raw_origin_allows_echo(origin_provider: Option<&str>, kind: ProviderKind) -> bool {
+    match origin_provider {
+        None => true,
+        Some(origin) => ProviderKind::from_str(origin) == Some(kind),
+    }
 }
 
 /// The Rule-1 echo decision for one assistant message with a usable raw

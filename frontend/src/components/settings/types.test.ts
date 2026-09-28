@@ -8,6 +8,8 @@ import {
   dirtySectionIds,
   discoveredCapsById,
   effectiveCaps,
+  effectiveReasoningEffort,
+  effortAutofillEligible,
   effortFromSelectValue,
   effortToSelectValue,
   importEndpointEditable,
@@ -223,6 +225,159 @@ describe("capsAutofillPatch", () => {
     expect(capsAutofillPatch(e, "m", { ctx: 100000, out: 8000 })).toBeNull();
     expect(capsAutofillPatch(e, "ghost", { ctx: 100000, out: 8000 })).toBeNull();
   });
+
+  it("fills an empty effort allow-list with the discovered levels", () => {
+    const e = ep(["m"]);
+    const patch = capsAutofillPatch(e, "m", {
+      ctx: null,
+      out: null,
+      efforts: ["max", "high", "medium", "low"],
+    });
+    expect(patch).toEqual({
+      model_configs: [
+        {
+          id: "m",
+          max_context: null,
+          max_output_tokens: null,
+          reasoning_efforts: ["max", "high", "medium", "low"],
+          reasoning_effort: null,
+        },
+      ],
+    });
+  });
+
+  it("does not fill an effort allow-list that would clamp the effective effort", () => {
+    // The backend resolves a value outside a model's list to the list's FIRST
+    // entry, so writing a list that omits the effective effort would silently
+    // downgrade it (here: the app default "max"). The card's Apply hint is
+    // the escape hatch — never a silent write.
+    const e = ep(["m"]);
+    expect(
+      capsAutofillPatch(e, "m", { ctx: null, out: null, efforts: ["low", "medium"] }),
+    ).toBeNull();
+  });
+
+  it("fills the allow-list when the effective effort survives it (off included)", () => {
+    const e = ep(["m"]);
+    e.reasoning_effort = "high";
+    expect(
+      capsAutofillPatch(e, "m", { ctx: null, out: null, efforts: ["high", "low"] }),
+    ).toEqual({
+      model_configs: [
+        {
+          id: "m",
+          max_context: null,
+          max_output_tokens: null,
+          reasoning_efforts: ["high", "low"],
+          reasoning_effort: null,
+        },
+      ],
+    });
+    // "off" resolves before the clamp (to "send nothing"), so any list is
+    // safe to write underneath it.
+    const off = ep(["m"]);
+    off.reasoning_effort = "off";
+    expect(
+      capsAutofillPatch(off, "m", { ctx: null, out: null, efforts: ["low"] }),
+    ).toEqual({
+      model_configs: [
+        {
+          id: "m",
+          max_context: null,
+          max_output_tokens: null,
+          reasoning_efforts: ["low"],
+          reasoning_effort: null,
+        },
+      ],
+    });
+  });
+
+  it("never overwrites a non-empty effort allow-list", () => {
+    const e = ep(["m"]);
+    e.model_configs = [
+      {
+        id: "m",
+        max_context: null,
+        max_output_tokens: null,
+        reasoning_efforts: ["max"],
+        reasoning_effort: null,
+      },
+    ];
+    expect(
+      capsAutofillPatch(e, "m", { ctx: null, out: null, efforts: ["max", "low"] }),
+    ).toBeNull();
+  });
+
+  it("effortAutofillEligible mirrors what capsAutofillPatch will fill", () => {
+    // The card's auto-fill note gates on this, so it must agree with the patch
+    // exactly — otherwise the note promises a fill that never happens
+    // (review LOW 1).
+    const e = ep(["m"]);
+    expect(effortAutofillEligible(e, "m", ["max", "low"])).toBe(true);
+    // Declined: the effective effort (app default "max") is outside the list.
+    expect(effortAutofillEligible(e, "m", ["low"])).toBe(false);
+    // Nothing discovered, or an empty list, is never eligible.
+    expect(effortAutofillEligible(e, "m", [])).toBe(false);
+    expect(effortAutofillEligible(e, "m", null)).toBe(false);
+    // A non-empty configured list is never overwritten.
+    e.model_configs = [
+      {
+        id: "m",
+        max_context: null,
+        max_output_tokens: null,
+        reasoning_efforts: ["max"],
+        reasoning_effort: null,
+      },
+    ];
+    expect(effortAutofillEligible(e, "m", ["max", "low"])).toBe(false);
+    // "off" resolves before the clamp, so any list is safe underneath it.
+    const off = ep(["m"]);
+    off.reasoning_effort = "off";
+    expect(effortAutofillEligible(off, "m", ["low"])).toBe(true);
+  });
+
+  it("effectiveReasoningEffort mirrors the backend chain, switch first", () => {
+    // The switch is the backend's first gate: with it off nothing is sent, so
+    // the effective effort is "off" regardless of what is configured.
+    const e = ep(["m"]);
+    expect(effectiveReasoningEffort(e, "m")).toBe("max"); // app default
+    e.reasoning_effort = "high";
+    expect(effectiveReasoningEffort(e, "m")).toBe("high");
+    e.model_configs = [
+      {
+        id: "m",
+        max_context: null,
+        max_output_tokens: null,
+        reasoning_efforts: [],
+        reasoning_effort: "low",
+      },
+    ];
+    expect(effectiveReasoningEffort(e, "m")).toBe("low"); // per-model wins
+    e.supports_reasoning_effort = false;
+    expect(effectiveReasoningEffort(e, "m")).toBe("off");
+  });
+
+  it("a disabled support switch makes an effort list safe to fill", () => {
+    // Review round 3 (LOW 1): with the switch off nothing is sent, so no list
+    // can clamp anything — the autofill must not decline, and the card must
+    // not warn about a clamp that cannot happen.
+    const e = ep(["m"]);
+    e.supports_reasoning_effort = false;
+    expect(effortAutofillEligible(e, "m", ["low"])).toBe(true);
+    expect(
+      capsAutofillPatch(e, "m", { ctx: null, out: null, efforts: ["low"] }),
+    ).toEqual({
+      model_configs: [
+        {
+          id: "m",
+          max_context: null,
+          max_output_tokens: null,
+          reasoning_efforts: ["low"],
+          reasoning_effort: null,
+        },
+      ],
+    });
+  });
 });
 
 describe("importEndpointEditable", () => {
@@ -327,10 +482,32 @@ describe("endpoint caps + input parsing", () => {
       { id: "mystery", vision_capable: false },
     ];
     expect(discoveredCapsById(list)).toEqual({
-      "gpt-4o": { ctx: 128000, out: 16384 },
-      mystery: { ctx: null, out: null },
+      "gpt-4o": { ctx: 128000, out: 16384, efforts: null },
+      mystery: { ctx: null, out: null, efforts: null },
     });
     expect(discoveredCapsById([])).toEqual({});
+  });
+
+  it("discoveredCapsById carries the reported effort levels, highest first", () => {
+    // Anthropic's capabilities.effort arrives as a highest-first list; an
+    // empty list normalizes to null so "nothing discovered" stays distinct
+    // from "no level supported".
+    const list: VisionModelInfo[] = [
+      {
+        id: "claude-opus-5-5",
+        vision_capable: true,
+        effort_levels: ["max", "high", "medium", "low"],
+      },
+      { id: "plain", vision_capable: false, effort_levels: [] },
+    ];
+    expect(discoveredCapsById(list)).toEqual({
+      "claude-opus-5-5": {
+        ctx: null,
+        out: null,
+        efforts: ["max", "high", "medium", "low"],
+      },
+      plain: { ctx: null, out: null, efforts: null },
+    });
   });
 
   it("effectiveCaps: per-model override wins, else the endpoint-level value", () => {

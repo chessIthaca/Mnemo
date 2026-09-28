@@ -1754,6 +1754,93 @@ fn raw_echo_not_injected_for_gemini_plain_turn() {
 }
 
 #[test]
+fn foreign_anthropic_raw_is_not_echoed_into_an_openai_compat_body() {
+    // Live 2027-01: a mid-session switch from Anthropic to z.ai (GLM) sent
+    // the Anthropic-native raw assistant turns verbatim inside the
+    // chat-completions body → HTTP 400 code 1214
+    // "messages[8].content[0].type type error", retried identically until
+    // the session died. A raw born in a different wire family must fall
+    // through to field construction.
+    let client = OpenAiClient::new(OpenAiClientConfig::test_default());
+    let msg = Message {
+        raw: Some(serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "let me look", "signature": "sig=="},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_files", "input": {"path": "a.txt"}}
+            ]
+        })),
+        origin_provider: Some("anthropic".into()),
+        origin_model: Some("claude-sonnet-4-5".into()),
+        ..Message::assistant(
+            "I'll read the file.",
+            vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "read_files".into(),
+                arguments: "{\"path\":\"a.txt\"}".into(),
+                provider_meta: None,
+            }],
+        )
+    };
+    let body = client.build_request_json(&[msg], &[], None).unwrap();
+    let built = &body["messages"][0];
+    let has_anthropic_block = built["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("thinking" | "redacted_thinking" | "tool_use" | "tool_result")
+                )
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        !has_anthropic_block,
+        "an Anthropic-native content block must never reach an OpenAI-compat \
+         body after a mid-session provider switch — that is the z.ai 400 \
+         code 1214: {built}"
+    );
+    assert_eq!(
+        built["content"], "I'll read the file.",
+        "a foreign-origin raw must be rebuilt from the structured fields"
+    );
+    assert_eq!(built["tool_calls"][0]["id"], "toolu_1");
+    assert_eq!(built["tool_calls"][0]["type"], "function");
+    assert_eq!(built["tool_calls"][0]["function"]["name"], "read_files");
+    assert_eq!(
+        built["tool_calls"][0]["function"]["arguments"],
+        "{\"path\":\"a.txt\"}"
+    );
+}
+
+#[test]
+fn same_family_origin_raw_still_echoes_verbatim() {
+    // The origin gate must suppress only FOREIGN raws: a raw born in this
+    // client's own wire family still echoes per Rule 1 — unknown vendor keys
+    // included, which field construction would drop.
+    let client = OpenAiClient::new(OpenAiClientConfig::test_default());
+    let msg = Message {
+        raw: Some(serde_json::json!({
+            "role": "assistant",
+            "content": "done",
+            "vendor_extension": {"k": 1}
+        })),
+        origin_provider: Some("openai".into()),
+        origin_model: Some("gpt-5".into()),
+        ..Message::assistant_text("done")
+    };
+    let body = client.build_request_json(&[msg], &[], None).unwrap();
+    let built = &body["messages"][0];
+    assert_eq!(built["content"], "done");
+    assert_eq!(
+        built["vendor_extension"],
+        serde_json::json!({"k": 1}),
+        "same-family raw must echo byte-identical — unknown keys included"
+    );
+}
+
+#[test]
 fn deepseek_tail_owner_keyed_when_system_follows_tool_results() {
     // provider-errors.jsonl id 1042 (2026-09-04 03:59:11, 18 s after commit
     // ec0d794): a 398-message auto-continue request to deepseek-v4-flash

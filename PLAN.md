@@ -593,7 +593,7 @@ results (file reads, shell, git) are truncated with a note.
 
 #### Optimizer levers (token-optimizer parity, backlog e4a50d22)
 
-Six independent context-economy levers live behind `[general.optimizer]` in
+Seven independent context-economy levers live behind `[general.optimizer]` in
 `config.toml` (`OptimizerConfig`, `src/config/general.rs`) — **on by default
 since 2027-01-25** (saving tokens is the expected behaviour; a config that never
 wrote the section runs every lever, and an explicit `false` is honoured as
@@ -604,7 +604,7 @@ green, now that they opt a lever out explicitly.
 | Lever | Flag | What it does |
 |---|---|---|
 | Delta/skeleton re-reads | `delta_reads` | A `read_files` re-read of a file the agent already has serves a skeleton (unchanged) or a unified diff (small change) instead of the whole file. |
-| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every model-served surface. |
+| Output compression | `compress_output` | Collapses known command families (`cargo`, `npm`/`yarn`/`pnpm`, `pytest`, `go`) to their signal lines, dedups repeats, and redacts credentials on every line the compactor serves (output it never sees passes through verbatim). |
 | Archive + expand | `archive` | Tool results past `archive_min_chars` are archived (full text in SQLite) and replaced by a preview; the always-advertised `expand_result` tool retrieves any row by id or keyword. |
 | Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
 | Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
@@ -662,6 +662,15 @@ self-correct by emitting valid JSON — three strikes does not make sense for an
 error the model can recover from. Provider errors retry with jittered
 exponential backoff (equal jitter via `retry_backoff_ms`: ~0.5–1s, ~1–2s) so
 concurrent agents retrying the same recovering endpoint don't stay in lockstep.
+
+Bad-JSON batches are isolated (plan d3aedfee): the calls whose arguments
+parse execute normally through the standard tool path, and only the malformed
+calls get the error, the guidance and the retry/cap escalation — one bad call
+no longer fails its well-formed siblings. At the abort arms (permanent triage
+or the 8-strike cap) the whole batch is still discarded — nothing runs. The
+first-failure guidance is a per-call one-liner naming the failing tool and the
+fields its schema requires (deterministic per tool+variant, so repeat detection
+keeps working).
 
 A repeat-failure circuit breaker covers the self-reinforcing shape
 (valid-JSON-wrong-fields): when a failed result's (tool, error text) matches a
@@ -1410,8 +1419,17 @@ product.
   auto-appended on save and load).
 - **Per-context reasoning-effort overrides** — `[models]` slots (`ModelRef`,
   `src/config/general.rs`) carry an optional `reasoning_effort` (Settings →
-  Models, one effort dropdown per context row; hidden for anthropic hosts,
-  disabled when the endpoint rejects effort). The slots span the workflow
+  Models, one effort dropdown per context row; shown for every kind, disabled
+  when the endpoint rejects effort). On Anthropic-kind endpoints the value is
+  sent as the Messages API's `output_config.effort` (`minimal` maps to `low`;
+  `off`/unset omit the field) — never as a `thinking` block, because
+  `{"type":"enabled"}` is deprecated on Claude 4.6 and rejected with a 400 by
+  4.7+, while `{"type":"disabled"}` is a 400 on models whose thinking is
+  always on. The same applies to the endpoint- and model-level effort
+  dropdowns in Settings → Providers, and to the per-model `reasoning_efforts`
+  allow-list, which `/models` discovery can auto-fill from Anthropic's
+  `capabilities.effort` flags (highest first — the clamp target is the list's
+  first entry). The slots span the workflow
   states plus the `bug_fixing` plan-kind override (active while the active
   plan's kind is `bug_fixing` in Executing/Reviewing — wins over `executing`)
   and the subagent role. `build_provider_for` resolves

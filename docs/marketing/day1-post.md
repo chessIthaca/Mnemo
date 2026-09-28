@@ -67,7 +67,7 @@ The harness is a 20-line page: it shows the card at 800×420 CSS px, which raste
 
 **Alt text** (paste into the platform's image-description field):
 
-> Mnemo launch card. Headline: "Stop paying flagship prices for an agent that forgets." Below it, three boxes with arrows — a sharp model plans, a cheap model executes, a read-only reviewer audits. Four claim pills follow: four-tier memory that survives sessions; a tree-sitter code graph over 12 languages; seven token levers with a live savings dashboard; no edits without a plan, and git push always gated. Footer: github.com/chessIthaca/Mnemo — Rust + Tauri, Windows + macOS, MIT.
+> Mnemo launch card. Headline: "Stop paying flagship prices for an agent that forgets." A strip below it shows the allocation: a sharp model plans, a cheap model executes, a read-only reviewer audits. Two supporting lines follow: remembers across sessions, a 12-language code graph, seven token levers on by default; no edits without a plan, git push always gated, credentials redacted in compressed output. Footer: github.com/chessIthaca/Mnemo — Rust + Tauri, Windows + macOS, MIT.
 
 **Do not** put the numbers on the card yet — Day 1 sells the pain and the fix. Numbers land from post #2 on, straight off the Dashboard.
 

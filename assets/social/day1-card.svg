@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-labelledby="d1-title d1-desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
   <title id="d1-title">Mnemo — an agentic coding harness that remembers</title>
-  <desc id="d1-desc">Launch card: a sharp model plans, a cheap model executes, a read-only reviewer audits. Four supporting claims: four-tier memory that survives sessions, a tree-sitter code graph over 12 languages, six token levers with a live savings dashboard, and no edits without a plan on disk with git push always gated.</desc>
+  <desc id="d1-desc">Launch card: a sharp model plans, a cheap model executes, a read-only reviewer audits. Four supporting claims: four-tier memory that survives sessions, a tree-sitter code graph over 12 languages, seven token levers with a live savings dashboard, and no edits without a plan on disk with git push always gated.</desc>
 
   <defs>
     <marker id="d1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -65,7 +65,7 @@
 
     <rect x="72" y="506" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
     <circle cx="98" cy="528" r="4" fill="#22d3ee"/>
-    <text x="118" y="534" font-size="15" fill="#cbd5e1">6 token levers · live savings dashboard</text>
+    <text x="118" y="534" font-size="15" fill="#cbd5e1">7 token levers · live savings dashboard</text>
 
     <rect x="616" y="506" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
     <circle cx="642" cy="528" r="4" fill="#22d3ee"/>

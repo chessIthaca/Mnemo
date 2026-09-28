@@ -15,13 +15,13 @@ Post: [`assets/social/day1-card.png`](../../assets/social/day1-card.png) (1200×
 >
 > 🧠 **Sharp model plans, cheap model executes, a third one reviews.** Per-state model slots with their own context and reasoning budgets. The plan is a file on disk, so the executor doesn't need to be brilliant — it needs to follow a recipe.
 >
-> ✂️ **Six token-saving levers, on by default.** Delta re-reads (a file you've already read is never re-sent whole), command-output compression, archive-and-expand for oversized results, compaction survival, cache-safe nudges. Every lever logs before/after tokens to a live savings dashboard.
+> ✂️ **Seven token-saving levers, on by default.** Delta re-reads (a file you've already read comes back as a skeleton or a diff, not the whole thing), command-output compression, archive-and-expand for oversized results, compaction survival, an S–F context-quality score, cache-safe lean-output nudges, and recall delta for repeat memories. Every lever logs before/after tokens to a live savings dashboard.
 >
 > 💾 **Memory that survives the session.** Four tiers — working → episodic → semantic → procedural — ranked by strength. Bug root causes, decisions, conventions: learned once, recalled automatically.
 >
 > 🗺️ **A knowledge graph, not grep.** Tree-sitter parses 12 languages into a per-project graph, so "who calls this, what breaks if I change it?" is one lookup.
 >
-> 🔒 **And it's safe to leave running — which is what makes the cheap model viable.** Mutation tools don't exist in the tool list until a plan is on disk. `git merge` and `git push` are gated *always*. Credentials are redacted before the model sees command output.
+> 🔒 **And it's safe to leave running — which is what makes the cheap model viable.** Mutation tools don't exist in the tool list until a plan is on disk. `git merge` and `git push` are gated *always*. The output compressor redacts credentials before the model sees large command output.
 >
 > Open source, Windows + macOS.
 > 👉 https://github.com/chessIthaca/Mnemo
@@ -35,7 +35,7 @@ Post: [`assets/social/day1-card.png`](../../assets/social/day1-card.png) (1200×
 ```
 Your coding agent forgets overnight — and you pay flagship prices for it to re-learn.
 
-Mnemo: sharp model plans → cheap model executes → a read-only reviewer audits. Persistent memory, code graph, 6 token levers.
+Mnemo: sharp model plans → cheap model executes → a read-only reviewer audits. Persistent memory, code graph, 7 token levers.
 
 MIT, Rust → https://github.com/chessIthaca/Mnemo
 ```
@@ -67,7 +67,7 @@ The harness is a 20-line page: it shows the card at 800×420 CSS px, which raste
 
 **Alt text** (paste into the platform's image-description field):
 
-> Mnemo launch card. Headline: "Stop paying flagship prices for an agent that forgets." Below it, three boxes with arrows — a sharp model plans, a cheap model executes, a read-only reviewer audits. Four claim pills follow: four-tier memory that survives sessions; a tree-sitter code graph over 12 languages; six token levers with a live savings dashboard; no edits without a plan, and git push always gated. Footer: github.com/chessIthaca/Mnemo — Rust + Tauri, Windows + macOS, MIT.
+> Mnemo launch card. Headline: "Stop paying flagship prices for an agent that forgets." Below it, three boxes with arrows — a sharp model plans, a cheap model executes, a read-only reviewer audits. Four claim pills follow: four-tier memory that survives sessions; a tree-sitter code graph over 12 languages; seven token levers with a live savings dashboard; no edits without a plan, and git push always gated. Footer: github.com/chessIthaca/Mnemo — Rust + Tauri, Windows + macOS, MIT.
 
 **Do not** put the numbers on the card yet — Day 1 sells the pain and the fix. Numbers land from post #2 on, straight off the Dashboard.
 

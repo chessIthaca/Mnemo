@@ -8,6 +8,7 @@ import {
   dirtySectionIds,
   discoveredCapsById,
   effectiveCaps,
+  effectiveReasoningEffort,
   effortAutofillEligible,
   effortFromSelectValue,
   effortToSelectValue,
@@ -333,6 +334,49 @@ describe("capsAutofillPatch", () => {
     const off = ep(["m"]);
     off.reasoning_effort = "off";
     expect(effortAutofillEligible(off, "m", ["low"])).toBe(true);
+  });
+
+  it("effectiveReasoningEffort mirrors the backend chain, switch first", () => {
+    // The switch is the backend's first gate: with it off nothing is sent, so
+    // the effective effort is "off" regardless of what is configured.
+    const e = ep(["m"]);
+    expect(effectiveReasoningEffort(e, "m")).toBe("max"); // app default
+    e.reasoning_effort = "high";
+    expect(effectiveReasoningEffort(e, "m")).toBe("high");
+    e.model_configs = [
+      {
+        id: "m",
+        max_context: null,
+        max_output_tokens: null,
+        reasoning_efforts: [],
+        reasoning_effort: "low",
+      },
+    ];
+    expect(effectiveReasoningEffort(e, "m")).toBe("low"); // per-model wins
+    e.supports_reasoning_effort = false;
+    expect(effectiveReasoningEffort(e, "m")).toBe("off");
+  });
+
+  it("a disabled support switch makes an effort list safe to fill", () => {
+    // Review round 3 (LOW 1): with the switch off nothing is sent, so no list
+    // can clamp anything — the autofill must not decline, and the card must
+    // not warn about a clamp that cannot happen.
+    const e = ep(["m"]);
+    e.supports_reasoning_effort = false;
+    expect(effortAutofillEligible(e, "m", ["low"])).toBe(true);
+    expect(
+      capsAutofillPatch(e, "m", { ctx: null, out: null, efforts: ["low"] }),
+    ).toEqual({
+      model_configs: [
+        {
+          id: "m",
+          max_context: null,
+          max_output_tokens: null,
+          reasoning_efforts: ["low"],
+          reasoning_effort: null,
+        },
+      ],
+    });
   });
 });
 

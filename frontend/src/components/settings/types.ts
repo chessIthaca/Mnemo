@@ -367,11 +367,23 @@ export function effortAutofillEligible(
   const current = modelConfigFor(ep, modelId);
   return (
     current.reasoning_efforts.length === 0 &&
-    effortSurvivesAllowList(
-      current.reasoning_effort ?? ep.reasoning_effort ?? null,
-      efforts,
-    )
+    effortSurvivesAllowList(effectiveReasoningEffort(ep, modelId), efforts)
   );
+}
+
+/**
+ * The reasoning effort that would actually be sent for a model, in UI
+ * vocabulary: the model's own value, else the endpoint's, else the app default
+ * `"max"` — and `"off"` while the endpoint's supports-effort switch is off,
+ * because that switch is the backend's FIRST gate (nothing is sent then, so no
+ * allow-list can clamp anything). Mirrors `Endpoint`'s resolution chain in
+ * `src/config/endpoints.rs`; every frontend consumer resolves through here so
+ * the UI can never disagree with the wire.
+ */
+export function effectiveReasoningEffort(ep: EndpointEditable, modelId: string): string {
+  if (!ep.supports_reasoning_effort) return "off";
+  const current = modelConfigFor(ep, modelId);
+  return current.reasoning_effort ?? ep.reasoning_effort ?? "max";
 }
 
 /**
@@ -383,7 +395,9 @@ export function effortAutofillEligible(
  *
  * `off` always survives: the backend resolves it before the clamp (to "send
  * nothing"), and a model whose list names `off` encodes it per provider.
- * The `"max"` fallback mirrors the backend's app default.
+ * The `"max"` fallback mirrors the backend's app default; callers resolve the
+ * value upstream with [`effectiveReasoningEffort`], which also folds in the
+ * endpoint's supports-effort switch.
  */
 function effortSurvivesAllowList(effective: string | null, levels: string[]): boolean {
   const value = effective ?? "max";

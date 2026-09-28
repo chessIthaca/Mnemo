@@ -189,6 +189,28 @@ pub trait Classifier: Send + Sync {
     /// about — a prompt, a tool output, a memory's content). `None` = no
     /// answer. Never fails: a disabled or broken backend returns `None`.
     async fn classify(&self, state: &str, question: &Question) -> Option<Answer>;
+
+    /// Answer several [`Question`]s about ONE `state` in a single backend
+    /// request. `questions` pairs a wire key — the `questions` map entry the
+    /// backend keys its answer by — with the question asked under it; the
+    /// returned vector is positional, one slot per question, `None` for a
+    /// question the backend did not answer.
+    ///
+    /// The default implementation loops [`classify`](Self::classify), so every
+    /// backend that cannot batch stays correct unchanged; [`LayaClassifier`]
+    /// overrides it with ONE `/v1/systemone` request, which is what makes a
+    /// compound (multi-question) decision cost a single round-trip.
+    async fn classify_many(
+        &self,
+        state: &str,
+        questions: &[(&str, Question)],
+    ) -> Vec<Option<Answer>> {
+        let mut answers = Vec::with_capacity(questions.len());
+        for (_, question) in questions {
+            answers.push(self.classify(state, question).await);
+        }
+        answers
+    }
 }
 
 /// The no-op classifier: never answers, never calls anything — an explicit
@@ -281,33 +303,51 @@ impl LayaClassifier {
         })
     }
 
-    /// The `/v1/systemone` request body for one typed question about `state`:
-    /// `{"state": <text>, "questions": {"question": <typed question>}}`.
+    /// The `/v1/systemone` request body for several typed questions about ONE
+    /// `state`: `{"state": <text>, "questions": {<key>: <typed question>, …}}`
+    /// — the compound form, where each question carries its own key and the
+    /// backend keys its answers by the same names.
     ///
-    /// This and `parse_answer` are the complete Laya wire mapping, kept
-    /// together so a protocol correction is a one-place change. `None` means
-    /// the question could not be serialized — impossible for the current
+    /// This and `parse_answer_for` are the complete Laya wire mapping, kept
+    /// together so a protocol correction is a one-place change. `None` means a
+    /// question could not be serialized — impossible for the current
     /// [`Question`] shape (strings, numbers and maps only) — handled rather
     /// than panicked on, per the failure-protected contract.
-    fn systemone_request(state: &str, question: &Question) -> Option<serde_json::Value> {
-        let question = serde_json::to_value(question).ok()?;
-        let mut questions = serde_json::Map::new();
-        questions.insert(LAYA_QUESTION_KEY.to_string(), question);
-        Some(serde_json::json!({ "state": state, "questions": questions }))
+    fn systemone_request_many(
+        state: &str,
+        questions: &[(&str, &Question)],
+    ) -> Option<serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        for (key, question) in questions {
+            map.insert((*key).to_string(), serde_json::to_value(question).ok()?);
+        }
+        Some(serde_json::json!({ "state": state, "questions": map }))
     }
 
-    /// Parse a `/v1/systemone` response body into the answer for `question`.
+    /// The single-question form of [`Self::systemone_request_many`]: the pinned
+    /// wire shape `{"state": <text>, "questions": {"question": …}}`
+    /// (see [`LAYA_QUESTION_KEY`]).
+    fn systemone_request(state: &str, question: &Question) -> Option<serde_json::Value> {
+        Self::systemone_request_many(state, &[(LAYA_QUESTION_KEY, question)])
+    }
+
+    /// Parse a `/v1/systemone` response body into the answer for the question
+    /// sent under `key`.
     ///
     /// The Jev-compatible answer shape is
-    /// `{"answers": {"question": {"choice": "billing", "confidence": 0.94,
+    /// `{"answers": {"<key>": {"choice": "billing", "confidence": 0.94,
     /// "probabilities": {"billing": 0.94, "other": 0.06}}}}`; `score` and
     /// `noul` entries carry their primitive's value the same way, and the
     /// `{input_tokens, output_tokens}` usage block is ignored. A missing
-    /// answer for our key, or a mismatched primitive, is `None` (the
+    /// answer for `key`, or a mismatched primitive, is `None` (the
     /// failure-protected path). A missing `confidence` reads as `0.0`:
     /// callers gate on it, so an unreported confidence is never trusted.
-    fn parse_answer(question: &Question, body: &serde_json::Value) -> Option<Answer> {
-        let entry = body.get("answers")?.get(LAYA_QUESTION_KEY)?;
+    fn parse_answer_for(
+        key: &str,
+        question: &Question,
+        body: &serde_json::Value,
+    ) -> Option<Answer> {
+        let entry = body.get("answers")?.get(key)?;
         let confidence = entry
             .get("confidence")
             .and_then(|v| v.as_f64())
@@ -340,6 +380,25 @@ impl LayaClassifier {
         }
     }
 
+    /// The single-question form of [`Self::parse_answer_for`]: the answer for
+    /// the pinned [`LAYA_QUESTION_KEY`] entry.
+    fn parse_answer(question: &Question, body: &serde_json::Value) -> Option<Answer> {
+        Self::parse_answer_for(LAYA_QUESTION_KEY, question, body)
+    }
+
+    /// POST `body` to `/v1/systemone` and return the parsed response payload —
+    /// `None` for every transport and protocol failure (connection error,
+    /// timeout, non-success status, unparseable body), the failure-protected
+    /// contract the [`Classifier`] trait promises its callers.
+    async fn post_systemone(&self, body: &serde_json::Value) -> Option<serde_json::Value> {
+        let url = format!("{}{}", self.endpoint, LAYA_SYSTEMONE_PATH);
+        let response = self.client.post(&url).json(body).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
+
     /// Flip the shared status. A poisoned lock means another thread panicked
     /// mid-write, so propagating the panic is the honest response.
     fn set_status(&self, status: ClassifierStatus) {
@@ -357,23 +416,54 @@ impl Classifier for LayaClassifier {
                 return None;
             }
         };
-        let url = format!("{}{}", self.endpoint, LAYA_SYSTEMONE_PATH);
         // Every transport or protocol failure is the same outcome: `None`.
-        let answer = async {
-            let response = self.client.post(&url).json(&body).send().await.ok()?;
-            if !response.status().is_success() {
-                return None;
-            }
-            let payload: serde_json::Value = response.json().await.ok()?;
-            Self::parse_answer(question, &payload)
-        }
-        .await;
+        let answer = self
+            .post_systemone(&body)
+            .await
+            .and_then(|payload| Self::parse_answer(question, &payload));
         self.set_status(if answer.is_some() {
             ClassifierStatus::Ready
         } else {
             ClassifierStatus::Failed
         });
         answer
+    }
+
+    /// ONE `/v1/systemone` POST for every question, then each answer parsed
+    /// under the key its question was sent with.
+    ///
+    /// Status: `Ready` only when EVERY asked question was answered — for a
+    /// one-question ask that is exactly the single-question contract (a
+    /// parsed answer is `Ready`) — and `Failed` otherwise, including a request
+    /// that could not be built, a connection error, a timeout, a non-success
+    /// status and an unparseable body. A question the backend left out keeps
+    /// its `None` slot while its siblings still answer, so a partial response
+    /// costs one caller-side fallback instead of the whole decision.
+    async fn classify_many(
+        &self,
+        state: &str,
+        questions: &[(&str, Question)],
+    ) -> Vec<Option<Answer>> {
+        let ask: Vec<(&str, &Question)> = questions.iter().map(|(key, q)| (*key, q)).collect();
+        let Some(body) = Self::systemone_request_many(state, &ask) else {
+            self.set_status(ClassifierStatus::Failed);
+            return vec![None; questions.len()];
+        };
+        let answers = match self.post_systemone(&body).await {
+            Some(payload) => questions
+                .iter()
+                .map(|(key, question)| Self::parse_answer_for(key, question, &payload))
+                .collect::<Vec<_>>(),
+            None => vec![None; questions.len()],
+        };
+        // An empty ask has nothing to trust: no question, no `Ready`.
+        let all_answered = !answers.is_empty() && answers.iter().all(Option::is_some);
+        self.set_status(if all_answered {
+            ClassifierStatus::Ready
+        } else {
+            ClassifierStatus::Failed
+        });
+        answers
     }
 }
 
@@ -740,6 +830,157 @@ mod tests {
                 }
             })
         );
+    }
+
+    // ---- The compound (multi-question) ask --------------------------------
+
+    /// A minimal choice question: the compound tests care about the keys and
+    /// the labels, not the question prose.
+    fn tiny_question(instructions: &str) -> Question {
+        Question::Choice {
+            instructions: instructions.to_string(),
+            criteria: BTreeMap::from([
+                ("a".to_string(), "first option".to_string()),
+                ("b".to_string(), "second option".to_string()),
+            ]),
+        }
+    }
+
+    /// A labelled choice answer without a distribution.
+    fn bare_choice(label: &str, confidence: f64) -> Option<Answer> {
+        Some(Answer::Choice {
+            label: label.to_string(),
+            confidence,
+            probabilities: BTreeMap::new(),
+        })
+    }
+
+    /// A backend that answers one question at a time — the shape the trait's
+    /// default `classify_many` must keep working. Counts its calls so the
+    /// fan-out is observable.
+    struct CountingClassifier {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Classifier for CountingClassifier {
+        async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            bare_choice("a", 0.9)
+        }
+    }
+
+    #[tokio::test]
+    async fn laya_classify_many_sends_one_request_for_all_questions() {
+        // The compound form the reflex call rides on (backlog a8495cc1): three
+        // typed questions about ONE state, answered in ONE round-trip. The stub
+        // serves exactly one connection, so a per-question implementation would
+        // fail to collect all three answers here.
+        let server = StubServer::start(
+            200,
+            r#"{"model":"english","answers":{
+                "complexity":{"choice":"medium","confidence":0.91},
+                "action":{"choice":"verify","confidence":0.88},
+                "risk_flag":{"choice":"none","confidence":0.95}}}"#,
+        )
+        .await;
+        let (classifier, status) = laya_classifier(&server.base_url(), Duration::from_secs(5));
+
+        let answers = classifier
+            .classify_many(
+                "step 3 of the plan",
+                &[
+                    ("complexity", tiny_question("How complex is this?")),
+                    ("action", tiny_question("What should happen next?")),
+                    ("risk_flag", tiny_question("Any risk?")),
+                ],
+            )
+            .await;
+
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0], bare_choice("medium", 0.91));
+        assert_eq!(answers[1], bare_choice("verify", 0.88));
+        assert_eq!(answers[2], bare_choice("none", 0.95));
+        assert_eq!(*status.read().expect("status lock"), ClassifierStatus::Ready);
+
+        // The wire body carries every question under its own key.
+        let request = server.recorded().expect("recorded request");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/systemone");
+        assert_eq!(
+            request.body.get("state"),
+            Some(&serde_json::json!("step 3 of the plan"))
+        );
+        let questions = request
+            .body
+            .get("questions")
+            .and_then(|q| q.as_object())
+            .expect("questions map");
+        assert_eq!(questions.len(), 3);
+        for key in ["complexity", "action", "risk_flag"] {
+            assert!(
+                questions.get(key).is_some(),
+                "missing question key {key} on the wire"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn laya_classify_many_missing_answer_keeps_slot_none_and_fails_status() {
+        // A partial response: the answered slot is usable, the one the backend
+        // left out is `None`, and the status is `Failed` — the ask deviated
+        // from the protocol, so the shared status must not claim `Ready`.
+        let server = StubServer::start(
+            200,
+            r#"{"answers":{"complexity":{"choice":"small","confidence":0.9}}}"#,
+        )
+        .await;
+        let (classifier, status) = laya_classifier(&server.base_url(), Duration::from_secs(5));
+
+        let answers = classifier
+            .classify_many(
+                "tiny edit",
+                &[
+                    ("complexity", tiny_question("How complex is this?")),
+                    ("risk_flag", tiny_question("Any risk?")),
+                ],
+            )
+            .await;
+
+        assert_eq!(answers[0], bare_choice("small", 0.9));
+        assert_eq!(answers[1], None);
+        assert_eq!(
+            *status.read().expect("status lock"),
+            ClassifierStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_many_default_loops_classify_per_question() {
+        // The default batch implementation asks one question at a time, so a
+        // backend that cannot batch (the kNN overlay, `NoClassifier`, a test
+        // stub) stays correct unchanged.
+        let classifier = CountingClassifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let answers = classifier
+            .classify_many(
+                "state",
+                &[
+                    ("complexity", tiny_question("How complex is this?")),
+                    ("action", tiny_question("What should happen next?")),
+                    ("risk_flag", tiny_question("Any risk?")),
+                ],
+            )
+            .await;
+
+        assert_eq!(
+            classifier.calls.load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+        assert_eq!(answers.len(), 3);
+        assert!(answers.iter().all(Option::is_some));
     }
 
     #[test]

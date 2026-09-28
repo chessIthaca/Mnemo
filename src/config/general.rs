@@ -300,11 +300,29 @@ pub struct LayaConfig {
     /// config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub routing: bool,
+    /// Opt in to the compound REFLEX call (backlog a8495cc1, item 1 of the
+    /// cost-saving chain): ONE multi-question `systemone` request answers
+    /// complexity (small/medium/high/escalate), action
+    /// (continue/retry/verify/escalate/complete) and risk
+    /// (none/security/data_loss) for the same state at once, and the three
+    /// answers are gated as ONE decision on the weakest of them (>=0.80).
+    /// Nothing acts on the answers yet: a decided state is logged
+    /// shadow-first to `~/.mnemo/laya/training/reflex.jsonl`, and every
+    /// fallback (a missing or non-choice answer, a label outside its
+    /// taxonomy, a weakest confidence below the gate) keeps the caller's
+    /// pre-existing behavior byte-identically. Off by default, and meant to
+    /// be enabled only against a **fine-tuned** checkpoint: base Laya
+    /// checkpoints are near-chance zero-shot on this task, which is exactly
+    /// what the reflex log's labeled corpus is for. Omitted from the saved
+    /// config while false.
+    #[serde(default, skip_serializing_if = "laya_flag_off")]
+    pub reflex: bool,
 }
 
 /// `skip_serializing_if` guard for the Laya-gated boolean opt-ins
 /// ([`LayaConfig`]'s `auto_type_memories`, `failure_triage`,
 /// `failure_triage_knn`, `auto_finetune`, `steer_tool_choice`, `routing`,
+/// `reflex`,
 /// and [`RoutingConfig::enforce`]): `false` (the default) stays unwritten,
 /// so untouched configs keep their exact pre-consumer shape.
 fn laya_flag_off(off: &bool) -> bool {
@@ -324,6 +342,7 @@ impl LayaConfig {
             && !self.auto_finetune
             && !self.steer_tool_choice
             && !self.routing
+            && !self.reflex
     }
 }
 
@@ -1758,6 +1777,29 @@ auto_finetune = true
         assert!(text.contains("steer_tool_choice"));
         let back: LayaConfig = toml::from_str(&text).unwrap();
         assert!(back.steer_tool_choice);
+    }
+
+    #[test]
+    fn laya_reflex_counts_as_touched() {
+        // The reflex opt-in (backlog a8495cc1) follows the same convention as
+        // the other Laya flags: absent means false, and with only it set
+        // is_default must be false — otherwise the whole [general.laya]
+        // section is skipped on save and the flag is silently lost across a
+        // restart.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.laya.reflex);
+        let only_reflex = LayaConfig {
+            reflex: true,
+            ..Default::default()
+        };
+        assert!(!only_reflex.is_default());
+        let text = toml::to_string(&only_reflex).unwrap();
+        assert!(text.contains("reflex"));
+        let back: LayaConfig = toml::from_str(&text).unwrap();
+        assert!(back.reflex);
+        // The untouched default carries no trace of the flag at all.
+        let serialized = toml::to_string(&LayaConfig::default()).unwrap();
+        assert!(!serialized.contains("reflex"));
     }
 
     #[test]

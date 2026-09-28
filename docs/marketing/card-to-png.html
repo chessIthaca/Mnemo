@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Card → PNG rasterisation harness</title>
+    <!--
+      Dev tool for the marketing cards in assets/social/ — NOT shipped functionality.
+
+      How to use: open this file in a browser, then screenshot the card's bounds
+      and save it as the card's .png. The math below is the whole trick.
+
+      The card SVG is 1200x630. This page displays it at 800x420 CSS px, because
+      on a 1.5x display scale (Windows 150%) that rasterises to exactly 1200x630
+      device pixels — the card at its native resolution, sharp, with no resampling.
+      On a 1x display, set width/height to 1200px/630px instead (and on a 2x
+      display, 600px/315px). Get it wrong in the too-big direction and the browser
+      clips the card's right edge rather than scaling it down.
+
+      The magenta page background is deliberate: it makes the card's exact bounds
+      unmistakable in a screenshot so the crop is never guesswork. If magenta
+      appears inside your crop, the crop is wrong.
+
+      Use ?src=<relative path> to rasterise a different card; without it, the
+      day-1 card is used.
+    -->
+    <style>
+      html, body { margin: 0; padding: 0; background: #ff00ff; }
+      img { display: block; width: 800px; height: 420px; }
+    </style>
+  </head>
+  <body>
+    <img id="card" src="../../assets/social/day1-card.svg" alt="Mnemo card" />
+    <script>
+      const src = new URLSearchParams(location.search).get('src');
+      if (src) document.getElementById('card').src = src;
+    </script>
+  </body>
+</html>

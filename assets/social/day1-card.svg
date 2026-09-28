@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-labelledby="d1-title d1-desc" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <title id="d1-title">Mnemo — an agentic coding harness that remembers</title>
+  <desc id="d1-desc">Launch card: a sharp model plans, a cheap model executes, a read-only reviewer audits. Four supporting claims: four-tier memory that survives sessions, a tree-sitter code graph over 12 languages, six token levers with a live savings dashboard, and no edits without a plan on disk with git push always gated.</desc>
+
+  <defs>
+    <marker id="d1-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#22d3ee"/>
+    </marker>
+    <radialGradient id="d1-glow" cx="0.12" cy="0.06" r="0.85">
+      <stop offset="0" stop-color="#0891b2" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#0891b2" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- backdrop -->
+  <rect width="1200" height="630" fill="#0f172a"/>
+  <rect width="1200" height="630" fill="url(#d1-glow)"/>
+
+  <!-- wordmark -->
+  <text x="72" y="90" font-size="36" font-weight="800" fill="#f8fafc" letter-spacing="-0.5">Mnemo</text>
+  <text x="72" y="120" font-size="18" fill="#94a3b8">An agentic coding harness that remembers.</text>
+
+  <!-- open-source badge, top right -->
+  <rect x="988" y="58" width="140" height="38" rx="19" fill="rgba(34,211,238,0.10)" stroke="#0891b2" stroke-width="1.2"/>
+  <text x="1058" y="82" text-anchor="middle" font-size="14" font-weight="600" fill="#67e8f9">open source · MIT</text>
+
+  <line x1="72" y1="148" x2="1128" y2="148" stroke="#94a3b8" stroke-opacity="0.25" stroke-width="1"/>
+
+  <!-- headline -->
+  <text x="72" y="226" font-size="50" font-weight="800" fill="#f8fafc" letter-spacing="-1">Stop paying <tspan fill="#22d3ee">flagship prices</tspan></text>
+  <text x="72" y="282" font-size="50" font-weight="800" fill="#f8fafc" letter-spacing="-1">for an agent that forgets.</text>
+
+  <!-- allocation row -->
+  <g>
+    <rect x="72" y="316" width="300" height="110" rx="14" fill="rgba(8,145,178,0.12)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="96" y="350" font-size="12" font-weight="700" fill="#67e8f9" letter-spacing="1.6">SHARP MODEL</text>
+    <text x="96" y="388" font-size="28" font-weight="700" fill="#f8fafc">Plans</text>
+    <text x="96" y="411" font-size="13" fill="#94a3b8">writes the plan to disk</text>
+
+    <rect x="450" y="316" width="300" height="110" rx="14" fill="rgba(8,145,178,0.12)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="474" y="350" font-size="12" font-weight="700" fill="#67e8f9" letter-spacing="1.6">CHEAP MODEL</text>
+    <text x="474" y="388" font-size="28" font-weight="700" fill="#f8fafc">Executes</text>
+    <text x="474" y="411" font-size="13" fill="#94a3b8">follows a recipe it can't ignore</text>
+
+    <rect x="828" y="316" width="300" height="110" rx="14" fill="rgba(8,145,178,0.12)" stroke="#0891b2" stroke-width="1.5"/>
+    <text x="852" y="350" font-size="12" font-weight="700" fill="#67e8f9" letter-spacing="1.6">READ-ONLY REVIEWER</text>
+    <text x="852" y="388" font-size="28" font-weight="700" fill="#f8fafc">Audits</text>
+    <text x="852" y="411" font-size="13" fill="#94a3b8">can't approve its own work</text>
+  </g>
+
+  <g stroke="#22d3ee" stroke-width="2" fill="none">
+    <line x1="380" y1="371" x2="440" y2="371" marker-end="url(#d1-arrow)"/>
+    <line x1="758" y1="371" x2="818" y2="371" marker-end="url(#d1-arrow)"/>
+  </g>
+
+  <!-- claim pills -->
+  <g>
+    <rect x="72" y="452" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
+    <circle cx="98" cy="474" r="4" fill="#22d3ee"/>
+    <text x="118" y="480" font-size="15" fill="#cbd5e1">4-tier memory that survives sessions</text>
+
+    <rect x="616" y="452" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
+    <circle cx="642" cy="474" r="4" fill="#22d3ee"/>
+    <text x="662" y="480" font-size="15" fill="#cbd5e1">tree-sitter code graph · 12 languages</text>
+
+    <rect x="72" y="506" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
+    <circle cx="98" cy="528" r="4" fill="#22d3ee"/>
+    <text x="118" y="534" font-size="15" fill="#cbd5e1">6 token levers · live savings dashboard</text>
+
+    <rect x="616" y="506" width="512" height="44" rx="22" fill="rgba(148,163,184,0.10)" stroke="#94a3b8" stroke-opacity="0.35" stroke-width="1"/>
+    <circle cx="642" cy="528" r="4" fill="#22d3ee"/>
+    <text x="662" y="534" font-size="15" fill="#cbd5e1">no edits without a plan · git push always gated</text>
+  </g>
+
+  <!-- footer -->
+  <text x="72" y="596" font-size="17" font-weight="700" fill="#67e8f9">github.com/chessIthaca/Mnemo</text>
+  <text x="1128" y="596" text-anchor="end" font-size="15" fill="#64748b">Rust + Tauri · Windows + macOS · MIT</text>
+</svg>

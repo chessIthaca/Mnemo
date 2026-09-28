@@ -1318,6 +1318,28 @@ product.
   dispositions are retrievable without a restart). All three flags are
   separate opt-ins (default off); disabled behavior is byte-identical
   (backlog 1a4049c1; the overlay is item 4b, backlog 057f7a34).
+- **Laya reflex — the compound decision call** (`src/agent/reflex.rs`, backlog
+  a8495cc1, item 1 of the cost-saving chain) — ONE multi-question `systemone`
+  request instead of one round-trip per question: `Classifier::classify_many`
+  (a trait method whose DEFAULT loops the single-question ask, so every
+  non-batching backend — the no-op, the kNN overlay, test stubs — is unchanged;
+  `LayaClassifier` overrides it with one POST and per-key parsing, `Ready` only
+  when every asked question was answered) answers complexity (small/medium/
+  high/escalate), action (continue/retry/verify/escalate/complete) and risk
+  (none/security/data_loss) about the same state at once. The three answers are
+  gated as ONE decision on the WEAKEST of them (`REFLEX_THRESHOLD` 0.80
+  inclusive); a missing, short or non-choice answer, or a label outside its
+  taxonomy, falls back for all three — a caller can never act on a partially
+  understood step. Deliberately no `scope_drift` question: step scope is checked
+  deterministically (`git diff --name-only` against the step's named paths), and
+  a classifier must never gate what a shell can check exactly. Ships the call
+  and a shadow-first JSONL log only (`~/.mnemo/laya/training/reflex.jsonl`,
+  decision + outcome rows joined on `turn_id`, best-effort appends that can
+  never fail a turn) — NOTHING acts on a decision yet: the `[general.laya]
+  reflex` opt-in (default off, omitted while false) exists for the consumers,
+  and with it off `ReflexHandle::decide` returns without asking at all. The lane
+  ladder (item 2), the harness verify (item 3) and the budget layer (item 4)
+  consume it.
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

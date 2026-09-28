@@ -28,6 +28,9 @@
 //! - [`model_routing`] — the Laya classifier's pre-prompt model-routing
 //!   decision layer (task complexity -> cheap/capable target, confidence-
 //!   gated and shadow-first, plus the routing training log).
+//! - [`reflex`] — the Laya classifier's compound REFLEX decision layer (one
+//!   typed complexity/action/risk decision per systemone request,
+//!   confidence-gated, plus the shadow training log).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
 //!
@@ -41,6 +44,7 @@ pub mod failure_triage;
 pub mod failure_triage_knn;
 pub mod model_routing;
 pub mod prompt;
+pub mod reflex;
 pub mod review_scope;
 pub mod steering_stats;
 

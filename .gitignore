@@ -80,3 +80,8 @@ __pycache__/
 
 # Patch-tool backup files — never commit
 *.orig
+
+# ===== Local-only architecture draft =====
+# docs/costsaving.md — cost-saving orchestration prompt working draft, kept
+# local for an architecture discussion (see the backlog). Never tracked.
+docs/costsaving.md

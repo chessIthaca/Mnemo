@@ -24,6 +24,7 @@ import {
   type DiscoveredCaps,
   discoveredCapsById,
   effectiveCaps,
+  effectiveReasoningEffort,
   effortAutofillEligible,
   effortFromSelectValue,
   effortToSelectValue,
@@ -134,20 +135,15 @@ export function EndpointCard({
     ? modelConfigFor(endpoint, capsRefModel).reasoning_efforts
     : [];
   const refEfforts = refCaps?.efforts ?? null;
-  // The effort that would actually be sent for the reference model, and
-  // whether the autofill will fill the allow-list at all: the notes below may
-  // only promise what capsAutofillPatch really does (review LOW 1).
-  const refEffectiveEffort = capsRefModel
-    ? (modelConfigFor(endpoint, capsRefModel).reasoning_effort ??
-      endpoint.reasoning_effort ??
-      null)
-    : null;
+  // The effort actually in play for the reference model — the configured
+  // value, else the app default "max", and "off" while the endpoint's support
+  // switch is off (nothing is sent then, so no discovered list can clamp it).
+  // One shared resolver, the same one the autofill eligibility uses, so the
+  // notes below can only ever promise what capsAutofillPatch really does.
+  const refResolvedEffort =
+    capsRefModel != null ? effectiveReasoningEffort(endpoint, capsRefModel) : "max";
   const refEffortsFillable =
     capsRefModel != null && effortAutofillEligible(endpoint, capsRefModel, refEfforts);
-  // The effort actually in play for the reference model: the configured value,
-  // else the app default "max" (mirroring the backend chain), so the clamp
-  // hint below also covers a fresh endpoint where nothing is configured yet.
-  const refResolvedEffort = refEffectiveEffort ?? "max";
 
   // Auto-fill empty cap fields with the provider-reported values for the
   // reference model, once per (model + caps) so manually clearing a field
@@ -165,7 +161,7 @@ export function EndpointCard({
 ${refCaps.ctx ?? "-"}
 ${refCaps.out ?? "-"}
 ${refCaps.efforts?.join(",") ?? "-"}
-${refEffectiveEffort ?? "-"}`;
+${refResolvedEffort}`;
     if (filledForRef.current === guardKey) return;
     const patch = capsAutofillPatch(endpoint, capsRefModel, refCaps);
     if (patch) {

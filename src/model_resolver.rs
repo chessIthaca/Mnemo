@@ -441,11 +441,12 @@ impl ModelResolver for ConfigModelResolver {
         let target_ref = match target {
             RouteTarget::Cheap => routing.cheap.as_ref(),
             RouteTarget::Capable => routing.capable.as_ref(),
-            // The escalation-lane rungs (backlog ad56c7bd) each get their own
-            // `[general.routing]` lane target -- wired with the lane config
-            // fields; until then a rung resolves to nothing, which keeps the
-            // current model (the fail-safe the ladder is built on).
-            RouteTarget::Medium | RouteTarget::High | RouteTarget::Escalate => None,
+            // The escalation-lane rungs (backlog ad56c7bd): each has its own
+            // USER-CHOSEN target, and an unset or dangling one falls through
+            // below to None -- the caller keeps the current model.
+            RouteTarget::Medium => routing.lane_medium.as_ref(),
+            RouteTarget::High => routing.lane_high.as_ref(),
+            RouteTarget::Escalate => routing.escalate.as_ref(),
         };
         // Validated as its own link: unset or dangling (endpoint deleted)
         // falls through to None, and the caller keeps the resolve() model.
@@ -711,6 +712,56 @@ mod tests {
         }));
         assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx).is_none());
         assert!(dangling.resolve_routed(RouteTarget::Capable, ctx).is_some());
+    }
+
+    #[test]
+    fn lane_targets_resolve_when_configured_and_fall_back_otherwise() {
+        let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
+        let r = resolver(config_with_routing(RoutingConfig {
+            lane_medium: Some(ModelRef {
+                endpoint: "deepseek".into(),
+                model: "medium-model".into(),
+                reasoning_effort: None,
+            }),
+            escalate: Some(ModelRef {
+                endpoint: "openai".into(),
+                model: "top-model".into(),
+                reasoning_effort: Some("max".into()),
+            }),
+            ..RoutingConfig::default()
+        }));
+        let medium = r
+            .resolve_routed(RouteTarget::Medium, ctx)
+            .expect("lane_medium target");
+        assert_eq!(medium.endpoint, "deepseek");
+        assert_eq!(medium.model, "medium-model");
+        // An unset rung falls through without error: the caller keeps the
+        // turn's configured model.
+        assert!(r.resolve_routed(RouteTarget::High, ctx).is_none());
+        let escalate = r
+            .resolve_routed(RouteTarget::Escalate, ctx)
+            .expect("escalate target");
+        assert_eq!(escalate.model, "top-model");
+        assert_eq!(escalate.reasoning_effort.as_deref(), Some("max"));
+
+        // Dangling lane target (the endpoint was deleted): today's model,
+        // exactly like a dangling cheap/capable target.
+        let dangling = resolver(config_with_routing(RoutingConfig {
+            escalate: Some(ModelRef {
+                endpoint: "gone".into(),
+                model: "top".into(),
+                reasoning_effort: None,
+            }),
+            ..RoutingConfig::default()
+        }));
+        assert!(dangling.resolve_routed(RouteTarget::Escalate, ctx).is_none());
+
+        // Default config (routing flag off, so no classification happens and
+        // `routing_policy()` returns None): every rung resolves to nothing.
+        let plain = resolver(config_with_endpoints(ModelsConfig::default()));
+        assert!(plain.resolve_routed(RouteTarget::Medium, ctx).is_none());
+        assert!(plain.resolve_routed(RouteTarget::High, ctx).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Escalate, ctx).is_none());
     }
 
     #[test]

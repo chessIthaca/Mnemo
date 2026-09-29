@@ -1820,6 +1820,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     let optimizer_config = Arc::new(std::sync::RwLock::new(
         config.general.general.optimizer.clone(),
     ));
+    // Harness-run deterministic verify (the cost-saving chain's verification
+    // item): live mirror of `[general.verify]`, shared with every
+    // StepVerifyHandle the factory builds (read at each plan-step boundary) —
+    // a save_settings call flips it via factory.set_verify_config.
+    let verify_config = Arc::new(std::sync::RwLock::new(config.general.general.verify.clone()));
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -2021,6 +2026,10 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // tool build (read_files delta/skeleton re-reads, shell output
     // compression, …).
     .with_optimizer_config(optimizer_config)
+    // Wire the shared harness-run verify config so `[general.verify]`'s
+    // command + timeout are read at each plan-step boundary by every agent
+    // built from this factory (a Settings save flips the mirror live).
+    .with_verify_config(verify_config)
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no

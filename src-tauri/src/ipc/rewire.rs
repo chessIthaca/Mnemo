@@ -186,6 +186,11 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // write the mirror kept its startup value, so a toggle silently needed
         // an app restart.
         factory.set_optimizer_config(cfg.general.general.optimizer.clone());
+        // Harness-run deterministic verify ([general.verify], the cost-saving
+        // chain's verification item): the same live contract — every shared
+        // StepVerifyHandle reads this config at each plan-step boundary, so a
+        // Settings save lands on the next complete_step with no rebuild.
+        factory.set_verify_config(cfg.general.general.verify.clone());
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

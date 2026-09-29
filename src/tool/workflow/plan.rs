@@ -1357,11 +1357,31 @@ fn complete_step_plan_id_guard(
 
 pub struct CompleteStepTool {
     workflow: Arc<Mutex<Workflow>>,
+    /// Harness-run deterministic verify (the cost-saving chain's verification
+    /// item): when wired, a SUCCESSFUL skeleton tick runs `[general.verify]`'s
+    /// command and appends the compact evidence note to the result. `None`
+    /// until the factory wires it — bare constructions (tests) keep the
+    /// pre-feature behavior byte-identically.
+    step_verify: Option<crate::agent::step_verify::StepVerifyHandle>,
 }
 
 impl CompleteStepTool {
     pub fn new(workflow: Arc<Mutex<Workflow>>) -> Self {
-        Self { workflow }
+        Self {
+            workflow,
+            step_verify: None,
+        }
+    }
+
+    /// Wire the harness-run verification handle (see
+    /// [`crate::agent::step_verify`]): a successful skeleton tick then runs
+    /// the configured command and appends its compact evidence note.
+    pub fn with_step_verify(
+        mut self,
+        handle: crate::agent::step_verify::StepVerifyHandle,
+    ) -> Self {
+        self.step_verify = Some(handle);
+        self
     }
 }
 
@@ -1549,7 +1569,7 @@ impl Tool for CompleteStepTool {
                 }
             })
             .unwrap_or_default();
-        match wf.complete_step(step_index as usize) {
+        let mut result = match wf.complete_step(step_index as usize) {
             Ok(()) => {
                 let state = wf.state();
                 let plan = wf.plan();
@@ -1585,7 +1605,29 @@ impl Tool for CompleteStepTool {
                 }
             }
             Err(e) => ToolResult::error(format!("failed to complete step: {e}")),
+        };
+        // Release the workflow lock BEFORE any verification: the harness
+        // command can run for minutes, and no workflow reader (the UI's
+        // current_plan, a sibling tool call) may wait on it.
+        drop(wf);
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): after a SUCCESSFUL skeleton tick, run
+        // `[general.verify]`'s command and append the compact evidence note
+        // (exit status, distinct error lines, counts — never the raw log).
+        // A failed verification keeps `success: true`: the step DID tick, and
+        // a false result would drive the tier-1 auto-retry into re-ticking a
+        // completed step — the failure signal lives in the note text. The
+        // detailed sub-step tick returns above, so it never reaches this
+        // hook.
+        if result.success {
+            if let Some(handle) = &self.step_verify {
+                if let Some((command, outcome)) = handle.run_checks().await {
+                    result.output.push_str("\n\n");
+                    result.output.push_str(&handle.evidence_note(&command, &outcome));
+                }
+            }
         }
+        result
     }
 }
 
@@ -4386,6 +4428,126 @@ mod tests {
         let wf = wf.lock().await;
         assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
         assert_eq!(wf.plan().unwrap().completed_count(), 1);
+    }
+
+    /// A `[general.verify]` handle over `command`, rooted at `root`.
+    fn verify_handle(
+        enabled: bool,
+        command: &str,
+        root: &std::path::Path,
+    ) -> crate::agent::step_verify::StepVerifyHandle {
+        let cfg = Arc::new(std::sync::RwLock::new(crate::config::VerifyConfig {
+            enabled,
+            test_command: command.to_string(),
+            timeout_secs: 60,
+        }));
+        let optimizer = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig::default()));
+        crate::agent::step_verify::StepVerifyHandle::new(cfg, optimizer).with_root(root.to_path_buf())
+    }
+
+    /// Create a one-step plan in `wf`, then tick its only skeleton step with
+    /// `verify` wired (or not).
+    async fn tick_first_step(
+        wf: Arc<Mutex<Workflow>>,
+        verify: Option<crate::agent::step_verify::StepVerifyHandle>,
+    ) -> crate::tool::ToolResult {
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let mut tool = CompleteStepTool::new(wf.clone());
+        if let Some(handle) = verify {
+            tool = tool.with_step_verify(handle);
+        }
+        tool.execute(json!({"step_index": 1})).await
+    }
+
+    #[tokio::test]
+    async fn complete_step_without_a_verify_handle_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let result = tick_first_step(wf, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(!result.output.contains("[verify]"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn disabled_verify_handle_leaves_the_tick_output_byte_identical() {
+        // Flag off = exactly today's behavior: a wired but DISABLED handle
+        // produces the same bytes as no handle at all.
+        let dir_a = tempdir().unwrap();
+        let text_a = tick_first_step(make_workflow(dir_a.path()), None)
+            .await
+            .output;
+        let dir_b = tempdir().unwrap();
+        let handle = verify_handle(false, "cargo test", dir_b.path());
+        let text_b = tick_first_step(make_workflow(dir_b.path()), Some(handle))
+            .await
+            .output;
+        assert_eq!(text_a, text_b);
+    }
+
+    #[tokio::test]
+    async fn enabled_verify_handle_appends_a_passed_note() {
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let handle = verify_handle(true, "echo ok", dir.path());
+        let result = tick_first_step(wf, Some(handle)).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Complete Step 1"), "{}", result.output);
+        assert!(
+            result.output.contains("[verify] `echo ok` — passed (exit 0)"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_verification_keeps_the_tick_successful() {
+        // The tick DID happen — a failed check must not flip it false (a
+        // false result would drive the tier-1 auto-retry into re-ticking a
+        // completed step). The failure signal lives in the note text.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let handle = verify_handle(true, "exit 7", dir.path());
+        let result = tick_first_step(wf, Some(handle)).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("[verify] `exit 7` — FAILED (exit 7)"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_sub_step_ticks_never_verify() {
+        // The detailed sub-step tick returns early (it drives no state) and
+        // must never spawn the verification command.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "Fix crash",
+                "goal": "G",
+                "context": "The app crashes on open; root cause: unguarded unwrap at src/app.rs:42.",
+                "steps": [
+                    "Reproduce — run `cargo test`",
+                    "Root-cause — the None unwrap at src/app.rs:42",
+                    "Fix — guard the unwrap in src/app.rs:42"
+                ],
+                "kind": "bug_fixing",
+                "bug": "the app crashes on open"
+            }))
+            .await;
+        let handle = verify_handle(true, "exit 7", dir.path());
+        let tool = CompleteStepTool::new(wf.clone()).with_step_verify(handle);
+        // Control: the skeleton ticks DO verify (notes land on both).
+        assert!(tool.execute(json!({"step_index": 1})).await.success);
+        assert!(tool.execute(json!({"step_index": 2})).await.success);
+        let tick = tool.execute(json!({"detailed_step_index": 1})).await;
+        assert!(tick.success, "{}", tick.output);
+        assert!(!tick.output.contains("[verify]"), "{}", tick.output);
     }
 
     #[tokio::test]

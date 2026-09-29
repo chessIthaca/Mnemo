@@ -126,8 +126,10 @@ impl StepVerifyHandle {
     /// Run the configured command once, or `None` when the feature is inert
     /// (`enabled` off or `test_command` blank) — an inert handle spawns NO
     /// process. The config is read live, so a mid-session Settings save takes
-    /// effect at the next boundary.
-    pub async fn run_checks(&self) -> Option<VerifyOutcome> {
+    /// effect at the next boundary. Returns the command that RAN together
+    /// with its outcome, so the caller's note names exactly that command even
+    /// if the live config changes right after.
+    pub async fn run_checks(&self) -> Option<(String, VerifyOutcome)> {
         let (command, timeout_secs) = {
             let cfg = self.cfg.read().expect("verify config lock poisoned");
             if !cfg.enabled || cfg.test_command.trim().is_empty() {
@@ -157,11 +159,14 @@ impl StepVerifyHandle {
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                return Some(VerifyOutcome::Failed {
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!("failed to spawn verification command: {e}"),
-                })
+                return Some((
+                    command,
+                    VerifyOutcome::Failed {
+                        exit_code: -1,
+                        stdout: String::new(),
+                        stderr: format!("failed to spawn verification command: {e}"),
+                    },
+                ))
             }
         };
         // `kill_on_drop` above is what makes the timeout a CLEAN cancel: when
@@ -175,23 +180,32 @@ impl StepVerifyHandle {
                 let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
                 if output.status.success() {
-                    Some(VerifyOutcome::Passed {
-                        summary: pass_summary(&stdout, &stderr),
-                    })
+                    Some((
+                        command,
+                        VerifyOutcome::Passed {
+                            summary: pass_summary(&stdout, &stderr),
+                        },
+                    ))
                 } else {
-                    Some(VerifyOutcome::Failed {
-                        exit_code: output.status.code().unwrap_or(-1),
-                        stdout,
-                        stderr,
-                    })
+                    Some((
+                        command,
+                        VerifyOutcome::Failed {
+                            exit_code: output.status.code().unwrap_or(-1),
+                            stdout,
+                            stderr,
+                        },
+                    ))
                 }
             }
-            Ok(Err(e)) => Some(VerifyOutcome::Failed {
-                exit_code: -1,
-                stdout: String::new(),
-                stderr: format!("verification command failed: {e}"),
-            }),
-            Err(_elapsed) => Some(VerifyOutcome::TimedOut { secs: timeout_secs }),
+            Ok(Err(e)) => Some((
+                command,
+                VerifyOutcome::Failed {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: format!("verification command failed: {e}"),
+                },
+            )),
+            Err(_elapsed) => Some((command, VerifyOutcome::TimedOut { secs: timeout_secs })),
         }
     }
 
@@ -351,11 +365,13 @@ mod tests {
     #[tokio::test]
     async fn passes_and_fails_with_the_real_exit_status() {
         match handle(true, "echo ok", 60).run_checks().await {
-            Some(VerifyOutcome::Passed { summary }) => assert!(summary.contains("ok"), "{summary}"),
+            Some((_, VerifyOutcome::Passed { summary })) => {
+                assert!(summary.contains("ok"), "{summary}")
+            }
             other => panic!("expected a pass, got {other:?}"),
         }
         match handle(true, "exit 7", 60).run_checks().await {
-            Some(VerifyOutcome::Failed { exit_code, .. }) => assert_eq!(exit_code, 7),
+            Some((_, VerifyOutcome::Failed { exit_code, .. })) => assert_eq!(exit_code, 7),
             other => panic!("expected a failure, got {other:?}"),
         }
     }
@@ -372,7 +388,10 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let outcome = handle(true, sleep, 1).run_checks().await;
-        assert_eq!(outcome, Some(VerifyOutcome::TimedOut { secs: 1 }));
+        assert_eq!(
+            outcome,
+            Some((sleep.to_string(), VerifyOutcome::TimedOut { secs: 1 }))
+        );
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "the timeout did not cancel the child: {:?}",

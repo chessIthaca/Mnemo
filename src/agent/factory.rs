@@ -39,8 +39,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::agent::context::ContextManager;
-use crate::agent::{reflex::ReflexHandle, AgentLoop, AgentLoopConfig};
-use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig};
+use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
+use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -283,6 +283,13 @@ pub struct AgentLoopFactory {
     /// [`with_optimizer_config`](Self::with_optimizer_config) from the
     /// loaded config at startup (mirrors `shell_filter`).
     optimizer: Arc<RwLock<OptimizerConfig>>,
+    /// Live mirror of `[general.verify]` (harness-run deterministic verify at
+    /// plan-step boundaries — the cost-saving chain's verification item),
+    /// shared with every `StepVerifyHandle` this factory builds. Defaults to
+    /// the inert config (disabled, no command, zero spawns); the IPC layer
+    /// overrides via [`with_verify_config`](Self::with_verify_config) from
+    /// the loaded config at startup (mirrors `optimizer`).
+    verify: Arc<RwLock<VerifyConfig>>,
     /// The persistent index-staleness log (backlog fc1d57fe) handed to every
     /// search/graph tool this factory builds: each stale-index repair appends
     /// one record per file, and the freshness note points at it. Defaults to
@@ -392,6 +399,10 @@ impl AgentLoopFactory {
             // the IPC layer overrides via `with_optimizer_config` from the
             // loaded config at startup (mirrors `shell_filter`).
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
+            // Verify config at its inert default (disabled — no command, no
+            // spawn); the IPC layer overrides via `with_verify_config` from
+            // the loaded config at startup (mirrors `optimizer`).
+            verify: Arc::new(RwLock::new(VerifyConfig::default())),
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
@@ -604,6 +615,18 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared `[general.verify]` config (harness-run deterministic
+    /// verify at plan-step boundaries — the cost-saving chain's verification
+    /// item). Called once by the IPC layer at startup; every
+    /// [`StepVerifyHandle`] built from this factory shares the same
+    /// `Arc<RwLock<VerifyConfig>>`, so a Settings save is observed at the next
+    /// step boundary with no rebuild (mirrors
+    /// [`with_optimizer_config`](Self::with_optimizer_config)).
+    pub fn with_verify_config(mut self, cfg: Arc<RwLock<VerifyConfig>>) -> Self {
+        self.verify = cfg;
+        self
+    }
+
     /// Wire in the [`AgentSpawner`] that backs the `spawn_agent` tool.
     ///
     /// Called once by the IPC layer after the `AgentManager` + factory exist.
@@ -692,6 +715,17 @@ impl AgentLoopFactory {
     /// rebuild and no app restart.
     pub fn set_optimizer_config(&self, cfg: OptimizerConfig) {
         *self.optimizer.write().expect("optimizer lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.verify]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every [`StepVerifyHandle`] shares the same
+    /// `Arc<RwLock<VerifyConfig>>` (see
+    /// [`with_verify_config`](Self::with_verify_config)) and reads it per
+    /// plan-step boundary, so a Settings save lands on the next
+    /// `complete_step` — no registry rebuild and no app restart.
+    pub fn set_verify_config(&self, cfg: VerifyConfig) {
+        *self.verify.write().expect("verify lock poisoned") = cfg;
     }
 
     /// Swap in a new provider (e.g. when the user switches models from the
@@ -1227,6 +1261,20 @@ impl AgentLoopFactory {
         }
     }
 
+    /// Build the harness-run verification handle for one agent (see
+    /// [`crate::agent::step_verify`]). Every handle reads the SAME live
+    /// `[general.verify]` + `[general.optimizer]` config, so the
+    /// `complete_step` tool and the loop's action=verify path always agree;
+    /// the root is the agent's sandbox (a root-spec agent verifies inside its
+    /// own worktree).
+    fn step_verify_handle(&self, root: Option<&AgentRootSpec>) -> StepVerifyHandle {
+        let root = match root {
+            Some(spec) => spec.sandbox.root().to_path_buf(),
+            None => self.sandbox.root().to_path_buf(),
+        };
+        StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer)).with_root(root)
+    }
+
     /// Register the plan-workflow tools (always present). These mutate the
     /// per-agent `Workflow` (create/complete/update/abandon a plan) and write
     /// the project's own `.coding/plans/` bookkeeping.
@@ -1242,7 +1290,13 @@ impl AgentLoopFactory {
             create = create.with_memory(store.clone());
         }
         registry.register(Box::new(create));
-        registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
+        // The harness-run verify handle rides the plan-step tick (the
+        // cost-saving chain's verification item): a successful skeleton
+        // complete_step runs `[general.verify]`'s command and appends the
+        // compact evidence note — no model roundtrip spent deciding to run.
+        registry.register(Box::new(
+            CompleteStepTool::new(workflow.clone()).with_step_verify(self.step_verify_handle(root)),
+        ));
         registry.register(Box::new(UpdatePlanTool::new(workflow.clone())));
         // abandon_plan supersedes the abandoned plan's lingering crash
         // markers when the memory store is wired (Phase 4 hygiene — mirrors

@@ -77,7 +77,7 @@ jobs:
       # [workspace] members = ["src-tauri"]), so all bundles land under
       # <repo-root>/target/... — not src-tauri/target (review F1).
       - name: Upload Windows installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-installers
           path: |
@@ -139,7 +139,7 @@ jobs:
           cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee -a macos-test-output.txt
       - name: Upload macOS test output
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-test-output
           path: macos-test-output.txt
@@ -219,7 +219,7 @@ jobs:
           ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/*.app mnemo.app.zip
       # Same root-target layout note as the Windows job (review F1).
       - name: Upload macOS bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-bundles-aarch64
           path: |

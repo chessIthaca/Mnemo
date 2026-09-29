@@ -1092,6 +1092,8 @@ impl AgentLoop {
                 confidence: decision.confidence,
                 threshold: policy.threshold,
                 target: decision.target.map(|t| t.label().to_string()),
+                lane: None,
+                step_index: None,
                 enforced: routed.is_some(),
                 model: routed
                     .as_ref()

@@ -13721,6 +13721,11 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
         match target {
             model_routing::RouteTarget::Cheap => self.cheap.clone(),
             model_routing::RouteTarget::Capable => self.capable.clone(),
+            // The lane rungs get canned targets with the lane tests (backlog
+            // ad56c7bd); until then a rung resolves to nothing here.
+            model_routing::RouteTarget::Medium
+            | model_routing::RouteTarget::High
+            | model_routing::RouteTarget::Escalate => None,
         }
     }
 

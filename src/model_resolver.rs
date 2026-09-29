@@ -441,6 +441,11 @@ impl ModelResolver for ConfigModelResolver {
         let target_ref = match target {
             RouteTarget::Cheap => routing.cheap.as_ref(),
             RouteTarget::Capable => routing.capable.as_ref(),
+            // The escalation-lane rungs (backlog ad56c7bd) each get their own
+            // `[general.routing]` lane target -- wired with the lane config
+            // fields; until then a rung resolves to nothing, which keeps the
+            // current model (the fail-safe the ladder is built on).
+            RouteTarget::Medium | RouteTarget::High | RouteTarget::Escalate => None,
         };
         // Validated as its own link: unset or dangling (endpoint deleted)
         // falls through to None, and the caller keeps the resolve() model.

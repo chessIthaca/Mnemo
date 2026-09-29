@@ -64,6 +64,10 @@ pub const ROUTING_LABEL_ARCHITECTURAL: &str = "architectural";
 pub const ROUTING_TEXT_MAX_CHARS: usize = 2000;
 
 /// The routing targets a confident classification selects between.
+///
+/// `Cheap` / `Capable` are the pre-prompt routing targets (backlog 091e694d);
+/// `Medium` / `High` / `Escalate` are the escalation-lane rungs (backlog
+/// ad56c7bd) selected step-granularly by the compound reflex call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteTarget {
     /// A confidently-TRIVIAL task: run on the configured `cheap` model.
@@ -71,14 +75,27 @@ pub enum RouteTarget {
     /// A confidently-ARCHITECTURAL task: run on the configured `capable`
     /// model.
     Capable,
+    /// A medium-complexity plan step (reflex rung `medium`): run on the
+    /// configured `lane_medium` model.
+    Medium,
+    /// A high-complexity plan step (reflex rung `high`): run on the
+    /// configured `lane_high` model.
+    High,
+    /// An escalate-rung plan step (reflex rung `escalate`, typically after a
+    /// failed cycle): run on the configured `escalate` model.
+    Escalate,
 }
 
 impl RouteTarget {
-    /// The wire/log label (`"cheap"` / `"capable"`).
+    /// The wire/log label (`"cheap"` / `"capable"` / `"medium"` / `"high"` /
+    /// `"escalate"`).
     pub fn label(self) -> &'static str {
         match self {
             Self::Cheap => "cheap",
             Self::Capable => "capable",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Escalate => "escalate",
         }
     }
 }
@@ -201,6 +218,18 @@ pub struct RouteDecisionRow {
     /// answer did not clear the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The escalation-lane rung a step-granular classification selected
+    /// (backlog ad56c7bd): one of `"cheap"` / `"medium"` / `"high"` /
+    /// `"escalate"`. Absent on pre-prompt (turn-granular) rows and on lane
+    /// rows whose answer did not clear the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// The 0-based index of the plan step a lane row classified (backlog
+    /// ad56c7bd; the same index [`Step`] carries). Absent on pre-prompt rows.
+    ///
+    /// [`Step`]: crate::workflow::plan_file::Step
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
     /// True when routing was IN EFFECT for this turn: enforcement was on (not
     /// shadow) and the selected target resolved to a live endpoint at turn
     /// start. Shadow, below-threshold and unknown-label decisions are all
@@ -504,6 +533,8 @@ mod tests {
             confidence: 0.93,
             threshold: 0.80,
             target: Some(RouteTarget::Cheap.label().to_string()),
+            lane: None,
+            step_index: None,
             enforced: false,
             model: None,
             task_text: "bump the version to 1.1.1".into(),
@@ -529,6 +560,52 @@ mod tests {
         assert_eq!(back, decision);
         assert_eq!(back_outcome, outcome);
         assert_eq!(back_outcome.turn_id, back.turn_id);
+    }
+
+    #[test]
+    fn lane_labels_are_the_plain_rung_names() {
+        // The escalation-lane rungs (backlog ad56c7bd) use the same plain
+        // class labels the other Laya consumers do; the pre-prompt labels
+        // stay byte-identical (the shipped corpus depends on them).
+        assert_eq!(RouteTarget::Medium.label(), "medium");
+        assert_eq!(RouteTarget::High.label(), "high");
+        assert_eq!(RouteTarget::Escalate.label(), "escalate");
+        assert_eq!(RouteTarget::Cheap.label(), "cheap");
+        assert_eq!(RouteTarget::Capable.label(), "capable");
+    }
+
+    #[test]
+    fn lane_rows_round_trip_and_old_shape_rows_still_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("routing.jsonl");
+        let lane_row = RouteDecisionRow {
+            ts: 1_700_000_001_000,
+            turn_id: "1700000001000-main".into(),
+            agent_id: "main".into(),
+            shadow: false,
+            label: "high".into(),
+            confidence: 0.91,
+            threshold: 0.80,
+            target: Some(RouteTarget::High.label().to_string()),
+            lane: Some(RouteTarget::High.label().to_string()),
+            step_index: Some(2),
+            enforced: true,
+            model: Some("ep/model".into()),
+            task_text: "wire the lane ladder".into(),
+            probabilities: BTreeMap::new(),
+        };
+        append_row(&path, &lane_row);
+        let text = std::fs::read_to_string(&path).expect("log readable");
+        let back: RouteDecisionRow =
+            serde_json::from_str(text.lines().next().expect("one line")).expect("lane row");
+        assert_eq!(back, lane_row);
+
+        // A row written BEFORE the lane fields existed (no `lane`, no
+        // `step_index`) still parses: both default to None.
+        let old = r#"{"ts":1,"turn_id":"t","agent_id":"main","shadow":true,"label":"trivial","confidence":0.9,"threshold":0.8,"target":"cheap","enforced":false,"task_text":"x"}"#;
+        let back_old: RouteDecisionRow = serde_json::from_str(old).expect("old row parses");
+        assert_eq!(back_old.lane, None);
+        assert_eq!(back_old.step_index, None);
     }
 
     #[test]

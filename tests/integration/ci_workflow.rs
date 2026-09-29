@@ -142,3 +142,59 @@ fn build_workflow_scopes_token_permissions() {
         "the release job's contents: write override went missing"
     );
 }
+
+/// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
+/// commit SHA, with the human version in a trailing `# vN` comment so
+/// Dependabot can keep it current.
+///
+/// A tag ref is mutable: whoever controls the action repository can repoint
+/// `@v7` at new code that then runs with this repo's `GITHUB_TOKEN` — the
+/// release job's token is `contents: write`. SHA pins make the executed commit
+/// immutable.
+///
+/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
+/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
+/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
+/// Because of that exception the repo-level "require SHA pinning" Actions
+/// setting stays off (it would reject the rust-toolchain step).
+#[test]
+fn workflows_pin_actions_to_full_shas() {
+    const ALLOWED_UNPINNED: [&str; 1] = ["dtolnay/rust-toolchain@stable"];
+    let root = env!("CARGO_MANIFEST_DIR");
+    for rel in [".github/workflows/build.yml", ".github/workflows/codeql.yml"] {
+        let text =
+            std::fs::read_to_string(format!("{root}/{rel}")).unwrap_or_else(|e| {
+                panic!("{rel} readable: {e}")
+            });
+        for (idx, line) in text.lines().enumerate() {
+            let t = line.trim();
+            let t = t.strip_prefix("- ").unwrap_or(t);
+            let Some(action) = t.strip_prefix("uses:") else {
+                continue;
+            };
+            let action = action.trim();
+            if ALLOWED_UNPINNED.contains(&action) {
+                continue;
+            }
+            assert!(
+                action.contains('@'),
+                "{rel}:{} uses {action:?} with no @ref",
+                idx + 1
+            );
+            let rev = action
+                .rsplit('@')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            assert!(
+                rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()),
+                "{rel}:{} pins {action:?} — use a full 40-hex commit SHA with \
+                 the version in a trailing `# vN` comment (or add the action to \
+                 ALLOWED_UNPINNED with a reason)",
+                idx + 1
+            );
+        }
+    }
+}

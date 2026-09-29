@@ -1,0 +1,12 @@
+// CodeQL configuration for the advanced-setup workflow
+// (.github/workflows/codeql.yml).
+//
+// `vendor/` is excluded from RESULTS (extraction still runs, which is what the
+// Rust no-build extractor needs). vendor/tao and vendor/wry are pruned
+// third-party mirrors regenerated from their PATCHES.md, so findings there are
+// not actionable in this repository: the only three results the Rust analysis
+// ever produced were `rust/insecure-cookie` in vendor/wry, dismissed as false
+// positives on 2026-09-29 (see .coding/analysis/2026-09-29-github-security-defects.md).
+// Report anything real upstream to tao/wry instead.
+paths-ignore:
+  - vendor/**

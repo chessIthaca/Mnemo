@@ -14489,9 +14489,30 @@ impl crate::model_resolver::ModelResolver for LaneStubResolver {
     }
 }
 
+/// Build a lane test agent over an EXISTING workflow handle — the seam the
+/// plan-identity regression test needs to push a second plan mid-run.
+fn lane_agent_with_workflow(
+    dir: &std::path::Path,
+    workflow: Arc<tokio::sync::Mutex<Workflow>>,
+    default_provider: Arc<dyn LlmClient>,
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
+    gate: model_routing::RoutingGate,
+    reflex: crate::agent::reflex::ReflexHandle,
+) -> AgentLoop {
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(default_provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_model_resolver(resolver)
+    .with_routing_gate(gate)
+    .with_reflex(reflex)
+}
+
 /// Build a lane test agent: the workflow starts with an ACTIVE plan (one
-/// unchecked step), the default provider serves unless a lane fires, and the
-/// reflex handle carries the canned classifier.
+/// unchecked step, titled `Lane plan`), the default provider serves unless a
+/// lane fires, and the reflex handle carries the canned classifier.
 fn lane_agent(
     dir: &std::path::Path,
     default_provider: Arc<dyn LlmClient>,
@@ -14512,15 +14533,7 @@ fn lane_agent(
             steps.iter().map(|s| s.to_string()).collect(),
         )
         .expect("plan created");
-    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
-    let registry = make_registry((*sandbox).clone(), workflow.clone());
-    AgentLoop::new(
-        test_config(default_provider, registry, workflow, sandbox),
-        crate::project::Constitution::default(),
-    )
-    .with_model_resolver(resolver)
-    .with_routing_gate(gate)
-    .with_reflex(reflex)
+    lane_agent_with_workflow(dir, workflow, default_provider, resolver, gate, reflex)
 }
 
 /// Drive one turn and hand back the fan-in receiver so the caller can inspect
@@ -14853,4 +14866,84 @@ async fn lane_without_a_target_falls_through_without_error() {
     assert_eq!(lane.lane.as_deref(), Some("medium"));
     assert!(!lane.enforced, "an unarmed rung is not enforced");
     assert!(lane.model.is_none());
+}
+
+#[tokio::test]
+async fn lane_memo_is_fresh_for_a_new_plan_that_repeats_the_title() {
+    // Review finding L1 (backlog ad56c7bd): the memo keys a plan by its ID, so
+    // a second plan carrying the SAME title — entering the same step index
+    // under an unchanged escalation epoch — must classify its own first
+    // attempt instead of reusing its predecessor's decision.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".into()],
+        )
+        .expect("plan created");
+    let agent = lane_agent_with_workflow(
+        dir.path(),
+        workflow.clone(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+    );
+
+    let (first, _rx) = run_lane_turn(&agent, "work the first plan").await;
+    assert_eq!(first.text, "from-medium-model");
+    assert_eq!(passes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // A SECOND plan with the SAME title and the same step index: only its
+    // generated id differs — exactly what the memo must key on.
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".into()],
+        )
+        .expect("second plan created");
+
+    let (second, _rx) = run_lane_turn(&agent, "work the second plan").await;
+    assert_eq!(second.text, "from-medium-model");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "a new plan must classify again, never reuse the previous plan's memo"
+    );
 }

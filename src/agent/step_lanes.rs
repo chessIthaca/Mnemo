@@ -164,8 +164,13 @@ fn reason_confidence(reason: &ReflexKeepReason) -> f64 {
 /// on now to decide whether a new classifier call is owed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaneState {
-    /// The plan the classification was made for (a different plan re-asks).
-    pub plan_title: String,
+    /// The ID of the plan the classification was made for — the plan's
+    /// identity for the memo, deliberately NOT its title: agent-generated plan
+    /// titles repeat ("Fix the failing test"), and keying on one let a NEW
+    /// plan reuse a decision made for its predecessor when it entered the same
+    /// step index under an unchanged epoch (ad56c7bd review finding L1). A
+    /// different id re-asks.
+    pub plan_id: String,
     /// The 0-based step index classified (the plan step's own index — the
     /// same value the routing row records).
     pub step_index: usize,
@@ -188,14 +193,14 @@ pub struct LaneState {
 impl LaneState {
     /// Record a decided classification for one step.
     pub fn decided(
-        plan_title: impl Into<String>,
+        plan_id: impl Into<String>,
         step_index: usize,
         decision: &ReflexDecision,
         shadow: bool,
         epoch: u64,
     ) -> Self {
         Self {
-            plan_title: plan_title.into(),
+            plan_id: plan_id.into(),
             step_index,
             target: Some(rung_from_decision(decision).to_route_target()),
             shadow,
@@ -208,14 +213,14 @@ impl LaneState {
     /// Record a fallback: no usable answer, so the step keeps its configured
     /// model.
     pub fn fallback(
-        plan_title: impl Into<String>,
+        plan_id: impl Into<String>,
         step_index: usize,
         reason: &ReflexKeepReason,
         shadow: bool,
         epoch: u64,
     ) -> Self {
         Self {
-            plan_title: plan_title.into(),
+            plan_id: plan_id.into(),
             step_index,
             target: None,
             shadow,
@@ -253,19 +258,23 @@ pub enum ClassifyHow {
 
 /// What to do about the current step, given the memoized state.
 ///
-/// `state`/`plan_title`/`step_index` describe the step the agent is on NOW, and
+/// `state`/`plan_id`/`step_index` describe the step the agent is on NOW, and
 /// `epoch` is the loop's escalation epoch (bumped by a confident
 /// failure-triage verdict). A `None` step (no active plan) is the caller's
 /// concern — it never asks; this function assumes a step exists.
+///
+/// The plan is compared by ID, never by title: two consecutive plans can carry
+/// the same agent-generated title, and the second one's first attempt must be
+/// classified fresh (review finding L1 on backlog ad56c7bd).
 pub fn needs_classify(
     state: Option<&LaneState>,
-    plan_title: &str,
+    plan_id: &str,
     step_index: usize,
     epoch: u64,
 ) -> ClassifyHow {
     match state {
         None => ClassifyHow::Fresh,
-        Some(current) if current.plan_title != plan_title || current.step_index != step_index => {
+        Some(current) if current.plan_id != plan_id || current.step_index != step_index => {
             ClassifyHow::Fresh
         }
         Some(current) if current.epoch != epoch => ClassifyHow::ReClassify,
@@ -449,10 +458,10 @@ mod tests {
     #[test]
     fn needs_classify_is_fresh_then_reuse_and_reclassifies_after_a_failure() {
         // First sight of a step: fresh -- classified on its first attempt.
-        assert_eq!(needs_classify(None, "plan", 0, 0), ClassifyHow::Fresh);
+        assert_eq!(needs_classify(None, "plan-a", 0, 0), ClassifyHow::Fresh);
 
         let state = LaneState::decided(
-            "plan",
+            "plan-a",
             1,
             &decision(Complexity::Medium, ReflexAction::Continue),
             false,
@@ -460,30 +469,47 @@ mod tests {
         );
         // Same step, same epoch: reuse -- no second classifier call.
         assert_eq!(
-            needs_classify(Some(&state), "plan", 1, 3),
+            needs_classify(Some(&state), "plan-a", 1, 3),
             ClassifyHow::Reuse
         );
-        // A different step, or a different plan, is a fresh step.
+        // A different step is a fresh step.
         assert_eq!(
-            needs_classify(Some(&state), "plan", 2, 3),
-            ClassifyHow::Fresh
-        );
-        assert_eq!(
-            needs_classify(Some(&state), "other plan", 1, 3),
+            needs_classify(Some(&state), "plan-a", 2, 3),
             ClassifyHow::Fresh
         );
         // A failed cycle moved the epoch: re-classify the same step.
         assert_eq!(
-            needs_classify(Some(&state), "plan", 1, 4),
+            needs_classify(Some(&state), "plan-a", 1, 4),
             ClassifyHow::ReClassify
         );
     }
 
     #[test]
+    fn a_new_plan_id_is_fresh_even_at_the_same_step_and_epoch() {
+        // The memo keys the plan by its ID, never its title (backlog
+        // ad56c7bd review finding L1): a NEW plan entering the same step index
+        // under an unchanged epoch must classify its own first attempt -- two
+        // consecutive plans can carry the same agent-generated title.
+        let state = LaneState::decided(
+            "plan-a",
+            1,
+            &decision(Complexity::Medium, ReflexAction::Continue),
+            false,
+            3,
+        );
+        assert_eq!(
+            needs_classify(Some(&state), "plan-b", 1, 3),
+            ClassifyHow::Fresh
+        );
+        // The memo carries the id itself, so nothing title-shaped can leak.
+        assert_eq!(state.plan_id, "plan-a");
+    }
+
+    #[test]
     fn decided_state_carries_the_rung_and_the_row_both_halves() {
         let decided = decision(Complexity::High, ReflexAction::Verify);
-        let state = LaneState::decided("plan", 2, &decided, false, 7);
-        assert_eq!(state.plan_title, "plan");
+        let state = LaneState::decided("plan-a", 2, &decided, false, 7);
+        assert_eq!(state.plan_id, "plan-a");
         assert_eq!(state.step_index, 2);
         assert_eq!(state.target, Some(RouteTarget::High));
         assert_eq!(state.label, "high");
@@ -519,7 +545,7 @@ mod tests {
     #[test]
     fn shadow_state_never_yields_a_target_and_the_row_says_so() {
         let decided = decision(Complexity::Escalate, ReflexAction::Escalate);
-        let shadow = LaneState::decided("plan", 0, &decided, true, 0);
+        let shadow = LaneState::decided("plan-a", 0, &decided, true, 0);
         // The rung is recorded, but never in effect.
         assert_eq!(shadow.target, Some(RouteTarget::Escalate));
         assert_eq!(shadow.effective_target(), None);
@@ -536,7 +562,7 @@ mod tests {
     #[test]
     fn fallback_rows_keep_the_model_and_carry_the_reason() {
         let state = LaneState::fallback(
-            "plan",
+            "plan-a",
             1,
             &ReflexKeepReason::LowConfidence(0.42),
             false,

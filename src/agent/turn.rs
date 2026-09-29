@@ -1163,12 +1163,15 @@ impl AgentLoop {
         }
         let policy = self.model_resolver.as_ref()?.routing_policy()?;
         // The live step, under the workflow lock; the guard is dropped before
-        // the first await (decide + resolve both await).
-        let (plan_title, step_index, step_text) = {
+        // the first await (decide + resolve both await). The plan's IDENTITY
+        // is its id, never its title -- agent-generated titles repeat, and the
+        // memo must never serve a new plan a decision made for its
+        // predecessor (ad56c7bd review finding L1).
+        let (plan_id, step_index, step_text) = {
             let wf = self.workflow.lock().await;
             let step = wf.current_step()?;
-            let title = wf.plan().map(|p| p.title.clone()).unwrap_or_default();
-            (title, step.index, step.text.clone())
+            let plan_id = wf.plan_id()?.to_string();
+            (plan_id, step.index, step.text.clone())
         };
         let epoch = self
             .escalation_epoch
@@ -1176,7 +1179,7 @@ impl AgentLoop {
         // The memo: the same step under the same epoch is never asked twice.
         let how = {
             let memo = self.lane_state.lock().ok()?;
-            step_lanes::needs_classify(memo.as_ref(), &plan_title, step_index, epoch)
+            step_lanes::needs_classify(memo.as_ref(), &plan_id, step_index, epoch)
         };
         if how == ClassifyHow::Reuse {
             let memo = self.lane_state.lock().ok()?;
@@ -1228,7 +1231,7 @@ impl AgentLoop {
                     );
                 }
                 let mut state =
-                    LaneState::decided(plan_title, step_index, decision, shadow, epoch);
+                    LaneState::decided(plan_id, step_index, decision, shadow, epoch);
                 // Memoize the miss (the pre-prompt contract): a rung whose
                 // target is unset or dangling is not armed at all.
                 if routed.is_none() {
@@ -1259,7 +1262,7 @@ impl AgentLoop {
                 }
                 if let Ok(mut memo) = self.lane_state.lock() {
                     *memo = Some(LaneState::fallback(
-                        plan_title,
+                        plan_id,
                         step_index,
                         reason,
                         shadow,

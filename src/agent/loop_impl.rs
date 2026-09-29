@@ -448,6 +448,12 @@ pub struct AgentLoop {
     /// triage sites, which cannot lock the async workflow to learn the live
     /// step.
     pub(crate) pending_lane_retry: std::sync::atomic::AtomicBool,
+    /// The attribution stamped for the next spend row (backlog a25a5323):
+    /// which plan/step/lane the coming request belongs to and why the model
+    /// runs (route/retry/escalate/default). Consumed once by the usage site
+    /// that writes the row; overwritten each iteration, so a request that
+    /// never reports usage cannot mis-attribute the next one.
+    pub(crate) spend_attribution: std::sync::Mutex<Option<budget::SpendAttribution>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -866,6 +872,7 @@ impl AgentLoop {
             budget: Arc::new(RwLock::new(BudgetConfig::default())),
             plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
             pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
+            spend_attribution: std::sync::Mutex::new(None),
         }
     }
 
@@ -1038,6 +1045,22 @@ impl AgentLoop {
     pub(crate) fn take_pending_lane_retry(&self) -> bool {
         self.pending_lane_retry
             .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stamp the attribution for the next spend row (consumed once by the
+    /// usage site, so every row carries the decision that priced it).
+    pub(crate) fn set_spend_attribution(&self, attr: budget::SpendAttribution) {
+        if let Ok(mut slot) = self.spend_attribution.lock() {
+            *slot = Some(attr);
+        }
+    }
+
+    /// Take the stamped spend attribution, if any.
+    pub(crate) fn take_spend_attribution(&self) -> Option<budget::SpendAttribution> {
+        self.spend_attribution
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Record a confident failure-triage verdict (backlog ad56c7bd). A

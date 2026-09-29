@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
+use super::budget;
 use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
@@ -267,6 +268,10 @@ pub(crate) struct TurnState {
     /// nothing) = no arm fires, no row is written, and model selection is
     /// exactly today's.
     route: Option<TurnRoute>,
+    /// The budget layer's turn identity (backlog a25a5323): one id per turn,
+    /// stamped on every spend row the turn writes, joining the ledger with
+    /// the routing/reflex logs' turn ids.
+    spend_turn_id: Option<String>,
 }
 
 impl TurnState {
@@ -292,6 +297,7 @@ impl TurnState {
             last_recall_results: None,
             last_recall_store_version: 0,
             route: None,
+            spend_turn_id: None,
         }
     }
 }
@@ -414,6 +420,9 @@ impl AgentLoop {
         // decision lives in `state.route`; each iteration's provider
         // resolution reads its target.
         state.route = self.route_turn_start(messages, agent_id).await;
+        // The budget layer's turn identity (backlog a25a5323): minted once
+        // per turn, stamped on every spend row this turn writes.
+        state.spend_turn_id = Some(model_routing::new_turn_id(&agent_id.to_string()));
 
         loop {
             // A swap deferred mid-run (a smaller-context model pick) is
@@ -470,16 +479,54 @@ impl AgentLoop {
             // decision is step-granular (more specific), and `state.route`
             // keeps feeding the turn-level outcome rows untouched.
             let lane_target = self.step_lane_target(agent_id).await;
-            // The deterministic budget gate (backlog a25a5323): apply a
-            // pending failed-cycle retry to the live step and, when a cap is
-            // reached, PAUSE the plan through a pending question — never a
-            // hard kill (the plan file is the resumption document). `Some`
-            // means the turn ends here.
+            // Budget-layer reads (backlog a25a5323), once per iteration: the
+            // live plan scope feeds the cap gate AND the spend ledger (rows
+            // are written regardless of the budget flag — it gates only the
+            // caps), and the failed-cycle marker says this iteration's
+            // request IS the retry.
+            let plan_scope = self.read_plan_scope().await;
+            let retry_pending = self.take_pending_lane_retry();
+            // The deterministic budget gate: when a cap is reached, PAUSE the
+            // plan through a pending question — never a hard kill (the plan
+            // file is the resumption document). `Some` means the turn ends
+            // here.
             if let Some(outcome) = self
-                .budget_gate(fanin_tx, agent_id, cmd_rx, &mut state)
+                .budget_gate(
+                    plan_scope.as_ref(),
+                    retry_pending,
+                    fanin_tx,
+                    agent_id,
+                    cmd_rx,
+                    &mut state,
+                )
                 .await
             {
                 return Ok(outcome);
+            }
+            // Stamp the spend attribution for the request this iteration
+            // builds: which plan/step/lane it belongs to and why the model
+            // runs. The usage site consumes it; an errored request that
+            // reports no usage simply leaves it to be overwritten.
+            if let Some((plan_id, step_index)) = &plan_scope {
+                let turn_id = state
+                    .spend_turn_id
+                    .clone()
+                    .unwrap_or_else(|| model_routing::new_turn_id(&agent_id.to_string()));
+                self.set_spend_attribution(budget::SpendAttribution {
+                    plan_id: plan_id.clone(),
+                    turn_id,
+                    step_index: *step_index,
+                    lane: lane_target.map(|t| t.label().to_string()),
+                    reason: if retry_pending {
+                        budget::BudgetReason::Retry
+                    } else if matches!(lane_target, Some(model_routing::RouteTarget::Escalate)) {
+                        budget::BudgetReason::Escalate
+                    } else if lane_target.is_some() {
+                        budget::BudgetReason::Route
+                    } else {
+                        budget::BudgetReason::Default
+                    },
+                });
             }
             let (provider, context_manager) = self
                 .resolve_iteration_provider(
@@ -1314,49 +1361,58 @@ impl AgentLoop {
         }
     }
 
+    /// The live plan's `(id, current step)` under ONE workflow lock —
+    /// `None` when no plan is active (chat turns and subagents run
+    /// planless). Shared by the budget gate and the spend attribution
+    /// (backlog a25a5323), so a single read serves both and the ledger rows
+    /// are written regardless of the budget flag.
+    async fn read_plan_scope(&self) -> Option<(String, Option<usize>)> {
+        let wf = self.workflow.lock().await;
+        let plan_id = wf.plan_id()?.to_string();
+        Some((plan_id, wf.current_step().map(|s| s.index)))
+    }
+
     /// The deterministic budget gate (backlog a25a5323, the cost-saving
     /// chain's budget item): called at every plan-step boundary, after the
-    /// lane decision and before the request resolves. Applies a pending
-    /// failed-cycle retry to the live step and, when a cap is reached, PAUSES
-    /// the plan through a pending question (continue for this plan / double
-    /// the reached cap / end the turn) — never a hard kill: plans are
+    /// lane decision and before the request resolves. Counts the pending
+    /// failed-cycle retry against the live step and, when a cap is reached,
+    /// PAUSES the plan through a pending question (continue for this plan /
+    /// double the reached cap / end the turn) — never a hard kill: plans are
     /// crash-resumable and the plan file is the resumption document.
     ///
-    /// Returns `Some(outcome)` when the turn ends here (the human chose to
-    /// end, a hard stop arrived while paused, or the question channel closed);
-    /// `None` to continue the turn. With no live plan (chat turns, subagents)
-    /// or the budget disabled this is a cheap no-op — no counters advance, no
-    /// question is emitted, byte-identical behavior.
+    /// `plan_scope` is the caller's single workflow read (the same one the
+    /// spend attribution uses) and the caller also drains the pending retry
+    /// flag, so one read serves both. Returns `Some(outcome)` when the turn
+    /// ends here (the human chose to end, a hard stop arrived while paused,
+    /// or the question channel closed); `None` to continue the turn. With no
+    /// live plan or the budget disabled this is a cheap no-op — no counters
+    /// advance, no question is emitted, byte-identical behavior.
     async fn budget_gate(
         &self,
+        plan_scope: Option<&(String, Option<usize>)>,
+        retry_pending: bool,
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         agent_id: AgentId,
         cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         state: &mut TurnState,
     ) -> Option<TurnOutcome> {
-        // A disabled budget is fully inert: no workflow lock, no counters, no
-        // question. The pending retry flag is still drained so a later enable
-        // cannot count a stale cycle.
+        // A disabled budget is fully inert: no counters, no question.
         let cfg = self.budget.read().expect("budget lock poisoned").clone();
-        let pending_retry = self.take_pending_lane_retry();
         if !cfg.enabled {
             return None;
         }
-        // The live plan, under the workflow lock (dropped before any await).
-        let (plan_id, step_index) = {
-            let wf = self.workflow.lock().await;
-            let Some(plan_id) = wf.plan_id().map(|s| s.to_string()) else {
-                return None;
-            };
-            (plan_id, wf.current_step().map(|s| s.index))
+        // No live plan (chat turns, subagents): nothing to cap.
+        let Some((plan_id, step_index)) = plan_scope else {
+            return None;
         };
         // Counters: point them at this plan (a new plan resets everything),
-        // then apply a pending failed-cycle retry to the step that runs next.
+        // then apply the pending failed-cycle retry to the step that runs
+        // next.
         self.with_plan_spend(|spend| {
-            spend.note_plan(&plan_id);
-            if pending_retry {
+            spend.note_plan(plan_id);
+            if retry_pending {
                 if let Some(step) = step_index {
-                    spend.note_lane_retry(step);
+                    spend.note_lane_retry(*step);
                 }
             }
         });
@@ -3658,6 +3714,62 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
     }
 
+    /// Record one per-decision spend row (backlog a25a5323) — the budget
+    /// layer's ledger. Fire-and-forget through the shared store (mirrors
+    /// [`record_stats_row`](Self::record_stats_row)); the per-plan counters
+    /// update INLINE first, so the next cap gate reads fresh numbers. No
+    /// stamped attribution or no store → no row (never a fabricated one).
+    pub(crate) fn record_spend_row(
+        &self,
+        session_id: Option<&str>,
+        provider: &dyn LlmClient,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: Option<u32>,
+    ) {
+        let Some(attr) = self.take_spend_attribution() else {
+            return;
+        };
+        // Inline counters first: the next iteration's gate must see this
+        // request's real spend.
+        self.with_plan_spend(|spend| {
+            spend.note_plan(&attr.plan_id);
+            spend.note_tokens(prompt_tokens as u64, completion_tokens as u64);
+        });
+        let Some(store) = &self.memory else {
+            return;
+        };
+        let now_epoch = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let event = crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.map(|s| s.to_string()),
+            turn_id: Some(attr.turn_id),
+            agent_id: None,
+            plan_id: attr.plan_id,
+            step_index: attr.step_index,
+            lane: attr.lane,
+            model: provider.model().to_string(),
+            reason: attr.reason.wire_label().to_string(),
+            tokens_in: prompt_tokens as i64,
+            tokens_out: completion_tokens as i64,
+            cached_tokens: cached_tokens.map(|c| c as i64),
+            detail: None,
+            created_at: now_epoch,
+        };
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = store.record_spend_event(&event).await {
+                eprintln!("mnemo: failed to record spend event: {e}");
+            }
+        });
+    }
+
     /// Record one token-savings ledger row (backlog e4a50d22): a lever's
     /// before/after token counts for one optimization event. Fire-and-forget
     /// — savings recording must never block or break the turn; a failed
@@ -4255,6 +4367,17 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                                 },
                             );
                             usage_recorded = true;
+                            // The budget layer's per-decision spend row
+                            // (backlog a25a5323): the SAME real usage that
+                            // just priced the request, attributed to the
+                            // plan step and lane decision that ran it.
+                            self.record_spend_row(
+                                session_id,
+                                provider.as_ref(),
+                                prompt_tokens,
+                                completion_tokens,
+                                Some(effective_cached),
+                            );
                             let _ = fanin_tx
                                 .send((agent_id, AgentEvent::Usage {
                                     prompt_tokens,

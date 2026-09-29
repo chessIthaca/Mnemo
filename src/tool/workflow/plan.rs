@@ -1363,6 +1363,11 @@ pub struct CompleteStepTool {
     /// until the factory wires it — bare constructions (tests) keep the
     /// pre-feature behavior byte-identically.
     step_verify: Option<crate::agent::step_verify::StepVerifyHandle>,
+    /// The shared memory store — when wired, a successful verification's
+    /// outcome lands in the `spend_events` ledger as a `verify` row (backlog
+    /// a25a5323; the per-plan cost report's deterministic-checks section).
+    /// `None` (tests / no store) skips the row.
+    memory: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
 }
 
 impl CompleteStepTool {
@@ -1370,6 +1375,7 @@ impl CompleteStepTool {
         Self {
             workflow,
             step_verify: None,
+            memory: None,
         }
     }
 
@@ -1382,6 +1388,60 @@ impl CompleteStepTool {
     ) -> Self {
         self.step_verify = Some(handle);
         self
+    }
+
+    /// Wire the shared memory store so a successful verification records its
+    /// outcome in the budget layer's `spend_events` ledger (backlog
+    /// a25a5323) — the per-plan cost report cites the real check results.
+    pub fn with_memory(mut self, memory: Arc<dyn crate::memory::MemoryStoreTrait>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Record this verification's outcome in the budget layer's spend ledger
+    /// (backlog a25a5323) — one `verify` row carrying the compact evidence
+    /// note, so the per-plan cost report cites real results. Fire-and-forget:
+    /// a failed durable write is logged, never surfaced (evidence collection
+    /// must not break the tick it documents).
+    fn record_verify_spend_row(
+        memory: &Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+        plan_id: Option<&str>,
+        step_index: usize,
+        command: &str,
+        note: &str,
+    ) {
+        let (Some(store), Some(plan_id)) = (memory, plan_id) else {
+            return;
+        };
+        let now_epoch = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let event = crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: None,
+            turn_id: None,
+            agent_id: None,
+            plan_id: plan_id.to_string(),
+            step_index: Some(step_index),
+            lane: None,
+            model: command.to_string(),
+            reason: "verify".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cached_tokens: None,
+            detail: Some(note.chars().take(600).collect()),
+            created_at: now_epoch,
+        };
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = store.record_spend_event(&event).await {
+                eprintln!("mnemo: failed to record verify spend event: {e}");
+            }
+        });
     }
 }
 
@@ -1546,6 +1606,10 @@ impl Tool for CompleteStepTool {
         // Capture the active plan's id BEFORE completing — a sub-plan's last
         // step pops the stack, so plan_id() afterwards is the parent's.
         let active_plan_id = wf.plan_id().map(str::to_string);
+        // The budget layer's evidence row (backlog a25a5323) needs the id
+        // AFTER the result is built (the json! moves it), so keep a clone
+        // for the verification hook below.
+        let spend_plan_id = active_plan_id.clone();
         // Detect out-of-order completion BEFORE the call: completing a step
         // after the first not-done one leaves a done step behind an undone
         // one — update_plan later REFUSES to replace the remaining steps in
@@ -1622,8 +1686,19 @@ impl Tool for CompleteStepTool {
         if result.success {
             if let Some(handle) = &self.step_verify {
                 if let Some((command, outcome)) = handle.run_checks().await {
+                    let note = handle.evidence_note(&command, &outcome);
+                    // The budget layer's evidence row (backlog a25a5323):
+                    // the deterministic check's real outcome, cited by the
+                    // per-plan cost report. Best-effort, fire-and-forget.
+                    Self::record_verify_spend_row(
+                        &self.memory,
+                        spend_plan_id.as_deref(),
+                        step_index as usize,
+                        &command,
+                        &note,
+                    );
                     result.output.push_str("\n\n");
-                    result.output.push_str(&handle.evidence_note(&command, &outcome));
+                    result.output.push_str(&note);
                 }
             }
         }
@@ -4517,6 +4592,52 @@ mod tests {
             result.output.contains("[verify] `exit 7` — FAILED (exit 7)"),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verification_records_its_outcome_in_the_spend_ledger() {
+        // The budget layer's evidence row (backlog a25a5323): with a store
+        // wired, the harness verification's real outcome lands in the spend
+        // ledger as one `verify` row — the per-plan cost report's
+        // deterministic-checks source.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let store: Arc<dyn crate::memory::MemoryStoreTrait> = Arc::new(
+            crate::memory::MemoryStore::open_in_memory(Arc::new(
+                crate::memory::HashEmbedder::new(),
+            ))
+            .unwrap(),
+        );
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let plan_id = wf.lock().await.plan_id().expect("a live plan").to_string();
+        let tool = CompleteStepTool::new(wf.clone())
+            .with_step_verify(verify_handle(true, "echo ok", dir.path()))
+            .with_memory(store.clone());
+        let result = tool.execute(json!({"step_index": 1})).await;
+        assert!(result.success, "{}", result.output);
+
+        // The row write is fire-and-forget (mirrors the stats recorder).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rows = store.spend_rows_for_plan(&plan_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.reason, "verify");
+        assert_eq!(row.step_index, Some(0));
+        assert_eq!(row.model, "echo ok");
+        assert_eq!(row.tokens_in, 0);
+        assert_eq!(row.tokens_out, 0);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("[verify] `echo ok` — passed (exit 0)"),
+            "{:?}",
+            row.detail
         );
     }
 

@@ -1338,9 +1338,15 @@ impl AgentLoopFactory {
         // cost-saving chain's verification item): a successful skeleton
         // complete_step runs `[general.verify]`'s command and appends the
         // compact evidence note — no model roundtrip spent deciding to run.
-        registry.register(Box::new(
-            CompleteStepTool::new(workflow.clone()).with_step_verify(self.step_verify_handle(root)),
-        ));
+        let mut complete_step = CompleteStepTool::new(workflow.clone())
+            .with_step_verify(self.step_verify_handle(root));
+        // The budget layer's evidence row (backlog a25a5323): with the store
+        // wired, a successful verification records its outcome in the
+        // `spend_events` ledger for the per-plan cost report.
+        if let Some(store) = &self.memory {
+            complete_step = complete_step.with_memory(store.clone());
+        }
+        registry.register(Box::new(complete_step));
         registry.register(Box::new(UpdatePlanTool::new(workflow.clone())));
         // abandon_plan supersedes the abandoned plan's lingering crash
         // markers when the memory store is wired (Phase 4 hygiene — mirrors

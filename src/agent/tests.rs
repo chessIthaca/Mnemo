@@ -14828,6 +14828,263 @@ async fn the_pending_lane_retry_lands_on_the_live_step_at_the_gate() {
     );
 }
 
+/// Poll the store for `n` spend rows on `plan_id` (the row write is
+/// fire-and-forget, mirroring the stats recorder) — a hard deadline keeps a
+/// regression failing instead of hanging.
+async fn wait_for_spend_rows(
+    store: &Arc<dyn crate::memory::MemoryStoreTrait>,
+    plan_id: &str,
+    n: usize,
+) -> Vec<crate::memory::SpendEvent> {
+    for _ in 0..100 {
+        let rows = store.spend_rows_for_plan(plan_id).await.unwrap();
+        if rows.len() >= n {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    store.spend_rows_for_plan(plan_id).await.unwrap()
+}
+
+/// An in-memory store for the spend-ledger tests.
+fn spend_store() -> Arc<dyn crate::memory::MemoryStoreTrait> {
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    Arc::new(MemoryStore::open_in_memory(embedder).unwrap())
+}
+
+/// A usage-REPORTING provider: the spend ledger only writes on REAL usage, so
+/// the ledger tests must serve requests that report tokens (the routing stubs
+/// emit text only).
+fn usage_provider(prompt_tokens: u32, completion_tokens: u32, cached: u32) -> Arc<dyn LlmClient> {
+    Arc::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "ran".into(),
+        },
+        LlmEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens: 0,
+            cached_tokens: cached,
+            ttft_ms: Some(50),
+            generation_ms: Some(120),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]]))
+}
+
+#[tokio::test]
+async fn spend_rows_carry_the_plan_step_and_real_usage() {
+    // Backlog a25a5323: every main plan request records ONE per-decision row
+    // with the real usage — plan, step, reason and tokens — regardless of the
+    // budget flag (the flag gates only the caps).
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(
+        usage_provider(1_200, 50, 800),
+        registry,
+        workflow.clone(),
+        sandbox,
+    );
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default());
+
+    let (outcome, _questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(!outcome.text.is_empty(), "the provider served the turn");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.plan_id, plan_id);
+    assert_eq!(row.step_index, Some(0));
+    assert_eq!(row.reason, "default", "no lane decision applied");
+    assert!(row.lane.is_none());
+    assert_eq!(row.tokens_in, 1_200);
+    assert_eq!(row.tokens_out, 50);
+    assert_eq!(row.cached_tokens, Some(800));
+    assert!(row.turn_id.is_some(), "rows join the routing logs by turn id");
+}
+
+#[tokio::test]
+async fn spend_rows_mark_the_failed_cycle_retry() {
+    // A pending failed-cycle retry makes the next request's row reason=retry,
+    // and the cap gate counts the same fact against the live step — the
+    // ledger and the caps read one truth.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(
+        usage_provider(500, 20, 0),
+        registry,
+        workflow.clone(),
+        sandbox,
+    );
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default())
+        .with_budget_config(Arc::new(std::sync::RwLock::new(crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        })));
+    agent.with_plan_spend(|spend| spend.note_plan(&plan_id));
+    agent.set_pending_lane_retry();
+
+    let (_outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(questions.is_empty(), "under every cap: no pause");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].reason, "retry");
+    assert_eq!(rows[0].tokens_in, 500);
+    let step_index = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .current_step()
+        .map(|s| s.index);
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index.unwrap()).copied()),
+        Some(1),
+        "the gate counted the same failed cycle"
+    );
+}
+
+/// A lane resolver that serves the MEDIUM lane with a usage-REPORTING
+/// provider (the routed spend-row test needs real tokens from the lane that
+/// actually served); everything else delegates to the standard stub.
+struct LaneUsageResolver {
+    inner: LaneStubResolver,
+    medium_provider: Arc<dyn LlmClient>,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for LaneUsageResolver {
+    fn resolve(
+        &self,
+        ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve(ctx)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, ctx)
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        if model.model == "medium-model" {
+            return Some((
+                self.medium_provider.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            ));
+        }
+        self.inner.build_turn_provider(model, fill_rate)
+    }
+}
+
+#[tokio::test]
+async fn spend_rows_follow_the_enforced_lane_switch() {
+    // The ledger's lane-switch acceptance (backlog a25a5323): an ENFORCED
+    // medium-lane iteration records the row with the lane and reason that
+    // priced it — plus the real tokens the lane provider reported.
+    let dir = tempdir().unwrap();
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        dir.path().join("reflex.jsonl"),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        dir.path().join("routing.jsonl"),
+    );
+    let resolver = Arc::new(LaneUsageResolver {
+        inner: LaneStubResolver {
+            policy: Some(model_routing::RoutingPolicy {
+                threshold: 0.80,
+                enforce: true,
+            }),
+            lane_medium: Some(stub_model_ref("medium-model")),
+            lane_high: None,
+            escalate: None,
+        },
+        medium_provider: usage_provider(900, 40, 0),
+    });
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".to_string()],
+        )
+        .expect("plan created");
+    let plan_id = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .plan_id()
+        .expect("a live plan")
+        .to_string();
+    let store = spend_store();
+    let mut agent = lane_agent_with_workflow(
+        dir.path(),
+        workflow.clone(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+    );
+    agent.memory = Some(store.clone());
+
+    let (outcome, _fanin) = run_lane_turn(&agent, "work the next plan step").await;
+    assert_eq!(outcome.text, "ran", "the medium lane served the step");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.reason, "route", "a lane decision priced the request");
+    assert_eq!(row.lane.as_deref(), Some("medium"));
+    assert_eq!(row.model, "mock", "the provider that actually served");
+    assert_eq!(row.tokens_in, 900);
+    assert_eq!(row.tokens_out, 40);
+    assert_eq!(row.step_index, Some(0));
+}
+
 /// The harness-run verify handle for a loop test (see
 /// [`crate::agent::step_verify`]): the shared config handle + the default
 /// optimizer config, rooted at `root`.

@@ -11,7 +11,16 @@
 // import (`useAgentStore` + every type/helper re-export) and composes the
 // slices into one Zustand store so nothing downstream changes.
 
-import { create } from "zustand";
+// zustand 5 dropped the `useSyncExternalStoreWithSelector` wrapper v4 used for
+// its `useStore` hook, so a selector whose result is a fresh object/array every
+// call now trips React's "The result of getSnapshot should be cached" warning
+// and, after 50 nested updates, throws error #185 (Maximum update depth
+// exceeded) — observed on 2026-09-29 as the ErrorBoundary's "UI render error".
+// `createWithEqualityFn` from `zustand/traditional` is v5's supported way to
+// keep the memoized-selector behaviour this store was written against (same
+// store API, Object.is default), which is what restores the pre-upgrade
+// behaviour for every consumer at once instead of auditing each selector.
+import { createWithEqualityFn as create } from "zustand/traditional";
 import type {
   AgentId,
   AgentInfo,

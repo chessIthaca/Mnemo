@@ -162,6 +162,7 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
       { name: "remark-breaks", license: "MIT", registry: npm("remark-breaks"), licenseUrl: MIT },
       { name: "rehype-highlight", license: "MIT", registry: npm("rehype-highlight"), licenseUrl: MIT },
       { name: "remark-gfm", license: "MIT", registry: npm("remark-gfm"), licenseUrl: MIT },
+      { name: "use-sync-external-store", license: "MIT", registry: npm("use-sync-external-store"), licenseUrl: MIT },
       { name: "zustand", license: "MIT", registry: npm("zustand"), licenseUrl: MIT },
       { name: "d3-force", license: "ISC", registry: npm("d3-force"), licenseUrl: ISC },
     ],

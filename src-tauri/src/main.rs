@@ -1825,6 +1825,11 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // StepVerifyHandle the factory builds (read at each plan-step boundary) —
     // a save_settings call flips it via factory.set_verify_config.
     let verify_config = Arc::new(std::sync::RwLock::new(config.general.general.verify.clone()));
+    // The deterministic budget layer (backlog a25a5323): live mirror of
+    // `[general.budget]`, shared with every loop the factory builds (read at
+    // each plan-step gate) — a save_settings call flips it via
+    // factory.set_budget_config.
+    let budget_config = Arc::new(std::sync::RwLock::new(config.general.general.budget.clone()));
     // The per-project code knowledge graph (GitNexus-style). Opened here and
     // indexed on a background thread — startup must never block on parsing
     // the codebase. A DB-open failure disables the graph outright (the
@@ -2030,6 +2035,10 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // command + timeout are read at each plan-step boundary by every agent
     // built from this factory (a Settings save flips the mirror live).
     .with_verify_config(verify_config)
+    // Wire the shared budget config so `[general.budget]`'s caps are read at
+    // each plan-step gate by every agent built from this factory (a Settings
+    // save flips the mirror live).
+    .with_budget_config(budget_config)
     // Wire the shared Laya auto-typing gate (backlog a147b63c):
     // memory_write reads the classifier slot + flag at call time, and
     // Settings saves flip the flag via `set_auto_typing_enabled` — no

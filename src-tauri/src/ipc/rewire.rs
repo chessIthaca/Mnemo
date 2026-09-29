@@ -191,6 +191,11 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // StepVerifyHandle reads this config at each plan-step boundary, so a
         // Settings save lands on the next complete_step with no rebuild.
         factory.set_verify_config(cfg.general.general.verify.clone());
+        // The deterministic budget layer ([general.budget], backlog a25a5323):
+        // the same live contract — the cap gate reads this config at every
+        // plan-step boundary, so a Settings save lands on the next gate with
+        // no rebuild.
+        factory.set_budget_config(cfg.general.general.budget.clone());
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

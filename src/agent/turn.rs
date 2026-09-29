@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::context::{self, TokenAccounting};
 use super::failure_triage;
@@ -470,6 +470,17 @@ impl AgentLoop {
             // decision is step-granular (more specific), and `state.route`
             // keeps feeding the turn-level outcome rows untouched.
             let lane_target = self.step_lane_target(agent_id).await;
+            // The deterministic budget gate (backlog a25a5323): apply a
+            // pending failed-cycle retry to the live step and, when a cap is
+            // reached, PAUSE the plan through a pending question — never a
+            // hard kill (the plan file is the resumption document). `Some`
+            // means the turn ends here.
+            if let Some(outcome) = self
+                .budget_gate(fanin_tx, agent_id, cmd_rx, &mut state)
+                .await
+            {
+                return Ok(outcome);
+            }
             let (provider, context_manager) = self
                 .resolve_iteration_provider(
                     lane_target.or(state.route.as_ref().and_then(|r| r.target)),
@@ -1208,6 +1219,19 @@ impl AgentLoop {
                 } else {
                     self.resolve_routed_model(target).await
                 };
+                // The budget layer counts this arm (backlog a25a5323): an
+                // ENFORCED Escalate-rung decision — once per decision, never
+                // per memo reuse (a long step must not multiply its count),
+                // and never in shadow (shadow routes nothing).
+                if !shadow
+                    && routed.is_some()
+                    && matches!(&target, model_routing::RouteTarget::Escalate)
+                {
+                    self.with_plan_spend(|spend| {
+                        spend.note_plan(&plan_id);
+                        spend.note_escalation();
+                    });
+                }
                 // The decision half of the fine-tuning corpus, joined to the
                 // routing row below by `turn_id`.
                 handle.log_decision(&ReflexDecisionRow::new(
@@ -1285,6 +1309,164 @@ impl AgentLoop {
                         epoch,
                     ));
                 }
+                None
+            }
+        }
+    }
+
+    /// The deterministic budget gate (backlog a25a5323, the cost-saving
+    /// chain's budget item): called at every plan-step boundary, after the
+    /// lane decision and before the request resolves. Applies a pending
+    /// failed-cycle retry to the live step and, when a cap is reached, PAUSES
+    /// the plan through a pending question (continue for this plan / double
+    /// the reached cap / end the turn) — never a hard kill: plans are
+    /// crash-resumable and the plan file is the resumption document.
+    ///
+    /// Returns `Some(outcome)` when the turn ends here (the human chose to
+    /// end, a hard stop arrived while paused, or the question channel closed);
+    /// `None` to continue the turn. With no live plan (chat turns, subagents)
+    /// or the budget disabled this is a cheap no-op — no counters advance, no
+    /// question is emitted, byte-identical behavior.
+    async fn budget_gate(
+        &self,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        agent_id: AgentId,
+        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        state: &mut TurnState,
+    ) -> Option<TurnOutcome> {
+        // A disabled budget is fully inert: no workflow lock, no counters, no
+        // question. The pending retry flag is still drained so a later enable
+        // cannot count a stale cycle.
+        let cfg = self.budget.read().expect("budget lock poisoned").clone();
+        let pending_retry = self.take_pending_lane_retry();
+        if !cfg.enabled {
+            return None;
+        }
+        // The live plan, under the workflow lock (dropped before any await).
+        let (plan_id, step_index) = {
+            let wf = self.workflow.lock().await;
+            let Some(plan_id) = wf.plan_id().map(|s| s.to_string()) else {
+                return None;
+            };
+            (plan_id, wf.current_step().map(|s| s.index))
+        };
+        // Counters: point them at this plan (a new plan resets everything),
+        // then apply a pending failed-cycle retry to the step that runs next.
+        self.with_plan_spend(|spend| {
+            spend.note_plan(&plan_id);
+            if pending_retry {
+                if let Some(step) = step_index {
+                    spend.note_lane_retry(step);
+                }
+            }
+        });
+        let hit = self.with_plan_spend(|spend| spend.cap_reached(&cfg))?;
+        // PAUSE: ask, never kill. The question carries the real numbers.
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let _ = fanin_tx
+            .send((
+                agent_id,
+                AgentEvent::UserQuestion {
+                    question_id: format!("budget-{}", model_routing::new_turn_id("budget")),
+                    question: hit.question(),
+                    options: vec![
+                        crate::runtime::QuestionOption {
+                            label: "Continue — pause budget checks for this plan".to_string(),
+                            description: Some(
+                                "The cap stays on for other plans; this one runs uncapped \
+                                 until it finishes."
+                                    .to_string(),
+                            ),
+                        },
+                        crate::runtime::QuestionOption {
+                            label: "Double the cap and continue".to_string(),
+                            description: Some(
+                                "Raises the reached cap to twice its value for this plan."
+                                    .to_string(),
+                            ),
+                        },
+                        crate::runtime::QuestionOption {
+                            label: "End the turn — the plan stays paused".to_string(),
+                            description: Some(
+                                "The plan keeps its resumption state; continue whenever \
+                                 you are ready."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                    responder: answer_tx,
+                },
+            ))
+            .await;
+        // Await the answer. Interrupt/Cancel (or a closed channel) end the
+        // turn; any other command folds into the turn's accumulation rule
+        // exactly like a mid-stream steer, and the pause continues.
+        let mut rx = answer_rx;
+        let answer = loop {
+            tokio::select! {
+                result = &mut rx => break result.ok(),
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => {
+                        StopReason::fold(&mut state.stop_reason, cmd);
+                        if state
+                            .stop_reason
+                            .as_ref()
+                            .is_some_and(StopReason::is_hard_stop)
+                        {
+                            return Some(TurnOutcome {
+                                finish_reason: FinishReason::Stop,
+                                text: String::new(),
+                                tool_calls_made: 0,
+                                stop_reason: state.stop_reason.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        // The agent is shutting down (command channel
+                        // closed) — end the turn; the plan stays resumable.
+                        return Some(TurnOutcome {
+                            finish_reason: FinishReason::Stop,
+                            text: String::new(),
+                            tool_calls_made: 0,
+                            stop_reason: Some(StopReason::Interrupt),
+                        });
+                    }
+                },
+            }
+        };
+        // A dropped question channel (UI gone) ends the turn rather than
+        // running on unasked.
+        let Some(answer) = answer else {
+            return Some(TurnOutcome {
+                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls_made: 0,
+                stop_reason: Some(StopReason::Interrupt),
+            });
+        };
+        match answer {
+            crate::runtime::UserAnswer::Choice { index: 0 } => {
+                // Continue: cap checks stay off for this plan.
+                self.with_plan_spend(|spend| spend.bypassed = true);
+                None
+            }
+            crate::runtime::UserAnswer::Choice { index: 1 } => {
+                // Double the reached cap and continue.
+                self.with_plan_spend(|spend| spend.double_cap(hit, &cfg));
+                None
+            }
+            crate::runtime::UserAnswer::Choice { .. } => Some(TurnOutcome {
+                // End the turn — the plan stays Executing (paused and
+                // resumable; the plan file is the resumption document).
+                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls_made: 0,
+                stop_reason: None,
+            }),
+            crate::runtime::UserAnswer::Freeform { .. } => {
+                // The human spoke instead of clicking: their words are the
+                // permission for this plan.
+                self.with_plan_spend(|spend| spend.bypassed = true);
                 None
             }
         }

@@ -40,7 +40,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::context::ContextManager;
 use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
-use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
+use crate::config::{BudgetConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -290,6 +290,11 @@ pub struct AgentLoopFactory {
     /// overrides via [`with_verify_config`](Self::with_verify_config) from
     /// the loaded config at startup (mirrors `optimizer`).
     verify: Arc<RwLock<VerifyConfig>>,
+    /// The shared `[general.budget]` config (backlog a25a5323, the
+    /// cost-saving chain's budget item): every loop built from this factory
+    /// reads it at its plan-step gates, so a Settings save is observed on the
+    /// next boundary with no rebuild (mirrors `verify`).
+    budget: Arc<RwLock<BudgetConfig>>,
     /// The persistent index-staleness log (backlog fc1d57fe) handed to every
     /// search/graph tool this factory builds: each stale-index repair appends
     /// one record per file, and the freshness note points at it. Defaults to
@@ -403,6 +408,10 @@ impl AgentLoopFactory {
             // spawn); the IPC layer overrides via `with_verify_config` from
             // the loaded config at startup (mirrors `optimizer`).
             verify: Arc::new(RwLock::new(VerifyConfig::default())),
+            // Budget config at its inert default (disabled — no cap ever
+            // fires); the IPC layer overrides via `with_budget_config` from
+            // the loaded config at startup (mirrors `verify`).
+            budget: Arc::new(RwLock::new(BudgetConfig::default())),
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
@@ -627,6 +636,17 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared `[general.budget]` config (the cost-saving chain's
+    /// budget item, backlog a25a5323). Called once by the IPC layer at
+    /// startup; every loop built from this factory shares the same
+    /// `Arc<RwLock<BudgetConfig>>` and reads it at its plan-step gates, so a
+    /// Settings save is observed on the next gate with no rebuild (mirrors
+    /// [`with_verify_config`](Self::with_verify_config)).
+    pub fn with_budget_config(mut self, cfg: Arc<RwLock<BudgetConfig>>) -> Self {
+        self.budget = cfg;
+        self
+    }
+
     /// Wire in the [`AgentSpawner`] that backs the `spawn_agent` tool.
     ///
     /// Called once by the IPC layer after the `AgentManager` + factory exist.
@@ -726,6 +746,17 @@ impl AgentLoopFactory {
     /// `complete_step` — no registry rebuild and no app restart.
     pub fn set_verify_config(&self, cfg: VerifyConfig) {
         *self.verify.write().expect("verify lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.budget]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is
+    /// persisted and reloaded). Every loop shares the same
+    /// `Arc<RwLock<BudgetConfig>>` (see
+    /// [`with_budget_config`](Self::with_budget_config)) and reads it at each
+    /// plan-step gate, so a Settings save lands on the next gate — no
+    /// registry rebuild and no app restart.
+    pub fn set_budget_config(&self, cfg: BudgetConfig) {
+        *self.budget.write().expect("budget lock poisoned") = cfg;
     }
 
     /// Swap in a new provider (e.g. when the user switches models from the
@@ -1080,6 +1111,13 @@ impl AgentLoopFactory {
         // `complete_step` tool reads (`step_verify_handle`).
         agent = agent.with_step_verify(self.step_verify_handle(root));
         }
+
+        // The budget layer (backlog a25a5323): every loop reads the shared
+        // live `[general.budget]` config at its plan-step gates — a Settings
+        // save lands on the next gate with no rebuild. Unconditional: the cap
+        // gate works with the reflex handle absent (caps are deterministic,
+        // not classifier-driven).
+        agent = agent.with_budget_config(Arc::clone(&self.budget));
 
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the
         // loop's no-override resolution branch reports it, so the status bar

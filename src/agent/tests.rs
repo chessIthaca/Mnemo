@@ -14556,6 +14556,278 @@ async fn run_lane_turn(
     (outcome, fanin_rx)
 }
 
+/// Build a budget test agent over an EXISTING workflow handle (backlog
+/// a25a5323) — no lane machinery needed: the cap gate is independent of the
+/// reflex handle and the routing gate.
+fn budget_agent(
+    dir: &std::path::Path,
+    workflow: Arc<tokio::sync::Mutex<Workflow>>,
+    provider: Arc<dyn LlmClient>,
+    cfg: crate::config::BudgetConfig,
+) -> AgentLoop {
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_budget_config(Arc::new(std::sync::RwLock::new(cfg)))
+}
+
+/// A budget test workflow with one ACTIVE plan (one unchecked step) — and the
+/// live plan id, which counter seeding must match (`note_plan` resets on a
+/// mismatched id).
+fn budget_workflow(dir: &std::path::Path) -> (Arc<tokio::sync::Mutex<Workflow>>, String) {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Budget plan",
+            "goal",
+            "context",
+            vec!["Step 1".to_string()],
+        )
+        .expect("plan created");
+    let plan_id = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .plan_id()
+        .expect("a live plan")
+        .to_string();
+    (workflow, plan_id)
+}
+
+/// Drive one turn while answering the FIRST budget question the loop emits
+/// (backlog a25a5323). Returns the outcome, the emitted question texts (empty
+/// when the turn never paused), and the non-question events.
+async fn run_budget_turn(
+    agent: &AgentLoop,
+    prompt: &str,
+    answer: crate::runtime::UserAnswer,
+) -> (TurnOutcome, Vec<String>, Vec<AgentEvent>) {
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    let mut answer = Some(answer);
+    let mut questions = Vec::new();
+    let mut events = Vec::new();
+    let turn = agent.run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None);
+    tokio::pin!(turn);
+    let outcome = loop {
+        tokio::select! {
+            result = &mut turn => break result.expect("turn completes"),
+            event = fanin_rx.recv() => {
+                if let Some((_id, event)) = event {
+                    if let AgentEvent::UserQuestion {
+                        question,
+                        responder,
+                        ..
+                    } = event
+                    {
+                        questions.push(question);
+                        if let Some(answer) = answer.take() {
+                            let _ = responder.send(answer);
+                        }
+                    } else {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+    };
+    (outcome, questions, events)
+}
+
+#[tokio::test]
+async fn budget_cap_pauses_the_plan_and_a_bypass_continues_the_turn() {
+    // Backlog a25a5323: a reached cap PAUSES the plan through a pending
+    // question — never a hard kill. Answering "continue" resumes the SAME
+    // turn with cap checks off for this plan.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 10,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    // Counters AT the cap: seed AFTER reading the live plan id (any other id
+    // would reset them).
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(10, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    // The pause asked with REAL numbers, and the turn ran on after the answer.
+    assert_eq!(questions.len(), 1, "exactly one pause: {questions:?}");
+    assert!(
+        questions[0].contains("spent 10 tokens (cap 10)"),
+        "the question cites the real spend: {questions:?}"
+    );
+    assert!(outcome.stop_reason.is_none());
+    assert!(
+        !outcome.text.is_empty(),
+        "the provider ran after the bypass answer"
+    );
+    // "Continue" turned cap checks off for this plan...
+    assert!(agent.with_plan_spend(|spend| spend.bypassed));
+    // ...and the plan was never killed: still live, still Executing.
+    let wf = workflow.lock().await;
+    assert_eq!(wf.plan_id().as_deref(), Some(plan_id.as_str()));
+    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+}
+
+#[tokio::test]
+async fn budget_cap_end_turn_answer_leaves_the_plan_paused_and_resumable() {
+    // The third answer ends the turn EARLY — before any request goes out —
+    // and leaves the plan exactly as it was: live, Executing, resumable.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "must not run");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 10,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(10, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 2 },
+    )
+    .await;
+
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    // No request reached the provider — the turn ended at the gate.
+    assert!(outcome.text.is_empty(), "{}", outcome.text);
+    assert_eq!(outcome.tool_calls_made, 0);
+    assert!(outcome.stop_reason.is_none());
+    // The plan is still live and Executing — paused, never killed.
+    let wf = workflow.lock().await;
+    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert!(
+        wf.plan_id().is_some(),
+        "the plan survives the end-turn answer"
+    );
+}
+
+#[tokio::test]
+async fn disabled_budget_never_asks_and_never_counts() {
+    // The inert default (no `with_budget_config`): no question, no counter
+    // touched — the turn runs exactly as before the layer existed, even with
+    // seeded spend far past any cap.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(1_000_000, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    assert!(
+        questions.is_empty(),
+        "a disabled budget never pauses: {questions:?}"
+    );
+    assert!(!outcome.text.is_empty());
+    assert!(!agent.with_plan_spend(|spend| spend.bypassed));
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.total_tokens()),
+        1_000_000,
+        "the disabled gate leaves the counters alone"
+    );
+}
+
+#[tokio::test]
+async fn the_pending_lane_retry_lands_on_the_live_step_at_the_gate() {
+    // A failed-cycle retry (flagged by `note_lane_escalation` via the triage
+    // sites) is counted against the step that runs next — the counter the
+    // retry cap reads. The flag is one-shot: a later gate run adds nothing.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let step_index = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .current_step()
+        .expect("a live step")
+        .index;
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    agent.with_plan_spend(|spend| spend.note_plan(&plan_id));
+    agent.set_pending_lane_retry();
+
+    let (_outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    assert!(questions.is_empty(), "under every cap: no pause");
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index).copied()),
+        Some(1),
+        "the failed cycle counts against the live step"
+    );
+    // One-shot: the next turn's gate adds nothing.
+    let (_outcome2, _q2, _e2) = run_budget_turn(
+        &agent,
+        "again",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index).copied()),
+        Some(1)
+    );
+}
+
 /// The harness-run verify handle for a loop test (see
 /// [`crate::agent::step_verify`]): the shared config handle + the default
 /// optimizer config, rooted at `root`.

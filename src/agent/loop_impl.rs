@@ -12,12 +12,13 @@
 
 use std::sync::{Arc, RwLock};
 
+use super::budget;
 use super::failure_triage;
 use super::model_routing;
 use super::reflex;
 use super::step_lanes;
 use super::step_verify;
-use crate::config::SafetyMode;
+use crate::config::{BudgetConfig, SafetyMode};
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
 use crate::provider::{FinishReason, LlmClient};
@@ -431,6 +432,22 @@ pub struct AgentLoop {
     /// stashed by the action=verify path, drained by the request seam (so it
     /// is delivered exactly once and never pollutes the cached prefix).
     pub(crate) verify_note: std::sync::Mutex<Option<String>>,
+    /// The budget layer's live config (backlog a25a5323, the cost-saving
+    /// chain's budget item): the plan-step gate reads it at every boundary.
+    /// Disabled by default — the gate then no-ops byte-identically. Shared
+    /// with the factory, so a Settings save lands on the next boundary with
+    /// no rebuild.
+    pub(crate) budget: Arc<RwLock<BudgetConfig>>,
+    /// The live per-plan spend counters (backlog a25a5323): tokens, armed
+    /// escalations, per-step failed-cycle retries, the human's bypass and any
+    /// doubled caps. In-memory and live-session scoped — the durable
+    /// `spend_events` ledger backs the per-plan cost report.
+    pub(crate) plan_spend: std::sync::Mutex<budget::PlanSpend>,
+    /// A failed-cycle retry flagged by `note_lane_escalation`: applied to the
+    /// step that runs next by the budget gate — the flag bridges the sync
+    /// triage sites, which cannot lock the async workflow to learn the live
+    /// step.
+    pub(crate) pending_lane_retry: std::sync::atomic::AtomicBool,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -846,6 +863,9 @@ impl AgentLoop {
             lane_failure: std::sync::Mutex::new(None),
             step_verify: None,
             verify_note: std::sync::Mutex::new(None),
+            budget: Arc::new(RwLock::new(BudgetConfig::default())),
+            plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
+            pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -986,6 +1006,40 @@ impl AgentLoop {
         self.verify_note.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    /// Attach the live `[general.budget]` config (backlog a25a5323). Wired by
+    /// the factory from the shared mirror; the inert default (disabled) keeps
+    /// the cap gate a no-op. Returns `self` for chaining.
+    pub fn with_budget_config(mut self, cfg: Arc<RwLock<BudgetConfig>>) -> Self {
+        self.budget = cfg;
+        self
+    }
+
+    /// The live `[general.budget]` config — shared with the factory, so a
+    /// Settings save is observed at the next plan-step gate.
+    pub fn budget_config(&self) -> Arc<RwLock<BudgetConfig>> {
+        Arc::clone(&self.budget)
+    }
+
+    /// Run `f` against the live per-plan spend counters (the budget gate's
+    /// read/update path; `pub(crate)` so tests can pre-seed counters).
+    pub(crate) fn with_plan_spend<R>(&self, f: impl FnOnce(&mut budget::PlanSpend) -> R) -> R {
+        let mut guard = self.plan_spend.lock().expect("plan_spend lock poisoned");
+        f(&mut guard)
+    }
+
+    /// Flag a failed-cycle retry for the next budget gate (see
+    /// [`note_lane_escalation`](Self::note_lane_escalation)).
+    pub(crate) fn set_pending_lane_retry(&self) {
+        self.pending_lane_retry
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the pending lane-retry flag (true exactly once per flag).
+    pub(crate) fn take_pending_lane_retry(&self) -> bool {
+        self.pending_lane_retry
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Record a confident failure-triage verdict (backlog ad56c7bd). A
     /// `permanent` or `flaky_test` verdict means the current attempt failed a
     /// cycle: the escalation epoch moves, so the next plan-step boundary
@@ -1004,6 +1058,10 @@ impl AgentLoop {
         }
         self.escalation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The budget layer (backlog a25a5323) counts this failed cycle as a
+        // lane retry at the next gate: the flag bridges the sync triage sites
+        // (which cannot lock the async workflow to learn the live step).
+        self.set_pending_lane_retry();
     }
 
     /// The failure-triage gate this loop was built with (`None` when triage is

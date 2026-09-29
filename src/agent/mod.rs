@@ -47,6 +47,7 @@ pub mod prompt;
 pub mod reflex;
 pub mod review_scope;
 pub mod steering_stats;
+pub mod step_lanes;
 
 mod dispatch;
 mod loop_impl;

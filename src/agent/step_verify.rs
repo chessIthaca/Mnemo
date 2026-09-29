@@ -377,10 +377,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_cancels_cleanly_and_reports_the_elapsed_bound() {
-        // The kill path the design relies on, empirically asserted: a 10s
-        // sleep under a 1s timeout must return in ~1s, not 10 — the future
-        // drop + kill_on_drop cancel the child (the shell tool's guarantee).
+    async fn timeout_releases_the_wait_promptly() {
+        // The WAIT half of "cancels cleanly": a 10s sleep under a 1s timeout
+        // must return in ~1s, not 10 — the harness future never wedges the
+        // plan. The KILL half (the child actually dies) is pinned separately
+        // by `timeout_kills_the_child_before_it_can_finish`.
         let sleep = if cfg!(target_os = "windows") {
             "Start-Sleep -Seconds 10"
         } else {
@@ -394,8 +395,38 @@ mod tests {
         );
         assert!(
             started.elapsed() < Duration::from_secs(8),
-            "the timeout did not cancel the child: {:?}",
+            "the timeout did not release the wait: {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_child_before_it_can_finish() {
+        // The KILL half, pinned observably (review finding L1): the command
+        // would write a marker AFTER its sleep — were `kill_on_drop(true)`
+        // ever removed, the wait would still return at the deadline but the
+        // orphaned child would live on and write the marker. Waiting past the
+        // child's own runtime before asserting absence gives a survivor every
+        // chance to prove itself.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("kill-marker.txt");
+        let command = if cfg!(target_os = "windows") {
+            "Start-Sleep -Seconds 3; Set-Content -Path kill-marker.txt -Value done"
+        } else {
+            "sleep 3 && echo done > kill-marker.txt"
+        };
+        let verify = handle(true, command, 1).with_root(dir.path().to_path_buf());
+        let outcome = verify.run_checks().await;
+        assert_eq!(
+            outcome,
+            Some((command.to_string(), VerifyOutcome::TimedOut { secs: 1 }))
+        );
+        // The child would have finished at ~3s; wait past that before
+        // asserting absence, so a survivor has every chance to write.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "the timed-out child survived and wrote its marker — the kill half of the clean cancel is broken"
         );
     }
 

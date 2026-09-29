@@ -97,7 +97,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # feature — a heavy dep tree (~2 min dev link time) that coding-only builds
 # skip (link-time research 2026-12-07, lever #4). The app (src-tauri) always
 # selects the feature.
-chromiumoxide = { version = "0.7", optional = true }
+chromiumoxide = { version = "0.9", optional = true }
 
 # Temp dirs for the per-launch throwaway Chromium profile (auto-removed on drop)
 tempfile = "3"

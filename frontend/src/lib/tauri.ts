@@ -489,6 +489,13 @@ export interface AppSettings {
       cheap: ModelRefConfig | null;
       /** The model a confidently-architectural task routes to (null = unset). */
       capable: ModelRefConfig | null;
+      /** The model a medium-complexity plan step routes to — the escalation-
+       *  lane rung `medium` (backlog ad56c7bd; null = unset). */
+      lane_medium: ModelRefConfig | null;
+      /** The model a high-complexity plan step routes to (lane `high`). */
+      lane_high: ModelRefConfig | null;
+      /** The model the escalate rung routes to (lane `escalate`). */
+      escalate: ModelRefConfig | null;
       /** The calibrated-probability gate: a decision routes only at or above
        *  it; below it today's model runs. */
       threshold: number;
@@ -653,6 +660,11 @@ export interface SettingsSavePatch {
   routing?: {
     cheap?: ModelRefConfig | null;
     capable?: ModelRefConfig | null;
+    /** The escalation-lane targets (backlog ad56c7bd) — the same
+     *  absent/null/set contract as `cheap` / `capable`. */
+    lane_medium?: ModelRefConfig | null;
+    lane_high?: ModelRefConfig | null;
+    escalate?: ModelRefConfig | null;
     threshold?: number;
     enforce?: boolean;
   };

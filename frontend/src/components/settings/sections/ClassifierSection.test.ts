@@ -217,6 +217,9 @@ describe("serializeClassifier", () => {
     routingEnforce: false,
     routingCheap: null,
     routingCapable: null,
+    routingLaneMedium: null,
+    routingLaneHigh: null,
+    routingEscalate: null,
     routingThreshold: 0.8,
   };
 
@@ -258,6 +261,24 @@ describe("serializeClassifier", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, routingThreshold: 0.9 }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingLaneMedium: { endpoint: "local", model: "medium" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingLaneHigh: { endpoint: "local", model: "high" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingEscalate: { endpoint: "stub", model: "top" },
+      }),
+    );
   });
 
   it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing)", () => {
@@ -272,8 +293,28 @@ describe("serializeClassifier", () => {
       routingEnforce: false,
       routingCheap: null,
       routingCapable: null,
+      routingLaneMedium: null,
+      routingLaneHigh: null,
+      routingEscalate: null,
       routingThreshold: 0.8,
     });
+  });
+
+  it("carries the escalation-lane targets through the saved patch (backlog ad56c7bd)", () => {
+    // The three lane pickers ride the same [general.routing] patch: the draft
+    // round-trips them, the payload sends the snake_case wire names (null
+    // clears, exactly like cheap/capable), and the bindings carry both the
+    // read type and the save patch.
+    expect(classifierSource).toContain("Lane ladder (per plan step)");
+    expect(classifierSource).toContain("lane_medium: routingLaneMedium,");
+    expect(classifierSource).toContain("lane_high: routingLaneHigh,");
+    expect(classifierSource).toContain("escalate: routingEscalate,");
+    expect(tauriSource).toContain("lane_medium: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_high: ModelRefConfig | null;");
+    expect(tauriSource).toContain("escalate: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_medium?: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_high?: ModelRefConfig | null;");
+    expect(tauriSource).toContain("escalate?: ModelRefConfig | null;");
   });
 });
 

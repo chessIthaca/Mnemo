@@ -110,6 +110,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [routingEnforce, setRoutingEnforce] = useState(false);
   const [routingCheap, setRoutingCheap] = useState<ModelRefConfig | null>(null);
   const [routingCapable, setRoutingCapable] = useState<ModelRefConfig | null>(null);
+  // The escalation-lane targets (backlog ad56c7bd): plan-step-granular routing
+  // on top of the pre-prompt decision — at each plan step the compound reflex
+  // call classifies the step and the ladder resolves cheap → default → medium
+  // → high → escalate. Unset = the step keeps the configured model.
+  const [routingLaneMedium, setRoutingLaneMedium] = useState<ModelRefConfig | null>(null);
+  const [routingLaneHigh, setRoutingLaneHigh] = useState<ModelRefConfig | null>(null);
+  const [routingEscalate, setRoutingEscalate] = useState<ModelRefConfig | null>(null);
   const [routingThreshold, setRoutingThreshold] = useState(0.8);
   // Endpoint catalog for the target pickers (rides the settings payload).
   const [endpoints, setEndpoints] = useState<EndpointInfo[]>([]);
@@ -144,6 +151,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         routingEnforce: routingWire?.enforce ?? false,
         routingCheap: routingWire?.cheap ?? null,
         routingCapable: routingWire?.capable ?? null,
+        routingLaneMedium: routingWire?.lane_medium ?? null,
+        routingLaneHigh: routingWire?.lane_high ?? null,
+        routingEscalate: routingWire?.escalate ?? null,
         routingThreshold: routingWire?.threshold ?? 0.8,
       };
       setEnabled(next.enabled);
@@ -156,6 +166,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setRoutingEnforce(next.routingEnforce);
       setRoutingCheap(next.routingCheap);
       setRoutingCapable(next.routingCapable);
+      setRoutingLaneMedium(next.routingLaneMedium);
+      setRoutingLaneHigh(next.routingLaneHigh);
+      setRoutingEscalate(next.routingEscalate);
       setRoutingThreshold(next.routingThreshold);
       setEndpoints(s.endpoints ?? []);
       setSnapshot(serializeClassifier(next));
@@ -214,6 +227,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     routingEnforce,
     routingCheap,
     routingCapable,
+    routingLaneMedium,
+    routingLaneHigh,
+    routingEscalate,
     routingThreshold,
   };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
@@ -260,6 +276,11 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
           routing: {
             cheap: routingCheap,
             capable: routingCapable,
+            // The escalation-lane targets (backlog ad56c7bd) ride the same
+            // null-clears contract as the other two.
+            lane_medium: routingLaneMedium,
+            lane_high: routingLaneHigh,
+            escalate: routingEscalate,
             threshold: routingThreshold,
             enforce: routingEnforce,
           },
@@ -500,6 +521,71 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
               <div className="text-[0.7rem] text-(--text-muted)">
                 Design-level work — a new feature, a cross-module refactor, a
                 new dependency, a data-model or concurrency change.
+              </div>
+            </div>
+            <div className="space-y-3 border-t border-border pt-3">
+              <div className="text-xs font-medium text-(--text-primary)">
+                Lane ladder (per plan step)
+              </div>
+              <div className="text-[0.7rem] text-(--text-muted)">
+                Needs the compound reflex opt-in plus a live classifier: at
+                each plan step the step text is classified in ONE call and the
+                matching lane serves that step. A step keeps its configured
+                model while a lane target is unset, the ladder re-asks only
+                after a failed cycle, and it stays shadow-first until
+                enforcement is on above.
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-(--text-primary)">
+                  Medium-complexity steps
+                </div>
+                <ModelPickerBody
+                  endpoints={endpoints}
+                  value={
+                    routingLaneMedium ?? {
+                      endpoint: "",
+                      model: "",
+                      reasoning_effort: null,
+                    }
+                  }
+                  onChange={(v) => setRoutingLaneMedium(v)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-(--text-primary)">
+                  High-complexity steps
+                </div>
+                <ModelPickerBody
+                  endpoints={endpoints}
+                  value={
+                    routingLaneHigh ?? {
+                      endpoint: "",
+                      model: "",
+                      reasoning_effort: null,
+                    }
+                  }
+                  onChange={(v) => setRoutingLaneHigh(v)}
+                />
+              </div>
+              <div className="space-y-1">
+                <div className="text-xs font-medium text-(--text-primary)">
+                  Escalate after a failed cycle
+                </div>
+                <ModelPickerBody
+                  endpoints={endpoints}
+                  value={
+                    routingEscalate ?? {
+                      endpoint: "",
+                      model: "",
+                      reasoning_effort: null,
+                    }
+                  }
+                  onChange={(v) => setRoutingEscalate(v)}
+                />
+                <div className="text-[0.7rem] text-(--text-muted)">
+                  Served once a step has failed a cycle (a permanent or
+                  flaky-test failure verdict) and the re-ask answers escalate.
+                </div>
               </div>
             </div>
             <div className="flex items-center gap-2">

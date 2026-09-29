@@ -536,6 +536,15 @@ export interface ClassifierDraft {
   routingCheap: ModelRefConfig | null;
   /** The model a confidently-architectural task routes to (null = unset). */
   routingCapable: ModelRefConfig | null;
+  /** The model a medium-complexity plan step routes to — the escalation-lane
+   *  rung `medium` (backlog ad56c7bd; null = unset: the step keeps the
+   *  configured model). */
+  routingLaneMedium: ModelRefConfig | null;
+  /** The model a high-complexity plan step routes to (lane `high`). */
+  routingLaneHigh: ModelRefConfig | null;
+  /** The model the escalate rung routes to (lane `escalate`, typically after
+   *  a failed cycle). */
+  routingEscalate: ModelRefConfig | null;
   /** The calibrated-probability gate (0–1): a decision routes only at or
    *  above it; below it today's model runs. */
   routingThreshold: number;

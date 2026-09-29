@@ -80,7 +80,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # MCP OAuth 2.1: PKCE S256 challenge (base64url(sha256(verifier))). Small
 # pure-Rust crate; base64 is already a dependency.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Base64 encoding for image attachments (vision fallback + describe_image tool)
 base64 = "0.22"

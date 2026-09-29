@@ -23,6 +23,13 @@ updates:
       # so a registry bump would drop the backported fixes and fight the pins.
       - dependency-name: tao
       - dependency-name: wry
+      # Reviewing any cargo PR from this group: confirm the Cargo.lock diff
+      # contains NO `[[patch.unused]]` entries. Bumping tauri past 2.11.6 (or
+      # tauri-runtime-wry past 2.11.4) moves wry to 0.57 and tao to 0.37, which
+      # turns both patches into `[[patch.unused]]` entries and silently ships
+      # the registry crates instead of the vendored ones — that is why #26 was
+      # closed and replaced by the hand-rolled #32.
+      - dependency-name: tauri-runtime-wry
   # npm. The workspace lockfile lives at the root (workspaces = ["frontend"]).
   - package-ecosystem: npm
     directory: "/"

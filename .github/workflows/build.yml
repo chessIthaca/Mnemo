@@ -51,13 +51,13 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install npm deps (root + frontend workspace)
         run: npm ci
       - name: Rust tests (workspace, mnemo + mnemo-app)
@@ -77,7 +77,7 @@ jobs:
       # [workspace] members = ["src-tauri"]), so all bundles land under
       # <repo-root>/target/... — not src-tauri/target (review F1).
       - name: Upload Windows installers
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-installers
           path: |
@@ -100,15 +100,15 @@ jobs:
       APPLE_NOTARY_GROUP_SET: ${{ secrets.APPLE_API_ISSUER != '' && secrets.APPLE_API_KEY != '' && secrets.APPLE_API_KEY_CONTENT != '' }}
       APPLE_GROUPS_INCONSISTENT: ${{ (secrets.APPLE_CERTIFICATE != '') != (secrets.APPLE_SIGNING_IDENTITY != '') || (secrets.APPLE_API_ISSUER != '') != (secrets.APPLE_API_KEY_CONTENT != '') || (secrets.APPLE_API_KEY != '') != (secrets.APPLE_API_KEY_CONTENT != '') }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install npm deps (root + frontend workspace)
         run: npm ci
       # Compile + test validation for the macOS target (the game_* tools and
@@ -139,7 +139,7 @@ jobs:
           cargo test --workspace --no-fail-fast -- --nocapture 2>&1 | tee -a macos-test-output.txt
       - name: Upload macOS test output
         if: ${{ always() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-test-output
           path: macos-test-output.txt
@@ -219,7 +219,7 @@ jobs:
           ditto -c -k --keepParent target/aarch64-apple-darwin/release/bundle/macos/*.app mnemo.app.zip
       # Same root-target layout note as the Windows job (review F1).
       - name: Upload macOS bundles
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-bundles-aarch64
           path: |
@@ -239,17 +239,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: windows-installers
           path: dist/windows
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: macos-bundles-aarch64
           path: dist/macos
       - name: Create GitHub release with installers
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           files: |
             dist/windows/**/*.msi

@@ -153,6 +153,36 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_savings_events_kind
             ON savings_events(kind);
 
+        -- Per-decision spend ledger (backlog a25a5323, the budget layer): one
+        -- row per MAIN plan request, written by the turn layer with the lane
+        -- ladder's attribution — so the bill traces to a decision (lane,
+        -- model, retry/escalation) rather than a session total. `reason` is
+        -- `route` | `retry` | `escalate` (the item's vocabulary) plus
+        -- `default` (plan requests with no lane decision — the plan token cap
+        -- counts EVERY plan request) and `verify` (deterministic-check
+        -- evidence rows from the harness-verify layer; `turn_id` may be NULL
+        -- there). Rows are written whenever a plan is active, independent of
+        -- `[general.budget] enabled` — the flag gates only the caps.
+        CREATE TABLE IF NOT EXISTS spend_events (
+            id            TEXT PRIMARY KEY,
+            session_id    TEXT,
+            turn_id       TEXT,
+            agent_id      TEXT,
+            plan_id       TEXT NOT NULL,
+            step_index    INTEGER,
+            lane          TEXT,
+            model         TEXT NOT NULL,
+            reason        TEXT NOT NULL,
+            tokens_in     INTEGER NOT NULL,
+            tokens_out    INTEGER NOT NULL,
+            cached_tokens INTEGER,
+            detail        TEXT,
+            created_at    INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_spend_events_plan
+            ON spend_events(plan_id, created_at);
+
         -- Progressive disclosure (backlog e4a50d22 lever 3): full originals of
         -- tool results too large to keep in context. The context carries a
         -- preview naming the row id; `expand_result` serves the archive back

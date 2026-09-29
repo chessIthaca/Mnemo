@@ -591,6 +591,58 @@ pub struct SavingsEvent {
     pub created_at: i64,
 }
 
+/// One per-decision spend ledger row (one row in `spend_events`) — the
+/// budget layer's bill (backlog a25a5323): which plan, step, lane and model
+/// a request ran on, what it cost, and WHY that model ran, so the per-plan
+/// cost report cites real numbers from real decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendEvent {
+    /// Unique row id (a UUID string).
+    pub id: String,
+    /// The memory session this row belongs to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The turn the request belonged to, when known (the route decision's
+    /// turn id, or one minted for the turn). `None` for rows recorded
+    /// outside a turn, e.g. a harness-verify evidence row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// The agent that spent the tokens, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// The plan this spend belongs to. Never `None` — only plan-scoped
+    /// requests are ledgered.
+    pub plan_id: String,
+    /// The plan step in progress when the request ran (the plan file's
+    /// 0-indexed `Step` indexing), when a step was active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    /// The lane the request ran on (`cheap` / `medium` / `high` / `escalate`),
+    /// when a lane decision applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<String>,
+    /// The model that served the request (the effective model id).
+    pub model: String,
+    /// Why this model ran: `route` (a lane/turn routing decision), `retry`
+    /// (a failed-cycle retry), `escalate` (an escalation arm), `default`
+    /// (no lane decision — the plan token cap still counts it), or `verify`
+    /// (a deterministic-check evidence row from the harness-verify layer).
+    pub reason: String,
+    /// Prompt tokens billed.
+    pub tokens_in: i64,
+    /// Completion tokens billed.
+    pub tokens_out: i64,
+    /// Cached prompt tokens (a subset of `tokens_in`), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i64>,
+    /// Free-form detail — the evidence-note head for `verify` rows, the
+    /// retry class for `retry` rows, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Unix timestamp (seconds) of the row.
+    pub created_at: i64,
+}
+
 /// Aggregated token savings across the whole project (all sessions) — the read
 /// path behind the Dashboard view (backlog 652ae094). It aggregates the
 /// `savings_events` ledger that the optimizer levers write (backlog

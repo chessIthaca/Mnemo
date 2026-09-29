@@ -157,6 +157,60 @@ fn build_workflow_scopes_token_permissions() {
 /// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
 /// Because of that exception the repo-level "require SHA pinning" Actions
 /// setting stays off (it would reject the rust-toolchain step).
+/// The release job must upload the installers to a DRAFT release and publish it
+/// afterwards — in that order.
+///
+/// This repo has GitHub's "immutable releases" setting ON: both existing
+/// releases report `immutable:true`. A published release rejects asset uploads
+/// with
+///
+/// ```text
+/// ##[error]Cannot upload asset Mnemo_1.2.0_x64_en-US.msi to an immutable
+/// release. GitHub only allows asset uploads before a release is published,
+/// so upload assets to a draft release before you publish it.
+/// ```
+///
+/// The pre-fix workflow created the release published (action-gh-release's
+/// default) and uploaded afterwards, so the v1.2.0 rerun (run 36354666875 —
+/// windows + macos green, release red) left that release with zero assets, and
+/// immutability makes that permanent. Regression: `draft: true` plus a
+/// `gh release edit --draft=false` publish step, in that order.
+#[test]
+fn build_workflow_uploads_installers_to_a_draft_release_first() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+
+    // The release job is the last job in the file; everything after it belongs
+    // to it (no job follows the 2-space `release:` key).
+    let release_job = text
+        .split_once("\n  release:")
+        .map(|(_, rest)| rest)
+        .expect("build.yml declares a `release:` job");
+
+    let draft_at = release_job.find("draft: true").unwrap_or_else(|| {
+        panic!(
+            "the release step must set `draft: true`: with immutable releases \
+             enabled, uploading assets to an already-published release fails \
+             (\"GitHub only allows asset uploads before a release is published\")"
+        )
+    });
+    let publish_at = release_job.find("--draft=false").unwrap_or_else(|| {
+        panic!(
+            "a step must publish the draft AFTER the installers are attached \
+             (gh release edit \"${{ github.ref_name }}\" --draft=false)"
+        )
+    });
+    assert!(
+        draft_at < publish_at,
+        "the publish step (`--draft=false`) must come after the draft upload \
+         (`draft: true`) — publishing first makes the release immutable and \
+         the asset upload fails"
+    );
+}
+
 #[test]
 fn workflows_pin_actions_to_full_shas() {
     const ALLOWED_UNPINNED: [&str; 1] = ["dtolnay/rust-toolchain@stable"];

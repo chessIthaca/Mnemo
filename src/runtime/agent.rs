@@ -2919,7 +2919,15 @@ mod tests {
     ) {
         drop(cmd_tx);
         let drain = tokio::spawn(async move { while fanin_rx.recv().await.is_some() {} });
-        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        // 30s, not 10s: the wind-down runs the auto-continue chain (up to
+        // MAX_AUTO_CONTINUE synthetic turns, each with provider + tool
+        // round-trips), which on a loaded CI runner can exceed 10s — the
+        // v1.2.0 tag build went red at exactly this timeout on the macOS
+        // runner (run 36354666875,
+        // `state_override_survives_429_fallback`, 2026-09-29), which skipped
+        // the release job and left the published release asset-less. The
+        // bound stays: a real regression must still fail rather than hang.
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
             .await
             .expect("agent task must exit once the command channel closes")
             .expect("agent task must not panic");

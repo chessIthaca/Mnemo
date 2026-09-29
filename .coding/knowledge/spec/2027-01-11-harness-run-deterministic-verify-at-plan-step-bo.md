@@ -1,0 +1,12 @@
++++
+title = "harness-run deterministic verify at plan-step boundaries (backlog 1f767466)"
+created = "2027-01-11"
++++
+
+Cost-saving chain item 3 (plan 38d881d0, branch wt/mnemo, tip c26961f; landing = human-approved PR path): with `[general.verify] enabled` + a non-empty `test_command`, the HARNESS runs the checks itself at plan-step boundaries — deterministic evidence with no model roundtrip (the failure-triage tier-1 precedent).
+
+SURFACES: src/agent/step_verify.rs — StepVerifyHandle { Arc<RwLock<VerifyConfig>>, Arc<RwLock<OptimizerConfig>>, root }; `run_checks() -> Option<(String, VerifyOutcome)>` (None + ZERO spawns when disabled/blank; powershell -Command / sh -c, kill_on_drop, tokio timeout default 300s = the shell tool's bound; the timeout is a clean cancel — the marker-file test pins the child kill and is genuinely red without kill_on_drop). `evidence_note`: head tag `[verify]` + lever-2 output_compactor::compress for known families, else a distinct-lines fallback with repeat counts, redacted, hard cap 2000 bytes (char-boundary truncation). src/config/general.rs VerifyConfig { enabled: false, test_command: String::new() (empty = inert; NEVER a built-in command), timeout_secs: 300 } with the section-omission serde guards.
+
+CONSUMERS (ONE live config — factory::step_verify_handle clones the same Arcs into both): (1) complete_step (src/tool/workflow/plan.rs): a SUCCESSFUL skeleton tick appends the note; the workflow lock is dropped BEFORE the await; a FAILED verification keeps success=true (the tick happened — a false result would drive tier-1 auto-retry into re-ticking a done step); the failure signal lives in the note; detailed sub-step ticks return early and NEVER verify. (2) reflex action=verify (turn.rs step_lane_target DECIDED branch): re-runs the checks and stashes a one-shot note (loop_impl with_step_verify / set_verify_note / take_verify_note) drained at the request seam via optimizer::append_nudge onto the volatile tail — fires under shadow too (evidence, not routing).
+
+INVARIANTS: flag off = byte-identical + zero spawns; no hardcoded vendor models; a Settings save lands on the next boundary (factory.set_verify_config — src-tauri main.rs startup + ipc/rewire.rs mirrors). Docs: README row, PLAN.md bullet, reflex.rs consumer doc. Tests: src/agent/step_verify.rs units (kill + conciseness), plan-tool tests, lane tests in src/agent/tests.rs. Reviews: .coding/reviews/2026-09-29-harness-verify-38d881d0-review{,-round2}.md (round 2 PASS, 0 high/1 low fixed).

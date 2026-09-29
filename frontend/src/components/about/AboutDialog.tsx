@@ -28,7 +28,7 @@ interface AboutDialogProps {
 
 
 /**
- * About dialog â€” credits Mnemo's direct dependencies and lists each one's
+ * About dialog — credits Mnemo's direct dependencies and lists each one's
  * license with a link to show it. Opened by clicking the app logo in the
  * Sidebar. Built on Radix Dialog (focus trap, Escape-to-close, focus restore).
  *
@@ -39,7 +39,7 @@ interface AboutDialogProps {
 export function AboutDialog({ open, onClose }: AboutDialogProps) {
   // The app version (from tauri.conf.json). Fetched when the dialog opens;
   // falls back to the manifest version on any error.
-  const [version, setVersion] = useState<string>("1.2.0");
+  const [version, setVersion] = useState<string>("1.3.0");
 
   // Hide the native child WebView2 while this full-viewport modal is open
   // (it's a separate HWND composited above the app's HTML — see useBrowserOverlay).

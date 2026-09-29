@@ -5,17 +5,17 @@
 /**
  * Curated dependency manifest for the About dialog.
  *
- * Lists the DIRECT dependencies of Mnemo across three manifests â€” the
+ * Lists the DIRECT dependencies of Mnemo across three manifests — the
  * library crate (`/Cargo.toml`), the Tauri app shell (`/src-tauri/Cargo.toml`),
- * and the frontend (`/frontend/package.json`) â€” each annotated with its SPDX
+ * and the frontend (`/frontend/package.json`) — each annotated with its SPDX
  * license label, a registry page (crates.io / npmjs.com), and a link to the
  * license text. Transitive dependencies are intentionally omitted: crediting
  * the direct deps (whose licenses we rely on) is the scope of the About dialog.
  *
  * Each crate is credited exactly once. Several crates are direct deps of BOTH
  * the library and the app shell (tokio, serde, serde_json, anyhow,
- * async-trait, base64); they appear only in the "Rust â€” library" group, and
- * the "Rust â€” app shell (additional)" group lists only the shell-only crates.
+ * async-trait, base64); they appear only in the "Rust — library" group, and
+ * the "Rust — app shell (additional)" group lists only the shell-only crates.
  * No crate is left uncredited.
  *
  * License labels mirror what each manifest's package metadata declares. Where a
@@ -38,7 +38,7 @@ export interface DependencyEntry {
 
 /** A titled group of dependencies (one per manifest source). */
 export interface DependencyGroup {
-  /** Group heading (e.g. "Rust â€” library"). */
+  /** Group heading (e.g. "Rust — library"). */
   title: string;
   /** The dependencies in this group. */
   entries: DependencyEntry[];
@@ -81,12 +81,12 @@ const CC0 = "https://creativecommons.org/publicdomain/zero/1.0/";
 
 /**
  * The direct dependencies, grouped by manifest source. Order is stable so the
- * About dialog renders the same list every time (library â†’ shell â†’ frontend
- * runtime â†’ frontend build/dev).
+ * About dialog renders the same list every time (library → shell → frontend
+ * runtime → frontend build/dev).
  */
 export const DEPENDENCY_GROUPS: DependencyGroup[] = [
   {
-    title: "Rust â€” library",
+    title: "Rust — library",
     entries: [
       { name: "tokio", license: "MIT", registry: crates("tokio"), licenseUrl: MIT },
       { name: "tokio-stream", license: "MIT", registry: crates("tokio-stream"), licenseUrl: MIT },
@@ -130,7 +130,7 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
     ],
   },
   {
-    title: "Rust â€” app shell (additional)",
+    title: "Rust — app shell (additional)",
     entries: [
       { name: "tauri", license: "MIT OR Apache-2.0", registry: crates("tauri"), licenseUrl: MIT },
       { name: "tauri-build", license: "MIT OR Apache-2.0", registry: crates("tauri-build"), licenseUrl: MIT },
@@ -149,7 +149,7 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
     ],
   },
   {
-    title: "Frontend â€” runtime",
+    title: "Frontend — runtime",
     entries: [
       { name: "@radix-ui/react-dialog", license: "MIT", registry: npm("@radix-ui/react-dialog"), licenseUrl: MIT },
       { name: "@radix-ui/react-tabs", license: "MIT", registry: npm("@radix-ui/react-tabs"), licenseUrl: MIT },
@@ -168,7 +168,7 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
     ],
   },
   {
-    title: "Frontend â€” build & dev",
+    title: "Frontend — build & dev",
     entries: [
       { name: "@tailwindcss/postcss", license: "MIT", registry: npm("@tailwindcss/postcss"), licenseUrl: MIT },
       { name: "@tailwindcss/typography", license: "MIT", registry: npm("@tailwindcss/typography"), licenseUrl: MIT },
@@ -182,6 +182,7 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
       { name: "vite", license: "MIT", registry: npm("vite"), licenseUrl: MIT },
       { name: "vitest", license: "MIT", registry: npm("vitest"), licenseUrl: MIT },
       { name: "@types/d3-force", license: "MIT", registry: npm("@types/d3-force"), licenseUrl: MIT },
+      { name: "@types/use-sync-external-store", license: "MIT", registry: npm("@types/use-sync-external-store"), licenseUrl: MIT },
     ],
   },
 ];

@@ -28,7 +28,10 @@ updates:
       # tauri-runtime-wry past 2.11.4) moves wry to 0.57 and tao to 0.37, which
       # turns both patches into `[[patch.unused]]` entries and silently ships
       # the registry crates instead of the vendored ones — that is why #26 was
-      # closed and replaced by the hand-rolled #32.
+      # closed and replaced by the hand-rolled #32. tauri and tauri-runtime-wry
+      # are therefore ignored here too — bump them by hand together with the
+      # vendor/ patches and re-check the lock for `[[patch.unused]]`.
+      - dependency-name: tauri
       - dependency-name: tauri-runtime-wry
   # npm. The workspace lockfile lives at the root (workspaces = ["frontend"]).
   - package-ecosystem: npm
@@ -39,8 +42,9 @@ updates:
     groups:
       npm-minor-patch:
         update-types: ["minor", "patch"]
-  # The workflows pin major action tags (actions/checkout@v5, …); this surfaces
-  # the next major as a reviewable PR instead of a runner warning.
+  # The workflows pin actions to full commit SHAs (each with a `# vN` comment;
+  # guarded by tests/integration/ci_workflow.rs): this surfaces the next action
+  # release as a reviewable PR instead of a runner warning.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

@@ -81,7 +81,7 @@ src/                  the `mnemo` library — the harness core (no Tauri)
 src-tauri/            the `mnemo-app` desktop shell (Tauri 2)
   src/                  startup, watchdog, console (headless REPL mode), IPC
   tests/                source-contract tests guarding the vendored patches
-frontend/             React 18 + TypeScript + Vite + Tailwind UI
+frontend/             React 19 + TypeScript 7 + Vite 8 + Tailwind 4 UI
 tests/integration/    cross-boundary integration tests
 scripts/              the npm launcher (start.mjs) + maintenance scripts
 vendor/               patched tao + wry — each with a PATCHES.md, wired via [patch.crates-io]

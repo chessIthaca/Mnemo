@@ -998,7 +998,7 @@ fn main() {
                 let agent_chat = app_handle.state::<IpcState>().agent_chat_webview.clone();
                 let teardown = move || {
                     // Kill the shared headless debug browser before the process
-                    // exits: chromiumoxide 0.7 never sets kill_on_drop, so a bare
+                    // exits: chromiumoxide never sets kill_on_drop, so a bare
                     // drop at teardown would leave the Chromium child alive
                     // holding locks on its throwaway profile dir (Review L2).
                     let _ = tauri::async_runtime::block_on(browser.close());

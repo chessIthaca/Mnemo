@@ -174,6 +174,11 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // getter and tracks the training-log file itself, so an embedder
         // change needs no extra wiring here — only the flag mirror.
         factory.set_failure_triage_knn_enabled(laya_cfg.failure_triage_knn);
+        // Reflex (backlog a8495cc1) -- the escalation lane ladder's classifier
+        // (backlog ad56c7bd): the same live-toggle contract -- the loop reads
+        // the shared classifier slot + this mirrored flag at each plan-step
+        // boundary, so a Settings save lands on the next step with no rebuild.
+        factory.set_reflex_enabled(laya_cfg.reflex);
         // Token-optimizer levers ([general.optimizer], backlog e4a50d22): the
         // same live-toggle contract — every lever-bearing tool reads the
         // shared Arc<RwLock<OptimizerConfig>> per call, so a Settings save

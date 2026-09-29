@@ -14372,3 +14372,485 @@ async fn hard_stop_synthesis_marks_not_run_results_as_errors() {
         "one terminal ToolResult event per unrun call"
     );
 }
+
+// --- Escalation lane ladder (backlog ad56c7bd) ------------------------------
+
+/// A classifier for the REFLEX question set (backlog a8495cc1): answers the
+/// three compound questions from canned labels and counts one call per PASS —
+/// a pass is one `classify_many`, the ladder's unit of classification.
+struct ReflexStubClassifier {
+    complexity: String,
+    action: String,
+    confidence: f64,
+    passes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for ReflexStubClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        // The ladder never asks single questions; a single ask would mean the
+        // wiring fell back to the non-batched path, so answer nothing.
+        None
+    }
+
+    async fn classify_many(
+        &self,
+        _state: &str,
+        questions: &[(&str, Question)],
+    ) -> Vec<Option<Answer>> {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        questions
+            .iter()
+            .map(|(_key, question)| {
+                let label = match question {
+                    // The complexity question's criteria carries the smallest
+                    // label; the action question's carries `continue`. The
+                    // remaining (risk) question answers the safe label.
+                    Question::Choice { criteria, .. } if criteria.contains_key("small") => {
+                        self.complexity.clone()
+                    }
+                    Question::Choice { criteria, .. } if criteria.contains_key("continue") => {
+                        self.action.clone()
+                    }
+                    _ => "none".to_string(),
+                };
+                Some(Answer::Choice {
+                    label,
+                    confidence: self.confidence,
+                    probabilities: std::collections::BTreeMap::new(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The reflex handle for a lane test: the canned classifier on the shared slot,
+/// the enable flag set, logging to a tempdir file (never the real corpus).
+fn reflex_handle(
+    classifier: Arc<ReflexStubClassifier>,
+    enabled: bool,
+    log_path: std::path::PathBuf,
+) -> crate::agent::reflex::ReflexHandle {
+    let classifier: Arc<dyn Classifier> = classifier;
+    crate::agent::reflex::ReflexHandle::new(
+        Arc::new(std::sync::RwLock::new(Some(classifier))),
+        Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+    )
+    .with_log_path(log_path)
+}
+
+/// A lane-only resolver: the pre-prompt path declines (`resolve` → None, no
+/// cheap/capable targets), while the three escalation rungs answer with the
+/// configured models. No HTTP client is ever built.
+struct LaneStubResolver {
+    policy: Option<model_routing::RoutingPolicy>,
+    lane_medium: Option<crate::config::ModelRef>,
+    lane_high: Option<crate::config::ModelRef>,
+    escalate: Option<crate::config::ModelRef>,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for LaneStubResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.policy
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        match target {
+            // The lane tests never configure the pre-prompt targets.
+            model_routing::RouteTarget::Cheap | model_routing::RouteTarget::Capable => None,
+            model_routing::RouteTarget::Medium => self.lane_medium.clone(),
+            model_routing::RouteTarget::High => self.lane_high.clone(),
+            model_routing::RouteTarget::Escalate => self.escalate.clone(),
+        }
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model.model, &format!("from-{}", model.model)),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+}
+
+/// Build a lane test agent: the workflow starts with an ACTIVE plan (one
+/// unchecked step), the default provider serves unless a lane fires, and the
+/// reflex handle carries the canned classifier.
+fn lane_agent(
+    dir: &std::path::Path,
+    default_provider: Arc<dyn LlmClient>,
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
+    gate: model_routing::RoutingGate,
+    reflex: crate::agent::reflex::ReflexHandle,
+    steps: &[&str],
+) -> AgentLoop {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    // The ladder resolves a STEP: the plan must be live before the turn runs.
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            steps.iter().map(|s| s.to_string()).collect(),
+        )
+        .expect("plan created");
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(default_provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_model_resolver(resolver)
+    .with_routing_gate(gate)
+    .with_reflex(reflex)
+}
+
+/// Drive one turn and hand back the fan-in receiver so the caller can inspect
+/// the `ModelChanged` events a lane switch emits.
+async fn run_lane_turn(
+    agent: &AgentLoop,
+    prompt: &str,
+) -> (
+    TurnOutcome,
+    mpsc::Receiver<(crate::runtime::AgentId, AgentEvent)>,
+) {
+    let (fanin_tx, fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes");
+    drop(fanin_tx);
+    (outcome, fanin_rx)
+}
+
+#[tokio::test]
+async fn lane_enforced_medium_serves_the_step_and_announces_the_switch() {
+    // The acceptance path: the ladder is armed (reflex on + routing opted in +
+    // enforce), the reflex call answers `medium`, and the medium lane target
+    // is configured -> the iteration runs on that model and the switch is
+    // announced so the tab's model label follows.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, mut fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(
+        outcome.text, "from-medium-model",
+        "the medium lane must serve the step"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        events.iter().any(|(model, _)| model == "medium-model"),
+        "a mid-run lane switch must be announced: {events:?}"
+    );
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one compound pass per step per attempt"
+    );
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("a lane decision row");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert_eq!(lane.label, "medium");
+    assert_eq!(lane.target.as_deref(), Some("medium"));
+    assert_eq!(lane.step_index, Some(0));
+    assert!(!lane.shadow);
+    assert!(lane.enforced);
+    assert_eq!(lane.model.as_deref(), Some("stub/medium-model"));
+
+    let corpus = std::fs::read_to_string(&reflex_log).expect("reflex corpus row");
+    assert!(
+        corpus.contains("medium"),
+        "the compound decision is logged: {corpus}"
+    );
+}
+
+#[tokio::test]
+async fn lane_shadow_logs_the_decision_but_never_switches_the_model() {
+    // Shadow-first (enforce off): the ladder classifies and logs, and the
+    // model is byte-identical to a ladder-free turn.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, mut fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default", "shadow never switches a model");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "shadow still classifies -- the corpus is what validates the ladder"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        events.iter().all(|(model, _)| model != "medium-model"),
+        "shadow must not announce the lane model: {events:?}"
+    );
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("a lane decision row");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert!(lane.shadow);
+    assert!(!lane.enforced);
+    assert!(lane.model.is_none());
+}
+
+#[tokio::test]
+async fn lane_reflex_flag_off_never_asks_the_classifier() {
+    // The `[general.laya] reflex` opt-in is off: zero classifier calls, no
+    // corpus row, no lane row, and the model selection is untouched.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        false,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "flag off = zero classifier calls"
+    );
+    assert!(!reflex_log.exists(), "no corpus without the opt-in");
+    let (decisions, _) = read_routing_log(&routing_log);
+    assert!(
+        decisions.iter().all(|row| row.lane.is_none()),
+        "no lane rows without the opt-in"
+    );
+}
+
+#[tokio::test]
+async fn lane_routing_flag_off_never_asks_the_classifier() {
+    // The `[general.laya] routing` opt-in is off (no policy): the ladder must
+    // not classify either -- one gate, both routing layers.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: None,
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no routing policy = no lane classification"
+    );
+    assert!(!reflex_log.exists());
+}
+
+#[tokio::test]
+async fn lane_without_a_target_falls_through_without_error() {
+    // The rung is selected but its target is UNSET: the ladder records the
+    // rung and keeps the configured model (the fail-safe -- never a built-in
+    // model id, never an error).
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "an unset lane target keeps the turn's configured model"
+    );
+    assert_eq!(passes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("the rung is still recorded");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert!(!lane.enforced, "an unarmed rung is not enforced");
+    assert!(lane.model.is_none());
+}

@@ -39,7 +39,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::agent::context::ContextManager;
-use crate::agent::{AgentLoop, AgentLoopConfig};
+use crate::agent::{reflex::ReflexHandle, AgentLoop, AgentLoopConfig};
 use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
@@ -200,6 +200,12 @@ pub struct AgentLoopFactory {
     /// resolver reads per turn). Attached to every loop built after the call,
     /// so each turn's pre-prompt classification reads it.
     routing: Option<RoutingGate>,
+    /// The shared compound-reflex handle (backlog a8495cc1) -- the escalation
+    /// lane ladder's classifier (backlog ad56c7bd). `None` until the IPC layer
+    /// wires it via `with_reflex` (the SAME shared classifier slot + the
+    /// `[general.laya] reflex` flag mirror, both read at every plan-step
+    /// boundary). Attached to every loop built after the call.
+    reflex: Option<ReflexHandle>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -400,6 +406,10 @@ impl AgentLoopFactory {
             // failure-handling site keeps its pre-classifier behavior.
             failure_triage: None,
             routing: None,
+            // No compound-reflex handle at construction either — wired via
+            // `with_reflex` (backlog a8495cc1). Until then the escalation lane
+            // ladder (backlog ad56c7bd) never classifies.
+            reflex: None,
             // No tool-choice gate at construction — wired via
             // `with_tool_choice` (backlog e2c47d5f). Until then the search
             // tools keep their regex auto-delegation heuristics byte-identically.
@@ -479,6 +489,17 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared compound-reflex handle (backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). Every loop built
+    /// after this call carries the handle, whose shared classifier slot + the
+    /// `[general.laya] reflex` flag mirror are read at every plan-step
+    /// boundary, so a Settings save needs no rebuild. When not wired, the
+    /// ladder never classifies and model selection is byte-identical.
+    pub fn with_reflex(mut self, handle: ReflexHandle) -> Self {
+        self.reflex = Some(handle);
+        self
+    }
+
     /// Flip the failure-triage enable flag on the shared gate — the Settings
     /// save path (rewire) calls this so the toggle reaches already-built
     /// loops with no rebuild.
@@ -499,6 +520,18 @@ impl AgentLoopFactory {
         if let Some(handle) = &self.failure_triage {
             handle
                 .knn_enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Flip the compound-reflex enable flag on the shared handle -- the
+    /// Settings save path (rewire) calls this so the `[general.laya] reflex`
+    /// toggle reaches already-built loops with no rebuild. No-op when no
+    /// handle is wired.
+    pub fn set_reflex_enabled(&self, on: bool) {
+        if let Some(handle) = &self.reflex {
+            handle
+                .enabled
                 .store(on, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -997,6 +1030,15 @@ impl AgentLoopFactory {
         // Settings save lands on the next turn with no rebuild.
         if let Some(gate) = &self.routing {
             agent = agent.with_routing_gate(gate.clone());
+        }
+
+        // Attach the compound-reflex handle (backlog a8495cc1) -- the
+        // escalation lane ladder's classifier (backlog ad56c7bd): each
+        // plan-step boundary reads the shared classifier slot + the
+        // `[general.laya] reflex` flag mirror, so a Settings save lands on the
+        // next step with no rebuild.
+        if let Some(handle) = &self.reflex {
+            agent = agent.with_reflex(handle.clone());
         }
 
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the

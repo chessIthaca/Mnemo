@@ -1503,6 +1503,19 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // a Settings save needs no rewire.
     let routing_gate = mnemo::agent::model_routing::RoutingGate::new(classifier_slot.clone());
 
+    // The compound-reflex handle (backlog a8495cc1) -- the escalation lane
+    // ladder's classifier (backlog ad56c7bd): the SAME shared classifier slot
+    // plus the `[general.laya] reflex` flag mirror, read at every plan-step
+    // boundary. A Settings save flips the flag live via `set_reflex_enabled`
+    // (no rebuild); the `[general.routing]` lane targets ride the live config
+    // the resolver reads per request.
+    let reflex_handle = mnemo::agent::reflex::ReflexHandle::new(
+        classifier_slot.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(
+            config.general.general.laya.reflex,
+        )),
+    );
+
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per
     // call. Settings saves update it via rewire_vision_embedder_and_classifier.
@@ -2036,6 +2049,12 @@ fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutco
     // opt-in flag + the [general.routing] threshold/enforce ride the live
     // config the resolver reads per turn (no rebuild, no flag mirror).
     .with_routing_gate(routing_gate)
+    // Wire the shared compound-reflex handle (backlog a8495cc1) -- the
+    // escalation lane ladder's classifier (backlog ad56c7bd): every loop reads
+    // the same classifier slot + the `[general.laya] reflex` flag mirror at
+    // each plan-step boundary, and a Settings save flips the flag live via
+    // `set_reflex_enabled` (no rebuild).
+    .with_reflex(reflex_handle)
     // Share the headless debug browser with the IPC layer (Browser tab).
     .with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —

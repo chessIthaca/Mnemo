@@ -14,6 +14,8 @@ use std::sync::{Arc, RwLock};
 
 use super::failure_triage;
 use super::model_routing;
+use super::reflex;
+use super::step_lanes;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -398,6 +400,26 @@ pub struct AgentLoop {
     /// live config by the model resolver per turn, so no flag mirror is needed
     /// here.
     pub(crate) routing: Option<model_routing::RoutingGate>,
+    /// The optional compound-reflex handle (the Laya classifier's compound
+    /// decision layer, `[general.laya] reflex`, backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). Carries the
+    /// SAME shared classifier slot + the config-mirrored enable flag, both read
+    /// at every plan-step boundary; `None` in tests / unwired builds, where the
+    /// ladder never classifies and model selection stays byte-identical.
+    pub(crate) reflex: Option<reflex::ReflexHandle>,
+    /// The escalation-lane memo for the plan step being worked (backlog
+    /// ad56c7bd): the rung the reflex call selected, under which escalation
+    /// epoch. Compared against the live step at every iteration boundary, so
+    /// the classifier is asked once per step per attempt.
+    pub(crate) lane_state: std::sync::Mutex<Option<step_lanes::LaneState>>,
+    /// The escalation epoch (backlog ad56c7bd): bumped by a confident
+    /// permanent/flaky_test failure-triage verdict, which is what re-arms the
+    /// lane classification for the SAME step. Never bumped on a first
+    /// attempt's behalf, so the ladder cannot route up before a real failure.
+    pub(crate) escalation_epoch: std::sync::atomic::AtomicU64,
+    /// The failure class that bumped the epoch most recently -- its label feeds
+    /// the re-classification state text.
+    pub(crate) lane_failure: std::sync::Mutex<Option<String>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -807,6 +829,10 @@ impl AgentLoop {
             root_spec: None,
             failure_triage: None,
             routing: None,
+            reflex: None,
+            lane_state: std::sync::Mutex::new(None),
+            escalation_epoch: std::sync::atomic::AtomicU64::new(0),
+            lane_failure: std::sync::Mutex::new(None),
         }
     }
 
@@ -889,6 +915,47 @@ impl AgentLoop {
     pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
         self.routing = Some(gate);
         self
+    }
+
+    /// Attach the compound-reflex handle (the Laya classifier's compound
+    /// decision layer, `[general.laya] reflex`; backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). The handle
+    /// carries the shared classifier slot + the config-mirrored enable flag,
+    /// both read at every plan-step boundary, so a Settings save lands on the
+    /// next step with no rebuild. Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise the ladder.
+    pub fn with_reflex(mut self, handle: reflex::ReflexHandle) -> Self {
+        self.reflex = Some(handle);
+        self
+    }
+
+    /// The compound-reflex handle this loop was built with (`None` when the
+    /// Laya foundation is not wired). The IPC layer mirrors the config flag
+    /// into the handle's live enable flag, so a Settings toggle needs no
+    /// rebuild.
+    pub fn reflex(&self) -> Option<&reflex::ReflexHandle> {
+        self.reflex.as_ref()
+    }
+
+    /// Record a confident failure-triage verdict (backlog ad56c7bd). A
+    /// `permanent` or `flaky_test` verdict means the current attempt failed a
+    /// cycle: the escalation epoch moves, so the next plan-step boundary
+    /// re-classifies the SAME step with the verdict named in the state text --
+    /// the only way the ladder ever routes up. Other classes (transient,
+    /// needs_user) change nothing here.
+    pub fn note_lane_escalation(&self, class: failure_triage::FailureClass) {
+        if !matches!(
+            class,
+            failure_triage::FailureClass::Permanent | failure_triage::FailureClass::FlakyTest
+        ) {
+            return;
+        }
+        if let Ok(mut failure) = self.lane_failure.lock() {
+            *failure = Some(class.label().to_string());
+        }
+        self.escalation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The failure-triage gate this loop was built with (`None` when triage is

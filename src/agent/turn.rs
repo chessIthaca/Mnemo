@@ -30,6 +30,8 @@ use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::model_routing;
+use super::reflex::{ReflexDecisionRow, ReflexOutcome};
+use super::step_lanes::{self, ClassifyHow, LaneState};
 use super::prompt;
 use super::recall_delta::DeltaDecision;
 use super::StopReason;
@@ -463,9 +465,14 @@ impl AgentLoop {
 
             // The provider + context manager for THIS iteration's request
             // (re-resolved every iteration — see resolve_iteration_provider).
+            // The escalation-lane target (backlog ad56c7bd) composes OVER the
+            // turn-level pre-prompt route for this iteration only: the lane
+            // decision is step-granular (more specific), and `state.route`
+            // keeps feeding the turn-level outcome rows untouched.
+            let lane_target = self.step_lane_target(agent_id).await;
             let (provider, context_manager) = self
                 .resolve_iteration_provider(
-                    state.route.as_ref().and_then(|r| r.target),
+                    lane_target.or(state.route.as_ref().and_then(|r| r.target)),
                     fanin_tx,
                     agent_id,
                 )
@@ -1133,6 +1140,137 @@ impl AgentLoop {
         resolver.resolve_routed(target, ctx)
     }
 
+    /// The escalation-lane route target for the plan step the agent is on now
+    /// (backlog ad56c7bd) — ONE compound-reflex call per step per attempt.
+    ///
+    /// Every miss keeps the iteration's pre-existing model: no handle, the
+    /// reflex flag off, a spawned agent, no live routing policy, no active
+    /// step, a below-gate / malformed / unknown-label answer, and an unset or
+    /// dangling `[general.routing]` lane target all return `None` (the
+    /// resolver's own fall-through is the last guard). Shadow mode (`enforce`
+    /// off) classifies and logs but returns `None` — the ladder is validated
+    /// on the corpus before it may ever switch a model. Rows are written
+    /// best-effort; a log failure never fails the turn.
+    async fn step_lane_target(&self, agent_id: AgentId) -> Option<model_routing::RouteTarget> {
+        // Fast exits, cheapest first: no handle, flag off, spawned agent, or
+        // no live routing policy -> ZERO classifier calls, byte-identical.
+        let handle = self.reflex.as_ref()?;
+        if !handle.is_enabled() {
+            return None;
+        }
+        if self.is_subagent() {
+            return None;
+        }
+        let policy = self.model_resolver.as_ref()?.routing_policy()?;
+        // The live step, under the workflow lock; the guard is dropped before
+        // the first await (decide + resolve both await).
+        let (plan_title, step_index, step_text) = {
+            let wf = self.workflow.lock().await;
+            let step = wf.current_step()?;
+            let title = wf.plan().map(|p| p.title.clone()).unwrap_or_default();
+            (title, step.index, step.text.clone())
+        };
+        let epoch = self
+            .escalation_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The memo: the same step under the same epoch is never asked twice.
+        let how = {
+            let memo = self.lane_state.lock().ok()?;
+            step_lanes::needs_classify(memo.as_ref(), &plan_title, step_index, epoch)
+        };
+        if how == ClassifyHow::Reuse {
+            let memo = self.lane_state.lock().ok()?;
+            return memo.as_ref().and_then(|s| s.effective_target());
+        }
+        // A re-classification (a failed cycle re-armed the ladder) names the
+        // verdict in the state text; a first attempt never sees one.
+        let failure = match how {
+            ClassifyHow::ReClassify => self.lane_failure.lock().ok().and_then(|f| f.clone()),
+            ClassifyHow::Fresh | ClassifyHow::Reuse => None,
+        };
+        let state_text = step_lanes::state_text(&step_text, failure.as_deref());
+        let outcome = handle.decide(&state_text).await;
+        let shadow = !policy.enforce;
+        let agent = agent_id.to_string();
+        let turn_id = model_routing::new_turn_id(&agent);
+        let log_path = self.routing.as_ref().map(|g| g.log_path().to_path_buf());
+        match &outcome {
+            ReflexOutcome::Decided { decision } => {
+                let rung = step_lanes::rung_from_decision(decision);
+                let target = rung.to_route_target();
+                // Shadow never selects a model; enforce resolves NOW so the
+                // row can name it and the miss below can be memoized.
+                let routed = if shadow {
+                    None
+                } else {
+                    self.resolve_routed_model(target).await
+                };
+                // The decision half of the fine-tuning corpus, joined to the
+                // routing row below by `turn_id`.
+                handle.log_decision(&ReflexDecisionRow::new(
+                    &turn_id,
+                    &agent,
+                    &state_text,
+                    decision,
+                ));
+                if let Some(path) = &log_path {
+                    model_routing::append_row(
+                        path,
+                        &step_lanes::decided_row(
+                            &turn_id,
+                            &agent,
+                            step_index,
+                            decision,
+                            &state_text,
+                            shadow,
+                            routed.as_ref(),
+                        ),
+                    );
+                }
+                let mut state =
+                    LaneState::decided(plan_title, step_index, decision, shadow, epoch);
+                // Memoize the miss (the pre-prompt contract): a rung whose
+                // target is unset or dangling is not armed at all.
+                if routed.is_none() {
+                    state.target = None;
+                }
+                if let Ok(mut memo) = self.lane_state.lock() {
+                    *memo = Some(state);
+                }
+                routed.is_some().then_some(target)
+            }
+            ReflexOutcome::Fallback { reason } => {
+                // A no-answer writes nothing (the pre-prompt contract); the
+                // other reasons are the calibration signal.
+                if step_lanes::fallback_is_loggable(reason) {
+                    if let Some(path) = &log_path {
+                        model_routing::append_row(
+                            path,
+                            &step_lanes::fallback_row(
+                                &turn_id,
+                                &agent,
+                                step_index,
+                                reason,
+                                &state_text,
+                                shadow,
+                            ),
+                        );
+                    }
+                }
+                if let Ok(mut memo) = self.lane_state.lock() {
+                    *memo = Some(LaneState::fallback(
+                        plan_title,
+                        step_index,
+                        reason,
+                        shadow,
+                        epoch,
+                    ));
+                }
+                None
+            }
+        }
+    }
+
     /// Handle a pending provider swap: the model picker deferred it so the
     /// OLD provider can summarize first when the conversation is too large
     /// for the new, smaller window. Returns [`PendingSwapOutcome`]:
@@ -1703,6 +1841,10 @@ impl AgentLoop {
                     let triage = gate.triage(&result.output).await;
                     if let failure_triage::FailureTriage::Classified { class, .. } = &triage {
                         state.last_triage_class = Some(*class);
+                        // A failed cycle the ladder may escalate on (backlog
+                        // ad56c7bd): a confident permanent/flaky_test verdict
+                        // re-arms this step's lane classification.
+                        self.note_lane_escalation(*class);
                     }
                     batch_triage = Some(triage);
                 }
@@ -4290,6 +4432,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 confidence,
             } = gate.triage(&error_text).await
             {
+                // The step's cycle just failed permanently (backlog ad56c7bd):
+                // the next step boundary re-classifies and may escalate.
+                self.note_lane_escalation(failure_triage::FailureClass::Permanent);
                 let pending = gate.log_failure(
                     failure_triage::FailureSite::BadJsonRepair,
                     bad_calls.first().map(|tc| tc.name.as_str()),

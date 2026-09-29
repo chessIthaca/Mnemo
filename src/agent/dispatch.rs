@@ -1105,6 +1105,10 @@ impl AgentLoop {
                         if let FailureTriage::Classified { class, confidence } =
                             gate.triage(&error_text).await
                         {
+                            // A failed provider cycle (backlog ad56c7bd): a
+                            // permanent/flaky_test verdict re-arms the lane
+                            // classification for the current step.
+                            self.note_lane_escalation(class);
                             if matches!(class, FailureClass::NeedsUser | FailureClass::Permanent) {
                                 let pending = gate.log_failure(
                                     failure_triage::FailureSite::ProviderTurn,

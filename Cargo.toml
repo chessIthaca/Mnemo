@@ -62,7 +62,7 @@ notify = "8"
 tiktoken-rs = "0.6"
 
 # Memory store
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Bundled in-process embeddings (ONNX Runtime, no Python/Ollama/cloud).
 # Curated small models (MiniLM, BGE, nomic) download on first use + cache.

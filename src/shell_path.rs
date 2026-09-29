@@ -30,7 +30,17 @@
 /// pollutes the captured value (the rc output shares stdout with the `printf`)
 /// — a newline in the value means exactly that.
 ///
-/// ```
+/// ```ignore
+/// // Deliberately NOT a doctest: doctests link the whole `mnemo` rlib, which
+/// // pulls in ort/ONNX Runtime and the MSVC C++ runtime, and that link fails
+/// // on Windows (`rust-lld: error: <root>: undefined symbol: mainCRTStartup`,
+/// // `undefined symbol: __CxxFrameHandler3`). Windows CI run 36617743608 went
+/// // red on exactly this test — `test src\shell_path.rs - shell_path::
+/// // is_adoptable_path (line 33) ... FAILED` — which blocks the release job, so
+/// // the v1.3.0 tag build could never publish installers. The same behaviour is
+/// // asserted by the unit tests below (adoptable_path_allows_spaces,
+/// // adoptable_path_keeps_internal_spaces,
+/// // adoptable_path_rejects_empty_and_control_characters).
 /// use mnemo::shell_path::is_adoptable_path;
 /// assert!(is_adoptable_path("/Applications/Some App/bin:/usr/bin"));
 /// assert!(!is_adoptable_path("   "));
@@ -79,4 +89,43 @@ mod tests {
         assert!(is_adoptable_path(" /usr/local/bin"));
         assert!(is_adoptable_path("/Applications/Some App/bin:/usr/bin"));
     }
+
+    // Regression (2026-09-29, run 36617743608): the `is_adoptable_path` doc
+    // example used to be a live doctest, and a doctest links the whole `mnemo`
+    // rlib — which pulls in ort/ONNX Runtime and the MSVC C++ runtime and fails
+    // on Windows with
+    //     rust-lld: error: <root>: undefined symbol: mainCRTStartup
+    //     rust-lld: error: undefined symbol: __CxxFrameHandler3
+    // The Windows job of the v1.3.0 tag build went red on exactly that test, and
+    // because the release job needs both build jobs, no installers could ever be
+    // published. Doc examples in this file must therefore stay non-compiled
+    // (i.e. `ignore`): the unit tests above already assert the behaviour.
+    #[test]
+    fn doc_examples_are_not_compiled_as_doctests() {
+        // Scan doc-comment lines only; a fence there opens a compiled example
+        // unless the same line says `ignore`.
+        let mut in_fence = false;
+        for (idx, line) in include_str!("shell_path.rs").lines().enumerate() {
+            let Some(doc) = line.trim_start().strip_prefix("///") else {
+                continue;
+            };
+            let Some(rest) = doc.trim_start().strip_prefix("```") else {
+                continue;
+            };
+            if in_fence {
+                in_fence = false; // closing fence
+                continue;
+            }
+            in_fence = true;
+            assert!(
+                rest.starts_with("ignore"),
+                "the doc fence opened at line {} must be an `ignore` fence: as a \
+                 live doctest it links the whole rlib (ort/ONNX Runtime + MSVC \
+                 C++ runtime) and fails on Windows, which blocks the release \
+                 job's installers",
+                idx + 1
+            );
+        }
+    }
+
 }

@@ -258,3 +258,19 @@ jobs:
             dist/macos/**/*.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # DRAFT first, publish after the upload (see the next step).
+          #
+          # This repo has GitHub's "immutable releases" enabled (both existing
+          # releases report immutable:true). Such a release rejects asset
+          # uploads once it is published: "Cannot upload asset ... to an
+          # immutable release. GitHub only allows asset uploads before a
+          # release is published, so upload assets to a draft release before
+          # you publish it." The pre-fix job created the release published and
+          # uploaded afterwards, so the v1.2.0 rerun (run 36354666875) died in
+          # this step and that release can never gain installers.
+          draft: true
+      - name: Publish the release (its installers are already attached)
+        env:
+          # GH_TOKEN is what `gh` reads; the job already holds contents:write.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --latest

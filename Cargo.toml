@@ -120,7 +120,7 @@ tree-sitter-html = "0.23.2"
 # Win32_Storage_FileSystem carries GetShortPathNameW for the 8.3-alias sandbox
 # regression test (plan b4812291).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

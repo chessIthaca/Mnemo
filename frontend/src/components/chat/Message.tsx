@@ -309,7 +309,12 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
                 // anchors are dead under the webview's CSP (user report
                 // 2027-01-07: review-report links failed to open).
                 a: MarkdownLink,
-                code({ className, children, ...props }) {
+                // `node`/`ref`/`key` are dropped from the spread: react-markdown
+                // 10 ships the React-18 JSX shape (`ref?: LegacyRef`, plus its
+                // `node` extra prop), which no longer spreads onto a DOM element
+                // under @types/react 19. The element owns its own ref and `node`
+                // was never a real attribute.
+                code({ className, children, node: _node, ref: _ref, key: _key, ...props }) {
                   const isInline = !className;
                   if (isInline) {
                     return (

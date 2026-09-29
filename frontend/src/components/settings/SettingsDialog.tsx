@@ -111,7 +111,10 @@ export function SettingsDialog({
   const modelsRef = useRef<SettingsSectionHandle>(null);
   const mcpRef = useRef<SettingsSectionHandle>(null);
   const advancedRef = useRef<SettingsSectionHandle>(null);
-  const sectionRefs: Partial<Record<SettingsSectionId, React.RefObject<SettingsSectionHandle>>> = {
+  // React 19 widened the ref object's type: `useRef<T>(null)` is now
+  // `RefObject<T | null>`, and that is exactly what a `forwardRef` component's
+  // `ref` prop accepts — so the map is annotated with the nullable form.
+  const sectionRefs: Partial<Record<SettingsSectionId, React.RefObject<SettingsSectionHandle | null>>> = {
     providers: providersRef,
     appearance: appearanceRef,
     chat: chatRef,

@@ -534,7 +534,11 @@ export function SourceEditor({
           <div className="prose prose-invert prose-sm max-w-none prose-pre:m-0 prose-pre:bg-bg-primary">
             <Markdown
               components={{
-                code({ className, children, ...props }) {
+                // `node`/`ref`/`key` are dropped from the spread: react-markdown
+                // 10 ships the React-18 JSX shape (`ref?: LegacyRef`, plus its
+                // `node` extra prop), which no longer spreads onto a DOM element
+                // under @types/react 19.
+                code({ className, children, node: _node, ref: _ref, key: _key, ...props }) {
                   const isInline = !className;
                   if (isInline) {
                     return (

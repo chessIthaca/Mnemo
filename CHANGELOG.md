@@ -36,14 +36,17 @@ board. Full snapshot with per-finding detail:
 ### Security
 - Closed all 13 open CodeQL findings (#31): workflow token permissions, a
   `Math.random()`-derived React key, two ReDoS-prone regexes (the heuristic one
-  validated by a 310,000-command differential fuzz plus a timing table), and
-  four cleartext-logging assertions. The open Dependabot alert (`glib`,
-  GHSA-wrw7-89jp-8q8g) was dismissed as unreachable — a Linux/GTK-only lock
-  entry never compiled for the Windows/macOS targets — and two
-  `rust/insecure-cookie` findings were dismissed as false positives (the
-  vendored wry propagates `Secure`).
-- Every GitHub Action ref is pinned to a full commit SHA, guarded by
-  `workflows_pin_actions_to_full_shas` in `tests/integration/ci_workflow.rs`;
+  validated by a 310,000-command differential fuzz plus a timing table), four
+  cleartext-logging test assertions, and the production fix that stops
+  `consolidation.rs` logging the session id. Three `rust/insecure-cookie`
+  findings were dismissed as false positives (the vendored wry propagates
+  `Secure`). The open Dependabot alert (`glib`, GHSA-wrw7-89jp-8q8g) was
+  dismissed as unreachable — a Linux/GTK-only lock entry never compiled for the
+  Windows/macOS targets.
+- Every GitHub Action ref is pinned to a full commit SHA — the one documented
+  exception is `dtolnay/rust-toolchain@stable`, which selects its toolchain by
+  ref — guarded by `workflows_pin_actions_to_full_shas` in
+  `tests/integration/ci_workflow.rs`;
   the build workflows scope `GITHUB_TOKEN` to `contents: read` while the
   release job keeps its `contents: write` override (#41, plus the same-day
   repo-hygiene merge).

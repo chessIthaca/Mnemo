@@ -46,3 +46,4 @@ STEP 3 FIGURES (measured on the wt/mnemo tip forked from 06fe9ee; reads via the 
 1 06fe9ee65aa256002d8b37d230e0c5fa51dabf2e
 2 06fe9ee65aa256002d8b37d230e0c5fa51dabf2e
 3 06fe9ee65aa256002d8b37d230e0c5fa51dabf2e
+4 4506f8c889b32961da8405d296d0d646aee93b2e

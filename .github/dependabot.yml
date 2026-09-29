@@ -1,0 +1,41 @@
+# Dependabot version updates.
+#
+# Security alerts are already enabled repository-wide (and security-update PRs
+# are automatic); this file only governs the SCHEDULED version-update PRs.
+# Weekly and grouped on purpose: this repo's CI is expensive (Windows + macOS
+# Tauri builds, ~25 min each), so ungrouped daily PRs would burn runner minutes
+# on patch bumps nobody reviews.
+version: 2
+updates:
+  # Rust. The root Cargo.lock covers the whole workspace
+  # (members = ["src-tauri"]), so one entry is enough.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # tao/wry are [patch.crates-io] path overrides onto vendor/ (root
+      # Cargo.toml): the app deliberately runs patched 0.35.4 / 0.55.3 builds,
+      # so a registry bump would drop the backported fixes and fight the pins.
+      - dependency-name: tao
+      - dependency-name: wry
+  # npm. The workspace lockfile lives at the root (workspaces = ["frontend"]).
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+  # The workflows pin major action tags (actions/checkout@v5, …); this surfaces
+  # the next major as a reviewable PR instead of a runner warning.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

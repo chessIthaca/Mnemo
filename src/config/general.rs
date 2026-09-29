@@ -138,6 +138,18 @@ pub struct GeneralSection {
     /// keep no trace of it (mirrors `[general.routing]`).
     #[serde(default, skip_serializing_if = "VerifyConfig::is_default")]
     pub verify: VerifyConfig,
+    /// **Deterministic budget layer (opt-in; cost-saving chain item 4,
+    /// backlog a25a5323).** Spend caps the model can never override: with
+    /// `enabled` on, a cap reached at a plan-step boundary PAUSES the plan
+    /// through a pending question (bypass for this plan / double the token
+    /// cap / end the turn) — never a hard kill, because plans are
+    /// crash-resumable and the plan file is the resumption document. The
+    /// per-decision spend ledger and the per-plan cost report are written
+    /// independently of this flag; it gates only the caps. Omitted from the
+    /// saved config while every field holds its default (mirrors
+    /// `[general.verify]`).
+    #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
+    pub budget: BudgetConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
     /// context levers that cut re-reads and command-output waste at the tool
     /// dispatch layer: delta/skeleton re-reads, semantic command-output
@@ -556,6 +568,100 @@ fn verify_flag_off(off: &bool) -> bool {
     !*off
 }
 
+/// The `[general.budget]` section — the deterministic budget layer (the
+/// cost-saving chain's fourth item, backlog a25a5323): spend caps the model
+/// can never override. With [`enabled`](Self::enabled) on, a cap reached at a
+/// plan-step boundary PAUSES the plan through a pending question (the
+/// `ask_user` channel — bypass for this plan / double the token cap / end the
+/// turn); it is never a hard kill, because plans are crash-resumable and the
+/// plan file is the resumption document. Opt-in and inert by default: with
+/// `enabled` false no cap ever fires and behavior is byte-identical. Omitted
+/// from the saved config while every field holds its default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Whether the budget caps are enforced. `false` (the default) leaves
+    /// the layer fully inert. Omitted while false.
+    #[serde(skip_serializing_if = "budget_flag_off")]
+    pub enabled: bool,
+    /// Total prompt+completion tokens a single plan may spend. `0` (the
+    /// default) disables the token cap. Omitted while 0.
+    #[serde(skip_serializing_if = "budget_tokens_is_default")]
+    pub max_tokens_per_plan: u64,
+    /// How many escalations a single plan may arm before the budget asks.
+    /// Defaults to one. Omitted while default.
+    #[serde(skip_serializing_if = "budget_escalations_is_default")]
+    pub max_escalations_per_plan: u32,
+    /// How many failed-cycle retries a single plan STEP may take before the
+    /// budget asks. Defaults to three. Omitted while default.
+    #[serde(skip_serializing_if = "budget_retries_is_default")]
+    pub max_retries_per_lane: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: default_budget_escalations(),
+            max_retries_per_lane: default_budget_lane_retries(),
+        }
+    }
+}
+
+impl BudgetConfig {
+    /// True while every field holds its default — the `[general.budget]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`RoutingConfig::is_default`]), so untouched configs keep no budget
+    /// trace.
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && budget_tokens_is_default(&self.max_tokens_per_plan)
+            && budget_escalations_is_default(&self.max_escalations_per_plan)
+            && budget_retries_is_default(&self.max_retries_per_lane)
+    }
+}
+
+/// The out-of-box escalation budget: one escalation per plan before the
+/// budget asks. Named fn so the serde default, the `Default` impl and the
+/// `skip_serializing_if` guard agree.
+fn default_budget_escalations() -> u32 {
+    1
+}
+
+/// The out-of-box per-step lane-retry budget: three attempted cycles on one
+/// step before the budget asks. Named fn so the serde default, the `Default`
+/// impl and the `skip_serializing_if` guard agree.
+fn default_budget_lane_retries() -> u32 {
+    3
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::enabled`]: `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-budget shape.
+fn budget_flag_off(off: &bool) -> bool {
+    !*off
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::max_tokens_per_plan`]:
+/// `0` (the default — the token cap is off) stays unwritten, so a section
+/// touched only by `enabled` keeps its minimal shape.
+fn budget_tokens_is_default(tokens: &u64) -> bool {
+    *tokens == 0
+}
+
+/// `skip_serializing_if` guard for
+/// [`BudgetConfig::max_escalations_per_plan`]: the default stays unwritten.
+fn budget_escalations_is_default(count: &u32) -> bool {
+    *count == default_budget_escalations()
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::max_retries_per_lane`]:
+/// the default stays unwritten.
+fn budget_retries_is_default(count: &u32) -> bool {
+    *count == default_budget_lane_retries()
+}
+
 /// The `[general.optimizer]` section — the token-optimizer levers (backlog
 /// e4a50d22), **all ON by default** (2027-01-25: saving tokens is the
 /// expected behavior, not an opt-in — a config that never wrote a
@@ -772,6 +878,7 @@ impl Default for GeneralSection {
             laya: LayaConfig::default(),
             routing: RoutingConfig::default(),
             verify: VerifyConfig::default(),
+            budget: BudgetConfig::default(),
             optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
@@ -1825,6 +1932,67 @@ enabled = true
     }
 
     #[test]
+    fn budget_defaults_inert_and_round_trips() {
+        // The budget layer is opt-in and INERT by default: disabled, no
+        // token cap, the documented non-zero count defaults — an absent
+        // [general.budget] section fires no cap and changes nothing.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.budget.enabled);
+        assert_eq!(cfg.general.budget.max_tokens_per_plan, 0);
+        assert_eq!(cfg.general.budget.max_escalations_per_plan, 1);
+        assert_eq!(cfg.general.budget.max_retries_per_lane, 3);
+
+        let text = r#"
+[general.budget]
+enabled = true
+max_tokens_per_plan = 500000
+max_escalations_per_plan = 2
+max_retries_per_lane = 5
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.budget.enabled);
+        assert_eq!(cfg.general.budget.max_tokens_per_plan, 500000);
+        assert_eq!(cfg.general.budget.max_escalations_per_plan, 2);
+        assert_eq!(cfg.general.budget.max_retries_per_lane, 5);
+
+        // Re-serialize + re-parse: every field survives.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.budget.enabled);
+        assert_eq!(cfg2.general.budget.max_tokens_per_plan, 500000);
+        assert_eq!(cfg2.general.budget.max_escalations_per_plan, 2);
+        assert_eq!(cfg2.general.budget.max_retries_per_lane, 5);
+    }
+
+    #[test]
+    fn budget_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [general.verify] / [general.routing]: an
+        // untouched (default) section is skipped in config.toml; touching
+        // one field writes only that field (the count defaults stay
+        // unwritten, so a minimal section stays minimal).
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.budget"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.budget]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.budget"));
+        assert!(!text.contains("max_tokens_per_plan"));
+        assert!(!text.contains("max_escalations_per_plan"));
+        assert!(!text.contains("max_retries_per_lane"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.budget.enabled);
+        assert_eq!(back.general.budget.max_escalations_per_plan, 1);
+        assert_eq!(back.general.budget.max_retries_per_lane, 3);
+    }
+
+    #[test]
     fn laya_removed_mode_endpoint_and_checkpoint_keys_are_ignored() {
         // External-endpoint mode and the multilingual checkpoint choice were
         // removed (managed-only, English-only). A config written before that
@@ -2453,6 +2621,7 @@ chat_hover_timestamps = true
                 laya: LayaConfig::default(),
                 routing: RoutingConfig::default(),
                 verify: VerifyConfig::default(),
+                budget: BudgetConfig::default(),
                 optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,

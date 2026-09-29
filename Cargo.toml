@@ -50,7 +50,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 # Paths / IDs / dirs
-directories = "5"
+directories = "6"
 glob = "0.3"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"

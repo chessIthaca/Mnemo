@@ -125,6 +125,19 @@ pub struct GeneralSection {
     /// touched routing keep no trace of it (mirrors `[general.laya]`).
     #[serde(default, skip_serializing_if = "RoutingConfig::is_default")]
     pub routing: RoutingConfig,
+    /// **Harness-run deterministic verify at plan-step boundaries (opt-in;
+    /// cost-saving chain).** With `enabled` on and a non-empty
+    /// `test_command`, every SUCCESSFUL skeleton `complete_step` runs the
+    /// command itself, compresses its output, and appends a compact evidence
+    /// note (exit status, distinct error lines, counts) to the tool result —
+    /// deterministic evidence before model reasoning, no model roundtrip
+    /// (the failure-triage tier-1 precedent). A failed verification never
+    /// fails the tick: the note carries the signal. Inert by default (no
+    /// spawn, byte-identical outputs). Omitted from the saved config while
+    /// every field holds its default, so configs that never touched verify
+    /// keep no trace of it (mirrors `[general.routing]`).
+    #[serde(default, skip_serializing_if = "VerifyConfig::is_default")]
+    pub verify: VerifyConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
     /// context levers that cut re-reads and command-output waste at the tool
     /// dispatch layer: delta/skeleton re-reads, semantic command-output
@@ -461,6 +474,81 @@ fn routing_threshold_is_default(threshold: &f64) -> bool {
     (*threshold - default_routing_threshold()).abs() < f64::EPSILON
 }
 
+/// The `[general.verify]` section — harness-run deterministic verification at
+/// plan-step boundaries (the cost-saving chain's verification item): with
+/// [`enabled`](Self::enabled) on and a non-empty
+/// [`test_command`](Self::test_command), a SUCCESSFUL skeleton
+/// `complete_step` runs the command itself, compresses its output through
+/// the lever-2 compressor, and appends a compact evidence note (exit status,
+/// distinct error lines, counts) to the tool result — deterministic evidence
+/// before model reasoning, with no model roundtrip (the failure-triage
+/// tier-1 auto-retry precedent). Opt-in and inert by default: an absent
+/// section never spawns a process, so behavior is byte-identical to today.
+/// Omitted from the saved config while every field holds its default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// Whether the harness runs `test_command` at each plan-step boundary.
+    /// `false` (the default) leaves the feature fully inert. Omitted while
+    /// false.
+    #[serde(skip_serializing_if = "verify_flag_off")]
+    pub enabled: bool,
+    /// The command run at each step boundary (e.g. `cargo test`). EMPTY (the
+    /// default) keeps the feature inert even with `enabled` on — there is
+    /// never a built-in command. Omitted while empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub test_command: String,
+    /// Seconds the command may run before being killed — a hanging suite
+    /// must not wedge the plan, and the kill surfaces as a failure-shaped
+    /// evidence note. Defaults to 300 (the same bound the `shell` tool
+    /// applies). Omitted while default.
+    #[serde(skip_serializing_if = "verify_timeout_is_default")]
+    pub timeout_secs: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            test_command: String::new(),
+            timeout_secs: default_verify_timeout_secs(),
+        }
+    }
+}
+
+impl VerifyConfig {
+    /// True while every field holds its default — the `[general.verify]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`RoutingConfig::is_default`]), so untouched configs keep no verify
+    /// trace.
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && self.test_command.is_empty()
+            && verify_timeout_is_default(&self.timeout_secs)
+    }
+}
+
+/// The out-of-box verification timeout: the same 5-minute bound the `shell`
+/// tool applies. Named fn so the serde default, the `Default` impl and the
+/// `skip_serializing_if` guard agree.
+fn default_verify_timeout_secs() -> u64 {
+    300
+}
+
+/// `skip_serializing_if` guard for [`VerifyConfig::timeout_secs`]: the
+/// default stays unwritten, so a section touched only by `enabled` or
+/// `test_command` keeps its minimal shape.
+fn verify_timeout_is_default(timeout: &u64) -> bool {
+    *timeout == default_verify_timeout_secs()
+}
+
+/// `skip_serializing_if` guard for [`VerifyConfig::enabled`]: `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-verify shape.
+fn verify_flag_off(off: &bool) -> bool {
+    !*off
+}
+
 /// The `[general.optimizer]` section — the token-optimizer levers (backlog
 /// e4a50d22), **all ON by default** (2027-01-25: saving tokens is the
 /// expected behavior, not an opt-in — a config that never wrote a
@@ -676,6 +764,7 @@ impl Default for GeneralSection {
             bundled_embedding_model: default_bundled_embedding_model(),
             laya: LayaConfig::default(),
             routing: RoutingConfig::default(),
+            verify: VerifyConfig::default(),
             optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
@@ -1674,6 +1763,61 @@ enforce = true
     }
 
     #[test]
+    fn verify_defaults_inert_and_round_trips() {
+        // Harness-run verify is opt-in and INERT by default: no enabled
+        // flag, no command, no spawn — an absent [general.verify] section
+        // keeps today's behavior exactly.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.verify.enabled);
+        assert!(cfg.general.verify.test_command.is_empty());
+        assert_eq!(cfg.general.verify.timeout_secs, 300);
+
+        let text = r#"
+[general.verify]
+enabled = true
+test_command = "cargo test"
+timeout_secs = 600
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.verify.enabled);
+        assert_eq!(cfg.general.verify.test_command, "cargo test");
+        assert_eq!(cfg.general.verify.timeout_secs, 600);
+
+        // Re-serialize + re-parse: every field survives.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.verify.enabled);
+        assert_eq!(cfg2.general.verify.test_command, "cargo test");
+        assert_eq!(cfg2.general.verify.timeout_secs, 600);
+    }
+
+    #[test]
+    fn verify_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [general.routing] / [general.laya]: an
+        // untouched (default) section is skipped in config.toml; touching
+        // one field writes only that field.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.verify"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.verify]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.verify"));
+        // The untouched command + timeout stay unwritten.
+        assert!(!text.contains("timeout_secs"));
+        assert!(!text.contains("test_command"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.verify.enabled);
+        assert_eq!(back.general.verify.timeout_secs, 300);
+    }
+
+    #[test]
     fn laya_removed_mode_endpoint_and_checkpoint_keys_are_ignored() {
         // External-endpoint mode and the multilingual checkpoint choice were
         // removed (managed-only, English-only). A config written before that
@@ -2301,6 +2445,7 @@ chat_hover_timestamps = true
                 bundled_embedding_model: None,
                 laya: LayaConfig::default(),
                 routing: RoutingConfig::default(),
+                verify: VerifyConfig::default(),
                 optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,

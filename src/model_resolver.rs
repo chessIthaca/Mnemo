@@ -785,6 +785,9 @@ mod tests {
         routed_config.general.general.routing = RoutingConfig {
             cheap: Some(cheap_ref()),
             capable: Some(capable_ref()),
+            lane_medium: None,
+            lane_high: None,
+            escalate: None,
             threshold: 0.9,
             enforce: true,
         };

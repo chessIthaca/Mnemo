@@ -360,6 +360,16 @@ impl LayaConfig {
 /// * `true` = **enforce**: a confident `trivial` answer runs the turn on
 ///   [`cheap`](Self::cheap), `architectural` on [`capable`](Self::capable).
 ///
+/// The same section carries the **escalation lane ladder** (backlog ad56c7bd):
+/// [`lane_medium`](Self::lane_medium), [`lane_high`](Self::lane_high) and
+/// [`escalate`](Self::escalate) are the per-lane targets for step-granular
+/// routing — at each plan-step boundary (and again only after a failed cycle)
+/// the compound reflex call classifies the step and the ladder resolves
+/// cheap → default → medium → high → escalate. Every rung is USER-CHOSEN:
+/// unset (the default) falls through to the turn's configured model — there is
+/// never a built-in model id. Step routing is shadow-first under the same
+/// [`enforce`](Self::enforce) switch as the pre-prompt decision.
+///
 /// Every fallback keeps today's model: an answer below
 /// [`threshold`](Self::threshold), a missing answer, an unknown label, or an
 /// unset or dangling target. Routing never overrides a skill, subagent or
@@ -376,6 +386,18 @@ pub struct RoutingConfig {
     /// (design-level work: a new feature, cross-module refactor, a new
     /// dependency, a data-model or concurrency change). `None` keeps today's.
     pub capable: Option<ModelRef>,
+    /// The endpoint + model a medium-complexity plan step routes to (the
+    /// escalation-lane rung `medium`, backlog ad56c7bd). USER-CHOSEN: `None`
+    /// (the default) falls through to the turn's configured model — never a
+    /// built-in model id.
+    pub lane_medium: Option<ModelRef>,
+    /// The endpoint + model a high-complexity plan step routes to (the rung
+    /// `high`). `None` falls through to the configured model.
+    pub lane_high: Option<ModelRef>,
+    /// The endpoint + model the escalate rung routes to (a step the reflex
+    /// call flags `escalate`, typically after a failed cycle). `None` falls
+    /// through to the configured model.
+    pub escalate: Option<ModelRef>,
     /// The calibrated-probability gate: a decision routes only at
     /// `confidence >= threshold`. Defaults to `0.80`, the same gate the
     /// other Laya consumers use; a below-threshold answer keeps today's
@@ -395,6 +417,9 @@ impl Default for RoutingConfig {
         Self {
             cheap: None,
             capable: None,
+            lane_medium: None,
+            lane_high: None,
+            escalate: None,
             threshold: default_routing_threshold(),
             enforce: false,
         }
@@ -409,6 +434,9 @@ impl RoutingConfig {
     fn is_default(&self) -> bool {
         self.cheap.is_none()
             && self.capable.is_none()
+            && self.lane_medium.is_none()
+            && self.lane_high.is_none()
+            && self.escalate.is_none()
             && routing_threshold_is_default(&self.threshold)
             && !self.enforce
     }
@@ -1550,6 +1578,69 @@ reasoning_effort = "max"
         assert!((cfg2.general.routing.threshold - 0.9).abs() < 1e-9);
         assert_eq!(cfg2.general.routing.cheap.unwrap().endpoint, "local");
         assert_eq!(cfg2.general.routing.capable.unwrap().model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn routing_lane_targets_default_to_none_and_round_trip() {
+        // The escalation-lane ladder (backlog ad56c7bd) is USER-CHOSEN: every
+        // rung defaults to None -- there is never a built-in model id -- and
+        // an unset rung falls through to the turn's configured model.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(cfg.general.routing.lane_medium.is_none());
+        assert!(cfg.general.routing.lane_high.is_none());
+        assert!(cfg.general.routing.escalate.is_none());
+
+        let text = r#"
+[general.laya]
+enabled = true
+routing = true
+
+[general.routing.lane_medium]
+endpoint = "local"
+model = "medium-model"
+
+[general.routing.escalate]
+endpoint = "anthropic"
+model = "big-model"
+reasoning_effort = "max"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.general.routing.lane_medium.as_ref().unwrap().model,
+            "medium-model"
+        );
+        assert!(cfg.general.routing.lane_high.is_none());
+        assert_eq!(
+            cfg.general
+                .routing
+                .escalate
+                .as_ref()
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+
+        // Re-serialize + re-parse: every set rung survives, the unset one
+        // stays unset.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert_eq!(cfg2.general.routing.lane_medium.unwrap().endpoint, "local");
+        assert!(cfg2.general.routing.lane_high.is_none());
+        assert_eq!(cfg2.general.routing.escalate.unwrap().model, "big-model");
+
+        // A lane target alone counts as touched: the section is written.
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.routing.lane_high]
+endpoint = "ep"
+model = "m"
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.routing"));
+        assert!(text.contains("lane_high"));
     }
 
     #[test]

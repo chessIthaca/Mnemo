@@ -249,7 +249,7 @@ jobs:
           name: macos-bundles-aarch64
           path: dist/macos
       - name: Create GitHub release with installers
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/windows/**/*.msi

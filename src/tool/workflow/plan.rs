@@ -2422,6 +2422,46 @@ impl Tool for FinishTool {
                 .into(),
         );
 
+        // (e) The per-plan cost report (backlog a25a5323, the budget layer):
+        // append the plan's REAL spend_events numbers to the plan file —
+        // totals, tokens per lane, the lane per step, retries, escalations
+        // with their reasons, the deterministic checks with their results,
+        // and the cache hits (deliberately NO counterfactual baseline).
+        // Fail-open like the capture above: a report failure notes and never
+        // blocks completion; a plan with no recorded spend writes no section.
+        if let (Some(store), Some(plan_id)) = (&self.memory, &plan_id) {
+            match store.spend_rows_for_plan(plan_id).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let report = crate::agent::budget::cost_report(&rows);
+                    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+                    let append = |text: &str| -> std::io::Result<()> {
+                        let mut text = text.to_string();
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push('\n');
+                        text.push_str(&report);
+                        std::fs::write(&plan_path, text)
+                    };
+                    match std::fs::read_to_string(&plan_path).and_then(|text| append(&text)) {
+                        Ok(()) => notes.push(format!(
+                            "cost report appended to the plan file ({} row(s))",
+                            rows.len()
+                        )),
+                        Err(e) => {
+                            eprintln!("finish: cost report append failed: {e}");
+                            notes.push(format!("cost report skipped: {e}"));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("finish: cost report rows unavailable: {e}");
+                    notes.push(format!("cost report skipped: {e}"));
+                }
+            }
+        }
+
         // Re-lock for the state transition. The state is re-checked: the
         // unlocked window above must not let finish fire from a state that
         // changed underneath it (e.g. an abandon_plan racing in).
@@ -4710,6 +4750,219 @@ mod tests {
             .execute(json!({"review_report": report.to_string_lossy()}))
             .await;
         assert!(res.success, "{}", res.output);
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::workflow::WorkflowState::Complete
+        );
+    }
+
+    /// One seeded spend row for the cost-report tests.
+    fn seeded_spend(
+        plan_id: &str,
+        reason: &str,
+        lane: Option<&str>,
+        step: Option<usize>,
+        tokens_in: i64,
+        tokens_out: i64,
+        detail: Option<&str>,
+    ) -> crate::memory::SpendEvent {
+        crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: None,
+            turn_id: Some("turn-1".into()),
+            agent_id: None,
+            plan_id: plan_id.to_string(),
+            step_index: step,
+            lane: lane.map(|l| l.to_string()),
+            model: "worker-model".into(),
+            reason: reason.to_string(),
+            tokens_in,
+            tokens_out,
+            cached_tokens: Some(100),
+            detail: detail.map(|d| d.to_string()),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// Create a one-step plan, complete it (→ Reviewing), and write a PASS
+    /// report; returns (dir, wf, plan_id, reviews_dir, report path).
+    async fn finished_ready_plan(
+        dir: &std::path::Path,
+    ) -> (Arc<Mutex<Workflow>>, String, std::path::PathBuf, std::path::PathBuf) {
+        let wf = make_workflow(dir);
+        let create = CreatePlanTool::new(wf.clone());
+        create
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let complete = CompleteStepTool::new(wf.clone());
+        complete.execute(json!({"step_index": 1})).await;
+        let plan_id = wf
+            .lock()
+            .await
+            .plan_id()
+            .expect("a live plan")
+            .to_string();
+        let reviews_dir = dir.join("reviews");
+        std::fs::create_dir_all(&reviews_dir).unwrap();
+        let report = reviews_dir.join("review.md");
+        std::fs::write(&report, "## Verdict: PASS\nno findings").unwrap();
+        (wf, plan_id, reviews_dir, report)
+    }
+
+    #[tokio::test]
+    async fn finish_appends_the_cost_report_to_the_plan_file() {
+        // Backlog a25a5323: at finish the plan's REAL spend rows render as a
+        // `## Cost report` section appended to the plan file — totals, tokens
+        // per lane, the lane per step, retries, escalations with their
+        // reasons, the deterministic checks with their results, and the cache
+        // hits; deliberately no counterfactual baseline column.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "route",
+                Some("medium"),
+                Some(0),
+                1_200,
+                200,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "retry",
+                Some("high"),
+                Some(0),
+                900,
+                100,
+                Some("flaky_test"),
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "escalate",
+                Some("escalate"),
+                Some(0),
+                2_000,
+                300,
+                Some("complexity high"),
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "verify",
+                None,
+                Some(0),
+                0,
+                0,
+                Some("[verify] `cargo test` — passed (exit 0)"),
+            ))
+            .await
+            .unwrap();
+
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("cost report appended to the plan file (4 row(s))"),
+            "{}",
+            res.output
+        );
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::workflow::WorkflowState::Complete
+        );
+
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        let text = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(text.contains("## Cost report"), "{text}");
+        assert!(
+            text.contains("4 request(s), 4100 tokens in + 600 tokens out = 4700 tokens"),
+            "{text}"
+        );
+        assert!(text.contains("400 cached prompt tokens"), "{text}");
+        assert!(text.contains("- escalate: 1 request(s), 2300 tokens"), "{text}");
+        assert!(text.contains("Lane per step:"), "{text}");
+        assert!(text.contains("- step 1: medium"), "{text}");
+        assert!(text.contains("- step 1: flaky_test — 1000 tokens"), "{text}");
+        assert!(
+            text.contains("- step 1: complexity high (2300 tokens)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- step 1: [verify] `cargo test` — passed (exit 0)"),
+            "{text}"
+        );
+        // REAL numbers only — the rejected counterfactual column stays out.
+        assert!(!text.contains("baseline"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn finish_without_spend_writes_no_cost_report() {
+        // A plan with no recorded spend writes no section — the report never
+        // fabricates an empty bill.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(!res.output.contains("cost report"), "{}", res.output);
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        let text = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(!text.contains("## Cost report"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_cost_report_failure_never_blocks_finish() {
+        // Fail-open, like the capture above: when the plan file cannot be read
+        // (removed here), the append notes the skip and finish still
+        // completes — the report must never cost a completion.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "route",
+                Some("medium"),
+                Some(0),
+                100,
+                10,
+                None,
+            ))
+            .await
+            .unwrap();
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        std::fs::remove_file(&plan_file).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("cost report skipped"),
+            "{}",
+            res.output
+        );
         assert_eq!(
             wf.lock().await.state(),
             crate::workflow::WorkflowState::Complete

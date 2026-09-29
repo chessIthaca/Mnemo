@@ -20,12 +20,13 @@ below is therefore computed at commit `a2522a4` (`refs/heads/main`, latest analy
 | Secret scanning | 0 | — | — |
 | Repository security advisories | 0 | — | — |
 
-Repo posture (context for the severities below): public repo; secret scanning +
+Repo posture at analysis time: public repo; secret scanning +
 push protection enabled (validity checks and non-provider patterns off); Dependabot
 alerts and security updates enabled (`automated-security-fixes.enabled=true`,
 `paused=false`); private vulnerability reporting enabled; Actions default workflow
 token permission already `read` (`can_approve_pull_request_reviews=false`); **no**
-`.github/dependabot.yml`, **no** `SECURITY.md`, no rulesets.
+`.github/dependabot.yml`, **no** `SECURITY.md`, no rulesets — all three landed later
+the same day, see "Follow-up" below.
 
 ## Open code-scanning alerts (13)
 
@@ -226,6 +227,19 @@ Local verification at the time of writing: `cargo test -p mnemo --lib --test int
 The 10 still-*open* code-scanning alerts (1, 3-8, 13-15) are fixed in the working tree;
 GitHub closes them once the change is pushed and default-setup CodeQL re-analyses (push
 to `main`, a PR, or the weekly run). Until then the security tab keeps showing them.
+
+## Follow-up landed the same day (2026-09-29)
+
+Repo-hygiene gaps this sweep surfaced, plus the fallout of the v1.2.0 tag build —
+none of these were in the alert list:
+
+| Item | Outcome |
+|---|---|
+| `main` protection | ruleset `main-protection` (id 24182945): `deletion` + `non_fast_forward` + `pull_request` (0 required approvals, merge/squash/rebase allowed, no bypass actors). Direct pushes to `main` are now rejected — the app's ruleset-aware landing path opens PRs instead. |
+| Dependabot version updates | `.github/dependabot.yml` added: weekly, grouped minor/patch per ecosystem, 5 open PRs each, `tao`/`wry` ignored (they are `[patch.crates-io]` vendor overrides). The first check ran within a minute and opened 15 PRs (5 per ecosystem). |
+| Security policy | `SECURITY.md` added (supported versions, private reporting, scope, automated checks). |
+| Secret-scanning extras | `secret_scanning_validity_checks` and `secret_scanning_non_provider_patterns` could **not** be enabled through the API — three PATCHes returned 200 while the repo stayed `disabled`, so they need the Settings → Code security UI. |
+| v1.2.0 tag build | The only unresolved red run: `state_override_survives_429_fallback` blew the 10 s `shutdown_agent` window (`src/runtime/agent.rs:2922`) on the macOS runner, the `release` job was skipped, and the published v1.2.0 release has **no assets**. Window widened to 30 s on `main` (`4b0764a`, merged `71e214b`) and the failed jobs re-run via `gh run rerun 36354666875 --failed`. |
 
 ## Reproduce
 

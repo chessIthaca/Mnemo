@@ -16,6 +16,7 @@ use super::failure_triage;
 use super::model_routing;
 use super::reflex;
 use super::step_lanes;
+use super::step_verify;
 use crate::config::SafetyMode;
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
@@ -420,6 +421,16 @@ pub struct AgentLoop {
     /// The failure class that bumped the epoch most recently -- its label feeds
     /// the re-classification state text.
     pub(crate) lane_failure: std::sync::Mutex<Option<String>>,
+    /// The harness-run verification handle (the cost-saving chain's
+    /// verification item): a decided `action=verify` reflex call re-runs
+    /// `[general.verify]`'s command harness-side and stashes the compact
+    /// evidence note for the next request's volatile tail. `None` in tests /
+    /// unwired builds -- the action then does nothing.
+    pub(crate) step_verify: Option<step_verify::StepVerifyHandle>,
+    /// The one-shot evidence note for the next request's volatile tail:
+    /// stashed by the action=verify path, drained by the request seam (so it
+    /// is delivered exactly once and never pollutes the cached prefix).
+    pub(crate) verify_note: std::sync::Mutex<Option<String>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -833,6 +844,8 @@ impl AgentLoop {
             lane_state: std::sync::Mutex::new(None),
             escalation_epoch: std::sync::atomic::AtomicU64::new(0),
             lane_failure: std::sync::Mutex::new(None),
+            step_verify: None,
+            verify_note: std::sync::Mutex::new(None),
         }
     }
 
@@ -936,6 +949,41 @@ impl AgentLoop {
     /// rebuild.
     pub fn reflex(&self) -> Option<&reflex::ReflexHandle> {
         self.reflex.as_ref()
+    }
+
+    /// Attach the harness-run verification handle (the cost-saving chain's
+    /// verification item). With it wired, a decided `action=verify` reflex
+    /// call re-runs the configured checks harness-side and rides the compact
+    /// evidence note on the next request's volatile tail. Returns `self` for
+    /// chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise the path.
+    pub fn with_step_verify(mut self, handle: step_verify::StepVerifyHandle) -> Self {
+        self.step_verify = Some(handle);
+        self
+    }
+
+    /// The harness-run verification handle this loop was built with (`None`
+    /// when `[general.verify]` is not wired).
+    pub fn step_verify(&self) -> Option<&step_verify::StepVerifyHandle> {
+        self.step_verify.as_ref()
+    }
+
+    /// Stash a harness-verification evidence note for the next request's
+    /// volatile tail (delivered exactly once — see [`take_verify_note`]).
+    ///
+    /// [`take_verify_note`]: Self::take_verify_note
+    pub(crate) fn set_verify_note(&self, note: String) {
+        if let Ok(mut slot) = self.verify_note.lock() {
+            *slot = Some(note);
+        }
+    }
+
+    /// Take the pending harness-verification evidence note, if any. One-shot
+    /// by construction: the request seam drains it, so the note is delivered
+    /// exactly once and the volatile tail stays byte-identical when empty.
+    pub fn take_verify_note(&self) -> Option<String> {
+        self.verify_note.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Record a confident failure-triage verdict (backlog ad56c7bd). A

@@ -14556,6 +14556,166 @@ async fn run_lane_turn(
     (outcome, fanin_rx)
 }
 
+/// The harness-run verify handle for a loop test (see
+/// [`crate::agent::step_verify`]): the shared config handle + the default
+/// optimizer config, rooted at `root`.
+fn step_verify_handle(
+    enabled: bool,
+    command: &str,
+    root: &std::path::Path,
+) -> crate::agent::step_verify::StepVerifyHandle {
+    let cfg = Arc::new(std::sync::RwLock::new(crate::config::VerifyConfig {
+        enabled,
+        test_command: command.to_string(),
+        timeout_secs: 60,
+    }));
+    let optimizer = Arc::new(std::sync::RwLock::new(
+        crate::config::OptimizerConfig::default(),
+    ));
+    crate::agent::step_verify::StepVerifyHandle::new(cfg, optimizer).with_root(root.to_path_buf())
+}
+
+#[tokio::test]
+async fn lane_verify_action_re_runs_the_checks_and_rides_the_note_on_the_tail() {
+    // The action=verify wiring (the cost-saving chain's verification item): a
+    // decided `verify` makes the HARNESS re-run the configured checks and the
+    // compact evidence note rides the next request's volatile tail — no model
+    // roundtrip spent deciding to run them. Shadow mode (enforce off) proves
+    // it is evidence, not routing.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "verify".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = lane_agent(
+        dir.path(),
+        provider,
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    )
+    .with_step_verify(step_verify_handle(true, "echo ok", dir.path()));
+
+    let (_outcome, _rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    let tails = recorder.request_tails();
+    assert!(
+        tails
+            .iter()
+            .any(|tail| tail.contains("[verify] `echo ok` — passed (exit 0)")),
+        "the evidence note must ride the volatile tail: {tails:?}"
+    );
+}
+
+#[tokio::test]
+async fn lane_verify_action_without_a_handle_stashes_no_note() {
+    // The action is inert without the handle: no checks run, no note, and the
+    // tail stays byte-identical to a ladder-free turn.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "verify".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = lane_agent(
+        dir.path(),
+        provider,
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (_outcome, _rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    let tails = recorder.request_tails();
+    assert!(
+        !tails.iter().any(|tail| tail.contains("[verify]")),
+        "no handle must mean no note: {tails:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_note_is_one_shot() {
+    // The request seam DRAINS the note, so it is delivered exactly once and
+    // the volatile tail stays byte-identical when the slot is empty.
+    let dir = tempdir().unwrap();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let agent = AgentLoop::new(
+        test_config(routed_provider("m", "from-m"), registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    agent.set_verify_note("the evidence note".to_string());
+    assert_eq!(agent.take_verify_note().as_deref(), Some("the evidence note"));
+    assert_eq!(agent.take_verify_note(), None, "one-shot by construction");
+}
+
 #[tokio::test]
 async fn lane_enforced_medium_serves_the_step_and_announces_the_switch() {
     // The acceptance path: the ladder is armed (reflex on + routing opted in +

@@ -1073,6 +1073,12 @@ impl AgentLoopFactory {
         // next step with no rebuild.
         if let Some(handle) = &self.reflex {
             agent = agent.with_reflex(handle.clone());
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): the loop re-runs `[general.verify]`'s command on
+        // a decided `action=verify` reflex call and rides the compact evidence
+        // note on the next request's volatile tail. Same live config the
+        // `complete_step` tool reads (`step_verify_handle`).
+        agent = agent.with_step_verify(self.step_verify_handle(root));
         }
 
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the

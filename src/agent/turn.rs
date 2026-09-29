@@ -30,7 +30,7 @@ use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::model_routing;
-use super::reflex::{ReflexDecisionRow, ReflexOutcome};
+use super::reflex::{ReflexAction, ReflexDecisionRow, ReflexOutcome};
 use super::step_lanes::{self, ClassifyHow, LaneState};
 use super::prompt;
 use super::recall_delta::DeltaDecision;
@@ -1239,6 +1239,22 @@ impl AgentLoop {
                 }
                 if let Ok(mut memo) = self.lane_state.lock() {
                     *memo = Some(state);
+                }
+                // Harness-run deterministic verify (the cost-saving chain's
+                // verification item): a decided `verify` action re-runs the
+                // configured checks harness-side and stashes the compact
+                // evidence note for the next request's volatile tail. This is
+                // EVIDENCE, not routing — it fires regardless of shadow /
+                // enforce, and the model never sees the decision itself.
+                // (`retry` / `escalate` need no code here: the escalate
+                // action already overrides the rung and a classified failure
+                // already re-arms the ladder — shipped with backlog ad56c7bd.)
+                if matches!(&decision.action, ReflexAction::Verify) {
+                    if let Some(verify) = self.step_verify.as_ref() {
+                        if let Some((command, outcome)) = verify.run_checks().await {
+                            self.set_verify_note(verify.evidence_note(&command, &outcome));
+                        }
+                    }
                 }
                 routed.is_some().then_some(target)
             }
@@ -3378,6 +3394,14 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // so the cached conversation prefix is never touched. A `None` nudge
         // leaves the tail byte-identical to its pre-lever form.
         crate::agent::optimizer::append_nudge(&mut volatile_tail, nudge);
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): a decided `action=verify` reflex call stashed a
+        // one-shot evidence note — it rides the volatile tail exactly like
+        // the lever-7 nudge (drained here, so it is delivered once and the
+        // cached prefix is never touched; an empty slot leaves the tail
+        // byte-identical).
+        let verify_note = self.take_verify_note();
+        crate::agent::optimizer::append_nudge(&mut volatile_tail, verify_note.as_deref());
         if tail_as_user {
             messages.push(Message::user_text(volatile_tail));
             messages.push(Message::user_text(prompt::CONTEXT_FOOTER));

@@ -18,7 +18,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 log = "0.4"
 # Managed Laya runtime (ipc/laya.rs): the uv download + readiness probe ride
 # reqwest (same version/feature set as the mnemo lib so the crate unifies),

@@ -83,7 +83,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.11"
 
 # Base64 encoding for image attachments (vision fallback + describe_image tool)
-base64 = "0.22"
+base64 = "0.23"
 
 # Image decode/crop/re-encode for the agentic zoom loop in the image_* tools
 # (grid → model votes → crop the full-resolution original → re-read). Already a

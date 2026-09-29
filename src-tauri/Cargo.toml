@@ -25,7 +25,7 @@ log = "0.4"
 # and the uv release archives extract via zip (Windows asset) + tar/flate2
 # (unix assets).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "stream"] }
-zip = "2"
+zip = "8"
 tar = "0.4"
 flate2 = "1"
 # uv release-asset digest verification (ipc/laya.rs verify_sha256) — same

@@ -503,6 +503,21 @@ export interface AppSettings {
        *  shadow: classify + log only). */
       enforce: boolean;
     };
+    /** The deterministic budget layer (`[general.budget]`, backlog a25a5323)
+     *  — spend caps the model can never override: a cap reached at a
+     *  plan-step boundary PAUSES the plan with a question (continue for this
+     *  plan / double the cap / end the turn) instead of killing it. Always
+     *  emitted, so the section renders the current numbers. */
+    budget?: {
+      /** Whether the caps are enforced. */
+      enabled: boolean;
+      /** Total tokens one plan may spend (0 = off). */
+      max_tokens_per_plan: number;
+      /** Escalations allowed per plan (default 1). */
+      max_escalations_per_plan: number;
+      /** Failed-cycle retries allowed per plan step (default 3). */
+      max_retries_per_lane: number;
+    };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
      *  default; debug builds always expose it regardless). */
@@ -667,6 +682,15 @@ export interface SettingsSavePatch {
     escalate?: ModelRefConfig | null;
     threshold?: number;
     enforce?: boolean;
+  };
+  /** `[general.budget]` patch (backlog a25a5323) — the deterministic budget
+   *  layer's caps. Absent fields keep the stored values; an absent section
+   *  keeps the whole section. */
+  budget?: {
+    enabled?: boolean;
+    max_tokens_per_plan?: number;
+    max_escalations_per_plan?: number;
+    max_retries_per_lane?: number;
   };
   /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
    *  is opt-in, off by default, and read per tool call from a live mirror, so

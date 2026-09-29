@@ -548,6 +548,16 @@ export interface ClassifierDraft {
   /** The calibrated-probability gate (0–1): a decision routes only at or
    *  above it; below it today's model runs. */
   routingThreshold: number;
+  /** The budget layer's opt-in (`[general.budget] enabled`, backlog
+   *  a25a5323) — deterministic spend caps the model can never override: a cap
+   *  reached pauses the plan with a question instead of killing it. */
+  budgetEnabled: boolean;
+  /** Total tokens one plan may spend (0 = no token cap). */
+  budgetMaxTokensPerPlan: number;
+  /** Escalations allowed per plan (default 1). */
+  budgetMaxEscalationsPerPlan: number;
+  /** Failed-cycle retries allowed per plan step (default 3). */
+  budgetMaxRetriesPerLane: number;
 }
 
 /** Serialize the classifier draft for dirty comparison. */

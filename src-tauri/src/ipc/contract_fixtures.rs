@@ -28,7 +28,7 @@ use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
 use mnemo::workflow::plan_file::PlanFile;
 use mnemo::workflow::WorkflowState;
 
-use crate::ipc::settings::RoutingWire;
+use crate::ipc::settings::{BudgetWire, RoutingWire};
 
 use crate::ipc::agent::{ActiveSkillInfo, AgentInfo, PlanAncestorInfo, WorkflowStateInfo};
 use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllProgress};
@@ -256,8 +256,17 @@ fn dto_fixtures_match_serde() {
             routing: RoutingWire {
                 cheap: None,
                 capable: None,
+                lane_medium: None,
+                lane_high: None,
+                escalate: None,
                 threshold: 0.80,
                 enforce: false,
+            },
+            budget: BudgetWire {
+                enabled: false,
+                max_tokens_per_plan: 0,
+                max_escalations_per_plan: 1,
+                max_retries_per_lane: 3,
             },
         },
         context: GetSettingsContext {

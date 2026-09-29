@@ -119,6 +119,26 @@ pub struct RoutingConfigDto {
     pub enforce: Option<bool>,
 }
 
+/// The `[general.budget]` section patch (the deterministic budget layer,
+/// backlog a25a5323): spend caps the model can never override. Present fields
+/// replace the stored values, absent fields keep them, an absent section keeps
+/// the whole section (the plain-Option convention the bool/usize scalars use).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BudgetConfigDto {
+    /// Whether the caps are enforced.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Total tokens one plan may spend (`0` = off).
+    #[serde(default)]
+    pub max_tokens_per_plan: Option<u64>,
+    /// Escalations allowed per plan (default 1).
+    #[serde(default)]
+    pub max_escalations_per_plan: Option<u32>,
+    /// Failed-cycle retries allowed per plan step (default 3).
+    #[serde(default)]
+    pub max_retries_per_lane: Option<u32>,
+}
+
 /// Deserialize an `Option<Option<T>>` so that a field **absent** from the JSON
 /// yields `None` (outer — "keep the existing value"), while an explicit `null`
 /// yields `Some(None)` (inner — "clear the override"). A present object yields
@@ -419,6 +439,10 @@ pub struct SettingsSaveDto {
     /// Absent = keep the stored section; see [`RoutingConfigDto`].
     #[serde(default)]
     pub routing: Option<RoutingConfigDto>,
+    /// The deterministic budget layer (`[general.budget]`, backlog
+    /// a25a5323). Absent = keep the stored section; see [`BudgetConfigDto`].
+    #[serde(default)]
+    pub budget: Option<BudgetConfigDto>,
     #[serde(default)]
     pub pricing: Option<Vec<PricingDto>>,
     #[serde(default)]
@@ -950,6 +974,21 @@ pub fn validate_and_apply_settings_patch(
         }
         if let Some(enforce) = routing.enforce {
             general.general.routing.enforce = enforce;
+        }
+    }
+
+    if let Some(budget) = &patch.budget {
+        if let Some(enabled) = budget.enabled {
+            general.general.budget.enabled = enabled;
+        }
+        if let Some(tokens) = budget.max_tokens_per_plan {
+            general.general.budget.max_tokens_per_plan = tokens;
+        }
+        if let Some(escalations) = budget.max_escalations_per_plan {
+            general.general.budget.max_escalations_per_plan = escalations;
+        }
+        if let Some(retries) = budget.max_retries_per_lane {
+            general.general.budget.max_retries_per_lane = retries;
         }
     }
 
@@ -1532,6 +1571,46 @@ mod tests {
             let err = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
             assert!(err.contains("routing threshold"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn budget_patch_sets_keeps_and_round_trips() {
+        // The [general.budget] patch (backlog a25a5323): present fields
+        // replace, absent fields keep, an absent section keeps everything —
+        // and the save → reload → save round-trip is stable.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            budget: Some(BudgetConfigDto {
+                enabled: Some(true),
+                max_tokens_per_plan: Some(250_000),
+                max_escalations_per_plan: None,
+                max_retries_per_lane: Some(5),
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.budget.enabled);
+        assert_eq!(next.general.general.budget.max_tokens_per_plan, 250_000);
+        assert_eq!(
+            next.general.general.budget.max_escalations_per_plan, 1,
+            "an absent field keeps the stored value"
+        );
+        assert_eq!(next.general.general.budget.max_retries_per_lane, 5);
+
+        // The section survives a serialize → parse round-trip (the DTO's
+        // field names match the config's, so a saved patch reloads).
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: SettingsSaveDto = serde_json::from_str(&json).unwrap();
+        let next2 = validate_and_apply_settings_patch(&next, &back).unwrap();
+        assert!(next2.general.general.budget.enabled);
+        assert_eq!(next2.general.general.budget.max_tokens_per_plan, 250_000);
+        assert_eq!(next2.general.general.budget.max_retries_per_lane, 5);
+
+        // An absent section keeps the stored values entirely.
+        let patch = SettingsSaveDto::default();
+        let next3 = validate_and_apply_settings_patch(&next2, &patch).unwrap();
+        assert!(next3.general.general.budget.enabled);
+        assert_eq!(next3.general.general.budget.max_tokens_per_plan, 250_000);
     }
 
     #[test]

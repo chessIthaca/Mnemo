@@ -68,6 +68,42 @@ function statusHint(status: ClassifierStatusWire): string {
 }
 
 /**
+ * One budget cap row (the deterministic budget layer, backlog a25a5323) —
+ * a non-negative number input carrying the review-L4 guard: `Number("")` is
+ * 0, so a cleared field reads as NaN and snaps back to the committed value
+ * instead of silently meaning "no cap".
+ */
+function BudgetNumberRow({ label, hint, value, onChange }: {
+  label: string;
+  hint: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <label className="w-40 text-[0.7rem] text-(--text-muted)">{label}</label>
+      <input
+        type="number"
+        min={0}
+        step={1}
+        value={value}
+        onChange={(e) => {
+          const raw = e.target.value;
+          const next = raw === "" ? Number.NaN : Number(raw);
+          if (!Number.isFinite(next) || next < 0) {
+            e.target.value = String(value);
+            return;
+          }
+          onChange(Math.floor(next));
+        }}
+        className="w-24 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
+      />
+      <span className="text-[0.7rem] text-(--text-muted)">{hint}</span>
+    </div>
+  );
+}
+
+/**
  * Classifier section — the opt-in Laya "System 1" classifier.
  *
  * Laya (https://huggingface.co/convaiinnovations/laya) is a fast, calibrated
@@ -118,6 +154,14 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   const [routingLaneHigh, setRoutingLaneHigh] = useState<ModelRefConfig | null>(null);
   const [routingEscalate, setRoutingEscalate] = useState<ModelRefConfig | null>(null);
   const [routingThreshold, setRoutingThreshold] = useState(0.8);
+  // The deterministic budget layer (backlog a25a5323, `[general.budget]`):
+  // spend caps the model can never override — a reached cap pauses the plan
+  // through a pending question (continue for this plan / double the cap /
+  // end the turn), never a hard kill.
+  const [budgetEnabled, setBudgetEnabled] = useState(false);
+  const [budgetMaxTokensPerPlan, setBudgetMaxTokensPerPlan] = useState(0);
+  const [budgetMaxEscalationsPerPlan, setBudgetMaxEscalationsPerPlan] = useState(1);
+  const [budgetMaxRetriesPerLane, setBudgetMaxRetriesPerLane] = useState(3);
   // Endpoint catalog for the target pickers (rides the settings payload).
   const [endpoints, setEndpoints] = useState<EndpointInfo[]>([]);
   const [catalog, setCatalog] = useState<LayaCheckpointInfo[]>([]);
@@ -140,6 +184,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       const s = await getSettings();
       const laya = s.general.laya;
       const routingWire = s.general.routing;
+      const budgetWire = s.general.budget;
       const next: ClassifierDraft = {
         enabled: laya?.enabled ?? false,
         autoTypeMemories: laya?.auto_type_memories ?? false,
@@ -155,6 +200,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         routingLaneHigh: routingWire?.lane_high ?? null,
         routingEscalate: routingWire?.escalate ?? null,
         routingThreshold: routingWire?.threshold ?? 0.8,
+        budgetEnabled: budgetWire?.enabled ?? false,
+        budgetMaxTokensPerPlan: budgetWire?.max_tokens_per_plan ?? 0,
+        budgetMaxEscalationsPerPlan: budgetWire?.max_escalations_per_plan ?? 1,
+        budgetMaxRetriesPerLane: budgetWire?.max_retries_per_lane ?? 3,
       };
       setEnabled(next.enabled);
       setAutoType(next.autoTypeMemories);
@@ -170,6 +219,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       setRoutingLaneHigh(next.routingLaneHigh);
       setRoutingEscalate(next.routingEscalate);
       setRoutingThreshold(next.routingThreshold);
+      setBudgetEnabled(next.budgetEnabled);
+      setBudgetMaxTokensPerPlan(next.budgetMaxTokensPerPlan);
+      setBudgetMaxEscalationsPerPlan(next.budgetMaxEscalationsPerPlan);
+      setBudgetMaxRetriesPerLane(next.budgetMaxRetriesPerLane);
       setEndpoints(s.endpoints ?? []);
       setSnapshot(serializeClassifier(next));
       setCatalog(await listLayaCheckpoints());
@@ -231,6 +284,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
     routingLaneHigh,
     routingEscalate,
     routingThreshold,
+    budgetEnabled,
+    budgetMaxTokensPerPlan,
+    budgetMaxEscalationsPerPlan,
+    budgetMaxRetriesPerLane,
   };
   const dirty = snapshot !== "" && serializeClassifier(draft) !== snapshot;
 
@@ -283,6 +340,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             escalate: routingEscalate,
             threshold: routingThreshold,
             enforce: routingEnforce,
+          },
+          // The deterministic budget layer (backlog a25a5323): the enable
+          // flag plus the three caps as plain optionals (absent = keep the
+          // stored value; the draft mirrors what the section shows, so an
+          // untouched block round-trips its loaded numbers).
+          budget: {
+            enabled: budgetEnabled,
+            max_tokens_per_plan: budgetMaxTokensPerPlan,
+            max_escalations_per_plan: budgetMaxEscalationsPerPlan,
+            max_retries_per_lane: budgetMaxRetriesPerLane,
           },
         });
         setSnapshot(serializeClassifier(draft));
@@ -615,6 +682,58 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
               <span className="text-[0.7rem] text-(--text-muted)">
                 a decision routes only at or above it (default 0.80)
               </span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* The deterministic budget layer (backlog a25a5323): the caps the
+          model can never override. A reached cap PAUSES the plan with a
+          question (continue for this plan / double the cap / end the turn) —
+          never a hard kill; plans are crash-resumable, so a pause costs
+          nothing. Independent of the classifier above. */}
+      <div className="space-y-2 rounded-lg border border-border bg-bg-primary p-3">
+        <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
+          <input
+            type="checkbox"
+            checked={budgetEnabled}
+            onChange={(e) => setBudgetEnabled(e.target.checked)}
+            className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
+          />
+          <span>
+            Budget caps per plan
+            <span className="ml-1 text-[0.7rem] text-(--text-muted)">
+              — deterministic spend caps the agent can never override: when one
+              is reached the plan PAUSES with a question (continue for this
+              plan / double the cap / end the turn) instead of being killed.
+              Off by default; needs no classifier.
+            </span>
+          </span>
+        </label>
+        {budgetEnabled && (
+          <div className="space-y-2 border-t border-border pt-2">
+            <BudgetNumberRow
+              label="Tokens per plan"
+              hint="total prompt + completion tokens; 0 = no token cap"
+              value={budgetMaxTokensPerPlan}
+              onChange={setBudgetMaxTokensPerPlan}
+            />
+            <BudgetNumberRow
+              label="Escalations per plan"
+              hint="ladder escalations before the budget asks (default 1)"
+              value={budgetMaxEscalationsPerPlan}
+              onChange={setBudgetMaxEscalationsPerPlan}
+            />
+            <BudgetNumberRow
+              label="Retries per step"
+              hint="failed-cycle retries allowed on one step (default 3)"
+              value={budgetMaxRetriesPerLane}
+              onChange={setBudgetMaxRetriesPerLane}
+            />
+            <div className="text-[0.7rem] text-(--text-muted)">
+              The per-decision spend ledger and the per-plan cost report
+              (appended to the plan file at finish) are written regardless of
+              this toggle — it gates only the caps.
             </div>
           </div>
         )}

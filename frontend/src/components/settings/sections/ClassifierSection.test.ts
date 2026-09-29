@@ -221,6 +221,10 @@ describe("serializeClassifier", () => {
     routingLaneHigh: null,
     routingEscalate: null,
     routingThreshold: 0.8,
+    budgetEnabled: false,
+    budgetMaxTokensPerPlan: 0,
+    budgetMaxEscalationsPerPlan: 1,
+    budgetMaxRetriesPerLane: 3,
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
@@ -279,9 +283,21 @@ describe("serializeClassifier", () => {
         routingEscalate: { endpoint: "stub", model: "top" },
       }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetEnabled: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxTokensPerPlan: 250_000 }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxEscalationsPerPlan: 2 }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxRetriesPerLane: 5 }),
+    );
   });
 
-  it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing)", () => {
+  it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing + budget)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       autoTypeMemories: false,
@@ -297,6 +313,10 @@ describe("serializeClassifier", () => {
       routingLaneHigh: null,
       routingEscalate: null,
       routingThreshold: 0.8,
+      budgetEnabled: false,
+      budgetMaxTokensPerPlan: 0,
+      budgetMaxEscalationsPerPlan: 1,
+      budgetMaxRetriesPerLane: 3,
     });
   });
 
@@ -315,6 +335,26 @@ describe("serializeClassifier", () => {
     expect(tauriSource).toContain("lane_medium?: ModelRefConfig | null;");
     expect(tauriSource).toContain("lane_high?: ModelRefConfig | null;");
     expect(tauriSource).toContain("escalate?: ModelRefConfig | null;");
+  });
+
+  it("carries the budget caps through the saved patch (backlog a25a5323)", () => {
+    // The deterministic budget layer's section: the toggle + the three caps
+    // ride the [general.budget] patch with the backend's exact snake_case
+    // names, the section renders them, and the read type carries the wire
+    // block the backend now emits.
+    expect(classifierSource).toContain("Budget caps per plan");
+    expect(classifierSource).toContain("enabled: budgetEnabled,");
+    expect(classifierSource).toContain("max_tokens_per_plan: budgetMaxTokensPerPlan,");
+    expect(classifierSource).toContain(
+      "max_escalations_per_plan: budgetMaxEscalationsPerPlan,",
+    );
+    expect(classifierSource).toContain("max_retries_per_lane: budgetMaxRetriesPerLane,");
+    expect(tauriSource).toContain("max_tokens_per_plan: number;");
+    expect(tauriSource).toContain("max_escalations_per_plan: number;");
+    expect(tauriSource).toContain("max_retries_per_lane: number;");
+    expect(tauriSource).toContain("max_tokens_per_plan?: number;");
+    expect(tauriSource).toContain("max_escalations_per_plan?: number;");
+    expect(tauriSource).toContain("max_retries_per_lane?: number;");
   });
 });
 

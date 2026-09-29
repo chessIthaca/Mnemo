@@ -516,12 +516,38 @@ pub struct RoutingWire {
     pub cheap: Option<ModelRefWire>,
     /// The model a confidently-ARCHITECTURAL task routes to (`null` = unset).
     pub capable: Option<ModelRefWire>,
+    /// The model a medium-complexity plan step routes to — the escalation-lane
+    /// rung `medium` (backlog ad56c7bd; `null` = unset: the step keeps the
+    /// configured model).
+    pub lane_medium: Option<ModelRefWire>,
+    /// The model a high-complexity plan step routes to (lane `high`).
+    pub lane_high: Option<ModelRefWire>,
+    /// The model the escalate rung routes to (lane `escalate`).
+    pub escalate: Option<ModelRefWire>,
     /// The calibrated-probability gate: a confident answer routes only at or
     /// above it; below it today's model runs.
     pub threshold: f64,
     /// Whether a confident decision switches the turn's model (`false` =
     /// shadow: classify + log only).
     pub enforce: bool,
+}
+
+/// The deterministic budget layer (`general.budget`, backlog a25a5323): spend
+/// caps the model can never override. With `enabled` on, a cap reached at a
+/// plan-step boundary PAUSES the plan through a pending question (continue for
+/// this plan / double the reached cap / end the turn) — never a hard kill.
+/// Emitted unconditionally (like `routing`), so Settings renders the current
+/// numbers and only sends what the user changed.
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetWire {
+    /// Whether the caps are enforced.
+    pub enabled: bool,
+    /// Total tokens one plan may spend (`0` = off).
+    pub max_tokens_per_plan: u64,
+    /// Escalations allowed per plan (default 1).
+    pub max_escalations_per_plan: u32,
+    /// Failed-cycle retries allowed per plan step (default 3).
+    pub max_retries_per_lane: u32,
 }
 
 /// A per-context model override (one entry of the `[models]` section). Emitted
@@ -630,6 +656,9 @@ pub struct GetSettingsGeneral {
     /// Pre-prompt model routing targets + policy (`general.routing`, backlog
     /// 091e694d) — inert while the `laya` `routing` opt-in is off.
     pub routing: RoutingWire,
+    /// The deterministic budget layer (`general.budget`, backlog a25a5323) —
+    /// the enable flag and the three caps.
+    pub budget: BudgetWire,
     /// Whether the agent's `browser_*` browser-inspection tools are enabled
     /// (exposes an unauthenticated localhost CDP port — opt-in, off by
     /// default; debug builds always expose it regardless).
@@ -833,8 +862,21 @@ fn routing_wire(routing: &mnemo::config::RoutingConfig) -> RoutingWire {
     RoutingWire {
         cheap: routing.cheap.as_ref().map(model_ref_wire),
         capable: routing.capable.as_ref().map(model_ref_wire),
+        lane_medium: routing.lane_medium.as_ref().map(model_ref_wire),
+        lane_high: routing.lane_high.as_ref().map(model_ref_wire),
+        escalate: routing.escalate.as_ref().map(model_ref_wire),
         threshold: routing.threshold,
         enforce: routing.enforce,
+    }
+}
+
+/// The wire shape of the `[general.budget]` section (backlog a25a5323).
+fn budget_wire(budget: &mnemo::config::BudgetConfig) -> BudgetWire {
+    BudgetWire {
+        enabled: budget.enabled,
+        max_tokens_per_plan: budget.max_tokens_per_plan,
+        max_escalations_per_plan: budget.max_escalations_per_plan,
+        max_retries_per_lane: budget.max_retries_per_lane,
     }
 }
 
@@ -951,6 +993,7 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
                 routing: config.general.general.laya.routing,
             },
             routing: routing_wire(&config.general.general.routing),
+            budget: budget_wire(&config.general.general.budget),
             enable_browser_inspection: config.general.general.enable_browser_inspection,
             auto_compact_on_plan_complete: config.general.general.auto_compact_on_plan_complete,
             optimizer: config.general.general.optimizer.clone(),
@@ -1460,8 +1503,17 @@ mod settings_dto_tests {
                 routing: RoutingWire {
                     cheap: None,
                     capable: None,
+                    lane_medium: None,
+                    lane_high: None,
+                    escalate: None,
                     threshold: 0.80,
                     enforce: false,
+                },
+                budget: BudgetWire {
+                    enabled: false,
+                    max_tokens_per_plan: 0,
+                    max_escalations_per_plan: 1,
+                    max_retries_per_lane: 3,
                 },
             },
             context: GetSettingsContext {
@@ -1623,8 +1675,17 @@ mod settings_dto_tests {
                 routing: RoutingWire {
                     cheap: None,
                     capable: None,
+                    lane_medium: None,
+                    lane_high: None,
+                    escalate: None,
                     threshold: 0.80,
                     enforce: false,
+                },
+                budget: BudgetWire {
+                    enabled: false,
+                    max_tokens_per_plan: 0,
+                    max_escalations_per_plan: 1,
+                    max_retries_per_lane: 3,
                 },
             },
             context: GetSettingsContext {

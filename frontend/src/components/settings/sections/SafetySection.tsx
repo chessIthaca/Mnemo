@@ -135,7 +135,7 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading safety settings…
       </div>
     );
@@ -144,10 +144,10 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-5">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Safety mode
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Controls which tool calls require human approval. Status bar quick-switch
           stays available; this panel also persists the default to config.toml.
           Bookkeeping tools (memory + plan lifecycle) never prompt.
@@ -169,7 +169,7 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
                 activeMode
                   ? m.danger
                     ? "border-red-500/60 bg-red-500/10"
-                    : "border-[color:var(--accent-color)]/50 bg-[color:var(--accent-color)]/10"
+                    : "border-(--accent-color)/50 bg-(--accent-color)/10"
                   : "border-border bg-bg-primary hover:bg-bg-tertiary/40"
               }`}
             >
@@ -178,19 +178,19 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
                   m.danger
                     ? "text-red-400"
                     : activeMode
-                      ? "text-[color:var(--accent-color)]"
-                      : "text-[color:var(--text-muted)]"
+                      ? "text-(--accent-color)"
+                      : "text-(--text-muted)"
                 }`}
               />
               <span className="min-w-0">
                 <span
                   className={`block text-sm font-medium ${
-                    m.danger ? "text-red-300" : "text-[color:var(--text-primary)]"
+                    m.danger ? "text-red-300" : "text-(--text-primary)"
                   }`}
                 >
                   {m.label}
                 </span>
-                <span className="mt-0.5 block text-xs text-[color:var(--text-muted)]">
+                <span className="mt-0.5 block text-xs text-(--text-muted)">
                   {m.description}
                 </span>
               </span>
@@ -201,11 +201,11 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
 
       <div className="space-y-1">
         <div className="flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             Safety rules (safety.toml)
           </h3>
         </div>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Patterns that auto-approve matching tool calls. Invalid TOML is rejected on save.
         </p>
         <textarea
@@ -213,7 +213,7 @@ export const SafetySection = forwardRef<SettingsSectionHandle, {
           onChange={(e) => setRules(e.target.value)}
           spellCheck={false}
           rows={12}
-          className="w-full resize-y rounded-lg border border-border bg-bg-primary px-3 py-2 font-mono text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full resize-y rounded-lg border border-border bg-bg-primary px-3 py-2 font-mono text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
           placeholder={"# safety.toml\n# [[rule]]\n# tool = \"shell\"\n# ..."}
         />
       </div>

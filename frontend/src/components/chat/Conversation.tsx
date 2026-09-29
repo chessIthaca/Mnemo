@@ -239,7 +239,7 @@ export function Conversation({ state }: ConversationProps) {
             <button
               type="button"
               onClick={() => setWindowSize((w) => w + TRANSCRIPT_WINDOW)}
-              className="rounded-full border border-border px-3 py-1 text-[0.7rem] text-[color:var(--text-muted)] transition-colors hover:border-[color:var(--accent-color)] hover:text-[color:var(--accent-color)]"
+              className="rounded-full border border-border px-3 py-1 text-[0.7rem] text-(--text-muted) transition-colors hover:border-(--accent-color) hover:text-(--accent-color)"
             >
               Show earlier messages ({hidden} hidden)
             </button>

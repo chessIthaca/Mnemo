@@ -158,7 +158,7 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading embedding settings…
       </div>
     );
@@ -167,10 +167,10 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Embeddings
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           A bundled in-process model ranks memory recall by genuine semantic
           similarity (e.g. a query about "authentication" finds memories about
           "login tokens" even with no shared keywords). It runs entirely on
@@ -189,7 +189,7 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
               key={m.id}
               className={`rounded-lg border p-3 transition-colors ${
                 isSel
-                  ? "border-[color:var(--accent-color)] bg-[color:var(--accent-color)]/5"
+                  ? "border-(--accent-color) bg-(--accent-color)/5"
                   : "border-border bg-bg-primary"
               }`}
             >
@@ -199,37 +199,37 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
                   name="bundled-embed-model"
                   checked={isSel}
                   onChange={() => setSelected(m.id)}
-                  className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                  className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
                 />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-[color:var(--text-primary)]">
+                    <span className="text-sm font-medium text-(--text-primary)">
                       {m.name}
                     </span>
                     {m.installed ? (
-                      <span className="flex items-center gap-0.5 rounded bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
+                      <span className="flex items-center gap-0.5 rounded-sm bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
                         <Check className="h-3 w-3" /> installed
                       </span>
                     ) : (
-                      <span className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)]">
+                      <span className="rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-(--text-muted)">
                         {m.size_mb} MB
                       </span>
                     )}
                   </div>
-                  <div className="mt-0.5 text-[0.7rem] text-[color:var(--text-muted)]">
+                  <div className="mt-0.5 text-[0.7rem] text-(--text-muted)">
                     <code>{m.id}</code> · {m.dim}-dim
                   </div>
                 </div>
               </label>
               {isDl && (
                 <div className="mt-2">
-                  <div className="mb-1 flex items-center justify-between text-[0.7rem] text-[color:var(--text-muted)]">
+                  <div className="mb-1 flex items-center justify-between text-[0.7rem] text-(--text-muted)">
                     <span>Downloading…</span>
                     <span>{fmtPct(progress * 100)}%</span>
                   </div>
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
                     <div
-                      className="h-full rounded-full bg-[color:var(--accent-color)] transition-[width] duration-300"
+                      className="h-full rounded-full bg-(--accent-color) transition-[width] duration-300"
                       style={{ width: `${Math.round(progress * 100)}%` }}
                     />
                   </div>
@@ -239,7 +239,7 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
                 <button
                   type="button"
                   onClick={() => void handleDownload(m.id)}
-                  className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50"
+                  className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-(--text-primary) hover:border-(--accent-color)/50"
                 >
                   <Download className="h-3.5 w-3.5" />
                   Download ({m.size_mb} MB)
@@ -250,17 +250,17 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
         })}
       </div>
 
-      <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex items-center gap-2 text-sm text-(--text-primary)">
         <input
           type="radio"
           name="bundled-embed-model"
           checked={selected === null}
           onChange={() => setSelected(null)}
-          className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           None (keyword-only)
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — offline, no download, no semantic matching
           </span>
         </span>
@@ -277,7 +277,7 @@ export const EmbeddingSection = forwardRef<SettingsSectionHandle, {
         </div>
       )}
       {saving && (
-        <div className="text-xs text-[color:var(--text-muted)]">Saving…</div>
+        <div className="text-xs text-(--text-muted)">Saving…</div>
       )}
     </div>
   );

@@ -85,7 +85,7 @@ function Legend({
         const off = hidden?.has(it.key) ?? false;
         const chip = (
           <>
-            <span className={`h-1.5 w-1.5 rounded-sm ${it.cls} ${off ? "opacity-30" : ""}`} />
+            <span className={`h-1.5 w-1.5 rounded-xs ${it.cls} ${off ? "opacity-30" : ""}`} />
             <span className={off ? "line-through" : undefined}>{it.label}</span>
           </>
         );
@@ -104,7 +104,7 @@ function Legend({
             aria-label={`${off ? "Show" : "Hide"} ${it.label}`}
             title={off ? `Show ${it.label}` : `Hide ${it.label} (click to show/hide)`}
             onClick={() => onToggle(it.key)}
-            className={`flex cursor-pointer items-center gap-1 rounded px-0.5 text-[0.62em] transition-opacity hover:opacity-80 ${
+            className={`flex cursor-pointer items-center gap-1 rounded-sm px-0.5 text-[0.62em] transition-opacity hover:opacity-80 ${
               off ? "text-slate-600" : "text-slate-500"
             }`}
           >
@@ -198,9 +198,9 @@ function Column({
     >
       {/* The faint full-height track keeps empty/zero columns visible; the
           bar itself is anchored to the bottom. */}
-      <div className="flex min-h-0 w-full flex-1 items-end overflow-hidden rounded-sm bg-bg-tertiary/40">
+      <div className="flex min-h-0 w-full flex-1 items-end overflow-hidden rounded-xs bg-bg-tertiary/40">
         <div
-          className="flex w-full flex-col-reverse overflow-hidden rounded-sm"
+          className="flex w-full flex-col-reverse overflow-hidden rounded-xs"
           style={{ height: `${heightPct}%` }}
         >
           {children}
@@ -238,7 +238,7 @@ function Column({
                 {tipRows.map((r) => (
                   <div key={r.label} className="flex items-center justify-between gap-4">
                     <span className="flex items-center gap-1.5 text-slate-400">
-                      {r.cls && <span className={`h-1.5 w-1.5 rounded-sm ${r.cls}`} />}
+                      {r.cls && <span className={`h-1.5 w-1.5 rounded-xs ${r.cls}`} />}
                       {r.label}
                     </span>
                     <span className="font-mono text-slate-200">{r.value}</span>
@@ -290,7 +290,7 @@ function PhaseChart({
   const hasData = rows.some((r) => stackTotal(phaseMsByKey(r), heightVisibility) > 0);
   const maxTotal = Math.max(0, ...rows.map((r) => stackTotal(phaseMsByKey(r), heightVisibility)));
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded border border-border p-2">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded-sm border border-border p-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[0.68em] font-semibold uppercase tracking-wide text-slate-400">
           Phase time per request
@@ -401,7 +401,7 @@ function TokenChart({
   const hasData = rows.some((r) => stackTotal(tokenMsByKey(r), heightVisibility) > 0);
   const maxStack = Math.max(0, ...rows.map((r) => stackTotal(tokenMsByKey(r), heightVisibility)));
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded border border-border p-2">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col rounded-sm border border-border p-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[0.68em] font-semibold uppercase tracking-wide text-slate-400">
           Tokens per request
@@ -509,7 +509,7 @@ export function TraceStats({ rows, height }: { rows: LlmRequestSummary[]; height
   const modeBtn = (m: ScaleMode, label: string) => (
     <button
       onClick={() => selectMode(m)}
-      className={`rounded px-1.5 py-0.5 text-[0.62em] font-medium normal-case tracking-normal transition-colors ${
+      className={`rounded-sm px-1.5 py-0.5 text-[0.62em] font-medium normal-case tracking-normal transition-colors ${
         mode === m
           ? "bg-cyan-500/20 text-cyan-300"
           : "bg-bg-tertiary text-slate-400 hover:text-slate-200"
@@ -534,7 +534,7 @@ export function TraceStats({ rows, height }: { rows: LlmRequestSummary[]; height
           </span>
         </div>
         <div className="flex items-center gap-3 overflow-x-auto font-mono text-[0.65em] text-slate-500">
-          <span title="requests in the ring buffer">{summary.count} reqs</span>
+          <span title="requests in the ring-3 buffer">{summary.count} reqs</span>
           <span title="total local prep time (prompt build, token counting, recall)">
             Σ prep {fmtPhase(summary.totalPrepMs)}
           </span>

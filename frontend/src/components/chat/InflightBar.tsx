@@ -474,7 +474,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                   <div className="mb-0.5 flex items-center justify-between">
                     <span className="text-slate-600">quality</span>
                     <span
-                      className={`rounded px-1 font-semibold ${qualityColor(
+                      className={`rounded-sm px-1 font-semibold ${qualityColor(
                         contextUsage.quality.grade,
                       )}`}
                     >
@@ -525,7 +525,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                   }
                 }}
                 disabled={running || agentId === null}
-                className="mt-1.5 w-full rounded border border-cyan-600/40 bg-cyan-600/10 px-2 py-1 text-cyan-400 transition-colors hover:bg-cyan-600/20 disabled:cursor-not-allowed disabled:opacity-40"
+                className="mt-1.5 w-full rounded-sm border border-cyan-600/40 bg-cyan-600/10 px-2 py-1 text-cyan-400 transition-colors hover:bg-cyan-600/20 disabled:cursor-not-allowed disabled:opacity-40"
                 title={
                   running
                     ? "Wait for the agent to finish before compacting"
@@ -581,6 +581,6 @@ function ActivityLine({ entry }: { entry: ActivityEntry }) {
           : "text-slate-300";
 
   return (
-    <div className={`whitespace-pre-wrap break-words py-0.5 ${color}`}>{entry.text}</div>
+    <div className={`whitespace-pre-wrap wrap-break-word py-0.5 ${color}`}>{entry.text}</div>
   );
 }

@@ -211,7 +211,7 @@ export function BrowserView() {
   if (!supported) {
     return (
       <div className="flex h-full flex-col gap-2 p-2 text-[0.875em]">
-        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded border border-red-900 bg-red-950/40 p-4 text-center">
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 rounded-sm border border-red-900 bg-red-950/40 p-4 text-center">
           <h3 className="text-[1.05em] font-semibold text-red-300">
             Browser tab unavailable on this platform
           </h3>
@@ -238,13 +238,13 @@ export function BrowserView() {
             if (e.key === "Enter") void openUrl();
           }}
           placeholder="e.g. google.com, http://localhost:3000, or file:///C:/page.html"
-          className="min-w-0 flex-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500 focus:outline-none"
+          className="min-w-0 flex-1 rounded-sm border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500 focus:outline-hidden"
         />
         <button
           onClick={() => void stopLoad()}
           title="Stop loading the page"
           aria-label="Stop loading the page"
-          className="flex items-center rounded border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
+          className="flex items-center rounded-sm border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -252,14 +252,14 @@ export function BrowserView() {
           onClick={() => void reloadPage()}
           title="Reload the current page (bypasses cache)"
           aria-label="Reload the current page (bypasses cache)"
-          className="flex items-center rounded border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
+          className="flex items-center rounded-sm border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
         >
           <RotateCw className="h-3.5 w-3.5" />
         </button>
         <button
           onClick={() => void openUrl()}
           title="Load the URL in the browser"
-          className="flex items-center gap-1 rounded border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
+          className="flex items-center gap-1 rounded-sm border border-border bg-bg-tertiary px-2 py-1 text-[0.85em] text-slate-300 hover:text-cyan-400"
         >
           <ExternalLink className="h-3.5 w-3.5" />
           Open
@@ -267,7 +267,7 @@ export function BrowserView() {
       </div>
 
       {error && (
-        <div className="rounded border border-red-900 bg-red-950/40 px-2 py-1 text-[0.8em] text-red-300">
+        <div className="rounded-sm border border-red-900 bg-red-950/40 px-2 py-1 text-[0.8em] text-red-300">
           {error}
         </div>
       )}
@@ -275,7 +275,7 @@ export function BrowserView() {
       {/* Placeholder for the native child WebView2 — the child renders above
           this rect as a separate HWND. The human plays here; the agent
           inspects/controls it via the browser_* tools (CDP attach to the child). */}
-      <div className="flex min-h-0 flex-1 overflow-hidden rounded border border-border bg-bg-tertiary">
+      <div className="flex min-h-0 flex-1 overflow-hidden rounded-sm border border-border bg-bg-tertiary">
         <div ref={areaRef} className="h-full w-full">
           {!loadedUrl && (
             <div className="flex h-full flex-col items-center justify-center text-slate-500">

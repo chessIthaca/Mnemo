@@ -73,7 +73,7 @@ function MemoryEntryCard({
         <span className="truncate text-slate-300">{queryLabel}</span>
       )}
       {entry.tier && (
-        <span className="rounded bg-violet-900/50 px-[0.375em] py-[0.125em] text-[0.65em] uppercase tracking-wide text-violet-300">
+        <span className="rounded-sm bg-violet-900/50 px-[0.375em] py-[0.125em] text-[0.65em] uppercase tracking-wide text-violet-300">
           {entry.tier}
         </span>
       )}
@@ -119,7 +119,7 @@ function MemoryEntryCard({
         <div className="mt-[0.25em] space-y-[0.15em]">
           {hits.map((h, i) => (
             <div key={i} className="flex items-center gap-[0.25em]">
-              <span className="rounded bg-violet-900/50 px-[0.375em] py-[0.125em] text-[0.65em] uppercase tracking-wide text-violet-300">
+              <span className="rounded-sm bg-violet-900/50 px-[0.375em] py-[0.125em] text-[0.65em] uppercase tracking-wide text-violet-300">
                 {h.tier}
               </span>
               <span className="truncate text-slate-400">{h.title}</span>
@@ -205,7 +205,7 @@ function VisionEntryCard({
         <div className="mt-[0.25em] space-y-[0.4em]">
           <div>
             <div className="text-[0.75em] text-slate-500">vision query</div>
-            <div className="whitespace-pre-wrap break-words text-slate-300">
+            <div className="whitespace-pre-wrap wrap-break-word text-slate-300">
               {entry.query}
             </div>
           </div>
@@ -214,7 +214,7 @@ function VisionEntryCard({
               {done && !entry.success ? "description unavailable" : "vision response"}
             </div>
             <div
-              className={`whitespace-pre-wrap break-words ${
+              className={`whitespace-pre-wrap wrap-break-word ${
                 done && !entry.success ? "text-red-400" : "text-slate-300"
               }`}
             >
@@ -283,7 +283,7 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
           <div className="pl-[1em]">
             <div className="text-sm text-slate-200">
               <div
-                className={`whitespace-pre-wrap break-words ${
+                className={`whitespace-pre-wrap wrap-break-word ${
                   chatProseCap ? "max-w-[100ch]" : ""
                 }`}
               >
@@ -319,7 +319,7 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
                   if (isInline) {
                     return (
                       <code
-                        className="inline-code rounded bg-bg-tertiary px-1.5 py-0.5 text-xs"
+                        className="inline-code rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-xs"
                         {...props}
                       >
                         {children}
@@ -357,7 +357,7 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
           <div className="rounded-lg rounded-bl-sm border border-amber-500/50 bg-amber-950/40 px-4 py-2 text-sm text-amber-200">
             <div className="flex items-center gap-2">
               <Compass className="h-3.5 w-3.5 shrink-0 text-amber-400" />
-              <span className="whitespace-pre-wrap break-words">{entry.text}</span>
+              <span className="whitespace-pre-wrap wrap-break-word">{entry.text}</span>
             </div>
             {entry.images && entry.images.length > 0 && (
               <div className="mt-2 flex flex-wrap gap-2">
@@ -397,7 +397,7 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
             </span>
           </div>
           {entry.prompt && (
-            <div className="mt-[0.25em] text-slate-500 whitespace-pre-wrap break-words">
+            <div className="mt-[0.25em] text-slate-500 whitespace-pre-wrap wrap-break-word">
               {entry.prompt}
             </div>
           )}
@@ -413,7 +413,7 @@ function MessageImpl({ entry, streaming = false }: MessageProps) {
             <p className="mb-2 text-sm text-slate-100">{entry.question}</p>
             <div className="flex items-start gap-2 text-sm">
               <span className="shrink-0 text-cyan-400">→</span>
-              <span className="whitespace-pre-wrap break-words text-slate-200">
+              <span className="whitespace-pre-wrap wrap-break-word text-slate-200">
                 {entry.answer}
               </span>
             </div>
@@ -708,7 +708,7 @@ function ToolCard({
         <pre
           ref={liveTailRef}
           aria-live="polite"
-          className="mt-[0.15em] h-[10em] overflow-auto whitespace-pre-wrap break-words rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-400"
+          className="mt-[0.15em] h-[10em] overflow-auto whitespace-pre-wrap wrap-break-word rounded-sm bg-bg-primary p-[0.5em] text-[0.75em] text-slate-400"
         >
           {liveTail}
         </pre>
@@ -836,7 +836,7 @@ function CallDetail({
               cwd: {shellArgs.cwd}
             </div>
           )}
-          <pre className="overflow-x-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
+          <pre className="overflow-x-auto rounded-sm bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
             {shellArgs.command}
           </pre>
         </div>
@@ -844,7 +844,7 @@ function CallDetail({
         prettyArgs && (
           <div>
             <div className="mb-[0.15em] text-[0.75em] text-slate-500">args</div>
-            <pre className="overflow-x-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
+            <pre className="overflow-x-auto rounded-sm bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
               {prettyArgs}
             </pre>
           </div>
@@ -891,21 +891,21 @@ function CallDetail({
           ) : shellOut ? (
             <>
               {shellStdout !== "" && (
-                <pre className="max-h-[24em] overflow-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
+                <pre className="max-h-[24em] overflow-auto rounded-sm bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
                   {shellStdout}
                 </pre>
               )}
               {shellStderr !== null && shellStderr !== "" && (
                 <div className="mt-[0.4em]">
                   <div className="mb-[0.15em] text-[0.75em] text-slate-500">stderr</div>
-                  <pre className="max-h-[24em] overflow-auto rounded bg-red-950/40 p-[0.5em] text-[0.75em] text-red-300">
+                  <pre className="max-h-[24em] overflow-auto rounded-sm bg-red-950/40 p-[0.5em] text-[0.75em] text-red-300">
                     {shellStderr}
                   </pre>
                 </div>
               )}
             </>
           ) : (
-            <pre className="max-h-[24em] overflow-auto rounded bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
+            <pre className="max-h-[24em] overflow-auto rounded-sm bg-bg-primary p-[0.5em] text-[0.75em] text-slate-300">
               {stripSteeringNotes(call.result.output, hiddenSteeringNotes)}
             </pre>
           )}

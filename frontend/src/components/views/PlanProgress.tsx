@@ -245,7 +245,7 @@ export function PlanProgress() {
               style={{ paddingLeft: `${parents.length * 14 + 4}px` }}
             >
               <span className="text-purple-400 select-none">↳</span>
-              <span className="rounded bg-purple-950/40 px-1.5 py-0.5 text-purple-300">
+              <span className="rounded-sm bg-purple-950/40 px-1.5 py-0.5 text-purple-300">
                 skill: {activeSkill.name}
               </span>
             </div>
@@ -257,7 +257,7 @@ export function PlanProgress() {
       <div className="mb-3">
         <h3 className="text-[0.875em] font-semibold text-cyan-400">{plan.title}</h3>
         <div className="mt-1 flex items-center gap-2 text-[0.75em]">
-          <span className={`rounded px-1.5 py-0.5 ${
+          <span className={`rounded-sm px-1.5 py-0.5 ${
             state === "executing" ? "bg-green-950/50 text-green-400" :
             state === "reviewing" ? "bg-purple-950/50 text-purple-400" :
             state === "complete" ? "bg-blue-950/50 text-blue-400" :

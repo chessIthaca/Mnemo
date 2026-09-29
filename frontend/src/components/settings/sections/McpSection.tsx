@@ -114,9 +114,9 @@ function fromEdit(e: McpEdit): McpServer {
 }
 
 const inputCls =
-  "w-full rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-sm text-[color:var(--text-primary)] outline-none focus:border-[color:var(--accent-color)]";
+  "w-full rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-sm text-(--text-primary) outline-hidden focus:border-(--accent-color)";
 const btnCls =
-  "rounded-lg border border-border px-3 py-1 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)] disabled:opacity-40";
+  "rounded-lg border border-border px-3 py-1 text-xs text-(--text-muted) hover:text-(--text-primary) disabled:opacity-40";
 
 /**
  * MCP section — configure Model Context Protocol servers (`mcp.toml`).
@@ -252,14 +252,14 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
 
     if (loading && !draft) {
       return (
-        <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="py-6 text-center text-xs text-(--text-muted)">
           Loading MCP servers…
         </div>
       );
     }
     if (!draft) {
       return (
-        <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="py-6 text-center text-xs text-(--text-muted)">
           {error ?? "MCP servers unavailable."}
         </div>
       );
@@ -270,10 +270,10 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
     return (
       <div className="space-y-5">
         <div className="space-y-3">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             MCP Servers
           </h3>
-          <p className="text-xs text-[color:var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             Servers expose their tools to the agent as a deferred group — the agent calls{" "}
             <code>load_tools</code> with <code>mcp.&lt;name&gt;</code> on first use. Every MCP
             tool call goes through your approval gate. Env entries are variable NAMES; values
@@ -281,7 +281,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
           </p>
 
           {draft.length === 0 && (
-            <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-xs text-[color:var(--text-muted)]">
+            <div className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-xs text-(--text-muted)">
               No MCP servers configured. Add one to expose its tools to the agent.
             </div>
           )}
@@ -294,7 +294,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                 className="space-y-2 rounded-lg border border-border bg-bg-tertiary/50 px-3 py-2.5"
               >
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-medium text-[color:var(--text-primary)]">
+                  <span className="text-sm font-medium text-(--text-primary)">
                     {s.name || "(unnamed)"}
                   </span>
                   <select
@@ -303,32 +303,32 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                       patchAt(i, { source: e.target.value as "global" | "project" })
                     }
                     title="Which file this server is saved to — project overrides win by name over global"
-                    className="rounded border border-border bg-bg-primary px-1 py-0.5 text-[0.7rem] text-[color:var(--text-muted)]"
+                    className="rounded-sm border border-border bg-bg-primary px-1 py-0.5 text-[0.7rem] text-(--text-muted)"
                   >
                     <option value="global">global</option>
                     <option value="project">project</option>
                   </select>
-                  <span className="min-w-0 flex-1 truncate text-xs text-[color:var(--text-muted)]">
+                  <span className="min-w-0 flex-1 truncate text-xs text-(--text-muted)">
                     {mcpTransportSummary(s)}
                   </span>
-                  <label className="flex items-center gap-1.5 text-xs text-[color:var(--text-muted)]">
+                  <label className="flex items-center gap-1.5 text-xs text-(--text-muted)">
                     <input
                       type="checkbox"
                       checked={s.enabled}
                       onChange={(e) => patchAt(i, { enabled: e.target.checked })}
-                      className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                      className="h-3.5 w-3.5 accent-(--accent-color)"
                     />
                     enabled
                   </label>
                   <label
-                    className="flex items-center gap-1.5 text-xs text-[color:var(--text-muted)]"
+                    className="flex items-center gap-1.5 text-xs text-(--text-muted)"
                     title="Trusted servers' tools run without per-call approval prompts (approval-only — the plan-first state gates never widen)"
                   >
                     <input
                       type="checkbox"
                       checked={s.trusted ?? false}
                       onChange={(e) => patchAt(i, { trusted: e.target.checked })}
-                      className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                      className="h-3.5 w-3.5 accent-(--accent-color)"
                     />
                     trusted
                   </label>
@@ -396,7 +396,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                           ? "text-emerald-300"
                           : statuses[s.name]?.last_error
                             ? "text-red-300"
-                            : "text-[color:var(--text-muted)]"
+                            : "text-(--text-muted)"
                       }`}
                     >
                       {line}
@@ -408,7 +408,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                   <div className="space-y-2 border-t border-border pt-2">
                     <div className="grid grid-cols-2 gap-2">
                       <label className="space-y-1">
-                        <span className="text-xs text-[color:var(--text-muted)]">Name</span>
+                        <span className="text-xs text-(--text-muted)">Name</span>
                         <input
                           id={`${inputId}name-${i}`}
                           value={editing.name}
@@ -418,7 +418,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                         />
                       </label>
                       <label className="space-y-1">
-                        <span className="text-xs text-[color:var(--text-muted)]">Transport</span>
+                        <span className="text-xs text-(--text-muted)">Transport</span>
                         <select
                           value={editing.transport}
                           onChange={(e) =>
@@ -437,7 +437,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                     {editing.transport === "stdio" ? (
                       <div className="space-y-2">
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">Command</span>
+                          <span className="text-xs text-(--text-muted)">Command</span>
                           <input
                             value={editing.command}
                             onChange={(e) => setEditing({ ...editing, command: e.target.value })}
@@ -446,7 +446,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                           />
                         </label>
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">
+                          <span className="text-xs text-(--text-muted)">
                             Arguments (one per line)
                           </span>
                           <textarea
@@ -458,7 +458,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                           />
                         </label>
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">
+                          <span className="text-xs text-(--text-muted)">
                             Env var names (one per line — values come from your environment)
                           </span>
                           <textarea
@@ -473,7 +473,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                     ) : (
                       <div className="space-y-2">
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">URL</span>
+                          <span className="text-xs text-(--text-muted)">URL</span>
                           <input
                             value={editing.url}
                             onChange={(e) => setEditing({ ...editing, url: e.target.value })}
@@ -482,7 +482,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                           />
                         </label>
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">Auth</span>
+                          <span className="text-xs text-(--text-muted)">Auth</span>
                           <select
                             value={editing.auth}
                             onChange={(e) => setEditing({ ...editing, auth: e.target.value })}
@@ -496,7 +496,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                         </label>
                         {editing.auth === "oauth" && (
                           <label className="block space-y-1">
-                            <span className="text-xs text-[color:var(--text-muted)]">
+                            <span className="text-xs text-(--text-muted)">
                               OAuth client id (pre-registered with the server)
                             </span>
                             <input
@@ -511,7 +511,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                         )}
                         {editing.auth === "oauth" && (
                           <label className="block space-y-1">
-                            <span className="text-xs text-[color:var(--text-muted)]">
+                            <span className="text-xs text-(--text-muted)">
                               OAuth scopes (space-separated)
                             </span>
                             <input
@@ -525,7 +525,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                           </label>
                         )}
                         <label className="block space-y-1">
-                          <span className="text-xs text-[color:var(--text-muted)]">
+                          <span className="text-xs text-(--text-muted)">
                             Headers (one per line: Header=ENV_VAR_NAME — values come from your
                             environment)
                           </span>
@@ -542,7 +542,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
                       </div>
                     )}
                     <label className="block space-y-1">
-                      <span className="text-xs text-[color:var(--text-muted)]">
+                      <span className="text-xs text-(--text-muted)">
                         Idle timeout (seconds — empty = keep the connection until it fails)
                       </span>
                       <input
@@ -577,14 +577,14 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
           <button
             type="button"
             onClick={() => setDraft([...draft, blankMcpServer()])}
-            className="rounded-lg border border-dashed border-border px-3 py-1.5 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="rounded-lg border border-dashed border-border px-3 py-1.5 text-xs text-(--text-muted) hover:text-(--text-primary)"
           >
             + Add server
           </button>
           <button
             type="button"
             onClick={refreshStatus}
-            className="rounded-lg border border-border px-3 py-1.5 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="rounded-lg border border-border px-3 py-1.5 text-xs text-(--text-muted) hover:text-(--text-primary)"
             title="Refresh the live status lines"
           >
             Refresh status
@@ -607,7 +607,7 @@ export const McpSection = forwardRef<SettingsSectionHandle, McpSectionProps>(
           </div>
         )}
         {saving && (
-          <div className="text-xs text-[color:var(--text-muted)]">Saving…</div>
+          <div className="text-xs text-(--text-muted)">Saving…</div>
         )}
       </div>
     );

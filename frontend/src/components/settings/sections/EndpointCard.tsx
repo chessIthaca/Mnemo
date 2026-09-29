@@ -286,7 +286,7 @@ ${refResolvedEffort}`;
     <div
       className={`space-y-3 rounded-lg border px-3 py-3 ${
         isDefault
-          ? "border-[color:var(--accent-color)]/50 bg-[color:var(--accent-color)]/5"
+          ? "border-(--accent-color)/50 bg-(--accent-color)/5"
           : "border-border bg-bg-primary"
       }`}
     >
@@ -297,7 +297,7 @@ ${refResolvedEffort}`;
           aria-expanded={open}
           aria-label={open ? "Collapse endpoint" : "Expand endpoint"}
           title={open ? "Collapse endpoint" : "Expand endpoint"}
-          className="shrink-0 rounded p-0.5 text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--text-primary)]"
+          className="shrink-0 rounded-sm p-0.5 text-(--text-muted) transition-colors hover:text-(--text-primary)"
         >
           <ChevronDown
             className={`h-4 w-4 transition-transform duration-150 ${open ? "" : "-rotate-90"}`}
@@ -306,8 +306,8 @@ ${refResolvedEffort}`;
         <KeyRound
           className={`h-4 w-4 shrink-0 ${
             isDefault
-              ? "text-[color:var(--accent-color)]"
-              : "text-[color:var(--text-muted)]"
+              ? "text-(--accent-color)"
+              : "text-(--text-muted)"
           }`}
         />
         <label className="sr-only" htmlFor={nameId}>
@@ -319,23 +319,23 @@ ${refResolvedEffort}`;
           onChange={(e) => onNameChange(e.target.value)}
           placeholder="endpoint name"
           spellCheck={false}
-          className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1 text-sm font-medium text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1 text-sm font-medium text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
         {isDefault && (
-          <span className="shrink-0 rounded-full bg-[color:var(--accent-color)]/20 px-2 py-0.5 text-[0.65rem] font-medium uppercase tracking-wide text-[color:var(--accent-color)]">
+          <span className="shrink-0 rounded-full bg-(--accent-color)/20 px-2 py-0.5 text-[0.65rem] font-medium uppercase tracking-wide text-(--accent-color)">
             Default
           </span>
         )}
         {isDefault && defaultModel && (
           <span
             title={defaultModel}
-            className="max-w-40 shrink-0 truncate rounded-full bg-[color:var(--accent-color)]/10 px-2 py-0.5 text-[0.65rem] text-[color:var(--accent-color)]"
+            className="max-w-40 shrink-0 truncate rounded-full bg-(--accent-color)/10 px-2 py-0.5 text-[0.65rem] text-(--accent-color)"
           >
             ★ {defaultModel}
           </span>
         )}
         {!open && !(isDefault && defaultModel) && (
-          <span className="shrink-0 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="shrink-0 text-[0.7rem] text-(--text-muted)">
             {endpoint.models.length} model{endpoint.models.length === 1 ? "" : "s"}
           </span>
         )}
@@ -344,14 +344,14 @@ ${refResolvedEffort}`;
           onClick={onDelete}
           title="Delete endpoint"
           aria-label="Delete endpoint"
-          className="shrink-0 rounded p-1 text-[color:var(--text-muted)] transition-colors hover:bg-red-500/10 hover:text-red-400"
+          className="shrink-0 rounded-sm p-1 text-(--text-muted) transition-colors hover:bg-red-500/10 hover:text-red-400"
         >
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
 
       {open && (
-        <div className="flex items-center gap-2 rounded bg-bg-secondary px-2 py-1.5">
+        <div className="flex items-center gap-2 rounded-sm bg-bg-secondary px-2 py-1.5">
           <label className="sr-only" htmlFor={kindId}>
             Provider kind
           </label>
@@ -360,7 +360,7 @@ ${refResolvedEffort}`;
             value={endpoint.kind}
             onChange={(e) => onEndpointChange({ kind: e.target.value })}
             title="Provider kind"
-            className="shrink-0 rounded border border-border bg-bg-primary px-1.5 py-1 font-mono text-[0.7rem] uppercase text-[color:var(--text-muted)] focus:border-[color:var(--accent-color)] focus:outline-none"
+            className="shrink-0 rounded-sm border border-border bg-bg-primary px-1.5 py-1 font-mono text-[0.7rem] uppercase text-(--text-muted) focus:border-(--accent-color) focus:outline-hidden"
           >
             {KIND_OPTIONS.map((k) => (
               <option key={k} value={k}>
@@ -377,14 +377,14 @@ ${refResolvedEffort}`;
             onChange={(e) => onEndpointChange({ base_url: e.target.value })}
             placeholder="https://api.example.com/v1/ (trailing / auto-added)"
             spellCheck={false}
-            className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 py-1 text-[0.7rem] text-[color:var(--text-muted)] focus:border-[color:var(--accent-color)] focus:bg-bg-primary focus:outline-none"
+            className="min-w-0 flex-1 rounded-sm border border-transparent bg-transparent px-1 py-1 text-[0.7rem] text-(--text-muted) focus:border-(--accent-color) focus:bg-bg-primary focus:outline-hidden"
           />
           <button
             type="button"
             onClick={onToggle}
             aria-expanded={open}
             title={open ? "Collapse endpoint" : "Expand endpoint"}
-            className="shrink-0 rounded px-1.5 py-0.5 text-[0.7rem] text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--text-primary)]"
+            className="shrink-0 rounded-sm px-1.5 py-0.5 text-[0.7rem] text-(--text-muted) transition-colors hover:text-(--text-primary)"
           >
             {endpoint.models.length} model{endpoint.models.length === 1 ? "" : "s"}
           </button>
@@ -395,7 +395,7 @@ ${refResolvedEffort}`;
         <>
           <div className="flex items-center gap-2">
             <label
-              className="w-16 shrink-0 text-xs text-[color:var(--text-muted)]"
+              className="w-16 shrink-0 text-xs text-(--text-muted)"
               htmlFor={keyId}
             >
               API key
@@ -408,14 +408,14 @@ ${refResolvedEffort}`;
               placeholder={showKey ? "enter key…" : "••••••••••••"}
               spellCheck={false}
               autoComplete="off"
-              className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             />
             <button
               type="button"
               onClick={() => setShowKey((s) => !s)}
               title={showKey ? "Hide key" : "Show key"}
               aria-label={showKey ? "Hide API key" : "Show API key"}
-              className="shrink-0 rounded p-1.5 text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--text-primary)]"
+              className="shrink-0 rounded-sm p-1.5 text-(--text-muted) transition-colors hover:text-(--text-primary)"
             >
               {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
             </button>
@@ -423,7 +423,7 @@ ${refResolvedEffort}`;
 
           <div className="grid grid-cols-2 gap-2">
             <label
-              className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]"
+              className="flex items-center gap-2 text-xs text-(--text-muted)"
               title="Unchecked = omit the reasoning control entirely (on Anthropic that field is output_config.effort, so nothing is sent)."
             >
               <input
@@ -432,19 +432,19 @@ ${refResolvedEffort}`;
                 onChange={(e) =>
                   onEndpointChange({ supports_reasoning_effort: e.target.checked })
                 }
-                className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                className="h-3.5 w-3.5 accent-(--accent-color)"
               />
               Supports reasoning effort
             </label>
             <label
-              className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]"
+              className="flex items-center gap-2 text-xs text-(--text-muted)"
               title="Endpoint-level default. Per-model Vision checkboxes (under each model row) override this — e.g. a text-only GLM and a vision-capable GLM flash on one Ollama endpoint."
             >
               <input
                 type="checkbox"
                 checked={endpoint.multimodal}
                 onChange={(e) => onEndpointChange({ multimodal: e.target.checked })}
-                className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                className="h-3.5 w-3.5 accent-(--accent-color)"
               />
               Multimodal (images)
             </label>
@@ -452,7 +452,7 @@ ${refResolvedEffort}`;
 
           <div className="flex items-center gap-2">
             <label
-              className="shrink-0 text-xs text-[color:var(--text-muted)]"
+              className="shrink-0 text-xs text-(--text-muted)"
               htmlFor={effortId}
             >
               Effort
@@ -473,7 +473,7 @@ ${refResolvedEffort}`;
                     ? "Default reasoning effort for this endpoint — sent as output_config.effort (the Messages API has no reasoning_effort field)"
                     : "Default reasoning effort for this endpoint"
               }
-              className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+              className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
             >
               <option value={REASONING_EFFORT_DEFAULT}>Default (max)</option>
               {REASONING_EFFORTS.map((r) => (
@@ -483,7 +483,7 @@ ${refResolvedEffort}`;
               ))}
             </select>
             {!endpoint.supports_reasoning_effort && (
-              <span className="shrink-0 text-[0.7rem] text-[color:var(--text-muted)]">
+              <span className="shrink-0 text-[0.7rem] text-(--text-muted)">
                 field omitted
               </span>
             )}
@@ -492,7 +492,7 @@ ${refResolvedEffort}`;
           {endpoint.kind === "anthropic" && (
             <div className="flex items-center gap-2">
               <label
-                className="shrink-0 text-xs text-[color:var(--text-muted)]"
+                className="shrink-0 text-xs text-(--text-muted)"
                 htmlFor={wsId}
               >
                 Workspace ID
@@ -504,7 +504,7 @@ ${refResolvedEffort}`;
                 onChange={(e) => onEndpointChange({ workspace_id: e.target.value })}
                 placeholder="ws_… (optional)"
                 title="Optional Anthropic workspace id — sent as the anthropic-workspace-id header so usage is attributed to that workspace"
-                className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
           )}
@@ -512,7 +512,7 @@ ${refResolvedEffort}`;
           <div className="grid grid-cols-2 gap-2">
             <div className="flex items-center gap-2">
               <label
-                className="shrink-0 text-xs text-[color:var(--text-muted)]"
+                className="shrink-0 text-xs text-(--text-muted)"
                 htmlFor={maxCtxId}
               >
                 Max context
@@ -529,12 +529,12 @@ ${refResolvedEffort}`;
                     onEndpointChange({ max_context: v });
                   }
                 }}
-                className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <div className="flex items-center gap-2">
               <label
-                className="shrink-0 text-xs text-[color:var(--text-muted)]"
+                className="shrink-0 text-xs text-(--text-muted)"
                 htmlFor={maxOutId}
               >
                 Max output
@@ -551,7 +551,7 @@ ${refResolvedEffort}`;
                     onEndpointChange({ max_output_tokens: v });
                   }
                 }}
-                className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
           </div>
@@ -581,7 +581,7 @@ ${refResolvedEffort}`;
                           }),
                         })
                       }
-                      className="underline underline-offset-2 hover:text-[color:var(--accent-color)]"
+                      className="underline underline-offset-2 hover:text-(--accent-color)"
                     >
                       Apply discovered
                     </button>
@@ -603,7 +603,7 @@ ${refResolvedEffort}`;
                           }),
                         })
                       }
-                      className="underline underline-offset-2 hover:text-[color:var(--accent-color)]"
+                      className="underline underline-offset-2 hover:text-(--accent-color)"
                     >
                       Apply discovered
                     </button>
@@ -639,7 +639,7 @@ ${refResolvedEffort}`;
                           }),
                         })
                       }
-                      className="underline underline-offset-2 hover:text-[color:var(--accent-color)]"
+                      className="underline underline-offset-2 hover:text-(--accent-color)"
                     >
                       Apply discovered
                     </button>
@@ -647,13 +647,13 @@ ${refResolvedEffort}`;
                 )}
               {((refCaps.ctx != null && effCapsCtx == null) ||
                 (refCaps.out != null && effCapsOut == null)) && (
-                <span className="text-[color:var(--text-muted)]">
+                <span className="text-(--text-muted)">
                   Values detected from endpoint for “{capsRefModel}” — empty
                   per-model fields auto-fill with these values; Save to persist.
                 </span>
               )}
               {refEffortsFillable && (
-                <span className="text-[color:var(--text-muted)]">
+                <span className="text-(--text-muted)">
                   Reasoning-effort levels detected for “{capsRefModel}” — the
                   empty per-model effort list auto-fills with them; Save to
                   persist.
@@ -667,7 +667,7 @@ ${refResolvedEffort}`;
               type="button"
               onClick={() => void testConnection()}
               disabled={testState.status === "loading"}
-              className="flex items-center gap-1 rounded-lg border border-border bg-bg-secondary px-2 py-1 text-xs text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--accent-color)] disabled:opacity-50"
+              className="flex items-center gap-1 rounded-lg border border-border bg-bg-secondary px-2 py-1 text-xs text-(--text-muted) transition-colors hover:text-(--accent-color) disabled:opacity-50"
             >
               <RefreshCw
                 className={`h-3 w-3 ${testState.status === "loading" ? "animate-spin" : ""}`}
@@ -688,13 +688,13 @@ ${refResolvedEffort}`;
 
           <div className="space-y-1.5" ref={pickerRef}>
             <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-[color:var(--text-muted)]">Models</span>
+              <span className="text-xs font-medium text-(--text-muted)">Models</span>
               <div className="flex items-center gap-3">
                 <button
                   type="button"
                   onClick={openAddPicker}
                   title="Fetch the model list from this endpoint's server and pick one to add"
-                  className="flex items-center gap-1 text-xs text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--accent-color)]"
+                  className="flex items-center gap-1 text-xs text-(--text-muted) transition-colors hover:text-(--accent-color)"
                 >
                   <RefreshCw className="h-3 w-3" />
                   Pick from server
@@ -702,7 +702,7 @@ ${refResolvedEffort}`;
                 <button
                   type="button"
                   onClick={onAddModel}
-                  className="flex items-center gap-1 text-xs text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--accent-color)]"
+                  className="flex items-center gap-1 text-xs text-(--text-muted) transition-colors hover:text-(--accent-color)"
                 >
                   <Plus className="h-3 w-3" />
                   Add model
@@ -730,7 +730,7 @@ ${refResolvedEffort}`;
             )}
 
             {endpoint.models.length === 0 && pickerOpen !== "__add__" && (
-              <div className="rounded border border-dashed border-border px-2 py-1.5 text-[0.7rem] text-[color:var(--text-muted)]">
+              <div className="rounded-sm border border-dashed border-border px-2 py-1.5 text-[0.7rem] text-(--text-muted)">
                 No models — click “Add model” or “Pick from server”.
               </div>
             )}
@@ -751,17 +751,17 @@ ${refResolvedEffort}`;
                     }}
                     placeholder="model id (focus to fetch from server)"
                     spellCheck={false}
-                    className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                    className="flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
                   />
                   {isDefault && m && (
                     <button
                       type="button"
                       onClick={() => onDefaultModel(m)}
                       title={defaultModel === m ? "Default model" : "Set as default model"}
-                      className={`shrink-0 rounded px-1.5 py-1 text-[0.65rem] transition-colors ${
+                      className={`shrink-0 rounded-sm px-1.5 py-1 text-[0.65rem] transition-colors ${
                         defaultModel === m
-                          ? "bg-[color:var(--accent-color)]/20 text-[color:var(--accent-color)]"
-                          : "text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+                          ? "bg-(--accent-color)/20 text-(--accent-color)"
+                          : "text-(--text-muted) hover:text-(--text-primary)"
                       }`}
                     >
                       {defaultModel === m ? "★ default" : "set ★"}
@@ -772,7 +772,7 @@ ${refResolvedEffort}`;
                     onClick={() => onDeleteModel(mi)}
                     title="Remove model"
                     aria-label="Remove model"
-                    className="shrink-0 rounded p-1 text-[color:var(--text-muted)] transition-colors hover:bg-red-500/10 hover:text-red-400"
+                    className="shrink-0 rounded-sm p-1 text-(--text-muted) transition-colors hover:bg-red-500/10 hover:text-red-400"
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -813,13 +813,13 @@ ${refResolvedEffort}`;
           </div>
 
           <div className="flex items-center gap-2 pt-1">
-            <label className="flex items-center gap-2 text-xs text-[color:var(--text-muted)]">
+            <label className="flex items-center gap-2 text-xs text-(--text-muted)">
               <input
                 type="radio"
                 checked={isDefault}
                 onChange={onSetDefault}
                 name="default-endpoint"
-                className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                className="h-3.5 w-3.5 accent-(--accent-color)"
               />
               Use as default endpoint
             </label>
@@ -858,7 +858,7 @@ function ModelRowConfig({
       : "";
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded bg-bg-secondary/60 px-2 py-1 text-[0.7rem] text-[color:var(--text-muted)]">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-sm bg-bg-secondary/60 px-2 py-1 text-[0.7rem] text-(--text-muted)">
       {/* Per-model max-context override */}
       <label className="flex items-center gap-1">
         ctx
@@ -871,7 +871,7 @@ function ModelRowConfig({
             const v = parsePositiveIntInput(e.target.value.trim());
             if (v !== undefined) onChange({ max_context: v });
           }}
-          className="w-24 rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-24 rounded-sm border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
       </label>
       {/* Per-model max-output override */}
@@ -886,7 +886,7 @@ function ModelRowConfig({
             const v = parsePositiveIntInput(e.target.value.trim());
             if (v !== undefined) onChange({ max_output_tokens: v });
           }}
-          className="w-24 rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-24 rounded-sm border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
       </label>
       {/* Per-model reasoning-effort allow-list (comma-separated; "off" is
@@ -904,7 +904,7 @@ function ModelRowConfig({
               ? "This endpoint does not accept reasoning_effort"
               : "Comma-separated reasoning-effort values this model supports (\"off\" is always available)"
           }
-          className="w-40 rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          className="w-40 rounded-sm border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
         />
       </label>
       {/* Per-model reasoning-effort default (backlog 5b099aef): the
@@ -925,7 +925,7 @@ function ModelRowConfig({
               ? "This endpoint does not accept a reasoning control"
               : "Default reasoning effort for this model (unset = the endpoint's Effort value)"
           }
-          className="rounded border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-sm border border-border bg-bg-primary px-1 py-0.5 font-mono text-[0.7rem] text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
         >
           <option value={REASONING_EFFORT_DEFAULT}>endpoint default</option>
           {REASONING_EFFORTS.map((r) => (
@@ -948,10 +948,10 @@ function ModelRowConfig({
           type="checkbox"
           checked={config.multimodal === true}
           onChange={(e) => onChange({ multimodal: e.target.checked ? true : null })}
-          className="h-3 w-3 accent-[color:var(--accent-color)]"
+          className="h-3 w-3 accent-(--accent-color)"
         />
       </label>
-      <span className="text-[0.65rem] text-[color:var(--text-muted)]">
+      <span className="text-[0.65rem] text-(--text-muted)">
         per-model overrides (empty = endpoint values)
       </span>
     </div>

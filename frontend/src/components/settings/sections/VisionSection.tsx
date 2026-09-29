@@ -180,7 +180,7 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading vision settings…
       </div>
     );
@@ -189,22 +189,22 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Vision
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           When the main provider is not multimodal, images are described via this
-          fallback model (<code className="text-[color:var(--accent-color)]">describe_image</code>
+          fallback model (<code className="text-(--accent-color)">describe_image</code>
           ). Prefer a multimodal endpoint.
         </p>
       </div>
 
-      <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex items-center gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={enabled}
           onChange={(e) => setEnabled(e.target.checked)}
-          className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="h-3.5 w-3.5 accent-(--accent-color)"
         />
         Enable vision fallback
       </label>
@@ -212,7 +212,7 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
       {enabled && (
         <>
           <div className="space-y-1">
-            <label className="text-sm text-[color:var(--text-primary)]" htmlFor="vis-ep">
+            <label className="text-sm text-(--text-primary)" htmlFor="vis-ep">
               Endpoint
             </label>
             <select
@@ -223,7 +223,7 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
                 const ep = endpoints.find((x) => x.name === e.target.value);
                 if (ep?.models[0] && !model) setModel(ep.models[0]);
               }}
-              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             >
               <option value="">— select —</option>
               {endpoints.map((ep) => (
@@ -236,14 +236,14 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
           </div>
           <div className="space-y-1" ref={pickerRef}>
             <div className="flex items-center justify-between">
-              <label className="text-sm text-[color:var(--text-primary)]" htmlFor="vis-model">
+              <label className="text-sm text-(--text-primary)" htmlFor="vis-model">
                 Model
               </label>
               <button
                 type="button"
                 onClick={() => void fetchVisionModels(true)}
                 title="Re-fetch the model list from the server"
-                className="flex items-center gap-1 text-xs text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--accent-color)]"
+                className="flex items-center gap-1 text-xs text-(--text-muted) transition-colors hover:text-(--accent-color)"
               >
                 <RefreshCw
                   className={`h-3 w-3 ${fetchState.status === "loading" ? "animate-spin" : ""}`}
@@ -272,7 +272,7 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
                 }}
                 placeholder="model id (focus to fetch from server)"
                 spellCheck={false}
-                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
               {pickerOpen && (
                 <ModelPickerDropdown
@@ -293,7 +293,7 @@ export const VisionSection = forwardRef<SettingsSectionHandle, {
               )}
             </div>
             {fetchState.status === "ready" && (
-              <p className="text-[0.7rem] text-[color:var(--text-muted)]">
+              <p className="text-[0.7rem] text-(--text-muted)">
                 {capable.length > 0
                   ? `${capable.length} of ${visionModels.length} model(s) are vision-capable (shown first)`
                   : visionModels.length > 0

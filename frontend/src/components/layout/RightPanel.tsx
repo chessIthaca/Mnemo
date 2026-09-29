@@ -31,7 +31,7 @@ export function RightPanel() {
   // calc(100% - 360px)) — so the layout engine re-clamps at EVERY
   // viewport: a plain percentage tracks resizes, but its render-time
   // clamp would go stale between renders (review L1). Falls back to
-  // flex-grow (undefined style) when no explicit width is set.
+  // grow (undefined style) when no explicit width is set.
   const clampedFrac =
     rightPanelWidthFrac !== null
       ? clampPanelFraction(rightPanelWidthFrac, window.innerWidth)
@@ -99,7 +99,7 @@ export function RightPanel() {
                         toggleTabAndReveal(view.id);
                       }
                     }}
-                    className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-sm text-slate-500 opacity-0 transition-opacity hover:bg-bg-tertiary hover:text-slate-200 focus:opacity-100 group-hover:opacity-100"
+                    className="ml-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-xs text-slate-500 opacity-0 transition-opacity hover:bg-bg-tertiary hover:text-slate-200 focus:opacity-100 group-hover:opacity-100"
                   >
                     <X className="h-3 w-3" />
                   </span>

@@ -732,7 +732,7 @@ export default function App() {
       {/* Startup reconciliation wait dialog — visible only while (or right
           after) the derived index syncs with the on-disk truth. */}
       {reconcile && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs">
           <SplashCard>
             <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-200">
               <RefreshCw
@@ -827,7 +827,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setEmbedderBannerDismissed(true)}
-                className="shrink-0 text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--text-primary)]"
+                className="shrink-0 text-(--text-muted) transition-colors hover:text-(--text-primary)"
                 title="Dismiss"
               >
                 ✕

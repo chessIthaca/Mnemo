@@ -271,7 +271,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
             <button
               onClick={handleAllowForProject}
               title="Approve this call and add a rule so future calls of this tool auto-approve"
-              className="flex items-center gap-1 rounded bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-500"
+              className="flex items-center gap-1 rounded-sm bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-500"
             >
               <FolderCheck className="h-3.5 w-3.5" />
               Allow for project
@@ -281,7 +281,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
             <button
               onClick={handleMarkSafe}
               title="Approve this call and save a rule so future matching calls auto-approve"
-              className="flex items-center gap-1 rounded bg-blue-600 px-3 py-1 text-xs font-medium text-white hover:bg-blue-500"
+              className="flex items-center gap-1 rounded-sm bg-blue-600 px-3 py-1 text-xs font-medium text-white hover:bg-blue-500"
             >
               <ShieldCheck className="h-3.5 w-3.5" />
               Mark Safe
@@ -291,7 +291,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
             <button
               onClick={handleMarkSafeClass}
               title="Approve this call and auto-approve the same operation (ignoring output filtering) in future"
-              className="flex items-center gap-1 rounded bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500"
+              className="flex items-center gap-1 rounded-sm bg-indigo-600 px-3 py-1 text-xs font-medium text-white hover:bg-indigo-500"
             >
               <Layers className="h-3.5 w-3.5" />
               Mark Safe (same op)
@@ -300,7 +300,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
           <button
             onClick={handleApprove}
             title="Approve this call (shortcut: A)"
-            className="flex items-center gap-1 rounded bg-green-600 px-3 py-1 text-xs font-medium text-white hover:bg-green-500"
+            className="flex items-center gap-1 rounded-sm bg-green-600 px-3 py-1 text-xs font-medium text-white hover:bg-green-500"
           >
             <Check className="h-3.5 w-3.5" />
             Approve
@@ -308,7 +308,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
           <button
             onClick={handleDeny}
             title="Deny this call (shortcut: D)"
-            className="flex items-center gap-1 rounded bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500"
+            className="flex items-center gap-1 rounded-sm bg-red-600 px-3 py-1 text-xs font-medium text-white hover:bg-red-500"
           >
             <X className="h-3.5 w-3.5" />
             Deny
@@ -316,7 +316,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
           <button
             onClick={handleDenyAll}
             title="Deny this and all remaining actions this turn (shortcut: Shift+D)"
-            className="flex items-center gap-1 rounded border border-red-500/60 bg-red-950/40 px-3 py-1 text-xs font-medium text-red-200 hover:bg-red-900/50"
+            className="flex items-center gap-1 rounded-sm border border-red-500/60 bg-red-950/40 px-3 py-1 text-xs font-medium text-red-200 hover:bg-red-900/50"
           >
             <X className="h-3.5 w-3.5" />
             Deny all
@@ -324,7 +324,7 @@ export function ApprovalPrompt({ approval }: ApprovalPromptProps) {
         </div>
       </div>
       {protectedTokens.length > 0 && (
-        <div className="mt-2 flex items-center gap-1.5 rounded border border-red-500/40 bg-red-950/30 px-2 py-1 text-xs text-red-300">
+        <div className="mt-2 flex items-center gap-1.5 rounded-sm border border-red-500/40 bg-red-950/30 px-2 py-1 text-xs text-red-300">
           <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
           <span>
             Touches protected path{protectedTokens.length > 1 ? "s" : ""}: {" "}

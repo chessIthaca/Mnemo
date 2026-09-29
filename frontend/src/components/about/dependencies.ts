@@ -169,12 +169,12 @@ export const DEPENDENCY_GROUPS: DependencyGroup[] = [
   {
     title: "Frontend â€” build & dev",
     entries: [
+      { name: "@tailwindcss/postcss", license: "MIT", registry: npm("@tailwindcss/postcss"), licenseUrl: MIT },
       { name: "@tailwindcss/typography", license: "MIT", registry: npm("@tailwindcss/typography"), licenseUrl: MIT },
       { name: "@tauri-apps/cli", license: "MIT OR Apache-2.0", registry: npm("@tauri-apps/cli"), licenseUrl: MIT },
       { name: "@types/react", license: "MIT", registry: npm("@types/react"), licenseUrl: MIT },
       { name: "@types/react-dom", license: "MIT", registry: npm("@types/react-dom"), licenseUrl: MIT },
       { name: "@vitejs/plugin-react", license: "MIT", registry: npm("@vitejs/plugin-react"), licenseUrl: MIT },
-      { name: "autoprefixer", license: "MIT", registry: npm("autoprefixer"), licenseUrl: MIT },
       { name: "postcss", license: "MIT", registry: npm("postcss"), licenseUrl: MIT },
       { name: "tailwindcss", license: "MIT", registry: npm("tailwindcss"), licenseUrl: MIT },
       { name: "typescript", license: "Apache-2.0", registry: npm("typescript"), licenseUrl: APACHE },

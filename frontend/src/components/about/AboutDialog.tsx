@@ -70,10 +70,10 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
             <MnemoLogo className="h-6 w-6 shrink-0" />
-            <DialogTitle className="text-sm font-semibold text-[color:var(--text-primary)]">
+            <DialogTitle className="text-sm font-semibold text-(--text-primary)">
               About Mnemo
             </DialogTitle>
-            <span className="shrink-0 rounded-full bg-bg-tertiary px-2 py-0.5 text-[0.65rem] font-medium text-[color:var(--text-muted)]">
+            <span className="shrink-0 rounded-full bg-bg-tertiary px-2 py-0.5 text-[0.65rem] font-medium text-(--text-muted)">
               v{version}
             </span>
           </div>
@@ -81,7 +81,7 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
             type="button"
             onClick={onClose}
             aria-label="Close about dialog"
-            className="shrink-0 rounded p-1 text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="shrink-0 rounded-sm p-1 text-(--text-muted) hover:text-(--text-primary)"
           >
             <X className="h-4 w-4" />
           </button>
@@ -127,7 +127,7 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
                       <button
                         type="button"
                         onClick={() => void openExternal(dep.licenseUrl)}
-                        className="shrink-0 rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-slate-400 transition-colors hover:text-cyan-400"
+                        className="shrink-0 rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-slate-400 transition-colors hover:text-cyan-400"
                         title={`Show the ${dep.license} license text`}
                       >
                         {dep.license}
@@ -139,7 +139,7 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
             ))}
           </div>
 
-          <p className="mt-3 flex shrink-0 items-center gap-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <p className="mt-3 flex shrink-0 items-center gap-1 text-[0.7rem] text-(--text-muted)">
             <ExternalLink className="h-3 w-3 shrink-0" />
             Click a name or license to open its page in your browser.
           </p>
@@ -150,7 +150,7 @@ export function AboutDialog({ open, onClose }: AboutDialogProps) {
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-border px-4 py-1.5 text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="rounded-lg border border-border px-4 py-1.5 text-sm text-(--text-muted) hover:text-(--text-primary)"
           >
             Close
           </button>

@@ -402,7 +402,7 @@ export function DiffViewer() {
         <span className="truncate text-[0.75em] font-medium text-slate-300">
           {toolName}: {resolved.path}
         </span>
-        <span className="ml-auto rounded bg-yellow-950/40 px-1.5 py-0.5 text-[0.625em] font-medium text-yellow-400">
+        <span className="ml-auto rounded-sm bg-yellow-950/40 px-1.5 py-0.5 text-[0.625em] font-medium text-yellow-400">
           pending
         </span>
       </div>
@@ -428,11 +428,11 @@ export function DiffViewer() {
         <span className="truncate text-[0.75em] font-medium text-slate-300">
           {gitScopeLabel}
         </span>
-        <span className="shrink-0 rounded bg-sky-950/40 px-1.5 py-0.5 text-[0.625em] font-medium text-sky-400">
+        <span className="shrink-0 rounded-sm bg-sky-950/40 px-1.5 py-0.5 text-[0.625em] font-medium text-sky-400">
           vs Git
         </span>
         <button
-          className="ml-auto flex shrink-0 items-center gap-1 rounded px-2 py-1 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+          className="ml-auto flex shrink-0 items-center gap-1 rounded-sm px-2 py-1 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
           onClick={() => setRefreshKey((k) => k + 1)}
           disabled={gitLoading}
           title="Re-run git diff HEAD"
@@ -453,7 +453,7 @@ export function DiffViewer() {
               Initialize one to track changes against git HEAD.
             </p>
             <button
-              className="flex items-center gap-1.5 rounded bg-sky-800/70 px-3 py-1.5 text-[0.75em] font-medium text-sky-100 hover:bg-sky-700 disabled:opacity-50"
+              className="flex items-center gap-1.5 rounded-sm bg-sky-800/70 px-3 py-1.5 text-[0.75em] font-medium text-sky-100 hover:bg-sky-700 disabled:opacity-50"
               onClick={handleInitGit}
               disabled={initLoading || gitLoading}
               title="Run git init in the project root"
@@ -549,7 +549,7 @@ export function DiffViewer() {
                 selectDiffPath(v === "" ? null : v);
               }
             }}
-            className="min-w-0 flex-1 truncate rounded border border-border bg-bg-tertiary px-2 py-1 text-[0.75em] text-slate-300"
+            className="min-w-0 flex-1 truncate rounded-sm border border-border bg-bg-tertiary px-2 py-1 text-[0.75em] text-slate-300"
             title="Changed files in the current top-level plan, or the whole tree vs git"
           >
             {showPending && (
@@ -573,7 +573,7 @@ export function DiffViewer() {
           </select>
           {/* View-mode toggle: the comprehensive git view (default) or the
               captured last-edit snapshots. */}
-          <div className="flex shrink-0 overflow-hidden rounded border border-border text-[0.625em]">
+          <div className="flex shrink-0 overflow-hidden rounded-sm border border-border text-[0.625em]">
             <button
               onClick={() => setMode("git")}
               className={

@@ -240,7 +240,7 @@ interface AppState extends AppStateLike {
   rightPanelVisible: boolean;
   /**
    * Right-panel width as a fraction of the window width (0–1), or null to
-   * use the default flex-grow width. Set by dragging the divider between
+   * use the default grow width. Set by dragging the divider between
    * the main column and the right panel; persisted to localStorage as a
    * fraction so it tracks window resizes and can never pin at a cap on a
    * small restored window.
@@ -446,7 +446,7 @@ interface AppState extends AppStateLike {
   setPricing: (p: PricingEntry[]) => void;
   setGitBranch: (b: string) => void;
   toggleRightPanel: () => void;
-  /** Set the right-panel width fraction. Pass null to restore the default flex-grow width. */
+  /** Set the right-panel width fraction. Pass null to restore the default grow width. */
   setRightPanelWidthFrac: (f: number | null) => void;
   /**
    * Update the right-panel width fraction in-memory only (no localStorage

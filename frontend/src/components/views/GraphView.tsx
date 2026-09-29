@@ -588,7 +588,7 @@ export function GraphView() {
           <span>loading…</span>
         )}
         <button
-          className="ml-auto flex items-center gap-1 rounded px-2 py-1 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+          className="ml-auto flex items-center gap-1 rounded-sm px-2 py-1 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
           onClick={() => void onRefresh()}
           disabled={refreshing}
           title="Re-index the code graph"
@@ -601,7 +601,7 @@ export function GraphView() {
       {/* Filters */}
       <div className="flex items-center gap-2 border-b border-slate-800 px-3 py-2">
         <input
-          className="w-32 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-500"
+          className="w-32 rounded-sm border border-slate-700 bg-slate-900 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-500"
           placeholder="filter by name…"
           value={nameFilter}
           onChange={(e) => {
@@ -610,7 +610,7 @@ export function GraphView() {
           }}
         />
         <select
-          className="rounded border border-slate-700 bg-slate-900 px-1 py-1 text-xs text-slate-200"
+          className="rounded-sm border border-slate-700 bg-slate-900 px-1 py-1 text-xs text-slate-200"
           value={kindFilter}
           onChange={(e) => {
             setKindFilter(e.target.value);
@@ -626,7 +626,7 @@ export function GraphView() {
         </select>
         {focus && (
           <button
-            className="flex items-center gap-1 rounded bg-sky-900/60 px-2 py-1 text-xs text-sky-300 hover:bg-sky-800"
+            className="flex items-center gap-1 rounded-sm bg-sky-900/60 px-2 py-1 text-xs text-sky-300 hover:bg-sky-800"
             onClick={() => setFocus(null)}
             title="Clear the focused neighborhood"
           >
@@ -714,7 +714,7 @@ export function GraphView() {
         {/* Selected node panel */}
         {selectedNode && (
           <div className="w-52 shrink-0 overflow-y-auto border-l border-slate-800 p-3 text-xs">
-            <p className="mb-1 break-words font-medium text-slate-200">
+            <p className="mb-1 wrap-break-word font-medium text-slate-200">
               {selectedNode.name}
             </p>
             <p className="mb-2 text-slate-500">{selectedNode.kind}</p>
@@ -728,13 +728,13 @@ export function GraphView() {
               </div>
             )}
             <button
-              className="w-full rounded bg-sky-900/60 px-2 py-1 text-sky-300 hover:bg-sky-800"
+              className="w-full rounded-sm bg-sky-900/60 px-2 py-1 text-sky-300 hover:bg-sky-800"
               onClick={() => setFocus({ id: selectedNode.id, name: selectedNode.name })}
             >
               Focus neighborhood
             </button>
             <button
-              className="mt-1.5 w-full rounded bg-sky-900/60 px-2 py-1 text-sky-300 hover:bg-sky-800"
+              className="mt-1.5 w-full rounded-sm bg-sky-900/60 px-2 py-1 text-sky-300 hover:bg-sky-800"
               onClick={() =>
                 setBrowse({
                   file: selectedNode.file,

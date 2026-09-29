@@ -104,7 +104,7 @@ export function ModelCombobox({ value, onChange, options }: ModelComboboxProps) 
             setOpen(true);
           }}
           onKeyDown={onKeyDown}
-          className="w-full min-w-0 rounded-l border border-border bg-bg-secondary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full min-w-0 rounded-l border border-border bg-bg-secondary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
         <button
           type="button"
@@ -125,7 +125,7 @@ export function ModelCombobox({ value, onChange, options }: ModelComboboxProps) 
               inputRef.current?.focus();
             }
           }}
-          className="shrink-0 rounded-r border border-l-0 border-border bg-bg-secondary px-1.5 text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)] focus:outline-none"
+          className="shrink-0 rounded-r border border-l-0 border-border bg-bg-secondary px-1.5 text-(--text-muted) hover:text-(--text-primary) focus:outline-hidden"
         >
           <ChevronDown
             className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`}
@@ -133,9 +133,9 @@ export function ModelCombobox({ value, onChange, options }: ModelComboboxProps) 
         </button>
       </div>
       {open && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-bg-primary shadow-lg">
+        <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-48 overflow-y-auto rounded-sm border border-border bg-bg-primary shadow-lg">
           {visible.length === 0 ? (
-            <div className="px-2 py-1.5 text-xs text-[color:var(--text-muted)]">
+            <div className="px-2 py-1.5 text-xs text-(--text-muted)">
               No configured model matches — free-typed values still save.
             </div>
           ) : (
@@ -168,10 +168,10 @@ export function ModelCombobox({ value, onChange, options }: ModelComboboxProps) 
                   }}
                   className="flex w-full items-baseline gap-2 px-2 py-1.5 text-left text-xs hover:bg-bg-secondary"
                 >
-                  <span className="min-w-0 truncate text-[color:var(--text-primary)]">
+                  <span className="min-w-0 truncate text-(--text-primary)">
                     {o.model}
                   </span>
-                  <span className="min-w-0 truncate text-[0.65rem] text-[color:var(--text-muted)]">
+                  <span className="min-w-0 truncate text-[0.65rem] text-(--text-muted)">
                     {o.endpoints.join(", ")}
                   </span>
                 </button>

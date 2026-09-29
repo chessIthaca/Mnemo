@@ -183,7 +183,7 @@ export function IndexingOverlay() {
   if (state === null) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs">
       <SplashCard>
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-200">
           <RefreshCw
@@ -209,7 +209,7 @@ export function IndexingOverlay() {
           />
         ) : (
           <>
-            <p className="mb-3 break-words text-xs text-red-400">
+            <p className="mb-3 wrap-break-word text-xs text-red-400">
               Indexing failed: {state.error}
             </p>
             <button

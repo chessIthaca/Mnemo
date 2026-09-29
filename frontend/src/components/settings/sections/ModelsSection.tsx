@@ -229,7 +229,7 @@ export const ModelsSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading model overrides…
       </div>
     );
@@ -238,10 +238,10 @@ export const ModelsSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-5">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Models
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Run specific contexts on a different endpoint + model than the default
           (e.g. a fast coding model for subagents, a smart model for planning).
           Unset overrides fall back to the default. Priority: skill &gt; subagent
@@ -276,17 +276,17 @@ export const ModelsSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       <div className="space-y-2">
-        <h4 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Per-skill overrides
         </h4>
-        <p className="text-xs text-[color:var(--text-muted)]">
-          A skill (e.g. <code className="text-[color:var(--accent-color)]">merge_to_main</code>)
+        <p className="text-xs text-(--text-muted)">
+          A skill (e.g. <code className="text-(--accent-color)">merge_to_main</code>)
           runs on the named model while active. Skills not listed fall back to the
           subagent/state/default chain.
         </p>
 
         {skillNames.length === 0 && (
-          <p className="text-xs text-[color:var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             No skill overrides configured.
           </p>
         )}
@@ -297,11 +297,11 @@ export const ModelsSection = forwardRef<SettingsSectionHandle, {
             className="space-y-2 rounded-lg border border-border bg-bg-primary px-3 py-2.5"
           >
             <div className="flex items-center justify-between gap-2">
-              <code className="text-xs text-[color:var(--accent-color)]">{name}</code>
+              <code className="text-xs text-(--accent-color)">{name}</code>
               <button
                 type="button"
                 onClick={() => removeSkillOverride(name)}
-                className="rounded p-1 text-[color:var(--text-muted)] hover:text-red-300"
+                className="rounded-sm p-1 text-(--text-muted) hover:text-red-300"
                 aria-label={`Remove ${name} override`}
                 title="Remove override"
               >
@@ -328,13 +328,13 @@ export const ModelsSection = forwardRef<SettingsSectionHandle, {
             }}
             placeholder="skill name (e.g. merge_to_main)"
             spellCheck={false}
-            className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+            className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
           />
           <button
             type="button"
             onClick={() => addSkillOverride(newSkillName)}
             disabled={!newSkillName.trim()}
-            className="flex shrink-0 items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)] disabled:opacity-40"
+            className="flex shrink-0 items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs text-(--text-muted) hover:text-(--text-primary) disabled:opacity-40"
           >
             <Plus className="h-3.5 w-3.5" />
             Add
@@ -375,7 +375,7 @@ function ModelPicker({
   const enabled = value !== null;
   return (
     <div className="space-y-2 rounded-lg border border-border bg-bg-primary px-3 py-2.5">
-      <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex items-center gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={enabled}
@@ -389,10 +389,10 @@ function ModelPicker({
                 : null,
             )
           }
-          className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span className="font-medium">{label}</span>
-        <span className="text-[color:var(--text-muted)]">— {hint}</span>
+        <span className="text-(--text-muted)">— {hint}</span>
       </label>
       {enabled && (
         <ModelPickerBody endpoints={endpoints} value={value} onChange={onChange} />
@@ -420,7 +420,7 @@ export function ModelPickerBody({
   return (
     <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
       <div className="space-y-1">
-        <label className="text-[0.7rem] text-[color:var(--text-muted)]">Endpoint</label>
+        <label className="text-[0.7rem] text-(--text-muted)">Endpoint</label>
         <select
           value={value.endpoint}
           onChange={(e) => {
@@ -431,7 +431,7 @@ export function ModelPickerBody({
               model: ep?.models[0] ?? value.model,
             });
           }}
-          className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         >
           <option value="">— select —</option>
           {endpoints.map((ep) => (
@@ -442,12 +442,12 @@ export function ModelPickerBody({
         </select>
       </div>
       <div className="space-y-1">
-        <label className="text-[0.7rem] text-[color:var(--text-muted)]">Model</label>
+        <label className="text-[0.7rem] text-(--text-muted)">Model</label>
         {host && host.models.length > 0 ? (
           <select
             value={value.model}
             onChange={(e) => onChange({ ...value, model: e.target.value })}
-            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
           >
             <option value="">— select —</option>
             {host.models.map((m) => (
@@ -465,7 +465,7 @@ export function ModelPickerBody({
             onChange={(e) => onChange({ ...value, model: e.target.value })}
             placeholder="model id"
             spellCheck={false}
-            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
           />
         )}
       </div>
@@ -475,7 +475,7 @@ export function ModelPickerBody({
           when the endpoint doesn't accept reasoning_effort. */}
       {host && host.kind !== "anthropic" && (
         <div className="space-y-1">
-          <label className="text-[0.7rem] text-[color:var(--text-muted)]">Effort</label>
+          <label className="text-[0.7rem] text-(--text-muted)">Effort</label>
           <select
             value={effortToSelectValue(value.reasoning_effort ?? null)}
             onChange={(e) =>
@@ -490,7 +490,7 @@ export function ModelPickerBody({
                 ? "This endpoint does not accept reasoning_effort"
                 : "Reasoning effort for this context (unset = the model's own default)"
             }
-            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="w-full rounded-lg border border-border bg-bg-primary px-2.5 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
           >
             <option value={REASONING_EFFORT_DEFAULT}>model default</option>
             {REASONING_EFFORTS.map((r) => (

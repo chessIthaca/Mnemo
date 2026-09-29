@@ -217,7 +217,7 @@ describe("promptHistory", () => {
       expect(shown).toBe("only");
     });
 
-    it("ring buffer caps at MAX_HISTORY (100)", () => {
+    it("ring-3 buffer caps at MAX_HISTORY (100)", () => {
       for (let i = 0; i < 150; i++) {
         pushPrompt(`prompt-${i}`);
       }

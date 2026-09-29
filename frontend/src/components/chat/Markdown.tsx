@@ -18,9 +18,9 @@ const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
 /** A minimal inline fallback: render the raw markdown as preformatted text.
  *  `whitespace-pre-wrap` keeps single newlines rendering as line breaks
  *  during the lazy-load window (2026-08-21 regression, transient form)
- *  until the pipeline loads; `break-words` matches the rendered path. */
+ *  until the pipeline loads; `wrap-break-word` matches the rendered path. */
 function MarkdownFallback({ children }: { children: ReactNode }) {
-  return <div className="markdown-fallback whitespace-pre-wrap break-words">{children}</div>;
+  return <div className="markdown-fallback whitespace-pre-wrap wrap-break-word">{children}</div>;
 }
 
 /**

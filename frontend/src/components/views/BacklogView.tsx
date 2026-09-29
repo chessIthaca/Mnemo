@@ -247,7 +247,7 @@ function BacklogInput() {
               />
               <button
                 onClick={() => removeImage(i)}
-                className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-sm bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
                 title="Remove image"
               >
                 <X className="h-2.5 w-2.5" />
@@ -272,7 +272,7 @@ function BacklogInput() {
           onPaste={handlePaste}
           placeholder="Add to backlog — Enter to queue, Shift+Enter for newline, paste images..."
           rows={1}
-          className="flex-1 resize-none rounded-lg border border-border bg-bg-primary px-3 py-2 text-[0.875em] text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-none"
+          className="flex-1 resize-none rounded-lg border border-border bg-bg-primary px-3 py-2 text-[0.875em] text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-hidden"
         />
         {attachedImages.length > 0 && (
           <div
@@ -656,7 +656,7 @@ export function BacklogItemCard({
           {canRetry && (
             <button
               onClick={handleRetry}
-              className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
+              className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
               title={
                 item.status === "done"
                   ? "Reset to pending — re-run this task (does not touch git history)"
@@ -669,7 +669,7 @@ export function BacklogItemCard({
           {canEdit && !editing && (
             <button
               onClick={() => setEditing(true)}
-              className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
+              className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
               title="Edit"
             >
               <Pencil className="h-3.5 w-3.5" />
@@ -677,7 +677,7 @@ export function BacklogItemCard({
           )}
           <button
             onClick={handleCopy}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
             title="Copy text to clipboard"
           >
             {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
@@ -685,7 +685,7 @@ export function BacklogItemCard({
           {item.status === "pending" && (
             <button
               onClick={handleDispatch}
-              className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
+              className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-cyan-400"
               title="Dispatch this item to main agent (when idle)"
             >
               <Play className="h-3.5 w-3.5" />
@@ -711,7 +711,7 @@ export function BacklogItemCard({
           <button
             onClick={handleSendToTop}
             disabled={index === 0}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
             title="Send to top"
           >
             <ArrowUpToLine className="h-3.5 w-3.5" />
@@ -719,7 +719,7 @@ export function BacklogItemCard({
           <button
             onClick={() => handleMove(-1)}
             disabled={index === 0}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
             title="Move up"
           >
             <ChevronUp className="h-3.5 w-3.5" />
@@ -727,7 +727,7 @@ export function BacklogItemCard({
           <button
             onClick={() => handleMove(1)}
             disabled={index === total - 1}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
             title="Move down"
           >
             <ChevronDown className="h-3.5 w-3.5" />
@@ -735,14 +735,14 @@ export function BacklogItemCard({
           <button
             onClick={handleSendToBottom}
             disabled={index === total - 1}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200 disabled:opacity-30"
             title="Send to bottom"
           >
             <ArrowDownToLine className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={handleRemove}
-            className="rounded p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-red-400"
+            className="rounded-sm p-1 text-slate-400 transition-colors hover:bg-bg-primary hover:text-red-400"
             title="Remove"
           >
             <X className="h-3.5 w-3.5" />
@@ -773,7 +773,7 @@ export function BacklogItemCard({
               }
             }}
             rows={2}
-            className="w-full resize-none rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-[0.8em] text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-none"
+            className="w-full resize-none rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-[0.8em] text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-hidden"
             placeholder="Edit the prompt… (paste or drop images to attach)"
           />
           {/* Editor image strip — existing + newly pasted/dropped attachments,
@@ -792,7 +792,7 @@ export function BacklogItemCard({
                   />
                   <button
                     onClick={() => removeEditImage(i)}
-                    className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                    className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-sm bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
                     title="Remove image"
                   >
                     <X className="h-2.5 w-2.5" />
@@ -804,7 +804,7 @@ export function BacklogItemCard({
           <div className="mt-1 flex items-center justify-end gap-1">
             <button
               onClick={handleCancelEdit}
-              className="rounded px-2 py-0.5 text-[0.7em] text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200"
+              className="rounded-sm px-2 py-0.5 text-[0.7em] text-slate-400 transition-colors hover:bg-bg-primary hover:text-slate-200"
               title="Cancel (Escape)"
             >
               Cancel
@@ -812,7 +812,7 @@ export function BacklogItemCard({
             <button
               onClick={handleSaveEdit}
               disabled={!editText.trim() && editImages.length === 0}
-              className="flex items-center gap-1 rounded bg-cyan-600 px-2 py-0.5 text-[0.7em] text-white transition-colors hover:bg-cyan-500 disabled:opacity-40"
+              className="flex items-center gap-1 rounded-sm bg-cyan-600 px-2 py-0.5 text-[0.7em] text-white transition-colors hover:bg-cyan-500 disabled:opacity-40"
               title="Save (Enter)"
             >
               <Check className="h-3 w-3" />
@@ -828,12 +828,12 @@ export function BacklogItemCard({
               headline aligned with a spacer instead of the chevron. */}
           <div className="flex items-start gap-1.5">
             <span
-              className={`mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[0.65em] font-medium uppercase tracking-wide ${badgeStyle}`}
+              className={`mt-0.5 shrink-0 rounded-sm px-1.5 py-0.5 text-[0.65em] font-medium uppercase tracking-wide ${badgeStyle}`}
             >
               {badgeLabel}
             </span>
             {item.deferred ? (
-              <span className="mt-0.5 shrink-0 rounded bg-violet-950/60 px-1.5 py-0.5 text-[0.65em] font-medium uppercase tracking-wide text-violet-400">
+              <span className="mt-0.5 shrink-0 rounded-sm bg-violet-950/60 px-1.5 py-0.5 text-[0.65em] font-medium uppercase tracking-wide text-violet-400">
                 Deferred
               </span>
             ) : null}
@@ -850,14 +850,14 @@ export function BacklogItemCard({
                     expanded ? "rotate-90" : ""
                   }`}
                 />
-                <span className="break-words text-[0.9em] font-semibold leading-snug text-slate-100">
+                <span className="wrap-break-word text-[0.9em] font-semibold leading-snug text-slate-100">
                   {headline}
                 </span>
               </button>
             ) : (
               <div className="flex min-w-0 flex-1 items-start gap-1">
                 <span className="mt-0.5 block h-3.5 w-3.5 shrink-0" />
-                <span className="break-words text-[0.9em] font-semibold leading-snug text-slate-100">
+                <span className="wrap-break-word text-[0.9em] font-semibold leading-snug text-slate-100">
                   {headline}
                 </span>
               </div>
@@ -878,7 +878,7 @@ export function BacklogItemCard({
               <button
                 type="button"
                 onClick={chipTarget !== null ? () => setActiveAgent(chipTarget) : undefined}
-                className={`flex min-w-0 max-w-full items-center gap-1.5 rounded border px-1.5 py-0.5 text-left text-[0.7em] ${
+                className={`flex min-w-0 max-w-full items-center gap-1.5 rounded-sm border px-1.5 py-0.5 text-left text-[0.7em] ${
                   chipTarget !== null
                     ? "cursor-pointer border-cyan-800/60 bg-cyan-950/40 text-cyan-200 hover:border-cyan-600"
                     : "cursor-default border-border bg-bg-primary text-slate-400"
@@ -892,7 +892,7 @@ export function BacklogItemCard({
                 {item.plan_title && (
                   <span className="truncate font-medium">{item.plan_title}</span>
                 )}
-                <span className="shrink-0 rounded bg-bg-primary/80 px-1 font-mono text-[0.9em] text-slate-400">
+                <span className="shrink-0 rounded-sm bg-bg-primary/80 px-1 font-mono text-[0.9em] text-slate-400">
                   {item.plan_id.slice(0, 8)}
                 </span>
               </button>
@@ -902,7 +902,7 @@ export function BacklogItemCard({
           {/* Body — the markdown stack (backlog 991942af), collapsed by
               default when long (backlog 40763a24). */}
           {hasBody && expanded && (
-            <div className="prose prose-invert prose-sm mt-1 max-w-none break-words text-[0.8em] text-slate-300 prose-p:my-1 prose-pre:m-0 prose-pre:bg-bg-primary">
+            <div className="prose prose-invert prose-sm mt-1 max-w-none wrap-break-word text-[0.8em] text-slate-300 prose-p:my-1 prose-pre:m-0 prose-pre:bg-bg-primary">
               <Markdown remarkPlugins={[remarkBreaks]}>{body}</Markdown>
             </div>
           )}
@@ -917,7 +917,7 @@ export function BacklogItemCard({
           {item.images.map((dataUrl, i) => (
             <div
               key={i}
-              className="h-10 w-10 overflow-hidden rounded border border-border bg-bg-primary"
+              className="h-10 w-10 overflow-hidden rounded-sm border border-border bg-bg-primary"
             >
               <img
                 src={dataUrl}
@@ -934,7 +934,7 @@ export function BacklogItemCard({
           f45513b2): the sha lives in the copyable checkpoint detail
           below, never as the note's headline. */}
       {displayNote.trim().length > 0 && (
-        <div className="mt-2 whitespace-pre-wrap break-words rounded border border-border bg-bg-primary px-2 py-1 text-[0.75em] text-slate-400">
+        <div className="mt-2 whitespace-pre-wrap wrap-break-word rounded-sm border border-border bg-bg-primary px-2 py-1 text-[0.75em] text-slate-400">
           {displayNote}
         </div>
       )}
@@ -950,7 +950,7 @@ export function BacklogItemCard({
           <button
             type="button"
             onClick={handleCopyCheckpoint}
-            className="shrink-0 rounded px-1 text-slate-500 hover:bg-bg-primary hover:text-slate-300"
+            className="shrink-0 rounded-sm px-1 text-slate-500 hover:bg-bg-primary hover:text-slate-300"
             title="Copy the full checkpoint sha (resume/rollback anchor)"
           >
             {checkpointCopied ? "copied" : "copy"}
@@ -1080,7 +1080,7 @@ export function BacklogView() {
           {runAll.active ? (
             <button
               onClick={handleStopAll}
-              className="flex items-center gap-1 rounded bg-red-600/80 px-2 py-1 text-[0.75em] text-white transition-colors hover:bg-red-500"
+              className="flex items-center gap-1 rounded-sm bg-red-600/80 px-2 py-1 text-[0.75em] text-white transition-colors hover:bg-red-500"
               title="Stop Run-All (graceful: the current in-flight item finishes its turn, then no more are dispatched)"
             >
               Stop
@@ -1089,7 +1089,7 @@ export function BacklogView() {
             <button
               onClick={handleRunAll}
               disabled={backlog.filter((b) => b.status === "pending").length === 0}
-              className="flex items-center gap-1 rounded bg-cyan-600 px-2 py-1 text-[0.75em] text-white transition-colors hover:bg-cyan-500 disabled:opacity-40"
+              className="flex items-center gap-1 rounded-sm bg-cyan-600 px-2 py-1 text-[0.75em] text-white transition-colors hover:bg-cyan-500 disabled:opacity-40"
               title="Run All: entry point for unattended processing of all pending backlog items (git checkpoint per item; respects safety)"
             >
               <Play className="h-3.5 w-3.5" />
@@ -1107,7 +1107,7 @@ export function BacklogView() {
           {hasFinished && (
             <button
               onClick={handleClearFinished}
-              className="flex items-center gap-1 rounded border border-border px-2 py-1 text-[0.75em] text-slate-400 transition-colors hover:bg-bg-tertiary hover:text-slate-200"
+              className="flex items-center gap-1 rounded-sm border border-border px-2 py-1 text-[0.75em] text-slate-400 transition-colors hover:bg-bg-tertiary hover:text-slate-200"
               title="Remove all finished (done/failed/can't-resolve) items"
             >
               <Trash2 className="h-3 w-3" />

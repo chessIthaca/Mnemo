@@ -55,7 +55,7 @@ describe("StatusBar model/provider fixed-width truncation (single-line bar)", ()
 
   it("merge-to-main button label never wraps", () => {
     expect(statusBarSource).toContain(
-      "flex items-center gap-1 rounded px-2 py-0.5 text-xs font-medium text-cyan-400 transition-colors hover:bg-bg-tertiary whitespace-nowrap",
+      "flex items-center gap-1 rounded-sm px-2 py-0.5 text-xs font-medium text-cyan-400 transition-colors hover:bg-bg-tertiary whitespace-nowrap",
     );
   });
 
@@ -65,7 +65,7 @@ describe("StatusBar model/provider fixed-width truncation (single-line bar)", ()
   // multiline-squeeze defect.
   it("safety-mode button label never wraps", () => {
     expect(statusBarSource).toContain(
-      "flex items-center gap-1.5 whitespace-nowrap rounded px-2 py-0.5 text-xs font-medium transition-colors",
+      "flex items-center gap-1.5 whitespace-nowrap rounded-sm px-2 py-0.5 text-xs font-medium transition-colors",
     );
   });
 });

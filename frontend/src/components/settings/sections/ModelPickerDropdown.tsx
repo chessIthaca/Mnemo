@@ -80,14 +80,14 @@ export function ModelPickerDropdown({
           onChange={(e) => onQueryChange(e.target.value)}
           placeholder="filter models…"
           spellCheck={false}
-          className="flex-1 rounded border border-border bg-bg-primary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="flex-1 rounded-sm border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
         <button
           type="button"
           onClick={onRefresh}
           title="Re-fetch the model list from the server"
           aria-label="Refresh model list"
-          className="shrink-0 rounded p-1 text-[color:var(--text-muted)] transition-colors hover:text-[color:var(--text-primary)]"
+          className="shrink-0 rounded-sm p-1 text-(--text-muted) transition-colors hover:text-(--text-primary)"
         >
           <RefreshCw className={`h-3.5 w-3.5 ${status === "loading" ? "animate-spin" : ""}`} />
         </button>
@@ -95,13 +95,13 @@ export function ModelPickerDropdown({
 
       <div className="max-h-44 overflow-y-auto">
         {status === "loading" && models.length === 0 && (
-          <div className="px-3 py-2 text-xs text-[color:var(--text-muted)]">Fetching models…</div>
+          <div className="px-3 py-2 text-xs text-(--text-muted)">Fetching models…</div>
         )}
         {status === "error" && (
           <div className="px-3 py-2 text-xs text-red-300">{error || "Failed to fetch models."}</div>
         )}
         {status === "ready" && models.length === 0 && (
-          <div className="px-3 py-2 text-xs text-[color:var(--text-muted)]">
+          <div className="px-3 py-2 text-xs text-(--text-muted)">
             {query.trim() ? "No models match the filter." : "No models available."}
           </div>
         )}
@@ -113,11 +113,11 @@ export function ModelPickerDropdown({
               role="option"
               aria-selected="false"
               onClick={() => onPick(m)}
-              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-[color:var(--text-primary)] transition-colors hover:bg-bg-tertiary focus:bg-bg-tertiary focus:outline-none"
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-(--text-primary) transition-colors hover:bg-bg-tertiary focus:bg-bg-tertiary focus:outline-hidden"
             >
               <span className="min-w-0 truncate">{m}</span>
               {visionCapableIds?.has(m) && (
-                <span className="ml-auto shrink-0 rounded bg-[color:var(--accent-color)]/15 px-1.5 py-0.5 text-[0.6rem] font-medium text-[color:var(--accent-color)]">
+                <span className="ml-auto shrink-0 rounded-sm bg-(--accent-color)/15 px-1.5 py-0.5 text-[0.6rem] font-medium text-(--accent-color)">
                   vision
                 </span>
               )}

@@ -34,7 +34,7 @@ export const LS_CODE_VARIABLE_COLOR = "mh.codeVariableColor";
 export const LS_RIGHT_PANEL_WIDTH = "mh.rightPanelWidth";
 /**
  * Persisted right-panel width as a FRACTION of the window width
- * (null = use the default flex-grow width). A fraction tracks window
+ * (null = use the default grow width). A fraction tracks window
  * resizes for free and can never pin at a render cap on a small restored
  * window — the legacy px value's failure mode.
  */
@@ -279,7 +279,7 @@ export function clampPanelFraction(frac: number, innerWidth: number): number {
  * unset, seeds from the legacy absolute-px key (mh.rightPanelWidth,
  * pre-fraction versions) by reinterpreting it against the current
  * viewport, clamped into the band — no migration write. Returns null when
- * neither key is set (the panel then uses its default flex-grow width).
+ * neither key is set (the panel then uses its default grow width).
  */
 export function readRightPanelWidthFrac(): number | null {
   const frac = readLsNumberOrNull(LS_RIGHT_PANEL_WIDTH_FRAC);

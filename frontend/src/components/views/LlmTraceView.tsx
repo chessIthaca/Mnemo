@@ -188,11 +188,11 @@ function CacheBadge({ usage }: { usage: LlmUsage | null }) {
   const pct = cacheHitPct(usage);
   if (pct === null) return null;
   return pct > 0 ? (
-    <span className="rounded bg-emerald-500/15 px-1 py-px font-mono text-[0.65em] font-semibold text-emerald-400">
+    <span className="rounded-sm bg-emerald-500/15 px-1 py-px font-mono text-[0.65em] font-semibold text-emerald-400">
       {fmtPct(pct)}% cached
     </span>
   ) : (
-    <span className="rounded bg-bg-tertiary px-1 py-px font-mono text-[0.65em] text-slate-500">
+    <span className="rounded-sm bg-bg-tertiary px-1 py-px font-mono text-[0.65em] text-slate-500">
       0% cached
     </span>
   );
@@ -296,7 +296,7 @@ function UsageCard({ usage, finishReason, streaming, ttft, reason, gen, connect,
   // the exact stalled time readable.
   const genShown = gen != null ? Math.max(0, gen - (reason ?? 0)) : null;
   return (
-    <div className="rounded border border-border p-2">
+    <div className="rounded-sm border border-border p-2">
       <div className="grid grid-cols-4 gap-2 text-center">
         <div>
           <div className="font-mono text-sm text-slate-200">{usage ? fmtInt(usage.prompt) : "—"}</div>
@@ -410,12 +410,12 @@ function MessageRow({
       ? `tool_calls: ${toolCalls.map((tc) => tc?.function?.name ?? "?").join(", ")}`
       : "(empty)");
   return (
-    <div className="rounded border border-border">
+    <div className="rounded-sm border border-border">
       <button
         onClick={onToggle}
         className="flex w-full items-center gap-2 px-2 py-1 text-left hover:bg-bg-tertiary"
       >
-        <span className={`shrink-0 rounded px-1.5 py-0.5 font-mono text-[0.62em] font-semibold uppercase ${ROLE_STYLES[role] ?? "bg-bg-tertiary text-slate-400"}`}>
+        <span className={`shrink-0 rounded-sm px-1.5 py-0.5 font-mono text-[0.62em] font-semibold uppercase ${ROLE_STYLES[role] ?? "bg-bg-tertiary text-slate-400"}`}>
           {role}
         </span>
         {diff && <DiffBadge status={diff} />}
@@ -456,7 +456,7 @@ function TopLevelChips({ req }: { req: LlmRequestDetail }) {
       {chips.map(({ k, v }) => (
         <span
           key={k}
-          className="rounded border border-border bg-bg-tertiary px-1.5 py-0.5 font-mono text-[0.65em] text-slate-400"
+          className="rounded-sm border border-border bg-bg-tertiary px-1.5 py-0.5 font-mono text-[0.65em] text-slate-400"
         >
           <span className="text-slate-500">{k}:</span>{" "}
           <span className="text-slate-200">
@@ -497,14 +497,14 @@ function RequestSection({
     });
 
   return (
-    <div className="rounded border border-border">
+    <div className="rounded-sm border border-border">
       <div className="flex items-center justify-between border-b border-border px-2 py-1">
         <span className="text-[0.68em] font-semibold uppercase tracking-wide text-slate-400">
           Request
         </span>
         <button
           onClick={() => setRawJson((v) => !v)}
-          className={`rounded px-1.5 py-0.5 text-[0.65em] font-medium transition-colors ${
+          className={`rounded-sm px-1.5 py-0.5 text-[0.65em] font-medium transition-colors ${
             rawJson
               ? "bg-cyan-500/20 text-cyan-300"
               : "bg-bg-tertiary text-slate-400 hover:text-slate-200"
@@ -533,7 +533,7 @@ function RequestSection({
               />
             ))}
             {compare && compare.removed > 0 && (
-              <div className="rounded border border-red-500/30 bg-red-950/20 px-2 py-1 text-[0.68em] text-red-300">
+              <div className="rounded-sm border border-red-500/30 bg-red-950/20 px-2 py-1 text-[0.68em] text-red-300">
                 <DiffBadge status="removed" /> {compare.removed} message
                 {compare.removed === 1 ? "" : "s"} from the previous request dropped from
                 this one.
@@ -546,7 +546,7 @@ function RequestSection({
 
           {/* Tools — collapsed to a count chip, expandable to name+description. */}
           {tools.length > 0 && (
-            <div className="rounded border border-border">
+            <div className="rounded-sm border border-border">
               <button
                 onClick={() => setToolsOpen((v) => !v)}
                 className="flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-bg-tertiary"
@@ -592,7 +592,7 @@ function ResponseSection({ detail }: { detail: LlmRequestDetail }) {
   const shown = expanded ? raw : raw.slice(0, COLLAPSE_AT);
 
   return (
-    <div className="rounded border border-border">
+    <div className="rounded-sm border border-border">
       <div className="flex items-center justify-between border-b border-border px-2 py-1">
         <span className="text-[0.68em] font-semibold uppercase tracking-wide text-slate-400">
           Response
@@ -631,7 +631,7 @@ function ResponseSection({ detail }: { detail: LlmRequestDetail }) {
             {truncatedLocal && (
               <button
                 onClick={() => setExpanded((v) => !v)}
-                className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 hover:text-slate-200"
+                className="rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 hover:text-slate-200"
               >
                 {expanded ? "Collapse" : `Expand (${fmtInt(raw.length)} bytes)`}
               </button>
@@ -658,7 +658,7 @@ function DeliveredToolCallsSection({ detail }: { detail: LlmRequestDetail }) {
   const calls = detail.raw_tool_calls ?? [];
   if (calls.length === 0) return null;
   return (
-    <div className="rounded border border-border">
+    <div className="rounded-sm border border-border">
       <div className="flex items-center justify-between border-b border-border px-2 py-1">
         <span className="text-[0.68em] font-semibold uppercase tracking-wide text-slate-400">
           Delivered tool calls
@@ -747,7 +747,7 @@ function compareMessages(
 /** Small badge rendering a diff status on a message row. */
 function DiffBadge({ status }: { status: DiffStatus }) {
   return (
-    <span className={`shrink-0 rounded px-1 py-px text-[0.6em] font-semibold uppercase ${DIFF_STYLES[status]}`}>
+    <span className={`shrink-0 rounded-sm px-1 py-px text-[0.6em] font-semibold uppercase ${DIFF_STYLES[status]}`}>
       {DIFF_LABELS[status]}
     </span>
   );
@@ -1163,7 +1163,7 @@ export function LlmTraceView() {
           <button
             onClick={clear}
             disabled={requests.length === 0}
-            className="flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 transition-colors hover:text-slate-200 disabled:opacity-40"
+            className="flex items-center gap-1 rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 transition-colors hover:text-slate-200 disabled:opacity-40"
           >
             <Eraser className="h-3 w-3" /> Clear
           </button>
@@ -1230,7 +1230,7 @@ export function LlmTraceView() {
               <div className="flex items-center justify-between">
                 <button
                   onClick={() => setCompareOn((v) => !v)}
-                  className={`flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[0.68em] font-medium transition-colors ${
+                  className={`flex items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-[0.68em] font-medium transition-colors ${
                     compareOn
                       ? "bg-cyan-500/20 text-cyan-300"
                       : "bg-bg-tertiary text-slate-400 hover:text-slate-200"

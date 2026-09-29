@@ -45,7 +45,7 @@ export const Sidebar = memo(function Sidebar() {
         onClick={() => setAboutOpen(true)}
         title="About Mnemo"
         aria-label="About Mnemo"
-        className="flex h-10 w-10 items-center justify-center rounded-lg transition-opacity hover:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-500"
+        className="flex h-10 w-10 items-center justify-center rounded-lg transition-opacity hover:opacity-90 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-cyan-500"
       >
         <MnemoLogo className="h-10 w-10" />
       </button>

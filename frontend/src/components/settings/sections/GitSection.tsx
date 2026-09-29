@@ -111,7 +111,7 @@ export const GitSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading git settings…
       </div>
     );
@@ -120,10 +120,10 @@ export const GitSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-5">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Core operations
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Comma-separated git subcommands that <strong>always require
           approval</strong> — even in Autonomous mode or under a matching safety
           rule. These are operations that land commits on a shared branch or
@@ -133,7 +133,7 @@ export const GitSection = forwardRef<SettingsSectionHandle, {
 
       <div className="space-y-2">
         <label
-          className="text-sm text-[color:var(--text-primary)]"
+          className="text-sm text-(--text-primary)"
           htmlFor="git-core-ops"
         >
           Git subcommands that always require approval
@@ -144,9 +144,9 @@ export const GitSection = forwardRef<SettingsSectionHandle, {
           value={coreOps}
           onChange={(e) => setCoreOps(e.target.value)}
           placeholder="merge, push"
-          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
-        <p className="text-[0.7rem] text-[color:var(--text-muted)]">
+        <p className="text-[0.7rem] text-(--text-muted)">
           Entries are matched case-insensitively against the git tool's{" "}
           <code>subcommand</code> argument. Changes take effect on the next git
           call (no restart needed).
@@ -154,7 +154,7 @@ export const GitSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       {saving && (
-        <div className="rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-muted)]">
+        <div className="rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-muted)">
           Saving…
         </div>
       )}

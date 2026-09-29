@@ -104,7 +104,7 @@ describe("BacklogView line-break display", () => {
 
   it("renders newlines in the failure note (plain text, pre-wrap)", () => {
     expect(source).toContain(
-      "mt-2 whitespace-pre-wrap break-words rounded border border-border",
+      "mt-2 whitespace-pre-wrap wrap-break-word rounded-sm border border-border",
     );
   });
 

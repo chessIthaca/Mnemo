@@ -101,7 +101,7 @@ function Node({
     <div>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-baseline gap-1.5 rounded px-0.5 text-left leading-relaxed hover:bg-bg-tertiary"
+        className="flex w-full items-baseline gap-1.5 rounded-sm px-0.5 text-left leading-relaxed hover:bg-bg-tertiary"
       >
         {open ? (
           <ChevronDown className="h-3 w-3 shrink-0 self-center text-slate-500" />

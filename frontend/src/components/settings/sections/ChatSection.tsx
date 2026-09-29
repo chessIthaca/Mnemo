@@ -127,7 +127,7 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
 
   if (!draft) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading chat settings…
       </div>
     );
@@ -136,72 +136,72 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
   return (
     <div className="space-y-5">
       <div className="space-y-3">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Chat
         </h3>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.showTokenUsage}
             onChange={(e) => patch({ showTokenUsage: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Show token usage in the activity bar
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.showToolImages}
             onChange={(e) => patch({ showToolImages: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Show images from image tools in chat
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.showToolActivity}
             onChange={(e) => patch({ showToolActivity: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Show tool activity in chat
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.showKnowledgeActivity}
             onChange={(e) => patch({ showKnowledgeActivity: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Show knowledge activity in chat (graph, memory, auto-recall)
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.showShellPreview}
             onChange={(e) => patch({ showShellPreview: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Stream shell output live in the tool card
         </label>
 
-        <div className="space-y-2 border-t border-[color:var(--border-color)] pt-3">
-          <div className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <div className="space-y-2 border-t border-(--border-color) pt-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             Steering notes in tool results
           </div>
-          <p className="text-xs text-[color:var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             Model guidance that rides in tool output. Unchecking a note hides that line
             in the chat card only — the tool result the model reads is unchanged.
           </p>
           {STEERING_NOTES.map((def) => (
             <label
               key={def.key}
-              className="flex items-start gap-2 text-sm text-[color:var(--text-primary)]"
+              className="flex items-start gap-2 text-sm text-(--text-primary)"
             >
               <input
                 type="checkbox"
@@ -211,11 +211,11 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
                     steeringNotes: { ...draft.steeringNotes, [def.key]: e.target.checked },
                   })
                 }
-                className="mt-[0.15em] h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+                className="mt-[0.15em] h-3.5 w-3.5 accent-(--accent-color)"
               />
               <span>
                 {def.label}
-                <span className="block text-xs text-[color:var(--text-muted)]">
+                <span className="block text-xs text-(--text-muted)">
                   {def.description}
                 </span>
               </span>
@@ -223,42 +223,42 @@ export const ChatSection = forwardRef<SettingsSectionHandle, ChatSectionProps>(
           ))}
         </div>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.chatThreadLine}
             onChange={(e) => patch({ chatThreadLine: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Thread line along activity cards
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.chatProseCap}
             onChange={(e) => patch({ chatProseCap: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Cap prose width (~100 columns)
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.chatTurnTint}
             onChange={(e) => patch({ chatTurnTint: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Alternating turn background
         </label>
 
-        <label className="flex items-center gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={draft.chatHoverTimestamps}
             onChange={(e) => patch({ chatHoverTimestamps: e.target.checked })}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Timestamps on hover
         </label>

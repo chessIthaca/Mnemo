@@ -227,8 +227,8 @@ export function SettingsDialog({
       >
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
-            <Settings className="h-5 w-5 shrink-0 text-[color:var(--accent-color)]" />
-            <DialogTitle className="text-sm font-semibold text-[color:var(--text-primary)]">
+            <Settings className="h-5 w-5 shrink-0 text-(--accent-color)" />
+            <DialogTitle className="text-sm font-semibold text-(--text-primary)">
               Settings
             </DialogTitle>
             {anyDirty && (
@@ -241,21 +241,21 @@ export function SettingsDialog({
             )}
           </div>
           <div className="flex min-w-0 flex-1 items-center justify-end gap-2">
-            <label className="relative hidden min-w-0 max-w-[14rem] flex-1 sm:block">
+            <label className="relative hidden min-w-0 max-w-56 flex-1 sm:block">
               <span className="sr-only">Search settings</span>
-              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[color:var(--text-muted)]" />
+              <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-(--text-muted)" />
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search…"
-                className="w-full rounded-lg border border-border bg-bg-primary py-1.5 pl-7 pr-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-lg border border-border bg-bg-primary py-1.5 pl-7 pr-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </label>
             <button
               type="button"
               onClick={requestClose}
               aria-label="Close settings"
-              className="rounded p-1 text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+              className="rounded-sm p-1 text-(--text-muted) hover:text-(--text-primary)"
             >
               <X className="h-4 w-4" />
             </button>
@@ -270,17 +270,17 @@ export function SettingsDialog({
             <div className="mb-2 px-1 sm:hidden">
               <label className="relative block">
                 <span className="sr-only">Search settings</span>
-                <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[color:var(--text-muted)]" />
+                <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-(--text-muted)" />
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                   placeholder="Search…"
-                  className="w-full rounded-lg border border-border bg-bg-primary py-1.5 pl-7 pr-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                  className="w-full rounded-lg border border-border bg-bg-primary py-1.5 pl-7 pr-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
                 />
               </label>
             </div>
             {filteredNav.length === 0 && (
-              <p className="px-2 text-[0.7rem] text-[color:var(--text-muted)]">
+              <p className="px-2 text-[0.7rem] text-(--text-muted)">
                 No matching sections.
               </p>
             )}
@@ -296,8 +296,8 @@ export function SettingsDialog({
                   aria-current={active ? "page" : undefined}
                   className={`flex flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 text-left transition-colors ${
                     active
-                      ? "bg-bg-tertiary text-[color:var(--text-primary)]"
-                      : "text-[color:var(--text-muted)] hover:bg-bg-tertiary/60 hover:text-[color:var(--text-primary)]"
+                      ? "bg-bg-tertiary text-(--text-primary)"
+                      : "text-(--text-muted) hover:bg-bg-tertiary/60 hover:text-(--text-primary)"
                   }`}
                 >
                   <span className="flex items-center gap-2 text-xs font-medium">
@@ -467,7 +467,7 @@ export function SettingsDialog({
 
         <div className="flex shrink-0 items-center justify-between gap-3 border-t border-border px-4 py-3">
           <div className="min-w-0">
-            <p className="text-[0.7rem] text-[color:var(--text-muted)]">
+            <p className="text-[0.7rem] text-(--text-muted)">
               {anyDirty
                 ? "OK saves all changes and closes; Cancel discards."
                 : "OK saves any changes and closes; Cancel closes without saving."}
@@ -481,7 +481,7 @@ export function SettingsDialog({
               type="button"
               onClick={requestClose}
               disabled={saving}
-              className="rounded-lg border border-border px-4 py-1.5 text-sm text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)] disabled:opacity-40"
+              className="rounded-lg border border-border px-4 py-1.5 text-sm text-(--text-muted) hover:text-(--text-primary) disabled:opacity-40"
             >
               Cancel
             </button>
@@ -489,7 +489,7 @@ export function SettingsDialog({
               type="button"
               onClick={() => void handleOk()}
               disabled={!anyDirty || saving}
-              className="rounded-lg bg-[color:var(--accent-color)] px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40"
+              className="rounded-lg bg-(--accent-color) px-4 py-1.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40"
             >
               {saving ? "Saving…" : "OK"}
             </button>

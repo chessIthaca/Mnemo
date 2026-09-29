@@ -103,3 +103,42 @@ fn build_workflow_avoids_node20_actions() {
         }
     }
 }
+
+/// The GITHUB_TOKEN must be scoped: the workflow declares a least-privilege
+/// `permissions:` block at the workflow level, and the only widening is the
+/// release job's explicit per-job override.
+///
+/// An unscoped token is CodeQL's `actions/missing-workflow-permissions` finding
+/// — alerts 1 (windows) and 13 (macos), open since 2026-09-21. The repo-level
+/// default is already `read`, but that is a repository *setting*: this test
+/// keeps the workflow itself least-privilege, so flipping that setting can
+/// never silently hand a build job a write token.
+#[test]
+fn build_workflow_scopes_token_permissions() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.github/workflows/build.yml"
+    ))
+    .expect("build.yml readable");
+    let lines: Vec<&str> = text.lines().collect();
+
+    let workflow_level = lines.iter().position(|l| l.starts_with("permissions:"));
+    let scoped = workflow_level.is_some_and(|idx| {
+        lines
+            .iter()
+            .skip(idx + 1)
+            .take_while(|l| l.trim().is_empty() || l.starts_with(' '))
+            .any(|l| l.trim_start().starts_with("contents:"))
+    });
+    assert!(
+        scoped,
+        "build.yml has no workflow-level `permissions:` block scoping the \
+         GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions alerts 1/13) \
+         — add `permissions:` + `contents: read` below the `env:` block"
+    );
+
+    assert!(
+        text.contains("permissions:\n      contents: write"),
+        "the release job's contents: write override went missing"
+    );
+}

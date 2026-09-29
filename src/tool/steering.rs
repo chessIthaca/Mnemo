@@ -510,8 +510,17 @@ mod tests {
         let note = consolidation_due_note(harness(store.clone()).as_ref(), Some("session-f11"))
             .await
             .expect("crossing the threshold fires the note");
-        assert!(note.contains("15 working-memory events"), "{note}");
-        assert!(note.contains("memory_consolidate"), "{note}");
+        // The note embeds the session id, so it is deliberately not printed in
+        // the failure messages (CodeQL rust/cleartext-logging alerts 6/7); the
+        // messages name what was expected instead.
+        assert!(
+            note.contains("15 working-memory events"),
+            "the note reports the crossing count"
+        );
+        assert!(
+            note.contains("memory_consolidate"),
+            "the note names the consolidation tool"
+        );
         // Fired once — the gate holds for subsequent calls.
         assert!(
             consolidation_due_note(harness(store).as_ref(), Some("session-f11"))

@@ -356,7 +356,12 @@ export function isGitMutation(toolName: string, argsJson: string): boolean {
     // separator like `;`/`&&`/`|`/`(`), allowing global flags with or
     // without values (`git -c x=y merge`, `git -C path commit`) — but NOT a
     // mere mention inside another command (`echo git commit`).
-    return /(?:^|[|;&,(]\s*)git\s+(?:-(?:C|c)\s+\S+\s+|-\S+\s+)*(?:commit|merge|checkout|branch)\b/.test(
+    // The `(?![\s-])` lookahead makes the two flag alternatives disjoint: a
+    // `-C`/`-c` value must not itself look like a flag. Without it the
+    // alternatives can consume the same text and the group backtracks
+    // exponentially on `git -C -! -C -! …` (CodeQL js/redos alert 4: 5.2 s at
+    // 28 repetitions); the accepted command set is unchanged.
+    return /(?:^|[|;&,(]\s*)git\s+(?:-(?:C|c)\s+(?![\s-])\S+\s+|-\S+\s+)*(?:commit|merge|checkout|branch)\b/.test(
       cmd,
     );
   }

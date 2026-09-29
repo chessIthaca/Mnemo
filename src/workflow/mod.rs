@@ -1524,10 +1524,12 @@ mod tests {
         let plans_dir = dir.path().join("plans");
         let mut wf = Workflow::new(plans_dir.clone());
         let id = wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
-        assert_eq!(id.len(), 8, "plan ids are short 8-hex handles, got {id}");
+        // `id` is derived from `uuid_hex`, so it is deliberately not printed in
+        // these failure messages (CodeQL rust/cleartext-logging alerts 14/15).
+        assert_eq!(id.len(), 8, "plan ids are short 8-hex handles");
         assert!(
             id.chars().all(|c| c.is_ascii_hexdigit()),
-            "the id is hex, got {id}"
+            "the id is hex"
         );
         assert!(
             plans_dir.join(format!("{id}.md")).exists(),

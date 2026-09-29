@@ -38,6 +38,14 @@ env:
   # (regression test: build_workflow_ci_env_is_clap_bool).
   CI: "true"
 
+# Least privilege for GITHUB_TOKEN: the build jobs only read the repository
+# (checkout + build + upload artifacts), so the token is scoped to
+# contents:read here and the release job widens it per job. CodeQL
+# actions/missing-workflow-permissions alerts 1 (windows) / 13 (macos);
+# regression test: build_workflow_scopes_token_permissions.
+permissions:
+  contents: read
+
 jobs:
   windows:
     runs-on: windows-latest

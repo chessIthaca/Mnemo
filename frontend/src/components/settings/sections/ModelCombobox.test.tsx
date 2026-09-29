@@ -114,8 +114,14 @@ describe("ModelCombobox source contracts (review round 2 — cross-platform + li
     // The bridge between the toggle's setOpen and its guard tolerates only
     // whitespace and // comment lines — it cannot jump to the entry
     // button's guard further down, so a removed toggle guard fails the pin.
-    expect(source).toMatch(
-      /onClick=\{\(\) => \{\s*setOpen\(\(o\) => !o\);(?:\s|\/\/[^\n]*)*if \(document\.activeElement !== inputRef\.current\) \{\s*skipOpenRef\.current = true;\s*inputRef\.current\?\.focus\(\);/,
+    // Line comments are stripped BEFORE matching: the old bridge (whitespace
+    // or a `//` comment under a nested `*`) backtracked exponentially, the
+    // CodeQL js/redos alert 3 — 5 s on a hostile 28-token command. A plain
+    // whitespace bridge over the comment-free source keeps exactly the same
+    // tolerance and still cannot jump to the entry button's guard.
+    const stripped = source.replace(/\/\/[^\n]*/g, "");
+    expect(stripped).toMatch(
+      /onClick=\{\(\) => \{\s*setOpen\(\(o\) => !o\);\s*if \(document\.activeElement !== inputRef\.current\) \{\s*skipOpenRef\.current = true;\s*inputRef\.current\?\.focus\(\);/,
     );
   });
 });

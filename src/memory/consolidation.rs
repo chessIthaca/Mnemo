@@ -205,7 +205,12 @@ pub(crate) async fn consolidate_session_with_events(
     // consolidation), but a silently growing working tier is its own
     // failure — log it (quality review LOW 6, class-closure).
     if let Err(e) = store.delete_working_for_session(session_id).await {
-        eprintln!("mnemo: failed to delete working events for session {session_id}: {e}");
+        // The session id itself is deliberately NOT interpolated: writing a
+        // session handle to a log is the CodeQL rust/cleartext-logging finding
+        // (alert 8). The error carries the failure; the needle
+        // `mnemo: failed to delete working events for session` stays pinned by
+        // durable_write_failures_log_instead_of_vanishing.
+        eprintln!("mnemo: failed to delete working events for session: {e}");
     }
 
     Ok(id)

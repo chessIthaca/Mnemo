@@ -271,7 +271,7 @@ export function GitView() {
         <p className="text-red-400">{error}</p>
         <button
           onClick={() => void refresh()}
-          className="w-fit rounded bg-bg-tertiary px-2 py-1 text-xs hover:text-slate-200"
+          className="w-fit rounded-sm bg-bg-tertiary px-2 py-1 text-xs hover:text-slate-200"
         >
           Retry
         </button>
@@ -309,7 +309,7 @@ export function GitView() {
         </span>
         <span className="ml-auto flex items-center gap-2 text-slate-500">
           <span className="flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-full bg-[color:var(--accent-color)]" />
+            <span className="inline-block h-2 w-2 rounded-full bg-(--accent-color)" />
             main
           </span>
           <span className="flex items-center gap-1">
@@ -510,7 +510,7 @@ export function GitView() {
       {/* Selected-commit detail row. */}
       {selectedCommit && (
         <div className="border-t border-border px-3 py-1.5 text-[0.75em] text-slate-400">
-          <span className="font-mono text-[color:var(--accent-color)]">
+          <span className="font-mono text-(--accent-color)">
             {selectedCommit.short_sha}
           </span>{" "}
           <span className="text-slate-300">{selectedCommit.subject}</span>{" "}
@@ -532,12 +532,12 @@ export function GitView() {
             className="flex items-center gap-2 px-3 py-1.5 text-[0.8em] hover:bg-bg-tertiary"
           >
             <GitBranch
-              className={`h-3 w-3 shrink-0 ${b.is_main ? "text-[color:var(--accent-color)]" : "text-slate-500"}`}
+              className={`h-3 w-3 shrink-0 ${b.is_main ? "text-(--accent-color)" : "text-slate-500"}`}
             />
             <span
               className={
                 b.is_main
-                  ? "font-medium text-[color:var(--accent-color)]"
+                  ? "font-medium text-(--accent-color)"
                   : b.is_current
                     ? "font-medium text-purple-400"
                     : "text-slate-300"
@@ -577,7 +577,7 @@ export function GitView() {
                       ? `Merge '${b.name}' into main via the merge_to_main skill (confirmation-gated)`
                       : "Merging is available once the active agent's workflow is Complete or Planning (no plan mid-flight)"
                   }
-                  className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.85em] font-medium transition-colors ${
+                  className={`flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[0.85em] font-medium transition-colors ${
                     canMerge
                       ? "text-cyan-400 hover:bg-bg-tertiary"
                       : "cursor-not-allowed text-cyan-400/40"

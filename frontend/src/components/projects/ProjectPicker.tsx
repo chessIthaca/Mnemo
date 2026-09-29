@@ -146,13 +146,13 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
     <div className="flex flex-col gap-5">
       {/* Registered projects list */}
       <section>
-        <h2 className="mb-2 text-sm font-semibold text-[color:var(--text-primary)]">
+        <h2 className="mb-2 text-sm font-semibold text-(--text-primary)">
           Your projects
         </h2>
         {loading ? (
-          <p className="text-xs text-[color:var(--text-muted)]">Loading…</p>
+          <p className="text-xs text-(--text-muted)">Loading…</p>
         ) : projects.length === 0 ? (
-          <p className="text-xs text-[color:var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             No projects registered yet. Create one below.
           </p>
         ) : (
@@ -164,10 +164,10 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
               >
                 <FolderOpen className="h-4 w-4 shrink-0 text-cyan-400" />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium text-[color:var(--text-primary)]">
+                  <div className="truncate text-sm font-medium text-(--text-primary)">
                     {p.name}
                   </div>
-                  <div className="truncate text-[0.7rem] text-[color:var(--text-muted)]">
+                  <div className="truncate text-[0.7rem] text-(--text-muted)">
                     {p.path}
                   </div>
                 </div>
@@ -175,7 +175,7 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
                   type="button"
                   onClick={() => void handleOpen(p.path)}
                   disabled={busy}
-                  className="shrink-0 rounded-lg bg-[color:var(--accent-color)] px-3 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+                  className="shrink-0 rounded-lg bg-(--accent-color) px-3 py-1 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
                 >
                   {openButtonLabel(phase)}
                 </button>
@@ -184,7 +184,7 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
                   onClick={() => void handleRemove(p.name)}
                   disabled={busy}
                   title="Remove from registry (does not delete files)"
-                  className="shrink-0 rounded-lg p-1.5 text-[color:var(--text-muted)] hover:bg-bg-tertiary hover:text-red-400 disabled:opacity-40"
+                  className="shrink-0 rounded-lg p-1.5 text-(--text-muted) hover:bg-bg-tertiary hover:text-red-400 disabled:opacity-40"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
@@ -198,13 +198,13 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
 
       {/* Create new project */}
       <section>
-        <h2 className="mb-2 text-sm font-semibold text-[color:var(--text-primary)]">
+        <h2 className="mb-2 text-sm font-semibold text-(--text-primary)">
           Create a new project
         </h2>
-        <p className="mb-3 text-[0.7rem] text-[color:var(--text-muted)]">
+        <p className="mb-3 text-[0.7rem] text-(--text-muted)">
           Pick a directory — it will be scaffolded with a{" "}
-          <code className="rounded bg-bg-tertiary px-1">.coding/</code> subfolder
-          and an <code className="rounded bg-bg-tertiary px-1">agent.md</code>{" "}
+          <code className="rounded-sm bg-bg-tertiary px-1">.coding/</code> subfolder
+          and an <code className="rounded-sm bg-bg-tertiary px-1">agent.md</code>{" "}
           constitution, then registered.
         </p>
         <div className="flex flex-col gap-2">
@@ -213,31 +213,31 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
               type="button"
               onClick={() => void handlePickDir()}
               disabled={busy}
-              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-[color:var(--text-primary)] hover:bg-bg-tertiary disabled:opacity-40"
+              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-(--text-primary) hover:bg-bg-tertiary disabled:opacity-40"
             >
               <FolderPlus className="h-3.5 w-3.5" />
               Choose directory…
             </button>
-            <span className="min-w-0 flex-1 truncate text-xs text-[color:var(--text-muted)]">
+            <span className="min-w-0 flex-1 truncate text-xs text-(--text-muted)">
               {chosenPath ?? "No directory selected"}
             </span>
           </div>
           <label className="flex items-center gap-2">
-            <span className="shrink-0 text-xs text-[color:var(--text-muted)]">
+            <span className="shrink-0 text-xs text-(--text-muted)">
               Name
             </span>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="defaults to the folder name"
-              className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             />
           </label>
           <button
             type="button"
             onClick={() => void handleCreate()}
             disabled={busy || !chosenPath}
-            className="mt-1 flex items-center justify-center gap-1.5 rounded-lg bg-[color:var(--accent-color)] px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40"
+            className="mt-1 flex items-center justify-center gap-1.5 rounded-lg bg-(--accent-color) px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-40"
           >
             {createButtonLabel(phase)}
           </button>
@@ -247,7 +247,7 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
       {error && (
         <div className="flex items-start gap-2 rounded-lg border border-red-600/40 bg-red-950/20 p-3 text-xs text-red-300">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-          <span className="min-w-0 break-words">{error}</span>
+          <span className="min-w-0 wrap-break-word">{error}</span>
         </div>
       )}
     </div>
@@ -262,10 +262,10 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
             is the whole UI); self-hides when the pass completes. */}
         <IndexingOverlay />
         <div className="w-full max-w-lg">
-          <h1 className="mb-1 text-center text-lg font-semibold text-[color:var(--text-primary)]">
+          <h1 className="mb-1 text-center text-lg font-semibold text-(--text-primary)">
             Choose a project
           </h1>
-          <p className="mb-6 text-center text-sm text-[color:var(--text-muted)]">
+          <p className="mb-6 text-center text-sm text-(--text-muted)">
             Select a registered project or create a new one to get started.
           </p>
           {body}
@@ -283,7 +283,7 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
     <Dialog open={true} onOpenChange={(o) => { if (!o) onClose?.(); }}>
       <DialogContent className="mx-4 flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-border bg-bg-secondary shadow-2xl">
         <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
-          <DialogTitle className="text-sm font-semibold text-[color:var(--text-primary)]">
+          <DialogTitle className="text-sm font-semibold text-(--text-primary)">
             Switch project
           </DialogTitle>
           <DialogDescription className="sr-only">
@@ -293,7 +293,7 @@ export function ProjectPicker({ onClose }: { onClose?: () => void }) {
             type="button"
             onClick={() => onClose?.()}
             aria-label="Close"
-            className="rounded p-1 text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="rounded-sm p-1 text-(--text-muted) hover:text-(--text-primary)"
           >
             <X className="h-4 w-4" />
           </button>

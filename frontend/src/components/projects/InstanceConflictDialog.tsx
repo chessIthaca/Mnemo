@@ -25,7 +25,7 @@ export function InstanceConflictDialog({
 }) {
   const launched = new Date(conflict.started_at * 1000).toLocaleTimeString();
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs">
       <SplashCard>
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-amber-400">
           <AlertTriangle className="h-4 w-4" />

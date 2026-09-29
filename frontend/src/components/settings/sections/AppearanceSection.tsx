@@ -179,7 +179,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
 
   if (!draft) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading appearance…
       </div>
     );
@@ -189,13 +189,13 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
     <div className="space-y-5">
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             Appearance
           </h3>
           <button
             type="button"
             onClick={handleResetDefaults}
-            className="flex items-center gap-1 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="flex items-center gap-1 text-xs text-(--text-muted) hover:text-(--text-primary)"
             title="Reset theme, font, and all colors to defaults (still needs Save)"
           >
             <RotateCcw className="h-3 w-3" />
@@ -204,7 +204,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
         </div>
 
         <div className="space-y-1">
-          <label className="text-sm text-[color:var(--text-primary)]">Theme</label>
+          <label className="text-sm text-(--text-primary)">Theme</label>
           <div className="flex gap-2">
             <ThemeButton
               active={draft.theme === "dark"}
@@ -228,14 +228,14 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
         </div>
 
         <div className="space-y-1">
-          <label className="text-sm text-[color:var(--text-primary)]" htmlFor="settings-font-family">
+          <label className="text-sm text-(--text-primary)" htmlFor="settings-font-family">
             Font family
           </label>
           <select
             id="settings-font-family"
             value={draft.fontFamily}
             onChange={(e) => patch({ fontFamily: e.target.value })}
-            className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+            className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
           >
             {FONT_OPTIONS.map((f) => (
               <option key={f} value={f}>
@@ -246,9 +246,9 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
         </div>
 
         <div className="space-y-1">
-          <label className="text-sm text-[color:var(--text-primary)]" htmlFor="settings-font-size">
+          <label className="text-sm text-(--text-primary)" htmlFor="settings-font-size">
             Font size{" "}
-            <span className="text-[color:var(--text-muted)]">({draft.fontSize}px)</span>
+            <span className="text-(--text-muted)">({draft.fontSize}px)</span>
           </label>
           <input
             id="settings-font-size"
@@ -261,14 +261,14 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
               const n = Number(e.target.value);
               if (Number.isFinite(n)) patch({ fontSize: Math.max(10, Math.min(24, n)) });
             }}
-            className="w-full accent-[color:var(--accent-color)]"
+            className="w-full accent-(--accent-color)"
           />
         </div>
       </div>
 
       <div className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             Colors
           </h3>
           <div className="flex items-center gap-2">
@@ -289,7 +289,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
                   codeVariableColor: "#ffa657",
                 })
               }
-              className="rounded border border-border px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+              className="rounded-sm border border-border px-1.5 py-0.5 text-[0.65rem] text-(--text-muted) hover:text-(--text-primary)"
             >
               Default dark
             </button>
@@ -310,7 +310,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
                   codeVariableColor: "#c2410c",
                 })
               }
-              className="rounded border border-border px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+              className="rounded-sm border border-border px-1.5 py-0.5 text-[0.65rem] text-(--text-muted) hover:text-(--text-primary)"
             >
               Light preset
             </button>
@@ -343,7 +343,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
         />
 
         <div className="pt-2">
-          <h4 className="text-[0.7rem] font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h4 className="text-[0.7rem] font-semibold uppercase tracking-wide text-(--text-muted)">
             Code
           </h4>
         </div>
@@ -392,11 +392,11 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
       </div>
 
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Preview
         </h3>
         <div
-          className="space-y-2 rounded-lg border border-border bg-bg-primary px-3 py-3 text-[color:var(--text-primary)]"
+          className="space-y-2 rounded-lg border border-border bg-bg-primary px-3 py-3 text-(--text-primary)"
           style={{
             fontFamily: "var(--app-font-family)",
             fontSize: "var(--app-font-size)",
@@ -404,7 +404,7 @@ export const AppearanceSection = forwardRef<SettingsSectionHandle, AppearanceSec
         >
           <p>The quick brown fox jumps over the lazy dog.</p>
           <pre
-            className="overflow-x-auto rounded border border-border px-3 py-2 text-[0.85em] leading-relaxed"
+            className="overflow-x-auto rounded-sm border border-border px-3 py-2 text-[0.85em] leading-relaxed"
             style={{ color: "var(--code-text)" }}
           >
             <code>
@@ -454,8 +454,8 @@ function ThemeButton({
       onClick={onClick}
       className={`flex flex-1 items-center justify-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors ${
         active
-          ? "border-[color:var(--accent-color)] bg-[color:var(--accent-color)]/20 text-[color:var(--accent-color)]"
-          : "border-border bg-bg-primary text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+          ? "border-(--accent-color) bg-(--accent-color)/20 text-(--accent-color)"
+          : "border-border bg-bg-primary text-(--text-muted) hover:text-(--text-primary)"
       }`}
     >
       {icon}
@@ -490,15 +490,15 @@ function ColorRow({
         type="color"
         value={HEX_RE.test(value) ? value : "#000000"}
         onChange={(e) => onChange(e.target.value)}
-        className="h-8 w-8 shrink-0 cursor-pointer rounded border border-border bg-bg-primary"
+        className="h-8 w-8 shrink-0 cursor-pointer rounded-sm border border-border bg-bg-primary"
         title={label}
         aria-label={label}
       />
       <div className="flex flex-1 flex-col">
-        <label htmlFor={`${id}-hex`} className="text-sm text-[color:var(--text-primary)]">
+        <label htmlFor={`${id}-hex`} className="text-sm text-(--text-primary)">
           {label}
         </label>
-        {hint && <span className="text-xs text-[color:var(--text-muted)]">{hint}</span>}
+        {hint && <span className="text-xs text-(--text-muted)">{hint}</span>}
       </div>
       <input
         id={`${id}-hex`}
@@ -513,9 +513,9 @@ function ColorRow({
           if (HEX_RE.test(local)) onChange(local);
           else setLocal(value);
         }}
-        className={`w-24 rounded-lg border bg-bg-primary px-2 py-1 text-sm text-[color:var(--text-primary)] focus:outline-none ${
+        className={`w-24 rounded-lg border bg-bg-primary px-2 py-1 text-sm text-(--text-primary) focus:outline-hidden ${
           local === "" || HEX_RE.test(local)
-            ? "border-border focus:border-[color:var(--accent-color)]"
+            ? "border-border focus:border-(--accent-color)"
             : "border-red-500/60"
         }`}
         spellCheck={false}

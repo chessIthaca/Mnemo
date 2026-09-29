@@ -186,7 +186,7 @@ export function DashboardBody({
       ? (cacheSavedTokens / savings.cache.prompt_tokens) * 100
       : 0;
   const maxDay = savings.per_day.reduce((m, d) => Math.max(m, d.saved_tokens), 0);
-  const card = "rounded border border-slate-700 bg-slate-800/40 p-2";
+  const card = "rounded-sm border border-slate-700 bg-slate-800/40 p-2";
   const th = "text-right font-normal px-1 py-0.5 whitespace-nowrap";
   const td = "text-right font-mono tabular-nums px-1 py-0.5 text-slate-300 whitespace-nowrap";
 
@@ -249,9 +249,9 @@ export function DashboardBody({
             {savings.per_day.map((d) => (
               <div key={d.day} className="flex items-center gap-2">
                 <span className="w-20 shrink-0 text-slate-500">{fmtDay(d.day)}</span>
-                <span className="h-2 grow rounded bg-slate-700/40">
+                <span className="h-2 grow rounded-sm bg-slate-700/40">
                   <span
-                    className="block h-2 rounded bg-emerald-500/60"
+                    className="block h-2 rounded-sm bg-emerald-500/60"
                     style={{
                       width:
                         maxDay > 0 ? `${Math.max(0, (d.saved_tokens / maxDay) * 100)}%` : "0%",

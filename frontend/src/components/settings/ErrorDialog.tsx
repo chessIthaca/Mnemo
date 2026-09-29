@@ -36,17 +36,17 @@ export function ErrorDialog({
   return (
     <Dialog open={open} onOpenChange={(o) => (!o ? onClose() : undefined)}>
       <DialogContent className="w-[min(34rem,calc(100vw-2rem))] rounded-xl border border-border bg-bg-secondary p-4 shadow-2xl">
-        <DialogTitle className="text-sm font-semibold text-[color:var(--text-primary)]">
+        <DialogTitle className="text-sm font-semibold text-(--text-primary)">
           {title}
         </DialogTitle>
-        <DialogDescription className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap break-words rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-200">
+        <DialogDescription className="mt-3 max-h-72 overflow-y-auto whitespace-pre-wrap wrap-break-word rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs leading-relaxed text-red-200">
           {message}
         </DialogDescription>
         <div className="mt-4 flex justify-end">
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-[color:var(--text-primary)] transition-colors hover:border-[color:var(--accent-color)]/60"
+            className="rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-(--text-primary) transition-colors hover:border-(--accent-color)/60"
           >
             OK
           </button>

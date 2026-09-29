@@ -349,7 +349,7 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading advanced settings…
       </div>
     );
@@ -358,10 +358,10 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-5">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Context
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           When conversation fill reaches this fraction of the model context window,
           earlier turns are summarized to free space. The Run-All auto-compact
           below follows this same dial — it fires only when the post-item
@@ -370,9 +370,9 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       <div className="space-y-2">
-        <label className="text-sm text-[color:var(--text-primary)]" htmlFor="fill-rate">
+        <label className="text-sm text-(--text-primary)" htmlFor="fill-rate">
           Summarize at fill rate{" "}
-          <span className="text-[color:var(--text-muted)]">
+          <span className="text-(--text-muted)">
             ({fmtPct(fillRate * 100)}%)
           </span>
         </label>
@@ -384,9 +384,9 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           step={0.05}
           value={fillRate}
           onChange={(e) => setFillRate(Number(e.target.value))}
-          className="w-full accent-[color:var(--accent-color)]"
+          className="w-full accent-(--accent-color)"
         />
-        <div className="flex justify-between text-[0.65rem] text-[color:var(--text-muted)]">
+        <div className="flex justify-between text-[0.65rem] text-(--text-muted)">
           <span>5% (aggressive)</span>
           <span>50% default</span>
           <span>95% (late)</span>
@@ -395,11 +395,11 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
 
       <div className="space-y-2">
         <label
-          className="text-sm text-[color:var(--text-primary)]"
+          className="text-sm text-(--text-primary)"
           htmlFor="cache-ceiling"
         >
           Proxy cache ceiling{" "}
-          <span className="text-[color:var(--text-muted)]">
+          <span className="text-(--text-muted)">
             {cacheCeiling === null
               ? "(disabled)"
               : `(${cacheCeiling.toLocaleString()} tok)`}
@@ -416,9 +416,9 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
             const t = e.target.value.trim();
             setCacheCeiling(t === "" ? null : Number(t));
           }}
-          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Summarize before the ~340K-token cliff where LiteLLM-class proxies
           drop whole-conversation prefix caching. Empty disables the guard;
           minimum 65,536 when set.
@@ -426,10 +426,10 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       <div className="space-y-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Trace memory
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Bounds the in-memory LLM trace log (the Trace tab's data). The
           budget caps total raw-response bytes across the ring — oldest
           payloads are evicted first, their rows stay. The request cap
@@ -439,7 +439,7 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
             <label
-              className="text-sm text-[color:var(--text-primary)]"
+              className="text-sm text-(--text-primary)"
               htmlFor="trace-budget"
             >
               Memory budget (MiB)
@@ -452,12 +452,12 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
               step={1}
               value={traceBudget}
               onChange={(e) => setTraceBudget(Number(e.target.value))}
-              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             />
           </div>
           <div className="space-y-1">
             <label
-              className="text-sm text-[color:var(--text-primary)]"
+              className="text-sm text-(--text-primary)"
               htmlFor="trace-req-cap"
             >
               Request body cap (KiB)
@@ -470,20 +470,20 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
               step={16}
               value={reqCap}
               onChange={(e) => setReqCap(Number(e.target.value))}
-              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             />
           </div>
         </div>
-        <p className="text-[0.65rem] text-[color:var(--text-muted)]">
+        <p className="text-[0.65rem] text-(--text-muted)">
           Takes effect immediately — no restart needed.
         </p>
       </div>
 
       <div className="space-y-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           File viewer skip directories
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Comma-separated directory names never shown in the Files tab's file
           tree (e.g. <code>.git, node_modules, target, dist</code>). Matching
           is by directory name, so a nested <code>target</code> is skipped too.
@@ -493,22 +493,22 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           value={skipDirs}
           onChange={(e) => setSkipDirs(e.target.value)}
           placeholder=".git, node_modules, target, dist"
-          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
         />
       </div>
 
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Config directory
         </h3>
         <div className="flex items-center gap-2">
-          <code className="min-w-0 flex-1 truncate rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)]">
+          <code className="min-w-0 flex-1 truncate rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary)">
             {configDir || "—"}
           </code>
           <button
             type="button"
             onClick={() => void copyPath()}
-            className="flex shrink-0 items-center gap-1 rounded-lg border border-border px-2 py-2 text-xs text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+            className="flex shrink-0 items-center gap-1 rounded-lg border border-border px-2 py-2 text-xs text-(--text-muted) hover:text-(--text-primary)"
             title="Copy path"
             aria-label="Copy config directory path"
           >
@@ -516,38 +516,38 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
             {copied ? "Copied" : "Copy"}
           </button>
         </div>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Contains config.toml, endpoints.toml, keys.toml, projects.toml.
         </p>
       </div>
 
       <div className="space-y-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Agent browser inspection
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Exposes an unauthenticated debug port (localhost:9222 — next free
           port when multiple instances run) so the agent's{" "}
           <code>browser_*</code> tools can inspect the Browser tab. Any local
           process could run arbitrary JavaScript in the app's webview — enable
           only on a machine you fully control. Requires restart to take effect.
         </p>
-        <label className="flex items-center gap-2 text-xs text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-xs text-(--text-primary)">
           <input
             type="checkbox"
             checked={inspectEnabled}
             onChange={(e) => setInspectEnabled(e.target.checked)}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Enable agent browser inspection (restart required)
         </label>
       </div>
 
       <div className="space-y-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Run-All auto-compact
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           During a Run-All loop, compact the main agent's context after each
           completed plan — before the next item is dispatched — so every item
           starts with a clean summarized context instead of exhausting the
@@ -559,31 +559,31 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           and proceeds; the loop never stalls on it. Only Run-All loops are
           affected — interactive plan completions never compact.
         </p>
-        <label className="flex items-center gap-2 text-xs text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-xs text-(--text-primary)">
           <input
             type="checkbox"
             checked={autoCompact}
             onChange={(e) => setAutoCompact(e.target.checked)}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Auto-compact between Run-All items
         </label>
       </div>
 
       <div className="space-y-2">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Export / import
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Download a JSON bundle of settings (endpoints, vision, pricing,
           UI). API keys are omitted unless you opt in.
         </p>
-        <label className="flex items-center gap-2 text-xs text-[color:var(--text-primary)]">
+        <label className="flex items-center gap-2 text-xs text-(--text-primary)">
           <input
             type="checkbox"
             checked={includeKeys}
             onChange={(e) => setIncludeKeys(e.target.checked)}
-            className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="h-3.5 w-3.5 accent-(--accent-color)"
           />
           Include API keys in export (sensitive)
         </label>
@@ -591,7 +591,7 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           <button
             type="button"
             onClick={() => void handleExport()}
-            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50"
+            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-(--text-primary) hover:border-(--accent-color)/50"
           >
             <Download className="h-3.5 w-3.5" />
             Export JSON
@@ -600,7 +600,7 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
             type="button"
             onClick={() => fileRef.current?.click()}
             disabled={importing}
-            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50 disabled:opacity-40"
+            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-(--text-primary) hover:border-(--accent-color)/50 disabled:opacity-40"
           >
             <Upload className="h-3.5 w-3.5" />
             {importing ? "Importing…" : "Import JSON"}
@@ -619,11 +619,11 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Known projects
         </h3>
         {projects.length === 0 ? (
-          <p className="text-xs text-[color:var(--text-muted)]">No projects registered.</p>
+          <p className="text-xs text-(--text-muted)">No projects registered.</p>
         ) : (
           <ul className="space-y-1">
             {projects.map((p) => (
@@ -631,8 +631,8 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
                 key={p.name}
                 className="rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs"
               >
-                <span className="font-medium text-[color:var(--text-primary)]">{p.name}</span>
-                <span className="mt-0.5 block truncate text-[color:var(--text-muted)]">
+                <span className="font-medium text-(--text-primary)">{p.name}</span>
+                <span className="mt-0.5 block truncate text-(--text-muted)">
                   {p.path}
                 </span>
               </li>

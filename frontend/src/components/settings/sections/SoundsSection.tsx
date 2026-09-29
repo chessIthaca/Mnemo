@@ -84,12 +84,12 @@ export const SoundsSection = forwardRef<SettingsSectionHandle, SoundsSectionProp
     ) {
       return (
         <div className="flex items-center gap-2">
-          <label className="flex flex-1 items-center gap-2 text-sm text-[color:var(--text-primary)]">
+          <label className="flex flex-1 items-center gap-2 text-sm text-(--text-primary)">
             <input
               type="checkbox"
               checked={draft![key]}
               onChange={(e) => patch({ [key]: e.target.checked } as Partial<SoundDraft>)}
-              className="h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+              className="h-3.5 w-3.5 accent-(--accent-color)"
             />
             {label}
           </label>
@@ -100,7 +100,7 @@ export const SoundsSection = forwardRef<SettingsSectionHandle, SoundsSectionProp
             type="button"
             onClick={() => playSound(kind)}
             title={previewTitle}
-            className="shrink-0 rounded border border-border px-1.5 py-0.5 text-[0.7em] text-[color:var(--text-muted)] hover:bg-bg-tertiary hover:text-[color:var(--text-primary)]"
+            className="shrink-0 rounded-sm border border-border px-1.5 py-0.5 text-[0.7em] text-(--text-muted) hover:bg-bg-tertiary hover:text-(--text-primary)"
           >
             ▶
           </button>
@@ -140,7 +140,7 @@ export const SoundsSection = forwardRef<SettingsSectionHandle, SoundsSectionProp
 
     if (!draft) {
       return (
-        <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="py-6 text-center text-xs text-(--text-muted)">
           Loading sound settings…
         </div>
       );
@@ -149,7 +149,7 @@ export const SoundsSection = forwardRef<SettingsSectionHandle, SoundsSectionProp
     return (
       <div className="space-y-5">
         <div className="space-y-3">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
             Notification sounds
           </h3>
 
@@ -169,7 +169,7 @@ export const SoundsSection = forwardRef<SettingsSectionHandle, SoundsSectionProp
             "Play the doom tone",
           )}
 
-          <p className="text-xs text-[color:var(--text-muted)]">
+          <p className="text-xs text-(--text-muted)">
             The doom tone plays when three consecutive errors abort the agent's
             turn (the model may be stuck). Previews play regardless of the
             toggles.

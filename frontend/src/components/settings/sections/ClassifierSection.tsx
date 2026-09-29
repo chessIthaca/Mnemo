@@ -282,7 +282,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading classifier settings…
       </div>
     );
@@ -291,10 +291,10 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Laya classifier
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           An optional "System 1" decision service: a fast, calibrated text
           classifier (not a generator) that answers typed questions — choice,
           score, or yes/no — with probabilities. Mnemo downloads and runs it
@@ -303,31 +303,31 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </p>
       </div>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={enabled}
           onChange={(e) => setEnabled(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Enable the Laya classifier
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — consult it for cheap, calibrated decisions
           </span>
         </span>
       </label>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={autoType}
           onChange={(e) => setAutoType(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Auto-type memory records
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — a confident classifier corrects the record's SPEC / DECISION /
             BUG / PLAN / HOW / REVIEW prefix on write; low confidence keeps
             yours. Enable only against a fine-tuned checkpoint — base models
@@ -336,16 +336,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </span>
       </label>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={steerToolChoice}
           onChange={(e) => setSteerToolChoice(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Steer search delegation with the classifier
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — the search / search_read tools ask the classifier whether a
             query wants the code graph (symbol), the file search (text), or
             the memory store (memory), and a confident answer picks the
@@ -355,16 +355,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </span>
       </label>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={failureTriage}
           onChange={(e) => setFailureTriage(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Classify failures to steer retries
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — at every failure site the error is classified
             (transient / permanent / needs_user / flaky_test) and a confident
             class steers the harness: read-only calls auto-retry once without
@@ -377,16 +377,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </span>
       </label>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={failureTriageKnn}
           onChange={(e) => setFailureTriageKnn(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Learn from logged failures between fine-tunes (kNN)
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — a local overlay over the failure-triage training log: the most
             similar logged failures vote on the class (the vote share is the
             confidence), so a resolved disposition is reusable on the very
@@ -398,16 +398,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </span>
       </label>
 
-      <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+      <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
         <input
           type="checkbox"
           checked={autoFinetune}
           onChange={(e) => setAutoFinetune(e.target.checked)}
-          className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+          className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
         />
         <span>
           Fine-tune on startup from logged failures
-          <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+          <span className="ml-1 text-[0.7rem] text-(--text-muted)">
             — managed runtime only: when enough new classified failures have
             accrued since the last fine-tune, the checkpoint is retrained in
             the background and hot-swapped. Never blocks startup.
@@ -416,16 +416,16 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       </label>
 
       <div className="space-y-2 rounded-lg border border-border bg-bg-primary p-3">
-        <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+        <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
           <input
             type="checkbox"
             checked={routing}
             onChange={(e) => setRouting(e.target.checked)}
-            className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)]"
+            className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color)"
           />
           <span>
             Route turns by task complexity
-            <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+            <span className="ml-1 text-[0.7rem] text-(--text-muted)">
               — the task text of every main-agent turn is classified
               (trivial / architectural) and, once enforcement is on, a
               confident answer runs the turn on the matching model below.
@@ -439,31 +439,31 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
 
         {routing && (
           <div className="space-y-3">
-            <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+            <div className="text-[0.7rem] text-(--text-muted)">
               Shadow-first: every classified turn is logged to
               <code> routing.jsonl</code> (the <code>laya/training/</code>{" "}
               dir under the app config dir) and no model is switched until
               enforcement is on.
             </div>
-            <label className="flex cursor-pointer items-start gap-2 text-sm text-[color:var(--text-primary)]">
+            <label className="flex cursor-pointer items-start gap-2 text-sm text-(--text-primary)">
               <input
                 type="checkbox"
                 checked={routingEnforce}
                 disabled={status !== "ready" && !routingEnforce}
                 onChange={(e) => setRoutingEnforce(e.target.checked)}
-                className="mt-0.5 h-3.5 w-3.5 accent-[color:var(--accent-color)] disabled:opacity-50"
+                className="mt-0.5 h-3.5 w-3.5 accent-(--accent-color) disabled:opacity-50"
               />
               <span>
                 Switch the model on a confident decision
-                <span className="ml-1 text-[0.7rem] text-[color:var(--text-muted)]">
+                <span className="ml-1 text-[0.7rem] text-(--text-muted)">
                   {status === "ready"
-                    ? "— off = shadow: classify + log only. Flip it once the routing log has enough labelled turns to trust."
+                    ? "— off = shadow-sm: classify + log only. Flip it once the routing log has enough labelled turns to trust."
                     : "— locked ON until the classifier is ready (install the checkpoint above); a near-chance base model must not steer the model choice, and switching it back off always works."}
                 </span>
               </span>
             </label>
             <div className="space-y-1">
-              <div className="text-xs font-medium text-[color:var(--text-primary)]">
+              <div className="text-xs font-medium text-(--text-primary)">
                 Trivial tasks
               </div>
               <ModelPickerBody
@@ -477,13 +477,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 }
                 onChange={(v) => setRoutingCheap(v)}
               />
-              <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+              <div className="text-[0.7rem] text-(--text-muted)">
                 A small, local, mechanical change — typo, rename, version
                 bump, one-line fix. Leave it unset to keep today's model.
               </div>
             </div>
             <div className="space-y-1">
-              <div className="text-xs font-medium text-[color:var(--text-primary)]">
+              <div className="text-xs font-medium text-(--text-primary)">
                 Architectural tasks
               </div>
               <ModelPickerBody
@@ -497,13 +497,13 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                 }
                 onChange={(v) => setRoutingCapable(v)}
               />
-              <div className="text-[0.7rem] text-[color:var(--text-muted)]">
+              <div className="text-[0.7rem] text-(--text-muted)">
                 Design-level work — a new feature, a cross-module refactor, a
                 new dependency, a data-model or concurrency change.
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <label className="text-[0.7rem] text-[color:var(--text-muted)]">
+              <label className="text-[0.7rem] text-(--text-muted)">
                 Confidence gate
               </label>
               <input
@@ -524,9 +524,9 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
                   }
                   setRoutingThreshold(next);
                 }}
-                className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-20 rounded-lg border border-border bg-bg-primary px-2 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
-              <span className="text-[0.7rem] text-[color:var(--text-muted)]">
+              <span className="text-[0.7rem] text-(--text-muted)">
                 a decision routes only at or above it (default 0.80)
               </span>
             </div>
@@ -538,27 +538,27 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         {catalog.map((c) => (
           <div key={c.id} className="rounded-lg border border-border bg-bg-primary p-3">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium text-[color:var(--text-primary)]">
+              <span className="text-sm font-medium text-(--text-primary)">
                 {c.name}
               </span>
               {c.installed ? (
-                <span className="flex items-center gap-0.5 rounded bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
+                <span className="flex items-center gap-0.5 rounded-sm bg-emerald-950/40 px-1.5 py-0.5 text-[0.65rem] text-emerald-400">
                   <Check className="h-3 w-3" /> installed
                 </span>
               ) : (
-                <span className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-[color:var(--text-muted)]">
+                <span className="rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] text-(--text-muted)">
                   ~{c.size_mb} MB
                 </span>
               )}
             </div>
-            <div className="mt-0.5 text-[0.7rem] text-[color:var(--text-muted)]">
+            <div className="mt-0.5 text-[0.7rem] text-(--text-muted)">
               <code>{c.id}</code> checkpoint
             </div>
             {!c.installed && !busy && (
               <button
                 type="button"
                 onClick={() => void handleDownload()}
-                className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50"
+                className="mt-2 flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs text-(--text-primary) hover:border-(--accent-color)/50"
               >
                 <Download className="h-3.5 w-3.5" />
                 Download (~{c.size_mb} MB)
@@ -566,7 +566,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
             )}
           </div>
         ))}
-        <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-[color:var(--text-muted)]">
+        <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-(--text-muted)">
           The managed runtime is self-contained but heavy: uv + virtualenv +
           laya[serve] (~0.8–1 GB) plus the English checkpoint (~810 MB), all
           under the app config dir. No Python needs to be preinstalled.
@@ -574,24 +574,24 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
       </div>
 
       <div className="rounded-lg border border-border bg-bg-primary p-3 text-xs">
-        <span className="text-[color:var(--text-muted)]">Status: </span>
-        <span className="font-medium text-[color:var(--text-primary)]">
+        <span className="text-(--text-muted)">Status: </span>
+        <span className="font-medium text-(--text-primary)">
           {statusLabel(status)}
         </span>
         {typeof status === "object" && (
           <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
             <div
-              className="h-full rounded-full bg-[color:var(--accent-color)] transition-[width] duration-300"
+              className="h-full rounded-full bg-(--accent-color) transition-[width] duration-300"
               style={{ width: `${Math.round(progress * 100)}%` }}
             />
           </div>
         )}
-        <div className="mt-1 text-[0.7rem] text-[color:var(--text-muted)]">
+        <div className="mt-1 text-[0.7rem] text-(--text-muted)">
           {statusHint(status)}
         </div>
       </div>
 
-      <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-[color:var(--text-muted)]">
+      <div className="rounded-lg border border-border bg-bg-tertiary/40 p-3 text-[0.7rem] text-(--text-muted)">
         Base Laya checkpoints are near-chance on custom tasks until fine-tuned
         — enable it for experiments and logging, and gate any real decision
         on a confidence threshold.
@@ -608,7 +608,7 @@ export const ClassifierSection = forwardRef<SettingsSectionHandle, {
         </div>
       )}
       {saving && (
-        <div className="text-xs text-[color:var(--text-muted)]">Saving…</div>
+        <div className="text-xs text-(--text-muted)">Saving…</div>
       )}
     </div>
   );

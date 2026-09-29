@@ -33,7 +33,7 @@ export function PlanStepRow({
   const hasDetails = body.trim().length > 0;
   return (
     <div
-      className={`flex items-start gap-2 rounded px-2 py-1.5 text-[0.875em] ${
+      className={`flex items-start gap-2 rounded-sm px-2 py-1.5 text-[0.875em] ${
         step.done ? "opacity-60" : "bg-bg-tertiary/50"
       }`}
     >
@@ -82,7 +82,7 @@ export function PlanStepRow({
             )}
             {hasDetails && expanded && (
               <div
-                className={`mt-0.5 whitespace-pre-wrap pl-[1.125rem] font-normal ${
+                className={`mt-0.5 whitespace-pre-wrap pl-4.5 font-normal ${
                   step.done ? "text-slate-500 line-through" : "text-slate-400"
                 }`}
               >

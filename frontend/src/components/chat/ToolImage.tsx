@@ -133,7 +133,7 @@ export function ImageLightbox({
       <DialogContent className="flex max-h-[90vh] w-[min(90vw,1400px)] flex-col rounded-lg border border-border bg-bg-secondary shadow-2xl">
         {/* Header: filename + Copy + Close. */}
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-2">
-          <DialogTitle className="min-w-0 truncate text-xs text-[color:var(--text-muted)]">
+          <DialogTitle className="min-w-0 truncate text-xs text-(--text-muted)">
             {alt}
           </DialogTitle>
           <DialogDescription className="sr-only">
@@ -145,7 +145,7 @@ export function ImageLightbox({
               onClick={() => void copy()}
               title="Copy image to clipboard"
               aria-label="Copy image to clipboard"
-              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[color:var(--text-muted)] transition-colors hover:bg-bg-tertiary hover:text-[color:var(--text-primary)]"
+              className="flex items-center gap-1 rounded-sm px-2 py-1 text-xs text-(--text-muted) transition-colors hover:bg-bg-tertiary hover:text-(--text-primary)"
             >
               {copied ? (
                 <Check className="h-3.5 w-3.5 text-cyan-400" />
@@ -158,7 +158,7 @@ export function ImageLightbox({
               type="button"
               onClick={onClose}
               aria-label="Close image viewer"
-              className="rounded p-1 text-[color:var(--text-muted)] hover:text-[color:var(--text-primary)]"
+              className="rounded-sm p-1 text-(--text-muted) hover:text-(--text-primary)"
             >
               <X className="h-4 w-4" />
             </button>
@@ -211,7 +211,7 @@ export function ToolImage({ path }: { path: string }) {
         <img
           src={dataUrl}
           alt={path}
-          className="max-h-40 rounded border border-border object-contain"
+          className="max-h-40 rounded-sm border border-border object-contain"
         />
       </button>
       {open && (

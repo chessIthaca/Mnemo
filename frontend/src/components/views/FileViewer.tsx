@@ -293,7 +293,7 @@ export function FileViewer() {
       <div key={entry.path}>
         <button
           onClick={() => openEntry(entry)}
-          className={`flex w-full items-center gap-1.5 rounded px-2 py-0.5 text-left text-xs hover:bg-bg-tertiary ${
+          className={`flex w-full items-center gap-1.5 rounded-sm px-2 py-0.5 text-left text-xs hover:bg-bg-tertiary ${
             selected ? "bg-bg-tertiary text-cyan-400" : "text-slate-300"
           }`}
           style={{ paddingLeft: `${depth * 12 + 8}px` }}

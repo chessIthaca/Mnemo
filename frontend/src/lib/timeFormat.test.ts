@@ -30,7 +30,7 @@ describe("fmtToolDuration", () => {
     expect(fmtToolDuration(72_500)).toBe("1m 13s");
   });
 
-  it("carries a rounded 60s into the minutes", () => {
+  it("carries a rounded-sm 60s into the minutes", () => {
     // 1m 59.999s must not render as "1m 60s".
     expect(fmtToolDuration(119_999)).toBe("2m 0s");
   });

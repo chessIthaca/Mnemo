@@ -258,7 +258,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading providers…
       </div>
     );
@@ -272,7 +272,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
         <button
           type="button"
           onClick={() => void load()}
-          className="rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-[color:var(--text-primary)] hover:opacity-90"
+          className="rounded-lg border border-border bg-bg-primary px-3 py-1.5 text-xs text-(--text-primary) hover:opacity-90"
         >
           Retry
         </button>
@@ -283,17 +283,17 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Providers
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Configure OpenAI-compatible endpoints, API keys, and the default
           model. Changes require Save before they take effect.
         </p>
         <div className="flex items-center gap-2 pt-1">
           <label
             htmlFor="default-model-select"
-            className="shrink-0 text-xs text-[color:var(--text-muted)]"
+            className="shrink-0 text-xs text-(--text-muted)"
           >
             Default model
           </label>
@@ -303,7 +303,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
             onChange={(e) => setDefaultModel(e.target.value || null)}
             disabled={defaultEndpoint === null}
             title="Model the app starts with — saved to config.toml; Save re-syncs the live provider"
-            className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            className="min-w-0 flex-1 rounded-lg border border-border bg-bg-primary px-2 py-1.5 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-50"
           >
             {defaultEndpoint === null ? (
               <option value="">(set a default endpoint first)</option>
@@ -322,9 +322,9 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
           </select>
         </div>
         {(defaultProvider || defaultModel) && (
-          <p className="text-xs text-[color:var(--text-primary)]">
+          <p className="text-xs text-(--text-primary)">
             Default:{" "}
-            <span className="font-medium text-[color:var(--accent-color)]">
+            <span className="font-medium text-(--accent-color)">
               {defaultProvider ?? "—"}
               {defaultModel ? ` / ${defaultModel}` : ""}
             </span>
@@ -333,7 +333,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
       </div>
 
       {endpoints.length === 0 && (
-        <div className="rounded-lg border border-border bg-bg-primary px-3 py-4 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="rounded-lg border border-border bg-bg-primary px-3 py-4 text-center text-xs text-(--text-muted)">
           No endpoints configured. Click “Add endpoint” to create one.
         </div>
       )}
@@ -387,7 +387,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
       <button
         type="button"
         onClick={addEndpoint}
-        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-muted)] transition-colors hover:border-[color:var(--accent-color)]/50 hover:text-[color:var(--accent-color)]"
+        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border bg-bg-primary px-3 py-2 text-xs text-(--text-muted) transition-colors hover:border-(--accent-color)/50 hover:text-(--accent-color)"
       >
         <Plus className="h-3.5 w-3.5" />
         Add endpoint
@@ -401,7 +401,7 @@ export const ProvidersSection = forwardRef<SettingsSectionHandle, ProvidersSecti
             title="Click to see the full error"
             className="block w-full cursor-pointer rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-left text-xs text-red-300"
           >
-            <span className="line-clamp-2 break-words">{saveError}</span>
+            <span className="line-clamp-2 wrap-break-word">{saveError}</span>
             <span className="mt-0.5 block text-[0.7rem] text-red-300/70 underline">
               Show full error…
             </span>

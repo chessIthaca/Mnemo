@@ -114,7 +114,7 @@ function OverviewPanel({ overview }: { overview: MemoryDebugOverview | null }) {
   const noStore = overview.model_id === "<none>";
   const c = overview.counts;
   return (
-    <div className="rounded border border-border bg-bg-tertiary p-2">
+    <div className="rounded-sm border border-border bg-bg-tertiary p-2">
       <div className="mb-1.5 flex items-center gap-1.5 text-[0.8em] font-semibold text-slate-300">
         <Brain className="h-3.5 w-3.5 text-cyan-400" />
         Embedder
@@ -261,11 +261,11 @@ function MemoryRow({ m }: { m: MemoryDebugWire }) {
               <span>sessions: <span className="font-mono text-slate-600">{m.source_session_ids.length}</span></span>
             )}
           </div>
-          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded bg-bg-secondary p-1.5 text-[0.85em] text-slate-300">
+          <pre className="max-h-48 overflow-auto whitespace-pre-wrap wrap-break-word rounded-sm bg-bg-secondary p-1.5 text-[0.85em] text-slate-300">
             {m.content}
           </pre>
           {m.data != null && (
-            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-bg-secondary p-1.5 text-[0.85em] text-slate-400">
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap wrap-break-word rounded-sm bg-bg-secondary p-1.5 text-[0.85em] text-slate-400">
               {JSON.stringify(m.data, null, 2)}
             </pre>
           )}
@@ -305,7 +305,7 @@ function LinkChip({ target }: { target: string }) {
     <span className="inline-flex items-center gap-1">
       <button
         onClick={() => void click()}
-        className="rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[0.85em] text-cyan-300 transition-colors hover:bg-cyan-500/20"
+        className="rounded-sm border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[0.85em] text-cyan-300 transition-colors hover:bg-cyan-500/20"
         title={`Resolve [[${target}]]`}
       >
         [[{target}]]
@@ -486,7 +486,7 @@ export function MemoryDebugView() {
         </div>
         <button
           onClick={refreshList}
-          className="flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 transition-colors hover:text-slate-200"
+          className="flex items-center gap-1 rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65em] font-medium text-slate-400 transition-colors hover:text-slate-200"
           title="Refresh the memory list"
         >
           <RefreshCw className="h-3 w-3" /> Refresh
@@ -504,7 +504,7 @@ export function MemoryDebugView() {
         <OverviewPanel overview={overview} />
 
         {/* Recall test panel */}
-        <div className="rounded border border-border bg-bg-tertiary p-2">
+        <div className="rounded-sm border border-border bg-bg-tertiary p-2">
           <div className="mb-1.5 flex items-center gap-1.5 text-[0.8em] font-semibold text-slate-300">
             <Search className="h-3.5 w-3.5 text-cyan-400" />
             Recall test
@@ -518,18 +518,18 @@ export function MemoryDebugView() {
                 if (e.key === "Enter") void runRecall();
               }}
               placeholder="Query the memory store…"
-              className="min-w-0 flex-1 rounded border border-border bg-bg-secondary px-2 py-1 text-[0.8em] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none"
+              className="min-w-0 flex-1 rounded-sm border border-border bg-bg-secondary px-2 py-1 text-[0.8em] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-hidden"
             />
             <button
               onClick={() => void runRecall()}
               disabled={recallLoading || !recallQuery.trim()}
-              className="flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-1 text-[0.75em] font-medium text-cyan-300 transition-colors hover:bg-cyan-500/30 disabled:opacity-40"
+              className="flex items-center gap-1 rounded-sm bg-cyan-500/20 px-2 py-1 text-[0.75em] font-medium text-cyan-300 transition-colors hover:bg-cyan-500/30 disabled:opacity-40"
             >
               {recallLoading ? "…" : "Recall"}
             </button>
           </div>
           {recallResults !== null && (
-            <div className="mt-1.5 max-h-48 overflow-y-auto rounded border border-border/50">
+            <div className="mt-1.5 max-h-48 overflow-y-auto rounded-sm border border-border/50">
               {recallResults.length === 0 ? (
                 <div className="px-2 py-1.5 text-[0.78em] text-slate-500">
                   No matches.
@@ -544,7 +544,7 @@ export function MemoryDebugView() {
         </div>
 
         {/* Memory browser panel */}
-        <div className="rounded border border-border bg-bg-tertiary p-2">
+        <div className="rounded-sm border border-border bg-bg-tertiary p-2">
           <div className="mb-1.5 flex items-center justify-between">
             <span className="text-[0.8em] font-semibold text-slate-300">
               Memories
@@ -552,7 +552,7 @@ export function MemoryDebugView() {
             <select
               value={tierFilter}
               onChange={(e) => setTierFilter(e.target.value as TierFilter)}
-              className="rounded border border-border bg-bg-secondary px-1.5 py-0.5 text-[0.72em] text-slate-300 focus:border-cyan-500/50 focus:outline-none"
+              className="rounded-sm border border-border bg-bg-secondary px-1.5 py-0.5 text-[0.72em] text-slate-300 focus:border-cyan-500/50 focus:outline-hidden"
             >
               {TIERS.map((t) => (
                 <option key={t} value={t}>
@@ -561,7 +561,7 @@ export function MemoryDebugView() {
               ))}
             </select>
           </div>
-          <div className="max-h-64 overflow-y-auto rounded border border-border/50">
+          <div className="max-h-64 overflow-y-auto rounded-sm border border-border/50">
             {memories.length === 0 ? (
               <div className="px-2 py-1.5 text-[0.78em] text-slate-500">
                 No memories in this tier.

@@ -435,7 +435,7 @@ export function SourceEditor({
             />
           )}
           {path && lang && (
-            <span className="shrink-0 rounded bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] uppercase tracking-wide text-slate-500">
+            <span className="shrink-0 rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-[0.65rem] uppercase tracking-wide text-slate-500">
               {lang}
             </span>
           )}
@@ -497,13 +497,13 @@ export function SourceEditor({
               </div>
             )}
             {/* Formatting toolbar: each button applies one lib/mdEdit transform. */}
-            <div className="flex shrink-0 flex-wrap items-center gap-0.5 rounded border border-border bg-bg-secondary px-1 py-0.5">
+            <div className="flex shrink-0 flex-wrap items-center gap-0.5 rounded-sm border border-border bg-bg-secondary px-1 py-0.5">
               {TOOLBAR_BUTTONS.map((b) => (
                 <button
                   key={b.title}
                   onClick={() => applyTransform(b.run)}
                   title={b.title}
-                  className="flex items-center rounded px-1.5 py-0.5 text-slate-400 hover:bg-bg-tertiary hover:text-slate-200"
+                  className="flex items-center rounded-sm px-1.5 py-0.5 text-slate-400 hover:bg-bg-tertiary hover:text-slate-200"
                 >
                   <b.icon className="h-3.5 w-3.5" />
                 </button>
@@ -517,9 +517,9 @@ export function SourceEditor({
                 onChange={(e) => setContent(e.target.value)}
                 onKeyDown={onEditorKeyDown}
                 spellCheck={false}
-                className="min-w-0 flex-1 resize-none rounded border border-border bg-bg-primary p-2 font-mono text-[0.75em] leading-relaxed text-slate-300 focus:outline-none"
+                className="min-w-0 flex-1 resize-none rounded-sm border border-border bg-bg-primary p-2 font-mono text-[0.75em] leading-relaxed text-slate-300 focus:outline-hidden"
               />
-              <div className="prose prose-invert prose-sm min-w-0 max-w-none flex-1 overflow-y-auto rounded border border-border bg-bg-primary p-3 prose-pre:bg-bg-primary prose-h1:border-b prose-h1:border-border prose-h1:pb-1 prose-h2:border-b prose-h2:border-border/60 prose-h2:pb-1">
+              <div className="prose prose-invert prose-sm min-w-0 max-w-none flex-1 overflow-y-auto rounded-sm border border-border bg-bg-primary p-3 prose-pre:bg-bg-primary prose-h1:border-b prose-h1:border-border prose-h1:pb-1 prose-h2:border-b prose-h2:border-border/60 prose-h2:pb-1">
                 <Markdown>{content}</Markdown>
               </div>
             </div>
@@ -542,7 +542,7 @@ export function SourceEditor({
                   const isInline = !className;
                   if (isInline) {
                     return (
-                      <code className="inline-code rounded bg-bg-tertiary px-1.5 py-0.5 text-xs" {...props}>
+                      <code className="inline-code rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-xs" {...props}>
                         {children}
                       </code>
                     );

@@ -142,7 +142,7 @@ export function MainPanel() {
                   )}
                 </span>
                 {needsApproval && (
-                  <span className="rounded bg-yellow-950/50 px-1 py-0.5 text-[0.625em] font-medium uppercase tracking-wide text-yellow-300">
+                  <span className="rounded-sm bg-yellow-950/50 px-1 py-0.5 text-[0.625em] font-medium uppercase tracking-wide text-yellow-300">
                     approve
                   </span>
                 )}
@@ -159,7 +159,7 @@ export function MainPanel() {
                         console.error("failed to cancel subagent:", err),
                       );
                     }}
-                    className="ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded text-slate-500 opacity-0 transition-opacity hover:bg-bg-tertiary hover:text-red-400 group-hover:opacity-100"
+                    className="ml-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-slate-500 opacity-0 transition-opacity hover:bg-bg-tertiary hover:text-red-400 group-hover:opacity-100"
                     title="Close subagent"
                     aria-label={`Close ${name}`}
                   >
@@ -195,7 +195,7 @@ export function MainPanel() {
           <button
             type="button"
             onClick={() => setActiveAgent(otherApproval.id)}
-            className="shrink-0 rounded bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500"
+            className="shrink-0 rounded-sm bg-yellow-600 px-3 py-1 text-xs font-medium text-white hover:bg-yellow-500"
           >
             Switch &amp; review
           </button>

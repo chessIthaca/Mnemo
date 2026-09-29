@@ -106,7 +106,7 @@ describe("Markdown fallback (lazy-load window) source contract", () => {
     // af0a7ea2). Once loaded, the pipeline owns line breaks (remark-breaks
     // on the backlog surfaces).
     expect(markdownSource).toContain(
-      'className="markdown-fallback whitespace-pre-wrap break-words"',
+      'className="markdown-fallback whitespace-pre-wrap wrap-break-word"',
     );
   });
 });

@@ -58,7 +58,7 @@ const MARKER_SPECS: MarkerSpec[] = [
     render: (inner, key) => (
       <code
         key={key}
-        className="inline-code rounded bg-bg-tertiary px-1.5 py-0.5 text-xs"
+        className="inline-code rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-xs"
       >
         {inner}
       </code>

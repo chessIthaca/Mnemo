@@ -173,7 +173,7 @@ describe("clampBottomHeight", () => {
     expect(clampBottomHeight(10_000, 1000)).toBe(600);
   });
 
-  it("passes in-range heights through, rounded", () => {
+  it("passes in-range heights through, rounded-sm", () => {
     expect(clampBottomHeight(200, 1000)).toBe(200);
     expect(clampBottomHeight(200.6, 1000)).toBe(201);
   });

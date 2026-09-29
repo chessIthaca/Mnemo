@@ -203,7 +203,7 @@ function StatRow({
 function SessionCard({ stats, pricing }: { stats: SessionStats | null; pricing: PricingEntry[] }) {
   if (!stats) {
     return (
-      <div className="rounded border border-border bg-bg-tertiary p-2 text-[0.8em] text-slate-500">
+      <div className="rounded-sm border border-border bg-bg-tertiary p-2 text-[0.8em] text-slate-500">
         No active session yet. Send a prompt to start one.
       </div>
     );
@@ -214,7 +214,7 @@ function SessionCard({ stats, pricing }: { stats: SessionStats | null; pricing: 
   const avgOutputRate = aggregateTokPerSec(stats.completion_tokens, stats.generation_ms_total);
   const cost = stats.per_model.reduce((sum, mb) => sum + modelCost(mb, pricing), 0);
   return (
-    <div className="rounded border border-border bg-bg-tertiary p-2">
+    <div className="rounded-sm border border-border bg-bg-tertiary p-2">
       <div className="mb-1.5 flex items-center gap-1.5 text-[0.8em] font-semibold text-slate-300">
         <Cpu className="h-3.5 w-3.5 text-cyan-400" />
         Session
@@ -294,7 +294,7 @@ function ProjectCard({ stats, pricing }: { stats: ProjectStats | null; pricing: 
   const avgInputRate = aggregateTokPerSec(stats.prompt_tokens, stats.ttft_ms_total);
   const avgOutputRate = aggregateTokPerSec(stats.completion_tokens, stats.generation_ms_total);
   return (
-    <div className="rounded border border-border bg-bg-tertiary p-2">
+    <div className="rounded-sm border border-border bg-bg-tertiary p-2">
       <div className="mb-1.5 flex items-center gap-1.5 text-[0.8em] font-semibold text-slate-300">
         <BarChart3 className="h-3.5 w-3.5 text-green-400" />
         Project (all sessions)
@@ -365,7 +365,7 @@ function ProjectCard({ stats, pricing }: { stats: ProjectStats | null; pricing: 
 function SessionList({ sessions }: { sessions: SessionSummary[] }) {
   if (sessions.length === 0) return null;
   return (
-    <div className="rounded border border-border bg-bg-tertiary p-2">
+    <div className="rounded-sm border border-border bg-bg-tertiary p-2">
       <div className="mb-1.5 text-[0.8em] font-semibold text-slate-300">Sessions</div>
       <div className="max-h-48 overflow-y-auto">
         {sessions.map((s) => (
@@ -458,7 +458,7 @@ export function StatsView() {
     <div className="h-full overflow-y-auto p-2">
       <div className="space-y-2">
         {error && (
-          <div className="rounded border border-red-600/40 bg-red-950/20 p-2 text-[0.8em] text-red-400">
+          <div className="rounded-sm border border-red-600/40 bg-red-950/20 p-2 text-[0.8em] text-red-400">
             {error}
           </div>
         )}
@@ -466,7 +466,7 @@ export function StatsView() {
         <ProjectCard stats={projectStats} pricing={pricing} />
         <SessionList sessions={sessions} />
         {pricing.length === 0 && (
-          <div className="rounded border border-border p-2 text-[0.78em] text-slate-500">
+          <div className="rounded-sm border border-border p-2 text-[0.78em] text-slate-500">
             <Coins className="mr-1 inline h-3 w-3" />
             No [[pricing]] entries in endpoints.toml — cost estimates are unavailable.
             Add a <code className="text-slate-400">[[pricing]]</code> table keyed by model

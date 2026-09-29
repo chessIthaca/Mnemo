@@ -160,7 +160,7 @@ export function computeDiff(oldText: string, newText: string): DiffLine[] {
 function renderDiffLines(lines: DiffLine[], maxHeightClass: string) {
   return (
     <div
-      className={`overflow-auto rounded border border-border bg-bg-primary font-mono text-[0.75em] ${maxHeightClass}`}
+      className={`overflow-auto rounded-sm border border-border bg-bg-primary font-mono text-[0.75em] ${maxHeightClass}`}
     >
       {lines.length === 0 ? (
         <div className="px-2 py-1 text-slate-500">(no changes)</div>
@@ -241,7 +241,7 @@ export function NewFileView({
   const lines = content.length === 0 ? [""] : content.split("\n");
   return (
     <div
-      className={`overflow-auto rounded border border-border bg-bg-primary font-mono text-[0.75em] ${maxHeightClass}`}
+      className={`overflow-auto rounded-sm border border-border bg-bg-primary font-mono text-[0.75em] ${maxHeightClass}`}
     >
       {lines.map((line, idx) => (
         <div

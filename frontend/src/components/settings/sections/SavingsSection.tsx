@@ -219,7 +219,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
 
   if (loading) {
     return (
-      <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+      <div className="py-6 text-center text-xs text-(--text-muted)">
         Loading savings…
       </div>
     );
@@ -228,10 +228,10 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Savings
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Token savings (the optimizer levers) and the model rates the Stats
           view uses for cost estimates — what a token costs, and what Mnemo
           saves.
@@ -241,10 +241,10 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
       {flags && knobs && (
         <div className="space-y-3">
           <div className="space-y-0.5">
-            <h4 className="text-xs font-semibold text-[color:var(--text-primary)]">
+            <h4 className="text-xs font-semibold text-(--text-primary)">
               Optimizer levers
             </h4>
-            <p className="text-xs text-[color:var(--text-muted)]">
+            <p className="text-xs text-(--text-muted)">
               All on by default; uncheck a lever to opt out. The Dashboard
               meters what they save; a flip lands on the next tool call — no
               restart.
@@ -265,13 +265,13 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
                       f ? { ...f, [lever.field]: e.target.checked } : f,
                     )
                   }
-                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[color:var(--accent-color)]"
+                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-(--accent-color)"
                 />
                 <span className="space-y-0.5">
-                  <span className="block text-xs text-[color:var(--text-primary)]">
+                  <span className="block text-xs text-(--text-primary)">
                     {lever.label}
                   </span>
-                  <span className="block text-[0.65rem] text-[color:var(--text-muted)]">
+                  <span className="block text-[0.65rem] text-(--text-muted)">
                     {lever.hint}
                   </span>
                 </span>
@@ -282,7 +282,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
           <div className="grid grid-cols-2 gap-2">
             {KNOBS.map((knob) => (
               <div key={knob.field} className="space-y-0.5">
-                <label className="text-[0.65rem] text-[color:var(--text-muted)]">
+                <label className="text-[0.65rem] text-(--text-muted)">
                   {knob.label}
                 </label>
                 <input
@@ -295,38 +295,38 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
                       k ? { ...k, [knob.field]: Number(e.target.value) || 0 } : k,
                     )
                   }
-                  className="w-full rounded border border-border bg-bg-secondary px-1.5 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                  className="w-full rounded-sm border border-border bg-bg-secondary px-1.5 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
                 />
               </div>
             ))}
           </div>
 
           <div className="space-y-0.5">
-            <label className="text-[0.65rem] text-[color:var(--text-muted)]">
+            <label className="text-[0.65rem] text-(--text-muted)">
               Extra compressible commands (one pattern per line)
             </label>
             <textarea
               rows={3}
               value={extraCommands}
               onChange={(e) => setExtraCommands(e.target.value)}
-              className="w-full resize-y rounded border border-border bg-bg-secondary px-1.5 py-1 font-mono text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+              className="w-full resize-y rounded-sm border border-border bg-bg-secondary px-1.5 py-1 font-mono text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
             />
           </div>
         </div>
       )}
 
       <div className="space-y-0.5">
-        <h4 className="text-xs font-semibold text-[color:var(--text-primary)]">
+        <h4 className="text-xs font-semibold text-(--text-primary)">
           Model rates
         </h4>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Dollars per 1M tokens — used by the Stats view for cost estimates.
           Cached rate is typically ~50% of input.
         </p>
       </div>
 
       {rows.length === 0 && (
-        <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-(--text-muted)">
           No pricing rows. Add one for each model you care about.
         </div>
       )}
@@ -338,7 +338,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
             className="grid grid-cols-[1fr_4.5rem_4.5rem_4.5rem_auto] items-end gap-1.5 rounded-lg border border-border bg-bg-primary p-2"
           >
             <div className="space-y-0.5">
-              <label className="text-[0.65rem] text-[color:var(--text-muted)]">Model</label>
+              <label className="text-[0.65rem] text-(--text-muted)">Model</label>
               <ModelCombobox
                 value={r.model}
                 onChange={(v) => updateRow(i, { model: v })}
@@ -346,43 +346,43 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
               />
             </div>
             <div className="space-y-0.5">
-              <label className="text-[0.65rem] text-[color:var(--text-muted)]">In $/M</label>
+              <label className="text-[0.65rem] text-(--text-muted)">In $/M</label>
               <input
                 type="number"
                 min={0}
                 step="0.01"
                 value={r.input_per_1m}
                 onChange={(e) => updateRow(i, { input_per_1m: Number(e.target.value) })}
-                className="w-full rounded border border-border bg-bg-secondary px-1.5 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-sm border border-border bg-bg-secondary px-1.5 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <div className="space-y-0.5">
-              <label className="text-[0.65rem] text-[color:var(--text-muted)]">Out $/M</label>
+              <label className="text-[0.65rem] text-(--text-muted)">Out $/M</label>
               <input
                 type="number"
                 min={0}
                 step="0.01"
                 value={r.output_per_1m}
                 onChange={(e) => updateRow(i, { output_per_1m: Number(e.target.value) })}
-                className="w-full rounded border border-border bg-bg-secondary px-1.5 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-sm border border-border bg-bg-secondary px-1.5 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <div className="space-y-0.5">
-              <label className="text-[0.65rem] text-[color:var(--text-muted)]">Cache $/M</label>
+              <label className="text-[0.65rem] text-(--text-muted)">Cache $/M</label>
               <input
                 type="number"
                 min={0}
                 step="0.01"
                 value={r.cached_per_1m}
                 onChange={(e) => updateRow(i, { cached_per_1m: Number(e.target.value) })}
-                className="w-full rounded border border-border bg-bg-secondary px-1.5 py-1 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-sm border border-border bg-bg-secondary px-1.5 py-1 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <button
               type="button"
               onClick={() => setRows((rs) => rs.filter((_, idx) => idx !== i))}
               aria-label="Remove pricing row"
-              className="mb-0.5 rounded p-1 text-[color:var(--text-muted)] hover:bg-red-500/10 hover:text-red-400"
+              className="mb-0.5 rounded-sm p-1 text-(--text-muted) hover:bg-red-500/10 hover:text-red-400"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
@@ -398,7 +398,7 @@ export const SavingsSection = forwardRef<SettingsSectionHandle, {
             { model: "", input_per_1m: 0, output_per_1m: 0, cached_per_1m: 0 },
           ])
         }
-        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border px-3 py-2 text-xs text-[color:var(--text-muted)] hover:border-[color:var(--accent-color)]/50 hover:text-[color:var(--accent-color)]"
+        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border px-3 py-2 text-xs text-(--text-muted) hover:border-(--accent-color)/50 hover:text-(--accent-color)"
       >
         <Plus className="h-3.5 w-3.5" />
         Add pricing row

@@ -775,7 +775,7 @@ export const InputBar = memo(function InputBar() {
                 // hide the bubble but the backend would still inject it).
                 <button
                   onClick={() => cancelPendingSteer(steer)}
-                  className="ml-auto flex h-4 w-4 shrink-0 items-center justify-center rounded text-amber-400/60 transition-colors hover:bg-amber-950/40 hover:text-amber-300"
+                  className="ml-auto flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-amber-400/60 transition-colors hover:bg-amber-950/40 hover:text-amber-300"
                   title="Cancel this steer"
                 >
                   <X className="h-3 w-3" />
@@ -800,7 +800,7 @@ export const InputBar = memo(function InputBar() {
               />
               <button
                 onClick={() => removeImage(i)}
-                className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-sm bg-black/60 text-white opacity-0 transition-opacity group-hover:opacity-100"
                 title="Remove image"
               >
                 <X className="h-3 w-3" />
@@ -903,7 +903,7 @@ export const InputBar = memo(function InputBar() {
             fontFamily: "var(--app-font-family)",
             fontSize: "var(--app-font-size)",
           }}
-          className="flex-1 resize-none rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-none disabled:opacity-50"
+          className="flex-1 resize-none rounded-lg border border-border bg-bg-primary px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-cyan-500 focus:outline-hidden disabled:opacity-50"
         />
         {/* Image attachment indicator — shown when images are attached. */}
         {attachedImages.length > 0 && (

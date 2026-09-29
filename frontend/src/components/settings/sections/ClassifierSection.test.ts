@@ -121,7 +121,7 @@ describe("ClassifierSection owns the opt-in controls", () => {
     expect(classifierSource).toContain("checked={autoFinetune}");
   });
 
-  it("renders the pre-prompt routing block (opt-in + shadow/enforce + targets + gate)", () => {
+  it("renders the pre-prompt routing block (opt-in + shadow + targets + gate)", () => {
     expect(classifierSource).toContain("Route turns by task complexity");
     expect(classifierSource).toContain(
       "Switch the model on a confident decision",

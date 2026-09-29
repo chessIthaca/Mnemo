@@ -239,11 +239,11 @@ export const MemorySection = forwardRef<
       <div className="rounded-lg border border-border bg-bg-primary p-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-2 text-sm font-medium text-[color:var(--text-primary)]">
+            <div className="flex items-center gap-2 text-sm font-medium text-(--text-primary)">
               <Icon className="h-4 w-4 shrink-0" aria-hidden />
               {title}
             </div>
-            <p className="mt-1 text-xs text-[color:var(--text-muted)]">
+            <p className="mt-1 text-xs text-(--text-muted)">
               {description}
             </p>
           </div>
@@ -251,20 +251,20 @@ export const MemorySection = forwardRef<
             type="button"
             onClick={() => void start(op)}
             disabled={busy}
-            className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-xs text-[color:var(--text-primary)] hover:border-[color:var(--accent-color)]/50 disabled:opacity-40"
+            className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-xs text-(--text-primary) hover:border-(--accent-color)/50 disabled:opacity-40"
           >
             {state.running ? "Running…" : buttonLabel}
           </button>
         </div>
         {state.running && (
           <div className="mt-2" aria-live="polite">
-            <div className="mb-1 flex items-center justify-between text-[0.7rem] text-[color:var(--text-muted)]">
+            <div className="mb-1 flex items-center justify-between text-[0.7rem] text-(--text-muted)">
               <span className="capitalize">{state.phase || "working"}…</span>
               <span>{pct === null ? "" : `${fmtPct(pct)}%`}</span>
             </div>
             <div className="h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary">
               <div
-                className={`h-full rounded-full bg-[color:var(--accent-color)] transition-[width] duration-300${
+                className={`h-full rounded-full bg-(--accent-color) transition-[width] duration-300${
                   pct === null ? " w-full animate-pulse" : ""
                 }`}
                 style={pct === null ? undefined : { width: `${pct}%` }}
@@ -289,10 +289,10 @@ export const MemorySection = forwardRef<
   return (
     <div className="space-y-4">
       <div className="space-y-1">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-[color:var(--text-muted)]">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-(--text-muted)">
           Memory & Search
         </h3>
-        <p className="text-xs text-[color:var(--text-muted)]">
+        <p className="text-xs text-(--text-muted)">
           Manual care for the project memory store and the code search index.
           All tools run in the background — watch the progress bar; the agent
           keeps working meanwhile.
@@ -300,7 +300,7 @@ export const MemorySection = forwardRef<
       </div>
 
       {loading ? (
-        <div className="py-6 text-center text-xs text-[color:var(--text-muted)]">
+        <div className="py-6 text-center text-xs text-(--text-muted)">
           Loading memory overview…
         </div>
       ) : loadError ? (
@@ -309,7 +309,7 @@ export const MemorySection = forwardRef<
         </div>
       ) : (
         overview && (
-          <div className="space-y-1 rounded-lg border border-border bg-bg-primary p-3 text-xs text-[color:var(--text-muted)]">
+          <div className="space-y-1 rounded-lg border border-border bg-bg-primary p-3 text-xs text-(--text-muted)">
             <div>
               working {overview.counts.working} · episodic{" "}
               {overview.counts.episodic} · semantic {overview.counts.semantic}{" "}
@@ -321,7 +321,7 @@ export const MemorySection = forwardRef<
               {overview.dim > 0 ? ` (${overview.dim}-dim)` : ""}
             </div>
             {overview.counts.total > 0 && !overview.fingerprint_matches && (
-              <div className="rounded bg-amber-500/10 px-2 py-1 text-[0.7rem] text-amber-300">
+              <div className="rounded-sm bg-amber-500/10 px-2 py-1 text-[0.7rem] text-amber-300">
                 Stored vectors don&apos;t match the active embedding model —
                 semantic recall is degraded. Rebuild recommended.
               </div>
@@ -378,17 +378,17 @@ export const MemorySection = forwardRef<
 
       {knobs && (
         <div className="rounded-lg border border-border bg-bg-primary p-3">
-          <div className="text-sm font-medium text-[color:var(--text-primary)]">
+          <div className="text-sm font-medium text-(--text-primary)">
             Retrieval scale knobs
           </div>
-          <p className="mt-1 text-xs text-[color:var(--text-muted)]">
+          <p className="mt-1 text-xs text-(--text-muted)">
             Tuned for large memory corpora — applied live on Save (no restart).
             Digest budgets are fixed per record type: {budgetsLine}.
           </p>
           <div className="mt-2 grid grid-cols-3 gap-3">
             <div className="space-y-1">
               <label
-                className="text-xs text-[color:var(--text-primary)]"
+                className="text-xs text-(--text-primary)"
                 htmlFor="mem-decay"
               >
                 Decay half-life (days)
@@ -408,12 +408,12 @@ export const MemorySection = forwardRef<
                     );
                   }
                 }}
-                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <div className="space-y-1">
               <label
-                className="text-xs text-[color:var(--text-primary)]"
+                className="text-xs text-(--text-primary)"
                 htmlFor="mem-query-cap"
               >
                 Per-query result cap
@@ -433,12 +433,12 @@ export const MemorySection = forwardRef<
                     );
                   }
                 }}
-                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
             <div className="space-y-1">
               <label
-                className="text-xs text-[color:var(--text-primary)]"
+                className="text-xs text-(--text-primary)"
                 htmlFor="mem-class-cap"
               >
                 Derived per-class cap
@@ -458,7 +458,7 @@ export const MemorySection = forwardRef<
                     );
                   }
                 }}
-                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-[color:var(--text-primary)] focus:border-[color:var(--accent-color)] focus:outline-none"
+                className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
               />
             </div>
           </div>
@@ -471,7 +471,7 @@ export const MemorySection = forwardRef<
             <div className="mt-2 text-xs text-emerald-300">Knobs saved.</div>
           )}
           {savingKnobs && (
-            <div className="mt-2 text-xs text-[color:var(--text-muted)]">
+            <div className="mt-2 text-xs text-(--text-muted)">
               Saving…
             </div>
           )}

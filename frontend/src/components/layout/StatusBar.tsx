@@ -576,7 +576,7 @@ export const StatusBar = memo(function StatusBar() {
         <div className="relative" ref={modelRef}>
           <button
             onClick={() => setModelOpen((o) => !o)}
-            className="flex items-center gap-1 rounded px-1 py-0.5 transition-colors hover:bg-bg-tertiary"
+            className="flex items-center gap-1 rounded-sm px-1 py-0.5 transition-colors hover:bg-bg-tertiary"
             title="Switch model"
             aria-haspopup="menu"
             aria-expanded={modelOpen}
@@ -607,7 +607,7 @@ export const StatusBar = memo(function StatusBar() {
             />
           </button>
           {modelError && (
-            <span className="absolute bottom-full left-0 z-50 mb-1 max-w-xs truncate rounded border border-red-600/40 bg-red-950/20 px-2 py-1 text-[0.7rem] text-red-400" title={modelError}>
+            <span className="absolute bottom-full left-0 z-50 mb-1 max-w-xs truncate rounded-sm border border-red-600/40 bg-red-950/20 px-2 py-1 text-[0.7rem] text-red-400" title={modelError}>
               {modelError}
             </span>
           )}
@@ -666,7 +666,7 @@ export const StatusBar = memo(function StatusBar() {
           <div className="relative" ref={effortRef}>
             <button
               onClick={() => setEffortOpen((o) => !o)}
-              className="flex items-center gap-1 rounded px-1 py-0.5 transition-colors hover:bg-bg-tertiary"
+              className="flex items-center gap-1 rounded-sm px-1 py-0.5 transition-colors hover:bg-bg-tertiary"
               title="Reasoning effort — click to change"
               aria-haspopup="menu"
               aria-expanded={effortOpen}
@@ -734,7 +734,7 @@ export const StatusBar = memo(function StatusBar() {
           <button
             onClick={() => hasPlan && setPickerOpen((o) => !o)}
             disabled={!hasPlan}
-            className={`flex items-center gap-1 rounded px-1 py-0.5 transition-colors ${
+            className={`flex items-center gap-1 rounded-sm px-1 py-0.5 transition-colors ${
               hasPlan
                 ? "hover:bg-bg-tertiary hover:text-green-300"
                 : "cursor-default"
@@ -787,7 +787,7 @@ export const StatusBar = memo(function StatusBar() {
         {((workflowState === "complete" || workflowState === "planning") && gitBranch && gitBranch !== "main" && gitBranch !== "no-branch") && (
           <button
             onClick={() => setMergeOpen(true)}
-            className="flex items-center gap-1 rounded px-2 py-0.5 text-xs font-medium text-cyan-400 transition-colors hover:bg-bg-tertiary whitespace-nowrap"
+            className="flex items-center gap-1 rounded-sm px-2 py-0.5 text-xs font-medium text-cyan-400 transition-colors hover:bg-bg-tertiary whitespace-nowrap"
             title={`Merge '${gitBranch}' into main (one atomic, confirmation-gated action)`}
           >
             <GitMerge className="h-3.5 w-3.5" />
@@ -815,7 +815,7 @@ export const StatusBar = memo(function StatusBar() {
             return (
               <button
                 onClick={() => useAgentStore.getState().openSettings("embeddings")}
-                className="flex items-center gap-1.5 rounded px-1.5 py-0.5 text-xs text-cyan-400 transition-colors hover:bg-bg-tertiary"
+                className="flex items-center gap-1.5 rounded-sm px-1.5 py-0.5 text-xs text-cyan-400 transition-colors hover:bg-bg-tertiary"
                 title={`Downloading ${d.model}… ${fmtPct(d.progress * 100)}%`}
               >
                 <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-cyan-400" />
@@ -837,7 +837,7 @@ export const StatusBar = memo(function StatusBar() {
             return (
               <button
                 onClick={() => useAgentStore.getState().openSettings("embeddings")}
-                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-amber-400 transition-colors hover:bg-bg-tertiary"
+                className="flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-xs text-amber-400 transition-colors hover:bg-bg-tertiary"
                 title="Embedding service issue — click to configure"
               >
                 ⚠
@@ -850,7 +850,7 @@ export const StatusBar = memo(function StatusBar() {
         <div className="relative ml-auto" ref={safetyRef}>
           <button
             onClick={() => setSafetyOpen((o) => !o)}
-            className={`flex items-center gap-1.5 whitespace-nowrap rounded px-2 py-0.5 text-xs font-medium transition-colors ${
+            className={`flex items-center gap-1.5 whitespace-nowrap rounded-sm px-2 py-0.5 text-xs font-medium transition-colors ${
               safetyMode === "autonomous"
                 ? "bg-red-600/20 text-red-400 hover:bg-red-600/30"
                 : safetyMode === "auto-approve-project"

@@ -328,11 +328,15 @@ pub struct LayaConfig {
     /// failed cycle; a fallback (a missing or non-choice answer, a label
     /// outside its taxonomy, a weakest confidence below the gate) keeps the
     /// step's configured model byte-identically, and a decided state is
-    /// logged to `~/.mnemo/laya/training/reflex.jsonl`. Off by default, and
-    /// meant to be enabled only against a **fine-tuned** checkpoint: base
-    /// Laya checkpoints are near-chance zero-shot on this task, which is
-    /// exactly what the reflex log's labeled corpus is for. Omitted from the
-    /// saved config while false.
+    /// logged to `~/.mnemo/laya/training/reflex.jsonl`. The **harness-run
+    /// verify** layer (backlog item 3, `[general.verify]`) is the second
+    /// consumer: a decided `verify` action re-runs the configured checks
+    /// harness-side and rides the compact evidence note on the next request's
+    /// volatile tail — evidence, not routing, so it fires under shadow too.
+    /// Off by default, and meant to be enabled only against a **fine-tuned**
+    /// checkpoint: base Laya checkpoints are near-chance zero-shot on this
+    /// task, which is exactly what the reflex log's labeled corpus is for.
+    /// Omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub reflex: bool,
 }

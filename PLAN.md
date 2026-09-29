@@ -1359,6 +1359,32 @@ product.
   and with it off `ReflexHandle::decide` returns without asking at all. The lane
   ladder (item 2), the harness verify (item 3) and the budget layer (item 4)
   consume it.
+- **Harness-run deterministic verify (2027-01, backlog 1f767466).** The
+  cost-saving chain's item 3 and the reflex call's second consumer: with
+  `[general.verify]` `enabled` on and a non-empty `test_command` (e.g.
+  `cargo test`), the harness runs the checks ITSELF at each plan-step boundary
+  — a successful skeleton `complete_step` — instead of spending a model
+  roundtrip deciding to (`StepVerifyHandle`, `src/agent/step_verify.rs`; the
+  failure-triage tier-1 auto-retry is the precedent for harness action on
+  deterministic evidence). The command runs through the platform shell (`sh
+  -c` / `powershell -Command`, the `shell` tool's own idiom) rooted at the
+  agent's sandbox, and its output is compressed through the existing lever-2
+  compressor (`output_compactor::compress` for known families; a
+  distinct-lines-plus-repeat-counts fallback otherwise) into a compact
+  evidence note — exit status, failing test names, distinct error lines,
+  counts, hard-capped at 2000 bytes — appended to the tool result; the raw
+  log never enters context. A verification that FAILS keeps the tick
+  `success: true`: the step DID tick, and a false result would drive the
+  tier-1 auto-retry into re-ticking a completed step — the failure signal
+  lives in the note. A `timeout_secs` hang (default 300, the `shell` tool's
+  bound) is killed cleanly (`kill_on_drop`, so the wait future's drop kills
+  the child) and surfaces as a failure-shaped note. The reflex `verify` action
+  re-runs the checks at the lane-classification boundary and the note rides
+  the next request's volatile tail via a one-shot drain (`append_nudge`),
+  so the cached prefix is never touched. Invariants: an absent section never
+  spawns a process (flag off = byte-identical), a detailed sub-step tick never
+  verifies, the config is read live per boundary (a Settings save lands on the
+  next `complete_step`), and no new dependencies.
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

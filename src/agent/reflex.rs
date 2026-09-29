@@ -16,8 +16,11 @@
 //! The CALL and the shadow LOG ship here; the **escalation lane ladder**
 //! (backlog ad56c7bd, [`super::step_lanes`]) is the first consumer — it reads
 //! the decision at each plan-step boundary and resolves the step's lane,
-//! strictly shadow-first until `[general.routing] enforce` is on (the harness
-//! verify step and the budget layer consume it in later items). The contract
+//! strictly shadow-first until `[general.routing] enforce` is on. The
+//! **harness-run verify** layer (backlog 1f767466, [`super::step_verify`]) is
+//! the second: a decided `verify` action re-runs `[general.verify]`'s command
+//! harness-side and rides the compact evidence note on the next request's
+//! volatile tail (the budget layer is the remaining consumer). The contract
 //! is [`super::failure_triage`]'s: opt-in
 //! (`[general.laya] reflex`, default off), a calibrated-confidence gate
 //! ([`REFLEX_THRESHOLD`]), and a strict fallback — a missing answer, a

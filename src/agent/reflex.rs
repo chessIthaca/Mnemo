@@ -13,9 +13,12 @@
 //! [`Classifier::classify_many`] and asks them together: one request, one
 //! confidence gate, one decision.
 //!
-//! This module ships the CALL and the shadow LOG only — nothing acts on a
-//! decision yet (the lane ladder, the harness verify step and the budget layer
-//! consume it). The contract is [`super::failure_triage`]'s: opt-in
+//! The CALL and the shadow LOG ship here; the **escalation lane ladder**
+//! (backlog ad56c7bd, [`super::step_lanes`]) is the first consumer — it reads
+//! the decision at each plan-step boundary and resolves the step's lane,
+//! strictly shadow-first until `[general.routing] enforce` is on (the harness
+//! verify step and the budget layer consume it in later items). The contract
+//! is [`super::failure_triage`]'s: opt-in
 //! (`[general.laya] reflex`, default off), a calibrated-confidence gate
 //! ([`REFLEX_THRESHOLD`]), and a strict fallback — a missing answer, a
 //! non-choice answer, a label outside its taxonomy, or a weakest confidence

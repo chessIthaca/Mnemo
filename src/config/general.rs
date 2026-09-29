@@ -306,15 +306,20 @@ pub struct LayaConfig {
     /// (continue/retry/verify/escalate/complete) and risk
     /// (none/security/data_loss) for the same state at once, and the three
     /// answers are gated as ONE decision on the weakest of them (>=0.80).
-    /// Nothing acts on the answers yet: a decided state is logged
-    /// shadow-first to `~/.mnemo/laya/training/reflex.jsonl`, and every
-    /// fallback (a missing or non-choice answer, a label outside its
-    /// taxonomy, a weakest confidence below the gate) keeps the caller's
-    /// pre-existing behavior byte-identically. Off by default, and meant to
-    /// be enabled only against a **fine-tuned** checkpoint: base Laya
-    /// checkpoints are near-chance zero-shot on this task, which is exactly
-    /// what the reflex log's labeled corpus is for. Omitted from the saved
-    /// config while false.
+    /// The **escalation lane ladder** (backlog ad56c7bd) is the first
+    /// consumer: at each plan-step boundary the step is classified once, and
+    /// the lane it answers (`small` → the `[general.routing] cheap` target,
+    /// plus the `medium` / `high` / `escalate` lanes) serves that step while
+    /// [`routing`](Self::routing) is on. Shadow-first like the pre-prompt
+    /// decision (enforce off = log only), re-classifying a step only after a
+    /// failed cycle; a fallback (a missing or non-choice answer, a label
+    /// outside its taxonomy, a weakest confidence below the gate) keeps the
+    /// step's configured model byte-identically, and a decided state is
+    /// logged to `~/.mnemo/laya/training/reflex.jsonl`. Off by default, and
+    /// meant to be enabled only against a **fine-tuned** checkpoint: base
+    /// Laya checkpoints are near-chance zero-shot on this task, which is
+    /// exactly what the reflex log's labeled corpus is for. Omitted from the
+    /// saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub reflex: bool,
 }

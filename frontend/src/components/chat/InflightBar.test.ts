@@ -196,6 +196,49 @@ describe("InflightBar reasoning panel is user-controlled", () => {
   });
 });
 
+
+/**
+ * Regression (2026-09-29): the "Compact context" control was a real <button>
+ * nested inside the bar's toggle <button> (clicking anywhere on the bar
+ * opens/closes the reasoning panel, and the ctx hover popup renders inside
+ * it). React logs "In HTML, <button> cannot be a descendant of <button>" for
+ * that nesting on every render, and the resulting DOM is invalid HTML.
+ *
+ * The popup control is now a span with role=button — the same fix RightPanel's
+ * tab close-x uses inside Radix's TabsTrigger — plus Enter/Space handling and
+ * `aria-disabled` in place of the `disabled` attribute a span cannot carry.
+ *
+ * A render-based test cannot catch this: vitest runs in the `node`
+ * environment (no DOM) and React's DOM-nesting validation lives in the client
+ * renderer's host config — `renderToStaticMarkup` stays silent about nested
+ * <button> (verified), which is why the fix was confirmed in the running app
+ * through the WebView2 CDP console instead (see
+ * .coding/knowledge/how/2026-09-29-read-the-running-app-webview-console-via-cdp.md).
+ */
+describe("InflightBar popup control is not a nested <button>", () => {
+  it("keeps exactly one real <button> in the bar (the panel toggle)", () => {
+    // The toggle is the only element that may be a <button>: the popup is
+    // rendered inside it, so a second one re-introduces the invalid nesting.
+    expect(source.match(/<button/g) ?? []).toHaveLength(1);
+  });
+
+  it("renders the compact control as a role=button span with keyboard support", () => {
+    expect(source).toContain('role="button"');
+    expect(source).toContain('aria-label="Compact context"');
+    expect(source).toContain('if (e.key !== "Enter" && e.key !== " ") return;');
+    expect(source).toContain("tabIndex={running || agentId === null ? -1 : 0}");
+  });
+
+  it("disables via aria-disabled (a span has no `disabled` attribute)", () => {
+    expect(source).toContain("aria-disabled={running || agentId === null}");
+    // Lookbehind: `aria-disabled={…}` contains the bare `disabled={…}`
+    // substring, so a plain toContain would match the fix itself.
+    expect(source).not.toMatch(/(?<!aria-)disabled=\{running \|\| agentId === null\}/);
+    // Tailwind's aria-disabled:* variants carry the old disabled:* styling.
+    expect(source).toContain("aria-disabled:cursor-not-allowed aria-disabled:opacity-40");
+  });
+});
+
 describe("InflightBar ctx popup quality badge", () => {
   it("renders the grade badge only when a quality report is present", () => {
     // Lever 6 (backlog e4a50d22): the popup is byte-for-byte unchanged when

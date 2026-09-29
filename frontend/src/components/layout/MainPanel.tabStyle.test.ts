@@ -84,3 +84,30 @@ describe("RightPanel tool-tab rail (reference, must not drift)", () => {
     );
   });
 });
+
+/**
+ * Regression (2026-09-29): both tab bars handed Radix `Tabs` a value that
+ * could be `undefined` — MainPanel while no agent is active
+ * (`activeAgent !== null ? String(activeAgent) : undefined`) and RightPanel
+ * while every view tab is disabled (`shownTab`, typed `| undefined`). Radix
+ * reads an undefined value as "uncontrolled" and then warns "Tabs is changing
+ * from uncontrolled to controlled" as soon as it becomes a string — in
+ * MainPanel when the first agent appears, in RightPanel when a disabled-away
+ * tab comes back. The empty string is the controlled spelling of "nothing
+ * selected": no trigger matches it, so neither bar renders a bogus active tab
+ * (both already render their own empty state).
+ */
+describe("tab bars stay controlled (Radix Tabs value is never undefined)", () => {
+  it("MainPanel falls back to an empty string while no agent is active", () => {
+    expect(mainPanelSource).toContain(
+      'value={activeAgent !== null ? String(activeAgent) : ""}',
+    );
+    expect(mainPanelSource).not.toContain("String(activeAgent) : undefined");
+  });
+
+  it("RightPanel falls back to an empty string while every view tab is disabled", () => {
+    expect(rightPanelSource).toContain('value={shownTab ?? ""}');
+    expect(rightPanelSource).not.toContain("value={shownTab}");
+  });
+});
+

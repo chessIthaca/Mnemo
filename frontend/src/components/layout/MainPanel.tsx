@@ -82,8 +82,13 @@ export function MainPanel() {
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {/* Agent tab bar */}
+      {/* `value` must never be undefined: Radix reads an undefined value as
+          "uncontrolled" and then warns ("Tabs is changing from uncontrolled to
+          controlled") the moment the first agent exists. The empty string is
+          the controlled spelling of "nothing selected" — no trigger matches
+          it, so no tab renders active. */}
       <Tabs
-        value={activeAgent !== null ? String(activeAgent) : undefined}
+        value={activeAgent !== null ? String(activeAgent) : ""}
         onValueChange={(v: string) => setActiveAgent(Number(v))}
         activationMode="automatic"
       >

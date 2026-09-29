@@ -13,6 +13,7 @@ import {
   effortFromSelectValue,
   effortToSelectValue,
   importEndpointEditable,
+  makeUid,
   modelConfigFor,
   parseEffortsList,
   parsePositiveIntInput,
@@ -22,6 +23,10 @@ import {
   upsertModelConfig,
 } from "./types";
 import type { EndpointEditable, VisionModelInfo } from "../../lib/tauri";
+// Source contract for the id minting (the `?raw` pattern used by the other
+// settings source-contract tests): the insecure-randomness fallback must not
+// come back.
+import typesSource from "./types.ts?raw";
 
 /** A minimal endpoint for the per-model-config helper tests. */
 function ep(models: string[]): EndpointEditable {
@@ -535,5 +540,20 @@ describe("endpoint caps + input parsing", () => {
     expect(parsePositiveIntInput("0")).toBeUndefined();
     expect(parsePositiveIntInput("-5")).toBeUndefined();
     expect(parsePositiveIntInput("abc")).toBeUndefined();
+  });
+});
+
+describe("makeUid", () => {
+  it("mints endpoint-row ids from crypto.randomUUID — no Math.random fallback", () => {
+    // CodeQL js/insecure-randomness alert 5: the old `Math.random` fallback is
+    // gone (module-scope counter instead) and the primary path is the secure
+    // random UUID every webview this app targets provides. Comments are
+    // stripped so the comment above may still name the removed source.
+    const code = typesSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    expect(code).not.toContain("Math.random");
+
+    const ids = new Set([makeUid(), makeUid(), makeUid()]);
+    expect(ids.size).toBe(3);
+    for (const id of ids) expect(id).toMatch(/^ep-[0-9a-f]{8}$/);
   });
 });

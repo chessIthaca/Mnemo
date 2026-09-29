@@ -218,13 +218,20 @@ export const FONT_OPTIONS = [
 ];
 
 /** Mint a unique id for an endpoint row (React key; not persisted).
- *  Uses crypto.randomUUID when available, else Math.random. This is for React
- *  list keys only — never reuse it for anything security-adjacent. */
+ *  Uses crypto.randomUUID — available in every webview this app runs in
+ *  (WebView2/Chromium and WKWebView are secure contexts). The fallback is a
+ *  module-scope counter, deliberately NOT `Math.random`: an insecure-randomness
+ *  source reachable from the settings UI is a security defect even when the
+ *  value is only a list key (CodeQL js/insecure-randomness alert 5).
+ *  Never reuse this for anything security-adjacent. */
+let uidSeq = 0;
+
 export function makeUid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return `ep-${crypto.randomUUID().slice(0, 8)}`;
   }
-  return `ep-${Math.random().toString(36).slice(2, 10)}`;
+  uidSeq += 1;
+  return `ep-s${uidSeq.toString(36)}`;
 }
 
 /** A blank endpoint used by the "Add endpoint" button. */

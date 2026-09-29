@@ -1,0 +1,16 @@
++++
+title = "attribution rewrite — the three carsten.hess@autodesk.com commits are now Carsten Hess &lt;carsten@hess.net&gt; (main 397f256 -&gt; a2522a4f)"
+created = "2027-01-11"
++++
+
+REWRITE (2026-09-28, plan 0014d260, performed ON main itself): the three commits authored AND committed as `Carsten Hess <carsten.hess@autodesk.com>` now carry `Carsten Hess <carsten@hess.net>` for BOTH author and committer. Mapping: 260d1f52 -> 76c8104, fd716eb2 -> 9ecf792, 6fa830de -> c581f38 (the three landed via PR #5, merge commit 02d051f4 -> rewritten too). main's tip: 397f256f4c744f5a1d312ed41a4165d9317b7344 -> a2522a4f47152d3cc91942e94d282bad94582041. Release tag v1.2.0 retargeted f3c5076 -> c5e8c85eba653f0133ffeb86792b00fa6c598fb4; v0.1.1 (53534b6) and WindowsRelease (76af04b) untouched.
+
+METHOD: `git filter-branch --env-filter '. /c/Users/carst/AppData/Local/Temp/mnemo-rewrite/identity.sh' --tag-name-filter cat -- 58016cfb..main`. The RANGE is the point: `58016cfb..main` limits the rewrite to the 112 commits that had to change (3 autodesk + 109 descendants), so every pre-range commit keeps its object, sha AND gpgsig signature (e.g. the signed 64dc339c survived). git filter-repo is NOT installed on this machine; filter-branch ships with git 2.55.0.windows.4.
+
+VERIFIED: `git diff 397f256 main` EMPTY (content byte-identical), 299 commits == before, 44 merges == before, subject list identical, autodesk grep over %ae|%ce EMPTY, identity distribution = carsten@hess.net pairs + dependabot only, filter hit-log = exactly 3 lines, cargo test green warning-free, dry-run on a scratch ref produced the SAME tip sha as the real run.
+
+GOTCHAS LEARNED: (1) a PowerShell variable holding a MULTI-LINE string is WORD-SPLIT when passed to a native command — git received the filter fragments as rev-list args ("fatal: bad revision '<$GIT_AUTHOR_EMAIL>'") and the env-filter never ran; the run that then completed still re-shas'd 288 of 299 commits because filter-branch rebuilds every commit through commit-tree and CANNOT carry a gpgsig header (the failed intermediate tip be082a3 was discarded before any push). Pass the filter as a ONE-LINE `. <script>` source command, never as an inline multi-line literal; the script file must be LF-only (a CRLF script injects CR into the exported values) and UTF-8 without BOM. (2) `filter-branch -f` consumes existing refs/original entries, so the durable safety net is a plain LOCAL branch: backup/attribution-rewrite-397f256 -> 397f256 (never pushed) plus refs/original/refs/heads/main. (3) Always dry-run a history rewrite on a scratch ref first and compare the resulting tip.
+
+CONSEQUENCES: merged PRs #1-#15 keep displaying their pre-rewrite commits (GitHub never rewrites PR data); memory/knowledge records naming old shas are historical, not current; the contributors list re-derives over hours. PUSH: main is protected by ruleset 23755694 (non_fast_forward + pull_request), so landing this required the owner to lift protection first — the agent never bypasses it; refs/heads/main goes with --force-with-lease and refs/tags/v1.2.0 with --force (tags are not covered by the ruleset).
+
+Plan file: .coding/plans/0014d260.md. Evidence files: $env:TEMP/mnemo-rewrite/ (count-before, merges-before, subjects-before/after, identities-before, descendants, filter-hits, fb-main.log).

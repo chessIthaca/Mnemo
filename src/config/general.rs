@@ -484,7 +484,10 @@ fn routing_threshold_is_default(threshold: &f64) -> bool {
 /// before model reasoning, with no model roundtrip (the failure-triage
 /// tier-1 auto-retry precedent). Opt-in and inert by default: an absent
 /// section never spawns a process, so behavior is byte-identical to today.
-/// Omitted from the saved config while every field holds its default.
+/// The command runs VERBATIM through the platform shell (PowerShell on
+/// Windows, `sh` elsewhere) — chained `&&`/`||` commands are not translated,
+/// so use a single command or a script. Omitted from the saved config while
+/// every field holds its default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VerifyConfig {

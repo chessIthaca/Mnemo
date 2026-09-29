@@ -512,20 +512,42 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                   no breakdown yet (send a prompt)
                 </div>
               )}
-              {/* Compact button — summarizes old messages into a summary
+              {/* Compact control — summarizes old messages into a summary
                   system message. Disabled while running (can't compact
-                  mid-turn). */}
-              <button
+                  mid-turn).
+
+                  It is deliberately NOT a real button element: this popup
+                  lives inside the bar's toggle button (clicking anywhere on
+                  the bar opens/closes the panel) and interactive content
+                  nested in a button is invalid HTML — React logged a
+                  DOM-nesting warning for it on every render.
+                  Following RightPanel's tab close-x, this is a span with
+                  role=button plus Enter/Space handling. `aria-disabled`
+                  replaces the `disabled` attribute (a span has none) and both
+                  handlers bail out while it is set. */}
+              <span
+                role="button"
+                tabIndex={running || agentId === null ? -1 : 0}
+                aria-disabled={running || agentId === null}
+                aria-label="Compact context"
                 onClick={(e) => {
+                  // Don't let the click also toggle the reasoning panel.
                   e.stopPropagation();
-                  if (agentId !== null) {
-                    compact(agentId).catch((err) =>
-                      console.error("failed to compact:", err),
-                    );
-                  }
+                  if (running || agentId === null) return;
+                  compact(agentId).catch((err) =>
+                    console.error("failed to compact:", err),
+                  );
                 }}
-                disabled={running || agentId === null}
-                className="mt-1.5 w-full rounded-sm border border-cyan-600/40 bg-cyan-600/10 px-2 py-1 text-cyan-400 transition-colors hover:bg-cyan-600/20 disabled:cursor-not-allowed disabled:opacity-40"
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (running || agentId === null) return;
+                  compact(agentId).catch((err) =>
+                    console.error("failed to compact:", err),
+                  );
+                }}
+                className="mt-1.5 block w-full cursor-pointer rounded-sm border border-cyan-600/40 bg-cyan-600/10 px-2 py-1 text-center text-cyan-400 transition-colors hover:bg-cyan-600/20 aria-disabled:cursor-not-allowed aria-disabled:opacity-40 aria-disabled:hover:bg-cyan-600/10"
                 title={
                   running
                     ? "Wait for the agent to finish before compacting"
@@ -533,7 +555,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                 }
               >
                 Compact context
-              </button>
+              </span>
               </div>
             </div>
           </span>

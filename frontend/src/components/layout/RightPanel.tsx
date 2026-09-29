@@ -53,8 +53,14 @@ export function RightPanel() {
       {/* Tab bar — Radix Tabs gives role="tablist"/"tab", aria-selected, and
           arrow-key navigation. The X close button stays outside the tablist. */}
       <div className="flex items-center border-b border-border">
+        {/* `value` must never be undefined: Radix falls back to uncontrolled
+            when it is (shownTab is undefined while every view tab is disabled)
+            and then warns "Tabs is changing from uncontrolled to controlled"
+            as soon as a tab becomes available again. The empty string is the
+            controlled spelling of "nothing selected"; the empty state itself
+            is rendered explicitly below (shownTab === undefined). */}
         <Tabs
-          value={shownTab}
+          value={shownTab ?? ""}
           onValueChange={(v: string) => setRightPanelTab(v as RightPanelTab)}
           activationMode="automatic"
           className="flex-1 overflow-x-auto"

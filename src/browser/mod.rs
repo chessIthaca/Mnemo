@@ -427,7 +427,12 @@ impl BrowserManager {
             .map_err(|e| Error::Browser(format!("failed to create browser profile dir: {e}")))?;
         let (browser, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(chromiumoxide::browser::HeadlessMode::New)
+                // chromiumoxide 0.9 made `HeadlessMode` unreachable (the config
+                // module is private; only BrowserConfig/BrowserConfigBuilder are
+                // re-exported), so the typed setter can no longer be called from
+                // outside the crate. The builder's `new_headless_mode()` sets
+                // exactly HeadlessMode::New — the mode this app wants.
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 // No plugins in this app: forbid extension loading explicitly
                 // (the throwaway profile already blocks extensions; this makes
@@ -2583,7 +2588,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches + connects to a real Chromium process; run with `cargo test -- --ignored`"]
     async fn browser_connect_attaches_to_running_chromium() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
         use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
         use chromiumoxide::page::ScreenshotParams;
 
@@ -2597,7 +2602,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -2710,7 +2715,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_connect_screenshot_eval_snapshot() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
 
         // (a) Launch a Chromium on an ephemeral debug port — the stand-in for
         // the app's WebView2.
@@ -2720,7 +2725,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -2886,7 +2891,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "heavy CDP-attach iframe integration test; run with --ignored"]
     async fn webview_frame_and_input_cdp_surface() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
         use chromiumoxide::cdp::browser_protocol::input::{
             DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
         };
@@ -2899,7 +2904,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -3120,7 +3125,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_page_selects_child_target() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
 
         // (a) Launch a Chromium on an ephemeral debug port — the stand-in for
         // the app's WebView2 (which hosts both the app page + the child).
@@ -3130,7 +3135,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -3232,7 +3237,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_read_falls_back_to_app_page_when_child_missing() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
 
         // (a) Launch a Chromium on an ephemeral debug port — the stand-in for
         // the app's WebView2 with ONLY the app page (no Browser tab opened).
@@ -3242,7 +3247,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -3329,7 +3334,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_click_and_type_drive_child_webview() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
         use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 
         // (a) Launch a Chromium stand-in on an ephemeral debug port.
@@ -3339,7 +3344,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -3498,7 +3503,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_click_without_child_says_to_navigate_first() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
 
         let profile = tempfile::Builder::new()
             .prefix("mnemo-webview-")
@@ -3506,7 +3511,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
@@ -3558,7 +3563,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "integration: launches a real Chromium process; run with `cargo test -- --ignored`"]
     async fn webview_navigate_auto_ensures_missing_child() {
-        use chromiumoxide::browser::{Browser, BrowserConfig, HeadlessMode};
+        use chromiumoxide::browser::{Browser, BrowserConfig};
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         let profile = tempfile::Builder::new()
@@ -3567,7 +3572,7 @@ mod tests {
             .expect("tempdir");
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
-                .headless_mode(HeadlessMode::New)
+                .new_headless_mode()
                 .user_data_dir(profile.path().to_path_buf())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])

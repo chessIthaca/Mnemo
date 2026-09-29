@@ -120,7 +120,7 @@ function BacklogInput() {
   const [addError, setAddError] = useState<string | null>(null);
   // Set by handleTemplate; the effect below applies focus + selection
   // AFTER React commits the template text (review LOW-1, round 1: a
-  // synchronous setSelectionRange runs before the commit — React 18
+  // synchronous setSelectionRange runs before the commit — React
   // batches the state update, so the selection clamps to the old (empty)
   // value and the caret lands at the end once the new value lands).
   const [templateJustInserted, setTemplateJustInserted] = useState(false);

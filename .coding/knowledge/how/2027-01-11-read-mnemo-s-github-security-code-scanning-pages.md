@@ -40,3 +40,5 @@ Two traps worth knowing:
   `function not defined: open/0`. Either use a `.ps1` script file (as
   `.coding/tmp/gh-security-report.ps1` does) or pipe `--jq ".[]"` JSONL into
   `ConvertFrom-Json`.
+
+Amended 2027-01-11: Re-verified at the 1.3.0 close-out (2026-09-29): the recipes below still work unchanged. Current live state: 0 open code-scanning, 0 open Dependabot, 0 open secret-scanning alerts; `gh api repos/chessIthaca/Mnemo/code-scanning/default-setup` returns state = not-configured, which is the expected confirmation that the repo now runs CodeQL in ADVANCED setup (.github/workflows/codeql.yml, from PR #41) instead of default setup — not a sign that scanning is off. The PowerShell --jq quoting trap noted below still applies: use the fetcher-script pattern (.coding/tmp/gh-security-report.ps1, raw dump gh-security-report.txt) or jq expressions without inner double quotes. Raw evidence of this re-check: .coding/tmp/gh-1.3-prep.txt.

@@ -44,7 +44,8 @@ Out of scope:
 
 ## Automated checks
 
-The repository runs CodeQL (default setup), Dependabot alerts and security
-updates, and secret scanning with push protection. Findings, the fixes, and the
+The repository runs CodeQL (advanced setup,
+`.github/workflows/codeql.yml`), Dependabot alerts and security updates, and
+secret scanning with push protection. Findings, the fixes, and the
 dismissal evidence live in `.coding/analysis/` — most recently
 `2026-09-29-github-security-defects.md`.

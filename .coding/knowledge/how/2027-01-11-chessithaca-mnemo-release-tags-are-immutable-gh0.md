@@ -1,6 +1,7 @@
 +++
 title = "chessIthaca/Mnemo — release tags are immutable (GH013 blocks moving refs/tags/v1.2.0); rulesets now empty"
 created = "2027-01-11"
+status = "superseded"
 +++
 
 2026-09-28, plan 0014d260 (attribution rewrite). MAIN: the rewritten tip a2522a4 IS on GitHub — origin/main reflog "update by push" at 10:43:46; GitHub refs/heads/main = a2522a4 = local main; old shas diverge (compare 397f256...main = diverged 112/112; 260d1f52...main = diverged); no autodesk identity in main's history; contributors already ["chessIthaca","dependabot[bot]"]. TAG: the retarget (f3c5076 → c5e8c85) canNOT be pushed — `git push --force origin refs/tags/v1.2.0` → GH013 "Repository rule violations … Cannot update this protected ref". Cause: GitHub **Immutable releases** is ON (both releases report immutable:true) — NOT a ruleset: repo rulesets = [] (admin token, trustworthy), 23755694 = 404, org rulesets N/A (chessIthaca is a User), legacy tag-protection endpoint 404, rules-on-main = [] (main currently unprotected). Remote tags verified untouched: v1.2.0 = 0887e40 (original annotated tag object → f3c5076; annotated object sha ≠ commit sha — don't misread as "moved"), v0.1.1 = 525aa4f5 (original annotated → 53534b6), WindowsRelease = 76af04b. Local: v1.2.0 lightweight → c5e8c85 (in main, tree 42ce3b7c == f3c5076's); safety refs backup/attribution-rewrite-397f256 + refs/original/refs/heads/main = 397f256. Tag resolution pending the user (unlock Immutable releases → retry, or leave the release tag as-is).

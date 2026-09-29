@@ -61,6 +61,9 @@ Thumbs.db
 .coding/instance.json
 # Scratch shards from in-session payload-decomposition workarounds — never commit.
 .coding/tmp-shard/
+# Per-session scratch (command logs, gh fetcher dumps, draft PR bodies) — the
+# evidence trail for the task in flight, never a deliverable; never commit.
+.coding/tmp/
 # Parallel run-all worktrees (plan ffd7a86f) — linked worktrees for
 # concurrently dispatched backlog items + the landing worktree. Disposable
 # working trees, never committed.

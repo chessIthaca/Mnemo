@@ -18,17 +18,34 @@ are intentionally global. Structured file tools are primary; shell / grep-glob /
 coding workflow. Every mutating action goes through an approve-each-action gate,
 with **diff-based approval** for file edits.
 
-## Current status (2026-08-11)
+## Current status (2026-09-29)
 
 The brain **and** the Tauri + React/TS GUI are built, tested, and working.
-The original Ratatui TUI was replaced by a Tauri 2 + React 18 + TypeScript +
+The original Ratatui TUI was replaced by a Tauri 2 + React 19 + TypeScript +
 Vite frontend; the brain is fully decoupled from the UI via typed channels
 (`AgentCommand` UI→Agent, `SerializableAgentEvent` Agent→UI) and an IPC
 adapter (`src-tauri/src/ipc/`). The app is a multi-agent, plan-first,
 approval-gated coding harness — not a UI swap.
 
-**Test counts:** 522 lib + 49 tauri (IPC) + 5 workflow-integration + 82
-vitest (frontend), `tsc --noEmit` clean.
+**Test counts (2026-09-29):** 2903 lib (5 ignored) + 344 app-shell (src-tauri,
+6 suites) + 21 integration + 92 vitest files / 1319 frontend tests;
+`cargo check` and `tsc --noEmit` clean.
+
+**Dependency & security posture (2026-09-29).** The dependabot + CodeQL sweep
+(PRs #16–#60) modernized the dependency set and hardened CI: React 19,
+TypeScript 7, Tailwind v4 (`@tailwindcss/postcss`; `autoprefixer` dropped),
+Vite 8, vitest 5, zustand 5, react-markdown 10, lucide-react 1.48,
+chromiumoxide 0.9, rusqlite 0.40, tiktoken-rs 0.12, sha2 0.11, toml 1.1,
+zip 8, windows-sys 0.61, directories 6. Vendored pins held: `tao` / `wry` /
+`tauri-runtime-wry` stay `[patch.crates-io]` path overrides (`vendor/`) —
+every cargo bump must leave **no** `[[patch.unused]]` in `Cargo.lock`. GitHub
+Action refs are pinned to full SHAs — the one documented exception,
+`dtolnay/rust-toolchain@stable`, selects its toolchain by ref — guarded by
+`tests/integration/ci_workflow.rs`; the build workflows scope `GITHUB_TOKEN`
+to `contents: read` (the release job keeps `contents: write`), and CodeQL
+runs in advanced setup with `vendor/**` excluded. 0 open code-scanning /
+Dependabot / secret-scanning alerts at the time of writing; the full
+snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`.
 
 **As-built architecture (post architecture-review remediation, Phases 0–6):**
 
@@ -351,8 +368,8 @@ vitest (frontend), `tsc --noEmit` clean.
 | Concern | Choice | Why |
 |---|---|---|
 | GUI framework | **Tauri 2.x** | Rust backend (the existing brain) + web frontend. Rich text, markdown, syntax highlighting, KaTeX, mermaid, live preview. Native window, small binary. |
-| Frontend framework | **React 18 + TypeScript + Vite** | Largest ecosystem for the rich-text components we need (react-markdown, Shiki, diff viewers). User is building web apps — dogfooding a React UI is a feature. |
-| Styling | **Tailwind CSS v3** (v3 toolchain: `autoprefixer` + `postcss`) | Modern, utility-first, fast to iterate. v4 is a possible future upgrade. |
+| Frontend framework | **React 19 + TypeScript 7 + Vite 8** | Largest ecosystem for the rich-text components we need (react-markdown, Shiki, diff viewers). User is building web apps — dogfooding a React UI is a feature. |
+| Styling | **Tailwind CSS v4** (`@tailwindcss/postcss`; `autoprefixer` dropped) | Modern, utility-first, fast to iterate. Migrated v3 → v4 on 2026-09-29. |
 | Component library | **shadcn/ui (Radix + Tailwind)** | Radix primitives adopted for the accessibility-critical components: dialogs (focus trap, `aria-modal`, focus restore) and tab bars (`role="tab"/"tablist"`, arrow-key nav) use thin `components/ui/` wrappers; the rest of the UI stays hand-built Tailwind on the same theme tokens. |
 | Markdown | **react-markdown + remark-gfm + rehype-highlight** | GFM tables/task lists, syntax highlighting via highlight.js. Upgradeable to Shiki for VS Code-quality highlighting. |
 | Code highlighting | **rehype-highlight (highlight.js)**; Shiki planned as the upgrade | highlight.js is the current baseline everywhere; Shiki (VS Code's highlighter, best-in-class token themes, lazy-loaded grammars) is the intended upgrade. |
@@ -1225,21 +1242,21 @@ serde_json = "1"
 ```json
 // frontend/package.json (key deps)
 {
-  "react": "^18",
-  "react-dom": "^18",
+  "react": "^19",
+  "react-dom": "^19",
   "@tauri-apps/api": "^2",
-  "react-markdown": "^9",
+  "react-markdown": "^10",
   "remark-gfm": "^4",
   "rehype-highlight": "^7",
   "shiki": "^1",
   "react-diff-view": "^3",
   "refractor": "^4",
-  "zustand": "^4",
-  "lucide-react": "^0.4",
+  "zustand": "^5",
+  "lucide-react": "^1",
   "tailwindcss": "^4",
   "@radix-ui/*": "...",
-  "vite": "^5",
-  "typescript": "^5"
+  "vite": "^8",
+  "typescript": "^7"
 }
 ```
 

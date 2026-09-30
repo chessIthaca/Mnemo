@@ -161,20 +161,19 @@ debug = false
 
 [workspace]
 members = ["src-tauri"]
-# `vendor/tao` is a [patch.crates-io] path override, not a member — excluding
+# `vendor/wry` is a [patch.crates-io] path override, not a member — excluding
 # it keeps cargo invocations from inside vendor/ from failing with "current
 # package believes it's in a workspace when it's not" (review LOW-2,
 # 2026-09-05).
 exclude = ["vendor"]
 resolver = "2"
 
-# Vendored tao 0.35.4 = 0.35.3 + PR #1215 backport (Windows keyboard/IME
-# self-deadlock fix, AppHangB1). tauri-runtime-wry 2.11.4 / wry 0.55.1 pin
-# tao ^0.35 and 0.36.0 (which carries the fix upstream) does not satisfy
-# that, so the fix is backported onto the exact 0.35.3 the app runs and
-# renumbered 0.35.4. See vendor/tao/PATCHES.md.
+# tao is no longer vendored: tauri 2.12 resolves tao 0.37.x, which carries
+# the PR #1215 Windows keyboard/IME deadlock fix natively (upstream 0.36.0,
+# merged 2026-06-10); the 0.35.4 backport existed only while
+# tauri-runtime-wry pinned tao ^0.35.
 #
-# Vendored wry 0.55.3 = 0.55.1 + two patches: (1) OS-account SSO —
+# Vendored wry 0.57.2 = 0.57.0 + two patches: (1) OS-account SSO —
 # create_environment sets AllowSingleSignOnUsingOSPrimaryAccount(true) on
 # the WebView2 environment options, so the Browser tab signs in to AAD/MSA
 # sites with the Windows primary account (Edge-equivalent silent SSO;
@@ -182,8 +181,7 @@ resolver = "2"
 # code). (2) Hard reload — webview2 reload() issues CDP Page.reload with
 # ignoreCache (WebView2's Reload() serves cached subresources, so the
 # Browser tab went stale; no native hard-reload API exists and Tauri 2
-# exposes none). tauri-runtime-wry 2.11.4 pins wry ^0.55; renumbered
-# 0.55.3. See vendor/wry/PATCHES.md.
+# exposes none). tauri-runtime-wry (via tauri 2.12) pins wry ^0.57;
+# renumbered 0.57.2. See vendor/wry/PATCHES.md.
 [patch.crates-io]
-tao = { path = "vendor/tao" }
 wry = { path = "vendor/wry" }

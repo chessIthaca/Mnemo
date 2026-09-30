@@ -36,8 +36,8 @@ In scope — the Mnemo library/CLI and the Tauri app:
 
 Out of scope:
 
-- **vendored dependencies** (`vendor/tao`, `vendor/wry`) — these are backport
-  mirrors; report upstream to tao/wry;
+- **vendored dependencies** (`vendor/wry`) — this is a backport
+  mirror; report upstream to wry;
 - a malicious tool call the user explicitly approved, or content a provider
   returned in response to the user's own request;
 - anything about data Mnemo never writes (your repository, your provider account).

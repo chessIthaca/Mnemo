@@ -14,15 +14,15 @@
 //! `location.reload(true)`, but the DevTools protocol has exactly this —
 //! CDP `Page.reload` with `{"ignoreCache":true}` via
 //! `ICoreWebView2::CallDevToolsProtocolMethod` (Page.reload + ignoreCache
-//! is documented in the CDP spec). Tauri 2.11.5's
-//! `Webview::reload` exposes no hook for it, so the vendored wry 0.55.3
+//! is documented in the CDP spec). Tauri's
+//! `Webview::reload` exposes no hook for it, so the vendored wry 0.57.2
 //! (`vendor/wry`, see PATCHES.md) patches the webview2 `reload()` to
 //! issue the CDP call, falling back to `Reload()` when the call itself
 //! fails.
 //!
 //! This test is the deterministic stand-in: it asserts the patch's
 //! source-level invariants against the vendored tree (`vendor/wry`,
-//! workspace root). It FAILS on the pristine 0.55.1 source (cache-serving
+//! workspace root). It FAILS on the pristine 0.57.0 source (cache-serving
 //! reload — the out-of-sync bug) and PASSES once the patch is applied,
 //! so the hard reload can never silently disappear via a vendor refresh
 //! or a botched merge.
@@ -99,18 +99,17 @@ fn reload_issues_cdp_page_reload_with_ignore_cache() {
     );
 }
 
-/// The renumber: the vendored crate must present itself as 0.55.3 so
-/// `[patch.crates-io]` satisfies tauri-runtime-wry's `wry = "^0.55"` pin
-/// while staying distinguishable from the registry's 0.55.1 and the
-/// previous vendored 0.55.2 in Cargo.lock (crates.io never published a
-/// 0.55.2 or 0.55.3).
+/// The renumber: the vendored crate must present itself as 0.57.2 so
+/// `[patch.crates-io]` satisfies tauri-runtime-wry's `wry = "^0.57"` pin
+/// while staying distinguishable from the registry's 0.57.0 in Cargo.lock
+/// (crates.io has published neither 0.57.1 nor 0.57.2).
 #[test]
-fn vendored_wry_is_renumbered_0_55_3() {
+fn vendored_wry_is_renumbered_0_57_2() {
     let manifest = read_vendored("Cargo.toml");
     assert!(
-        manifest.contains("version = \"0.55.3\""),
-        "vendored wry must be renumbered 0.55.3 (0.55.1 + SSO patch + hard-reload patch) so \
-         the [patch.crates-io] entry satisfies tauri-runtime-wry's ^0.55 requirement and the \
+        manifest.contains("version = \"0.57.2\""),
+        "vendored wry must be renumbered 0.57.2 (0.57.0 + SSO patch + hard-reload patch) so \
+         the [patch.crates-io] entry satisfies tauri-runtime-wry's ^0.57 requirement and the \
          patched copy is distinguishable from the registry's versions"
     );
 }

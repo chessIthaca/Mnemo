@@ -143,20 +143,6 @@ fn build_workflow_scopes_token_permissions() {
     );
 }
 
-/// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
-/// commit SHA, with the human version in a trailing `# vN` comment so
-/// Dependabot can keep it current.
-///
-/// A tag ref is mutable: whoever controls the action repository can repoint
-/// `@v7` at new code that then runs with this repo's `GITHUB_TOKEN` — the
-/// release job's token is `contents: write`. SHA pins make the executed commit
-/// immutable.
-///
-/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
-/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
-/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
-/// Because of that exception the repo-level "require SHA pinning" Actions
-/// setting stays off (it would reject the rust-toolchain step).
 /// The release job must upload the installers to a DRAFT release and publish it
 /// afterwards — in that order.
 ///
@@ -211,15 +197,54 @@ fn build_workflow_uploads_installers_to_a_draft_release_first() {
     );
 }
 
+/// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
+/// commit SHA, with the human version in a trailing `# vN` comment so
+/// Dependabot can keep it current.
+///
+/// A tag ref is mutable: whoever controls the action repository can repoint
+/// `@v7` at new code that then runs with this repo's `GITHUB_TOKEN` — the
+/// release job's token is `contents: write`. SHA pins make the executed commit
+/// immutable.
+///
+/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
+/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
+/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
+/// Because of that exception the repo-level "require SHA pinning" Actions
+/// setting stays off (it would reject the rust-toolchain step).
+///
+/// The guard enumerates `.github/workflows/` itself — every `*.yml`/`*.yaml`
+/// file found there is checked, so a workflow file added later is covered
+/// without editing the test; a hardcoded file list would silently leave it
+/// unguarded. A missing or empty workflows directory fails the test outright
+/// instead of passing vacuously.
 #[test]
 fn workflows_pin_actions_to_full_shas() {
     const ALLOWED_UNPINNED: [&str; 1] = ["dtolnay/rust-toolchain@stable"];
     let root = env!("CARGO_MANIFEST_DIR");
-    for rel in [".github/workflows/build.yml", ".github/workflows/codeql.yml"] {
+    let workflows_dir = format!("{root}/.github/workflows");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|e| panic!("{workflows_dir} readable: {e}"))
+        .map(|entry| entry.expect(".github/workflows entry readable").path())
+        .filter(|path| {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        ".github/workflows holds no *.yml/*.yaml workflow files — the SHA-pin \
+         guard would pass vacuously; the enumeration must see the workflows it \
+         guards"
+    );
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-UTF-8 workflow file name>");
+        let rel = format!(".github/workflows/{name}");
         let text =
-            std::fs::read_to_string(format!("{root}/{rel}")).unwrap_or_else(|e| {
-                panic!("{rel} readable: {e}")
-            });
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{rel} readable: {e}"));
         for (idx, line) in text.lines().enumerate() {
             let t = line.trim();
             let t = t.strip_prefix("- ").unwrap_or(t);

@@ -4,7 +4,7 @@
 
 //! Per-tool prompt builders for the `image_*` tools.
 //!
-//! Each tool shares one call path (load image â†’ vision model) but injects its
+//! Each tool shares one call path (load image → vision model) but injects its
 //! own prompt + fixed markdown section headers. Principles baked into every
 //! prompt: answer comprehensively in ONE pass (the zoom loop is stateless
 //! across calls), follow the section headers exactly, transcribe text
@@ -40,7 +40,7 @@ impl ImageTool {
 }
 
 /// Tool-specific extras passed to the prompt builder (target, framework, lang
-/// hint, code context, focus â€” whichever apply to the tool).
+/// hint, code context, focus — whichever apply to the tool).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PromptArgs {
     /// The user's specific question about the image.
@@ -49,7 +49,7 @@ pub(crate) struct PromptArgs {
     pub extra: HashMap<String, String>,
 }
 
-/// Shared preamble â€” the quality principles every prompt leads with.
+/// Shared preamble — the quality principles every prompt leads with.
 const PREAMBLE: &str = "Answer comprehensively in one pass. Follow the section headers exactly. \
 Transcribe text verbatim where relevant. Write \"unknown\" rather than guess.";
 
@@ -90,7 +90,7 @@ pub(crate) fn build_prompt(tool: ImageTool, args: &PromptArgs) -> String {
         }
         ImageTool::ExtractText => {
             format!(
-                "Task: Verbatim OCR â€” extract all visible text, preserving layout and whitespace.\n{}{}",
+                "Task: Verbatim OCR — extract all visible text, preserving layout and whitespace.\n{}{}",
                 extra_line("Language hint", "lang_hint"),
                 question_line(),
             ) + "\nRespond with these sections:\n\
@@ -118,7 +118,7 @@ pub(crate) fn build_prompt(tool: ImageTool, args: &PromptArgs) -> String {
         }
         ImageTool::AnalyzeChart => {
             format!(
-                "Task: Read this chart/dashboard â€” extract values, trends, outliers.\n{}",
+                "Task: Read this chart/dashboard — extract values, trends, outliers.\n{}",
                 question_line(),
             ) + "\nRespond with these sections:\n\
                ## Chart Overview\n## Data\n(the values: series/labels/numbers; trends if visible)\n\
@@ -130,7 +130,7 @@ pub(crate) fn build_prompt(tool: ImageTool, args: &PromptArgs) -> String {
                 extra_line("Focus area", "focus"),
                 question_line(),
             ) + "\nRespond with these sections:\n\
-               ## Diff Summary\n(overview: what changed + Aâ†’B direction)\n\
+               ## Diff Summary\n(overview: what changed + A→B direction)\n\
                ## Details\n(each change: what + where)"
         }
         ImageTool::ImageAnalysis => {
@@ -153,7 +153,7 @@ pub(crate) fn build_prompt(tool: ImageTool, args: &PromptArgs) -> String {
 /// The control prompt for the agentic zoom loop. The model either asks to zoom
 /// into one of the server-provided regions, or declares it is confident and
 /// answers. Carries the full task prompt (with its section headers) so the
-/// model knows the expected answer format, then appends the vote instruction â€”
+/// model knows the expected answer format, then appends the vote instruction —
 /// no contradictory "respond with sections" vs "ONLY JSON" split.
 pub(crate) fn zoom_control_prompt(task_prompt: &str, region_labels: &[String]) -> String {
     let labels = region_labels.join(", ");

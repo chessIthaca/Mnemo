@@ -24,12 +24,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
+use super::budget;
 use super::context::{self, TokenAccounting};
 use super::failure_triage;
 use super::loop_impl::{AgentLoop, TurnOutcome};
 use super::model_routing;
+use super::reflex::{ReflexAction, ReflexDecisionRow, ReflexOutcome};
+use super::step_lanes::{self, ClassifyHow, LaneState};
 use super::prompt;
 use super::recall_delta::DeltaDecision;
 use super::StopReason;
@@ -265,6 +268,10 @@ pub(crate) struct TurnState {
     /// nothing) = no arm fires, no row is written, and model selection is
     /// exactly today's.
     route: Option<TurnRoute>,
+    /// The budget layer's turn identity (backlog a25a5323): one id per turn,
+    /// stamped on every spend row the turn writes, joining the ledger with
+    /// the routing/reflex logs' turn ids.
+    spend_turn_id: Option<String>,
 }
 
 impl TurnState {
@@ -290,6 +297,7 @@ impl TurnState {
             last_recall_results: None,
             last_recall_store_version: 0,
             route: None,
+            spend_turn_id: None,
         }
     }
 }
@@ -412,6 +420,9 @@ impl AgentLoop {
         // decision lives in `state.route`; each iteration's provider
         // resolution reads its target.
         state.route = self.route_turn_start(messages, agent_id).await;
+        // The budget layer's turn identity (backlog a25a5323): minted once
+        // per turn, stamped on every spend row this turn writes.
+        state.spend_turn_id = Some(model_routing::new_turn_id(&agent_id.to_string()));
 
         loop {
             // A swap deferred mid-run (a smaller-context model pick) is
@@ -463,9 +474,71 @@ impl AgentLoop {
 
             // The provider + context manager for THIS iteration's request
             // (re-resolved every iteration — see resolve_iteration_provider).
+            // The escalation-lane target (backlog ad56c7bd) composes OVER the
+            // turn-level pre-prompt route for this iteration only: the lane
+            // decision is step-granular (more specific), and `state.route`
+            // keeps feeding the turn-level outcome rows untouched.
+            let lane_target = self.step_lane_target(agent_id).await;
+            // Budget-layer reads (backlog a25a5323), once per iteration: the
+            // live plan scope feeds the cap gate AND the spend ledger (rows
+            // are written regardless of the budget flag — it gates only the
+            // caps), and the failed-cycle marker says this iteration's
+            // request IS the retry.
+            let plan_scope = self.read_plan_scope().await;
+            let retry_pending = self.take_pending_lane_retry();
+            // The deterministic budget gate: when a cap is reached, PAUSE the
+            // plan through a pending question — never a hard kill (the plan
+            // file is the resumption document). `Some` means the turn ends
+            // here.
+            if let Some(outcome) = self
+                .budget_gate(
+                    plan_scope.as_ref(),
+                    retry_pending,
+                    fanin_tx,
+                    agent_id,
+                    cmd_rx,
+                    &mut state,
+                )
+                .await
+            {
+                return Ok(outcome);
+            }
+            // Stamp the spend attribution for the request this iteration
+            // builds: which plan/step/lane it belongs to and why the model
+            // runs. The usage site consumes it; the stamp is overwritten next
+            // iteration and CLEARED when no plan is live, so a request that
+            // errors without reporting usage cannot leak a stale attribution
+            // into a later planless turn (round-1 finding L1).
+            if let Some((plan_id, step_index)) = &plan_scope {
+                let turn_id = state
+                    .spend_turn_id
+                    .clone()
+                    .unwrap_or_else(|| model_routing::new_turn_id(&agent_id.to_string()));
+                self.set_spend_attribution(budget::SpendAttribution {
+                    plan_id: plan_id.clone(),
+                    turn_id,
+                    step_index: *step_index,
+                    lane: lane_target.map(|t| t.label().to_string()),
+                    reason: if retry_pending {
+                        budget::BudgetReason::Retry
+                    } else if matches!(lane_target, Some(model_routing::RouteTarget::Escalate)) {
+                        budget::BudgetReason::Escalate
+                    } else if lane_target.is_some() {
+                        budget::BudgetReason::Route
+                    } else {
+                        budget::BudgetReason::Default
+                    },
+                });
+            } else {
+                // No live plan (round-1 finding L1): clear any stamp left by
+                // an earlier request that reported no usage, so a planless
+                // turn can never consume a stale attribution — a phantom row
+                // billed to a finished plan.
+                self.clear_spend_attribution();
+            }
             let (provider, context_manager) = self
                 .resolve_iteration_provider(
-                    state.route.as_ref().and_then(|r| r.target),
+                    lane_target.or(state.route.as_ref().and_then(|r| r.target)),
                     fanin_tx,
                     agent_id,
                 )
@@ -1092,6 +1165,8 @@ impl AgentLoop {
                 confidence: decision.confidence,
                 threshold: policy.threshold,
                 target: decision.target.map(|t| t.label().to_string()),
+                lane: None,
+                step_index: None,
                 enforced: routed.is_some(),
                 model: routed
                     .as_ref()
@@ -1129,6 +1204,336 @@ impl AgentLoop {
             wf.active_plan_kind(),
         );
         resolver.resolve_routed(target, ctx)
+    }
+
+    /// The escalation-lane route target for the plan step the agent is on now
+    /// (backlog ad56c7bd) — ONE compound-reflex call per step per attempt.
+    ///
+    /// Every miss keeps the iteration's pre-existing model: no handle, the
+    /// reflex flag off, a spawned agent, no live routing policy, no active
+    /// step, a below-gate / malformed / unknown-label answer, and an unset or
+    /// dangling `[general.routing]` lane target all return `None` (the
+    /// resolver's own fall-through is the last guard). Shadow mode (`enforce`
+    /// off) classifies and logs but returns `None` — the ladder is validated
+    /// on the corpus before it may ever switch a model. Rows are written
+    /// best-effort; a log failure never fails the turn.
+    async fn step_lane_target(&self, agent_id: AgentId) -> Option<model_routing::RouteTarget> {
+        // Fast exits, cheapest first: no handle, flag off, spawned agent, or
+        // no live routing policy -> ZERO classifier calls, byte-identical.
+        let handle = self.reflex.as_ref()?;
+        if !handle.is_enabled() {
+            return None;
+        }
+        if self.is_subagent() {
+            return None;
+        }
+        let policy = self.model_resolver.as_ref()?.routing_policy()?;
+        // The live step, under the workflow lock; the guard is dropped before
+        // the first await (decide + resolve both await). The plan's IDENTITY
+        // is its id, never its title -- agent-generated titles repeat, and the
+        // memo must never serve a new plan a decision made for its
+        // predecessor (ad56c7bd review finding L1).
+        let (plan_id, step_index, step_text) = {
+            let wf = self.workflow.lock().await;
+            let step = wf.current_step()?;
+            let plan_id = wf.plan_id()?.to_string();
+            (plan_id, step.index, step.text.clone())
+        };
+        let epoch = self
+            .escalation_epoch
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The memo: the same step under the same epoch is never asked twice.
+        let how = {
+            let memo = self.lane_state.lock().ok()?;
+            step_lanes::needs_classify(memo.as_ref(), &plan_id, step_index, epoch)
+        };
+        if how == ClassifyHow::Reuse {
+            let memo = self.lane_state.lock().ok()?;
+            return memo.as_ref().and_then(|s| s.effective_target());
+        }
+        // A re-classification (a failed cycle re-armed the ladder) names the
+        // verdict in the state text; a first attempt never sees one.
+        let failure = match how {
+            ClassifyHow::ReClassify => self.lane_failure.lock().ok().and_then(|f| f.clone()),
+            ClassifyHow::Fresh | ClassifyHow::Reuse => None,
+        };
+        let state_text = step_lanes::state_text(&step_text, failure.as_deref());
+        let outcome = handle.decide(&state_text).await;
+        let shadow = !policy.enforce;
+        let agent = agent_id.to_string();
+        let turn_id = model_routing::new_turn_id(&agent);
+        let log_path = self.routing.as_ref().map(|g| g.log_path().to_path_buf());
+        match &outcome {
+            ReflexOutcome::Decided { decision } => {
+                let rung = step_lanes::rung_from_decision(decision);
+                let target = rung.to_route_target();
+                // Shadow never selects a model; enforce resolves NOW so the
+                // row can name it and the miss below can be memoized.
+                let routed = if shadow {
+                    None
+                } else {
+                    self.resolve_routed_model(target).await
+                };
+                // The budget layer counts this arm (backlog a25a5323): an
+                // ENFORCED Escalate-rung decision — once per decision, never
+                // per memo reuse (a long step must not multiply its count),
+                // and never in shadow (shadow routes nothing).
+                if !shadow
+                    && routed.is_some()
+                    && matches!(&target, model_routing::RouteTarget::Escalate)
+                {
+                    self.with_plan_spend(|spend| {
+                        spend.note_plan(&plan_id);
+                        spend.note_escalation();
+                    });
+                }
+                // The decision half of the fine-tuning corpus, joined to the
+                // routing row below by `turn_id`.
+                handle.log_decision(&ReflexDecisionRow::new(
+                    &turn_id,
+                    &agent,
+                    &state_text,
+                    decision,
+                ));
+                if let Some(path) = &log_path {
+                    model_routing::append_row(
+                        path,
+                        &step_lanes::decided_row(
+                            &turn_id,
+                            &agent,
+                            step_index,
+                            decision,
+                            &state_text,
+                            shadow,
+                            routed.as_ref(),
+                        ),
+                    );
+                }
+                let mut state =
+                    LaneState::decided(plan_id, step_index, decision, shadow, epoch);
+                // Memoize the miss (the pre-prompt contract): a rung whose
+                // target is unset or dangling is not armed at all.
+                if routed.is_none() {
+                    state.target = None;
+                }
+                if let Ok(mut memo) = self.lane_state.lock() {
+                    *memo = Some(state);
+                }
+                // Harness-run deterministic verify (the cost-saving chain's
+                // verification item): a decided `verify` action re-runs the
+                // configured checks harness-side and stashes the compact
+                // evidence note for the next request's volatile tail. This is
+                // EVIDENCE, not routing — it fires regardless of shadow /
+                // enforce, and the model never sees the decision itself.
+                // (`retry` / `escalate` need no code here: the escalate
+                // action already overrides the rung and a classified failure
+                // already re-arms the ladder — shipped with backlog ad56c7bd.)
+                if matches!(&decision.action, ReflexAction::Verify) {
+                    if let Some(verify) = self.step_verify.as_ref() {
+                        if let Some((command, outcome)) = verify.run_checks().await {
+                            self.set_verify_note(verify.evidence_note(&command, &outcome));
+                        }
+                    }
+                }
+                routed.is_some().then_some(target)
+            }
+            ReflexOutcome::Fallback { reason } => {
+                // A no-answer writes nothing (the pre-prompt contract); the
+                // other reasons are the calibration signal.
+                if step_lanes::fallback_is_loggable(reason) {
+                    if let Some(path) = &log_path {
+                        model_routing::append_row(
+                            path,
+                            &step_lanes::fallback_row(
+                                &turn_id,
+                                &agent,
+                                step_index,
+                                reason,
+                                &state_text,
+                                shadow,
+                            ),
+                        );
+                    }
+                }
+                if let Ok(mut memo) = self.lane_state.lock() {
+                    *memo = Some(LaneState::fallback(
+                        plan_id,
+                        step_index,
+                        reason,
+                        shadow,
+                        epoch,
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// The live plan's `(id, current step)` under ONE workflow lock —
+    /// `None` when no plan is active (chat turns and subagents run
+    /// planless). Shared by the budget gate and the spend attribution
+    /// (backlog a25a5323), so a single read serves both and the ledger rows
+    /// are written regardless of the budget flag.
+    async fn read_plan_scope(&self) -> Option<(String, Option<usize>)> {
+        let wf = self.workflow.lock().await;
+        let plan_id = wf.plan_id()?.to_string();
+        Some((plan_id, wf.current_step().map(|s| s.index)))
+    }
+
+    /// The deterministic budget gate (backlog a25a5323, the cost-saving
+    /// chain's budget item): called at every plan-step boundary, after the
+    /// lane decision and before the request resolves. Counts the pending
+    /// failed-cycle retry against the live step and, when a cap is reached,
+    /// PAUSES the plan through a pending question (continue for this plan /
+    /// double the reached cap / end the turn) — never a hard kill: plans are
+    /// crash-resumable and the plan file is the resumption document.
+    ///
+    /// `plan_scope` is the caller's single workflow read (the same one the
+    /// spend attribution uses) and the caller also drains the pending retry
+    /// flag, so one read serves both. Returns `Some(outcome)` when the turn
+    /// ends here (the human chose to end, a hard stop arrived while paused,
+    /// or the question channel closed); `None` to continue the turn. With no
+    /// live plan or the budget disabled this is a cheap no-op — no counters
+    /// advance, no question is emitted, byte-identical behavior.
+    async fn budget_gate(
+        &self,
+        plan_scope: Option<&(String, Option<usize>)>,
+        retry_pending: bool,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        agent_id: AgentId,
+        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        state: &mut TurnState,
+    ) -> Option<TurnOutcome> {
+        // A disabled budget is fully inert: no counters, no question.
+        let cfg = self.budget.read().expect("budget lock poisoned").clone();
+        if !cfg.enabled {
+            return None;
+        }
+        // No live plan (chat turns, subagents): nothing to cap.
+        let Some((plan_id, step_index)) = plan_scope else {
+            return None;
+        };
+        // Counters: point them at this plan (a new plan resets everything),
+        // then apply the pending failed-cycle retry to the step that runs
+        // next.
+        self.with_plan_spend(|spend| {
+            spend.note_plan(plan_id);
+            if retry_pending {
+                if let Some(step) = step_index {
+                    spend.note_lane_retry(*step);
+                }
+            }
+        });
+        let hit = self.with_plan_spend(|spend| spend.cap_reached(&cfg))?;
+        // PAUSE: ask, never kill. The question carries the real numbers.
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let _ = fanin_tx
+            .send((
+                agent_id,
+                AgentEvent::UserQuestion {
+                    question_id: format!("budget-{}", model_routing::new_turn_id("budget")),
+                    question: hit.question(),
+                    options: vec![
+                        crate::runtime::QuestionOption {
+                            label: "Continue — pause budget checks for this plan".to_string(),
+                            description: Some(
+                                "The cap stays on for other plans; this one runs uncapped \
+                                 until it finishes."
+                                    .to_string(),
+                            ),
+                        },
+                        crate::runtime::QuestionOption {
+                            label: "Double the cap and continue".to_string(),
+                            description: Some(
+                                "Raises the reached cap to twice its value for this plan."
+                                    .to_string(),
+                            ),
+                        },
+                        crate::runtime::QuestionOption {
+                            label: "End the turn — the plan stays paused".to_string(),
+                            description: Some(
+                                "The plan keeps its resumption state; continue whenever \
+                                 you are ready."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                    responder: answer_tx,
+                },
+            ))
+            .await;
+        // Await the answer. Interrupt/Cancel (or a closed channel) end the
+        // turn; any other command folds into the turn's accumulation rule
+        // exactly like a mid-stream steer, and the pause continues.
+        let mut rx = answer_rx;
+        let answer = loop {
+            tokio::select! {
+                result = &mut rx => break result.ok(),
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => {
+                        StopReason::fold(&mut state.stop_reason, cmd);
+                        if state
+                            .stop_reason
+                            .as_ref()
+                            .is_some_and(StopReason::is_hard_stop)
+                        {
+                            return Some(TurnOutcome {
+                                finish_reason: FinishReason::Stop,
+                                text: String::new(),
+                                tool_calls_made: 0,
+                                stop_reason: state.stop_reason.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        // The agent is shutting down (command channel
+                        // closed) — end the turn; the plan stays resumable.
+                        return Some(TurnOutcome {
+                            finish_reason: FinishReason::Stop,
+                            text: String::new(),
+                            tool_calls_made: 0,
+                            stop_reason: Some(StopReason::Interrupt),
+                        });
+                    }
+                },
+            }
+        };
+        // A dropped question channel (UI gone) ends the turn rather than
+        // running on unasked.
+        let Some(answer) = answer else {
+            return Some(TurnOutcome {
+                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls_made: 0,
+                stop_reason: Some(StopReason::Interrupt),
+            });
+        };
+        match answer {
+            crate::runtime::UserAnswer::Choice { index: 0 } => {
+                // Continue: cap checks stay off for this plan.
+                self.with_plan_spend(|spend| spend.bypassed = true);
+                None
+            }
+            crate::runtime::UserAnswer::Choice { index: 1 } => {
+                // Double the reached cap and continue.
+                self.with_plan_spend(|spend| spend.double_cap(hit, &cfg));
+                None
+            }
+            crate::runtime::UserAnswer::Choice { .. } => Some(TurnOutcome {
+                // End the turn — the plan stays Executing (paused and
+                // resumable; the plan file is the resumption document).
+                finish_reason: FinishReason::Stop,
+                text: String::new(),
+                tool_calls_made: 0,
+                stop_reason: None,
+            }),
+            crate::runtime::UserAnswer::Freeform { .. } => {
+                // The human spoke instead of clicking: their words are the
+                // permission for this plan.
+                self.with_plan_spend(|spend| spend.bypassed = true);
+                None
+            }
+        }
     }
 
     /// Handle a pending provider swap: the model picker deferred it so the
@@ -1701,6 +2106,10 @@ impl AgentLoop {
                     let triage = gate.triage(&result.output).await;
                     if let failure_triage::FailureTriage::Classified { class, .. } = &triage {
                         state.last_triage_class = Some(*class);
+                        // A failed cycle the ladder may escalate on (backlog
+                        // ad56c7bd): a confident permanent/flaky_test verdict
+                        // re-arms this step's lane classification.
+                        self.note_lane_escalation(*class);
                     }
                     batch_triage = Some(triage);
                 }
@@ -3231,6 +3640,14 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         // so the cached conversation prefix is never touched. A `None` nudge
         // leaves the tail byte-identical to its pre-lever form.
         crate::agent::optimizer::append_nudge(&mut volatile_tail, nudge);
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): a decided `action=verify` reflex call stashed a
+        // one-shot evidence note — it rides the volatile tail exactly like
+        // the lever-7 nudge (drained here, so it is delivered once and the
+        // cached prefix is never touched; an empty slot leaves the tail
+        // byte-identical).
+        let verify_note = self.take_verify_note();
+        crate::agent::optimizer::append_nudge(&mut volatile_tail, verify_note.as_deref());
         if tail_as_user {
             messages.push(Message::user_text(volatile_tail));
             messages.push(Message::user_text(prompt::CONTEXT_FOOTER));
@@ -3303,6 +3720,62 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 }
             });
         }
+    }
+
+    /// Record one per-decision spend row (backlog a25a5323) — the budget
+    /// layer's ledger. Fire-and-forget through the shared store (mirrors
+    /// [`record_stats_row`](Self::record_stats_row)); the per-plan counters
+    /// update INLINE first, so the next cap gate reads fresh numbers. No
+    /// stamped attribution or no store → no row (never a fabricated one).
+    pub(crate) fn record_spend_row(
+        &self,
+        session_id: Option<&str>,
+        provider: &dyn LlmClient,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: Option<u32>,
+    ) {
+        let Some(attr) = self.take_spend_attribution() else {
+            return;
+        };
+        // Inline counters first: the next iteration's gate must see this
+        // request's real spend.
+        self.with_plan_spend(|spend| {
+            spend.note_plan(&attr.plan_id);
+            spend.note_tokens(prompt_tokens as u64, completion_tokens as u64);
+        });
+        let Some(store) = &self.memory else {
+            return;
+        };
+        let now_epoch = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let event = crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.map(|s| s.to_string()),
+            turn_id: Some(attr.turn_id),
+            agent_id: None,
+            plan_id: attr.plan_id,
+            step_index: attr.step_index,
+            lane: attr.lane,
+            model: provider.model().to_string(),
+            reason: attr.reason.wire_label().to_string(),
+            tokens_in: prompt_tokens as i64,
+            tokens_out: completion_tokens as i64,
+            cached_tokens: cached_tokens.map(|c| c as i64),
+            detail: None,
+            created_at: now_epoch,
+        };
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = store.record_spend_event(&event).await {
+                eprintln!("mnemo: failed to record spend event: {e}");
+            }
+        });
     }
 
     /// Record one token-savings ledger row (backlog e4a50d22): a lever's
@@ -3902,6 +4375,17 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                                 },
                             );
                             usage_recorded = true;
+                            // The budget layer's per-decision spend row
+                            // (backlog a25a5323): the SAME real usage that
+                            // just priced the request, attributed to the
+                            // plan step and lane decision that ran it.
+                            self.record_spend_row(
+                                session_id,
+                                provider.as_ref(),
+                                prompt_tokens,
+                                completion_tokens,
+                                Some(effective_cached),
+                            );
                             let _ = fanin_tx
                                 .send((agent_id, AgentEvent::Usage {
                                     prompt_tokens,
@@ -4288,6 +4772,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                 confidence,
             } = gate.triage(&error_text).await
             {
+                // The step's cycle just failed permanently (backlog ad56c7bd):
+                // the next step boundary re-classifies and may escalate.
+                self.note_lane_escalation(failure_triage::FailureClass::Permanent);
                 let pending = gate.log_failure(
                     failure_triage::FailureSite::BadJsonRepair,
                     bad_calls.first().map(|tc| tc.name.as_str()),

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! The agentic auto-zoom loop â€” grid â†’ model votes â†’ crop the full-resolution
-//! original â†’ re-read, up to `max_rounds`, with early-exit when confident.
+//! The agentic auto-zoom loop — grid → model votes → crop the full-resolution
+//! original → re-read, up to `max_rounds`, with early-exit when confident.
 //!
 //! When image decode/crop/re-encode isn't possible (unsupported format, decode
 //! failure), the loop falls back to a single overview pass so the tool still
@@ -63,12 +63,12 @@ pub(crate) struct Region {
     pub note: Option<String>,
 }
 
-/// The zoom loop's result â€” the markdown answer + structured metadata.
+/// The zoom loop's result — the markdown answer + structured metadata.
 #[derive(Debug, Clone)]
 pub(crate) struct ZoomResult {
     /// The structured markdown answer (the primary tool output).
     pub markdown: String,
-    /// The model's self-reported confidence (0â€“1), when it reported one.
+    /// The model's self-reported confidence (0–1), when it reported one.
     pub confidence: Option<f64>,
     /// How many zoom rounds executed (0 for a single overview pass).
     pub rounds: u32,
@@ -130,7 +130,7 @@ pub(crate) async fn analyze_with_zoom(
         let full_img = image::load_from_memory(&bytes_owned).ok()?;
         let overview_url =
             if full_img.width() <= MAX_OVERVIEW_EDGE && full_img.height() <= MAX_OVERVIEW_EDGE {
-                // Small enough â€” send the original data URL (no re-encode).
+                // Small enough — send the original data URL (no re-encode).
                 data_url_owned
             } else {
                 let overview = full_img.resize(
@@ -148,7 +148,7 @@ pub(crate) async fn analyze_with_zoom(
     let (full_img, overview_url) = match decoded {
         Some(v) => v,
         None => {
-            // Decode failed â€” single overview pass on the original data URL.
+            // Decode failed — single overview pass on the original data URL.
             let markdown =
                 describe_image_data_url(vision, data_url, Some(&build_prompt(tool, args))).await?;
             return Ok(ZoomResult {
@@ -162,12 +162,12 @@ pub(crate) async fn analyze_with_zoom(
     };
     let full_img = Arc::new(full_img);
 
-    // A named/bbox region â†’ single pass on a crop of the full-res original.
+    // A named/bbox region → single pass on a crop of the full-res original.
     if let Some(r) = region {
         return crop_and_describe(vision, &full_img, r, tool, args).await;
     }
 
-    // Overview detail level â†’ single pass on the (downsampled) overview.
+    // Overview detail level → single pass on the (downsampled) overview.
     if detail_level == DetailLevel::Overview {
         let markdown =
             describe_image_data_url(vision, &overview_url, Some(&build_prompt(tool, args))).await?;
@@ -180,7 +180,7 @@ pub(crate) async fn analyze_with_zoom(
         });
     }
 
-    // Normal / Fine / Auto â†’ the zoom loop.
+    // Normal / Fine / Auto → the zoom loop.
     zoom_loop(
         vision,
         &full_img,
@@ -198,7 +198,7 @@ fn encode_png_data_url(img: &RgbaImage) -> String {
     let mut buf = Cursor::new(Vec::new());
     // write_to is infallible for PNG into a Vec; surface any error as a string.
     if img.write_to(&mut buf, ImageFormat::Png).is_err() {
-        // Should not happen for PNGâ†’Vec, but be defensive.
+        // Should not happen for PNG→Vec, but be defensive.
         return String::new();
     }
     bytes_to_data_url("image/png", &buf.into_inner())
@@ -215,7 +215,7 @@ async fn crop_and_describe(
 ) -> Result<ZoomResult> {
     let bbox = parse_region(region).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "invalid region '{region}' â€” use a named region (top-left, top-right, bottom-left, bottom-right, center) or a bbox 'x,y,w,h' with 0..1 values"
+            "invalid region '{region}' — use a named region (top-left, top-right, bottom-left, bottom-right, center) or a bbox 'x,y,w,h' with 0..1 values"
         ))
     })?;
     let crop_url = crop_to_data_url(full_img, &bbox).await;
@@ -235,13 +235,13 @@ async fn crop_and_describe(
     })
 }
 
-/// The zoom loop: overview â†’ model votes â†’ crop â†’ re-read â†’ repeat.
+/// The zoom loop: overview → model votes → crop → re-read → repeat.
 ///
 /// Each round sends the control prompt (task + sections + vote instruction).
 /// The model returns JSON: `action=done` (with the section-formatted answer in
 /// `answer`) or `action=zoom` (with a `box` to crop). Crops always come from
 /// the full-res original; the crop URL is reassigned each round so progressive
-/// zoom converges. `Auto` early-exits when confidence â‰¥ threshold.
+/// zoom converges. `Auto` early-exits when confidence ≥ threshold.
 async fn zoom_loop(
     vision: &dyn ImageDescriber,
     full_img: &Arc<image::DynamicImage>,
@@ -258,7 +258,7 @@ async fn zoom_loop(
     let mut rounds = 0u32;
 
     // Round 0: the overview pass. Send the overview + the control prompt (which
-    // carries the task + section headers + the vote instruction â€” no separate
+    // carries the task + section headers + the vote instruction — no separate
     // markdown-section instruction that would contradict the "ONLY JSON" vote).
     let control = zoom_control_prompt(&task_prompt, &region_labels);
     let overview_answer = describe_image_data_url(vision, overview_url, Some(&control)).await?;
@@ -289,7 +289,7 @@ async fn zoom_loop(
 
                     let crop_vote_result = parse_vote(&crop_answer);
 
-                    // A "done" vote always returns (the model is confident) â€”
+                    // A "done" vote always returns (the model is confident) —
                     // for ALL detail levels, not just Auto.
                     if let Some(v) = crop_vote_result.as_ref() {
                         if v.action == "done" {
@@ -304,7 +304,7 @@ async fn zoom_loop(
                     }
 
                     // Auto early-exit: if the model's confidence is high enough
-                    // (even on a zoom vote), stop â€” the spec says Auto "zooms
+                    // (even on a zoom vote), stop — the spec says Auto "zooms
                     // only when needed, early-exits when clear".
                     if detail_level == DetailLevel::Auto {
                         if let Some(c) = crop_vote_result.as_ref().and_then(|v| v.confidence) {
@@ -350,7 +350,7 @@ async fn zoom_loop(
                                         current_url = url;
                                     }
                                     None => {
-                                        // Couldn't crop â€” treat the answer as done.
+                                        // Couldn't crop — treat the answer as done.
                                         warnings.push(
                                             "model voted a region that could not be cropped; used last view"
                                                 .into(),
@@ -366,7 +366,7 @@ async fn zoom_loop(
                                 }
                             }
                             None => {
-                                // Parse fail â€” treat the raw text as the answer.
+                                // Parse fail — treat the raw text as the answer.
                                 return Ok(ZoomResult {
                                     markdown: next_answer,
                                     confidence: None,
@@ -391,7 +391,7 @@ async fn zoom_loop(
                     });
                 }
                 None => {
-                    // Couldn't crop the voted region â€” fall back to the overview answer.
+                    // Couldn't crop the voted region — fall back to the overview answer.
                     warnings.push(
                         "model voted a region that could not be cropped; used overview".into(),
                     );
@@ -406,7 +406,7 @@ async fn zoom_loop(
             }
         }
         None => {
-            // Parse fail â€” treat the raw overview text as the answer.
+            // Parse fail — treat the raw overview text as the answer.
             Ok(ZoomResult {
                 markdown: overview_answer,
                 confidence: None,
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn decode_fail_falls_back_to_single_pass() {
-        // Corrupt bytes â†’ decode fails â†’ single overview call + warning.
+        // Corrupt bytes → decode fails → single overview call + warning.
         let mock = Arc::new(MockDescriber::new("overview answer"));
         let vision: Arc<dyn ImageDescriber> = mock.clone();
         let result = analyze_with_zoom(
@@ -670,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn zoom_loop_done_on_first_vote() {
-        // The model immediately votes done â†’ rounds=1, answer returned.
+        // The model immediately votes done → rounds=1, answer returned.
         let mock = Arc::new(MockDescriber::new(
             "{\"action\":\"done\",\"answer\":\"the answer\",\"confidence\":0.95}",
         ));
@@ -697,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn zoom_loop_zoom_then_done() {
         // C2 regression guard: the model votes zoom (with a box) then done.
-        // Round 0: overview â†’ vote zoom. Round 1: crop â†’ vote done.
+        // Round 0: overview → vote zoom. Round 1: crop → vote done.
         // The mock returns the zoom vote first, then the done vote.
         let calls = Arc::new(std::sync::Mutex::new(0u32));
         let vision: Arc<dyn ImageDescriber> = Arc::new(CountingDescriber {
@@ -725,7 +725,7 @@ mod tests {
     }
 
     /// A mock that returns a zoom vote on the first call and a done vote on the
-    /// second â€” exercises the zoomâ†’cropâ†’done path (C1 + C2).
+    /// second — exercises the zoom→crop→done path (C1 + C2).
     struct CountingDescriber {
         calls: Arc<std::sync::Mutex<u32>>,
     }

@@ -517,9 +517,16 @@ pub fn spawn(
                             mgr.main_agent_id() == Some(agent_id)
                         };
                         if is_main {
+                            // Bug 69093a21: the fallback may only re-link an
+                            // item whose plan was superseded THIS turn — the
+                            // turn latch's abandoned plan id (bba2c82d),
+                            // never a stale foreign link.
+                            let superseded_plan =
+                                turn_resolve.abandoned_plan_id(agent_id).map(str::to_string);
                             crate::ipc::run_all::stamp_backlog_in_flight(
                                 &app,
                                 top_plan_id.as_deref(),
+                                superseded_plan.as_deref(),
                             )
                             .await;
                         }

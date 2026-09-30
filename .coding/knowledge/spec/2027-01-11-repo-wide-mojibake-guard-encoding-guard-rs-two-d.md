@@ -1,0 +1,6 @@
++++
+title = "repo-wide mojibake guard (encoding_guard.rs) — two damage classes, dual class-2 leads"
+created = "2027-01-11"
++++
+
+Guard: tests/integration/encoding_guard.rs, test `repo_source_carries_no_mojibake`, registered in tests/integration/main.rs. Scope: src/, src-tauri/src/, frontend/src/, tests/ (rs/ts/tsx/js/jsx/css/json/toml/md); skips target/node_modules/.git/dist/.worktrees/vendor/.coding; binary skip = NUL in first 8 KB; non-vacuity floor 100 files; failure names file:line:class. Class 1 = six cp1252-round-trip needles (em dash, arrow, box dash, en dash, >=, CJK hint; same set as the image_tools module guard). Class 2 = CP437-then-cp1252 double-mangle: two generic leads as UTF-8 — U+00CE (C3 8E; damage of 0xE2-led originals: general punctuation, CJK) and U+00E2 (C3 A2; damage of 0xC2/0xC3-led Latin-1 text and 0xF0-led emoji) — each counted only when followed by a non-ASCII byte; first-wins de-duplication by offset against the class-1 labels. Needles are escape-only (\u{...}) so the file never self-matches. Unreadable files panic naming the path (never silently skipped). Landed in commit e496a09 (plan 5cdff537); RED baseline 2027-01-11 = exit 101 with exactly 15 findings, all src/agent/tests.rs (11 em dash, 3 arrow, 1 double arrow — since fixed to real —/→/⇒). Round-2 review PASS: .coding/reviews/2026-09-30-5cdff537-encoding-sweep-round2.md.

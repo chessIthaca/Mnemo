@@ -7,6 +7,12 @@
   "endpoints": [],
   "general": {
     "auto_compact_on_plan_complete": false,
+    "budget": {
+      "enabled": false,
+      "max_escalations_per_plan": 1,
+      "max_retries_per_lane": 3,
+      "max_tokens_per_plan": 0
+    },
     "bundled_embedding_model": null,
     "default_model": null,
     "default_provider": null,
@@ -38,6 +44,9 @@
       "capable": null,
       "cheap": null,
       "enforce": false,
+      "escalate": null,
+      "lane_high": null,
+      "lane_medium": null,
       "threshold": 0.8
     },
     "safety": "approve-each-action",

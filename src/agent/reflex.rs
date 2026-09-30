@@ -13,9 +13,19 @@
 //! [`Classifier::classify_many`] and asks them together: one request, one
 //! confidence gate, one decision.
 //!
-//! This module ships the CALL and the shadow LOG only — nothing acts on a
-//! decision yet (the lane ladder, the harness verify step and the budget layer
-//! consume it). The contract is [`super::failure_triage`]'s: opt-in
+//! The CALL and the shadow LOG ship here; the **escalation lane ladder**
+//! (backlog ad56c7bd, [`super::step_lanes`]) is the first consumer — it reads
+//! the decision at each plan-step boundary and resolves the step's lane,
+//! strictly shadow-first until `[general.routing] enforce` is on. The
+//! **harness-run verify** layer (backlog 1f767466, [`super::step_verify`]) is
+//! the second: a decided `verify` action re-runs `[general.verify]`'s command
+//! harness-side and rides the compact evidence note on the next request's
+//! volatile tail. The **budget layer** (backlog a25a5323, [`super::budget`])
+//! is the third and last: its gate runs at the same plan-step boundary,
+//! counting the escalations this decision's rung arms and the failed-cycle
+//! retries the triage sites flag, and PAUSES the plan through a pending
+//! question when a cap is reached. The contract
+//! is [`super::failure_triage`]'s: opt-in
 //! (`[general.laya] reflex`, default off), a calibrated-confidence gate
 //! ([`REFLEX_THRESHOLD`]), and a strict fallback — a missing answer, a
 //! non-choice answer, a label outside its taxonomy, or a weakest confidence

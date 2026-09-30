@@ -515,14 +515,14 @@ mod tests {
         }
     }
 
-    /// Regression: capping a multi-byte (CJK) body must NOT panic. A naive
+    /// Regression: capping a multi-byte body must NOT panic. A naive
     /// `text[..max_length]` byte slice panics when the cut lands inside a
     /// 3-byte char — this test builds such a string and asserts the
     /// char-boundary-safe `cap_body` returns success + a truncation note.
     #[test]
     fn cap_body_multibyte_no_panic() {
-        // 3-byte CJK char repeated enough times to exceed the cap in bytes.
-        let text = "漢".repeat(20_000); // 60_000 bytes
+        // 3-byte char repeated enough times to exceed the cap in bytes.
+        let text = "→".repeat(20_000); // 60_000 bytes
         let capped = cap_body(text, 50_000);
         assert!(capped.len() <= 50_000 + 64, "capped near the limit");
         assert!(

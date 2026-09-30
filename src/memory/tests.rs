@@ -2082,6 +2082,97 @@ async fn savings_events_round_trip_and_negative_expansions() {
 }
 
 #[tokio::test]
+async fn spend_events_round_trip_by_plan() {
+    // Backlog a25a5323: the budget layer's per-decision ledger persists the
+    // plan/step/lane/model attribution and the token cost, and the reader
+    // scopes to ONE plan (the per-plan cost report's source).
+    let store = MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap();
+    let now = 1_700_000_000;
+    let row = |plan: &str, reason: &str, lane: Option<&str>, at: i64| SpendEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("s1".into()),
+        turn_id: Some("turn-1".into()),
+        agent_id: Some("agent-1".into()),
+        plan_id: plan.into(),
+        step_index: Some(2),
+        lane: lane.map(|l| l.to_string()),
+        model: "worker-model".into(),
+        reason: reason.into(),
+        tokens_in: 1_200,
+        tokens_out: 300,
+        cached_tokens: Some(800),
+        detail: None,
+        created_at: at,
+    };
+    store
+        .record_spend_event(&row("plan-a", "route", Some("medium"), now))
+        .await
+        .unwrap();
+    store
+        .record_spend_event(&row("plan-a", "retry", Some("high"), now + 1))
+        .await
+        .unwrap();
+    store
+        .record_spend_event(&row("plan-b", "default", None, now + 2))
+        .await
+        .unwrap();
+    // A harness-verify evidence row: no turn, lane or step — the NULL
+    // columns must round-trip like every other row.
+    store
+        .record_spend_event(&SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: None,
+            turn_id: None,
+            agent_id: None,
+            plan_id: "plan-a".into(),
+            step_index: None,
+            lane: None,
+            model: "cargo test".into(),
+            reason: "verify".into(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cached_tokens: None,
+            detail: Some("[verify] `cargo test` — FAILED (exit 101)".into()),
+            created_at: now + 3,
+        })
+        .await
+        .unwrap();
+
+    let a = store.spend_rows_for_plan("plan-a").await.unwrap();
+    assert_eq!(a.len(), 3);
+    assert_eq!(a[0].reason, "route");
+    assert_eq!(a[0].lane.as_deref(), Some("medium"));
+    assert_eq!(a[0].step_index, Some(2));
+    assert_eq!(a[0].model, "worker-model");
+    assert_eq!(a[0].tokens_in, 1_200);
+    assert_eq!(a[0].tokens_out, 300);
+    assert_eq!(a[0].cached_tokens, Some(800));
+    assert_eq!(a[1].reason, "retry");
+    assert_eq!(a[1].lane.as_deref(), Some("high"));
+    // The verify-shaped row survives with its NULL columns.
+    assert_eq!(a[2].reason, "verify");
+    assert!(a[2].turn_id.is_none());
+    assert!(a[2].lane.is_none());
+    assert!(a[2].step_index.is_none());
+    assert_eq!(
+        a[2].detail.as_deref(),
+        Some("[verify] `cargo test` — FAILED (exit 101)")
+    );
+
+    // The reader scopes to ONE plan, and an unknown plan reads empty —
+    // never an error.
+    let b = store.spend_rows_for_plan("plan-b").await.unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].reason, "default");
+    assert!(b[0].lane.is_none());
+    assert!(store
+        .spend_rows_for_plan("plan-none")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn savings_stats_aggregates_kinds_days_recent_and_cache() {
     // Backlog 652ae094: the Dashboard's read path — the ledger aggregated
     // per-kind (biggest saver first), per UTC day (oldest first), the bounded

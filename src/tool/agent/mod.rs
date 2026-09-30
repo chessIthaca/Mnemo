@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn cap_tool_output_multibyte_no_panic() {
-        // 200 KB of a 3-byte CJK char — the cut point lands inside a multi-byte
+        // 200 KB of a 3-byte char — the cut point lands inside a multi-byte
         // char. Must not panic and must produce valid UTF-8.
-        let s = "日".repeat(70_000); // ~210 KB
+        let s = "→".repeat(70_000); // ~210 KB
         let out = cap_tool_output(s);
         // The result is valid UTF-8 (no panic, no mid-char cut).
         assert!(out.is_char_boundary(out.len()));

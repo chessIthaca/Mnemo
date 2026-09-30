@@ -31,6 +31,10 @@ updates:
       # closed and replaced by the hand-rolled #32. tauri and tauri-runtime-wry
       # are therefore ignored here too — bump them by hand together with the
       # vendor/ patches and re-check the lock for `[[patch.unused]]`.
+      # Machine-guarded since 2027-01-11: the integration guard
+      # `cargo_lock_keeps_the_vendored_patches` fails the build when a
+      # `[[patch.unused]]` entry appears or tao/wry stop being path-sourced
+      # (`tests/integration/ci_workflow.rs`).
       - dependency-name: tauri
       - dependency-name: tauri-runtime-wry
   # npm. The workspace lockfile lives at the root (workspaces = ["frontend"]).

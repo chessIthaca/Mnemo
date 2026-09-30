@@ -36,14 +36,19 @@ approval-gated coding harness — not a UI swap.
 TypeScript 7, Tailwind v4 (`@tailwindcss/postcss`; `autoprefixer` dropped),
 Vite 8, vitest 5, zustand 5, react-markdown 10, lucide-react 1.48,
 chromiumoxide 0.9, rusqlite 0.40, tiktoken-rs 0.12, sha2 0.11, toml 1.1,
-zip 8, windows-sys 0.61, directories 6. Vendored pins held: `tao` / `wry` /
-`tauri-runtime-wry` stay `[patch.crates-io]` path overrides (`vendor/`) —
-every cargo bump must leave **no** `[[patch.unused]]` in `Cargo.lock`. GitHub
+zip 8, windows-sys 0.61, directories 6. Vendored pins held: exactly `tao` /
+`wry` stay `[patch.crates-io]` path overrides (`vendor/`; tauri and
+tauri-runtime-wry are bumped by hand together with them) — every cargo bump
+must leave **no** `[[patch.unused]]` in `Cargo.lock`, machine-guarded by
+`cargo_lock_keeps_the_vendored_patches` in
+`tests/integration/ci_workflow.rs`. GitHub
 Action refs are pinned to full SHAs — the one documented exception,
 `dtolnay/rust-toolchain@stable`, selects its toolchain by ref — guarded by
-`tests/integration/ci_workflow.rs`; the build workflows scope `GITHUB_TOKEN`
-to `contents: read` (the release job keeps `contents: write`), and CodeQL
-runs in advanced setup with `vendor/**` excluded. 0 open code-scanning /
+`tests/integration/ci_workflow.rs`, which enumerates every workflow file
+under `.github/workflows` and asserts the workflow-level `contents:` value
+exactly; the build workflows scope `GITHUB_TOKEN` to `contents: read` (the
+release job keeps `contents: write`), and CodeQL runs in advanced setup with
+`vendor/**` excluded. 0 open code-scanning /
 Dependabot / secret-scanning alerts at the time of writing; the full
 snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`.
 
@@ -898,6 +903,8 @@ base dial).
 
 **Pre-prompt model routing (2027-01, backlog 091e694d).** Item 2 of the Laya chain: the routing lever classifies each main-agent turn's task text ONCE — at `run_turn`'s head, before the first request is built — as `trivial` vs `architectural` (one calibrated `Question::Choice`; the text is capped at `ROUTING_TEXT_MAX_CHARS` = 2 000 chars) and, only with the `[general.laya] routing` opt-in on, enforcement on (`[general.routing] enforce`), a confident answer and a configured target, runs the turn on it. `RouteTarget::{Cheap,Capable}`, `RoutingDecision`, the question, the log rows and the gate live in `src/agent/model_routing.rs`; the arm sits in `AgentLoop::resolve_turn_provider_routed` (src/agent/loop_impl.rs) BELOW the three explicit-pin arms (skill, picker pin, forced model) and ABOVE the state/subagent chain it replaces — `resolve_turn_provider` is the plain wrapper that passes no route — and `ModelResolver::resolve_routed` (src/model_resolver.rs) is the single guard that refuses the skill, subagent and bug-fixing contexts, so an arm that did not fire cannot smuggle routing past an explicit choice and an unset, dangling or refused target falls through to the chain unchanged. The classifier handle is the app runtime's ONE shared slot, read through `RoutingGate` (which also owns the log path — `RoutingGate::with_log_path` is the test seam, `routing_log_path()` = `~/.mnemo/laya/training/routing.jsonl`, beside the failure-triage log); the opt-in flag, threshold and mode ride the LIVE config, read per turn by `ModelResolver::routing_policy`, so a Settings save lands on the next turn with no rewire and no flag mirror. Shadow-first is the contract: with `enforce: false` every classified turn writes a decision row (at turn start) and an outcome row (from `TurnRoute`'s `Drop` — the one hook every exit path of the turn runs, `?` unwind included) without touching the model. Invariants: below-threshold, no-answer, unknown-label and unset-or-dangling-target all keep today's model; subagents, reviewers and compaction summaries are never routed; exactly one classification per turn, never per iteration; every classifier and log call is best-effort and can never fail a turn. Covered by 7 turn-level tests in src/agent/tests.rs (the enforcement path red-checked by neutralizing the arm), 8 unit tests in src/agent/model_routing.rs and 5 in src/model_resolver.rs.
 
+**Escalation lane ladder (2027-01, backlog ad56c7bd).** The step-granular twin of the pre-prompt decision, and the first consumer of the compound reflex call: at every iteration boundary `AgentLoop::step_lane_target` (src/agent/turn.rs) snapshots the live plan step and asks the reflex question set ONCE per step per attempt, then resolves the lane the answer selects — `small` → `RouteTarget::Cheap`, plus the new `Medium` / `High` / `Escalate` rungs — against `[general.routing] lane_medium` / `lane_high` / `escalate`, USER-CHOSEN optional targets (unset or dangling falls through to the step's configured model; the ladder never invents a model id — the local-only costsaving draft's hardcoded ladder is deliberately not copied). The pure decision logic lives in `src/agent/step_lanes.rs` (`LaneRung`, `rung_from_decision` — complexity picks the rung and an `escalate` ACTION overrides it —, `state_text`, `LaneState` + `needs_classify`, and the routing rows), so `Fresh` / `Reuse` / `ReClassify` is unit-testable without a loop: the memo re-uses a decision for the same plan id + step (keyed by the plan's ID, NEVER its title — a repeated agent-generated title must not leak a decision across plans) and re-classifies only after a failed cycle — the `AgentLoop::note_lane_escalation` epoch bump, wired at all four confident failure-triage verdict sites (tool dispatch, bad-JSON repair, provider retry, the runtime turn attempt), never on a first attempt's behalf. A decided rung composes OVER the turn-level route for that iteration (`lane.or(route)` at `resolve_iteration_provider`'s call site), so the switch rides the existing per-iteration resolver and surfaces as `AgentEvent::ModelChanged` with no new code; `RouteDecisionRow` grew `lane` + `step_index` (serde-defaulted, so old corpus rows still parse) and a decided state also writes the reflex corpus row, joined by `turn_id`. Invariants: the reflex flag AND the routing flag gate the whole path (zero classifier calls otherwise), shadow-first under the same `[general.routing] enforce` switch (decision logged, model never switched), every miss keeps the configured model, and `[models.reviewing]` stays reviewer-spawn-only. Covered by 5 loop-level tests in src/agent/tests.rs (enforcement + announcement, shadow, both flags off, unset target), 8 in src/agent/step_lanes.rs, and the config/DTO/resolver round-trips.
+
 **Subagent role state (2026-01-03).** A parented sub-agent's `Workflow` loads
 the main plan's stack from the shared plans dir (the read-only mirror that
 feeds `current_plan` for reviewers and the UI staircase) but is stamped
@@ -1357,6 +1364,60 @@ product.
   and with it off `ReflexHandle::decide` returns without asking at all. The lane
   ladder (item 2), the harness verify (item 3) and the budget layer (item 4)
   consume it.
+- **Harness-run deterministic verify (2027-01, backlog 1f767466).** The
+  cost-saving chain's item 3 and the reflex call's second consumer: with
+  `[general.verify]` `enabled` on and a non-empty `test_command` (e.g.
+  `cargo test`), the harness runs the checks ITSELF at each plan-step boundary
+  — a successful skeleton `complete_step` — instead of spending a model
+  roundtrip deciding to (`StepVerifyHandle`, `src/agent/step_verify.rs`; the
+  failure-triage tier-1 auto-retry is the precedent for harness action on
+  deterministic evidence). The command runs through the platform shell (`sh
+  -c` / `powershell -Command`, the `shell` tool's own idiom) rooted at the
+  agent's sandbox, and its output is compressed through the existing lever-2
+  compressor (`output_compactor::compress` for known families; a
+  distinct-lines-plus-repeat-counts fallback otherwise) into a compact
+  evidence note — exit status, failing test names, distinct error lines,
+  counts, hard-capped at 2000 bytes — appended to the tool result; the raw
+  log never enters context. A verification that FAILS keeps the tick
+  `success: true`: the step DID tick, and a false result would drive the
+  tier-1 auto-retry into re-ticking a completed step — the failure signal
+  lives in the note. A `timeout_secs` hang (default 300, the `shell` tool's
+  bound) is killed cleanly (`kill_on_drop`, so the wait future's drop kills
+  the child) and surfaces as a failure-shaped note. The reflex `verify` action
+  re-runs the checks at the lane-classification boundary and the note rides
+  the next request's volatile tail via a one-shot drain (`append_nudge`),
+  so the cached prefix is never touched. Invariants: an absent section never
+  spawns a process (flag off = byte-identical), a detailed sub-step tick never
+  verifies, the config is read live per boundary (a Settings save lands on the
+  next `complete_step`), and no new dependencies.
+- **Budget layer (2027-01, backlog a25a5323).** The cost-saving chain's item 4
+  and the reflex call's third consumer: `[general.budget]` (`enabled`, off by
+  default and omitted while default; `max_tokens_per_plan` u64, 0 = off;
+  `max_escalations_per_plan`, default 1; `max_retries_per_lane`, default 3)
+  makes spend deterministic at each plan-step boundary (`src/agent/budget.rs` —
+  pure counters, the cap gate, and the report renderer). A cap reached PAUSES
+  the plan through a pending question (continue for this plan / double the
+  reached cap / end the turn) on the `ask_user` channel — never a hard kill:
+  plans are crash-resumable and the plan file is the resumption document, so a
+  pause stays `Executing` and a later session resumes it. The gate counts each
+  main plan request's tokens inline (the next boundary reads fresh numbers),
+  the failed-cycle retries the triage sites flag (applied to the step that
+  runs next), and the escalations the ladder's rung arms — once per decision,
+  never per memo reuse. A per-decision ledger (`spend_events` beside
+  `savings_events`) traces the bill to the decision: plan/step/lane/model,
+  tokens in/out, cached tokens, and the reason (`route` | `retry` | `escalate`
+  | `default` for plan requests with no lane decision | `verify` for the
+  harness-run check results) — written for every main plan request REGARDLESS
+  of the flag, which gates only the caps. At `finish` the plan's rows render
+  as a `## Cost report` appended to the plan file: totals, tokens per lane,
+  lane per step, retries, escalations with their reasons, deterministic checks
+  with their results, and the cache hits — REAL numbers only, with NO
+  counterfactual baseline column (rejected in the cost-saving DECISION).
+  Invariants: disabled flag = byte-identical (no cap fires, no question), the
+  counters are in-memory and live-session scoped while the ledger is the
+  durable truth (documented boundary), a Settings save lands on the next
+  boundary, and every ledger/report write is fail-open — never failing a turn
+  or a completion.
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

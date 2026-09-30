@@ -1357,11 +1357,91 @@ fn complete_step_plan_id_guard(
 
 pub struct CompleteStepTool {
     workflow: Arc<Mutex<Workflow>>,
+    /// Harness-run deterministic verify (the cost-saving chain's verification
+    /// item): when wired, a SUCCESSFUL skeleton tick runs `[general.verify]`'s
+    /// command and appends the compact evidence note to the result. `None`
+    /// until the factory wires it — bare constructions (tests) keep the
+    /// pre-feature behavior byte-identically.
+    step_verify: Option<crate::agent::step_verify::StepVerifyHandle>,
+    /// The shared memory store — when wired, a successful verification's
+    /// outcome lands in the `spend_events` ledger as a `verify` row (backlog
+    /// a25a5323; the per-plan cost report's deterministic-checks section).
+    /// `None` (tests / no store) skips the row.
+    memory: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
 }
 
 impl CompleteStepTool {
     pub fn new(workflow: Arc<Mutex<Workflow>>) -> Self {
-        Self { workflow }
+        Self {
+            workflow,
+            step_verify: None,
+            memory: None,
+        }
+    }
+
+    /// Wire the harness-run verification handle (see
+    /// [`crate::agent::step_verify`]): a successful skeleton tick then runs
+    /// the configured command and appends its compact evidence note.
+    pub fn with_step_verify(
+        mut self,
+        handle: crate::agent::step_verify::StepVerifyHandle,
+    ) -> Self {
+        self.step_verify = Some(handle);
+        self
+    }
+
+    /// Wire the shared memory store so a successful verification records its
+    /// outcome in the budget layer's `spend_events` ledger (backlog
+    /// a25a5323) — the per-plan cost report cites the real check results.
+    pub fn with_memory(mut self, memory: Arc<dyn crate::memory::MemoryStoreTrait>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Record this verification's outcome in the budget layer's spend ledger
+    /// (backlog a25a5323) — one `verify` row carrying the compact evidence
+    /// note, so the per-plan cost report cites real results. Fire-and-forget:
+    /// a failed durable write is logged, never surfaced (evidence collection
+    /// must not break the tick it documents).
+    fn record_verify_spend_row(
+        memory: &Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+        plan_id: Option<&str>,
+        step_index: usize,
+        command: &str,
+        note: &str,
+    ) {
+        let (Some(store), Some(plan_id)) = (memory, plan_id) else {
+            return;
+        };
+        let now_epoch = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let event = crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: None,
+            turn_id: None,
+            agent_id: None,
+            plan_id: plan_id.to_string(),
+            step_index: Some(step_index),
+            lane: None,
+            model: command.to_string(),
+            reason: "verify".to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cached_tokens: None,
+            detail: Some(note.chars().take(600).collect()),
+            created_at: now_epoch,
+        };
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            if let Err(e) = store.record_spend_event(&event).await {
+                eprintln!("mnemo: failed to record verify spend event: {e}");
+            }
+        });
     }
 }
 
@@ -1526,6 +1606,10 @@ impl Tool for CompleteStepTool {
         // Capture the active plan's id BEFORE completing — a sub-plan's last
         // step pops the stack, so plan_id() afterwards is the parent's.
         let active_plan_id = wf.plan_id().map(str::to_string);
+        // The budget layer's evidence row (backlog a25a5323) needs the id
+        // AFTER the result is built (the json! moves it), so keep a clone
+        // for the verification hook below.
+        let spend_plan_id = active_plan_id.clone();
         // Detect out-of-order completion BEFORE the call: completing a step
         // after the first not-done one leaves a done step behind an undone
         // one — update_plan later REFUSES to replace the remaining steps in
@@ -1549,7 +1633,7 @@ impl Tool for CompleteStepTool {
                 }
             })
             .unwrap_or_default();
-        match wf.complete_step(step_index as usize) {
+        let mut result = match wf.complete_step(step_index as usize) {
             Ok(()) => {
                 let state = wf.state();
                 let plan = wf.plan();
@@ -1585,7 +1669,40 @@ impl Tool for CompleteStepTool {
                 }
             }
             Err(e) => ToolResult::error(format!("failed to complete step: {e}")),
+        };
+        // Release the workflow lock BEFORE any verification: the harness
+        // command can run for minutes, and no workflow reader (the UI's
+        // current_plan, a sibling tool call) may wait on it.
+        drop(wf);
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): after a SUCCESSFUL skeleton tick, run
+        // `[general.verify]`'s command and append the compact evidence note
+        // (exit status, distinct error lines, counts — never the raw log).
+        // A failed verification keeps `success: true`: the step DID tick, and
+        // a false result would drive the tier-1 auto-retry into re-ticking a
+        // completed step — the failure signal lives in the note text. The
+        // detailed sub-step tick returns above, so it never reaches this
+        // hook.
+        if result.success {
+            if let Some(handle) = &self.step_verify {
+                if let Some((command, outcome)) = handle.run_checks().await {
+                    let note = handle.evidence_note(&command, &outcome);
+                    // The budget layer's evidence row (backlog a25a5323):
+                    // the deterministic check's real outcome, cited by the
+                    // per-plan cost report. Best-effort, fire-and-forget.
+                    Self::record_verify_spend_row(
+                        &self.memory,
+                        spend_plan_id.as_deref(),
+                        step_index as usize,
+                        &command,
+                        &note,
+                    );
+                    result.output.push_str("\n\n");
+                    result.output.push_str(&note);
+                }
+            }
         }
+        result
     }
 }
 
@@ -2304,6 +2421,46 @@ impl Tool for FinishTool {
              (memory_write) so the new behavior is recorded"
                 .into(),
         );
+
+        // (e) The per-plan cost report (backlog a25a5323, the budget layer):
+        // append the plan's REAL spend_events numbers to the plan file —
+        // totals, tokens per lane, the lane per step, retries, escalations
+        // with their reasons, the deterministic checks with their results,
+        // and the cache hits (deliberately NO counterfactual baseline).
+        // Fail-open like the capture above: a report failure notes and never
+        // blocks completion; a plan with no recorded spend writes no section.
+        if let (Some(store), Some(plan_id)) = (&self.memory, &plan_id) {
+            match store.spend_rows_for_plan(plan_id).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let report = crate::agent::budget::cost_report(&rows);
+                    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+                    let append = |text: &str| -> std::io::Result<()> {
+                        let mut text = text.to_string();
+                        if !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text.push('\n');
+                        text.push_str(&report);
+                        std::fs::write(&plan_path, text)
+                    };
+                    match std::fs::read_to_string(&plan_path).and_then(|text| append(&text)) {
+                        Ok(()) => notes.push(format!(
+                            "cost report appended to the plan file ({} row(s))",
+                            rows.len()
+                        )),
+                        Err(e) => {
+                            eprintln!("finish: cost report append failed: {e}");
+                            notes.push(format!("cost report skipped: {e}"));
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("finish: cost report rows unavailable: {e}");
+                    notes.push(format!("cost report skipped: {e}"));
+                }
+            }
+        }
 
         // Re-lock for the state transition. The state is re-checked: the
         // unlocked window above must not let finish fire from a state that
@@ -4388,6 +4545,172 @@ mod tests {
         assert_eq!(wf.plan().unwrap().completed_count(), 1);
     }
 
+    /// A `[general.verify]` handle over `command`, rooted at `root`.
+    fn verify_handle(
+        enabled: bool,
+        command: &str,
+        root: &std::path::Path,
+    ) -> crate::agent::step_verify::StepVerifyHandle {
+        let cfg = Arc::new(std::sync::RwLock::new(crate::config::VerifyConfig {
+            enabled,
+            test_command: command.to_string(),
+            timeout_secs: 60,
+        }));
+        let optimizer = Arc::new(std::sync::RwLock::new(crate::config::OptimizerConfig::default()));
+        crate::agent::step_verify::StepVerifyHandle::new(cfg, optimizer).with_root(root.to_path_buf())
+    }
+
+    /// Create a one-step plan in `wf`, then tick its only skeleton step with
+    /// `verify` wired (or not).
+    async fn tick_first_step(
+        wf: Arc<Mutex<Workflow>>,
+        verify: Option<crate::agent::step_verify::StepVerifyHandle>,
+    ) -> crate::tool::ToolResult {
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let mut tool = CompleteStepTool::new(wf.clone());
+        if let Some(handle) = verify {
+            tool = tool.with_step_verify(handle);
+        }
+        tool.execute(json!({"step_index": 1})).await
+    }
+
+    #[tokio::test]
+    async fn complete_step_without_a_verify_handle_appends_nothing() {
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let result = tick_first_step(wf, None).await;
+        assert!(result.success, "{}", result.output);
+        assert!(!result.output.contains("[verify]"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn disabled_verify_handle_leaves_the_tick_output_byte_identical() {
+        // Flag off = exactly today's behavior: a wired but DISABLED handle
+        // produces the same bytes as no handle at all.
+        let dir_a = tempdir().unwrap();
+        let text_a = tick_first_step(make_workflow(dir_a.path()), None)
+            .await
+            .output;
+        let dir_b = tempdir().unwrap();
+        let handle = verify_handle(false, "cargo test", dir_b.path());
+        let text_b = tick_first_step(make_workflow(dir_b.path()), Some(handle))
+            .await
+            .output;
+        assert_eq!(text_a, text_b);
+    }
+
+    #[tokio::test]
+    async fn enabled_verify_handle_appends_a_passed_note() {
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let handle = verify_handle(true, "echo ok", dir.path());
+        let result = tick_first_step(wf, Some(handle)).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("Complete Step 1"), "{}", result.output);
+        assert!(
+            result.output.contains("[verify] `echo ok` — passed (exit 0)"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_verification_keeps_the_tick_successful() {
+        // The tick DID happen — a failed check must not flip it false (a
+        // false result would drive the tier-1 auto-retry into re-ticking a
+        // completed step). The failure signal lives in the note text.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let handle = verify_handle(true, "exit 7", dir.path());
+        let result = tick_first_step(wf, Some(handle)).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("[verify] `exit 7` — FAILED (exit 7)"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verification_records_its_outcome_in_the_spend_ledger() {
+        // The budget layer's evidence row (backlog a25a5323): with a store
+        // wired, the harness verification's real outcome lands in the spend
+        // ledger as one `verify` row — the per-plan cost report's
+        // deterministic-checks source.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let store: Arc<dyn crate::memory::MemoryStoreTrait> = Arc::new(
+            crate::memory::MemoryStore::open_in_memory(Arc::new(
+                crate::memory::HashEmbedder::new(),
+            ))
+            .unwrap(),
+        );
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let plan_id = wf.lock().await.plan_id().expect("a live plan").to_string();
+        let tool = CompleteStepTool::new(wf.clone())
+            .with_step_verify(verify_handle(true, "echo ok", dir.path()))
+            .with_memory(store.clone());
+        let result = tool.execute(json!({"step_index": 1})).await;
+        assert!(result.success, "{}", result.output);
+
+        // The row write is fire-and-forget (mirrors the stats recorder).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rows = store.spend_rows_for_plan(&plan_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.reason, "verify");
+        assert_eq!(row.step_index, Some(0));
+        assert_eq!(row.model, "echo ok");
+        assert_eq!(row.tokens_in, 0);
+        assert_eq!(row.tokens_out, 0);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("[verify] `echo ok` — passed (exit 0)"),
+            "{:?}",
+            row.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn detailed_sub_step_ticks_never_verify() {
+        // The detailed sub-step tick returns early (it drives no state) and
+        // must never spawn the verification command.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({
+                "title": "Fix crash",
+                "goal": "G",
+                "context": "The app crashes on open; root cause: unguarded unwrap at src/app.rs:42.",
+                "steps": [
+                    "Reproduce — run `cargo test`",
+                    "Root-cause — the None unwrap at src/app.rs:42",
+                    "Fix — guard the unwrap in src/app.rs:42"
+                ],
+                "kind": "bug_fixing",
+                "bug": "the app crashes on open"
+            }))
+            .await;
+        let handle = verify_handle(true, "exit 7", dir.path());
+        let tool = CompleteStepTool::new(wf.clone()).with_step_verify(handle);
+        // Control: the skeleton ticks DO verify (notes land on both).
+        assert!(tool.execute(json!({"step_index": 1})).await.success);
+        assert!(tool.execute(json!({"step_index": 2})).await.success);
+        let tick = tool.execute(json!({"detailed_step_index": 1})).await;
+        assert!(tick.success, "{}", tick.output);
+        assert!(!tick.output.contains("[verify]"), "{}", tick.output);
+    }
+
     #[tokio::test]
     async fn complete_step_transitions_to_reviewing() {
         let dir = tempdir().unwrap();
@@ -4427,6 +4750,219 @@ mod tests {
             .execute(json!({"review_report": report.to_string_lossy()}))
             .await;
         assert!(res.success, "{}", res.output);
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::workflow::WorkflowState::Complete
+        );
+    }
+
+    /// One seeded spend row for the cost-report tests.
+    fn seeded_spend(
+        plan_id: &str,
+        reason: &str,
+        lane: Option<&str>,
+        step: Option<usize>,
+        tokens_in: i64,
+        tokens_out: i64,
+        detail: Option<&str>,
+    ) -> crate::memory::SpendEvent {
+        crate::memory::SpendEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: None,
+            turn_id: Some("turn-1".into()),
+            agent_id: None,
+            plan_id: plan_id.to_string(),
+            step_index: step,
+            lane: lane.map(|l| l.to_string()),
+            model: "worker-model".into(),
+            reason: reason.to_string(),
+            tokens_in,
+            tokens_out,
+            cached_tokens: Some(100),
+            detail: detail.map(|d| d.to_string()),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    /// Create a one-step plan, complete it (→ Reviewing), and write a PASS
+    /// report; returns (dir, wf, plan_id, reviews_dir, report path).
+    async fn finished_ready_plan(
+        dir: &std::path::Path,
+    ) -> (Arc<Mutex<Workflow>>, String, std::path::PathBuf, std::path::PathBuf) {
+        let wf = make_workflow(dir);
+        let create = CreatePlanTool::new(wf.clone());
+        create
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]
+            }))
+            .await;
+        let complete = CompleteStepTool::new(wf.clone());
+        complete.execute(json!({"step_index": 1})).await;
+        let plan_id = wf
+            .lock()
+            .await
+            .plan_id()
+            .expect("a live plan")
+            .to_string();
+        let reviews_dir = dir.join("reviews");
+        std::fs::create_dir_all(&reviews_dir).unwrap();
+        let report = reviews_dir.join("review.md");
+        std::fs::write(&report, "## Verdict: PASS\nno findings").unwrap();
+        (wf, plan_id, reviews_dir, report)
+    }
+
+    #[tokio::test]
+    async fn finish_appends_the_cost_report_to_the_plan_file() {
+        // Backlog a25a5323: at finish the plan's REAL spend rows render as a
+        // `## Cost report` section appended to the plan file — totals, tokens
+        // per lane, the lane per step, retries, escalations with their
+        // reasons, the deterministic checks with their results, and the cache
+        // hits; deliberately no counterfactual baseline column.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "route",
+                Some("medium"),
+                Some(0),
+                1_200,
+                200,
+                None,
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "retry",
+                Some("high"),
+                Some(0),
+                900,
+                100,
+                Some("flaky_test"),
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "escalate",
+                Some("escalate"),
+                Some(0),
+                2_000,
+                300,
+                Some("complexity high"),
+            ))
+            .await
+            .unwrap();
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "verify",
+                None,
+                Some(0),
+                0,
+                0,
+                Some("[verify] `cargo test` — passed (exit 0)"),
+            ))
+            .await
+            .unwrap();
+
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("cost report appended to the plan file (4 row(s))"),
+            "{}",
+            res.output
+        );
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::workflow::WorkflowState::Complete
+        );
+
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        let text = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(text.contains("## Cost report"), "{text}");
+        assert!(
+            text.contains("3 request(s), 4100 tokens in + 600 tokens out = 4700 tokens"),
+            "{text}"
+        );
+        assert!(text.contains("300 cached prompt tokens"), "{text}");
+        assert!(text.contains("- escalate: 1 request(s), 2300 tokens"), "{text}");
+        assert!(text.contains("Lane per step:"), "{text}");
+        assert!(text.contains("- step 1: medium"), "{text}");
+        assert!(text.contains("- step 1: flaky_test — 1000 tokens"), "{text}");
+        assert!(
+            text.contains("- step 1: complexity high (2300 tokens)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- step 1: [verify] `cargo test` — passed (exit 0)"),
+            "{text}"
+        );
+        // REAL numbers only — the rejected counterfactual column stays out.
+        assert!(!text.contains("baseline"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn finish_without_spend_writes_no_cost_report() {
+        // A plan with no recorded spend writes no section — the report never
+        // fabricates an empty bill.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(!res.output.contains("cost report"), "{}", res.output);
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        let text = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(!text.contains("## Cost report"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_cost_report_failure_never_blocks_finish() {
+        // Fail-open, like the capture above: when the plan file cannot be read
+        // (removed here), the append notes the skip and finish still
+        // completes — the report must never cost a completion.
+        let dir = tempdir().unwrap();
+        let (wf, plan_id, reviews_dir, report) = finished_ready_plan(dir.path()).await;
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap());
+        store
+            .record_spend_event(&seeded_spend(
+                &plan_id,
+                "route",
+                Some("medium"),
+                Some(0),
+                100,
+                10,
+                None,
+            ))
+            .await
+            .unwrap();
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        std::fs::remove_file(&plan_file).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), reviews_dir).with_memory(store);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("cost report skipped"),
+            "{}",
+            res.output
+        );
         assert_eq!(
             wf.lock().await.state(),
             crate::workflow::WorkflowState::Complete

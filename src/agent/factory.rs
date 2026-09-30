@@ -39,8 +39,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use crate::agent::context::ContextManager;
-use crate::agent::{AgentLoop, AgentLoopConfig};
-use crate::config::{OptimizerConfig, SafetyMode, ShellFilterConfig};
+use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
+use crate::config::{BudgetConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
 use crate::memory::knowledge::{self, KnowledgeStore};
 use crate::memory::MemoryStoreTrait;
 use crate::project::ConstitutionSource;
@@ -200,6 +200,12 @@ pub struct AgentLoopFactory {
     /// resolver reads per turn). Attached to every loop built after the call,
     /// so each turn's pre-prompt classification reads it.
     routing: Option<RoutingGate>,
+    /// The shared compound-reflex handle (backlog a8495cc1) -- the escalation
+    /// lane ladder's classifier (backlog ad56c7bd). `None` until the IPC layer
+    /// wires it via `with_reflex` (the SAME shared classifier slot + the
+    /// `[general.laya] reflex` flag mirror, both read at every plan-step
+    /// boundary). Attached to every loop built after the call.
+    reflex: Option<ReflexHandle>,
     /// An optional spawner that lets an agent start background agents (the
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
@@ -277,6 +283,18 @@ pub struct AgentLoopFactory {
     /// [`with_optimizer_config`](Self::with_optimizer_config) from the
     /// loaded config at startup (mirrors `shell_filter`).
     optimizer: Arc<RwLock<OptimizerConfig>>,
+    /// Live mirror of `[general.verify]` (harness-run deterministic verify at
+    /// plan-step boundaries — the cost-saving chain's verification item),
+    /// shared with every `StepVerifyHandle` this factory builds. Defaults to
+    /// the inert config (disabled, no command, zero spawns); the IPC layer
+    /// overrides via [`with_verify_config`](Self::with_verify_config) from
+    /// the loaded config at startup (mirrors `optimizer`).
+    verify: Arc<RwLock<VerifyConfig>>,
+    /// The shared `[general.budget]` config (backlog a25a5323, the
+    /// cost-saving chain's budget item): every loop built from this factory
+    /// reads it at its plan-step gates, so a Settings save is observed on the
+    /// next boundary with no rebuild (mirrors `verify`).
+    budget: Arc<RwLock<BudgetConfig>>,
     /// The persistent index-staleness log (backlog fc1d57fe) handed to every
     /// search/graph tool this factory builds: each stale-index repair appends
     /// one record per file, and the freshness note points at it. Defaults to
@@ -386,6 +404,14 @@ impl AgentLoopFactory {
             // the IPC layer overrides via `with_optimizer_config` from the
             // loaded config at startup (mirrors `shell_filter`).
             optimizer: Arc::new(RwLock::new(OptimizerConfig::default())),
+            // Verify config at its inert default (disabled — no command, no
+            // spawn); the IPC layer overrides via `with_verify_config` from
+            // the loaded config at startup (mirrors `optimizer`).
+            verify: Arc::new(RwLock::new(VerifyConfig::default())),
+            // Budget config at its inert default (disabled — no cap ever
+            // fires); the IPC layer overrides via `with_budget_config` from
+            // the loaded config at startup (mirrors `verify`).
+            budget: Arc::new(RwLock::new(BudgetConfig::default())),
             // The global index-staleness log (backlog fc1d57fe) unless a test
             // overrides it.
             staleness_log: crate::index_staleness::StalenessLog::global(),
@@ -400,6 +426,10 @@ impl AgentLoopFactory {
             // failure-handling site keeps its pre-classifier behavior.
             failure_triage: None,
             routing: None,
+            // No compound-reflex handle at construction either — wired via
+            // `with_reflex` (backlog a8495cc1). Until then the escalation lane
+            // ladder (backlog ad56c7bd) never classifies.
+            reflex: None,
             // No tool-choice gate at construction — wired via
             // `with_tool_choice` (backlog e2c47d5f). Until then the search
             // tools keep their regex auto-delegation heuristics byte-identically.
@@ -479,6 +509,17 @@ impl AgentLoopFactory {
         self
     }
 
+    /// Wire the shared compound-reflex handle (backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). Every loop built
+    /// after this call carries the handle, whose shared classifier slot + the
+    /// `[general.laya] reflex` flag mirror are read at every plan-step
+    /// boundary, so a Settings save needs no rebuild. When not wired, the
+    /// ladder never classifies and model selection is byte-identical.
+    pub fn with_reflex(mut self, handle: ReflexHandle) -> Self {
+        self.reflex = Some(handle);
+        self
+    }
+
     /// Flip the failure-triage enable flag on the shared gate — the Settings
     /// save path (rewire) calls this so the toggle reaches already-built
     /// loops with no rebuild.
@@ -499,6 +540,18 @@ impl AgentLoopFactory {
         if let Some(handle) = &self.failure_triage {
             handle
                 .knn_enabled
+                .store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Flip the compound-reflex enable flag on the shared handle -- the
+    /// Settings save path (rewire) calls this so the `[general.laya] reflex`
+    /// toggle reaches already-built loops with no rebuild. No-op when no
+    /// handle is wired.
+    pub fn set_reflex_enabled(&self, on: bool) {
+        if let Some(handle) = &self.reflex {
+            handle
+                .enabled
                 .store(on, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -568,6 +621,29 @@ impl AgentLoopFactory {
     /// [`with_shell_filter_config`](Self::with_shell_filter_config)).
     pub fn with_optimizer_config(mut self, cfg: Arc<RwLock<OptimizerConfig>>) -> Self {
         self.optimizer = cfg;
+        self
+    }
+
+    /// Wire the shared `[general.verify]` config (harness-run deterministic
+    /// verify at plan-step boundaries — the cost-saving chain's verification
+    /// item). Called once by the IPC layer at startup; every
+    /// [`StepVerifyHandle`] built from this factory shares the same
+    /// `Arc<RwLock<VerifyConfig>>`, so a Settings save is observed at the next
+    /// step boundary with no rebuild (mirrors
+    /// [`with_optimizer_config`](Self::with_optimizer_config)).
+    pub fn with_verify_config(mut self, cfg: Arc<RwLock<VerifyConfig>>) -> Self {
+        self.verify = cfg;
+        self
+    }
+
+    /// Wire the shared `[general.budget]` config (the cost-saving chain's
+    /// budget item, backlog a25a5323). Called once by the IPC layer at
+    /// startup; every loop built from this factory shares the same
+    /// `Arc<RwLock<BudgetConfig>>` and reads it at its plan-step gates, so a
+    /// Settings save is observed on the next gate with no rebuild (mirrors
+    /// [`with_verify_config`](Self::with_verify_config)).
+    pub fn with_budget_config(mut self, cfg: Arc<RwLock<BudgetConfig>>) -> Self {
+        self.budget = cfg;
         self
     }
 
@@ -659,6 +735,28 @@ impl AgentLoopFactory {
     /// rebuild and no app restart.
     pub fn set_optimizer_config(&self, cfg: OptimizerConfig) {
         *self.optimizer.write().expect("optimizer lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.verify]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is persisted
+    /// and reloaded). Every [`StepVerifyHandle`] shares the same
+    /// `Arc<RwLock<VerifyConfig>>` (see
+    /// [`with_verify_config`](Self::with_verify_config)) and reads it per
+    /// plan-step boundary, so a Settings save lands on the next
+    /// `complete_step` — no registry rebuild and no app restart.
+    pub fn set_verify_config(&self, cfg: VerifyConfig) {
+        *self.verify.write().expect("verify lock poisoned") = cfg;
+    }
+
+    /// Update the live `[general.budget]` config (called by the app's
+    /// `save_settings` / `save_endpoints` rewire after the config is
+    /// persisted and reloaded). Every loop shares the same
+    /// `Arc<RwLock<BudgetConfig>>` (see
+    /// [`with_budget_config`](Self::with_budget_config)) and reads it at each
+    /// plan-step gate, so a Settings save lands on the next gate — no
+    /// registry rebuild and no app restart.
+    pub fn set_budget_config(&self, cfg: BudgetConfig) {
+        *self.budget.write().expect("budget lock poisoned") = cfg;
     }
 
     /// Swap in a new provider (e.g. when the user switches models from the
@@ -999,6 +1097,28 @@ impl AgentLoopFactory {
             agent = agent.with_routing_gate(gate.clone());
         }
 
+        // Attach the compound-reflex handle (backlog a8495cc1) -- the
+        // escalation lane ladder's classifier (backlog ad56c7bd): each
+        // plan-step boundary reads the shared classifier slot + the
+        // `[general.laya] reflex` flag mirror, so a Settings save lands on the
+        // next step with no rebuild.
+        if let Some(handle) = &self.reflex {
+            agent = agent.with_reflex(handle.clone());
+        // Harness-run deterministic verify (the cost-saving chain's
+        // verification item): the loop re-runs `[general.verify]`'s command on
+        // a decided `action=verify` reflex call and rides the compact evidence
+        // note on the next request's volatile tail. Same live config the
+        // `complete_step` tool reads (`step_verify_handle`).
+        agent = agent.with_step_verify(self.step_verify_handle(root));
+        }
+
+        // The budget layer (backlog a25a5323): every loop reads the shared
+        // live `[general.budget]` config at its plan-step gates — a Settings
+        // save lands on the next gate with no rebuild. Unconditional: the cap
+        // gate works with the reflex handle absent (caps are deterministic,
+        // not classifier-driven).
+        agent = agent.with_budget_config(Arc::clone(&self.budget));
+
         // Stamp the shared default's DISPLAY effort (backlog 51dab4da): the
         // loop's no-override resolution branch reports it, so the status bar
         // shows the default model's effective effort (per-model override →
@@ -1185,6 +1305,20 @@ impl AgentLoopFactory {
         }
     }
 
+    /// Build the harness-run verification handle for one agent (see
+    /// [`crate::agent::step_verify`]). Every handle reads the SAME live
+    /// `[general.verify]` + `[general.optimizer]` config, so the
+    /// `complete_step` tool and the loop's action=verify path always agree;
+    /// the root is the agent's sandbox (a root-spec agent verifies inside its
+    /// own worktree).
+    fn step_verify_handle(&self, root: Option<&AgentRootSpec>) -> StepVerifyHandle {
+        let root = match root {
+            Some(spec) => spec.sandbox.root().to_path_buf(),
+            None => self.sandbox.root().to_path_buf(),
+        };
+        StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer)).with_root(root)
+    }
+
     /// Register the plan-workflow tools (always present). These mutate the
     /// per-agent `Workflow` (create/complete/update/abandon a plan) and write
     /// the project's own `.coding/plans/` bookkeeping.
@@ -1200,7 +1334,19 @@ impl AgentLoopFactory {
             create = create.with_memory(store.clone());
         }
         registry.register(Box::new(create));
-        registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
+        // The harness-run verify handle rides the plan-step tick (the
+        // cost-saving chain's verification item): a successful skeleton
+        // complete_step runs `[general.verify]`'s command and appends the
+        // compact evidence note — no model roundtrip spent deciding to run.
+        let mut complete_step = CompleteStepTool::new(workflow.clone())
+            .with_step_verify(self.step_verify_handle(root));
+        // The budget layer's evidence row (backlog a25a5323): with the store
+        // wired, a successful verification records its outcome in the
+        // `spend_events` ledger for the per-plan cost report.
+        if let Some(store) = &self.memory {
+            complete_step = complete_step.with_memory(store.clone());
+        }
+        registry.register(Box::new(complete_step));
         registry.register(Box::new(UpdatePlanTool::new(workflow.clone())));
         // abandon_plan supersedes the abandoned plan's lingering crash
         // markers when the memory store is wired (Phase 4 hygiene — mirrors

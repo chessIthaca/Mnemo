@@ -217,7 +217,14 @@ describe("serializeClassifier", () => {
     routingEnforce: false,
     routingCheap: null,
     routingCapable: null,
+    routingLaneMedium: null,
+    routingLaneHigh: null,
+    routingEscalate: null,
     routingThreshold: 0.8,
+    budgetEnabled: false,
+    budgetMaxTokensPerPlan: 0,
+    budgetMaxEscalationsPerPlan: 1,
+    budgetMaxRetriesPerLane: 3,
   };
 
   it("serializes identical drafts identically (clean state → not dirty)", () => {
@@ -258,9 +265,39 @@ describe("serializeClassifier", () => {
     expect(serializeClassifier(base)).not.toBe(
       serializeClassifier({ ...base, routingThreshold: 0.9 }),
     );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingLaneMedium: { endpoint: "local", model: "medium" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingLaneHigh: { endpoint: "local", model: "high" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({
+        ...base,
+        routingEscalate: { endpoint: "stub", model: "top" },
+      }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetEnabled: true }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxTokensPerPlan: 250_000 }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxEscalationsPerPlan: 2 }),
+    );
+    expect(serializeClassifier(base)).not.toBe(
+      serializeClassifier({ ...base, budgetMaxRetriesPerLane: 5 }),
+    );
   });
 
-  it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing)", () => {
+  it("matches the persisted shape (enabled + auto-typing + tool-choice + triage + kNN overlay + fine-tune + routing + budget)", () => {
     expect(JSON.parse(serializeClassifier(base))).toEqual({
       enabled: true,
       autoTypeMemories: false,
@@ -272,8 +309,52 @@ describe("serializeClassifier", () => {
       routingEnforce: false,
       routingCheap: null,
       routingCapable: null,
+      routingLaneMedium: null,
+      routingLaneHigh: null,
+      routingEscalate: null,
       routingThreshold: 0.8,
+      budgetEnabled: false,
+      budgetMaxTokensPerPlan: 0,
+      budgetMaxEscalationsPerPlan: 1,
+      budgetMaxRetriesPerLane: 3,
     });
+  });
+
+  it("carries the escalation-lane targets through the saved patch (backlog ad56c7bd)", () => {
+    // The three lane pickers ride the same [general.routing] patch: the draft
+    // round-trips them, the payload sends the snake_case wire names (null
+    // clears, exactly like cheap/capable), and the bindings carry both the
+    // read type and the save patch.
+    expect(classifierSource).toContain("Lane ladder (per plan step)");
+    expect(classifierSource).toContain("lane_medium: routingLaneMedium,");
+    expect(classifierSource).toContain("lane_high: routingLaneHigh,");
+    expect(classifierSource).toContain("escalate: routingEscalate,");
+    expect(tauriSource).toContain("lane_medium: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_high: ModelRefConfig | null;");
+    expect(tauriSource).toContain("escalate: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_medium?: ModelRefConfig | null;");
+    expect(tauriSource).toContain("lane_high?: ModelRefConfig | null;");
+    expect(tauriSource).toContain("escalate?: ModelRefConfig | null;");
+  });
+
+  it("carries the budget caps through the saved patch (backlog a25a5323)", () => {
+    // The deterministic budget layer's section: the toggle + the three caps
+    // ride the [general.budget] patch with the backend's exact snake_case
+    // names, the section renders them, and the read type carries the wire
+    // block the backend now emits.
+    expect(classifierSource).toContain("Budget caps per plan");
+    expect(classifierSource).toContain("enabled: budgetEnabled,");
+    expect(classifierSource).toContain("max_tokens_per_plan: budgetMaxTokensPerPlan,");
+    expect(classifierSource).toContain(
+      "max_escalations_per_plan: budgetMaxEscalationsPerPlan,",
+    );
+    expect(classifierSource).toContain("max_retries_per_lane: budgetMaxRetriesPerLane,");
+    expect(tauriSource).toContain("max_tokens_per_plan: number;");
+    expect(tauriSource).toContain("max_escalations_per_plan: number;");
+    expect(tauriSource).toContain("max_retries_per_lane: number;");
+    expect(tauriSource).toContain("max_tokens_per_plan?: number;");
+    expect(tauriSource).toContain("max_escalations_per_plan?: number;");
+    expect(tauriSource).toContain("max_retries_per_lane?: number;");
   });
 });
 

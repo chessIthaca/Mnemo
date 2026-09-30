@@ -612,6 +612,10 @@ impl AgentTask {
                                 if let FailureTriage::Classified { class, confidence } =
                                     gate.triage(&error_text).await
                                 {
+                                    // A failed cycle the ladder may escalate
+                                    // on (backlog ad56c7bd): re-arm the lane
+                                    // classification for the current step.
+                                    self.agent_loop.note_lane_escalation(class);
                                     classified = Some((gate, class, confidence, error_text));
                                 }
                             }

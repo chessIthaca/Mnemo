@@ -489,12 +489,34 @@ export interface AppSettings {
       cheap: ModelRefConfig | null;
       /** The model a confidently-architectural task routes to (null = unset). */
       capable: ModelRefConfig | null;
+      /** The model a medium-complexity plan step routes to — the escalation-
+       *  lane rung `medium` (backlog ad56c7bd; null = unset). */
+      lane_medium: ModelRefConfig | null;
+      /** The model a high-complexity plan step routes to (lane `high`). */
+      lane_high: ModelRefConfig | null;
+      /** The model the escalate rung routes to (lane `escalate`). */
+      escalate: ModelRefConfig | null;
       /** The calibrated-probability gate: a decision routes only at or above
        *  it; below it today's model runs. */
       threshold: number;
       /** Whether a confident decision switches the turn's model (false =
        *  shadow: classify + log only). */
       enforce: boolean;
+    };
+    /** The deterministic budget layer (`[general.budget]`, backlog a25a5323)
+     *  — spend caps the model can never override: a cap reached at a
+     *  plan-step boundary PAUSES the plan with a question (continue for this
+     *  plan / double the cap / end the turn) instead of killing it. Always
+     *  emitted, so the section renders the current numbers. */
+    budget?: {
+      /** Whether the caps are enforced. */
+      enabled: boolean;
+      /** Total tokens one plan may spend (0 = off). */
+      max_tokens_per_plan: number;
+      /** Escalations allowed per plan (default 1). */
+      max_escalations_per_plan: number;
+      /** Failed-cycle retries allowed per plan step (default 3). */
+      max_retries_per_lane: number;
     };
     /** Whether the agent's `browser_*` browser-inspection tools are enabled
      *  (exposes an unauthenticated localhost CDP port — opt-in, off by
@@ -653,8 +675,22 @@ export interface SettingsSavePatch {
   routing?: {
     cheap?: ModelRefConfig | null;
     capable?: ModelRefConfig | null;
+    /** The escalation-lane targets (backlog ad56c7bd) — the same
+     *  absent/null/set contract as `cheap` / `capable`. */
+    lane_medium?: ModelRefConfig | null;
+    lane_high?: ModelRefConfig | null;
+    escalate?: ModelRefConfig | null;
     threshold?: number;
     enforce?: boolean;
+  };
+  /** `[general.budget]` patch (backlog a25a5323) — the deterministic budget
+   *  layer's caps. Absent fields keep the stored values; an absent section
+   *  keeps the whole section. */
+  budget?: {
+    enabled?: boolean;
+    max_tokens_per_plan?: number;
+    max_escalations_per_plan?: number;
+    max_retries_per_lane?: number;
   };
   /** Token-optimizer levers (`[general.optimizer]`, backlog e4a50d22) — each
    *  is opt-in, off by default, and read per tool call from a live mirror, so

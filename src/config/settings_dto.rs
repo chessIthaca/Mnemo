@@ -99,12 +99,44 @@ pub struct RoutingConfigDto {
     /// The model a confidently-ARCHITECTURAL task routes to.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub capable: Option<Option<ModelRefDto>>,
+    /// The model a medium-complexity plan step routes to (escalation-lane
+    /// rung `medium`, backlog ad56c7bd). Same double-Option semantics as the
+    /// other targets.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub lane_medium: Option<Option<ModelRefDto>>,
+    /// The model a high-complexity plan step routes to (rung `high`). Same
+    /// semantics.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub lane_high: Option<Option<ModelRefDto>>,
+    /// The model the escalate rung routes to. Same semantics.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub escalate: Option<Option<ModelRefDto>>,
     /// The calibrated-probability gate (`0.0..=1.0`; validated).
     #[serde(default)]
     pub threshold: Option<f64>,
     /// Whether a confident decision actually switches the turn's model.
     #[serde(default)]
     pub enforce: Option<bool>,
+}
+
+/// The `[general.budget]` section patch (the deterministic budget layer,
+/// backlog a25a5323): spend caps the model can never override. Present fields
+/// replace the stored values, absent fields keep them, an absent section keeps
+/// the whole section (the plain-Option convention the bool/usize scalars use).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BudgetConfigDto {
+    /// Whether the caps are enforced.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Total tokens one plan may spend (`0` = off).
+    #[serde(default)]
+    pub max_tokens_per_plan: Option<u64>,
+    /// Escalations allowed per plan (default 1).
+    #[serde(default)]
+    pub max_escalations_per_plan: Option<u32>,
+    /// Failed-cycle retries allowed per plan step (default 3).
+    #[serde(default)]
+    pub max_retries_per_lane: Option<u32>,
 }
 
 /// Deserialize an `Option<Option<T>>` so that a field **absent** from the JSON
@@ -407,6 +439,10 @@ pub struct SettingsSaveDto {
     /// Absent = keep the stored section; see [`RoutingConfigDto`].
     #[serde(default)]
     pub routing: Option<RoutingConfigDto>,
+    /// The deterministic budget layer (`[general.budget]`, backlog
+    /// a25a5323). Absent = keep the stored section; see [`BudgetConfigDto`].
+    #[serde(default)]
+    pub budget: Option<BudgetConfigDto>,
     #[serde(default)]
     pub pricing: Option<Vec<PricingDto>>,
     #[serde(default)]
@@ -924,11 +960,35 @@ pub fn validate_and_apply_settings_patch(
         if let Some(capable) = &routing.capable {
             general.general.routing.capable = capable.as_ref().map(|m| to_ref(m));
         }
+        if let Some(lane) = &routing.lane_medium {
+            general.general.routing.lane_medium = lane.as_ref().map(|m| to_ref(m));
+        }
+        if let Some(lane) = &routing.lane_high {
+            general.general.routing.lane_high = lane.as_ref().map(|m| to_ref(m));
+        }
+        if let Some(lane) = &routing.escalate {
+            general.general.routing.escalate = lane.as_ref().map(|m| to_ref(m));
+        }
         if let Some(threshold) = routing.threshold {
             general.general.routing.threshold = threshold;
         }
         if let Some(enforce) = routing.enforce {
             general.general.routing.enforce = enforce;
+        }
+    }
+
+    if let Some(budget) = &patch.budget {
+        if let Some(enabled) = budget.enabled {
+            general.general.budget.enabled = enabled;
+        }
+        if let Some(tokens) = budget.max_tokens_per_plan {
+            general.general.budget.max_tokens_per_plan = tokens;
+        }
+        if let Some(escalations) = budget.max_escalations_per_plan {
+            general.general.budget.max_escalations_per_plan = escalations;
+        }
+        if let Some(retries) = budget.max_retries_per_lane {
+            general.general.budget.max_retries_per_lane = retries;
         }
     }
 
@@ -1417,6 +1477,17 @@ mod tests {
                     model: "big".into(),
                     reasoning_effort: None,
                 })),
+                lane_medium: Some(Some(ModelRefDto {
+                    endpoint: "ep".into(),
+                    model: "mid".into(),
+                    reasoning_effort: None,
+                })),
+                lane_high: None,
+                escalate: Some(Some(ModelRefDto {
+                    endpoint: "ep".into(),
+                    model: "top".into(),
+                    reasoning_effort: None,
+                })),
                 threshold: Some(0.9),
                 enforce: Some(true),
             }),
@@ -1440,18 +1511,41 @@ mod tests {
                 .model,
             "big"
         );
+        let lane = next
+            .general
+            .general
+            .routing
+            .lane_medium
+            .clone()
+            .expect("lane_medium set");
+        assert_eq!(lane.model, "mid");
+        assert_eq!(
+            next.general
+                .general
+                .routing
+                .escalate
+                .as_ref()
+                .expect("escalate set")
+                .model,
+            "top"
+        );
+        assert!(next.general.general.routing.lane_high.is_none());
 
         // Clear: Some(None) empties the slot; fields absent from the patch
         // keep their stored values.
         let patch = SettingsSaveDto {
             routing: Some(RoutingConfigDto {
                 cheap: Some(None),
+                escalate: Some(None),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&next, &patch).unwrap();
         assert!(next.general.general.routing.cheap.is_none());
+        assert!(next.general.general.routing.escalate.is_none());
+        assert!(next.general.general.routing.lane_medium.is_some());
+        assert!(next.general.general.routing.lane_high.is_none());
         assert!(next.general.general.routing.capable.is_some());
         assert!(next.general.general.routing.enforce);
 
@@ -1480,6 +1574,46 @@ mod tests {
     }
 
     #[test]
+    fn budget_patch_sets_keeps_and_round_trips() {
+        // The [general.budget] patch (backlog a25a5323): present fields
+        // replace, absent fields keep, an absent section keeps everything —
+        // and the save → reload → save round-trip is stable.
+        let current = Config::default();
+        let patch = SettingsSaveDto {
+            budget: Some(BudgetConfigDto {
+                enabled: Some(true),
+                max_tokens_per_plan: Some(250_000),
+                max_escalations_per_plan: None,
+                max_retries_per_lane: Some(5),
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert!(next.general.general.budget.enabled);
+        assert_eq!(next.general.general.budget.max_tokens_per_plan, 250_000);
+        assert_eq!(
+            next.general.general.budget.max_escalations_per_plan, 1,
+            "an absent field keeps the stored value"
+        );
+        assert_eq!(next.general.general.budget.max_retries_per_lane, 5);
+
+        // The section survives a serialize → parse round-trip (the DTO's
+        // field names match the config's, so a saved patch reloads).
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: SettingsSaveDto = serde_json::from_str(&json).unwrap();
+        let next2 = validate_and_apply_settings_patch(&next, &back).unwrap();
+        assert!(next2.general.general.budget.enabled);
+        assert_eq!(next2.general.general.budget.max_tokens_per_plan, 250_000);
+        assert_eq!(next2.general.general.budget.max_retries_per_lane, 5);
+
+        // An absent section keeps the stored values entirely.
+        let patch = SettingsSaveDto::default();
+        let next3 = validate_and_apply_settings_patch(&next2, &patch).unwrap();
+        assert!(next3.general.general.budget.enabled);
+        assert_eq!(next3.general.general.budget.max_tokens_per_plan, 250_000);
+    }
+
+    #[test]
     fn routing_patch_distinguishes_absent_from_null() {
         // The wire contract the dialog relies on: an absent target keeps the
         // stored override, an explicit null clears it.
@@ -1490,8 +1624,21 @@ mod tests {
         let routing = dto.routing.expect("routing present");
         assert!(matches!(routing.cheap, Some(None)));
         assert!(matches!(routing.capable, Some(Some(_))));
+        assert!(routing.lane_medium.is_none());
+        assert!(routing.lane_high.is_none());
+        assert!(routing.escalate.is_none());
         assert!(routing.threshold.is_none());
         assert!(routing.enforce.is_none());
+
+        // The lane targets use the same absent/null/set contract.
+        let dto: SettingsSaveDto = serde_json::from_str(
+            r#"{"routing":{"lane_medium":{"endpoint":"ep","model":"m"},"lane_high":null}}"#,
+        )
+        .expect("patch parses");
+        let routing = dto.routing.expect("routing present");
+        assert!(matches!(routing.lane_medium, Some(Some(_))));
+        assert!(matches!(routing.lane_high, Some(None)));
+        assert!(routing.escalate.is_none());
 
         let dto: SettingsSaveDto =
             serde_json::from_str(r#"{"routing":{"threshold":0.75}}"#).expect("patch parses");

@@ -174,6 +174,11 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // getter and tracks the training-log file itself, so an embedder
         // change needs no extra wiring here — only the flag mirror.
         factory.set_failure_triage_knn_enabled(laya_cfg.failure_triage_knn);
+        // Reflex (backlog a8495cc1) -- the escalation lane ladder's classifier
+        // (backlog ad56c7bd): the same live-toggle contract -- the loop reads
+        // the shared classifier slot + this mirrored flag at each plan-step
+        // boundary, so a Settings save lands on the next step with no rebuild.
+        factory.set_reflex_enabled(laya_cfg.reflex);
         // Token-optimizer levers ([general.optimizer], backlog e4a50d22): the
         // same live-toggle contract — every lever-bearing tool reads the
         // shared Arc<RwLock<OptimizerConfig>> per call, so a Settings save
@@ -181,6 +186,16 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         // write the mirror kept its startup value, so a toggle silently needed
         // an app restart.
         factory.set_optimizer_config(cfg.general.general.optimizer.clone());
+        // Harness-run deterministic verify ([general.verify], the cost-saving
+        // chain's verification item): the same live contract — every shared
+        // StepVerifyHandle reads this config at each plan-step boundary, so a
+        // Settings save lands on the next complete_step with no rebuild.
+        factory.set_verify_config(cfg.general.general.verify.clone());
+        // The deterministic budget layer ([general.budget], backlog a25a5323):
+        // the same live contract — the cap gate reads this config at every
+        // plan-step boundary, so a Settings save lands on the next gate with
+        // no rebuild.
+        factory.set_budget_config(cfg.general.general.budget.clone());
     }
     // Read back through the accessor items 2-5 will use, so the log shows the
     // installed state (a poisoned lock reads as "cleared").

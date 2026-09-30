@@ -125,6 +125,31 @@ pub struct GeneralSection {
     /// touched routing keep no trace of it (mirrors `[general.laya]`).
     #[serde(default, skip_serializing_if = "RoutingConfig::is_default")]
     pub routing: RoutingConfig,
+    /// **Harness-run deterministic verify at plan-step boundaries (opt-in;
+    /// cost-saving chain).** With `enabled` on and a non-empty
+    /// `test_command`, every SUCCESSFUL skeleton `complete_step` runs the
+    /// command itself, compresses its output, and appends a compact evidence
+    /// note (exit status, distinct error lines, counts) to the tool result —
+    /// deterministic evidence before model reasoning, no model roundtrip
+    /// (the failure-triage tier-1 precedent). A failed verification never
+    /// fails the tick: the note carries the signal. Inert by default (no
+    /// spawn, byte-identical outputs). Omitted from the saved config while
+    /// every field holds its default, so configs that never touched verify
+    /// keep no trace of it (mirrors `[general.routing]`).
+    #[serde(default, skip_serializing_if = "VerifyConfig::is_default")]
+    pub verify: VerifyConfig,
+    /// **Deterministic budget layer (opt-in; cost-saving chain item 4,
+    /// backlog a25a5323).** Spend caps the model can never override: with
+    /// `enabled` on, a cap reached at a plan-step boundary PAUSES the plan
+    /// through a pending question (bypass for this plan / double the token
+    /// cap / end the turn) — never a hard kill, because plans are
+    /// crash-resumable and the plan file is the resumption document. The
+    /// per-decision spend ledger and the per-plan cost report are written
+    /// independently of this flag; it gates only the caps. Omitted from the
+    /// saved config while every field holds its default (mirrors
+    /// `[general.verify]`).
+    #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
+    pub budget: BudgetConfig,
     /// **Token-optimizer levers (on by default; backlog e4a50d22).** The
     /// context levers that cut re-reads and command-output waste at the tool
     /// dispatch layer: delta/skeleton re-reads, semantic command-output
@@ -306,15 +331,24 @@ pub struct LayaConfig {
     /// (continue/retry/verify/escalate/complete) and risk
     /// (none/security/data_loss) for the same state at once, and the three
     /// answers are gated as ONE decision on the weakest of them (>=0.80).
-    /// Nothing acts on the answers yet: a decided state is logged
-    /// shadow-first to `~/.mnemo/laya/training/reflex.jsonl`, and every
-    /// fallback (a missing or non-choice answer, a label outside its
-    /// taxonomy, a weakest confidence below the gate) keeps the caller's
-    /// pre-existing behavior byte-identically. Off by default, and meant to
-    /// be enabled only against a **fine-tuned** checkpoint: base Laya
-    /// checkpoints are near-chance zero-shot on this task, which is exactly
-    /// what the reflex log's labeled corpus is for. Omitted from the saved
-    /// config while false.
+    /// The **escalation lane ladder** (backlog ad56c7bd) is the first
+    /// consumer: at each plan-step boundary the step is classified once, and
+    /// the lane it answers (`small` → the `[general.routing] cheap` target,
+    /// plus the `medium` / `high` / `escalate` lanes) serves that step while
+    /// [`routing`](Self::routing) is on. Shadow-first like the pre-prompt
+    /// decision (enforce off = log only), re-classifying a step only after a
+    /// failed cycle; a fallback (a missing or non-choice answer, a label
+    /// outside its taxonomy, a weakest confidence below the gate) keeps the
+    /// step's configured model byte-identically, and a decided state is
+    /// logged to `~/.mnemo/laya/training/reflex.jsonl`. The **harness-run
+    /// verify** layer (backlog item 3, `[general.verify]`) is the second
+    /// consumer: a decided `verify` action re-runs the configured checks
+    /// harness-side and rides the compact evidence note on the next request's
+    /// volatile tail — evidence, not routing, so it fires under shadow too.
+    /// Off by default, and meant to be enabled only against a **fine-tuned**
+    /// checkpoint: base Laya checkpoints are near-chance zero-shot on this
+    /// task, which is exactly what the reflex log's labeled corpus is for.
+    /// Omitted from the saved config while false.
     #[serde(default, skip_serializing_if = "laya_flag_off")]
     pub reflex: bool,
 }
@@ -360,6 +394,16 @@ impl LayaConfig {
 /// * `true` = **enforce**: a confident `trivial` answer runs the turn on
 ///   [`cheap`](Self::cheap), `architectural` on [`capable`](Self::capable).
 ///
+/// The same section carries the **escalation lane ladder** (backlog ad56c7bd):
+/// [`lane_medium`](Self::lane_medium), [`lane_high`](Self::lane_high) and
+/// [`escalate`](Self::escalate) are the per-lane targets for step-granular
+/// routing — at each plan-step boundary (and again only after a failed cycle)
+/// the compound reflex call classifies the step and the ladder resolves
+/// cheap → default → medium → high → escalate. Every rung is USER-CHOSEN:
+/// unset (the default) falls through to the turn's configured model — there is
+/// never a built-in model id. Step routing is shadow-first under the same
+/// [`enforce`](Self::enforce) switch as the pre-prompt decision.
+///
 /// Every fallback keeps today's model: an answer below
 /// [`threshold`](Self::threshold), a missing answer, an unknown label, or an
 /// unset or dangling target. Routing never overrides a skill, subagent or
@@ -376,6 +420,18 @@ pub struct RoutingConfig {
     /// (design-level work: a new feature, cross-module refactor, a new
     /// dependency, a data-model or concurrency change). `None` keeps today's.
     pub capable: Option<ModelRef>,
+    /// The endpoint + model a medium-complexity plan step routes to (the
+    /// escalation-lane rung `medium`, backlog ad56c7bd). USER-CHOSEN: `None`
+    /// (the default) falls through to the turn's configured model — never a
+    /// built-in model id.
+    pub lane_medium: Option<ModelRef>,
+    /// The endpoint + model a high-complexity plan step routes to (the rung
+    /// `high`). `None` falls through to the configured model.
+    pub lane_high: Option<ModelRef>,
+    /// The endpoint + model the escalate rung routes to (a step the reflex
+    /// call flags `escalate`, typically after a failed cycle). `None` falls
+    /// through to the configured model.
+    pub escalate: Option<ModelRef>,
     /// The calibrated-probability gate: a decision routes only at
     /// `confidence >= threshold`. Defaults to `0.80`, the same gate the
     /// other Laya consumers use; a below-threshold answer keeps today's
@@ -395,6 +451,9 @@ impl Default for RoutingConfig {
         Self {
             cheap: None,
             capable: None,
+            lane_medium: None,
+            lane_high: None,
+            escalate: None,
             threshold: default_routing_threshold(),
             enforce: false,
         }
@@ -409,6 +468,9 @@ impl RoutingConfig {
     fn is_default(&self) -> bool {
         self.cheap.is_none()
             && self.capable.is_none()
+            && self.lane_medium.is_none()
+            && self.lane_high.is_none()
+            && self.escalate.is_none()
             && routing_threshold_is_default(&self.threshold)
             && !self.enforce
     }
@@ -426,6 +488,178 @@ fn default_routing_threshold() -> f64 {
 /// its minimal shape.
 fn routing_threshold_is_default(threshold: &f64) -> bool {
     (*threshold - default_routing_threshold()).abs() < f64::EPSILON
+}
+
+/// The `[general.verify]` section — harness-run deterministic verification at
+/// plan-step boundaries (the cost-saving chain's verification item): with
+/// [`enabled`](Self::enabled) on and a non-empty
+/// [`test_command`](Self::test_command), a SUCCESSFUL skeleton
+/// `complete_step` runs the command itself, compresses its output through
+/// the lever-2 compressor, and appends a compact evidence note (exit status,
+/// distinct error lines, counts) to the tool result — deterministic evidence
+/// before model reasoning, with no model roundtrip (the failure-triage
+/// tier-1 auto-retry precedent). Opt-in and inert by default: an absent
+/// section never spawns a process, so behavior is byte-identical to today.
+/// The command runs VERBATIM through the platform shell (PowerShell on
+/// Windows, `sh` elsewhere) — chained `&&`/`||` commands are not translated,
+/// so use a single command or a script. Omitted from the saved config while
+/// every field holds its default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifyConfig {
+    /// Whether the harness runs `test_command` at each plan-step boundary.
+    /// `false` (the default) leaves the feature fully inert. Omitted while
+    /// false.
+    #[serde(skip_serializing_if = "verify_flag_off")]
+    pub enabled: bool,
+    /// The command run at each step boundary (e.g. `cargo test`). EMPTY (the
+    /// default) keeps the feature inert even with `enabled` on — there is
+    /// never a built-in command. Omitted while empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub test_command: String,
+    /// Seconds the command may run before being killed — a hanging suite
+    /// must not wedge the plan, and the kill surfaces as a failure-shaped
+    /// evidence note. Defaults to 300 (the same bound the `shell` tool
+    /// applies). Omitted while default.
+    #[serde(skip_serializing_if = "verify_timeout_is_default")]
+    pub timeout_secs: u64,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            test_command: String::new(),
+            timeout_secs: default_verify_timeout_secs(),
+        }
+    }
+}
+
+impl VerifyConfig {
+    /// True while every field holds its default — the `[general.verify]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`RoutingConfig::is_default`]), so untouched configs keep no verify
+    /// trace.
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && self.test_command.is_empty()
+            && verify_timeout_is_default(&self.timeout_secs)
+    }
+}
+
+/// The out-of-box verification timeout: the same 5-minute bound the `shell`
+/// tool applies. Named fn so the serde default, the `Default` impl and the
+/// `skip_serializing_if` guard agree.
+fn default_verify_timeout_secs() -> u64 {
+    300
+}
+
+/// `skip_serializing_if` guard for [`VerifyConfig::timeout_secs`]: the
+/// default stays unwritten, so a section touched only by `enabled` or
+/// `test_command` keeps its minimal shape.
+fn verify_timeout_is_default(timeout: &u64) -> bool {
+    *timeout == default_verify_timeout_secs()
+}
+
+/// `skip_serializing_if` guard for [`VerifyConfig::enabled`]: `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-verify shape.
+fn verify_flag_off(off: &bool) -> bool {
+    !*off
+}
+
+/// The `[general.budget]` section — the deterministic budget layer (the
+/// cost-saving chain's fourth item, backlog a25a5323): spend caps the model
+/// can never override. With [`enabled`](Self::enabled) on, a cap reached at a
+/// plan-step boundary PAUSES the plan through a pending question (the
+/// `ask_user` channel — bypass for this plan / double the token cap / end the
+/// turn); it is never a hard kill, because plans are crash-resumable and the
+/// plan file is the resumption document. Opt-in and inert by default: with
+/// `enabled` false no cap ever fires and behavior is byte-identical. Omitted
+/// from the saved config while every field holds its default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Whether the budget caps are enforced. `false` (the default) leaves
+    /// the layer fully inert. Omitted while false.
+    #[serde(skip_serializing_if = "budget_flag_off")]
+    pub enabled: bool,
+    /// Total prompt+completion tokens a single plan may spend. `0` (the
+    /// default) disables the token cap. Omitted while 0.
+    #[serde(skip_serializing_if = "budget_tokens_is_default")]
+    pub max_tokens_per_plan: u64,
+    /// How many escalations a single plan may arm before the budget asks.
+    /// Defaults to one. Omitted while default.
+    #[serde(skip_serializing_if = "budget_escalations_is_default")]
+    pub max_escalations_per_plan: u32,
+    /// How many failed-cycle retries a single plan STEP may take before the
+    /// budget asks. Defaults to three. Omitted while default.
+    #[serde(skip_serializing_if = "budget_retries_is_default")]
+    pub max_retries_per_lane: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: default_budget_escalations(),
+            max_retries_per_lane: default_budget_lane_retries(),
+        }
+    }
+}
+
+impl BudgetConfig {
+    /// True while every field holds its default — the `[general.budget]`
+    /// section is then omitted from `config.toml` (mirrors
+    /// [`RoutingConfig::is_default`]), so untouched configs keep no budget
+    /// trace.
+    fn is_default(&self) -> bool {
+        !self.enabled
+            && budget_tokens_is_default(&self.max_tokens_per_plan)
+            && budget_escalations_is_default(&self.max_escalations_per_plan)
+            && budget_retries_is_default(&self.max_retries_per_lane)
+    }
+}
+
+/// The out-of-box escalation budget: one escalation per plan before the
+/// budget asks. Named fn so the serde default, the `Default` impl and the
+/// `skip_serializing_if` guard agree.
+fn default_budget_escalations() -> u32 {
+    1
+}
+
+/// The out-of-box per-step lane-retry budget: three attempted cycles on one
+/// step before the budget asks. Named fn so the serde default, the `Default`
+/// impl and the `skip_serializing_if` guard agree.
+fn default_budget_lane_retries() -> u32 {
+    3
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::enabled`]: `false` (the
+/// default) stays unwritten, so untouched configs keep their exact
+/// pre-budget shape.
+fn budget_flag_off(off: &bool) -> bool {
+    !*off
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::max_tokens_per_plan`]:
+/// `0` (the default — the token cap is off) stays unwritten, so a section
+/// touched only by `enabled` keeps its minimal shape.
+fn budget_tokens_is_default(tokens: &u64) -> bool {
+    *tokens == 0
+}
+
+/// `skip_serializing_if` guard for
+/// [`BudgetConfig::max_escalations_per_plan`]: the default stays unwritten.
+fn budget_escalations_is_default(count: &u32) -> bool {
+    *count == default_budget_escalations()
+}
+
+/// `skip_serializing_if` guard for [`BudgetConfig::max_retries_per_lane`]:
+/// the default stays unwritten.
+fn budget_retries_is_default(count: &u32) -> bool {
+    *count == default_budget_lane_retries()
 }
 
 /// The `[general.optimizer]` section — the token-optimizer levers (backlog
@@ -643,6 +877,8 @@ impl Default for GeneralSection {
             bundled_embedding_model: default_bundled_embedding_model(),
             laya: LayaConfig::default(),
             routing: RoutingConfig::default(),
+            verify: VerifyConfig::default(),
+            budget: BudgetConfig::default(),
             optimizer: OptimizerConfig::default(),
             enable_browser_inspection: false,
             codegraph: default_codegraph_enabled(),
@@ -1553,6 +1789,69 @@ reasoning_effort = "max"
     }
 
     #[test]
+    fn routing_lane_targets_default_to_none_and_round_trip() {
+        // The escalation-lane ladder (backlog ad56c7bd) is USER-CHOSEN: every
+        // rung defaults to None -- there is never a built-in model id -- and
+        // an unset rung falls through to the turn's configured model.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(cfg.general.routing.lane_medium.is_none());
+        assert!(cfg.general.routing.lane_high.is_none());
+        assert!(cfg.general.routing.escalate.is_none());
+
+        let text = r#"
+[general.laya]
+enabled = true
+routing = true
+
+[general.routing.lane_medium]
+endpoint = "local"
+model = "medium-model"
+
+[general.routing.escalate]
+endpoint = "anthropic"
+model = "big-model"
+reasoning_effort = "max"
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert_eq!(
+            cfg.general.routing.lane_medium.as_ref().unwrap().model,
+            "medium-model"
+        );
+        assert!(cfg.general.routing.lane_high.is_none());
+        assert_eq!(
+            cfg.general
+                .routing
+                .escalate
+                .as_ref()
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+
+        // Re-serialize + re-parse: every set rung survives, the unset one
+        // stays unset.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert_eq!(cfg2.general.routing.lane_medium.unwrap().endpoint, "local");
+        assert!(cfg2.general.routing.lane_high.is_none());
+        assert_eq!(cfg2.general.routing.escalate.unwrap().model, "big-model");
+
+        // A lane target alone counts as touched: the section is written.
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.routing.lane_high]
+endpoint = "ep"
+model = "m"
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.routing"));
+        assert!(text.contains("lane_high"));
+    }
+
+    #[test]
     fn routing_section_is_omitted_while_default_and_written_once_touched() {
         // Convention parity with [general.laya]: an untouched (default)
         // section is skipped in config.toml; touching one field writes only
@@ -1575,6 +1874,122 @@ enforce = true
         let back: GeneralConfig = toml::from_str(&text).unwrap();
         assert!(back.general.routing.enforce);
         assert!((back.general.routing.threshold - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn verify_defaults_inert_and_round_trips() {
+        // Harness-run verify is opt-in and INERT by default: no enabled
+        // flag, no command, no spawn — an absent [general.verify] section
+        // keeps today's behavior exactly.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.verify.enabled);
+        assert!(cfg.general.verify.test_command.is_empty());
+        assert_eq!(cfg.general.verify.timeout_secs, 300);
+
+        let text = r#"
+[general.verify]
+enabled = true
+test_command = "cargo test"
+timeout_secs = 600
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.verify.enabled);
+        assert_eq!(cfg.general.verify.test_command, "cargo test");
+        assert_eq!(cfg.general.verify.timeout_secs, 600);
+
+        // Re-serialize + re-parse: every field survives.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.verify.enabled);
+        assert_eq!(cfg2.general.verify.test_command, "cargo test");
+        assert_eq!(cfg2.general.verify.timeout_secs, 600);
+    }
+
+    #[test]
+    fn verify_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [general.routing] / [general.laya]: an
+        // untouched (default) section is skipped in config.toml; touching
+        // one field writes only that field.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.verify"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.verify]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.verify"));
+        // The untouched command + timeout stay unwritten.
+        assert!(!text.contains("timeout_secs"));
+        assert!(!text.contains("test_command"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.verify.enabled);
+        assert_eq!(back.general.verify.timeout_secs, 300);
+    }
+
+    #[test]
+    fn budget_defaults_inert_and_round_trips() {
+        // The budget layer is opt-in and INERT by default: disabled, no
+        // token cap, the documented non-zero count defaults — an absent
+        // [general.budget] section fires no cap and changes nothing.
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        assert!(!cfg.general.budget.enabled);
+        assert_eq!(cfg.general.budget.max_tokens_per_plan, 0);
+        assert_eq!(cfg.general.budget.max_escalations_per_plan, 1);
+        assert_eq!(cfg.general.budget.max_retries_per_lane, 3);
+
+        let text = r#"
+[general.budget]
+enabled = true
+max_tokens_per_plan = 500000
+max_escalations_per_plan = 2
+max_retries_per_lane = 5
+"#;
+        let cfg: GeneralConfig = toml::from_str(text).unwrap();
+        assert!(cfg.general.budget.enabled);
+        assert_eq!(cfg.general.budget.max_tokens_per_plan, 500000);
+        assert_eq!(cfg.general.budget.max_escalations_per_plan, 2);
+        assert_eq!(cfg.general.budget.max_retries_per_lane, 5);
+
+        // Re-serialize + re-parse: every field survives.
+        let back = toml::to_string(&cfg).unwrap();
+        let cfg2: GeneralConfig = toml::from_str(&back).unwrap();
+        assert!(cfg2.general.budget.enabled);
+        assert_eq!(cfg2.general.budget.max_tokens_per_plan, 500000);
+        assert_eq!(cfg2.general.budget.max_escalations_per_plan, 2);
+        assert_eq!(cfg2.general.budget.max_retries_per_lane, 5);
+    }
+
+    #[test]
+    fn budget_section_is_omitted_while_default_and_written_once_touched() {
+        // Convention parity with [general.verify] / [general.routing]: an
+        // untouched (default) section is skipped in config.toml; touching
+        // one field writes only that field (the count defaults stay
+        // unwritten, so a minimal section stays minimal).
+        let cfg: GeneralConfig = toml::from_str("").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(!text.contains("general.budget"));
+
+        let cfg: GeneralConfig = toml::from_str(
+            r#"
+[general.budget]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("general.budget"));
+        assert!(!text.contains("max_tokens_per_plan"));
+        assert!(!text.contains("max_escalations_per_plan"));
+        assert!(!text.contains("max_retries_per_lane"));
+        let back: GeneralConfig = toml::from_str(&text).unwrap();
+        assert!(back.general.budget.enabled);
+        assert_eq!(back.general.budget.max_escalations_per_plan, 1);
+        assert_eq!(back.general.budget.max_retries_per_lane, 3);
     }
 
     #[test]
@@ -2205,6 +2620,8 @@ chat_hover_timestamps = true
                 bundled_embedding_model: None,
                 laya: LayaConfig::default(),
                 routing: RoutingConfig::default(),
+                verify: VerifyConfig::default(),
+                budget: BudgetConfig::default(),
                 optimizer: OptimizerConfig::default(),
                 enable_browser_inspection: false,
                 codegraph: true,

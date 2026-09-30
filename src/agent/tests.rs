@@ -1275,7 +1275,7 @@ async fn error_recovery_malformed_json() {
     );
 
     // The re-injected assistant message must carry VALID tool-call
-    // arguments Î“Ã‡Ã¶ otherwise the broken arguments get serialized into the
+    // arguments — otherwise the broken arguments get serialized into the
     // next request body and the gateway rejects it (400 "Unterminated
     // string") when it parses the `arguments` field. The malformed
     // arguments are sanitized to "{}".
@@ -2270,7 +2270,7 @@ async fn bad_json_aborts_at_higher_cap() {
 
 #[tokio::test]
 async fn create_plan_never_needs_approval() {
-    // create_plan is AutoRun Î“Ã‡Ã¶ even in ApproveEachAction mode, it must run
+    // create_plan is AutoRun — even in ApproveEachAction mode, it must run
     // without an approval prompt (otherwise the agent is stuck unable to act).
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
@@ -2322,7 +2322,7 @@ async fn create_plan_never_needs_approval() {
         .await
         .unwrap();
 
-    // Drain events Î“Ã‡Ã¶ none should be an ApprovalRequest.
+    // Drain events — none should be an ApprovalRequest.
     let mut saw_approval = false;
     while let Ok(Some((_id, event))) =
         tokio::time::timeout(std::time::Duration::from_millis(100), fanin_rx.recv()).await
@@ -2445,7 +2445,7 @@ async fn git_merge_prompts_even_in_autonomous_mode() {
 #[tokio::test]
 async fn run_turn_records_session_id_on_tool_events() {
     // Verify that passing a real session_id into run_turn causes the
-    // working-memory tool event to be tagged with that session_id Î“Ã‡Ã¶
+    // working-memory tool event to be tagged with that session_id —
     // without it, consolidation is a no-op.
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "file contents").unwrap();
@@ -2784,7 +2784,7 @@ async fn run_turn_records_request_stats_on_usage() {
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
 
-    // First turn Î“Ã‡Ã¶ start a real session so session_stats has metadata
+    // First turn — start a real session so session_stats has metadata
     // to look up. Normally AgentTask does this; here we do it directly.
     let session = store.start_session("test").await.unwrap();
     agent.set_session_id(session.id.clone());
@@ -2886,7 +2886,7 @@ async fn run_turn_records_request_stats_on_usage() {
 async fn cache_heuristic_skipped_after_summarization() {
     // Regression for the over-reporting finding: after a context
     // summarization the conversation prefix is rewritten, so the
-    // min(prev, curr) cache heuristic must NOT be applied Î“Ã‡Ã¶ the next
+    // min(prev, curr) cache heuristic must NOT be applied — the next
     // request has no large shared-prefix cache to estimate and should
     // report cached_tokens = 0 (not min of the pre-summary sizes).
     let dir = tempdir().unwrap();
@@ -2947,7 +2947,7 @@ async fn cache_heuristic_skipped_after_summarization() {
         ],
     ]));
 
-    // max_context = 100, fill_rate 0.5 Î“Ã¥Ã† summarize_at = 50 tokens. The 9
+    // max_context = 100, fill_rate 0.5 → summarize_at = 50 tokens. The 9
     // messages each carry >6 tokens, so the threshold trips on the 2nd turn.
     let agent = AgentLoop::new(
         AgentLoopConfig {
@@ -2981,7 +2981,7 @@ async fn cache_heuristic_skipped_after_summarization() {
 
     // Grow the conversation past the threshold (and past keep_recent + 1)
     // so the SECOND turn triggers a real summarization before its main
-    // request. Each message carries >6 tokens; 8+ messages Î“Ã§Ã† over 50.
+    // request. Each message carries >6 tokens; 8+ messages ⇒ over 50.
     while messages.len() < 9 {
         messages.push(Message::user_text(
             "additional conversation content with enough tokens to pass the threshold",
@@ -3213,7 +3213,7 @@ async fn constitution_reread_after_agent_md_edit() {
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
 
-    // Turn 1 Î“Ã‡Ã¶ the v1 rules should be in the system prompt.
+    // Turn 1 — the v1 rules should be in the system prompt.
     let mut messages = vec![Message::user_text("hi")];
     agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
@@ -3229,7 +3229,7 @@ async fn constitution_reread_after_agent_md_edit() {
     std::fs::write(&ppath, "PROJECT-RULE-V2-NEW").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    // Turn 2 Î“Ã‡Ã¶ the new rule must appear (re-read from disk).
+    // Turn 2 — the new rule must appear (re-read from disk).
     let mut messages2 = vec![Message::user_text("again")];
     agent
         .run_turn(&mut messages2, &fanin_tx, 1, &mut cmd_rx, None)
@@ -4778,7 +4778,7 @@ async fn safety_rule_auto_approves_in_approve_each_mode() {
         .await
         .unwrap();
 
-    // Drain events Î“Ã‡Ã¶ none should be an ApprovalRequest (the rule
+    // Drain events — none should be an ApprovalRequest (the rule
     // auto-approved the call).
     let mut saw_approval = false;
     let mut saw_tool_result = false;
@@ -4826,7 +4826,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    // A rule for "ok.txt" Î“Ã‡Ã¶ but the call writes "other.txt".
+    // A rule for "ok.txt" — but the call writes "other.txt".
     let safety_path = dir.path().join("safety.toml");
     let safety_rules = Arc::new(crate::safety_rules::SafetyRules::new(&safety_path).unwrap());
     safety_rules
@@ -4869,7 +4869,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
     .with_safety_rules(safety_rules);
 
     let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
-    // A command channel that never answers Î“Ã‡Ã¶ the approval will hang until
+    // A command channel that never answers — the approval will hang until
     // the channel closes (ChannelClosed), which is fine; we just need to
     // observe that an ApprovalRequest was emitted.
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
@@ -4940,8 +4940,8 @@ async fn describe_image_errors_when_no_vision_client() {
 #[test]
 fn is_multimodal_reflects_provider_caps() {
     // is_multimodal() must reflect the provider's capability set. A mock
-    // provider with multimodal=false Î“Ã¥Ã† is_multimodal() == false; with
-    // multimodal=true Î“Ã¥Ã† true.
+    // provider with multimodal=false → is_multimodal() == false; with
+    // multimodal=true → true.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -13721,6 +13721,11 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
         match target {
             model_routing::RouteTarget::Cheap => self.cheap.clone(),
             model_routing::RouteTarget::Capable => self.capable.clone(),
+            // The lane rungs get canned targets with the lane tests (backlog
+            // ad56c7bd); until then a rung resolves to nothing here.
+            model_routing::RouteTarget::Medium
+            | model_routing::RouteTarget::High
+            | model_routing::RouteTarget::Escalate => None,
         }
     }
 
@@ -14365,5 +14370,1320 @@ async fn hard_stop_synthesis_marks_not_run_results_as_errors() {
     assert_eq!(
         terminal_events, 2,
         "one terminal ToolResult event per unrun call"
+    );
+}
+
+// --- Escalation lane ladder (backlog ad56c7bd) ------------------------------
+
+/// A classifier for the REFLEX question set (backlog a8495cc1): answers the
+/// three compound questions from canned labels and counts one call per PASS —
+/// a pass is one `classify_many`, the ladder's unit of classification.
+struct ReflexStubClassifier {
+    complexity: String,
+    action: String,
+    confidence: f64,
+    passes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Classifier for ReflexStubClassifier {
+    async fn classify(&self, _state: &str, _question: &Question) -> Option<Answer> {
+        // The ladder never asks single questions; a single ask would mean the
+        // wiring fell back to the non-batched path, so answer nothing.
+        None
+    }
+
+    async fn classify_many(
+        &self,
+        _state: &str,
+        questions: &[(&str, Question)],
+    ) -> Vec<Option<Answer>> {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        questions
+            .iter()
+            .map(|(_key, question)| {
+                let label = match question {
+                    // The complexity question's criteria carries the smallest
+                    // label; the action question's carries `continue`. The
+                    // remaining (risk) question answers the safe label.
+                    Question::Choice { criteria, .. } if criteria.contains_key("small") => {
+                        self.complexity.clone()
+                    }
+                    Question::Choice { criteria, .. } if criteria.contains_key("continue") => {
+                        self.action.clone()
+                    }
+                    _ => "none".to_string(),
+                };
+                Some(Answer::Choice {
+                    label,
+                    confidence: self.confidence,
+                    probabilities: std::collections::BTreeMap::new(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The reflex handle for a lane test: the canned classifier on the shared slot,
+/// the enable flag set, logging to a tempdir file (never the real corpus).
+fn reflex_handle(
+    classifier: Arc<ReflexStubClassifier>,
+    enabled: bool,
+    log_path: std::path::PathBuf,
+) -> crate::agent::reflex::ReflexHandle {
+    let classifier: Arc<dyn Classifier> = classifier;
+    crate::agent::reflex::ReflexHandle::new(
+        Arc::new(std::sync::RwLock::new(Some(classifier))),
+        Arc::new(std::sync::atomic::AtomicBool::new(enabled)),
+    )
+    .with_log_path(log_path)
+}
+
+/// A lane-only resolver: the pre-prompt path declines (`resolve` → None, no
+/// cheap/capable targets), while the three escalation rungs answer with the
+/// configured models. No HTTP client is ever built.
+struct LaneStubResolver {
+    policy: Option<model_routing::RoutingPolicy>,
+    lane_medium: Option<crate::config::ModelRef>,
+    lane_high: Option<crate::config::ModelRef>,
+    escalate: Option<crate::config::ModelRef>,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for LaneStubResolver {
+    fn resolve(
+        &self,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        None
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.policy
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        _ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        match target {
+            // The lane tests never configure the pre-prompt targets.
+            model_routing::RouteTarget::Cheap | model_routing::RouteTarget::Capable => None,
+            model_routing::RouteTarget::Medium => self.lane_medium.clone(),
+            model_routing::RouteTarget::High => self.lane_high.clone(),
+            model_routing::RouteTarget::Escalate => self.escalate.clone(),
+        }
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        _fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        Some((
+            routed_provider(&model.model, &format!("from-{}", model.model)),
+            context::ContextManager::new(128_000, 0.5),
+        ))
+    }
+}
+
+/// Build a lane test agent over an EXISTING workflow handle — the seam the
+/// plan-identity regression test needs to push a second plan mid-run.
+fn lane_agent_with_workflow(
+    dir: &std::path::Path,
+    workflow: Arc<tokio::sync::Mutex<Workflow>>,
+    default_provider: Arc<dyn LlmClient>,
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
+    gate: model_routing::RoutingGate,
+    reflex: crate::agent::reflex::ReflexHandle,
+) -> AgentLoop {
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(default_provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_model_resolver(resolver)
+    .with_routing_gate(gate)
+    .with_reflex(reflex)
+}
+
+/// Build a lane test agent: the workflow starts with an ACTIVE plan (one
+/// unchecked step, titled `Lane plan`), the default provider serves unless a
+/// lane fires, and the reflex handle carries the canned classifier.
+fn lane_agent(
+    dir: &std::path::Path,
+    default_provider: Arc<dyn LlmClient>,
+    resolver: Arc<dyn crate::model_resolver::ModelResolver>,
+    gate: model_routing::RoutingGate,
+    reflex: crate::agent::reflex::ReflexHandle,
+    steps: &[&str],
+) -> AgentLoop {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    // The ladder resolves a STEP: the plan must be live before the turn runs.
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            steps.iter().map(|s| s.to_string()).collect(),
+        )
+        .expect("plan created");
+    lane_agent_with_workflow(dir, workflow, default_provider, resolver, gate, reflex)
+}
+
+/// Drive one turn and hand back the fan-in receiver so the caller can inspect
+/// the `ModelChanged` events a lane switch emits.
+async fn run_lane_turn(
+    agent: &AgentLoop,
+    prompt: &str,
+) -> (
+    TurnOutcome,
+    mpsc::Receiver<(crate::runtime::AgentId, AgentEvent)>,
+) {
+    let (fanin_tx, fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    let outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .expect("turn completes");
+    drop(fanin_tx);
+    (outcome, fanin_rx)
+}
+
+/// Build a budget test agent over an EXISTING workflow handle (backlog
+/// a25a5323) — no lane machinery needed: the cap gate is independent of the
+/// reflex handle and the routing gate.
+fn budget_agent(
+    dir: &std::path::Path,
+    workflow: Arc<tokio::sync::Mutex<Workflow>>,
+    provider: Arc<dyn LlmClient>,
+    cfg: crate::config::BudgetConfig,
+) -> AgentLoop {
+    let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    )
+    .with_budget_config(Arc::new(std::sync::RwLock::new(cfg)))
+}
+
+/// A budget test workflow with one ACTIVE plan (one unchecked step) — and the
+/// live plan id, which counter seeding must match (`note_plan` resets on a
+/// mismatched id).
+fn budget_workflow(dir: &std::path::Path) -> (Arc<tokio::sync::Mutex<Workflow>>, String) {
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.join("plans"))));
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Budget plan",
+            "goal",
+            "context",
+            vec!["Step 1".to_string()],
+        )
+        .expect("plan created");
+    let plan_id = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .plan_id()
+        .expect("a live plan")
+        .to_string();
+    (workflow, plan_id)
+}
+
+/// Drive one turn while answering the FIRST budget question the loop emits
+/// (backlog a25a5323). Returns the outcome, the emitted question texts (empty
+/// when the turn never paused), and the non-question events.
+async fn run_budget_turn(
+    agent: &AgentLoop,
+    prompt: &str,
+    answer: crate::runtime::UserAnswer,
+) -> (TurnOutcome, Vec<String>, Vec<AgentEvent>) {
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text(prompt)];
+    let mut answer = Some(answer);
+    let mut questions = Vec::new();
+    let mut events = Vec::new();
+    let turn = agent.run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None);
+    tokio::pin!(turn);
+    let outcome = loop {
+        tokio::select! {
+            result = &mut turn => break result.expect("turn completes"),
+            event = fanin_rx.recv() => {
+                if let Some((_id, event)) = event {
+                    if let AgentEvent::UserQuestion {
+                        question,
+                        responder,
+                        ..
+                    } = event
+                    {
+                        questions.push(question);
+                        if let Some(answer) = answer.take() {
+                            let _ = responder.send(answer);
+                        }
+                    } else {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+    };
+    (outcome, questions, events)
+}
+
+#[tokio::test]
+async fn budget_cap_pauses_the_plan_and_a_bypass_continues_the_turn() {
+    // Backlog a25a5323: a reached cap PAUSES the plan through a pending
+    // question — never a hard kill. Answering "continue" resumes the SAME
+    // turn with cap checks off for this plan.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 10,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    // Counters AT the cap: seed AFTER reading the live plan id (any other id
+    // would reset them).
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(10, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    // The pause asked with REAL numbers, and the turn ran on after the answer.
+    assert_eq!(questions.len(), 1, "exactly one pause: {questions:?}");
+    assert!(
+        questions[0].contains("spent 10 tokens (cap 10)"),
+        "the question cites the real spend: {questions:?}"
+    );
+    assert!(outcome.stop_reason.is_none());
+    assert!(
+        !outcome.text.is_empty(),
+        "the provider ran after the bypass answer"
+    );
+    // "Continue" turned cap checks off for this plan...
+    assert!(agent.with_plan_spend(|spend| spend.bypassed));
+    // ...and the plan was never killed: still live, still Executing.
+    let wf = workflow.lock().await;
+    assert_eq!(wf.plan_id().as_deref(), Some(plan_id.as_str()));
+    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+}
+
+#[tokio::test]
+async fn budget_cap_end_turn_answer_leaves_the_plan_paused_and_resumable() {
+    // The third answer ends the turn EARLY — before any request goes out —
+    // and leaves the plan exactly as it was: live, Executing, resumable.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "must not run");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 10,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(10, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 2 },
+    )
+    .await;
+
+    assert_eq!(questions.len(), 1, "{questions:?}");
+    // No request reached the provider — the turn ended at the gate.
+    assert!(outcome.text.is_empty(), "{}", outcome.text);
+    assert_eq!(outcome.tool_calls_made, 0);
+    assert!(outcome.stop_reason.is_none());
+    // The plan is still live and Executing — paused, never killed.
+    let wf = workflow.lock().await;
+    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert!(
+        wf.plan_id().is_some(),
+        "the plan survives the end-turn answer"
+    );
+}
+
+#[tokio::test]
+async fn disabled_budget_never_asks_and_never_counts() {
+    // The inert default (no `with_budget_config`): no question, no counter
+    // touched — the turn runs exactly as before the layer existed, even with
+    // seeded spend far past any cap.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    agent.with_plan_spend(|spend| {
+        spend.note_plan(&plan_id);
+        spend.note_tokens(1_000_000, 0);
+    });
+
+    let (outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    assert!(
+        questions.is_empty(),
+        "a disabled budget never pauses: {questions:?}"
+    );
+    assert!(!outcome.text.is_empty());
+    assert!(!agent.with_plan_spend(|spend| spend.bypassed));
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.total_tokens()),
+        1_000_000,
+        "the disabled gate leaves the counters alone"
+    );
+}
+
+#[tokio::test]
+async fn the_pending_lane_retry_lands_on_the_live_step_at_the_gate() {
+    // A failed-cycle retry (flagged by `note_lane_escalation` via the triage
+    // sites) is counted against the step that runs next — the counter the
+    // retry cap reads. The flag is one-shot: a later gate run adds nothing.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let step_index = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .current_step()
+        .expect("a live step")
+        .index;
+    let provider: Arc<dyn LlmClient> = routed_provider("default-model", "ran on");
+    let agent = budget_agent(
+        dir.path(),
+        workflow.clone(),
+        provider,
+        crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        },
+    );
+    agent.with_plan_spend(|spend| spend.note_plan(&plan_id));
+    agent.set_pending_lane_retry();
+
+    let (_outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+
+    assert!(questions.is_empty(), "under every cap: no pause");
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index).copied()),
+        Some(1),
+        "the failed cycle counts against the live step"
+    );
+    // One-shot: the next turn's gate adds nothing.
+    let (_outcome2, _q2, _e2) = run_budget_turn(
+        &agent,
+        "again",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index).copied()),
+        Some(1)
+    );
+}
+
+/// Poll the store for `n` spend rows on `plan_id` (the row write is
+/// fire-and-forget, mirroring the stats recorder) — a hard deadline keeps a
+/// regression failing instead of hanging.
+async fn wait_for_spend_rows(
+    store: &Arc<dyn crate::memory::MemoryStoreTrait>,
+    plan_id: &str,
+    n: usize,
+) -> Vec<crate::memory::SpendEvent> {
+    for _ in 0..100 {
+        let rows = store.spend_rows_for_plan(plan_id).await.unwrap();
+        if rows.len() >= n {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    store.spend_rows_for_plan(plan_id).await.unwrap()
+}
+
+/// An in-memory store for the spend-ledger tests.
+fn spend_store() -> Arc<dyn crate::memory::MemoryStoreTrait> {
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    Arc::new(MemoryStore::open_in_memory(embedder).unwrap())
+}
+
+/// A usage-REPORTING provider: the spend ledger only writes on REAL usage, so
+/// the ledger tests must serve requests that report tokens (the routing stubs
+/// emit text only).
+fn usage_provider(prompt_tokens: u32, completion_tokens: u32, cached: u32) -> Arc<dyn LlmClient> {
+    Arc::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "ran".into(),
+        },
+        LlmEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens: 0,
+            cached_tokens: cached,
+            ttft_ms: Some(50),
+            generation_ms: Some(120),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]]))
+}
+
+#[tokio::test]
+async fn spend_rows_carry_the_plan_step_and_real_usage() {
+    // Backlog a25a5323: every main plan request records ONE per-decision row
+    // with the real usage — plan, step, reason and tokens — regardless of the
+    // budget flag (the flag gates only the caps).
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(
+        usage_provider(1_200, 50, 800),
+        registry,
+        workflow.clone(),
+        sandbox,
+    );
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default());
+
+    let (outcome, _questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(!outcome.text.is_empty(), "the provider served the turn");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.plan_id, plan_id);
+    assert_eq!(row.step_index, Some(0));
+    assert_eq!(row.reason, "default", "no lane decision applied");
+    assert!(row.lane.is_none());
+    assert_eq!(row.tokens_in, 1_200);
+    assert_eq!(row.tokens_out, 50);
+    assert_eq!(row.cached_tokens, Some(800));
+    assert!(row.turn_id.is_some(), "rows join the routing logs by turn id");
+}
+
+#[tokio::test]
+async fn spend_rows_mark_the_failed_cycle_retry() {
+    // A pending failed-cycle retry makes the next request's row reason=retry,
+    // and the cap gate counts the same fact against the live step — the
+    // ledger and the caps read one truth.
+    let dir = tempdir().unwrap();
+    let (workflow, plan_id) = budget_workflow(dir.path());
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(
+        usage_provider(500, 20, 0),
+        registry,
+        workflow.clone(),
+        sandbox,
+    );
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default())
+        .with_budget_config(Arc::new(std::sync::RwLock::new(crate::config::BudgetConfig {
+            enabled: true,
+            max_tokens_per_plan: 0,
+            max_escalations_per_plan: 1,
+            max_retries_per_lane: 3,
+        })));
+    agent.with_plan_spend(|spend| spend.note_plan(&plan_id));
+    agent.set_pending_lane_retry();
+
+    let (_outcome, questions, _events) = run_budget_turn(
+        &agent,
+        "work the plan",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(questions.is_empty(), "under every cap: no pause");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].reason, "retry");
+    assert_eq!(rows[0].tokens_in, 500);
+    let step_index = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .current_step()
+        .map(|s| s.index);
+    assert_eq!(
+        agent.with_plan_spend(|spend| spend.lane_retries.get(&step_index.unwrap()).copied()),
+        Some(1),
+        "the gate counted the same failed cycle"
+    );
+}
+
+#[tokio::test]
+async fn a_planless_turn_never_consumes_a_stale_spend_attribution() {
+    // Regression (round-1 finding L1, backlog a25a5323): a request that
+    // reports no usage leaves its stamp in the slot; the next PLANLESS turn
+    // must clear it rather than write a phantom row billed to a finished plan
+    // (and re-key the live counters to a dead plan id). The counters update
+    // inline; the durable row lands on a spawned task, so the store assertion
+    // settles first.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(usage_provider(700, 30, 0), registry, workflow, sandbox);
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default());
+    // An unconsumed stamp from an earlier errored request on a plan that has
+    // since gone away.
+    agent.set_spend_attribution(crate::agent::budget::SpendAttribution {
+        plan_id: "dead-plan".into(),
+        turn_id: "turn-x".into(),
+        step_index: Some(0),
+        lane: Some("medium".into()),
+        reason: crate::agent::budget::BudgetReason::Route,
+    });
+
+    let (outcome, _questions, _events) = run_budget_turn(
+        &agent,
+        "just chatting",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(!outcome.text.is_empty(), "the provider served the turn");
+
+    // Deterministic: the counters were never re-keyed to the dead plan.
+    assert_eq!(agent.with_plan_spend(|spend| spend.total_tokens()), 0);
+    assert_eq!(agent.with_plan_spend(|spend| spend.plan_id.clone()), None);
+    // Let any spawned ledger write land, then assert none was made.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        store
+            .spend_rows_for_plan("dead-plan")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a planless turn must not consume a stale stamp"
+    );
+}
+
+/// A lane resolver that serves the MEDIUM lane with a usage-REPORTING
+/// provider (the routed spend-row test needs real tokens from the lane that
+/// actually served); everything else delegates to the standard stub.
+struct LaneUsageResolver {
+    inner: LaneStubResolver,
+    medium_provider: Arc<dyn LlmClient>,
+}
+
+#[async_trait::async_trait]
+impl crate::model_resolver::ModelResolver for LaneUsageResolver {
+    fn resolve(
+        &self,
+        ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve(ctx)
+    }
+
+    fn routing_policy(&self) -> Option<model_routing::RoutingPolicy> {
+        self.inner.routing_policy()
+    }
+
+    fn resolve_routed(
+        &self,
+        target: model_routing::RouteTarget,
+        ctx: crate::model_resolver::ModelContext<'_>,
+    ) -> Option<crate::config::ModelRef> {
+        self.inner.resolve_routed(target, ctx)
+    }
+
+    fn build_turn_provider(
+        &self,
+        model: &crate::config::ModelRef,
+        fill_rate: f64,
+    ) -> Option<(Arc<dyn LlmClient>, context::ContextManager)> {
+        if model.model == "medium-model" {
+            return Some((
+                self.medium_provider.clone(),
+                context::ContextManager::new(128_000, 0.5),
+            ));
+        }
+        self.inner.build_turn_provider(model, fill_rate)
+    }
+}
+
+#[tokio::test]
+async fn spend_rows_follow_the_enforced_lane_switch() {
+    // The ledger's lane-switch acceptance (backlog a25a5323): an ENFORCED
+    // medium-lane iteration records the row with the lane and reason that
+    // priced it — plus the real tokens the lane provider reported.
+    let dir = tempdir().unwrap();
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        dir.path().join("reflex.jsonl"),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        dir.path().join("routing.jsonl"),
+    );
+    let resolver = Arc::new(LaneUsageResolver {
+        inner: LaneStubResolver {
+            policy: Some(model_routing::RoutingPolicy {
+                threshold: 0.80,
+                enforce: true,
+            }),
+            lane_medium: Some(stub_model_ref("medium-model")),
+            lane_high: None,
+            escalate: None,
+        },
+        medium_provider: usage_provider(900, 40, 0),
+    });
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".to_string()],
+        )
+        .expect("plan created");
+    let plan_id = workflow
+        .try_lock()
+        .expect("fresh workflow")
+        .plan_id()
+        .expect("a live plan")
+        .to_string();
+    let store = spend_store();
+    let mut agent = lane_agent_with_workflow(
+        dir.path(),
+        workflow.clone(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+    );
+    agent.memory = Some(store.clone());
+
+    let (outcome, _fanin) = run_lane_turn(&agent, "work the next plan step").await;
+    assert_eq!(outcome.text, "ran", "the medium lane served the step");
+
+    let rows = wait_for_spend_rows(&store, &plan_id, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.reason, "route", "a lane decision priced the request");
+    assert_eq!(row.lane.as_deref(), Some("medium"));
+    assert_eq!(row.model, "mock", "the provider that actually served");
+    assert_eq!(row.tokens_in, 900);
+    assert_eq!(row.tokens_out, 40);
+    assert_eq!(row.step_index, Some(0));
+}
+
+/// The harness-run verify handle for a loop test (see
+/// [`crate::agent::step_verify`]): the shared config handle + the default
+/// optimizer config, rooted at `root`.
+fn step_verify_handle(
+    enabled: bool,
+    command: &str,
+    root: &std::path::Path,
+) -> crate::agent::step_verify::StepVerifyHandle {
+    let cfg = Arc::new(std::sync::RwLock::new(crate::config::VerifyConfig {
+        enabled,
+        test_command: command.to_string(),
+        timeout_secs: 60,
+    }));
+    let optimizer = Arc::new(std::sync::RwLock::new(
+        crate::config::OptimizerConfig::default(),
+    ));
+    crate::agent::step_verify::StepVerifyHandle::new(cfg, optimizer).with_root(root.to_path_buf())
+}
+
+#[tokio::test]
+async fn lane_verify_action_re_runs_the_checks_and_rides_the_note_on_the_tail() {
+    // The action=verify wiring (the cost-saving chain's verification item): a
+    // decided `verify` makes the HARNESS re-run the configured checks and the
+    // compact evidence note rides the next request's volatile tail — no model
+    // roundtrip spent deciding to run them. Shadow mode (enforce off) proves
+    // it is evidence, not routing.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "verify".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = lane_agent(
+        dir.path(),
+        provider,
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    )
+    .with_step_verify(step_verify_handle(true, "echo ok", dir.path()));
+
+    let (_outcome, _rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    let tails = recorder.request_tails();
+    assert!(
+        tails
+            .iter()
+            .any(|tail| tail.contains("[verify] `echo ok` — passed (exit 0)")),
+        "the evidence note must ride the volatile tail: {tails:?}"
+    );
+}
+
+#[tokio::test]
+async fn lane_verify_action_without_a_handle_stashes_no_note() {
+    // The action is inert without the handle: no checks run, no note, and the
+    // tail stays byte-identical to a ladder-free turn.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "verify".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let recorder = Arc::new(RecordingProvider::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta {
+            text: "done".into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]])));
+    let provider: Arc<dyn LlmClient> = recorder.clone();
+    let agent = lane_agent(
+        dir.path(),
+        provider,
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (_outcome, _rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    let tails = recorder.request_tails();
+    assert!(
+        !tails.iter().any(|tail| tail.contains("[verify]")),
+        "no handle must mean no note: {tails:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_note_is_one_shot() {
+    // The request seam DRAINS the note, so it is delivered exactly once and
+    // the volatile tail stays byte-identical when the slot is empty.
+    let dir = tempdir().unwrap();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let agent = AgentLoop::new(
+        test_config(routed_provider("m", "from-m"), registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    agent.set_verify_note("the evidence note".to_string());
+    assert_eq!(agent.take_verify_note().as_deref(), Some("the evidence note"));
+    assert_eq!(agent.take_verify_note(), None, "one-shot by construction");
+}
+
+#[tokio::test]
+async fn lane_enforced_medium_serves_the_step_and_announces_the_switch() {
+    // The acceptance path: the ladder is armed (reflex on + routing opted in +
+    // enforce), the reflex call answers `medium`, and the medium lane target
+    // is configured -> the iteration runs on that model and the switch is
+    // announced so the tab's model label follows.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, mut fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(
+        outcome.text, "from-medium-model",
+        "the medium lane must serve the step"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        events.iter().any(|(model, _)| model == "medium-model"),
+        "a mid-run lane switch must be announced: {events:?}"
+    );
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one compound pass per step per attempt"
+    );
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("a lane decision row");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert_eq!(lane.label, "medium");
+    assert_eq!(lane.target.as_deref(), Some("medium"));
+    assert_eq!(lane.step_index, Some(0));
+    assert!(!lane.shadow);
+    assert!(lane.enforced);
+    assert_eq!(lane.model.as_deref(), Some("stub/medium-model"));
+
+    let corpus = std::fs::read_to_string(&reflex_log).expect("reflex corpus row");
+    assert!(
+        corpus.contains("medium"),
+        "the compound decision is logged: {corpus}"
+    );
+}
+
+#[tokio::test]
+async fn lane_shadow_logs_the_decision_but_never_switches_the_model() {
+    // Shadow-first (enforce off): the ladder classifies and logs, and the
+    // model is byte-identical to a ladder-free turn.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: false,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, mut fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default", "shadow never switches a model");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "shadow still classifies -- the corpus is what validates the ladder"
+    );
+    let events = take_model_changed(&mut fanin_rx);
+    assert!(
+        events.iter().all(|(model, _)| model != "medium-model"),
+        "shadow must not announce the lane model: {events:?}"
+    );
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("a lane decision row");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert!(lane.shadow);
+    assert!(!lane.enforced);
+    assert!(lane.model.is_none());
+}
+
+#[tokio::test]
+async fn lane_reflex_flag_off_never_asks_the_classifier() {
+    // The `[general.laya] reflex` opt-in is off: zero classifier calls, no
+    // corpus row, no lane row, and the model selection is untouched.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        false,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "flag off = zero classifier calls"
+    );
+    assert!(!reflex_log.exists(), "no corpus without the opt-in");
+    let (decisions, _) = read_routing_log(&routing_log);
+    assert!(
+        decisions.iter().all(|row| row.lane.is_none()),
+        "no lane rows without the opt-in"
+    );
+}
+
+#[tokio::test]
+async fn lane_routing_flag_off_never_asks_the_classifier() {
+    // The `[general.laya] routing` opt-in is off (no policy): the ladder must
+    // not classify either -- one gate, both routing layers.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: None,
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(outcome.text, "from-default");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no routing policy = no lane classification"
+    );
+    assert!(!reflex_log.exists());
+}
+
+#[tokio::test]
+async fn lane_without_a_target_falls_through_without_error() {
+    // The rung is selected but its target is UNSET: the ladder records the
+    // rung and keeps the configured model (the fail-safe -- never a built-in
+    // model id, never an error).
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: None,
+        lane_high: None,
+        escalate: None,
+    });
+    let agent = lane_agent(
+        dir.path(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+        &["classify the step"],
+    );
+
+    let (outcome, _fanin_rx) = run_lane_turn(&agent, "work the next plan step").await;
+
+    assert_eq!(
+        outcome.text, "from-default",
+        "an unset lane target keeps the turn's configured model"
+    );
+    assert_eq!(passes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    let (decisions, _) = read_routing_log(&routing_log);
+    let lane = decisions
+        .iter()
+        .find(|row| row.lane.is_some())
+        .expect("the rung is still recorded");
+    assert_eq!(lane.lane.as_deref(), Some("medium"));
+    assert!(!lane.enforced, "an unarmed rung is not enforced");
+    assert!(lane.model.is_none());
+}
+
+#[tokio::test]
+async fn lane_memo_is_fresh_for_a_new_plan_that_repeats_the_title() {
+    // Review finding L1 (backlog ad56c7bd): the memo keys a plan by its ID, so
+    // a second plan carrying the SAME title — entering the same step index
+    // under an unchanged escalation epoch — must classify its own first
+    // attempt instead of reusing its predecessor's decision.
+    let dir = tempdir().unwrap();
+    let routing_log = dir.path().join("routing.jsonl");
+    let reflex_log = dir.path().join("reflex.jsonl");
+    let passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reflex = reflex_handle(
+        Arc::new(ReflexStubClassifier {
+            complexity: "medium".into(),
+            action: "continue".into(),
+            confidence: 0.9,
+            passes: passes.clone(),
+        }),
+        true,
+        reflex_log.clone(),
+    );
+    let gate = routing_gate(
+        None,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        routing_log.clone(),
+    );
+    let resolver = Arc::new(LaneStubResolver {
+        policy: Some(model_routing::RoutingPolicy {
+            threshold: 0.80,
+            enforce: true,
+        }),
+        lane_medium: Some(stub_model_ref("medium-model")),
+        lane_high: None,
+        escalate: None,
+    });
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".into()],
+        )
+        .expect("plan created");
+    let agent = lane_agent_with_workflow(
+        dir.path(),
+        workflow.clone(),
+        routed_provider("default-model", "from-default"),
+        resolver,
+        gate,
+        reflex,
+    );
+
+    let (first, _rx) = run_lane_turn(&agent, "work the first plan").await;
+    assert_eq!(first.text, "from-medium-model");
+    assert_eq!(passes.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+    // A SECOND plan with the SAME title and the same step index: only its
+    // generated id differs — exactly what the memo must key on.
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Lane plan",
+            "goal",
+            "context",
+            vec!["classify the step".into()],
+        )
+        .expect("second plan created");
+
+    let (second, _rx) = run_lane_turn(&agent, "work the second plan").await;
+    assert_eq!(second.text, "from-medium-model");
+    assert_eq!(
+        passes.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "a new plan must classify again, never reuse the previous plan's memo"
     );
 }

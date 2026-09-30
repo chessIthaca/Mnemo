@@ -2381,7 +2381,9 @@ mod tests {
         // The `Executing`-entry stamp falls back to the hand-stamped item
         // when no dispatch pointer names one.
         let stamp = fn_body(include_str!("run_all.rs"), "stamp_backlog_in_flight");
-        assert!(stamp.contains("chat_linkage_candidate(&store.items(), top_plan_id)"));
+        assert!(
+            stamp.contains("chat_linkage_candidate(&store.items(), top_plan_id, superseded_plan)")
+        );
         // The single-dispatch path auto-feeds only past a terminally
         // resolved item.
         assert!(single.contains("resolved_terminally"));
@@ -2821,7 +2823,7 @@ mod tests {
 
         // 1. The `Executing` fallback finds the hand-stamped item...
         assert_eq!(
-            chat_linkage_candidate(&store.items(), Some("plan-chat")).as_deref(),
+            chat_linkage_candidate(&store.items(), Some("plan-chat"), None).as_deref(),
             Some(item.id.as_str())
         );
         // 2. ...but while it is UNLINKED the Done guard refuses it — the
@@ -2869,11 +2871,21 @@ mod tests {
         store.set_plan_id(&item.id, Some("plan-old"), Some("Abandoned plan"));
 
         // Its OWN plan entering again: already linked, nothing to re-link.
-        assert_eq!(chat_linkage_candidate(&store.items(), Some("plan-old")), None);
-        // A successor plan entering: the superseded item is claimed...
         assert_eq!(
-            chat_linkage_candidate(&store.items(), Some("plan-new")).as_deref(),
+            chat_linkage_candidate(&store.items(), Some("plan-old"), None),
+            None
+        );
+        // A successor plan entering WITH the abandonment evidence (the plan
+        // superseded this turn): the superseded item is claimed...
+        assert_eq!(
+            chat_linkage_candidate(&store.items(), Some("plan-new"), Some("plan-old")).as_deref(),
             Some(item.id.as_str())
+        );
+        // ...but a bare successor, with no abandonment evidence, must NOT
+        // claim it — that stale-link claim is bug 69093a21.
+        assert_eq!(
+            chat_linkage_candidate(&store.items(), Some("plan-new"), None),
+            None
         );
         // ...and re-linking makes it resolvable by the successor alone.
         assert!(store.set_plan_id(&item.id, Some("plan-new"), Some("Successor")));
@@ -2883,8 +2895,54 @@ mod tests {
         );
         assert_eq!(resolve_linkage_target(&store.items(), "plan-old"), None);
         // With no readable plan id, only the never-linked case is claimed.
-        assert_eq!(chat_linkage_candidate(&store.items(), None), None);
+        assert_eq!(chat_linkage_candidate(&store.items(), None, None), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_linkage_refuses_a_stale_foreign_link() {
+        // Regression 69093a21 (2027-01-11 run-all batch): the fallback
+        // claimed ANY mismatched plan link, so an item left InFlight on a
+        // plan that merely COMPLETED without resolving was adopted by the
+        // NEXT item's `Executing` entry and had its record overwritten
+        // with the new plan (a25a5323 gained 07ff4ea6, then f0758c0d,
+        // while the dispatched items never got their links). A link may
+        // only be superseded when the abandonment is evidenced — never on
+        // the strength of a stale foreign link.
+        let dir = unique_temp_dir("chat-stale-link");
+        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let item = store.add("stale item".into(), vec![]);
+        store.set_status(&item.id, BacklogStatus::InFlight, None);
+        store.set_plan_id(&item.id, Some("plan-done"), Some("Completed plan"));
+
+        assert_eq!(
+            chat_linkage_candidate(&store.items(), Some("plan-new"), None),
+            None,
+            "a foreign (completed) link must NOT be claimed by the fallback"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_pointer_falls_through_to_the_single_dispatch_item() {
+        // Regression 69093a21: while a run-all is armed BETWEEN items
+        // (`current_item == None`), the stamp read only the run-all
+        // pointer, so a single-dispatch item (`single_in_flight`) was
+        // shadowed; the fallback then adopted a stale InFlight item and
+        // the real item — Pending, its plan entering `Executing` — never
+        // got its link. The pointer read must fall through, and the
+        // fallback must receive the superseded-plan evidence.
+        let body = fn_body(include_str!("run_all.rs"), "stamp_backlog_in_flight");
+        assert!(
+            body.contains("run_current"),
+            "the run-all pointer must be read into a value that can fall \
+             through to single_in_flight (the bare match arm shadows it)"
+        );
+        assert!(
+            body.contains("superseded_plan"),
+            "the fallback must receive the superseded-plan evidence \
+             (chat_linkage_candidate gains the parameter)"
+        );
     }
 
     #[test]
@@ -7226,10 +7284,12 @@ async fn finish_captured_item_done(app: &tauri::AppHandle, state: &IpcState, id:
 /// `current_plan` is the plan now entering `Executing`:
 ///
 /// - an item with NO `plan_id` is the agent's own hand-stamp awaiting a plan;
-/// - an item linked to a DIFFERENT plan was linked to a plan that was
-///   abandoned and replaced, so this entry re-links it to the successor —
-///   the same refresh the dispatched path performs, so the linkage always
-///   names the plan the item's status derives from;
+/// - an item linked to the plan superseded THIS TURN (`superseded_plan` —
+///   the turn latch's abandoned plan id) is re-linked to its successor, the
+///   same refresh the dispatched path performs;
+/// - any OTHER link is stale and is never claimed (bug 69093a21: the old
+///   "any mismatched link" arm let the fallback overwrite a completed item's
+///   record);
 /// - with no readable plan id, only the unlinked case is claimed.
 ///
 /// Unambiguous answers only: exactly ONE live `InFlight` item qualifies. Zero
@@ -7255,13 +7315,14 @@ async fn finish_captured_item_done(app: &tauri::AppHandle, state: &IpcState, id:
 pub fn chat_linkage_candidate(
     items: &[mnemo::backlog::BacklogItem],
     current_plan: Option<&str>,
+    superseded_plan: Option<&str>,
 ) -> Option<String> {
     let mut candidates = items.iter().filter(|item| {
         item.deleted_at.is_none()
             && item.status == BacklogStatus::InFlight
             && match item.plan_id.as_deref() {
                 None => true,
-                Some(linked) => matches!(current_plan, Some(plan) if plan != linked),
+                Some(linked) => Some(linked) == superseded_plan && Some(linked) != current_plan,
             }
     });
     let candidate = candidates.next()?;
@@ -7316,42 +7377,56 @@ pub fn should_stamp_in_flight(prev: Option<WorkflowState>, new: WorkflowState) -
 /// repeated entries), while the linkage refreshes on every entry (a fresh
 /// plan replacing an abandoned one mid-dispatch re-links).
 ///
-/// The item is the dispatch pointer's when a dispatch is in flight; with no
-/// pointer (a chat-driven session — backlog 9e859618) it is the one
-/// hand-stamped `InFlight` item that is unlinked or still linked to a
-/// superseded plan, see [`chat_linkage_candidate`] (which re-links a
-/// superseded item to the plan now executing). Either way the linkage written
-/// here is what later lets a pointer-less session resolve `Done`
+/// The item is the dispatch pointer's when a dispatch is in flight — the
+/// run-all pointer first, falling through to the single-dispatch pointer
+/// (bug 69093a21: a bare run-all arm shadowed a live single dispatch while a
+/// run-all was armed between items); with no pointer (a chat-driven session
+/// — backlog 9e859618) it is the one hand-stamped `InFlight` item that is
+/// unlinked or linked to the plan superseded this turn, see
+/// [`chat_linkage_candidate`]. Either way the linkage written here is what
+/// later lets a pointer-less session resolve `Done`
 /// ([`resolve_linked_chat_item`]).
 ///
 /// The MAIN-agent gate lives at the call site (the forwarder owns the
 /// manager lock budget): child agents entering `Executing` must not stamp
 /// the main agent's item while it is still pre-planning.
-pub(crate) async fn stamp_backlog_in_flight(app: &tauri::AppHandle, top_plan_id: Option<&str>) {
+pub(crate) async fn stamp_backlog_in_flight(
+    app: &tauri::AppHandle,
+    top_plan_id: Option<&str>,
+    superseded_plan: Option<&str>,
+) {
     let state = app.state::<IpcState>();
-    // Run-All takes priority; then the single-dispatch in-flight pointer
-    // (read-only — resolution still consumes it).
-    let pointer = {
+    // Run-All takes priority; then the single-dispatch in-flight pointer —
+    // FALLING THROUGH when the run-all is armed between items
+    // (`current_item == None`): the bare `Some(r) => current_item` arm used
+    // to shadow a live `single_in_flight`, the fallback then adopted a stale
+    // item, and the really-dispatched one never got its link (bug 69093a21).
+    // (Both reads are read-only — resolution still consumes the pointers.)
+    let run_current = {
         let guard = state.backlog.run_all.lock().await;
-        match guard.as_ref() {
-            Some(r) => r
-                .current_item
+        guard.as_ref().and_then(|r| {
+            r.current_item
                 .lock()
                 .expect("current_item lock poisoned")
-                .clone(),
-            None => state
-                .backlog
-                .single_in_flight
-                .lock()
-                .expect("single_in_flight lock poisoned")
-                .clone(),
-        }
+                .clone()
+        })
     };
+    let pointer = run_current.or_else(|| {
+        state
+            .backlog
+            .single_in_flight
+            .lock()
+            .expect("single_in_flight lock poisoned")
+            .clone()
+    });
     let mut store = state.backlog.store.lock().await;
     // Chat-path fallback (backlog 9e859618): with no dispatch pointer, the
-    // item an agent stamped `InFlight` by hand — and which no plan has linked
-    // yet — is the only item this `Executing` entry can belong to.
-    let item_id = pointer.or_else(|| chat_linkage_candidate(&store.items(), top_plan_id));
+    // item an agent stamped `InFlight` by hand — unlinked, or linked to the
+    // plan superseded this turn — is the only item this `Executing` entry
+    // can belong to. Any other link is stale and is never overwritten
+    // (bug 69093a21).
+    let item_id =
+        pointer.or_else(|| chat_linkage_candidate(&store.items(), top_plan_id, superseded_plan));
     let Some(id) = item_id else {
         return;
     };

@@ -12,9 +12,13 @@
 
 use std::sync::{Arc, RwLock};
 
+use super::budget;
 use super::failure_triage;
 use super::model_routing;
-use crate::config::SafetyMode;
+use super::reflex;
+use super::step_lanes;
+use super::step_verify;
+use crate::config::{BudgetConfig, SafetyMode};
 use crate::error::Result;
 use crate::memory::MemoryStoreTrait;
 use crate::provider::{FinishReason, LlmClient};
@@ -398,6 +402,58 @@ pub struct AgentLoop {
     /// live config by the model resolver per turn, so no flag mirror is needed
     /// here.
     pub(crate) routing: Option<model_routing::RoutingGate>,
+    /// The optional compound-reflex handle (the Laya classifier's compound
+    /// decision layer, `[general.laya] reflex`, backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). Carries the
+    /// SAME shared classifier slot + the config-mirrored enable flag, both read
+    /// at every plan-step boundary; `None` in tests / unwired builds, where the
+    /// ladder never classifies and model selection stays byte-identical.
+    pub(crate) reflex: Option<reflex::ReflexHandle>,
+    /// The escalation-lane memo for the plan step being worked (backlog
+    /// ad56c7bd): the rung the reflex call selected, under which escalation
+    /// epoch. Compared against the live step at every iteration boundary, so
+    /// the classifier is asked once per step per attempt.
+    pub(crate) lane_state: std::sync::Mutex<Option<step_lanes::LaneState>>,
+    /// The escalation epoch (backlog ad56c7bd): bumped by a confident
+    /// permanent/flaky_test failure-triage verdict, which is what re-arms the
+    /// lane classification for the SAME step. Never bumped on a first
+    /// attempt's behalf, so the ladder cannot route up before a real failure.
+    pub(crate) escalation_epoch: std::sync::atomic::AtomicU64,
+    /// The failure class that bumped the epoch most recently -- its label feeds
+    /// the re-classification state text.
+    pub(crate) lane_failure: std::sync::Mutex<Option<String>>,
+    /// The harness-run verification handle (the cost-saving chain's
+    /// verification item): a decided `action=verify` reflex call re-runs
+    /// `[general.verify]`'s command harness-side and stashes the compact
+    /// evidence note for the next request's volatile tail. `None` in tests /
+    /// unwired builds -- the action then does nothing.
+    pub(crate) step_verify: Option<step_verify::StepVerifyHandle>,
+    /// The one-shot evidence note for the next request's volatile tail:
+    /// stashed by the action=verify path, drained by the request seam (so it
+    /// is delivered exactly once and never pollutes the cached prefix).
+    pub(crate) verify_note: std::sync::Mutex<Option<String>>,
+    /// The budget layer's live config (backlog a25a5323, the cost-saving
+    /// chain's budget item): the plan-step gate reads it at every boundary.
+    /// Disabled by default — the gate then no-ops byte-identically. Shared
+    /// with the factory, so a Settings save lands on the next boundary with
+    /// no rebuild.
+    pub(crate) budget: Arc<RwLock<BudgetConfig>>,
+    /// The live per-plan spend counters (backlog a25a5323): tokens, armed
+    /// escalations, per-step failed-cycle retries, the human's bypass and any
+    /// doubled caps. In-memory and live-session scoped — the durable
+    /// `spend_events` ledger backs the per-plan cost report.
+    pub(crate) plan_spend: std::sync::Mutex<budget::PlanSpend>,
+    /// A failed-cycle retry flagged by `note_lane_escalation`: applied to the
+    /// step that runs next by the budget gate — the flag bridges the sync
+    /// triage sites, which cannot lock the async workflow to learn the live
+    /// step.
+    pub(crate) pending_lane_retry: std::sync::atomic::AtomicBool,
+    /// The attribution stamped for the next spend row (backlog a25a5323):
+    /// which plan/step/lane the coming request belongs to and why the model
+    /// runs (route/retry/escalate/default). Consumed once by the usage site
+    /// that writes the row; overwritten each iteration, so a request that
+    /// never reports usage cannot mis-attribute the next one.
+    pub(crate) spend_attribution: std::sync::Mutex<Option<budget::SpendAttribution>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -807,6 +863,16 @@ impl AgentLoop {
             root_spec: None,
             failure_triage: None,
             routing: None,
+            reflex: None,
+            lane_state: std::sync::Mutex::new(None),
+            escalation_epoch: std::sync::atomic::AtomicU64::new(0),
+            lane_failure: std::sync::Mutex::new(None),
+            step_verify: None,
+            verify_note: std::sync::Mutex::new(None),
+            budget: Arc::new(RwLock::new(BudgetConfig::default())),
+            plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
+            pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
+            spend_attribution: std::sync::Mutex::new(None),
         }
     }
 
@@ -889,6 +955,145 @@ impl AgentLoop {
     pub fn with_routing_gate(mut self, gate: model_routing::RoutingGate) -> Self {
         self.routing = Some(gate);
         self
+    }
+
+    /// Attach the compound-reflex handle (the Laya classifier's compound
+    /// decision layer, `[general.laya] reflex`; backlog a8495cc1) -- the
+    /// escalation lane ladder's classifier (backlog ad56c7bd). The handle
+    /// carries the shared classifier slot + the config-mirrored enable flag,
+    /// both read at every plan-step boundary, so a Settings save lands on the
+    /// next step with no rebuild. Returns `self` for chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise the ladder.
+    pub fn with_reflex(mut self, handle: reflex::ReflexHandle) -> Self {
+        self.reflex = Some(handle);
+        self
+    }
+
+    /// The compound-reflex handle this loop was built with (`None` when the
+    /// Laya foundation is not wired). The IPC layer mirrors the config flag
+    /// into the handle's live enable flag, so a Settings toggle needs no
+    /// rebuild.
+    pub fn reflex(&self) -> Option<&reflex::ReflexHandle> {
+        self.reflex.as_ref()
+    }
+
+    /// Attach the harness-run verification handle (the cost-saving chain's
+    /// verification item). With it wired, a decided `action=verify` reflex
+    /// call re-runs the configured checks harness-side and rides the compact
+    /// evidence note on the next request's volatile tail. Returns `self` for
+    /// chaining. Wired by
+    /// [`AgentLoopFactory`](crate::agent::factory::AgentLoopFactory); `None`
+    /// in tests that don't exercise the path.
+    pub fn with_step_verify(mut self, handle: step_verify::StepVerifyHandle) -> Self {
+        self.step_verify = Some(handle);
+        self
+    }
+
+    /// The harness-run verification handle this loop was built with (`None`
+    /// when `[general.verify]` is not wired).
+    pub fn step_verify(&self) -> Option<&step_verify::StepVerifyHandle> {
+        self.step_verify.as_ref()
+    }
+
+    /// Stash a harness-verification evidence note for the next request's
+    /// volatile tail (delivered exactly once — see [`take_verify_note`]).
+    ///
+    /// [`take_verify_note`]: Self::take_verify_note
+    pub(crate) fn set_verify_note(&self, note: String) {
+        if let Ok(mut slot) = self.verify_note.lock() {
+            *slot = Some(note);
+        }
+    }
+
+    /// Take the pending harness-verification evidence note, if any. One-shot
+    /// by construction: the request seam drains it, so the note is delivered
+    /// exactly once and the volatile tail stays byte-identical when empty.
+    pub fn take_verify_note(&self) -> Option<String> {
+        self.verify_note.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Attach the live `[general.budget]` config (backlog a25a5323). Wired by
+    /// the factory from the shared mirror; the inert default (disabled) keeps
+    /// the cap gate a no-op. Returns `self` for chaining.
+    pub fn with_budget_config(mut self, cfg: Arc<RwLock<BudgetConfig>>) -> Self {
+        self.budget = cfg;
+        self
+    }
+
+    /// The live `[general.budget]` config — shared with the factory, so a
+    /// Settings save is observed at the next plan-step gate.
+    pub fn budget_config(&self) -> Arc<RwLock<BudgetConfig>> {
+        Arc::clone(&self.budget)
+    }
+
+    /// Run `f` against the live per-plan spend counters (the budget gate's
+    /// read/update path; `pub(crate)` so tests can pre-seed counters).
+    pub(crate) fn with_plan_spend<R>(&self, f: impl FnOnce(&mut budget::PlanSpend) -> R) -> R {
+        let mut guard = self.plan_spend.lock().expect("plan_spend lock poisoned");
+        f(&mut guard)
+    }
+
+    /// Flag a failed-cycle retry for the next budget gate (see
+    /// [`note_lane_escalation`](Self::note_lane_escalation)).
+    pub(crate) fn set_pending_lane_retry(&self) {
+        self.pending_lane_retry
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Consume the pending lane-retry flag (true exactly once per flag).
+    pub(crate) fn take_pending_lane_retry(&self) -> bool {
+        self.pending_lane_retry
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stamp the attribution for the next spend row (consumed once by the
+    /// usage site, so every row carries the decision that priced it).
+    pub(crate) fn set_spend_attribution(&self, attr: budget::SpendAttribution) {
+        if let Ok(mut slot) = self.spend_attribution.lock() {
+            *slot = Some(attr);
+        }
+    }
+
+    /// Clear the stamped spend attribution — the planless path, so a stamp
+    /// left by an earlier request that reported no usage can never be
+    /// consumed by a later turn with no live plan (round-1 finding L1).
+    pub(crate) fn clear_spend_attribution(&self) {
+        if let Ok(mut slot) = self.spend_attribution.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Take the stamped spend attribution, if any.
+    pub(crate) fn take_spend_attribution(&self) -> Option<budget::SpendAttribution> {
+        self.spend_attribution
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Record a confident failure-triage verdict (backlog ad56c7bd). A
+    /// `permanent` or `flaky_test` verdict means the current attempt failed a
+    /// cycle: the escalation epoch moves, so the next plan-step boundary
+    /// re-classifies the SAME step with the verdict named in the state text --
+    /// the only way the ladder ever routes up. Other classes (transient,
+    /// needs_user) change nothing here.
+    pub fn note_lane_escalation(&self, class: failure_triage::FailureClass) {
+        if !matches!(
+            class,
+            failure_triage::FailureClass::Permanent | failure_triage::FailureClass::FlakyTest
+        ) {
+            return;
+        }
+        if let Ok(mut failure) = self.lane_failure.lock() {
+            *failure = Some(class.label().to_string());
+        }
+        self.escalation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The budget layer (backlog a25a5323) counts this failed cycle as a
+        // lane retry at the next gate: the flag bridges the sync triage sites
+        // (which cannot lock the async workflow to learn the live step).
+        self.set_pending_lane_retry();
     }
 
     /// The failure-triage gate this loop was built with (`None` when triage is

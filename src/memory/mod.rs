@@ -37,7 +37,7 @@ pub use types::{
     MemoryAccessEntry, MemoryClass, MemoryData, MemoryFilter, MemoryRecordType, MemorySearchConfig,
     MemoryTier, ModelBreakdown, ProceduralData, ProjectStats, RequestStats, SavingsDayBreakdown,
     SavingsEvent, SavingsKindBreakdown, SavingsStats, SemanticData, Session, SessionStats,
-    SessionSummary, WorkingData,
+    SessionSummary, SpendEvent, WorkingData,
 };
 
 /// A scored memory result.
@@ -400,6 +400,17 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// recent events, and the project's prompt-cache efficiency. An empty
     /// ledger yields zeroed/empty fields, never an error.
     async fn savings_stats(&self) -> Result<SavingsStats>;
+
+    /// Record one per-decision spend row (the budget layer's ledger, backlog
+    /// a25a5323): the plan, step, lane, model and token cost of one request,
+    /// with the reason that model ran. Written for every main plan request
+    /// while a plan is active — independent of `[general.budget] enabled`,
+    /// which gates only the caps.
+    async fn record_spend_event(&self, event: &SpendEvent) -> Result<()>;
+
+    /// Read ONE plan's spend rows, oldest first — the source the per-plan
+    /// cost report is rendered from at `finish`.
+    async fn spend_rows_for_plan(&self, plan_id: &str) -> Result<Vec<SpendEvent>>;
 
     /// Archive the FULL original of an oversized tool result (backlog
     /// e4a50d22 lever 3) and return the new row id — the handle the context
@@ -2195,6 +2206,80 @@ impl MemoryStoreTrait for MemoryStore {
         })
         .await
         .map_err(|e| Error::Memory(format!("savings_events_rows task failed: {e}")))?
+    }
+
+    async fn record_spend_event(&self, event: &SpendEvent) -> Result<()> {
+        let conn = self.conn.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            let step_index = event.step_index.map(|s| s as i64);
+            conn.execute(
+                "INSERT INTO spend_events \
+                 (id, session_id, turn_id, agent_id, plan_id, step_index, lane, model, \
+                  reason, tokens_in, tokens_out, cached_tokens, detail, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    event.id,
+                    event.session_id,
+                    event.turn_id,
+                    event.agent_id,
+                    event.plan_id,
+                    step_index,
+                    event.lane,
+                    event.model,
+                    event.reason,
+                    event.tokens_in,
+                    event.tokens_out,
+                    event.cached_tokens,
+                    event.detail,
+                    event.created_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("record_spend_event task failed: {e}")))?
+    }
+
+    async fn spend_rows_for_plan(&self, plan_id: &str) -> Result<Vec<SpendEvent>> {
+        let read_conn = self.read_conn().clone();
+        let plan_id = plan_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Vec<SpendEvent>> {
+            let conn = read_conn.lock().expect("conn lock poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, turn_id, agent_id, plan_id, step_index, lane, model, \
+                 reason, tokens_in, tokens_out, cached_tokens, detail, created_at \
+                 FROM spend_events WHERE plan_id = ?1 ORDER BY created_at, id",
+            )?;
+            let rows = stmt.query_map(params![plan_id], |row| {
+                Ok(SpendEvent {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    plan_id: row.get(4)?,
+                    step_index: row.get::<_, Option<i64>>(5)?.map(|s| s as usize),
+                    lane: row.get(6)?,
+                    model: row.get(7)?,
+                    reason: row.get(8)?,
+                    tokens_in: row.get(9)?,
+                    tokens_out: row.get(10)?,
+                    cached_tokens: row.get(11)?,
+                    detail: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| {
+                    Error::Memory(format!("spend_rows_for_plan read failed: {e}"))
+                })?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("spend_rows_for_plan task failed: {e}")))?
     }
 
     async fn savings_stats(&self) -> Result<SavingsStats> {

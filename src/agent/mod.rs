@@ -37,6 +37,7 @@
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 
 pub mod approval;
+pub mod budget;
 pub mod optimizer;
 pub mod context;
 pub mod factory;
@@ -47,6 +48,8 @@ pub mod prompt;
 pub mod reflex;
 pub mod review_scope;
 pub mod steering_stats;
+pub mod step_lanes;
+pub mod step_verify;
 
 mod dispatch;
 mod loop_impl;

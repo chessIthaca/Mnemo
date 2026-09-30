@@ -1154,11 +1154,13 @@ three
         // Multi-byte UTF-8 content large enough to hit the per-file byte cap —
         // must not panic (regression for char-boundary truncation).
         let dir = tempdir().unwrap();
-        // ~180 KB of CJK chars (3 bytes each) → exceeds DEFAULT_MAX_BYTES (100 KB).
-        let content = "日本語".repeat(20_000);
-        std::fs::write(dir.path().join("cjk.txt"), &content).unwrap();
+        // ~180 KB of 3-byte chars → exceeds DEFAULT_MAX_BYTES (100 KB).
+        let content = "→→→".repeat(20_000);
+        std::fs::write(dir.path().join("multibyte.txt"), &content).unwrap();
         let tool = make_tool(dir.path());
-        let result = tool.execute(json!({"files": [{"path": "cjk.txt"}]})).await;
+        let result = tool
+            .execute(json!({"files": [{"path": "multibyte.txt"}]}))
+            .await;
         assert!(result.success, "{}", result.output.len());
         // The per-file byte cap should have fired (150 KB > 100 KB).
         assert!(
@@ -1167,7 +1169,7 @@ three
             result.output.len()
         );
         // Output must be valid UTF-8 (no panic, no replacement chars from a bad cut).
-        assert!(result.output.contains("日本語"));
+        assert!(result.output.contains("→→→"));
     }
 
     #[tokio::test]

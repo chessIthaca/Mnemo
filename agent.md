@@ -42,6 +42,13 @@ command.
 - For every defect (bug) you fix, add a regression test that reproduces the
   defect and asserts the fix. The test must fail without the fix and pass with
   it, so the defect can never silently reappear.
+- The red-check must exercise the real artifact where practical. When the
+  faithful red-check would require mutating a large or costly artifact (for
+  example regenerating `Cargo.lock`), prove red on a **gitignored doctored
+  copy** of the real file (e.g. `.coding/tmp/redcheck/`), swapped in via a
+  temporary uncommitted pointer edit — a plan-documented deviation with the
+  evidence in the commit message. Ratified 2027-01-11; precedent: plan
+  f0758c0d (`cargo_lock_keeps_the_vendored_patches`, item 6e071b07).
 - The build must be **warning-free**: under `#![deny(warnings)]` (set at both
   crate roots, `src/lib.rs` and `src-tauri/src/main.rs`) any warning fails the
   build, so a green `cargo test` already proves there are zero warnings. Never

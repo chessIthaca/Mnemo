@@ -10,5 +10,6 @@
 
 mod ci_workflow;
 mod contract_fixtures;
+mod encoding_guard;
 mod ipc_bridge;
 mod workflow_integration;

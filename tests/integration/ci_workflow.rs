@@ -113,6 +113,9 @@ fn build_workflow_avoids_node20_actions() {
 /// default is already `read`, but that is a repository *setting*: this test
 /// keeps the workflow itself least-privilege, so flipping that setting can
 /// never silently hand a build job a write token.
+///
+/// The workflow-level value must be exactly `read`: an existence-only check
+/// would accept `write`/`write-all` and silently defeat least-privilege.
 #[test]
 fn build_workflow_scopes_token_permissions() {
     let text = std::fs::read_to_string(concat!(
@@ -123,18 +126,22 @@ fn build_workflow_scopes_token_permissions() {
     let lines: Vec<&str> = text.lines().collect();
 
     let workflow_level = lines.iter().position(|l| l.starts_with("permissions:"));
-    let scoped = workflow_level.is_some_and(|idx| {
+    let contents = workflow_level.and_then(|idx| {
         lines
             .iter()
             .skip(idx + 1)
             .take_while(|l| l.trim().is_empty() || l.starts_with(' '))
-            .any(|l| l.trim_start().starts_with("contents:"))
+            .find_map(|l| l.trim_start().strip_prefix("contents:"))
     });
-    assert!(
-        scoped,
-        "build.yml has no workflow-level `permissions:` block scoping the \
-         GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions alerts 1/13) \
-         — add `permissions:` + `contents: read` below the `env:` block"
+    let value = contents.map(|v| v.trim().trim_matches('"').trim_matches('\''));
+    assert_eq!(
+        value,
+        Some("read"),
+        "build.yml's workflow-level `permissions:` block must scope the \
+         GITHUB_TOKEN to exactly `contents: read` (CodeQL \
+         actions/missing-workflow-permissions alerts 1/13) — `write`/`write-all` \
+         defeats least-privilege; the release job's per-job override is the only \
+         widening"
     );
 
     assert!(
@@ -143,20 +150,6 @@ fn build_workflow_scopes_token_permissions() {
     );
 }
 
-/// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
-/// commit SHA, with the human version in a trailing `# vN` comment so
-/// Dependabot can keep it current.
-///
-/// A tag ref is mutable: whoever controls the action repository can repoint
-/// `@v7` at new code that then runs with this repo's `GITHUB_TOKEN` — the
-/// release job's token is `contents: write`. SHA pins make the executed commit
-/// immutable.
-///
-/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
-/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
-/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
-/// Because of that exception the repo-level "require SHA pinning" Actions
-/// setting stays off (it would reject the rust-toolchain step).
 /// The release job must upload the installers to a DRAFT release and publish it
 /// afterwards — in that order.
 ///
@@ -211,15 +204,54 @@ fn build_workflow_uploads_installers_to_a_draft_release_first() {
     );
 }
 
+/// Every `uses:` in this repo's workflows must be pinned to a full 40-hex
+/// commit SHA, with the human version in a trailing `# vN` comment so
+/// Dependabot can keep it current.
+///
+/// A tag ref is mutable: whoever controls the action repository can repoint
+/// `@v7` at new code that then runs with this repo's `GITHUB_TOKEN` — the
+/// release job's token is `contents: write`. SHA pins make the executed commit
+/// immutable.
+///
+/// The documented exception is `dtolnay/rust-toolchain@stable`: that action
+/// reads its own ref to choose the toolchain (`@stable`, `@nightly`,
+/// `@1.75.0`, …) and publishes no version tags, so a SHA pin would break it.
+/// Because of that exception the repo-level "require SHA pinning" Actions
+/// setting stays off (it would reject the rust-toolchain step).
+///
+/// The guard enumerates `.github/workflows/` itself — every `*.yml`/`*.yaml`
+/// file found there is checked, so a workflow file added later is covered
+/// without editing the test; a hardcoded file list would silently leave it
+/// unguarded. A missing or empty workflows directory fails the test outright
+/// instead of passing vacuously.
 #[test]
 fn workflows_pin_actions_to_full_shas() {
     const ALLOWED_UNPINNED: [&str; 1] = ["dtolnay/rust-toolchain@stable"];
     let root = env!("CARGO_MANIFEST_DIR");
-    for rel in [".github/workflows/build.yml", ".github/workflows/codeql.yml"] {
+    let workflows_dir = format!("{root}/.github/workflows");
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&workflows_dir)
+        .unwrap_or_else(|e| panic!("{workflows_dir} readable: {e}"))
+        .map(|entry| entry.expect(".github/workflows entry readable").path())
+        .filter(|path| {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+            ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+        })
+        .collect();
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        ".github/workflows holds no *.yml/*.yaml workflow files — the SHA-pin \
+         guard would pass vacuously; the enumeration must see the workflows it \
+         guards"
+    );
+    for path in &paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-UTF-8 workflow file name>");
+        let rel = format!(".github/workflows/{name}");
         let text =
-            std::fs::read_to_string(format!("{root}/{rel}")).unwrap_or_else(|e| {
-                panic!("{rel} readable: {e}")
-            });
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{rel} readable: {e}"));
         for (idx, line) in text.lines().enumerate() {
             let t = line.trim();
             let t = t.strip_prefix("- ").unwrap_or(t);
@@ -251,4 +283,71 @@ fn workflows_pin_actions_to_full_shas() {
             );
         }
     }
+}
+
+// Failure text for the vendored-patch lock guard below.
+const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the tao/wry path patches in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the Windows keyboard/IME deadlock backport and the WebView2 SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/ (see vendor/tao/PATCHES.md, vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
+
+/// The lock must keep the vendored `[patch.crates-io]` overrides in effect:
+/// the `tao` and `wry` packages must stay PATH-sourced in `Cargo.lock` (no
+/// `source = ` line in their `[[package]]` entries, so the resolved crates
+/// are the `vendor/` copies) and the lock must carry no `[[patch.unused]]`
+/// entries. This is the machine check behind the `.github/dependabot.yml`
+/// review note: bumping `tauri` past 2.11.6 (or `tauri-runtime-wry` past
+/// 2.11.4) moves wry to 0.57 / tao to 0.37, turning both overrides into
+/// `[[patch.unused]]` — the registry crates would then ship instead of the
+/// vendored builds, losing the Windows keyboard/IME deadlock backport
+/// (vendor/tao/PATCHES.md) and the WebView2 OS-account SSO + hard-reload
+/// patches (vendor/wry/PATCHES.md) while CI stays green. Review H1 of
+/// `.coding/reviews/2026-09-29-rust-ci-dependency-wave-review.md`.
+#[test]
+fn cargo_lock_keeps_the_vendored_patches() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/Cargo.lock"
+    ))
+    .expect("root Cargo.lock readable");
+    assert!(!text.contains("[[patch.unused]]"), "{}", UNUSED_PATCH_MSG);
+
+    // A path-sourced entry has NO `source = ` line; any source (registry or
+    // git) means the vendored build is not what resolves. Exact-name match:
+    // `tao-macros` must never count as `tao`.
+    let mut seen_tao = false;
+    let mut seen_wry = false;
+    let mut target: Option<&str> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if line.starts_with("[[") {
+            target = None;
+        } else if let Some(name) = line
+            .strip_prefix("name = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            match name {
+                "tao" => {
+                    seen_tao = true;
+                    target = Some("tao");
+                }
+                "wry" => {
+                    seen_wry = true;
+                    target = Some("wry");
+                }
+                _ => target = None,
+            }
+        } else if line.starts_with("source = ") {
+            if let Some(name) = target {
+                panic!(
+                    "Cargo.lock's `{name}` entry (line {}) is not path-sourced \
+                     (`{line}`): the vendored [patch.crates-io] override is not \
+                     in effect, so a registry/git build ships instead of \
+                     vendor/{name} — see vendor/{name}/PATCHES.md",
+                    idx + 1
+                );
+            }
+        }
+    }
+    assert!(
+        seen_tao && seen_wry,
+        "Cargo.lock resolves no tao/wry package (saw tao={seen_tao}, \
+         wry={seen_wry}): both vendored crates must resolve"
+    );
 }

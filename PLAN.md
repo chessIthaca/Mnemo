@@ -41,9 +41,11 @@ zip 8, windows-sys 0.61, directories 6. Vendored pins held: `tao` / `wry` /
 every cargo bump must leave **no** `[[patch.unused]]` in `Cargo.lock`. GitHub
 Action refs are pinned to full SHAs — the one documented exception,
 `dtolnay/rust-toolchain@stable`, selects its toolchain by ref — guarded by
-`tests/integration/ci_workflow.rs`; the build workflows scope `GITHUB_TOKEN`
-to `contents: read` (the release job keeps `contents: write`), and CodeQL
-runs in advanced setup with `vendor/**` excluded. 0 open code-scanning /
+`tests/integration/ci_workflow.rs`, which enumerates every workflow file
+under `.github/workflows` and asserts the workflow-level `contents:` value
+exactly; the build workflows scope `GITHUB_TOKEN` to `contents: read` (the
+release job keeps `contents: write`), and CodeQL runs in advanced setup with
+`vendor/**` excluded. 0 open code-scanning /
 Dependabot / secret-scanning alerts at the time of writing; the full
 snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`.
 

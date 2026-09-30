@@ -41,3 +41,4 @@ Dependabot PR #67 (fastembed 4.9.1 -> 7.1.0) does not compile. Verified 2026-09-
 
 ## Reviews
 1 7d60f419e34c573cc3f823c6b7ad590ca8ae83ae
+2 bb418f2ecaedeac6e38cb89ac9529c5f610be1a7

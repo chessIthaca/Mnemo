@@ -1,0 +1,6 @@
++++
+title = "red-check a costly file artifact — gitignored doctored copy + temporary pointer swap"
+created = "2027-01-11"
++++
+
+Accepted procedure, ratified 2027-01-11 (user), codified in agent.md Code style: when the faithful red-check for a guard/regression test would require mutating a large or costly artifact (e.g. regenerating the 7528-line Cargo.lock to observe [[patch.unused]] drift), prove red on a gitignored doctored copy instead — (1) Copy-Item the real artifact to gitignored scratch (.coding/tmp/redcheck/; .gitignore:66 covers .coding/tmp/, uncommittable by construction); (2) mutate the copy per variant (e.g. append a [[patch.unused]] block; inject a source = "registry+..." line after the tao entry's version line); (3) swap the guard onto the copy via a TEMPORARY UNCOMMITTED pointer edit (concat!/env! is compile-time — the pointer must change, not an env var), run each variant to RED per assertion; (4) revert the pointer, delete the scratch; (5) record the deviation in the plan context and carry the evidence (variant output, panic lines) in the commit message. Precedent: plan f0758c0d / item 6e071b07, guard cargo_lock_keeps_the_vendored_patches (tests/integration/ci_workflow.rs), red-check credibility PASS in .coding/reviews/2026-09-30-lock-guard-f0758c0d-review.md.

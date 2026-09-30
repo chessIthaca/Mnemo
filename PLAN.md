@@ -36,9 +36,12 @@ approval-gated coding harness — not a UI swap.
 TypeScript 7, Tailwind v4 (`@tailwindcss/postcss`; `autoprefixer` dropped),
 Vite 8, vitest 5, zustand 5, react-markdown 10, lucide-react 1.48,
 chromiumoxide 0.9, rusqlite 0.40, tiktoken-rs 0.12, sha2 0.11, toml 1.1,
-zip 8, windows-sys 0.61, directories 6. Vendored pins held: `tao` / `wry` /
-`tauri-runtime-wry` stay `[patch.crates-io]` path overrides (`vendor/`) —
-every cargo bump must leave **no** `[[patch.unused]]` in `Cargo.lock`. GitHub
+zip 8, windows-sys 0.61, directories 6. Vendored pins held: exactly `tao` /
+`wry` stay `[patch.crates-io]` path overrides (`vendor/`; tauri and
+tauri-runtime-wry are bumped by hand together with them) — every cargo bump
+must leave **no** `[[patch.unused]]` in `Cargo.lock`, machine-guarded by
+`cargo_lock_keeps_the_vendored_patches` in
+`tests/integration/ci_workflow.rs`. GitHub
 Action refs are pinned to full SHAs — the one documented exception,
 `dtolnay/rust-toolchain@stable`, selects its toolchain by ref — guarded by
 `tests/integration/ci_workflow.rs`, which enumerates every workflow file

@@ -1906,6 +1906,50 @@ mod settings_dto_tests {
     }
 
     #[test]
+    fn routing_wire_carries_the_lane_targets() {
+        // Regression (found while wiring the budget Settings block, backlog
+        // a25a5323): the wire emitted only cheap/capable/threshold/enforce —
+        // the three escalation-lane targets never reached getSettings, so the
+        // section loaded them as null and every save sent an EXPLICIT null,
+        // which the [general.routing] patch reads as "clear the target"
+        // (absent = keep, null = clear) — silently wiping configured lane
+        // models on an unrelated save. A configured target must now reach the
+        // wire, and unset ones stay EMITTED as null (never skipped), so the
+        // frontend's `| null` types and the draft round-trip hold.
+        use mnemo::config::{ModelRef, RoutingConfig};
+        let cfg = RoutingConfig {
+            lane_medium: Some(ModelRef {
+                endpoint: "stub".into(),
+                model: "mid".into(),
+                reasoning_effort: None,
+            }),
+            escalate: Some(ModelRef {
+                endpoint: "stub".into(),
+                model: "top".into(),
+                reasoning_effort: None,
+            }),
+            ..RoutingConfig::default()
+        };
+        let wire = routing_wire(&cfg);
+        assert_eq!(
+            wire.lane_medium.as_ref().map(|m| m.model.as_str()),
+            Some("mid"),
+            "a configured lane target must reach the wire"
+        );
+        assert_eq!(
+            wire.escalate.as_ref().map(|m| m.model.as_str()),
+            Some("top")
+        );
+        let json = serde_json::to_value(&wire).unwrap();
+        assert_eq!(json["lane_medium"]["model"], "mid");
+        assert_eq!(json["lane_medium"]["endpoint"], "stub");
+        // Unset targets are present-and-null, never absent.
+        assert!(json.get("lane_high").is_some(), "{json}");
+        assert!(json["lane_high"].is_null(), "{json}");
+        assert_eq!(json["escalate"]["model"], "top");
+    }
+
+    #[test]
     fn save_settings_sets_embedding_model() {
         // The embedding_model patch deserializes from the frontend payload
         // shape { embedding_model: { endpoint, model } }.

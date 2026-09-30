@@ -42,13 +42,15 @@ command.
 - A **feature-gated** dependency bump additionally requires the feature-enabled
   run — `cargo test --features embeddings` (fastembed/ONNX) or `--features
   browser` (chromiumoxide), whichever tree the bump touches. Plain `cargo test`
-  never compiles those paths and NO CI job does either (`build.yml` triggers on
-  manual dispatch + `v*` tags only; `codeql.yml` builds default features), so a
-  major bump there can compile-fail unnoticed: dependabot PR #67 (2026-09-30)
-  showed a green "Analyze (rust)" check while `cargo check --features
-  embeddings` exited 101 — fastembed 4.9.1 -> 7.1.0 removed `InitOptions` (now a
-  deprecated alias, fatal under `#![deny(warnings)]`) and gave
-  `TextEmbedding::embed` a `&mut self` receiver.
+  never compiles those paths, and no **pull-request-triggered** job does
+  either: `codeql.yml`'s Rust analysis is no-build-only, and `build.yml` — which
+  *does* compile them, via `cargo test --workspace` with src-tauri selecting
+  both features — triggers only on manual dispatch and `v*` tags. A PR can
+  therefore merge a broken feature tree unnoticed until the next tag build:
+  dependabot PR #67 (2026-09-30) showed a green "Analyze (rust)" check while
+  `cargo check --features embeddings` exited 101 — fastembed 4.9.1 -> 7.1.0
+  turned `InitOptions` into a deprecated alias (fatal under
+  `#![deny(warnings)]`) and gave `TextEmbedding::embed` a `&mut self` receiver.
 - For every defect (bug) you fix, add a regression test that reproduces the
   defect and asserts the fix. The test must fail without the fix and pass with
   it, so the defect can never silently reappear.

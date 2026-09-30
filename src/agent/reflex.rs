@@ -20,7 +20,11 @@
 //! **harness-run verify** layer (backlog 1f767466, [`super::step_verify`]) is
 //! the second: a decided `verify` action re-runs `[general.verify]`'s command
 //! harness-side and rides the compact evidence note on the next request's
-//! volatile tail (the budget layer is the remaining consumer). The contract
+//! volatile tail. The **budget layer** (backlog a25a5323, [`super::budget`])
+//! is the third and last: its gate runs at the same plan-step boundary,
+//! counting the escalations this decision's rung arms and the failed-cycle
+//! retries the triage sites flag, and PAUSES the plan through a pending
+//! question when a cap is reached. The contract
 //! is [`super::failure_triage`]'s: opt-in
 //! (`[general.laya] reflex`, default off), a calibrated-confidence gate
 //! ([`REFLEX_THRESHOLD`]), and a strict fallback — a missing answer, a

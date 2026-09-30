@@ -1385,6 +1385,34 @@ product.
   spawns a process (flag off = byte-identical), a detailed sub-step tick never
   verifies, the config is read live per boundary (a Settings save lands on the
   next `complete_step`), and no new dependencies.
+- **Budget layer (2027-01, backlog a25a5323).** The cost-saving chain's item 4
+  and the reflex call's third consumer: `[general.budget]` (`enabled`, off by
+  default and omitted while default; `max_tokens_per_plan` u64, 0 = off;
+  `max_escalations_per_plan`, default 1; `max_retries_per_lane`, default 3)
+  makes spend deterministic at each plan-step boundary (`src/agent/budget.rs` —
+  pure counters, the cap gate, and the report renderer). A cap reached PAUSES
+  the plan through a pending question (continue for this plan / double the
+  reached cap / end the turn) on the `ask_user` channel — never a hard kill:
+  plans are crash-resumable and the plan file is the resumption document, so a
+  pause stays `Executing` and a later session resumes it. The gate counts each
+  main plan request's tokens inline (the next boundary reads fresh numbers),
+  the failed-cycle retries the triage sites flag (applied to the step that
+  runs next), and the escalations the ladder's rung arms — once per decision,
+  never per memo reuse. A per-decision ledger (`spend_events` beside
+  `savings_events`) traces the bill to the decision: plan/step/lane/model,
+  tokens in/out, cached tokens, and the reason (`route` | `retry` | `escalate`
+  | `default` for plan requests with no lane decision | `verify` for the
+  harness-run check results) — written for every main plan request REGARDLESS
+  of the flag, which gates only the caps. At `finish` the plan's rows render
+  as a `## Cost report` appended to the plan file: totals, tokens per lane,
+  lane per step, retries, escalations with their reasons, deterministic checks
+  with their results, and the cache hits — REAL numbers only, with NO
+  counterfactual baseline column (rejected in the cost-saving DECISION).
+  Invariants: disabled flag = byte-identical (no cap fires, no question), the
+  counters are in-memory and live-session scoped while the ledger is the
+  durable truth (documented boundary), a Settings save lands on the next
+  boundary, and every ledger/report write is fail-open — never failing a turn
+  or a completion.
 - **Vision fallback** — a `VisionClient` plus a `describe_image` agent tool,
   with an image-attachment fallback path: when the active main model resolves
   to multimodal = false (`Capabilities.multimodal`, resolved per model — the

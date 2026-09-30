@@ -404,13 +404,13 @@ mod tests {
         // Trailing content without a final newline and multi-byte chars must
         // survive the round trip unchanged apart from the endings.
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "日本語\r\ntail-no-newline").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "café\r\ntail-no-newline").unwrap();
         let tool = make_tool(dir.path());
         let result = tool.execute(json!({"path": "a.txt", "to": "lf"})).await;
         assert!(result.success, "{}", result.output);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "日本語\ntail-no-newline"
+            "café\ntail-no-newline"
         );
     }
 }

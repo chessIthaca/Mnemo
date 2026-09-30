@@ -303,7 +303,7 @@ impl Tool for ImageExtractTextTool {
                     "lang_hint".into(),
                     json!({
                         "type": "string",
-                        "description": "Language/script hint, e.g. 'zh' or '中文'."
+                        "description": "Language/script hint, e.g. 'zh' or 'Chinese'."
                     }),
                 );
                 m

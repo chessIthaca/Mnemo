@@ -1275,7 +1275,7 @@ async fn error_recovery_malformed_json() {
     );
 
     // The re-injected assistant message must carry VALID tool-call
-    // arguments Î“Ã‡Ã¶ otherwise the broken arguments get serialized into the
+    // arguments — otherwise the broken arguments get serialized into the
     // next request body and the gateway rejects it (400 "Unterminated
     // string") when it parses the `arguments` field. The malformed
     // arguments are sanitized to "{}".
@@ -2270,7 +2270,7 @@ async fn bad_json_aborts_at_higher_cap() {
 
 #[tokio::test]
 async fn create_plan_never_needs_approval() {
-    // create_plan is AutoRun Î“Ã‡Ã¶ even in ApproveEachAction mode, it must run
+    // create_plan is AutoRun — even in ApproveEachAction mode, it must run
     // without an approval prompt (otherwise the agent is stuck unable to act).
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
@@ -2322,7 +2322,7 @@ async fn create_plan_never_needs_approval() {
         .await
         .unwrap();
 
-    // Drain events Î“Ã‡Ã¶ none should be an ApprovalRequest.
+    // Drain events — none should be an ApprovalRequest.
     let mut saw_approval = false;
     while let Ok(Some((_id, event))) =
         tokio::time::timeout(std::time::Duration::from_millis(100), fanin_rx.recv()).await
@@ -2445,7 +2445,7 @@ async fn git_merge_prompts_even_in_autonomous_mode() {
 #[tokio::test]
 async fn run_turn_records_session_id_on_tool_events() {
     // Verify that passing a real session_id into run_turn causes the
-    // working-memory tool event to be tagged with that session_id Î“Ã‡Ã¶
+    // working-memory tool event to be tagged with that session_id —
     // without it, consolidation is a no-op.
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("test.txt"), "file contents").unwrap();
@@ -2784,7 +2784,7 @@ async fn run_turn_records_request_stats_on_usage() {
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
 
-    // First turn Î“Ã‡Ã¶ start a real session so session_stats has metadata
+    // First turn — start a real session so session_stats has metadata
     // to look up. Normally AgentTask does this; here we do it directly.
     let session = store.start_session("test").await.unwrap();
     agent.set_session_id(session.id.clone());
@@ -2886,7 +2886,7 @@ async fn run_turn_records_request_stats_on_usage() {
 async fn cache_heuristic_skipped_after_summarization() {
     // Regression for the over-reporting finding: after a context
     // summarization the conversation prefix is rewritten, so the
-    // min(prev, curr) cache heuristic must NOT be applied Î“Ã‡Ã¶ the next
+    // min(prev, curr) cache heuristic must NOT be applied — the next
     // request has no large shared-prefix cache to estimate and should
     // report cached_tokens = 0 (not min of the pre-summary sizes).
     let dir = tempdir().unwrap();
@@ -2947,7 +2947,7 @@ async fn cache_heuristic_skipped_after_summarization() {
         ],
     ]));
 
-    // max_context = 100, fill_rate 0.5 Î“Ã¥Ã† summarize_at = 50 tokens. The 9
+    // max_context = 100, fill_rate 0.5 → summarize_at = 50 tokens. The 9
     // messages each carry >6 tokens, so the threshold trips on the 2nd turn.
     let agent = AgentLoop::new(
         AgentLoopConfig {
@@ -2981,7 +2981,7 @@ async fn cache_heuristic_skipped_after_summarization() {
 
     // Grow the conversation past the threshold (and past keep_recent + 1)
     // so the SECOND turn triggers a real summarization before its main
-    // request. Each message carries >6 tokens; 8+ messages Î“Ã§Ã† over 50.
+    // request. Each message carries >6 tokens; 8+ messages ⇒ over 50.
     while messages.len() < 9 {
         messages.push(Message::user_text(
             "additional conversation content with enough tokens to pass the threshold",
@@ -3213,7 +3213,7 @@ async fn constitution_reread_after_agent_md_edit() {
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
 
-    // Turn 1 Î“Ã‡Ã¶ the v1 rules should be in the system prompt.
+    // Turn 1 — the v1 rules should be in the system prompt.
     let mut messages = vec![Message::user_text("hi")];
     agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
@@ -3229,7 +3229,7 @@ async fn constitution_reread_after_agent_md_edit() {
     std::fs::write(&ppath, "PROJECT-RULE-V2-NEW").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    // Turn 2 Î“Ã‡Ã¶ the new rule must appear (re-read from disk).
+    // Turn 2 — the new rule must appear (re-read from disk).
     let mut messages2 = vec![Message::user_text("again")];
     agent
         .run_turn(&mut messages2, &fanin_tx, 1, &mut cmd_rx, None)
@@ -4778,7 +4778,7 @@ async fn safety_rule_auto_approves_in_approve_each_mode() {
         .await
         .unwrap();
 
-    // Drain events Î“Ã‡Ã¶ none should be an ApprovalRequest (the rule
+    // Drain events — none should be an ApprovalRequest (the rule
     // auto-approved the call).
     let mut saw_approval = false;
     let mut saw_tool_result = false;
@@ -4826,7 +4826,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    // A rule for "ok.txt" Î“Ã‡Ã¶ but the call writes "other.txt".
+    // A rule for "ok.txt" — but the call writes "other.txt".
     let safety_path = dir.path().join("safety.toml");
     let safety_rules = Arc::new(crate::safety_rules::SafetyRules::new(&safety_path).unwrap());
     safety_rules
@@ -4869,7 +4869,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
     .with_safety_rules(safety_rules);
 
     let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
-    // A command channel that never answers Î“Ã‡Ã¶ the approval will hang until
+    // A command channel that never answers — the approval will hang until
     // the channel closes (ChannelClosed), which is fine; we just need to
     // observe that an ApprovalRequest was emitted.
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
@@ -4940,8 +4940,8 @@ async fn describe_image_errors_when_no_vision_client() {
 #[test]
 fn is_multimodal_reflects_provider_caps() {
     // is_multimodal() must reflect the provider's capability set. A mock
-    // provider with multimodal=false Î“Ã¥Ã† is_multimodal() == false; with
-    // multimodal=true Î“Ã¥Ã† true.
+    // provider with multimodal=false → is_multimodal() == false; with
+    // multimodal=true → true.
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),

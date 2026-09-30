@@ -1276,7 +1276,10 @@ mod tests {
         let mixed = "ab\u{e9}cd -- ef"; // non-ASCII acts as a separator
         assert_eq!(slug_for(mixed, "2026-08-23"), "2026-08-23-ab-cd-ef");
         // No ASCII letters at all → the `record` fallback.
-        assert_eq!(slug_for("日本語", "2026-08-23"), "2026-08-23-record");
+        assert_eq!(
+            slug_for("\u{e9}\u{e8}\u{ea}", "2026-08-23"),
+            "2026-08-23-record"
+        );
     }
 
     #[test]

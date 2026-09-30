@@ -1875,7 +1875,7 @@ mod tests {
         assert_eq!(truncate("abcde", 5), "abcde");
         assert_eq!(truncate("abcdef", 5), "abcd…");
         // Multi-byte chars never split.
-        assert_eq!(truncate("日本語テスト", 3), "日本…");
+        assert_eq!(truncate("→→→→→→", 3), "→→…");
     }
 
     #[test]

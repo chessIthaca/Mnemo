@@ -27,5 +27,8 @@ Root cause documented (2027-01-11; verified by byte-scan of the four files). Aut
 ## Bug
 src/tool/agent/image_tools/ ships double-encoded mojibake in user-visible strings: `â€”` (Windows-1252 round-trip of the em dash —) in tool descriptions, schema strings, error messages, and prompt text, and `â†’` (round-trip of the arrow →) in doc comments and prompt text — 57 source lines across mod.rs, prompts.rs, tools.rs, zoom.rs (verified sweep 2027-01-11), rendered garbled to users and the vision model.
 
+## Regression test
+image_tools_strings_carry_no_mojibake
+
 ## Reviews
 1 68b09e21d423bba16d7c685e53941334bb989bdb

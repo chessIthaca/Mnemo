@@ -14965,6 +14965,57 @@ async fn spend_rows_mark_the_failed_cycle_retry() {
     );
 }
 
+#[tokio::test]
+async fn a_planless_turn_never_consumes_a_stale_spend_attribution() {
+    // Regression (round-1 finding L1, backlog a25a5323): a request that
+    // reports no usage leaves its stamp in the slot; the next PLANLESS turn
+    // must clear it rather than write a phantom row billed to a finished plan
+    // (and re-key the live counters to a dead plan id). The counters update
+    // inline; the durable row lands on a spawned task, so the store assertion
+    // settles first.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let store = spend_store();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let mut cfg = test_config(usage_provider(700, 30, 0), registry, workflow, sandbox);
+    cfg.memory = Some(store.clone());
+    let agent = AgentLoop::new(cfg, crate::project::Constitution::default());
+    // An unconsumed stamp from an earlier errored request on a plan that has
+    // since gone away.
+    agent.set_spend_attribution(crate::agent::budget::SpendAttribution {
+        plan_id: "dead-plan".into(),
+        turn_id: "turn-x".into(),
+        step_index: Some(0),
+        lane: Some("medium".into()),
+        reason: crate::agent::budget::BudgetReason::Route,
+    });
+
+    let (outcome, _questions, _events) = run_budget_turn(
+        &agent,
+        "just chatting",
+        crate::runtime::UserAnswer::Choice { index: 0 },
+    )
+    .await;
+    assert!(!outcome.text.is_empty(), "the provider served the turn");
+
+    // Deterministic: the counters were never re-keyed to the dead plan.
+    assert_eq!(agent.with_plan_spend(|spend| spend.total_tokens()), 0);
+    assert_eq!(agent.with_plan_spend(|spend| spend.plan_id.clone()), None);
+    // Let any spawned ledger write land, then assert none was made.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        store
+            .spend_rows_for_plan("dead-plan")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a planless turn must not consume a stale stamp"
+    );
+}
+
 /// A lane resolver that serves the MEDIUM lane with a usage-REPORTING
 /// provider (the routed spend-row test needs real tokens from the lane that
 /// actually served); everything else delegates to the standard stub.

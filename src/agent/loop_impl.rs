@@ -1055,6 +1055,15 @@ impl AgentLoop {
         }
     }
 
+    /// Clear the stamped spend attribution — the planless path, so a stamp
+    /// left by an earlier request that reported no usage can never be
+    /// consumed by a later turn with no live plan (round-1 finding L1).
+    pub(crate) fn clear_spend_attribution(&self) {
+        if let Ok(mut slot) = self.spend_attribution.lock() {
+            *slot = None;
+        }
+    }
+
     /// Take the stamped spend attribution, if any.
     pub(crate) fn take_spend_attribution(&self) -> Option<budget::SpendAttribution> {
         self.spend_attribution

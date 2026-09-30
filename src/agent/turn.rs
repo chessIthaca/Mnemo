@@ -505,8 +505,10 @@ impl AgentLoop {
             }
             // Stamp the spend attribution for the request this iteration
             // builds: which plan/step/lane it belongs to and why the model
-            // runs. The usage site consumes it; an errored request that
-            // reports no usage simply leaves it to be overwritten.
+            // runs. The usage site consumes it; the stamp is overwritten next
+            // iteration and CLEARED when no plan is live, so a request that
+            // errors without reporting usage cannot leak a stale attribution
+            // into a later planless turn (round-1 finding L1).
             if let Some((plan_id, step_index)) = &plan_scope {
                 let turn_id = state
                     .spend_turn_id
@@ -527,6 +529,12 @@ impl AgentLoop {
                         budget::BudgetReason::Default
                     },
                 });
+            } else {
+                // No live plan (round-1 finding L1): clear any stamp left by
+                // an earlier request that reported no usage, so a planless
+                // turn can never consume a stale attribution — a phantom row
+                // billed to a finished plan.
+                self.clear_spend_attribution();
             }
             let (provider, context_manager) = self
                 .resolve_iteration_provider(

@@ -113,6 +113,9 @@ fn build_workflow_avoids_node20_actions() {
 /// default is already `read`, but that is a repository *setting*: this test
 /// keeps the workflow itself least-privilege, so flipping that setting can
 /// never silently hand a build job a write token.
+///
+/// The workflow-level value must be exactly `read`: an existence-only check
+/// would accept `write`/`write-all` and silently defeat least-privilege.
 #[test]
 fn build_workflow_scopes_token_permissions() {
     let text = std::fs::read_to_string(concat!(
@@ -123,18 +126,22 @@ fn build_workflow_scopes_token_permissions() {
     let lines: Vec<&str> = text.lines().collect();
 
     let workflow_level = lines.iter().position(|l| l.starts_with("permissions:"));
-    let scoped = workflow_level.is_some_and(|idx| {
+    let contents = workflow_level.and_then(|idx| {
         lines
             .iter()
             .skip(idx + 1)
             .take_while(|l| l.trim().is_empty() || l.starts_with(' '))
-            .any(|l| l.trim_start().starts_with("contents:"))
+            .find_map(|l| l.trim_start().strip_prefix("contents:"))
     });
-    assert!(
-        scoped,
-        "build.yml has no workflow-level `permissions:` block scoping the \
-         GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions alerts 1/13) \
-         — add `permissions:` + `contents: read` below the `env:` block"
+    let value = contents.map(|v| v.trim().trim_matches('"').trim_matches('\''));
+    assert_eq!(
+        value,
+        Some("read"),
+        "build.yml's workflow-level `permissions:` block must scope the \
+         GITHUB_TOKEN to exactly `contents: read` (CodeQL \
+         actions/missing-workflow-permissions alerts 1/13) — `write`/`write-all` \
+         defeats least-privilege; the release job's per-job override is the only \
+         widening"
     );
 
     assert!(

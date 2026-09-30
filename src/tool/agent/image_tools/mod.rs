@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Image analysis tools â€” the `image_*` family, mirroring the vision-mcp spec.
+//! Image analysis tools — the `image_*` family, mirroring the vision-mcp spec.
 //!
 //! This module hosts the **shared vision plumbing** (moved here from the old
 //! `describe_image.rs`) plus the seven task-specific image tools:
@@ -21,7 +21,7 @@
 //! fine/normal/auto detail level is requested, falling back to a single
 //! overview pass when image decode/crop/re-encode isn't possible.
 //!
-//! All tools are `NeedsApproval` â€” they read a file inside the sandbox and
+//! All tools are `NeedsApproval` — they read a file inside the sandbox and
 //! send its bytes to the configured vision endpoint over the network, so they
 //! are gated behind an approval prompt (never auto-run). The MIME is content-
 //! sniffed from magic bytes (not just the extension) so a non-image file
@@ -69,14 +69,14 @@ pub fn load_image_data_url(sandbox: &Sandbox, path: &str) -> Result<String> {
         .ok_or_else(|| Error::InvalidInput(format!("path has no file extension: {path}")))?;
     let mime = mime_from_ext(ext).ok_or_else(|| {
         Error::InvalidInput(format!(
-            "unsupported image extension '.{ext}' â€” expected png, jpg, jpeg, gif, webp, or bmp"
+            "unsupported image extension '.{ext}' — expected png, jpg, jpeg, gif, webp, or bmp"
         ))
     })?;
 
     let bytes = std::fs::read(&validated)?;
     if !magic_matches(mime, &bytes) {
         return Err(Error::InvalidInput(format!(
-            "file content does not match '.{ext}' (expected {mime}) â€” the magic bytes do not match"
+            "file content does not match '.{ext}' (expected {mime}) — the magic bytes do not match"
         )));
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
@@ -85,7 +85,7 @@ pub fn load_image_data_url(sandbox: &Sandbox, path: &str) -> Result<String> {
 
 /// Verify a file's leading bytes match the magic-number signature of the
 /// claimed MIME type. This closes the exfiltration gap where a non-image file
-/// renamed with an image extension (e.g. `secret.txt` â†’ `secret.png`) would be
+/// renamed with an image extension (e.g. `secret.txt` → `secret.png`) would be
 /// read and sent to the vision endpoint: the content must actually be the
 /// claimed image format.
 ///
@@ -109,10 +109,10 @@ pub fn magic_matches(mime: &str, bytes: &[u8]) -> bool {
 
 /// Describe an image given as a base64 data URL, using the vision model.
 ///
-/// `question` is the prompt to the vision model â€” when `None` or empty,
+/// `question` is the prompt to the vision model — when `None` or empty,
 /// [`DEFAULT_DESCRIBE_PROMPT`] is used. This is the shared entry point used
-/// by both the tools (file â†’ data URL â†’ here) and the attachment fallback
-/// (pasted image data URLs â†’ here).
+/// by both the tools (file → data URL → here) and the attachment fallback
+/// (pasted image data URLs → here).
 pub async fn describe_image_data_url(
     vision: &dyn ImageDescriber,
     data_url: &str,
@@ -169,13 +169,13 @@ pub(crate) async fn load_image_data_url_and_bytes(
             })?;
         let mime = mime_from_ext(ext).ok_or_else(|| {
             Error::InvalidInput(format!(
-                "unsupported image extension '.{ext}' â€” expected png, jpg, jpeg, gif, webp, or bmp"
+                "unsupported image extension '.{ext}' — expected png, jpg, jpeg, gif, webp, or bmp"
             ))
         })?;
         let bytes = std::fs::read(&validated)?;
         if !magic_matches(mime, &bytes) {
             return Err(Error::InvalidInput(format!(
-                "file content does not match '.{ext}' (expected {mime}) â€” the magic bytes do not match"
+                "file content does not match '.{ext}' (expected {mime}) — the magic bytes do not match"
             )));
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -201,7 +201,7 @@ mod test_support {
 
     /// A mock vision model: returns a canned description and records the
     /// prompts it was called with (so tests can assert default vs custom
-    /// prompt) â€” no network.
+    /// prompt) — no network.
     pub(crate) struct MockDescriber {
         pub description: String,
         pub calls: StdMutex<Vec<(String, String)>>,
@@ -278,8 +278,8 @@ mod tests {
     fn load_image_data_url_builds_data_url() {
         let dir = tempfile::tempdir().unwrap();
         let sandbox = Sandbox::new(dir.path()).unwrap();
-        // A tiny PNG (just the magic bytes + padding â€” content validity
-        // doesn't matter for the data URL, only the extension â†’ MIME).
+        // A tiny PNG (just the magic bytes + padding — content validity
+        // doesn't matter for the data URL, only the extension → MIME).
         std::fs::write(dir.path().join("pic.png"), b"\x89PNG\r\n\x1a\n").unwrap();
         let url = load_image_data_url(&sandbox, "pic.png").unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
@@ -355,5 +355,62 @@ mod tests {
         .await;
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls[0].1, "what is this?");
+    }
+
+    /// No user-visible string in this module carries double-encoded
+    /// punctuation, separators, and script hints — the em dash, arrow,
+    /// box-drawing dash, en dash, ≥, and CJK text must be the real characters,
+    /// not the multi-character mojibake left by a UTF-8 → Windows-1252
+    /// round-trip at authoring time (backlog f4616c13, deferred from
+    /// .coding/reviews/2026-09-15-imperative-steering-phrasing-review-round2.md;
+    /// same class as the 2026-09-29 dependencies.ts/AboutDialog.tsx fix).
+    /// The needles are built from `\u{...}` escapes so this test's own
+    /// source never matches the scan it performs.
+    #[test]
+    fn image_tools_strings_carry_no_mojibake() {
+        let em_dash = "\u{00E2}\u{20AC}\u{201D}";
+        let arrow = "\u{00E2}\u{2020}\u{2019}";
+        let box_draw = "\u{00E2}\u{201D}\u{20AC}";
+        let en_dash = "\u{00E2}\u{20AC}\u{201C}";
+        let ge = "\u{00E2}\u{2030}\u{00A5}";
+        let cjk = "\u{00E4}\u{00B8}\u{00AD}\u{00E6}\u{2013}\u{2021}";
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/tool/agent/image_tools");
+        // Every `*.rs` beside this one, so a file added later is covered
+        // without touching this test (CI-workflow guards' sweep principle).
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .expect("module directory readable")
+            .map(|entry| {
+                entry
+                    .expect("dir entry readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no module sources found under {dir}");
+        for file in &files {
+            let text =
+                std::fs::read_to_string(format!("{dir}/{file}")).expect("module source readable");
+            for (label, needle) in [
+                ("em dash", em_dash),
+                ("arrow", arrow),
+                ("box drawing", box_draw),
+                ("en dash", en_dash),
+                ("greater-or-equal", ge),
+                ("cjk hint", cjk),
+            ] {
+                if let Some(offset) = text.find(needle) {
+                    // Byte 10 is the newline; count them for a 1-based line.
+                    let line = text[..offset].bytes().filter(|b| *b == 10).count() + 1;
+                    panic!(
+                        "src/tool/agent/image_tools/{file}:{line} carries mojibake \
+                         ({label}): double-encoded punctuation — write the literal \
+                         character instead"
+                    );
+                }
+            }
+        }
     }
 }

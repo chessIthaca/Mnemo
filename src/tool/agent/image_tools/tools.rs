@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! The seven `image_*` tools â€” each builds a task-specific prompt and runs it
+//! The seven `image_*` tools — each builds a task-specific prompt and runs it
 //! through the agentic zoom loop ([`zoom::analyze_with_zoom`]) with a graceful
 //! single-pass fallback when image decode/crop fails.
 //!
@@ -30,7 +30,7 @@ const MAX_ZOOM_ROUNDS: u32 = 3;
 
 /// Common arguments shared by every image tool: `question`, `detail_level`,
 /// `region`, `thinking`. `thinking` is accepted for spec-fidelity but is
-/// advisory only â€” our vision backend does not honor a reasoning mode.
+/// advisory only — our vision backend does not honor a reasoning mode.
 #[derive(Debug, Default, Deserialize)]
 struct CommonArgs {
     #[serde(default)]
@@ -99,7 +99,7 @@ async fn run_single(
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("{} failed: {e}", tool.name())),
     };
-    // `thinking` is advisory â€” our vision backend doesn't honor a reasoning
+    // `thinking` is advisory — our vision backend doesn't honor a reasoning
     // mode, so surface a warning when the caller requested it (so the model
     // knows the flag was accepted but had no effect).
     let mut warnings = result.warnings;
@@ -148,7 +148,7 @@ fn single_image_schema(
     }));
     props.insert("region".into(), json!({
         "type": "string",
-        "description": "Optional: restrict to a region â€” a named region ('top-left', 'top-right', 'bottom-left', 'bottom-right', 'center') or a bbox 'x,y,w,h' (0..1)."
+        "description": "Optional: restrict to a region — a named region ('top-left', 'top-right', 'bottom-left', 'bottom-right', 'center') or a bbox 'x,y,w,h' (0..1)."
     }));
     props.insert("thinking".into(), json!({
         "type": "boolean",
@@ -165,9 +165,9 @@ fn single_image_schema(
     )
 }
 
-// â”€â”€ 1. image_ui_to_artifact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 1. image_ui_to_artifact ─────────────────────────────────────────────────
 
-/// UI screenshot â†’ code or spec.
+/// UI screenshot → code or spec.
 pub struct ImageUiToArtifactTool(ImageToolState);
 
 impl ImageUiToArtifactTool {
@@ -256,9 +256,9 @@ impl Tool for ImageUiToArtifactTool {
     }
 }
 
-// â”€â”€ 2. image_extract_text â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 2. image_extract_text ───────────────────────────────────────────────────
 
-/// Verbatim OCR â€” extract all visible text, preserving layout.
+/// Verbatim OCR — extract all visible text, preserving layout.
 pub struct ImageExtractTextTool(ImageToolState);
 
 impl ImageExtractTextTool {
@@ -294,7 +294,7 @@ impl Tool for ImageExtractTextTool {
     fn schema(&self) -> ToolSchema {
         single_image_schema(
             "image_extract_text",
-            "Verbatim OCR â€” extract all visible text from a screenshot, preserving layout and \
+            "Verbatim OCR — extract all visible text from a screenshot, preserving layout and \
              whitespace. Use detail_level='fine' for tiny text (the zoom loop crops and re-reads \
              the region). Set `lang_hint` (e.g. 'zh') to guide recognition.",
             {
@@ -303,7 +303,7 @@ impl Tool for ImageExtractTextTool {
                     "lang_hint".into(),
                     json!({
                         "type": "string",
-                        "description": "Language/script hint, e.g. 'zh' or 'ä¸­æ–‡'."
+                        "description": "Language/script hint, e.g. 'zh' or '中文'."
                     }),
                 );
                 m
@@ -333,9 +333,9 @@ impl Tool for ImageExtractTextTool {
     }
 }
 
-// â”€â”€ 3. image_diagnose_error â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 3. image_diagnose_error ─────────────────────────────────────────────────
 
-/// Error/exception diagnosis â†’ root cause / verbatim / location / fix.
+/// Error/exception diagnosis → root cause / verbatim / location / fix.
 pub struct ImageDiagnoseErrorTool(ImageToolState);
 
 impl ImageDiagnoseErrorTool {
@@ -371,7 +371,7 @@ impl Tool for ImageDiagnoseErrorTool {
     fn schema(&self) -> ToolSchema {
         single_image_schema(
             "image_diagnose_error",
-            "Diagnose an error/exception from a screenshot â€” root cause, verbatim error text, \
+            "Diagnose an error/exception from a screenshot — root cause, verbatim error text, \
              location, and concrete fix steps. Pass `code_context` (relevant code/snippet) to \
              improve the diagnosis.",
             {
@@ -410,7 +410,7 @@ impl Tool for ImageDiagnoseErrorTool {
     }
 }
 
-// â”€â”€ 4. image_understand_diagram â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 4. image_understand_diagram ────────────────────────────────────────────
 
 /// Understand a technical diagram (architecture/flow/UML/ER/sequence).
 pub struct ImageUnderstandDiagramTool(ImageToolState);
@@ -446,7 +446,7 @@ impl Tool for ImageUnderstandDiagramTool {
     fn schema(&self) -> ToolSchema {
         single_image_schema(
             "image_understand_diagram",
-            "Understand a technical diagram (architecture, flow, UML, ER, sequence) â€” overview, \
+            "Understand a technical diagram (architecture, flow, UML, ER, sequence) — overview, \
              structure, key relationships. Use this for any schematic or diagram the main model \
              cannot parse.",
             serde_json::Map::new(),
@@ -471,9 +471,9 @@ impl Tool for ImageUnderstandDiagramTool {
     }
 }
 
-// â”€â”€ 5. image_analyze_chart â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 5. image_analyze_chart ──────────────────────────────────────────────────
 
-/// Read charts/dashboards â€” values, trends, outliers.
+/// Read charts/dashboards — values, trends, outliers.
 pub struct ImageAnalyzeChartTool(ImageToolState);
 
 impl ImageAnalyzeChartTool {
@@ -507,7 +507,7 @@ impl Tool for ImageAnalyzeChartTool {
     fn schema(&self) -> ToolSchema {
         single_image_schema(
             "image_analyze_chart",
-            "Read a chart or dashboard â€” extract values, series, labels, trends, and outliers. \
+            "Read a chart or dashboard — extract values, series, labels, trends, and outliers. \
              Use this for any data visualization the main model cannot read.",
             serde_json::Map::new(),
         )
@@ -531,7 +531,7 @@ impl Tool for ImageAnalyzeChartTool {
     }
 }
 
-// â”€â”€ 6. image_ui_diff â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 6. image_ui_diff ────────────────────────────────────────────────────────
 
 /// Compare two UI screenshots (A before / B after).
 pub struct ImageUiDiffTool(ImageToolState);
@@ -612,7 +612,7 @@ impl Tool for ImageUiDiffTool {
         }));
         ToolSchema::new(
             "image_ui_diff",
-            "Compare two UI screenshots (A=before, B=after) and describe what changed â€” a diff \
+            "Compare two UI screenshots (A=before, B=after) and describe what changed — a diff \
              summary plus per-change details. Use this to verify a UI change or spot a regression.",
             json!({
                 "type": "object",
@@ -631,7 +631,7 @@ impl Tool for ImageUiDiffTool {
         };
         // Load both images to data URLs. Both are sent to the vision model in
         // ONE call (via describe_images) so the model actually sees both
-        // screenshots together and can compare them â€” not two independent
+        // screenshots together and can compare them — not two independent
         // descriptions concatenated.
         let (url_a, _bytes_a) =
             match load_image_data_url_and_bytes(&self.0.sandbox, &args.image_a).await {
@@ -673,7 +673,7 @@ impl Tool for ImageUiDiffTool {
     }
 }
 
-// â”€â”€ 7. image_analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── 7. image_analysis ───────────────────────────────────────────────────────
 
 /// Generic image understanding (the fallback).
 pub struct ImageAnalysisTool(ImageToolState);
@@ -709,7 +709,7 @@ impl Tool for ImageAnalysisTool {
     fn schema(&self) -> ToolSchema {
         single_image_schema(
             "image_analysis",
-            "Generic image understanding â€” describe an image or answer a question about it. Use \
+            "Generic image understanding — describe an image or answer a question about it. Use \
              this as the fallback when no task-specific image tool fits. Pass `question` to ask \
              something specific, or omit it for a detailed description.",
             serde_json::Map::new(),

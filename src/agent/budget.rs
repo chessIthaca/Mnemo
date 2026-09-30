@@ -308,9 +308,13 @@ pub fn cost_report(rows: &[SpendEvent]) -> String {
     }
     let mut lane_rows: Vec<(&str, (usize, i64))> = lanes.into_iter().collect();
     lane_rows.sort_by(|a, b| (b.1).1.cmp(&(a.1).1).then_with(|| a.0.cmp(b.0)));
-    out.push_str("\nPer lane:\n");
-    for (lane, (count, tokens)) in lane_rows {
-        out.push_str(&format!("- {lane}: {count} request(s), {tokens} tokens\n"));
+    // The header is emitted only with content: a verify-only ledger has no
+    // lane rows and must not render a dangling "Per lane:" line (round-2 L1).
+    if !lane_rows.is_empty() {
+        out.push_str("\nPer lane:\n");
+        for (lane, (count, tokens)) in lane_rows {
+            out.push_str(&format!("- {lane}: {count} request(s), {tokens} tokens\n"));
+        }
     }
 
     // The lane each step ran on, from the route rows (the step's LAST route
@@ -678,8 +682,10 @@ mod tests {
             None,
             Some("[verify] `cargo test` — passed (exit 0)"),
         )]);
-        // A verify-only ledger still reports zero MODEL requests.
+        // A verify-only ledger still reports zero MODEL requests, and no
+        // dangling "Per lane:" header with nothing under it (round-2 L1).
         assert!(report.contains("0 request(s)"), "{report}");
+        assert!(!report.contains("Per lane"), "{report}");
         assert!(report.contains("- step ?: [verify] `cargo test` — passed (exit 0)"));
     }
 

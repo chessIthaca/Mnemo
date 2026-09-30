@@ -73,7 +73,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # (~rav1e, minutes of cold compile). Coding-only/light builds skip it and run
 # the built-in hash embedder (keyword-tier recall, status Failed when a model
 # is configured). The app (src-tauri) always selects the feature.
-fastembed = { version = "4", optional = true }
+fastembed = { version = "7", optional = true }
 
 # HTTP for embeddings fallback (Ollama /api/embed)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate", "stream"] }

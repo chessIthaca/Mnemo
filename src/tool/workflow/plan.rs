@@ -4890,10 +4890,10 @@ mod tests {
         let text = std::fs::read_to_string(&plan_file).unwrap();
         assert!(text.contains("## Cost report"), "{text}");
         assert!(
-            text.contains("4 request(s), 4100 tokens in + 600 tokens out = 4700 tokens"),
+            text.contains("3 request(s), 4100 tokens in + 600 tokens out = 4700 tokens"),
             "{text}"
         );
-        assert!(text.contains("400 cached prompt tokens"), "{text}");
+        assert!(text.contains("300 cached prompt tokens"), "{text}");
         assert!(text.contains("- escalate: 1 request(s), 2300 tokens"), "{text}");
         assert!(text.contains("Lane per step:"), "{text}");
         assert!(text.contains("- step 1: medium"), "{text}");

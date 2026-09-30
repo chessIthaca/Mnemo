@@ -272,19 +272,25 @@ pub struct SpendAttribution {
 /// the deterministic checks with their results, and the cache hits. There is
 /// deliberately NO counterfactual "vs single-model baseline" column (rejected
 /// in the cost-saving DECISION memory): the ledger records what WAS spent,
-/// not what might have been.
+/// not what might have been. The `verify` evidence rows are excluded from the
+/// request/token totals — they carry no usage and are listed separately under
+/// "Deterministic checks".
 pub fn cost_report(rows: &[SpendEvent]) -> String {
     let mut out = String::from("## Cost report\n\n");
     if rows.is_empty() {
         out.push_str("No spend was recorded for this plan.\n");
         return out;
     }
-    let tokens_in: i64 = rows.iter().map(|r| r.tokens_in).sum();
-    let tokens_out: i64 = rows.iter().map(|r| r.tokens_out).sum();
-    let cached: i64 = rows.iter().map(|r| r.cached_tokens.unwrap_or(0)).sum();
+    // Model requests only: the `verify` rows are deterministic-check EVIDENCE
+    // (zero tokens, no model) listed separately under "Deterministic checks" —
+    // counting them as requests would overstate the bill (round-1 finding L2).
+    let billed: Vec<&SpendEvent> = rows.iter().filter(|r| r.reason != "verify").collect();
+    let tokens_in: i64 = billed.iter().map(|r| r.tokens_in).sum();
+    let tokens_out: i64 = billed.iter().map(|r| r.tokens_out).sum();
+    let cached: i64 = billed.iter().map(|r| r.cached_tokens.unwrap_or(0)).sum();
     out.push_str(&format!(
         "Totals: {} request(s), {} tokens in + {} tokens out = {} tokens; {} cached prompt tokens (a subset of tokens in).\n",
-        rows.len(),
+        billed.len(),
         tokens_in,
         tokens_out,
         tokens_in + tokens_out,
@@ -294,7 +300,7 @@ pub fn cost_report(rows: &[SpendEvent]) -> String {
     // Per-lane breakdown, biggest spender first (ties break on the lane name
     // so the report is deterministic across runs).
     let mut lanes: HashMap<&str, (usize, i64)> = HashMap::new();
-    for r in rows {
+    for r in &billed {
         let lane = r.lane.as_deref().unwrap_or("(no lane)");
         let entry = lanes.entry(lane).or_insert((0, 0));
         entry.0 += 1;
@@ -625,18 +631,22 @@ mod tests {
                 Some("[verify] `cargo test` — FAILED (exit 101)"),
             ),
             row("route", Some("high"), Some(1), 500, 100, None, None),
+            row("default", None, Some(0), 300, 50, None, None),
         ];
         let report = cost_report(&rows);
         assert!(report.starts_with("## Cost report\n"));
+        // 6 ledger rows, 5 MODEL requests: the 0-token `verify` evidence row
+        // is not a request (round-1 finding L2).
         assert!(
-            report.contains("5 request(s), 4400 tokens in + 700 tokens out = 5100 tokens"),
+            report.contains("5 request(s), 4700 tokens in + 750 tokens out = 5450 tokens"),
             "{report}"
         );
+        assert!(!report.contains("6 request(s)"), "{report}");
         assert!(report.contains("3000 cached prompt tokens"), "{report}");
         assert!(report.contains("- escalate: 1 request(s), 2300 tokens"));
         assert!(report.contains("- high: 2 request(s), 1600 tokens"));
         assert!(report.contains("- medium: 1 request(s), 1200 tokens"));
-        assert!(report.contains("- (no lane): 1 request(s), 0 tokens"));
+        assert!(report.contains("- (no lane): 1 request(s), 350 tokens"));
         assert!(report.contains("Lane per step:"));
         assert!(report.contains("- step 1: medium"));
         assert!(report.contains("- step 2: high"));
@@ -668,6 +678,8 @@ mod tests {
             None,
             Some("[verify] `cargo test` — passed (exit 0)"),
         )]);
+        // A verify-only ledger still reports zero MODEL requests.
+        assert!(report.contains("0 request(s)"), "{report}");
         assert!(report.contains("- step ?: [verify] `cargo test` — passed (exit 0)"));
     }
 

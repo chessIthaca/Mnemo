@@ -583,6 +583,15 @@ impl ToolFilter {
                 ToolCategory::Agent => {
                     (safety == SafetyLevel::AutoRun && !name.starts_with("mcp__"))
                         || name == "spawn_agent"
+                        // The `image_*` family is read-only w.r.t. the project
+                        // (it reads an image inside the sandbox and calls the
+                        // vision model), so the plan-first rule — no changes
+                        // without a plan — does not justify hiding it: a plan
+                        // built around an attached screenshot or design mockup
+                        // must be able to look at the image before the plan
+                        // exists. It stays NeedsApproval, so every call still
+                        // prompts — the same reasoning as the Browser arm.
+                        || name.starts_with("image_")
                 }
                 // create_plan is the planning tool (AutoRun — it writes only to
                 // the sandboxed `.coding/plans/` dir); complete_step is NOT
@@ -807,6 +816,15 @@ impl ToolFilter {
                 ToolCategory::Agent => {
                     (safety == SafetyLevel::AutoRun && !name.starts_with("mcp__"))
                         || name == "spawn_agent"
+                        // The `image_*` family is read-only w.r.t. the project
+                        // (it reads an image inside the sandbox and calls the
+                        // vision model), so the plan-first rule — no changes
+                        // without a plan — does not justify hiding it: a plan
+                        // built around an attached screenshot or design mockup
+                        // must be able to look at the image before the plan
+                        // exists. It stays NeedsApproval, so every call still
+                        // prompts — the same reasoning as the Browser arm.
+                        || name.starts_with("image_")
                 }
                 // Browser tools (reads AND mutations) stay visible in Complete:
                 // between tasks is exactly when the user asks the agent to
@@ -1858,6 +1876,141 @@ mod tests {
                                                               // Planning or Complete (validated against the registry's available_in).
         assert!(names.contains(&"skill_start".to_string()));
         assert!(names.contains(&"memory_recall".to_string())); // always
+    }
+
+    /// The `image_*` family must be visible in the Planning and Complete
+    /// workflow states: it is read-only w.r.t. the project — it reads an image
+    /// inside the sandbox and calls the vision model — so the plan-first rule
+    /// ("no changes without a plan") does not justify hiding it, and a plan
+    /// that must account for an attached screenshot or design mockup cannot
+    /// look at the image until a plan exists. The family stays
+    /// `NeedsApproval`, so every call still prompts: the approval gate — not
+    /// state visibility — is the guard (the same reasoning as the Browser
+    /// arms).
+    ///
+    /// Regression for the two `ToolCategory::Agent` arms of
+    /// [`ToolFilter::allows`]. Exercises the REAL tools (real constructors →
+    /// real name/category/safety/deferred_group) and enumerates the family out
+    /// of the registry, so a renamed or added member stays covered instead of
+    /// a hardcoded name list.
+    #[test]
+    fn image_family_visible_in_planning_and_complete() {
+        // Local vision stub — the property under test is name/category/safety,
+        // so the describer never has to return anything meaningful.
+        // `is_configured` keeps its `true` default, so the tools are available.
+        struct StubVision;
+        #[async_trait]
+        impl crate::provider::vision::ImageDescriber for StubVision {
+            async fn describe_image(
+                &self,
+                _image_url: &str,
+                _prompt: &str,
+            ) -> crate::error::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let mut r = registry();
+        let vision: std::sync::Arc<dyn crate::provider::vision::ImageDescriber> =
+            std::sync::Arc::new(StubVision);
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap();
+        use crate::tool::agent::image_tools::tools as img;
+        for tool in [
+            Box::new(img::ImageUiToArtifactTool::new(sandbox.clone(), vision.clone()))
+                as Box<dyn Tool>,
+            Box::new(img::ImageExtractTextTool::new(sandbox.clone(), vision.clone()))
+                as Box<dyn Tool>,
+            Box::new(img::ImageDiagnoseErrorTool::new(sandbox.clone(), vision.clone()))
+                as Box<dyn Tool>,
+            Box::new(img::ImageUnderstandDiagramTool::new(sandbox.clone(), vision.clone()))
+                as Box<dyn Tool>,
+            Box::new(img::ImageAnalyzeChartTool::new(sandbox.clone(), vision.clone()))
+                as Box<dyn Tool>,
+            Box::new(img::ImageUiDiffTool::new(sandbox.clone(), vision.clone())) as Box<dyn Tool>,
+            Box::new(img::ImageAnalysisTool::new(sandbox, vision)) as Box<dyn Tool>,
+        ] {
+            r.register(tool);
+        }
+
+        // Enumerate the family from the registry itself — never a hardcoded
+        // name list, which would silently miss a new or renamed tool.
+        let image_names: Vec<String> = r
+            .iter()
+            .map(|t| t.name().to_string())
+            .filter(|n| n.starts_with("image_"))
+            .collect();
+        assert_eq!(
+            image_names.len(),
+            7,
+            "fixture must carry the whole family: {image_names:?}"
+        );
+
+        let caps = Capabilities::openai();
+
+        // Discoverability: while the group is still hidden, the index must
+        // advertise `image` in both states. (A group whose tools the filter
+        // denies is dropped from the index — a load_tools door onto nothing.)
+        for (state, filter) in [
+            ("Planning", ToolFilter::Planning),
+            ("Complete", ToolFilter::Complete),
+        ] {
+            assert!(
+                r.hidden_groups_for(&filter)
+                    .iter()
+                    .any(|(g, _)| g == "image"),
+                "the image group must be advertised in {state}"
+            );
+        }
+
+        // Reveal the group once; from here the family is held back only by the
+        // per-state filter.
+        r.load_group("image");
+
+        // Fixture sanity: in Executing the family is visible today — so a
+        // failure below is the state gate, not a broken fixture.
+        let executing: Vec<String> = r
+            .schemas(&caps, &ToolFilter::Executing)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for n in &image_names {
+            assert!(
+                executing.contains(n),
+                "{n} visible in Executing (fixture sanity)"
+            );
+        }
+
+        for (state, filter) in [
+            ("Planning", ToolFilter::Planning),
+            ("Complete", ToolFilter::Complete),
+        ] {
+            let names: Vec<String> = r
+                .schemas(&caps, &filter)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            // The whole family is in the surface.
+            for n in &image_names {
+                assert!(names.contains(n), "{n} must be visible in {state}");
+            }
+            // HARD RULE survives: the mutating tools stay hidden — no changes
+            // without a plan.
+            for m in ["file_write", "file_edit", "shell", "git"] {
+                assert!(
+                    !names.contains(&m.to_string()),
+                    "{m} must stay hidden in {state} (no changes without a plan)"
+                );
+            }
+            // Visibility never drops the approval prompt.
+            for n in &image_names {
+                assert_eq!(
+                    r.get(n).expect("registered above").safety(),
+                    SafetyLevel::NeedsApproval,
+                    "{n} must stay NeedsApproval"
+                );
+            }
+        }
     }
 
     #[test]

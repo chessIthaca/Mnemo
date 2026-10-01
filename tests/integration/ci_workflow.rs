@@ -286,19 +286,21 @@ fn workflows_pin_actions_to_full_shas() {
 }
 
 // Failure text for the vendored-patch lock guard below.
-const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the tao/wry path patches in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the Windows keyboard/IME deadlock backport and the WebView2 SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/ (see vendor/tao/PATCHES.md, vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
+const UNUSED_PATCH_MSG: &str = "Cargo.lock carries a [[patch.unused]] entry: a [patch.crates-io] override (the wry path patch in Cargo.toml) no longer applies to the resolved version, so the registry crate would ship instead of the vendored build — losing the WebView2 OS-account SSO + hard-reload patches. Re-pin tauri / tauri-runtime-wry by hand together with vendor/wry (see vendor/wry/PATCHES.md and the .github/dependabot.yml ignore list), then re-run this guard";
 
-/// The lock must keep the vendored `[patch.crates-io]` overrides in effect:
-/// the `tao` and `wry` packages must stay PATH-sourced in `Cargo.lock` (no
-/// `source = ` line in their `[[package]]` entries, so the resolved crates
-/// are the `vendor/` copies) and the lock must carry no `[[patch.unused]]`
+/// The lock must keep the vendored `[patch.crates-io]` override in effect:
+/// the `wry` package must stay PATH-sourced in `Cargo.lock` (no `source = `
+/// line in its `[[package]]` entry, so the resolved crate is the `vendor/`
+/// copy) and the lock must carry no `[[patch.unused]]`
 /// entries. This is the machine check behind the `.github/dependabot.yml`
-/// review note: bumping `tauri` past 2.11.6 (or `tauri-runtime-wry` past
-/// 2.11.4) moves wry to 0.57 / tao to 0.37, turning both overrides into
-/// `[[patch.unused]]` — the registry crates would then ship instead of the
-/// vendored builds, losing the Windows keyboard/IME deadlock backport
-/// (vendor/tao/PATCHES.md) and the WebView2 OS-account SSO + hard-reload
-/// patches (vendor/wry/PATCHES.md) while CI stays green. Review H1 of
+/// review note: bumping `tauri` past 2.12.0 (or `tauri-runtime-wry` past
+/// 2.12.0) moves wry off `^0.57`, turning the override into a
+/// `[[patch.unused]]` — the registry crate would then ship instead of the
+/// vendored build, losing the WebView2 OS-account SSO + hard-reload
+/// patches (vendor/wry/PATCHES.md) while CI stays green. (tao needs no
+/// check: tauri 2.12 resolves tao 0.37.x, which carries the PR #1215
+/// keyboard/IME deadlock fix natively — vendor/tao was dropped with it.)
+/// Review H1 of
 /// `.coding/reviews/2026-09-29-rust-ci-dependency-wave-review.md`.
 #[test]
 fn cargo_lock_keeps_the_vendored_patches() {
@@ -311,43 +313,33 @@ fn cargo_lock_keeps_the_vendored_patches() {
 
     // A path-sourced entry has NO `source = ` line; any source (registry or
     // git) means the vendored build is not what resolves. Exact-name match:
-    // `tao-macros` must never count as `tao`.
-    let mut seen_tao = false;
+    // only a `name = "wry"` line arms the check.
     let mut seen_wry = false;
-    let mut target: Option<&str> = None;
+    let mut target_wry = false;
     for (idx, line) in text.lines().enumerate() {
         if line.starts_with("[[") {
-            target = None;
+            target_wry = false;
         } else if let Some(name) = line
             .strip_prefix("name = \"")
             .and_then(|rest| rest.strip_suffix('"'))
         {
-            match name {
-                "tao" => {
-                    seen_tao = true;
-                    target = Some("tao");
-                }
-                "wry" => {
-                    seen_wry = true;
-                    target = Some("wry");
-                }
-                _ => target = None,
+            target_wry = name == "wry";
+            if target_wry {
+                seen_wry = true;
             }
-        } else if line.starts_with("source = ") {
-            if let Some(name) = target {
-                panic!(
-                    "Cargo.lock's `{name}` entry (line {}) is not path-sourced \
-                     (`{line}`): the vendored [patch.crates-io] override is not \
-                     in effect, so a registry/git build ships instead of \
-                     vendor/{name} — see vendor/{name}/PATCHES.md",
-                    idx + 1
-                );
-            }
+        } else if line.starts_with("source = ") && target_wry {
+            panic!(
+                "Cargo.lock's `wry` entry (line {}) is not path-sourced \
+                 (`{line}`): the vendored [patch.crates-io] override is not \
+                 in effect, so a registry/git build ships instead of \
+                 vendor/wry — see vendor/wry/PATCHES.md",
+                idx + 1
+            );
         }
     }
     assert!(
-        seen_tao && seen_wry,
-        "Cargo.lock resolves no tao/wry package (saw tao={seen_tao}, \
-         wry={seen_wry}): both vendored crates must resolve"
+        seen_wry,
+        "Cargo.lock resolves no wry package (saw wry={seen_wry}): the \
+         vendored crate must resolve"
     );
 }

@@ -80,11 +80,11 @@ src/                  the `mnemo` library — the harness core (no Tauri)
   backlog.rs            the Run-All queue
 src-tauri/            the `mnemo-app` desktop shell (Tauri 2)
   src/                  startup, watchdog, console (headless REPL mode), IPC
-  tests/                source-contract tests guarding the vendored patches
+  tests/                source-contract tests guarding the vendored wry patches
 frontend/             React 19 + TypeScript 7 + Vite 8 + Tailwind 4 UI
 tests/integration/    cross-boundary integration tests
 scripts/              the npm launcher (start.mjs) + maintenance scripts
-vendor/               patched tao + wry — each with a PATCHES.md, wired via [patch.crates-io]
+vendor/               patched wry — with a PATCHES.md, wired via [patch.crates-io]
 assets/               diagrams (workflow.svg)
 agent.md              the project constitution — loaded before every agent turn
 PLAN.md               the technical-decisions log
@@ -95,7 +95,7 @@ PLAN.md               the technical-decisions log
 
 **`.coding/` is the memory the repo carries.** Plans, review reports, knowledge files, and the backlog travel in git and merge across machines; the SQLite caches (`memory.db`, `codegraph.db`) are rebuildable and gitignored. A fresh clone of Mnemo's own repo arrives with its development history already loaded. Creating a project seeds those ignore rules (and the backlog's union-merge attribute) into the new project's `.gitignore`/`.gitattributes`, appending only what is missing — existing user lines are never touched.
 
-**Vendored patches.** `vendor/` carries small, documented patches to `tao` (Windows IME self-deadlock fix) and `wry` (SSO + hard-reload for the embedded browser), each guarded by source-contract tests in `src-tauri/tests/`; the lock pins themselves are guarded by `cargo_lock_keeps_the_vendored_patches` (`tests/integration/ci_workflow.rs`), which fails if a `[[patch.unused]]` entry appears or `tao`/`wry` stop resolving from the vendored paths.
+**Vendored patches.** `vendor/` carries small, documented patches to `wry` (OS-account SSO + hard-reload for the embedded browser), guarded by source-contract tests in `src-tauri/tests/`; the lock pin itself is guarded by `cargo_lock_keeps_the_vendored_patches` (`tests/integration/ci_workflow.rs`), which fails if a `[[patch.unused]]` entry appears or `wry` stops resolving from the vendored path. (`tao` used to be vendored for its Windows IME self-deadlock fix; tauri 2.12 moved the app to tao 0.37.x, which carries that upstream fix natively — the backport and its guard were dropped with it.)
 
 ---
 
@@ -208,7 +208,7 @@ Pull requests gratefully considered.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — providers, models, effort routing, MCP servers, per-project state
 - [PLAN.md](PLAN.md) — technical decisions and provider strategy
 - [agent.md](agent.md) — the project constitution the agent loads every turn
-- [vendor/wry/PATCHES.md](vendor/wry/PATCHES.md) + [vendor/tao/PATCHES.md](vendor/tao/PATCHES.md) — what is patched upstream and why
+- [vendor/wry/PATCHES.md](vendor/wry/PATCHES.md) — what is patched upstream and why
 - `.coding/` — the agent's own working state (plans, reviews, knowledge, backlog)
 
 ---

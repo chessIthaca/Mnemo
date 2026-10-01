@@ -20,8 +20,9 @@
 //! `KEY_EVENT_BUILDERS` while `KeyEventBuilder::process_message` calls
 //! `PeekMessageW`, which dispatches an inbound SEND that re-enters the window
 //! proc on the same thread and re-locks the non-reentrant `parking_lot`
-//! mutex. Fixed by the vendored tao 0.35.4 backport of upstream PR #1215
-//! (`vendor/tao/PATCHES.md`) + Rust-side delta coalescing in the event
+//! mutex. Fixed upstream by PR #1215 (tao 0.36.0+; the interim vendored 0.35.4
+//! backport was dropped when tauri 2.12 moved the app to registry tao 0.37.x)
+//! + Rust-side delta coalescing in the event
 //! forwarder (`DeltaBatcher`, `ipc/events.rs`). The watchdog stays armed: any
 //! recurrence yields a named stack again.
 //!

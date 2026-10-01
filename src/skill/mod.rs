@@ -336,6 +336,11 @@ pub const REPO_LOCAL_SKILLS: &[(&str, &str)] = &[
         "this repo's PR/ruleset closeout after a human merges — repo-local by the \
          2026-09-26 decision (memory f4b6d203)",
     ),
+    (
+        "pr_sweep",
+        "work the open PR queue end to end — this repo's dependabot queue and the \
+         pull_request ruleset 23755694 PR path are meaningless in a user's project",
+    ),
 ];
 
 /// Seed the [`SHIPPED_SKILLS`] into `skills_dir` (a project's
@@ -705,6 +710,73 @@ prompt = "Merge."
     }
 
     #[test]
+    fn pr_sweep_parses_and_carries_the_merge_gate_order() {
+        // The PR-queue sweep skill (user request 2026-09-30): like the other
+        // repo-local skills, a file that stops parsing is only logged and
+        // skipped at startup, so a rotted pr_sweep would silently vanish.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".coding/skills");
+        let reg = SkillRegistry::load_dir(&dir);
+        let sweep = reg.get("pr_sweep").expect("pr_sweep.toml parses and loads");
+        assert!(reg.is_available_in("pr_sweep", WorkflowState::Complete));
+        assert!(reg.is_available_in("pr_sweep", WorkflowState::Planning));
+        assert!(!reg.is_available_in("pr_sweep", WorkflowState::Executing));
+        assert_eq!(
+            sweep.target_state,
+            WorkflowState::Planning,
+            "a PR needing code changes must land the agent back in Planning"
+        );
+        // The charter is verify-then-merge: no file tools, so the sweep can
+        // never become a plan-less source-editing path.
+        assert!(sweep.tools.iter().any(|t| t == "shell"));
+        assert!(sweep.tools.iter().any(|t| t == "git"));
+        for forbidden in ["file_write", "file_edit", "multi_edit"] {
+            assert!(
+                !sweep.tools.iter().any(|t| t == forbidden),
+                "pr_sweep must not carry {forbidden}: a PR needing source edits goes to a plan"
+            );
+        }
+        // ORDERING is the point: both gates must clear BEFORE the merge, and
+        // the Cargo.lock guard is the one that silently ships the registry
+        // crates instead of the vendored tao/wry when it is skipped.
+        let gate1 = sweep
+            .prompt
+            .find("Gate 1")
+            .expect("the evidence gate is in the prompt");
+        let gate2 = sweep
+            .prompt
+            .find("[[patch.unused]]")
+            .expect("the Cargo.lock guard is in the prompt");
+        let approve = sweep
+            .prompt
+            .find("gh pr review")
+            .expect("the approve step is in the prompt");
+        let merge = sweep
+            .prompt
+            .find("gh pr merge")
+            .expect("the merge step is in the prompt");
+        assert!(
+            gate1 < merge,
+            "the evidence gate must precede the merge (gate at {gate1}, merge at {merge})"
+        );
+        assert!(
+            gate2 < merge,
+            "the Cargo.lock gate must precede the merge (gate at {gate2}, merge at {merge})"
+        );
+        assert!(
+            approve < merge,
+            "approval must precede the merge (approve at {approve}, merge at {merge})"
+        );
+        assert!(
+            sweep.prompt.contains("skill_end"),
+            "pr_sweep exits via skill_end"
+        );
+        assert!(
+            sweep.prompt.contains("git pull --no-rebase"),
+            "pr_sweep syncs main after the merges"
+        );
+    }
+
+    #[test]
     fn merge_to_main_and_new_release_write_their_records_before_the_landing_commit() {
         // ORDERING, not mere presence (the 2026-09-26 defect): the landing
         // skill's bookkeeping step ran AFTER the branch content was frozen, so
@@ -848,6 +920,10 @@ prompt = "Merge."
         assert!(
             !is_shipped_skill("post_merge_sync"),
             "post_merge_sync stays repo-local (memory f4b6d203)"
+        );
+        assert!(
+            !is_shipped_skill("pr_sweep"),
+            "pr_sweep stays repo-local (this repo's dependabot queue + ruleset path)"
         );
         assert!(!is_shipped_skill("merge_to_main_v2"));
         assert!(!is_shipped_skill(""));

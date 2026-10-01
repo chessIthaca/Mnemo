@@ -1,0 +1,58 @@
+# The pr_sweep skill - work the open pull-request queue: verify each PR, merge
+# the ones that pass, report the rest.
+#
+# Entered via skill_start("pr_sweep") from Complete or Planning - NO plan needed
+# for the sweep itself: it lands other people's already-authored PRs through the
+# ruleset's own review path, it writes no source, and it produces no commits.
+#
+# The prompt below is injected into the system prompt EVERY turn the skill runs,
+# so it stays a terse checklist. The rationale for its rules lives here in
+# comments (never injected) - do not move it back into the prompt; each rule
+# encodes a real failure or a real policy:
+# - The allow-list is shell + git ONLY, on purpose (step 5): the sweep must not
+#   become a plan-less source-editing path. A bump that needs code changes is
+#   left OPEN and routed to a plan - which is why target_state is Planning, and
+#   the same reason create_skill.toml abandons to a plan when app code is
+#   involved. file_write/file_edit are deliberately NOT granted here.
+# - Gate 2 (step 3) is this repo's own review instruction, not a guess:
+#   .github/dependabot.yml:26-39 tells the reviewer to confirm the Cargo.lock
+#   diff carries no `[[patch.unused]]` and that tao/wry stay path-sourced from
+#   vendor/ - bumping tauri past 2.11.6 moves wry to 0.57 and tao to 0.37,
+#   turning both [patch.crates-io] pins into unused entries and silently
+#   shipping the registry crates (that is why #26 was closed and replaced by the
+#   hand-rolled #32). Machine-guarded by `cargo_lock_keeps_the_vendored_patches`
+#   (tests/integration/ci_workflow.rs) - but that guard only runs on OUR tree, so
+#   it cannot stop a merge on GitHub.
+# - Approving is legal here, and only here (step 6): the author is
+#   dependabot[bot], never us, so a chessIthaca approval is not a self-approval.
+#   The reason merge_to_main stops at "report the PR URL" is self-approval
+#   against ruleset 23755694 (required_approving_review_count: 1) - that does not
+#   apply to PRs we did not author. Force/`--admin`/ruleset edits stay forbidden.
+# - Gate 1 prefers CI on the MERGE COMMIT (step 2): GitHub tests the merged
+#   result, while a local checkout of the PR head alone only proves the branch
+#   against its own base - the Sep-29 PRs (#65/#66/#67) predate the #71 merge
+#   into main, so their branches alone are stale evidence.
+# - This file is repo-local, not app-shipped (like new_release.toml and
+#   post_merge_sync.toml): it is this repo's dependabot queue plus its
+#   pull_request ruleset path, so it is declared in REPO_LOCAL_SKILLS
+#   (src/skill/mod.rs) and travels via git (the .coding/ side-car) instead of
+#   being seeded into a user's project. The guard test
+#   every_repo_skill_is_shipped_or_declared_repo_local forces that choice.
+#
+# Re-edit this file freely, then call `skill_reload` to pick the change up: the
+# registry is otherwise loaded once, at app startup.
+
+name = "pr_sweep"
+available_in = ["complete", "planning"]
+target_state = "planning"
+tools = ["shell", "git"]
+prompt = """
+Sweep this repo's open pull requests — verify each one, then land every PR that passes. Steps:
+1. `gh pr list --state open --json number,title,headRefName,author,mergeable,mergeStateStatus`; work them ONE at a time, never several at once.
+2. Gate 1 — evidence on the MERGED state: `gh pr view <n> --json mergeable,mergeStateStatus,headRefOid` plus `gh pr checks <n>`; green CI on the pull_request merge commit is the primary evidence. No checks attached, or a check pending/failing → run the project's own checks locally on the PR's merged state (`cargo test` unpiped, read its result lines; npm: `npm ci` + `npm run build` + `npm test`).
+3. Gate 2 — cargo PRs ONLY: read the Cargo.lock diff (`gh pr diff <n>`) and confirm NO `[[patch.unused]]` entry appears and tao/wry stay path-sourced from vendor/ (this repo's vendored pins; .github/dependabot.yml:26-39). Gate 2 must pass BEFORE any merge.
+4. A MAJOR version bump additionally needs its changelog read (breaking changes?) plus a real local build/test — never a CI-only pass.
+5. A PR that would need source or manifest edits is NEVER merged here: leave it open, name the needed change in the report, and route it to a plan at skill_end. This skill carries no file tools on purpose.
+6. Merge the PRs that pass: `gh pr review <n> --approve` then `gh pr merge <n> --merge`. The author is dependabot[bot] (never us), so approving is not a self-approval — the ruleset requires one. NEVER force, never `--admin`, never edit the ruleset; a refusal is reported as-is, never worked around.
+7. After the merges: sync local main (`git checkout main` on the git tool, then `git pull --no-rebase` on shell; confirm main equals origin/main) and write ONE semantic memory of the sweep.
+8. Report per PR: number, disposition (merged / left open + why), the evidence used; then `git status --short`, and `skill_end` → Planning."""

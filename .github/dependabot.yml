@@ -18,22 +18,25 @@ updates:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
     ignore:
-      # tao/wry are [patch.crates-io] path overrides onto vendor/ (root
-      # Cargo.toml): the app deliberately runs patched 0.35.4 / 0.55.3 builds,
-      # so a registry bump would drop the backported fixes and fight the pins.
-      - dependency-name: tao
+      # wry is a [patch.crates-io] path override onto vendor/ (root
+      # Cargo.toml): the app deliberately runs a patched 0.57.2 build (WebView2
+      # OS-account SSO + hard reload), so a registry bump would drop those
+      # fixes and fight the pin.
       - dependency-name: wry
       # Reviewing any cargo PR from this group: confirm the Cargo.lock diff
-      # contains NO `[[patch.unused]]` entries. Bumping tauri past 2.11.6 (or
-      # tauri-runtime-wry past 2.11.4) moves wry to 0.57 and tao to 0.37, which
-      # turns both patches into `[[patch.unused]]` entries and silently ships
-      # the registry crates instead of the vendored ones — that is why #26 was
-      # closed and replaced by the hand-rolled #32. tauri and tauri-runtime-wry
-      # are therefore ignored here too — bump them by hand together with the
-      # vendor/ patches and re-check the lock for `[[patch.unused]]`.
+      # contains NO `[[patch.unused]]` entries and keeps wry path-sourced.
+      # Bumping tauri past 2.12.0 (or tauri-runtime-wry past 2.12.0) moves wry
+      # off ^0.57, which turns the patch into a `[[patch.unused]]` entry and
+      # silently ships the registry crate instead of the vendored one — that is
+      # why #26 was closed and replaced by the hand-rolled #32. tauri and
+      # tauri-runtime-wry are therefore ignored here too — bump them by hand
+      # together with the vendor/wry patches and re-check the lock for
+      # `[[patch.unused]]`. (tao is no longer vendored or ignored: tauri 2.12
+      # resolves tao 0.37.x, which carries the PR #1215 keyboard/IME deadlock
+      # fix natively.)
       # Machine-guarded since 2027-01-11: the integration guard
       # `cargo_lock_keeps_the_vendored_patches` fails the build when a
-      # `[[patch.unused]]` entry appears or tao/wry stop being path-sourced
+      # `[[patch.unused]]` entry appears or wry stops being path-sourced
       # (`tests/integration/ci_workflow.rs`).
       - dependency-name: tauri
       - dependency-name: tauri-runtime-wry

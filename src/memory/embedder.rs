@@ -143,9 +143,10 @@ pub struct BundledModelInfo {
 /// degrades to keyword + tier + strength rather than dying.
 #[cfg(feature = "embeddings")]
 pub struct BundledEmbedder {
-    /// Behind an `Arc` so it can be cloned into the `spawn_blocking` task
-    /// (`TextEmbedding` is not `Clone`).
-    model: Arc<fastembed::TextEmbedding>,
+    /// Behind an `Arc<Mutex<_>>` so it can be cloned into the `spawn_blocking`
+    /// task (`TextEmbedding` is not `Clone`) while still being handed out
+    /// mutably — fastembed 7's `TextEmbedding::embed` takes `&mut self`.
+    model: Arc<std::sync::Mutex<fastembed::TextEmbedding>>,
     model_id: String,
     dim: usize,
     status: Arc<RwLock<EmbedderStatus>>,
@@ -165,12 +166,12 @@ impl BundledEmbedder {
     ) -> Result<Self, String> {
         let model = model_for_id(model_id)?;
         let dim = dim_for_model(&model);
-        let init = fastembed::InitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+        let init = fastembed::TextInitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
         let model = fastembed::TextEmbedding::try_new(init)
             .map_err(|e| format!("failed to load embedding model '{model_id}': {e}"))?;
         *status.write().expect("embedder status lock poisoned") = EmbedderStatus::Ready;
         Ok(Self {
-            model: Arc::new(model),
+            model: Arc::new(std::sync::Mutex::new(model)),
             model_id: model_id.to_string(),
             dim,
             status,
@@ -220,7 +221,13 @@ impl Embedder for BundledEmbedder {
         // ONNX inference is CPU-bound — run it on the blocking pool so the
         // async runtime is never stalled. A failure returns a zero vector
         // (matching the Embedder contract) + flips the shared status.
-        match tokio::task::spawn_blocking(move || model.embed(vec![text], None)).await {
+        let embed = tokio::task::spawn_blocking(move || {
+            // fastembed 7's `embed` takes `&mut self`; the guard is scoped to
+            // this sync closure, so it never crosses an `.await`.
+            let mut model = model.lock().expect("embedder model lock poisoned");
+            model.embed(vec![text], None)
+        });
+        match embed.await {
             Ok(Ok(mut batches)) if !batches.is_empty() => {
                 let v = batches.remove(0);
                 if v.len() == dim {

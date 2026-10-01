@@ -14,15 +14,15 @@
 //! `ICoreWebView2EnvironmentOptions::AllowSingleSignOnUsingOSPrimaryAccount`
 //! (MS Learn: "used to enable single sign on with AAD and personal MSA
 //! resources inside WebView; all AAD accounts connected to Windows are
-//! supported"). wry 0.55.1 builds the environment options itself and never
+//! supported"). wry builds the environment options itself and never
 //! sets the flag, and Tauri 2's `WebviewBuilder` exposes no environment
-//! hook — so the flag cannot be set from app code. The vendored wry 0.55.3
+//! hook — so the flag cannot be set from app code. The vendored wry 0.57.2
 //! (`vendor/wry`, see PATCHES.md) patches `create_environment` to call
 //! `set_allow_single_sign_on_using_os_primary_account(true)`.
 //!
 //! This test is the deterministic stand-in: it asserts the patch's
 //! source-level invariants against the vendored tree (`vendor/wry`,
-//! workspace root). It FAILS on the pristine 0.55.1 source (SSO off — the
+//! workspace root). It FAILS on the pristine 0.57.0 source (SSO off — the
 //! login-wall bug) and PASSES once the patch is applied, so OS SSO can
 //! never silently disappear via a vendor refresh or a botched merge.
 
@@ -86,18 +86,18 @@ fn create_environment_sets_os_sso() {
     );
 }
 
-/// The renumber: the vendored crate must present itself as 0.55.3 so
-/// `[patch.crates-io]` satisfies tauri-runtime-wry's `wry = "^0.55"` pin
-/// while staying distinguishable from the registry's 0.55.1 in Cargo.lock.
-/// (0.55.3 = 0.55.1 + the SSO patch + the hard-reload patch — see
+/// The renumber: the vendored crate must present itself as 0.57.2 so
+/// `[patch.crates-io]` satisfies tauri-runtime-wry's `wry = "^0.57"` pin
+/// while staying distinguishable from the registry's 0.57.0 in Cargo.lock.
+/// (0.57.2 = 0.57.0 + the SSO patch + the hard-reload patch — see
 /// tests/wry_hard_reload_patch.rs.)
 #[test]
-fn vendored_wry_is_renumbered_0_55_3() {
+fn vendored_wry_is_renumbered_0_57_2() {
     let manifest = read_vendored("Cargo.toml");
     assert!(
-        manifest.contains("version = \"0.55.3\""),
-        "vendored wry must be renumbered 0.55.3 (0.55.1 + OS-account SSO patch + hard-reload \
-         patch) so the [patch.crates-io] entry satisfies tauri-runtime-wry's ^0.55 requirement \
-         and the patched copy is distinguishable from the registry's 0.55.1"
+        manifest.contains("version = \"0.57.2\""),
+        "vendored wry must be renumbered 0.57.2 (0.57.0 + OS-account SSO patch + hard-reload \
+         patch) so the [patch.crates-io] entry satisfies tauri-runtime-wry's ^0.57 requirement \
+         and the patched copy is distinguishable from the registry's 0.57.0"
     );
 }

@@ -68,6 +68,7 @@ export default defineConfig({
       "src/lib/format.test.ts",
       "src/lib/inflightPanelPref.test.ts",
       "src/lib/language.test.ts",
+      "src/lib/linkGesture.test.ts",
       "src/lib/mdEdit.test.ts",
       "src/lib/messageEquality.test.ts",
       "src/lib/openFile.test.ts",

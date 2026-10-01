@@ -39,6 +39,7 @@ import { browserWebviewSupported } from "../../lib/tauri";
 import { MarkdownLink, openMarkdownTarget } from "./MarkdownLink";
 import messageSource from "./Message.tsx?raw";
 import markdownImplSource from "./MarkdownImpl.tsx?raw";
+import markdownLinkSource from "./MarkdownLink.tsx?raw";
 
 /**
  * The router awaits the (mocked) platform probe before touching the store, so
@@ -289,5 +290,40 @@ describe("MarkdownImpl default link override (source contract)", () => {
     // replaced the whole app UI. The override now defaults INSIDE the single
     // ReactMarkdown renderer (a caller's own `a` still wins — spread after).
     expect(markdownImplSource).toContain("a: MarkdownLink, ...components");
+  });
+});
+
+describe("escape-hatch press wiring (source contract)", () => {
+  // User report 2026-10-01: a ctrl-click on a chat link loaded the app's own
+  // Browser tab instead of the OS browser — the hatch was decided from the
+  // CLICK event's flags, but the engine decides a ctrl/middle-click gesture
+  // itself (WebView2 raises NewWindowRequested; wry surfaces it only when a
+  // new_window_req_handler is registered, and the app registers none), so the
+  // click can arrive with the modifier already consumed. The press carries it
+  // reliably, so the hatch is sampled there and consumed once by the click.
+  it("MarkdownLink samples the hatch on the press and consults it from the click", () => {
+    expect(markdownLinkSource).toContain("onMouseDown");
+    expect(markdownLinkSource).toContain("noteLinkPress(e)");
+    expect(markdownLinkSource).toContain("takeLinkPress()");
+    // When the hatch is armed the press must suppress the engine's own
+    // ctrl/middle-click gesture.
+    expect(markdownLinkSource).toContain("if (noteLinkPress(e)) e.preventDefault()");
+  });
+
+  it("the web_fetch URL chip samples the press the same way", () => {
+    expect(messageSource).toContain("noteLinkPress(e)");
+    expect(messageSource).toContain("takeLinkPress()");
+    expect(messageSource).toContain("if (noteLinkPress(e)) e.preventDefault()");
+  });
+
+  it("drains the press record on the gestures that never fire a click", () => {
+    // Round-1 LOW 1: a middle-click records a press but never fires `click`,
+    // and a keyboard activation fires no press at all — both must drain the
+    // record, so an aborted press cannot be consumed by a later click and send
+    // a keyboard activation to the OS browser.
+    expect(markdownLinkSource).toContain("takeLinkPress();");
+    expect(markdownLinkSource).toContain("onKeyDown");
+    expect(messageSource).toContain("takeLinkPress();");
+    expect(messageSource).toContain("onKeyDown");
   });
 });

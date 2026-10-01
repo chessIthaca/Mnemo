@@ -10,6 +10,7 @@ import { MarkdownLink } from "./MarkdownLink";
 import { CodeBlock } from "./CodeBlock";
 import { UnifiedDiffView } from "./DiffView";
 import { openDiffInViewer, openFileInViewer } from "../../lib/openFile";
+import { noteLinkPress, takeLinkPress } from "../../lib/linkGesture";
 import { openChatLink } from "../../lib/openChatLink";
 import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
 import { fmtToolDuration, fmtTs } from "../../lib/timeFormat";
@@ -640,9 +641,28 @@ function ToolCard({
               <button
                 key={chip.key}
                 type="button"
+                onMouseDown={(e) => {
+                  // Sample the escape hatch at PRESS time (lib/linkGesture.ts):
+                  // the engine decides a ctrl/middle-click gesture itself and
+                  // can dispatch the click without the modifier (user report
+                  // 2026-10-01), so the press is the reliable signal.
+                  if (noteLinkPress(e)) e.preventDefault();
+                }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  void openChatLink(url, { osBrowser: e.ctrlKey || e.metaKey });
+                  void openChatLink(url, {
+                    osBrowser: takeLinkPress() || e.ctrlKey || e.metaKey,
+                  });
+                }}
+                onAuxClick={(e) => {
+                  // Middle-click never fires `click`, so drain the press it
+                  // recorded (the chip has no middle-click route of its own).
+                  if (e.button === 1) takeLinkPress();
+                }}
+                onKeyDown={(e) => {
+                  // Enter/Space activate the chip with no preceding press —
+                  // drain any record an aborted press left behind.
+                  if (e.key === "Enter" || e.key === " ") takeLinkPress();
                 }}
                 title={`Open ${url} in the Browser tab — ctrl-click for your browser`}
                 className="flex items-center gap-[0.15em] text-cyan-400 underline-offset-2 hover:underline"

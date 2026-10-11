@@ -60,6 +60,16 @@ async fn parent_root_binding(
     })
 }
 
+/// Spawn a background agent: build its loop via the factory, spawn its task,
+/// register it with the manager, and track its loop for `get_workflow_state`.
+///
+/// Shared by the `spawn_agent` Tauri command (the UI button), the
+/// [`IpcSpawner`] (the agent's `spawn_agent` tool), and main-agent startup
+/// (main.rs), so all three paths behave identically. When `initial_prompt` is
+/// `Some`, it's sent as the agent's first turn right after registration.
+/// `parent_id` is the agent that spawned this one via the tool (`None` for
+/// UI-button spawns and the main agent) — used to notify the parent when this
+/// agent finishes. Returns `(agent_id, name)`.
 pub async fn spawn_agent_shared(
     factory: Arc<AgentLoopFactory>,
     manager: Arc<tokio::sync::Mutex<AgentManager>>,

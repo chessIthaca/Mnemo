@@ -83,17 +83,6 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
     })
 }
 
-/// Spawn a background agent: build its loop via the factory, spawn its task,
-/// register it with the manager, and track its loop for `get_workflow_state`.
-///
-/// Shared by the `spawn_agent` Tauri command (the UI button), the
-/// [`IpcSpawner`] (the agent's `spawn_agent` tool), and main-agent startup
-/// (main.rs), so all three paths behave identically. When `initial_prompt` is
-/// `Some`, it's sent as the agent's first turn right after registration.
-/// `parent_id` is the agent that spawned this one via the tool (`None` for
-/// UI-button spawns and the main agent) — used to notify the parent when this
-/// agent finishes. Returns `(agent_id, name)`.
-
 /// Spawn a parallel run-all worktree agent (plan ffd7a86f): a PARENTLESS
 /// agent bound to the item's git worktree — its file/shell/search tools,
 /// git tools, and code graph all operate on the worktree root, and its

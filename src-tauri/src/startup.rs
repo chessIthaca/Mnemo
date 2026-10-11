@@ -12,9 +12,9 @@
 #[cfg(test)]
 use mnemo::config::{Config, Endpoint};
 
-pub(crate) use mnemo::host::startup::{
-    project_flag_from_args, resolve_startup_provider, should_reembed_at_startup,
-};
+pub(crate) use mnemo::host::startup::resolve_startup_provider;
+#[cfg(test)]
+use mnemo::host::startup::{project_flag_from_args, should_reembed_at_startup};
 
 /// Whether the process was launched in console mode (`-console` or
 /// `--console`) — run the brain as a terminal REPL, never touching

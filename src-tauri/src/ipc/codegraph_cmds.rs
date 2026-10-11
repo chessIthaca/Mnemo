@@ -46,9 +46,12 @@ use crate::ipc::error::IpcError;
 use crate::ipc::memory_maintenance::{should_forward_progress, PROGRESS_EVERY};
 
 pub(crate) use mnemo::host::index_progress::{
+    startup_index_snapshot, IndexProgressEvent, INDEX_PROGRESS_CHANNEL,
+};
+#[cfg(test)]
+use mnemo::host::index_progress::{
     clear_startup_index, ensure_startup_index_visible, mark_startup_index_active,
-    record_startup_index_progress, startup_index_snapshot, startup_should_forward,
-    IndexProgressEvent, INDEX_PROGRESS_CHANNEL,
+    record_startup_index_progress, startup_should_forward,
 };
 use crate::ipc::state::IpcState;
 

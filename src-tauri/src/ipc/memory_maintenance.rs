@@ -34,8 +34,7 @@ use crate::ipc::error::IpcError;
 use crate::ipc::state::IpcState;
 
 pub(crate) use mnemo::host::maintenance::{
-    claim_busy, should_forward_progress, BusyGuard, ReconcileEvent, PROGRESS_EVERY,
-    RECONCILE_CHANNEL,
+    claim_busy, should_forward_progress, BusyGuard, PROGRESS_EVERY, RECONCILE_CHANNEL,
 };
 
 /// The Tauri event channel the maintenance task streams progress on.

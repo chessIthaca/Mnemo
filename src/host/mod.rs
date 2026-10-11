@@ -7,6 +7,9 @@
 //! startup code-graph index progress. Nothing in this module may depend on
 //! Tauri or on the app crate.
 
+#[cfg(all(feature = "browser", feature = "embeddings"))]
+pub mod brain;
 pub mod index_progress;
 pub mod maintenance;
+pub mod notifier;
 pub mod startup;

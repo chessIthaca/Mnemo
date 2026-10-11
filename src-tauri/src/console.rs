@@ -1418,7 +1418,7 @@ async fn begin_shutdown(state: &mut ReplState, runtime: &ConsoleRuntime) {
 /// helpers above — a future headless daemon swaps this function for a
 /// non-interactive loop over the same runtime.
 pub(crate) async fn run_console() -> i32 {
-    let brain = match crate::build_brain(None) {
+    let brain = match crate::build_brain(None, tokio::runtime::Handle::current()) {
         Ok(crate::BrainOutcome::Ready(brain)) => brain,
         Ok(crate::BrainOutcome::NeedsProject(_)) => {
             eprintln!(
@@ -1432,6 +1432,8 @@ pub(crate) async fn run_console() -> i32 {
             return 1;
         }
     };
+    let laya_cfg = brain.config.lock().await.general.general.laya.clone();
+    let (laya, pending_laya_start) = crate::attach_laya(&brain, &laya_cfg);
 
     // Installed bundled embedding model: build_brain deferred its ~110 MB
     // ONNX load off the main thread (AppHangB1 diagnostics) and left the
@@ -1450,8 +1452,8 @@ pub(crate) async fn run_console() -> i32 {
     // sidecar on the port the classifier client was built against. No
     // Tauri events in console mode — the status transitions still land in
     // the shared status for any GUI process reading it.
-    if let Some((_checkpoint_id, port)) = &brain.pending_laya_start {
-        let manager = brain.laya.clone();
+    if let Some((_checkpoint_id, port)) = &pending_laya_start {
+        let manager = laya.clone();
         let checkpoint = crate::ipc::laya::english_checkpoint();
         let port = *port;
         let no_app: Option<tauri::AppHandle> = None;

@@ -3,9 +3,9 @@
 // See LICENSE in the repository root.
 
 //! Host-side wiring shared by every frontend (the Tauri GUI, the console, and
-//! the headless API): startup helpers, the maintenance busy-flag, and the
-//! startup code-graph index progress. Nothing in this module may depend on
-//! Tauri or on the app crate.
+//! the headless API): the brain builder + its host-notifier seam, startup
+//! helpers, the maintenance busy-flag, and the startup code-graph index
+//! progress. Nothing in this module may depend on Tauri or on the app crate.
 
 #[cfg(all(feature = "browser", feature = "embeddings"))]
 pub mod brain;

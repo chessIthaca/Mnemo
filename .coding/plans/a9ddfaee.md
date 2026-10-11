@@ -31,3 +31,10 @@ Repo state: .coding/specs/ is untracked — commit the two spec files FIRST (the
 ## Reviews
 1 322139e308fe8a504a502c93316311b0adf4220c
 2 f7ac4d1052e01203d845a48f384c6ef749b77a79
+
+## Cost report
+
+Totals: 65 request(s), 5403329 tokens in + 82754 tokens out = 5486083 tokens; 4630784 cached prompt tokens (a subset of tokens in).
+
+Per lane:
+- (no lane): 65 request(s), 5486083 tokens

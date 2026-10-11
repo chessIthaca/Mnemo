@@ -37,9 +37,10 @@ use crate::provider::openai::{OpenAiClient, OpenAiClientConfig};
 
 /// The built brain — everything needed to run the agent.
 ///
-/// `pub(crate)` (with the four fields the console runtime needs also
-/// `pub(crate)`) so `-console` mode can reuse the exact same construction
-/// path without a Tauri app: `build_brain` is AppHandle-free by design.
+/// `pub` with all fields `pub` so every host (the Tauri GUI, the console,
+/// the headless API) can reuse the exact same construction path and wire
+/// its own state from the pieces it needs: `build_brain` takes a
+/// host-notifier + a runtime handle, never a Tauri app.
 pub struct Brain {
     pub factory: Arc<AgentLoopFactory>,
     /// Concrete memory store for runtime embedder rewire (Settings → Memory).
@@ -389,8 +390,10 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     let classifier_status = Arc::new(RwLock::new(
         crate::memory::classifier::ClassifierStatus::Disabled,
     ));
-    // The managed-runtime owner sharing the same status — inert until the
-    // startup hook / Settings rewire enable Laya.
+    // The classifier itself is attached by the HOST after the build (the
+    // managed runtime is host-owned — the app's attach_laya fills the
+    // shared slot below before the first agent spawns), so the kernel
+    // brain leaves it empty here.
     let classifier: Option<Arc<dyn crate::memory::classifier::Classifier>> = None;
     // The shared classifier SLOT + the auto-typing flag (backlog a147b63c):
     // one Arc pair feeds the factory's memory_write tools (call-time read)

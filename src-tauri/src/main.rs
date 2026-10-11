@@ -689,7 +689,7 @@ fn main() {
                     }
 
                     // Managed Laya: the classifier client already points at
-                    // the pre-allocated loopback port (build_brain); spawn
+                    // the pre-allocated loopback port (attach_laya); spawn
                     // the sidecar now and drive the status to Ready/Failed
                     // (progress on classifier://status).
                     if let Some((_checkpoint_id, port)) = &pending_laya_start {

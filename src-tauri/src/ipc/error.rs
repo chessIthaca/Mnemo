@@ -56,6 +56,12 @@ impl From<&str> for IpcError {
     }
 }
 
+impl From<mnemo::host::maintenance::MaintenanceBusy> for IpcError {
+    fn from(e: mnemo::host::maintenance::MaintenanceBusy) -> Self {
+        IpcError::msg(e.message)
+    }
+}
+
 impl From<mnemo::error::Error> for IpcError {
     fn from(e: mnemo::error::Error) -> Self {
         // The Debug representation starts with the variant name (e.g.

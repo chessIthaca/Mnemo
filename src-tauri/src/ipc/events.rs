@@ -49,6 +49,7 @@ use mnemo::runtime::{AgentCommand, AgentEvent, AgentId, AgentManager, Serialized
 use mnemo::workflow::WorkflowState;
 
 use crate::ipc::approval::PendingApprovals;
+pub(crate) use mnemo::host::runtime::cleanup_inactive_subagents;
 use crate::ipc::state::IpcState;
 
 /// The Tauri event channel name for agent events.
@@ -1310,77 +1311,6 @@ fn emit_child_finished(app: &AppHandle, event: SerializableAgentEvent) {
     };
     if let Err(e) = app.emit(AGENT_EVENT_CHANNEL, &payload) {
         eprintln!("failed to emit child_finished event: {e}");
-    }
-}
-
-/// Cancel every INACTIVE subagent registered with the manager, leaving the
-/// given `trigger_agent` and any RUNNING subagent untouched.
-///
-/// Called when an agent starts a fresh plan from Complete (Complete →
-/// Executing): stale background agents from the previous plan should be
-/// cleaned up so their tabs disappear. A subagent is "inactive" when it has
-/// started at least one turn and is not currently running — cancelling a
-/// running subagent would kill a task still in flight, so those are left alone
-/// (they exit on their own and are removed by the existing `Exited` forwarder
-/// path), and a subagent that has never started is *pending*, not completed,
-/// so it is left alone too.
-///
-/// Also called from `spawn_agent_shared` right before a new agent is spawned:
-/// per the user's rule, completed (inactive) subagents are cleaned up only when
-/// a new agent is spawned (or the user closes a tab) — never proactively. This
-/// keeps finished subagent tabs around for review until the user moves on.
-///
-/// Each cancelled subagent emits `Finished` then `Exited`; the `Exited`
-/// handler in the forwarder removes it from the manager + the per-agent loop
-/// map and emits the event so the frontend drops its tab.
-///
-/// The snapshot + all the `Cancel` sends happen under a **single** manager
-/// lock acquisition. `mgr.send` uses `try_send` (non-blocking), so this never
-/// awaits while holding the lock. Holding the lock across the whole loop
-/// prevents a concurrent `send_prompt` IPC command from enqueuing a `Prompt`
-/// *between* the snapshot and the `Cancel` — the `Prompt` send needs the same
-/// lock, so it blocks until every `Cancel` is already in the channel, landing
-/// the `Cancel` ahead of any later `Prompt` in the FIFO. The agent task then
-/// reads the `Cancel` first and exits without running an extra turn.
-pub(crate) async fn cleanup_inactive_subagents(
-    manager_arc: &Arc<Mutex<AgentManager>>,
-    trigger_agent: AgentId,
-) {
-    let mgr = manager_arc.lock().await;
-    let to_cancel: Vec<AgentId> = mgr
-        .list()
-        .iter()
-        .filter(|h| {
-            h.id != trigger_agent
-                && h.parent_id.is_some()
-                // "Inactive" means ran-and-went-idle, NOT never-started. A
-                // subagent registered by an earlier `spawn_agent` in the SAME
-                // assistant message has `running == false` until its first
-                // `Started` event reaches the forwarder — without the
-                // `has_ever_started` half of this test, each spawn's cleanup
-                // cancelled its not-yet-started siblings, so only the
-                // last-spawned agent of a batch survived (live-observed
-                // 2026-09-08, plan ccff0138: four reviewers spawned, one ran).
-                // Latch first (Acquire load): observing `has_ever_started`
-                // guarantees the `running = true` store that preceded the
-                // latch store in `set_running` is visible to the
-                // `is_running()` load below — on the first latch transition
-                // (a freshly spawned agent) the two can never present
-                // "started + idle" mid-`set_running(true)` (quality review
-                // Q1, 2026-09-08). On re-starts (turn 2+) a
-                // nanosecond-scale residual remains, equivalent to the
-                // cleanup winning the race during the agent's designed
-                // idle gap between turns.
-                && h.has_ever_started()
-                && !h.is_running()
-        })
-        .map(|h| h.id)
-        .collect();
-    // Send each Cancel while still holding the lock (try_send is non-blocking,
-    // so this is brief and never awaits). Keeping the lock until all Cancels
-    // are enqueued guarantees correct FIFO ordering vs. a concurrent Prompt.
-    for id in to_cancel {
-        let _ = mgr.send(id, AgentCommand::Cancel);
     }
 }
 

@@ -20,7 +20,6 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 
 use mnemo::agent::factory::AgentLoopFactory;
-use mnemo::agent::AgentLoop;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::memory::MemoryStore;
 use mnemo::project::Project;
@@ -84,12 +83,8 @@ pub struct IpcState {
     /// `None` only in tests that construct `IpcState` directly.
     pub watchdog: Option<Arc<crate::watchdog::Watchdog>>,
 }
+pub(crate) use mnemo::host::runtime::AgentLoopMap;
 
-/// The per-agent loop map: `Arc<tokio::Mutex<HashMap<AgentId, Arc<AgentLoop>>>>`.
-/// Shared across the IPC layer (state, spawn, events). A type alias so the
-/// 8+ spellings of this type don't drift.
-pub(crate) type AgentLoopMap =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<AgentId, Arc<AgentLoop>>>>;
 
 /// The agent-runtime slice of [`IpcState`].
 pub struct AgentRuntimeContext {

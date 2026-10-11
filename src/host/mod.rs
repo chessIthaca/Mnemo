@@ -12,4 +12,5 @@ pub mod brain;
 pub mod index_progress;
 pub mod maintenance;
 pub mod notifier;
+pub mod runtime;
 pub mod startup;

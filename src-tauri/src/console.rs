@@ -29,15 +29,17 @@
 use std::sync::Arc;
 
 use mnemo::agent::factory::AgentLoopFactory;
-use mnemo::config::{Config, ModelRef};
+use mnemo::config::Config;
 use mnemo::provider::trace::LlmRequestLog;
 use mnemo::runtime::channels::{AgentEvent, Approval, QuestionOption, UserAnswer};
 use mnemo::runtime::{
-    AgentCommand, AgentId, AgentManager, AgentSpawner, DescendantTracker, ParentAwareSpawner,
+    AgentCommand, AgentId, AgentManager,
 };
 use mnemo::tool::ToolResult;
 
-use crate::ipc::state::AgentLoopMap;
+use mnemo::host::runtime::{AgentLoopMap, HostSpawner, LifecycleBookkeeping};
+#[cfg(test)]
+use mnemo::runtime::ParentAwareSpawner;
 
 /// The reasoning-effort values the status-bar picker offers; `/reasoning`
 /// validates its argument against this list before swapping.
@@ -498,7 +500,7 @@ pub(crate) fn help_text() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Headless core — ConsoleRuntime + ConsoleSpawner
+// Headless core — ConsoleRuntime + HostSpawner
 // ---------------------------------------------------------------------------
 
 /// The console's tracked model selection — the endpoint + model the live
@@ -569,226 +571,6 @@ fn model_swap_effort(sel: Option<&ModelSelection>, target_supports: bool) -> Opt
     sel.requested_effort.clone()
 }
 
-/// The console's [`AgentSpawner`] — the AppHandle-free twin of
-/// [`crate::ipc::spawn::IpcSpawner`]. Delegates to the same shared spawn
-/// path (`spawn_agent_shared`) so a console-spawned background agent is
-/// indistinguishable from a GUI one (own workflow, manager registration,
-/// loop-map tracking). Two GUI-only niceties are skipped: no
-/// `PromptDispatched` event (it exists purely to render the task as the
-/// first message in a UI transcript) and no `ChildFinished` emit (a
-/// sidebar-only marker) — the parent completion Suggestion IS sent, by the
-/// console's [`LifecycleBookkeeping`], with the same text the GUI uses.
-pub(crate) struct ConsoleSpawner {
-    factory: Arc<AgentLoopFactory>,
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
-}
-
-impl ConsoleSpawner {
-    /// Create a spawner over the shared runtime pieces.
-    pub(crate) fn new(
-        factory: Arc<AgentLoopFactory>,
-        manager: Arc<tokio::sync::Mutex<AgentManager>>,
-        agent_loops: AgentLoopMap,
-    ) -> Self {
-        Self {
-            factory,
-            manager,
-            agent_loops,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentSpawner for ConsoleSpawner {
-    /// Spawn a background agent with no parent and no forced model —
-    /// delegates to `spawn_with_parent` with both as `None` (mirrors
-    /// `IpcSpawner`).
-    async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<AgentId, String> {
-        self.spawn_with_parent(name, task, None, None, role).await
-    }
-
-    /// This spawner is parent-aware (tool-spawned agents record their
-    /// parent, closing the completion-notification loop).
-    fn parent_aware(&self) -> Option<&dyn ParentAwareSpawner> {
-        Some(self)
-    }
-}
-
-#[async_trait::async_trait]
-impl ParentAwareSpawner for ConsoleSpawner {
-    /// Spawn a background agent on behalf of the given parent (the agent
-    /// whose `spawn_agent` tool call triggered this). Same semantics as
-    /// `IpcSpawner::spawn_with_parent` minus the UI-only event emit.
-    async fn spawn_with_parent(
-        &self,
-        name: &str,
-        task: &str,
-        parent_id: Option<AgentId>,
-        model: Option<ModelRef>,
-        role: Option<String>,
-    ) -> Result<AgentId, String> {
-        let (id, _) = crate::ipc::spawn::spawn_agent_shared(
-            self.factory.clone(),
-            self.manager.clone(),
-            self.agent_loops.clone(),
-            name.to_string(),
-            Some(task.to_string()),
-            parent_id,
-            model,
-            role,
-            false, // own_plans_dir — subagents share the main dir (can't mutate)
-            None, // no worktree binding — subagents inherit the parent's root
-        )
-        .await?;
-        Ok(id)
-    }
-}
-
-#[async_trait::async_trait]
-impl DescendantTracker for ConsoleSpawner {
-    /// Whether the agent has any running spawned descendants — delegates to
-    /// the manager's `parent_id`-chain walk, same as the IPC twin.
-    async fn has_running_descendants(&self, agent_id: AgentId) -> bool {
-        let mgr = self.manager.lock().await;
-        mgr.has_running_descendants(agent_id)
-    }
-}
-
-/// Console-side lifecycle bookkeeping — the console's equivalent of the GUI
-/// event forwarder's manager maintenance, minus the UI emits. The REPL calls
-/// one of these for EVERY agent event, exactly where the forwarder would:
-///
-/// - [`on_started`](Self::on_started) / [`on_turn_ended`](Self::on_turn_ended)
-///   keep `AgentHandle.running` current. Those flags drive two security-
-///   relevant behaviors that silently break without maintenance: the
-///   workflow state-transition gate ("no plan mutations while subagents
-///   run", via [`DescendantTracker`]) and
-///   `cleanup_inactive_subagents` (which must never Cancel a RUNNING child).
-/// - [`on_turn_ended`](Self::on_turn_ended) also sends the child's parent the
-///   completion-notification `Suggestion` (once per child, with the child's
-///   `last_review_report` path — the same text the GUI forwarder composes),
-///   closing the orchestrator feedback loop.
-/// - [`on_exited`](Self::on_exited) removes the dead agent from the manager
-///   and the per-agent loop map, so both stay bounded over a long session.
-struct LifecycleBookkeeping {
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
-    /// Children already notified (first terminal event wins — a multi-turn
-    /// child must not re-notify its parent).
-    notified_children: std::sync::Mutex<std::collections::HashSet<AgentId>>,
-}
-
-impl LifecycleBookkeeping {
-    /// Create bookkeeping over the shared manager + loop map.
-    fn new(manager: Arc<tokio::sync::Mutex<AgentManager>>, agent_loops: AgentLoopMap) -> Self {
-        Self {
-            manager,
-            agent_loops,
-            notified_children: std::sync::Mutex::new(std::collections::HashSet::new()),
-        }
-    }
-
-    /// The agent started a turn — mark it running.
-    pub(crate) async fn on_started(&self, id: AgentId) {
-        self.manager.lock().await.set_running(id, true);
-    }
-
-    /// The agent's turn ended (a `Finished` or a final non-retrying `Error`)
-    /// — mark it idle and, for a tool-spawned child, notify its parent once.
-    /// `success` mirrors the GUI forwarder: `true` for `Finished`, `false`
-    /// for a final error (drives the failed-reviewer protocol).
-    pub(crate) async fn on_turn_ended(&self, id: AgentId, success: bool) {
-        {
-            let mgr = self.manager.lock().await;
-            mgr.set_running(id, false);
-        }
-        // Notify at most once per child (mirrors the forwarder's
-        // `notified_children` set — the insert decides, before the
-        // parent-existence check, exactly like `events.rs`).
-        if self
-            .notified_children
-            .lock()
-            .expect("notified_children lock poisoned")
-            .insert(id)
-        {
-            self.notify_parent(id, success).await;
-        }
-    }
-
-    /// The agent's task truly terminated — mark it idle and remove it from
-    /// the manager + the per-agent loop map (and from the notified set, so
-    /// neither grows without bound over a long session).
-    pub(crate) async fn on_exited(&self, id: AgentId) {
-        {
-            let mut mgr = self.manager.lock().await;
-            mgr.set_running(id, false);
-            mgr.remove(id);
-        }
-        self.agent_loops.lock().await.remove(&id);
-        self.notified_children
-            .lock()
-            .expect("notified_children lock poisoned")
-            .remove(&id);
-    }
-
-    /// Send the child's parent the completion-notification `Suggestion`,
-    /// including the child's last review-report path when it wrote one — the
-    /// same composition as the GUI's `notify_parent_on_completion` (minus
-    /// the sidebar-only `ChildFinished` emit), including the failed-reviewer
-    /// protocol: a `role: "reviewer"` child that ended (failed OR finished
-    /// cleanly) with no report sets the parent's reviewer-failure latch and
-    /// gets the ask-the-user text instead of the generic no-report steer.
-    /// Best-effort: a full inbox or a gone parent drops the notification
-    /// silently (a nicety, not a guarantee — same as the GUI).
-    async fn notify_parent(&self, id: AgentId, success: bool) {
-        let (parent_id, child_name, child_role) = {
-            let mgr = self.manager.lock().await;
-            let Some(pid) = mgr.parent_id(id) else {
-                return; // no parent (the main agent / a UI-spawned agent)
-            };
-            let name = mgr
-                .get(id)
-                .map(|h| h.name.clone())
-                .unwrap_or_else(|| format!("agent-{id}"));
-            let role = mgr.role(id);
-            (pid, name, role)
-        };
-        let report_path: Option<String> = self
-            .agent_loops
-            .lock()
-            .await
-            .get(&id)
-            .map(|l| l.last_review_report())
-            .flatten();
-        // Backlog 5b46674d: no !success gate — a reviewer that FINISHES
-        // report-less is just as report-less as a failed one (the review did
-        // not happen either way).
-        let reviewer_failed_no_report =
-            child_role.as_deref() == Some("reviewer") && report_path.is_none();
-        if reviewer_failed_no_report {
-            if let Some(parent_loop) = {
-                let loops = self.agent_loops.lock().await;
-                loops.get(&parent_id).cloned()
-            } {
-                parent_loop.set_reviewer_failure_pending(true);
-            }
-        }
-        let text = if reviewer_failed_no_report {
-            mnemo::runtime::turn_resolve::reviewer_failure_suggestion_text(&child_name)
-        } else {
-            let outcome = if success { "finished" } else { "failed" };
-            mnemo::runtime::turn_resolve::completion_suggestion_text(
-                &child_name,
-                outcome,
-                report_path.as_deref(),
-            )
-        };
-        let mgr = self.manager.lock().await;
-        let _ = mgr.send(parent_id, AgentCommand::Suggestion(text.into()));
-    }
-}
-
 /// The headless core of console mode: the brain + agent manager + per-agent
 /// loop map + the fan-in event receiver, with typed operations.
 ///
@@ -821,7 +603,7 @@ pub(crate) struct ConsoleRuntime {
 
 impl ConsoleRuntime {
     /// Build the runtime from a ready brain: create the manager, wire the
-    /// [`ConsoleSpawner`] into the factory, and spawn the main agent via the
+    /// [`HostSpawner`] into the factory, and spawn the main agent via the
     /// same shared path as the GUI's main agent (id allocation, channel
     /// setup, loop-map insert, and registration are identical).
     pub(crate) async fn start(brain: crate::Brain) -> anyhow::Result<Self> {
@@ -835,9 +617,9 @@ impl ConsoleRuntime {
 
         // Wire the spawn_agent tool's spawner BEFORE building the main agent
         // (the tool is registered per build) — same ordering as the GUI
-        // setup. One ConsoleSpawner serves as both AgentSpawner and
+        // setup. One HostSpawner serves as both AgentSpawner and
         // DescendantTracker.
-        let spawner = Arc::new(ConsoleSpawner::new(
+        let spawner = Arc::new(HostSpawner::new(
             brain.factory.clone(),
             manager.clone(),
             agent_loops.clone(),
@@ -2293,7 +2075,7 @@ mod tests {
         assert_eq!(model_swap_effort(None, true), None);
     }
 
-    // --- ConsoleSpawner ---------------------------------------------------
+    // --- HostSpawner ------------------------------------------------------
 
     use mnemo::agent::context::ContextManager;
     use mnemo::project::ConstitutionSource;
@@ -2362,7 +2144,7 @@ mod tests {
         let agent_loops: AgentLoopMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let spawner = ConsoleSpawner::new(factory, manager.clone(), agent_loops.clone());
+        let spawner = HostSpawner::new(factory, manager.clone(), agent_loops.clone());
         let id = spawner
             .spawn_with_parent("reviewer", "review the diff", Some(7), None, None)
             .await

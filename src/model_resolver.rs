@@ -860,6 +860,67 @@ mod tests {
     }
 
     #[test]
+    fn workflow_policy_routing_table_unchanged() {
+        // Job 2a's routing golden (master-spec :914): every (state, skill,
+        // subagent, plan-kind) cell the per-turn chain can receive, with a
+        // DISTINCT model per slot so each cell's winner is unambiguous.
+        // Also pins that the spawn-only slots (`reviewing`, `summarize`)
+        // never leak into the per-turn chain. The joined table is frozen
+        // from the first run on the pre-change tree (the single assert
+        // failure prints all winners); gates 2a.6's RouteKey rework.
+        let m = |model: &str| {
+            ModelRef {
+                endpoint: "openai".into(),
+                model: model.into(),
+                reasoning_effort: None,
+            }
+        };
+        let models = || ModelsConfig {
+            planning: Some(m("m-planning")),
+            executing: Some(m("m-executing")),
+            bug_fixing: Some(m("m-bug-fixing")),
+            complete: Some(m("m-complete")),
+            subagent: Some(m("m-subagent")),
+            reviewing: Some(m("m-reviewer-spawn")),
+            summarize: Some(m("m-summarize")),
+            skill: HashMap::from([("new_release".to_string(), m("m-skill-release"))]),
+        };
+        let r = resolver(config_with_endpoints(models()));
+        let cells = [
+            (WorkflowState::Planning, None, false, None),
+            (WorkflowState::Executing, None, false, None),
+            (WorkflowState::Reviewing, None, false, None),
+            (WorkflowState::Complete, None, false, None),
+            (WorkflowState::Subagent, None, true, None),
+            (WorkflowState::Skill, Some("new_release"), false, None),
+            (WorkflowState::Executing, None, false, Some(PlanKind::BugFixing)),
+            (WorkflowState::Executing, None, false, Some(PlanKind::Research)),
+            (WorkflowState::Complete, None, false, Some(PlanKind::BugFixing)),
+            (WorkflowState::Executing, None, true, Some(PlanKind::BugFixing)),
+        ];
+        // One joined assertion: the first run's failure prints ALL ten
+        // winners at once for the fill; the frozen constant keeps the whole
+        // table pinned through 2a.6.
+        const GOLDEN_TABLE: &str =
+            "m-planning,m-executing,m-executing,m-complete,m-subagent,m-skill-release,m-bug-fixing,m-executing,m-complete,m-subagent";
+        let winners: Vec<String> = cells
+            .into_iter()
+            .map(|(state, skill, is_sub, kind)| {
+                let ctx = ModelContext::new(state, skill, is_sub, kind);
+                match r.resolve(ctx) {
+                    Some(resolved) => resolved.model.clone(),
+                    None => "<none>".to_string(),
+                }
+            })
+            .collect();
+        assert_eq!(
+            winners.join(","),
+            GOLDEN_TABLE,
+            "routing table drifted — fill GOLDEN_TABLE from the left side"
+        );
+    }
+
+    #[test]
     fn returns_none_when_no_overrides() {
         let r = resolver(config_with_endpoints(ModelsConfig::default()));
         let ctx = ModelContext::new(WorkflowState::Planning, None, false, None);

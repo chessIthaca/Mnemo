@@ -962,6 +962,46 @@ mod tests {
     }
 
     #[test]
+    fn workflow_stable_head_bytes_unchanged() {
+        // Job 2a's golden (master-spec :913): the stable head is the provider
+        // cache prefix (:237-240) — every 2a rewire must keep these bytes
+        // identical. Pins build_stable_head's full byte stream against a
+        // fixed Constitution fixture (SHA-256 + length).
+        use sha2::{Digest, Sha256};
+        let constitution = Constitution {
+            global: "# HARD RULES — GLOBAL (agent.md)\n\n- fixture global rule one.\n".to_string(),
+            project: "# HARD RULES — PROJECT (agent.md)\n\n- fixture project rule one.\n".to_string(),
+        };
+        let head = build_stable_head(&constitution);
+        // GOLDEN: frozen from the first run on the pre-change tree. The
+        // single assertion below prints len + sha256 on any drift — fill
+        // GOLDEN_HEAD from that left side, then re-run green.
+        const GOLDEN_HEAD: &str =
+            "len=12351|sha256=7fda6b3b60375015ae2575e41fc3c952b76b7bd5be365f5a727a2e2f2499dfda";
+        for marker in [
+            "CORE PRINCIPLES:",
+            "WORKFLOW LIFECYCLE — a plan-first state machine.",
+            "APP RULES — universal hard rules",
+            "# HARD RULES — GLOBAL (agent.md)",
+            "# HARD RULES — PROJECT (agent.md)",
+        ] {
+            assert!(head.contains(marker), "head lacks marker: {marker}");
+        }
+        assert_eq!(
+            format!(
+                "len={}|sha256={}",
+                head.len(),
+                Sha256::digest(head.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+            GOLDEN_HEAD,
+            "stable head bytes drifted — fill GOLDEN_HEAD from the left side"
+        );
+    }
+
+    #[test]
     fn stable_head_contains_universal_closing_rules() {
         // The universal closing-sequence + app-mechanics rules (APP_RULES) are
         // baked into the compiled stable head so every project inherits them —

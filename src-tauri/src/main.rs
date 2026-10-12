@@ -488,6 +488,19 @@ fn main() {
                     brain.factory.set_spawner(spawner.clone());
                     brain.factory.set_descendant_tracker(spawner);
 
+                    // Wire the app-side policy factory (2b.2; master-spec
+                    // :266-269): the app impl builds each agent's WorkflowPolicy
+                    // and registers the app-owned tools (ask_user + the backlog
+                    // trio). The backlog store + notifier live on the app factory
+                    // (the app-owned wiring) — the kernel factory only sees the
+                    // trait. Wired before the first agent build (the policy and
+                    // its tool registrations are read per build).
+                    let policy_factory =
+                        Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new());
+                    let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> =
+                        policy_factory.clone();
+                    brain.factory.set_policy_factory(factory_dyn);
+
                     // Share the ONE backlog store Arc (created above, before
                     // the match) between the IPC `backlog_*` commands
                     // (state.backlog.store) and the agent's `backlog_add`
@@ -496,7 +509,7 @@ fn main() {
                     // each other. Wired before the main agent is built (the
                     // tool is read per registry build). No backlog wiring on
                     // the NeedsProject/Err paths — no factory, no agent.
-                    brain.factory.set_backlog(Arc::clone(&backlog));
+                    policy_factory.set_backlog(Arc::clone(&backlog));
 
                     // The UI seam for agent-side adds: the library crate has
                     // no Tauri dependency, so the factory's notifier callback
@@ -517,7 +530,7 @@ fn main() {
                                 crate::ipc::backlog_cmds::emit_backlog_changed(&app, &state).await;
                             });
                         });
-                        brain.factory.set_backlog_notifier(notifier);
+                        policy_factory.set_backlog_notifier(notifier);
                     }
 
                     // Build the first ("main") agent via the factory so it gets

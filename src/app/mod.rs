@@ -17,6 +17,7 @@ pub mod workflow_policy;
 /// The relocated app module graph (job 2b): the workflow state machine + plan
 /// files, the backlog store, the skill library, and the workflow tooling.
 pub mod backlog;
+pub mod policy_factory;
 pub mod skill;
 pub mod tool;
 pub mod workflow;

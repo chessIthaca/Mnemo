@@ -1214,6 +1214,18 @@ pub(crate) async fn run_console() -> i32 {
             return 1;
         }
     };
+    // 2b.2: wire the app-side policy factory (master-spec :266-269) so
+    // console-mode agents keep the WorkflowPolicy semantics the GUI arm gets
+    // (the workflow state section in the volatile tail + the state-scoped
+    // routing chain) — the reviewer's HIGH catch: the kernel factory built
+    // WorkflowPolicy UNCONDITIONALLY pre-2b.2, so a GUI-arm-only wiring would
+    // have silently regressed console agents to NoPolicy. NO backlog wiring
+    // here: console opens no store (review finding 7 keeps `backlog_add` and
+    // its siblings out of console registries — the policy factory's
+    // None-wired backlog slot reproduces that exactly while `ask_user` stays).
+    let policy_factory = Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new());
+    let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> = policy_factory.clone();
+    brain.factory.set_policy_factory(factory_dyn);
     let laya_cfg = brain.config.lock().await.general.general.laya.clone();
     let (laya, pending_laya_start) = crate::attach_laya(&brain, &laya_cfg);
 

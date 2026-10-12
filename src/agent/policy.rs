@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 
 use crate::project::Constitution;
 use crate::provider::Capabilities;
@@ -117,9 +118,74 @@ pub struct RouteKey {
 /// Build context handed to [`AgentPolicy::register_tools`] (master-spec
 /// :207).
 pub struct PolicyBuildCtx {
-    pub agent_id: crate::runtime::channels::AgentId,
+    pub agent_id: Option<crate::runtime::AgentId>,
     pub project_root: std::path::PathBuf,
     pub plans_dir: std::path::PathBuf,
+}
+
+/// The build context handed to [`AgentPolicyFactory::build_policy`] (2b.2).
+/// The workflow handle is intentionally opaque: the kernel still owns the
+/// loop's workflow (`Arc<Mutex<Workflow>>` — the 2a-era field, removed in
+/// 2b.3) but this seam cannot name the app type (the boundary contract,
+/// master-spec :255-258), so the app-side factory casts it to its own
+/// workflow type. The cast retires together with the field in 2b.3.
+pub struct PolicyFactoryCtx {
+    pub agent_id: Option<crate::runtime::AgentId>,
+    pub project_root: std::path::PathBuf,
+    pub plans_dir: std::path::PathBuf,
+    /// The loop's workflow handle, opaque at the seam (cast app-side).
+    pub workflow: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// What [`AgentPolicyFactory::build_policy`] hands back: the policy the
+/// kernel stores on the loop, plus the loop-attach hook the build's tail
+/// invokes once the loop is Arc-wrapped (2a.6's back-ref). Packaging the
+/// attach as a `FnOnce` keeps the concrete policy type entirely app-side
+/// — the kernel never names it.
+pub struct PolicyBuildResult {
+    pub policy: Arc<dyn AgentPolicy>,
+    /// The post-Arc back-ref attach (a no-op for [`NoPolicy`]-shaped
+    /// policies that carry no loop facts).
+    pub attach_loop: Box<dyn FnOnce(std::sync::Weak<crate::agent::AgentLoop>) + Send>,
+}
+
+/// The app-side policy factory (2b.2; master-spec :266-269: "The factory
+/// takes `Arc<dyn PolicyFactory>`"). The kernel factory consumes this to
+/// build each agent's policy and to let the app register its tools (D5:
+/// kernel-called, app-owned). The app's concrete impl carries its wiring
+/// setters (`set_backlog`/`set_backlog_notifier`) as inherent methods so
+/// the kernel never names the app's wiring types at the trait. The kernel
+/// default is [`NoPolicyFactory`] — production and the kernel test helpers
+/// wire the app implementation at startup/factory-help time.
+pub trait AgentPolicyFactory: Send + Sync {
+    /// Build the policy wrapping the agent's own workflow (the opaque
+    /// handle in `ctx`). Called once per built agent, before the final
+    /// Arc-wrap; the returned `attach_loop` hook is invoked at the build's
+    /// tail.
+    fn build_policy(&self, ctx: &PolicyFactoryCtx) -> PolicyBuildResult;
+
+    /// Register app-side tools onto the agent's registry (D5). 2b.2's move
+    /// covers the param-free and wiring-only tools (ask_user, the backlog
+    /// trio); the plan/skill registrations stay kernel-side until 2b.3
+    /// carries their workflow/skill dependencies across the seam.
+    fn register_tools(&self, reg: &mut ToolRegistry, ctx: &PolicyBuildCtx);
+}
+
+/// The kernel-default policy factory: builds [`NoPolicy`] policies and
+/// registers nothing. Built agents' consults read the NoPolicy defaults
+/// (the free agent). Used when no app factory is wired (tests that never
+/// needed one).
+pub struct NoPolicyFactory;
+
+impl AgentPolicyFactory for NoPolicyFactory {
+    fn build_policy(&self, _ctx: &PolicyFactoryCtx) -> PolicyBuildResult {
+        PolicyBuildResult {
+            policy: Arc::new(NoPolicy),
+            attach_loop: Box::new(|_| {}),
+        }
+    }
+
+    fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
 }
 
 /// The kernel's six compiled prompt blocks (prompt.rs consts), handed to the

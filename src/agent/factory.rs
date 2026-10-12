@@ -79,7 +79,6 @@ use crate::tool::memory::{
     AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
     MemorySupersedeTool, MemoryUpdateTool, MemoryWriteTool,
 };
-use crate::tool::workflow::ask_user::AskUserTool;
 use crate::tool::workflow::plan::{
     AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
 };
@@ -88,15 +87,6 @@ use crate::tool::workflow::skill::{
 };
 use crate::tool::ToolRegistry;
 use crate::workflow::Workflow;
-
-/// The shared backlog wiring handed to every `backlog_add` tool: the store
-/// handle (the SAME `Arc` the Tauri `backlog_*` commands lock) plus the
-/// optional UI notifier the app layer injects so agent adds emit
-/// `backlog://changed` live.
-struct BacklogWiring {
-    store: Arc<tokio::sync::Mutex<crate::backlog::BacklogStore>>,
-    on_changed: Option<Arc<dyn Fn() + Send + Sync>>,
-}
 
 /// A per-agent root override for parallel run-all worktree agents
 /// (plan ffd7a86f).
@@ -217,15 +207,11 @@ pub struct AgentLoopFactory {
     /// [`set_descendant_tracker`](Self::set_descendant_tracker). Behind an
     /// `RwLock` so it can be set once at startup through the shared `Arc`.
     descendant_tracker: RwLock<Option<Arc<dyn crate::runtime::DescendantTracker>>>,
-    /// An optional shared backlog store handle + UI notifier — the SAME
-    /// `Arc<tokio::sync::Mutex<..>>` the Tauri `backlog_*` IPC commands lock,
-    /// plus the optional `on_changed` callback the app layer injects so
-    /// agent-side `backlog_add` calls emit `backlog://changed` (the library
-    /// crate has no Tauri dependency, so the callback is the seam). `None`
-    /// until the IPC layer wires it in via
-    /// [`set_backlog`](Self::set_backlog); until then the `backlog_add` tool
-    /// is omitted from every registry.
-    backlog: RwLock<Option<BacklogWiring>>,
+    /// The app-side policy factory (2b.2; master-spec :266-269). `None`
+    /// (the default) builds kernel `NoPolicy`-equivalent policies via
+    /// NoPolicyFactory — production and the kernel test helpers wire the
+    /// app implementation via set_policy_factory before the first build.
+    policy_factory: RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>,
     /// The skill library — the `.coding/skills/` dir plus the LIVE registry it
     /// holds. Shared across all agents, and reloadable in place: a skill file
     /// authored mid-session (`skill_create`) or edited by hand + `skill_reload`
@@ -372,10 +358,7 @@ impl AgentLoopFactory {
             // in via `set_descendant_tracker` alongside the spawner. Until
             // then the state-transition gate is not enforced.
             descendant_tracker: RwLock::new(None),
-            // No backlog store at construction — the IPC layer wires it in
-            // via `set_backlog` once the shared store exists. Until then the
-            // `backlog_add` tool is omitted from every registry.
-            backlog: RwLock::new(None),
+            policy_factory: RwLock::new(None),
             // No skill registry at construction — the IPC layer wires it in
             // via `with_skills` once the project's skills dir is known.
             skills: None,
@@ -671,35 +654,20 @@ impl AgentLoopFactory {
             .expect("descendant_tracker lock poisoned") = Some(tracker);
     }
 
-    /// Wire in the shared backlog store that backs the `backlog_add` tool.
-    ///
-    /// Called once by the IPC layer at startup with the SAME
-    /// `Arc<tokio::sync::Mutex<BacklogStore>>` the `backlog_*` commands use,
-    /// so agent adds and UI mutations serialize through one mutex and can
-    /// never clobber each other. The wiring slot also carries an optional UI
-    /// notifier injected later via [`set_backlog_notifier`](Self::set_backlog_notifier)
-    /// so agent adds emit `backlog://changed` live. Only affects agents built
-    /// **after** this call (the tool is read per `build`), so the IPC layer
-    /// sets it before building the main agent. Also omitted in console mode
-    /// (`-console`): no store is opened there, so the tool is not registered
-    /// (review finding 7).
-    pub fn set_backlog(&self, store: Arc<tokio::sync::Mutex<crate::backlog::BacklogStore>>) {
-        *self.backlog.write().expect("backlog lock poisoned") = Some(BacklogWiring {
-            store,
-            on_changed: None,
-        });
-    }
-
-    /// Wire the UI notifier into the backlog wiring: after every successful
-    /// agent-side `backlog_add`, the callback fires so the app layer can
-    /// emit `backlog://changed` and the Backlog tab updates live. No-op when
-    /// no store is wired (the IPC layer calls [`set_backlog`](Self::set_backlog)
-    /// first, before this).
-    pub fn set_backlog_notifier(&self, on_changed: Arc<dyn Fn() + Send + Sync>) {
-        let mut slot = self.backlog.write().expect("backlog lock poisoned");
-        if let Some(wiring) = slot.as_mut() {
-            wiring.on_changed = Some(on_changed);
-        }
+    /// Wire the app-side policy factory (2b.2; master-spec :266-269: "the
+    /// factory takes `Arc<dyn PolicyFactory>`"). Call before the first
+    /// `build()` — production wires at startup; the kernel test helpers wire
+    /// so factory-built agents keep the 2a-era WorkflowPolicy semantics with
+    /// no per-test attach. Unwired factories build the kernel NoPolicy
+    /// default.
+    pub fn set_policy_factory(
+        &self,
+        factory: Arc<dyn crate::agent::policy::AgentPolicyFactory>,
+    ) {
+        *self
+            .policy_factory
+            .write()
+            .expect("policy_factory lock poisoned") = Some(factory);
     }
 
     /// Update the live git core-operations list (called by `save_settings`
@@ -1031,25 +999,44 @@ impl AgentLoopFactory {
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).
-        .with_plans_dir(plans_dir);
+        .with_plans_dir(plans_dir.clone());
 
-        // 2a.2: attach the workflow agent's policy — the app wrapper over
-        // this agent's own workflow. Since 2a.3 the kernel consults it (the
-        // tool surface, the volatile tail, the prompt/turn-end hooks, and —
-        // 2a.6 — the routing key); the kernel default stays NoPolicy. The
-        // loop back-ref attaches at the build's tail once the loop is
-        // Arc'd.
-        let workflow_policy = Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent.workflow_handle()),
-        );
-        // The trait-object move is a canonical unsizing coercion; the
-        // concrete Arc stays alive for the tail's back-ref attach.
-        // (Arc::clone cannot infer through the dyn annotation — clone into
-        // a concrete-typed alias first, then coerce at the annotated move.)
-        let policy_concrete: Arc<crate::app::workflow_policy::WorkflowPolicy> =
-            Arc::clone(&workflow_policy);
-        let policy_dyn: Arc<dyn crate::agent::policy::AgentPolicy> = policy_concrete;
-        agent.set_policy(policy_dyn);
+        // 2b.2: the agent's policy comes from the app-side policy factory
+        // (master-spec :266-269) — the kernel never names the app policy
+        // type; unwired factories build the kernel NoPolicy default. Since
+        // 2a.3 the kernel consults the policy (the tool surface, the
+        // volatile tail, the prompt/turn-end hooks, and — 2a.6 — the
+        // routing key). The returned attach hook runs at the build's tail
+        // once the loop is Arc'd.
+        let built_policy = {
+            let factory_slot = self
+                .policy_factory
+                .read()
+                .expect("policy_factory lock poisoned");
+            match factory_slot.as_ref() {
+                Some(pf) => {
+                    let ctx = crate::agent::policy::PolicyFactoryCtx {
+                        agent_id: agent_id.clone(),
+                        project_root: self.project_root.clone(),
+                        plans_dir: plans_dir,
+                        // The unsize coercion needs the annotated move (the
+                        // 2a.5-era lesson): Arc::clone's generic T would
+                        // otherwise infer through the dyn target.
+                        workflow: {
+                            let handle: Arc<dyn std::any::Any + Send + Sync> =
+                                agent.workflow_handle();
+                            handle
+                        },
+                    };
+                    pf.build_policy(&ctx)
+                }
+                None => crate::agent::policy::PolicyBuildResult {
+                    policy: Arc::new(crate::agent::policy::NoPolicy),
+                    attach_loop: Box::new(|_| {}),
+                },
+            }
+        };
+        agent.set_policy(built_policy.policy);
 
         if let Some(id) = agent_id {
             agent = agent.with_agent_id(id);
@@ -1147,7 +1134,7 @@ impl AgentLoopFactory {
         let agent = Arc::new(agent);
         // 2a.6: attach the loop back-ref — the policy's subagent-slot source
         // (idempotent OnceLock; the first attach wins).
-        workflow_policy.attach_loop(Arc::downgrade(&agent));
+        (built_policy.attach_loop)(Arc::downgrade(&agent));
         agent
     }
 
@@ -1187,6 +1174,12 @@ impl AgentLoopFactory {
             ToolRegistry::with_groups(crate::tool::LoadedGroups::new(), mcp_table.clone());
         self.register_agent_tools(&mut registry, &sandbox, root);
         self.register_workflow_tools(&mut registry, workflow, root, plans_dir);
+        // 2b.2: the app-owned tools (ask_user + the backlog trio whose wiring
+        // is app-side) register via the policy factory — D5: kernel-called,
+        // app-owned. Placed right after register_workflow_tools (the moved
+        // block sat at its tail) so the registry's insertion ORDER is
+        // byte-stable vs pre-2b.2.
+        self.register_policy_factory_tools(&mut registry, agent_id, plans_dir);
         self.register_skill_tools(&mut registry, workflow, &sandbox);
         self.register_vision_tool(&mut registry, &sandbox);
         self.register_memory_tools(&mut registry, root);
@@ -1415,38 +1408,30 @@ impl AgentLoopFactory {
             workflow.clone(),
             plans_dir.to_path_buf(),
         )));
-        // ask_user is always available (not gated by ToolFilter — like memory
-        // tools) so the agent can ask a question in any workflow state. The
-        // pause is driven from dispatch, not the tool's execute().
-        registry.register(Box::new(AskUserTool::new()));
-        // backlog_add shares the app's one store handle (the same Arc the
-        // IPC backlog commands lock) — the sanctioned agent write path to
-        // the user's backlog (.coding/backlog.jsonl is protected from the
-        // file tools). The optional on_changed notifier (wired by the IPC
-        // layer via set_backlog_notifier) fires after each add so the
-        // Backlog tab updates live. Omitted entirely when no store is
-        // wired (tests / NeedsProject).
-        if let Some(wiring) = self.backlog.read().expect("backlog lock poisoned").as_ref() {
-            registry.register(Box::new(
-                crate::tool::workflow::backlog::BacklogAddTool::new(
-                    Arc::clone(&wiring.store),
-                    wiring.on_changed.clone(),
-                ),
-            ));
-            // backlog_status — same wiring; changes status through the same
-            // guarded transition table the harness uses (see the tool docs).
-            registry.register(Box::new(
-                crate::tool::workflow::backlog::BacklogStatusTool::new(
-                    Arc::clone(&wiring.store),
-                    wiring.on_changed.clone(),
-                ),
-            ));
-            // backlog_list — read-only query; needs no notifier (it never
-            // mutates). Safe for read-only reviewers (their strict allow-list
-            // names it): querying the backlog is allowed, modifying it is not.
-            registry.register(Box::new(
-                crate::tool::workflow::backlog::BacklogListTool::new(Arc::clone(&wiring.store)),
-            ));
+    }
+
+    /// Register the app-owned tools via the policy factory (2b.2; D5:
+    /// kernel-called, app-owned). The app impl does the registering; the
+    /// kernel factory never names the app's wiring or policy types. No-op
+    /// without a wired factory — unwired (NoPolicy) factories build
+    /// registries without the app-owned tools.
+    fn register_policy_factory_tools(
+        &self,
+        registry: &mut ToolRegistry,
+        agent_id: Option<crate::runtime::AgentId>,
+        plans_dir: &Path,
+    ) {
+        let slot = self
+            .policy_factory
+            .read()
+            .expect("policy_factory lock poisoned");
+        let ctx = crate::agent::policy::PolicyBuildCtx {
+            agent_id,
+            project_root: self.project_root.clone(),
+            plans_dir: plans_dir.to_path_buf(),
+        };
+        if let Some(pf) = slot.as_ref() {
+            pf.register_tools(registry, &ctx);
         }
     }
 
@@ -3103,10 +3088,17 @@ mod tests {
             crate::skill::SkillRegistry::new(),
         )));
         factory.set_spawner(Arc::new(MockSpawner));
-        // Fully wired = backlog store too (the IPC layer always wires it in
-        // the Ready path before building the main agent).
-        factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
-            crate::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
+        // The app-owned tools ride the app policy factory (2b.2): wire the
+        // app factory into the kernel factory (the production build() path)
+        // and carry the backlog store on it — fully wired = the Ready path's
+        // shape.
+        let policy_factory =
+            Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new());
+        let factory_dyn: Arc<dyn crate::agent::policy::AgentPolicyFactory> =
+            policy_factory.clone();
+        factory.set_policy_factory(factory_dyn);
+        policy_factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
+            crate::app::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
         )));
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
         let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
@@ -3244,8 +3236,15 @@ mod tests {
             crate::skill::SkillRegistry::new(),
         )));
         factory.set_spawner(Arc::new(MockSpawner));
-        factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
-            crate::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
+        // 2b.2: the backlog trio registers via the app policy factory (D5) —
+        // wire it the way production does before asserting the filter reads.
+        let policy_factory2 =
+            Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new());
+        let factory_dyn2: Arc<dyn crate::agent::policy::AgentPolicyFactory> =
+            policy_factory2.clone();
+        factory.set_policy_factory(factory_dyn2);
+        policy_factory2.set_backlog(Arc::new(tokio::sync::Mutex::new(
+            crate::app::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
         )));
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
         let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());

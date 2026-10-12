@@ -360,3 +360,20 @@ runtime/{turn_resolve, channels}, memory/{indexer/plans, finish_capture},
 factory.rs (:86-88 tool::workflow tools, :90, :686-98), tool/mod.rs (:31
 + the opens), skill/mod.rs (:31), tool/agent/spawn_agent.rs (:38),
 prompt.rs (the :531 app import + the wrapper).
+### A4. The console-mode shape (settled during the 2b.2 review round 1)
+
+Console mode (`run_console`, src-tauri/src/console.rs) wires the app
+`WorkflowPolicyFactory` too — the reviewer's HIGH finding: the kernel factory
+constructed WorkflowPolicy UNCONDITIONALLY pre-2b.2, so a GUI-arm-only
+wiring would have silently regressed console agents to NoPolicy (no
+workflow tail section, the `["free"]` routing chain, while the plan tools
+stayed registered). The wiring sits right after `build_brain`'s Ready arm,
+before the first agent build. NO backlog wiring on the console path:
+console opens no store (review finding 7 keeps the `backlog_add` trio out
+of console registries — the policy factory's None-wired backlog slot
+reproduces that exactly, while `ask_user` stays registered). The kernel
+test helpers (factory.rs make_factory, console.rs make_factory,
+config_io.rs, events.rs) stay unwired (NoPolicy) — every one of them
+asserts bookkeeping, not policy semantics (reviewer-2b2's checklist + the
+battery; no test covers console policy semantics, noted as the accepted
+gap the boundary test's 2b.3 pass will not narrow).

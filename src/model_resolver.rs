@@ -817,6 +817,71 @@ mod tests {
     }
 
     #[test]
+    fn free_slot_resolves_configured_or_falls_back_to_default() {
+        // Job 2a review LOW (round 1): the [models.free] slot mapping is
+        // pinned - NoPolicy loops emit the ["free"] key (the policy.rs :218
+        // contract, master-spec :241-246), so a set free link resolves it
+        // and an unset/dangling link rides the default. The compat ctor
+        // cannot produce a bare ["free"] key (every (state, skill, flag)
+        // combination carries a state slot or a skill/subagent slot), so
+        // the ctx is built directly and cloned per case (the last case
+        // consumes it).
+        let free_ctx = ModelContext {
+            route: crate::agent::policy::RouteKey {
+                slots: vec!["free".to_string()],
+            },
+            is_subagent: false,
+        };
+        let m = |model: &str| ModelRef {
+            endpoint: "openai".into(),
+            model: model.into(),
+            reasoning_effort: None,
+        };
+
+        // A set free link resolves the [models.free] model.
+        let set = resolver(config_with_endpoints(ModelsConfig {
+            free: Some(m("m-free")),
+            ..ModelsConfig::default()
+        }));
+        let resolved = set
+            .resolve(free_ctx.clone())
+            .expect("a set free link resolves the free slot");
+        assert_eq!(resolved.model, "m-free");
+
+        // An unset free link: the walk falls off the last slot into
+        // resolve_model_ref(None) = None - the "no per-context override,
+        // ride the default" contract. resolve() is the OVERRIDE resolver;
+        // the loop's own default-provider path follows a None return, and
+        // the pre-2a.6 arms behaved identically for unset state links.
+        let unset = resolver(config_with_endpoints(ModelsConfig::default()));
+        let resolved = unset.resolve(free_ctx.clone());
+        assert!(
+            resolved.is_none(),
+            "an unset free link leaves the override slot empty (the default ride)"
+        );
+
+        // A dangling free link (the endpoint deleted) also rides the
+        // default - a reference that fails to resolve continues the walk,
+        // which has no further slots.
+        let dangling = resolver(config_with_endpoints(ModelsConfig {
+            free: Some(ModelRef {
+                endpoint: "deleted-endpoint".into(),
+                model: "m-dangling".into(),
+                reasoning_effort: None,
+            }),
+            ..ModelsConfig::default()
+        }));
+        // A dangling free link (the endpoint deleted) also rides the
+        // default: the reference fails to resolve, the walk continues,
+        // and there are no further slots - None (the default ride).
+        let resolved = dangling.resolve(free_ctx);
+        assert!(
+            resolved.is_none(),
+            "a dangling free link leaves the override slot empty (the default ride)"
+        );
+    }
+
+    #[test]
     fn routing_config_never_changes_the_resolve_chain() {
         // The regression pin for the whole feature: with routing configured
         // and enforcing, resolve() is byte-for-byte today's chain.

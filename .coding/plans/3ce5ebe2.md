@@ -40,3 +40,4 @@ Step 3 landed (2027-01-12): ALL kernel→app severs complete + the crate-root al
 
 ## Reviews
 1 aeba3b657acd05816417826f09d21b3c86fc1452
+2 d813510576fc322329b27fe6474c264b9916b466

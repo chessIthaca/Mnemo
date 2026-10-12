@@ -479,8 +479,6 @@ pub(crate) fn append_plan_nudge(
 /// `WORKFLOW STATE` or `RECALLED MEMORIES`. Keep it short (30-60 chars).
 pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ignore>";
 
-/// Append a section to the head, skipping empty ones (mirrors how the
-/// constitution sections are skipped).
 /// Build the **stable head** of the system prompt: the six compiled prompt
 /// blocks + the global + project constitution.
 ///

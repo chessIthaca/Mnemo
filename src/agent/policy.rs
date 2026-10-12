@@ -36,8 +36,8 @@ impl ToolSurface {
 }
 
 /// Per-call veto beyond the filter (master-spec :215-217): the plan-mutation
-/// gate and the research write verdict keep their tool-side homes until
-/// 2b/2c. Default: [`GateVerdict::Allow`].
+/// gate and the research write verdict move into `WorkflowPolicy` in 2a.3.
+/// Default: [`GateVerdict::Allow`].
 #[derive(Debug, Clone)]
 pub enum GateVerdict {
     /// The call proceeds (subject to the surface filter).
@@ -56,8 +56,8 @@ pub struct PromptHook {
     /// plain-prompt clear). `None` leaves the runtime's own derivation
     /// untouched (2a.5 moves the reads across one arm at a time).
     pub unattended: Option<bool>,
-    /// `Some(text)` rewrites the volatile tail's app part (the plan nudge
-    /// rides this hook from 2a.5).
+    /// `Some(text)` replaces the synthesized Linux/newline-safe prompt tail
+    /// (the plan nudge rides this hook from 2a.5).
     pub tail_rewrite: Option<String>,
 }
 
@@ -78,7 +78,7 @@ pub enum Continuation {
 pub struct TurnSummary {
     /// `true` for `Finish::Stop` without error, per the emit gate.
     pub success: bool,
-    /// The stop reason the runtime observed.
+    /// The stop reason the runtime observed (`crate::agent::StopReason`).
     pub stop_reason: crate::agent::StopReason,
 }
 
@@ -95,8 +95,8 @@ pub struct RoleSpec {
     pub role: String,
 }
 
-/// Routing key (master-spec :218-219): the ordered config slot names the
-/// resolver walks, then default. `WorkflowPolicy` emits exactly today's
+/// Routing key (master-spec :218-219): the ordered config slot names +
+/// skill name the resolver walks, then default. `WorkflowPolicy` emits exactly today's
 /// chain (the golden table test, 2a.0); `NoPolicy` emits `["free"]` →
 /// `[models.free]` (routing contract :241-246).
 #[derive(Debug, Clone)]
@@ -114,8 +114,8 @@ pub struct PolicyBuildCtx {
 }
 
 /// The kernel's six compiled prompt blocks (prompt.rs consts), handed to the
-/// policy so `stable_head` stays byte-identical (cache contract :237-240).
-/// The app wrapper supplies `KernelPromptBlocks::workflow()`; job 2b moves
+/// policy so `stable_head` can stay byte-identical (cache contract :237-240).
+/// The app wrapper supplies `KernelPromptBlocks::workflow()`; job 2b relocates
 /// the app halves and trims the kernel consts to KERNEL_PREAMBLE +
 /// KERNEL_RULES.
 pub struct KernelPromptBlocks {
@@ -144,9 +144,9 @@ pub trait AgentPolicy: Send + Sync {
     /// Called once at build: register app tools (plan/backlog/skill/review).
     fn register_tools(&self, reg: &mut ToolRegistry, ctx: &PolicyBuildCtx);
 
-    /// The stable head — the policy's exact byte stream for the cache
-    /// prefix. `WorkflowPolicy` assembles `k` (the app-supplied blocks)
-    /// + the constitution; `NoPolicy` defaults to the kernel head.
+    /// The stable head. Default = kernel head (KERNEL_PREAMBLE +
+    /// KERNEL_RULES + TOOL_CALL_DISCIPLINE + TOOL_STRATEGY +
+    /// MEMORY_RECORDS + constitution).
     fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String;
 
     /// The policy's part of the volatile tail (kernel adds recall +

@@ -33,6 +33,8 @@
 //!   confidence-gated, plus the shadow training log).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
+//! - [`policy`] — the kernel→app policy seam ([`AgentPolicy`], the
+//!   supporting types, [`NoPolicy`]); added by job 2a, nothing routed yet.
 //!
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 

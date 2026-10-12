@@ -27,7 +27,7 @@ use crate::error::Result;
 ///   changes (reading code, drafting a design, exploring options).
 ///
 /// The kind is set at `create_plan` time and persisted in the `.md` (a `## Kind`
-/// section), so [`Workflow::complete_step`](crate::workflow::Workflow::complete_step)
+/// section), so [`Workflow::complete_step`](crate::app::workflow::Workflow::complete_step)
 /// reads it from the in-memory plan — the decision is by construction, not a
 /// prompt instruction. Old plans without a `## Kind` section default to
 /// `Implementation` (the historical behavior: every plan was reviewed).

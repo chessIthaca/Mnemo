@@ -14,6 +14,13 @@
 
 pub mod workflow_policy;
 
+/// The relocated app module graph (job 2b): the workflow state machine + plan
+/// files, the backlog store, the skill library, and the workflow tooling.
+pub mod backlog;
+pub mod skill;
+pub mod tool;
+pub mod workflow;
+
 /// Install a panic hook that prints the panic before the process exits.
 /// (The Tauri webview doesn't need terminal restoration, but we keep a
 /// hook so panics in the brain surface cleanly.)

@@ -9,7 +9,7 @@
 //! context (≥40 chars: symptom/root-cause, file anchors, verification
 //! commands), every step naming concrete file path(s) (or an explicit no-code
 //! marker, the same vocabulary as the backlog detail bar via
-//! [`crate::backlog::body_carries_detail_marker`]), and `bug_fixing` plans
+//! [`crate::app::backlog::body_carries_detail_marker`]), and `bug_fixing` plans
 //! naming the regression-test design. One actionable error names every
 //! violation so the retry fixes all of them in one shot.
 //!
@@ -36,7 +36,7 @@ use crate::project::git_ops::{
 };
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-use crate::workflow::{PlanKind, Workflow, WorkflowState};
+use crate::app::workflow::{PlanKind, Workflow, WorkflowState};
 
 /// The locked 4-step skeleton for `kind = bug_fixing` plans — the bug
 /// protocol: reproduce with a failing regression test → document the root
@@ -340,7 +340,7 @@ fn step_issue(steps: &[String], bug_skeleton_exempt: bool) -> Option<String> {
     let path_free: Vec<usize> = steps
         .iter()
         .enumerate()
-        .filter(|(_, step)| !crate::backlog::body_carries_detail_marker(step))
+        .filter(|(_, step)| !crate::app::backlog::body_carries_detail_marker(step))
         .map(|(i, _)| i)
         .collect();
     let first = *path_free.first()?;
@@ -513,7 +513,7 @@ fn reachability_evidence_issue(text: &str) -> Option<String> {
 /// context must be substantive (symptom/root-cause, file anchors,
 /// verification commands), every step must name concrete file path(s) (or
 /// carry an explicit no-code marker — the same vocabulary as the backlog
-/// detail bar via [`crate::backlog::body_carries_detail_marker`]), and
+/// detail bar via [`crate::app::backlog::body_carries_detail_marker`]), and
 /// `bug_fixing` plans must carry the regression-test design (the forced
 /// skeleton is path-free by design, so the per-step check does not apply;
 /// the design requirement takes its place). Returns every violation found
@@ -1715,7 +1715,7 @@ impl Tool for CompleteStepTool {
 /// falls back to the generic "call current_plan" advice).
 fn plan_id_hint(
     provided: &str,
-    stack: &[crate::workflow::PlanFrame],
+    stack: &[crate::app::workflow::PlanFrame],
     plans_dir: &std::path::Path,
 ) -> Option<String> {
     // 1. Another plan on the stack (exact or prefix match, either direction).
@@ -2169,7 +2169,7 @@ impl Tool for FinishTool {
         // it (the fix is unverifiable).
         let mut notes: Vec<String> = Vec::new();
         if let Some(plan) = &plan {
-            if plan.kind == crate::workflow::PlanKind::BugFixing {
+            if plan.kind == crate::app::workflow::PlanKind::BugFixing {
                 let test = plan
                     .regression_test
                     .as_deref()
@@ -2947,7 +2947,7 @@ mod tests {
         assert!(result.output.contains("created plan"));
         // Workflow should now be Executing.
         let wf = wf.lock().await;
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
     }
 
     #[tokio::test]
@@ -3030,7 +3030,7 @@ mod tests {
         let wf = wf.lock().await;
         assert_eq!(
             wf.plan().unwrap().kind,
-            crate::workflow::PlanKind::Implementation
+            crate::app::workflow::PlanKind::Implementation
         );
     }
 
@@ -3054,7 +3054,7 @@ mod tests {
         let wf_guard = wf.lock().await;
         assert_eq!(
             wf_guard.plan().unwrap().kind,
-            crate::workflow::PlanKind::Research
+            crate::app::workflow::PlanKind::Research
         );
         drop(wf_guard);
 
@@ -3062,7 +3062,7 @@ mod tests {
         let complete = CompleteStepTool::new(wf.clone());
         complete.execute(json!({"step_index": 1})).await;
         let wf_guard = wf.lock().await;
-        assert_eq!(wf_guard.state(), crate::workflow::WorkflowState::Complete);
+        assert_eq!(wf_guard.state(), crate::app::workflow::WorkflowState::Complete);
     }
 
     #[tokio::test]
@@ -3089,7 +3089,7 @@ mod tests {
         // The workflow stays in Planning (no plan was created).
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Planning
+            crate::app::workflow::WorkflowState::Planning
         );
     }
 
@@ -3119,7 +3119,7 @@ mod tests {
         );
         let wf_guard = wf.lock().await;
         let plan = wf_guard.plan().unwrap();
-        assert_eq!(plan.kind, crate::workflow::PlanKind::BugFixing);
+        assert_eq!(plan.kind, crate::app::workflow::PlanKind::BugFixing);
         assert_eq!(plan.steps.len(), 4, "the skeleton is forced");
         assert!(
             plan.steps[0]
@@ -3225,7 +3225,7 @@ mod tests {
         let wf_guard = wf.lock().await;
         assert_eq!(
             wf_guard.plan().unwrap().kind,
-            crate::workflow::PlanKind::BugFixing
+            crate::app::workflow::PlanKind::BugFixing
         );
     }
 
@@ -3686,11 +3686,11 @@ mod tests {
         let text =
             std::fs::read_to_string(wf_guard.plans_dir().join(format!("{id}.md"))).unwrap();
         // Re-parse: the injected markers must NOT have taken effect.
-        let parsed = crate::workflow::PlanFile::parse(&text).unwrap();
+        let parsed = crate::app::workflow::PlanFile::parse(&text).unwrap();
         assert_eq!(parsed.bug_symptom.as_deref(), Some("the real symptom"));
         assert_eq!(parsed.regression_test, None);
         assert_eq!(parsed.title, "T");
-        assert_eq!(parsed.kind, crate::workflow::PlanKind::BugFixing);
+        assert_eq!(parsed.kind, crate::app::workflow::PlanKind::BugFixing);
         // The escaped lines survive in the section body.
         let detail = parsed.detailed_steps.as_deref().unwrap();
         assert!(detail.contains("\\## Bug"), "{detail}");
@@ -3746,8 +3746,8 @@ mod tests {
         // Re-parsing the file keeps kind = bug_fixing and the 4-step
         // skeleton — the injection is neutralized.
         let reparsed =
-            crate::workflow::PlanFile::read_from_file(&plans_dir.join(format!("{id}.md"))).unwrap();
-        assert_eq!(reparsed.kind, crate::workflow::PlanKind::BugFixing);
+            crate::app::workflow::PlanFile::read_from_file(&plans_dir.join(format!("{id}.md"))).unwrap();
+        assert_eq!(reparsed.kind, crate::app::workflow::PlanKind::BugFixing);
         assert_eq!(reparsed.steps.len(), 4);
         assert_eq!(
             reparsed.bug_symptom.as_deref(),
@@ -3783,7 +3783,7 @@ mod tests {
         );
         assert_eq!(
             wf_guard.plan().unwrap().kind,
-            crate::workflow::PlanKind::BugFixing,
+            crate::app::workflow::PlanKind::BugFixing,
             "kind unchanged"
         );
     }
@@ -3926,7 +3926,7 @@ mod tests {
             .await;
         assert!(result.success, "{}", result.output);
         let wf = wf.lock().await;
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
     }
 
     #[tokio::test]
@@ -4541,7 +4541,7 @@ mod tests {
         let result = complete.execute(json!({"step_index": 1})).await;
         assert!(result.success);
         let wf = wf.lock().await;
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
         assert_eq!(wf.plan().unwrap().completed_count(), 1);
     }
 
@@ -4723,7 +4723,7 @@ mod tests {
         complete.execute(json!({"step_index": 1})).await;
         let wf = wf.lock().await;
         // Final step → Reviewing (not Complete); finish is the only onward path.
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Reviewing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Reviewing);
     }
 
     #[tokio::test]
@@ -4752,7 +4752,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -4883,7 +4883,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
 
         let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
@@ -4965,7 +4965,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -5001,7 +5001,7 @@ mod tests {
         // Still Reviewing — finish did not proceed.
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -5036,7 +5036,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -5081,7 +5081,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -5131,7 +5131,7 @@ mod tests {
         assert!(!res.success);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -5431,7 +5431,7 @@ mod tests {
         let result = abandon.execute(json!({})).await;
         assert!(result.success);
         let w = wf.lock().await;
-        assert_eq!(w.state(), crate::workflow::WorkflowState::Planning);
+        assert_eq!(w.state(), crate::app::workflow::WorkflowState::Planning);
     }
 
     #[tokio::test]
@@ -5503,7 +5503,7 @@ mod tests {
         // The plan itself is still abandoned (state back to Planning).
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Planning
+            crate::app::workflow::WorkflowState::Planning
         );
     }
 
@@ -6161,7 +6161,7 @@ mod tests {
         complete.execute(json!({"step_index": 4})).await;
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -6195,7 +6195,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -6226,7 +6226,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -6261,7 +6261,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6301,7 +6301,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6337,7 +6337,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing
+            crate::app::workflow::WorkflowState::Reviewing
         );
     }
 
@@ -6372,7 +6372,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6413,7 +6413,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6459,7 +6459,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6492,7 +6492,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 
@@ -6533,7 +6533,7 @@ mod tests {
         assert!(res.success, "{}", res.output);
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
         // The capture ran: a PLAN: digest + a BUG: digest exist (authored).
         let (authored, derived) = concrete.count_by_class().await.unwrap();
@@ -6571,7 +6571,7 @@ mod tests {
         );
         assert_eq!(
             wf.lock().await.state(),
-            crate::workflow::WorkflowState::Complete
+            crate::app::workflow::WorkflowState::Complete
         );
     }
 }

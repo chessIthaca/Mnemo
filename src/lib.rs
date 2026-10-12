@@ -11,7 +11,7 @@
 
 pub mod agent;
 pub mod app;
-pub mod backlog;
+pub use crate::app::backlog; // job 2b: relocated; the alias keeps every existing path resolving
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod codegraph;
@@ -28,8 +28,8 @@ pub mod provider;
 pub mod runtime;
 pub mod safety_rules;
 pub mod shell_path;
-pub mod skill;
+pub use crate::app::skill; // job 2b: relocated; the alias keeps every existing path resolving
 pub mod thread_util;
 pub mod tool;
 pub mod webview_args;
-pub mod workflow;
+pub use crate::app::workflow; // job 2b: relocated; the alias keeps every existing path resolving

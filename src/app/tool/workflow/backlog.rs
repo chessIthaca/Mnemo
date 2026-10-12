@@ -11,7 +11,7 @@
 //! including read-only reviewers: querying the backlog is allowed, modifying
 //! it is not).
 //!
-//! The backlog (`.coding/backlog.jsonl`, see [`crate::backlog`]) is the
+//! The backlog (`.coding/backlog.jsonl`, see [`crate::app::backlog`]) is the
 //! user-owned list of prompts waiting to be dispatched to the main agent.
 //! It is PROTECTED harness state — the file tools refuse to edit it — so
 //! these tools are the agent's sanctioned write paths: when the user asks
@@ -22,9 +22,9 @@
 //! Item shape (backlog 45a4eb88): every NEW item is headline + body — the
 //! first line a short headline (≤ 100 chars), then the body carrying the
 //! detail. The Backlog tab renders that split (backlog 40763a24), so
-//! `backlog_add` validates it via [`crate::backlog::normalize_item_text`]
+//! `backlog_add` validates it via [`crate::app::backlog::normalize_item_text`]
 //! (the same shape contract the IPC add command enforces through the
-//! image-aware [`crate::backlog::normalize_new_item_text`] — image-only
+//! image-aware [`crate::app::backlog::normalize_new_item_text`] — image-only
 //! items are exempt there) and rejects shape-less text with an error
 //! naming the required shape. Existing items are grandfathered.
 //!
@@ -64,7 +64,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::backlog::{
+use crate::app::backlog::{
     BacklogPosition, BacklogStatus, BacklogStore, MAX_HEADLINE_CHARS, MAX_ITEM_TEXT_CHARS,
     MIN_BODY_CHARS, normalize_item_text,
 };
@@ -503,7 +503,7 @@ impl Tool for BacklogListTool {
         // Pending first (the queue's front), then by id for the rest.
         items.sort_by_key(|i| {
             (
-                i.status != crate::backlog::BacklogStatus::Pending,
+                i.status != crate::app::backlog::BacklogStatus::Pending,
                 i.id.clone(),
             )
         });
@@ -597,7 +597,7 @@ mod tests {
             items[0].text,
             "Add the flux capacitor to the build\n\nProblem: the reactor stalls on cold start (2027-01-07); repro: build twice. Fix direction: order the part and wire it into src/reactor/mod.rs, then add a build test. Acceptance: cargo test reactor. Related: review 568d405."
         );
-        assert_eq!(items[0].status, crate::backlog::BacklogStatus::Pending);
+        assert_eq!(items[0].status, crate::app::backlog::BacklogStatus::Pending);
     }
 
     #[tokio::test]
@@ -991,7 +991,7 @@ mod tests {
         let reopened = BacklogStore::open(path.clone());
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Done
+            crate::app::backlog::BacklogStatus::Done
         );
 
         // A note is carried onto the record.
@@ -1002,7 +1002,7 @@ mod tests {
         let reopened = BacklogStore::open(path);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Pending
+            crate::app::backlog::BacklogStatus::Pending
         );
         assert_eq!(reopened.items()[0].note.as_deref(), Some("retry please"));
     }
@@ -1033,7 +1033,7 @@ mod tests {
         let reopened = BacklogStore::open(path.clone());
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Pending
+            crate::app::backlog::BacklogStatus::Pending
         );
 
         // Terminal → terminal is also refused (done → failed); the allowed set
@@ -1051,7 +1051,7 @@ mod tests {
         let reopened = BacklogStore::open(path);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Done
+            crate::app::backlog::BacklogStatus::Done
         );
     }
 
@@ -1129,7 +1129,7 @@ mod tests {
         store
             .lock()
             .await
-            .transition(&done_id, crate::backlog::BacklogStatus::Done, None);
+            .transition(&done_id, crate::app::backlog::BacklogStatus::Done, None);
         let tool = BacklogListTool::new(store);
 
         let result = tool.execute(json!({})).await;
@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(reopened.items().len(), 3);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Done
+            crate::app::backlog::BacklogStatus::Done
         );
     }
 
@@ -1212,7 +1212,7 @@ mod tests {
         assert!(reopened.items()[0].deferred);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Pending,
+            crate::app::backlog::BacklogStatus::Pending,
             "parking keeps the status"
         );
 
@@ -1234,7 +1234,7 @@ mod tests {
         let reopened = BacklogStore::open(path);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::InFlight
+            crate::app::backlog::BacklogStatus::InFlight
         );
         assert!(reopened.items()[0].deferred);
     }
@@ -1284,7 +1284,7 @@ mod tests {
         let reopened = BacklogStore::open(path);
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Pending,
+            crate::app::backlog::BacklogStatus::Pending,
             "the dropped status leaves the item untouched"
         );
         assert!(
@@ -1337,7 +1337,7 @@ mod tests {
         );
         assert_eq!(
             reopened.items()[0].status,
-            crate::backlog::BacklogStatus::Pending
+            crate::app::backlog::BacklogStatus::Pending
         );
     }
 

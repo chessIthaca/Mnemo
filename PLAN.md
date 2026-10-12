@@ -77,7 +77,8 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   New items carry the headline+body shape the Backlog tab renders (backlog
   45a4eb88): first line a short headline (≤100 chars), then a blank line,
   then the body — enforced at both write paths by the shared
-  `normalize_item_text` validator in `src/backlog.rs` (the agent-facing
+  `normalize_item_text` validator in `src/app/backlog.rs` (relocated under
+  `crate::app` by the job-2b module moves; the agent-facing
   `backlog_add` tool directly; the UI's IPC command via the image-aware
   `normalize_new_item_text`, which exempts image-only items — a pasted
   screenshot with no caption has no headline to validate), with the Backlog

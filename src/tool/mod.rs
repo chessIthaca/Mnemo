@@ -19,7 +19,7 @@ pub mod browser;
 pub mod error_message;
 pub mod memory;
 pub mod steering;
-pub mod workflow;
+pub use crate::app::tool::workflow; // job 2b: relocated; the alias keeps crate::tool::workflow resolving
 
 use std::collections::HashMap;
 

@@ -854,7 +854,7 @@ impl Workflow {
                 combined.extend(frame.plan.steps[split..].iter().cloned());
             }
             for text in new_steps {
-                let header = crate::workflow::plan_file::extract_bold_header_pub(&text);
+                let header = crate::app::workflow::plan_file::extract_bold_header_pub(&text);
                 combined.push(Step {
                     index: combined.len(),
                     text,

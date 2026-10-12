@@ -33,10 +33,10 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::provider::ToolSchema;
-use crate::skill::{SkillLibrary, SkillSpec};
+use crate::app::skill::{SkillLibrary, SkillSpec};
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-use crate::workflow::{Workflow, WorkflowState};
+use crate::app::workflow::{Workflow, WorkflowState};
 
 /// Arguments for `skill_start`.
 #[derive(Debug, Deserialize)]
@@ -483,7 +483,7 @@ impl Tool for SkillCreateTool {
         if let Err(e) = validate_skill_name(&args.name) {
             return ToolResult::error(e);
         }
-        if crate::skill::is_shipped_skill(&args.name) {
+        if crate::app::skill::is_shipped_skill(&args.name) {
             return ToolResult::error(format!(
                 "'{}' is a skill shipped with the app — skill_create will not rewrite it. Edit the file with the approval-gated file tools (file_edit, or file_write when the file is missing) if you really mean to, or pick another name",
                 args.name
@@ -692,7 +692,7 @@ impl Tool for SkillReloadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skill::{SkillRegistry, SkillSpec};
+    use crate::app::skill::{SkillRegistry, SkillSpec};
     use tempfile::tempdir;
 
     /// Build a registry with one skill available in Complete + Planning.

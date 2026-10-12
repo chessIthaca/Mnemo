@@ -5,8 +5,8 @@
 //! Skills — named, activatable overlays on the workflow.
 //!
 //! A skill is a file-defined bundle of {tool allow-list, prompt, entry/exit
-//! states} that, when started via [`SkillStartTool`](crate::tool::workflow::skill::SkillStartTool),
-//! transitions the workflow into [`WorkflowState::Skill`](crate::workflow::WorkflowState::Skill)
+//! states} that, when started via [`SkillStartTool`](crate::app::tool::workflow::skill::SkillStartTool),
+//! transitions the workflow into [`WorkflowState::Skill`](crate::app::workflow::WorkflowState::Skill)
 //! and replaces the base tool filter with the skill's allow-list + injects the
 //! skill's prompt into the system prompt. The agent then drives toward the
 //! goal using its tools; it exits via `skill_end` (→ target_state) or
@@ -28,12 +28,12 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::WorkflowState;
+use crate::app::workflow::WorkflowState;
 
 /// The spec for one skill, loaded from a `.coding/skills/<name>.toml` file.
 ///
 /// `available_in` gates which workflow states the skill may be started from
-/// (validated by [`SkillStartTool`](crate::tool::workflow::skill::SkillStartTool)
+/// (validated by [`SkillStartTool`](crate::app::tool::workflow::skill::SkillStartTool)
 /// at call time). `target_state` is where the workflow lands after `skill_end`.
 /// `tools` is the allow-list active while the skill runs. `prompt` is the goal
 /// the agent drives toward (injected into the system prompt).
@@ -297,11 +297,11 @@ impl SkillLibrary {
 pub const SHIPPED_SKILLS: &[(&str, &str)] = &[
     (
         "merge_to_main",
-        include_str!("../../.coding/skills/merge_to_main.toml"),
+        include_str!("../../../.coding/skills/merge_to_main.toml"),
     ),
     (
         "create_skill",
-        include_str!("../../.coding/skills/create_skill.toml"),
+        include_str!("../../../.coding/skills/create_skill.toml"),
     ),
 ];
 

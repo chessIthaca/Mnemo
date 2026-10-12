@@ -18,7 +18,7 @@ use crate::agent::policy::{
 use crate::project::Constitution;
 use crate::provider::Capabilities;
 use crate::tool::{ToolRegistry, ToolResult};
-use crate::workflow::{Workflow, WorkflowState};
+use crate::app::workflow::{Workflow, WorkflowState};
 
 /// The workflow agent's policy — byte-identical behavior to the pre-2a
 /// direct reads (acceptance :785-788).

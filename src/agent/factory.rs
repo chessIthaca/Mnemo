@@ -1011,13 +1011,39 @@ impl AgentLoopFactory {
                         // The handle passes straight through — the ctx field
                         // IS the neutral trait type since 2b.3 (no cast).
                         workflow: agent.workflow_handle(),
+                        // 2c.1 (G1): the caller's prompt spec arrives with
+                        // the Engine's SpawnOptions (3a). The app factory
+                        // (production's wiring) composes today's workflow
+                        // head and ignores the option.
+                        prompt: None,
                     };
-                    pf.build_policy(&ctx)
+                    // 2c.1 (G1, §5.9.1 :629-630): a wired factory may REFUSE
+                    // the build — today only a NoPolicy factory without the
+                    // caller's PromptSpec. The loop build is infallible and
+                    // production always wires the app factory (which never
+                    // errs), so the kernel runs the EXPLICIT coding-default
+                    // fallback here; the Engine path (3a) owns propagating
+                    // the error to its spawn callers (step-file D2's
+                    // documented forward).
+                    pf.build_policy(&ctx).unwrap_or_else(|_error| {
+                        crate::agent::policy::PolicyBuildResult {
+                            policy: Arc::new(
+                                crate::agent::policy::NoPolicy::with_coding_default(),
+                            ),
+                            attach_loop: Box::new(|_| {}),
+                        }
+                    })
                 }
-                None => crate::agent::policy::PolicyBuildResult {
-                    policy: Arc::new(crate::agent::policy::NoPolicy),
-                    attach_loop: Box::new(|_| {}),
-                },
+                None => {
+                    // 2c.1 (G1): the unwired arm's default is the kernel's
+                    // EXPLICIT coding default (never a silent assembly).
+                    crate::agent::policy::PolicyBuildResult {
+                        policy: Arc::new(
+                            crate::agent::policy::NoPolicy::with_coding_default(),
+                        ),
+                        attach_loop: Box::new(|_| {}),
+                    }
+                }
             }
         };
         agent.set_policy(built_policy.policy);

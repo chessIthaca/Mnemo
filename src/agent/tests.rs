@@ -3316,8 +3316,9 @@ async fn volatile_tail_then_stable_footer_appended_and_popped() {
     let prompts = captured.lock().await;
     assert_eq!(prompts.len(), 1);
     assert!(
-        prompts[0].contains("plan-first workflow"),
-        "head has the preamble"
+        prompts[0].starts_with(crate::agent::prompt::KERNEL_CODING_DEFAULT_IDENTITY),
+        "head has the free coding-default identity (2c.1/G1: the bare loop's \
+         default is the explicit coding-default spec, not the workflow head)"
     );
     assert!(
         !prompts[0].contains(crate::agent::prompt::CONTEXT_FOOTER),

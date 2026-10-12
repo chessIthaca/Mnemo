@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::agent::prompt::PromptSpec;
 use crate::project::Constitution;
 use crate::provider::Capabilities;
 use crate::tool::{ToolFilter, ToolRegistry, ToolResult};
@@ -150,6 +151,30 @@ pub struct PolicyFactoryCtx {
     /// 2b.3); the app side recovers its concrete, lockable Arc through
     /// `as_any_arc`.
     pub workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
+    /// The caller's prompt spec (2c.1/G1, §5.9.1). `None` today — the
+    /// Engine's SpawnOptions supplies it (3a); a wired factory building a
+    /// spec-free free agent errors with the `prompt_required` code.
+    pub prompt: Option<PromptSpec>,
+}
+
+/// The kernel errors a policy-factory build can fail with (2c.1). The
+/// Engine's spawn surface (3a) maps these onto its own error with the
+/// spec's stable codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelError {
+    /// A `NoPolicy` build (§5.9.1) without a caller-supplied
+    /// [`PromptSpec`](crate::agent::prompt::PromptSpec) — the free agent
+    /// never silently defaults to a coding identity (G1).
+    PromptRequired,
+}
+
+impl KernelError {
+    /// The stable error code (`prompt_required`, §5.9.1 :630).
+    pub fn code(&self) -> &'static str {
+        match self {
+            KernelError::PromptRequired => "prompt_required",
+        }
+    }
 }
 
 /// What [`AgentPolicyFactory::build_policy`] hands back: the policy the
@@ -187,8 +212,14 @@ pub trait AgentPolicyFactory: Send + Sync {
     /// Build the policy wrapping the agent's own workflow (the opaque
     /// handle in `ctx`). Called once per built agent, before the final
     /// Arc-wrap; the returned `attach_loop` hook is invoked at the build's
-    /// tail.
-    fn build_policy(&self, ctx: &PolicyFactoryCtx) -> PolicyBuildResult;
+    /// tail. MAY REFUSE (2c.1/G1): a [`NoPolicy`]-semantics factory without
+    /// the caller's [`PromptSpec`] errors with
+    /// [`KernelError::PromptRequired`] (§5.9.1 :629-630 — never a silent
+    /// coding default; the Engine path (3a) propagates it).
+    fn build_policy(
+        &self,
+        ctx: &PolicyFactoryCtx,
+    ) -> Result<PolicyBuildResult, KernelError>;
 
     /// Register app-side tools onto the agent's registry (D5). 2b.2's move
     /// covers the param-free and wiring-only tools (ask_user, the backlog
@@ -212,11 +243,22 @@ impl AgentPolicyFactory for NoPolicyFactory {
         Arc::new(crate::agent::workflow_handle::UnwiredWorkflow)
     }
 
-    fn build_policy(&self, _ctx: &PolicyFactoryCtx) -> PolicyBuildResult {
-        PolicyBuildResult {
-            policy: Arc::new(NoPolicy),
+    /// Build the free agent's policy — enforcing G1 (§5.9.1 :629-630): the
+    /// caller's PromptSpec is REQUIRED; without one the build errors with
+    /// the `prompt_required` code, never a silent coding default.
+    fn build_policy(
+        &self,
+        ctx: &PolicyFactoryCtx,
+    ) -> Result<PolicyBuildResult, KernelError> {
+        let spec = ctx
+            .prompt
+            .clone()
+            .ok_or(KernelError::PromptRequired)
+            .map(Arc::new)?;
+        Ok(PolicyBuildResult {
+            policy: Arc::new(NoPolicy::with_spec(spec)),
             attach_loop: Box::new(|_| {}),
-        }
+        })
     }
 
     fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
@@ -294,15 +336,45 @@ pub trait AgentPolicy: Send + Sync {
     async fn on_session_end(&self);
 }
 
-/// The kernel default — the free agent (master-spec :200-202). Everything
-/// no-op/constant here; the free-agent behaviors land in job 2c.
-pub struct NoPolicy;
+/// The kernel default — the free agent (§5.2 :200-202): no workflow, no
+/// plan tools, the `"free"` route, the constant surface (2a). 2c.1/G1:
+/// its stable head composes from the CALLER's
+/// [`PromptSpec`](crate::agent::prompt::PromptSpec) — a spec-free
+/// `NoPolicy` cannot exist (the factory errors with `KernelError`
+/// ::PromptRequired instead, never a silent coding default).
+pub struct NoPolicy {
+    /// The caller-supplied prompt spec (the head's recipe).
+    spec: Arc<PromptSpec>,
+}
+
+impl NoPolicy {
+    /// Build the free-agent policy over a caller-supplied spec (G1).
+    pub fn with_spec(spec: Arc<PromptSpec>) -> Self {
+        Self { spec }
+    }
+
+    /// The kernel's explicit fallback — the loop's bare default and the
+    /// factory's unwired arm: the mnemo coding default (the console/GUI
+    /// free mode's spec, §5.9.1 :631-632), never a silently-assembled
+    /// coding head. The Engine spawn path (3a) errors without the
+    /// caller's spec (`KernelError::PromptRequired`).
+    pub fn with_coding_default() -> Self {
+        Self {
+            spec: Arc::new(crate::agent::prompt::PromptSpec::coding_default()),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentPolicy for NoPolicy {
     fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
-    fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String {
-        assemble_stable_head(k, c)
+    fn stable_head(&self, _k: &KernelPromptBlocks, c: &Constitution) -> String {
+        // 2c.1/G1 (§5.9.1 :626-627): the free head composes from the
+        // caller's spec — identity, the selected blocks, extra_stable,
+        // constitution (the spec's mode filters the loaded sources) — NOT
+        // the workflow block set. The 2a stub mirrored the workflow head;
+        // the 2a.0 byte-golden pins the WORKFLOW path only.
+        crate::agent::prompt::assemble_spec_head(&self.spec, c)
     }
     async fn volatile_tail(&self, _caps: &Capabilities) -> String {
         String::new()
@@ -357,7 +429,19 @@ pub fn assemble_stable_head(k: &KernelPromptBlocks, c: &Constitution) -> String 
     }
     // Constitution — global first, then project (trim-empty check only;
     // the pushed bytes are the raw field contents, exactly as the
-    // original body did).
+    // original body did). The section pushes are shared with the free
+    // agent's spec assembler (2c.1) — one body, byte-pinned by the
+    // 2a.0 golden.
+    push_constitution_sections(&mut out, c);
+    out
+}
+
+/// The constitution section pushes, shared by the two head assemblers
+/// (`assemble_stable_head`, the 2a.0 golden's body, and prompt.rs's
+/// `assemble_spec_head`, the free agent's). Byte-pinned: the `# HARD
+/// RULES` headers + the raw field content + the blank-line separators
+/// must never drift.
+pub fn push_constitution_sections(out: &mut String, c: &Constitution) {
     if !c.global.trim().is_empty() {
         out.push_str("# HARD RULES — GLOBAL (agent.md)\n\n");
         out.push_str(&c.global);
@@ -368,5 +452,52 @@ pub fn assemble_stable_head(k: &KernelPromptBlocks, c: &Constitution) -> String 
         out.push_str(&c.project);
         out.push_str("\n\n");
     }
-    out
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2c.1/G1 (row 25's kernel form): a NoPolicy factory build WITHOUT a
+    /// caller-supplied PromptSpec errors with the spec's stable code —
+    /// never a silent coding default.
+    #[test]
+    fn no_policy_requires_identity() {
+        let ctx = PolicyFactoryCtx {
+            agent_id: None,
+            project_root: std::path::PathBuf::from("/tmp/proj"),
+            plans_dir: std::path::PathBuf::from("/tmp/proj/.coding/plans"),
+            prompt: None,
+            workflow: Arc::new(crate::agent::workflow_handle::UnwiredWorkflow),
+        };
+        let Err(error) = NoPolicyFactory.build_policy(&ctx) else {
+            panic!("a spec-free NoPolicy build must refuse");
+        };
+        assert_eq!(error.code(), "prompt_required");
+    }
+
+    /// 2c.1/G1: WITH the spec the factory builds a policy whose head
+    /// composes from the spec (identity first; no workflow text) and whose
+    /// constitution mode is the spec's (the assembler's filter).
+    #[test]
+    fn no_policy_with_spec_builds_spec_head() {
+        let ctx = PolicyFactoryCtx {
+            agent_id: None,
+            project_root: std::path::PathBuf::from("/tmp/proj"),
+            plans_dir: std::path::PathBuf::from("/tmp/proj/.coding/plans"),
+            prompt: Some(crate::agent::prompt::PromptSpec::coding_default()),
+            workflow: Arc::new(crate::agent::workflow_handle::UnwiredWorkflow),
+        };
+        let built = NoPolicyFactory.build_policy(&ctx).unwrap();
+        let head = built
+            .policy
+            .stable_head(&KernelPromptBlocks::workflow(), &Constitution::default());
+        assert!(
+            head.starts_with(crate::agent::prompt::KERNEL_CODING_DEFAULT_IDENTITY),
+            "the free head starts with the spec's identity"
+        );
+        assert!(
+            !head.contains("WORKFLOW LIFECYCLE") && !head.contains("APP RULES"),
+            "the free head carries no workflow text"
+        );
+    }
 }

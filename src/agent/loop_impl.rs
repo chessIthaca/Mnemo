@@ -497,9 +497,11 @@ impl ConstitutionHolder {
     /// `Static` (tests), the head is rebuilt every call (tests don't need the
     /// cache and value the simplicity).
     ///
-    /// `policy` supplies the kernel prompt blocks (2a.4): both `NoPolicy`
-    /// and the factory-attached `WorkflowPolicy` produce today's bytes
-    /// (`assemble_stable_head(&KernelPromptBlocks::workflow(), …)`).
+    /// `policy` supplies the head (2a.4 + 2c.1/G1): the factory-attached
+    /// `WorkflowPolicy` produces today's bytes
+    /// (`assemble_stable_head(&KernelPromptBlocks::workflow(), …)`), while
+    /// `NoPolicy` composes the free head from its caller's `PromptSpec`
+    /// (whose constitution mode filters the loaded sources).
     pub(crate) fn stable_head(&self, policy: &dyn crate::agent::policy::AgentPolicy) -> String {
         match self {
             ConstitutionHolder::Source {
@@ -901,7 +903,10 @@ impl AgentLoop {
             plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
             pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
             spend_attribution: std::sync::Mutex::new(None),
-            policy: Arc::new(crate::agent::policy::NoPolicy),
+            // 2c.1/G1: the bare-loop default carries the kernel's EXPLICIT
+            // coding default (never a silent assembly; the factory may
+            // overwrite via set_policy).
+            policy: Arc::new(crate::agent::policy::NoPolicy::with_coding_default()),
         }
     }
 
@@ -2770,9 +2775,11 @@ mod tests {
         };
 
         // First call builds and caches the head.
-        let head1 = holder.stable_head(&crate::agent::policy::NoPolicy);
+        let head1 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         // Second call with no file change returns the cached head (identical).
-        let head2 = holder.stable_head(&crate::agent::policy::NoPolicy);
+        let head2 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         assert_eq!(
             head1, head2,
             "head must be cached across calls when constitution unchanged"
@@ -2789,7 +2796,8 @@ mod tests {
         }
 
         // Third call rebuilds because the constitution changed.
-        let head3 = holder.stable_head(&crate::agent::policy::NoPolicy);
+        let head3 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         assert_ne!(head3, head1, "head must rebuild when constitution changes");
     }
 }

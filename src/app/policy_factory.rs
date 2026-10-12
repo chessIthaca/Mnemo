@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 
 use crate::agent::policy::{
-    AgentPolicyFactory, PolicyBuildCtx, PolicyBuildResult, PolicyFactoryCtx,
+    AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult,
+    PolicyFactoryCtx,
 };
 use crate::app::backlog::BacklogStore;
 use crate::app::tool::workflow::ask_user::AskUserTool;
@@ -144,7 +145,10 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         Arc::new(Arc::new(tokio::sync::Mutex::new(workflow)))
     }
 
-    fn build_policy(&self, ctx: &PolicyFactoryCtx) -> PolicyBuildResult {
+    fn build_policy(
+        &self,
+        ctx: &PolicyFactoryCtx,
+    ) -> Result<PolicyBuildResult, KernelError> {
         // The kernel hands the loop's workflow handle back through the
         // neutral trait (2b.3); the app factory recovers its concrete
         // lockable Arc via as_any_arc — an app→app cast, the legal
@@ -168,10 +172,10 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // the first attach wins).
         let policy = Arc::new(WorkflowPolicy::new(workflow));
         let concrete: Arc<WorkflowPolicy> = Arc::clone(&policy);
-        PolicyBuildResult {
+        Ok(PolicyBuildResult {
             policy,
             attach_loop: Box::new(move |loop_weak| concrete.attach_loop(loop_weak)),
-        }
+        })
     }
 
     fn register_tools(&self, registry: &mut ToolRegistry, ctx: &PolicyBuildCtx) {

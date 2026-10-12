@@ -417,6 +417,196 @@ pub(crate) fn append_plan_nudge(
 /// `WORKFLOW STATE` or `RECALLED MEMORIES`. Keep it short (30-60 chars).
 pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ignore>";
 
+/// The coding default's identity — what the mnemo console/GUI free mode
+/// passes (§5.9.1 :631-632). Deliberately WITHOUT the plan-first-workflow
+/// phrasing of the workflow preamble's identity (row 6's grep): the free
+/// head must contain no workflow text, and the identity is the CALLER's —
+/// the Engine path (3a) errors without one (`prompt_required`), while the
+/// console passes this explicitly.
+pub(crate) const KERNEL_CODING_DEFAULT_IDENTITY: &str = "\
+You are a coding agent. You help the user build software by reading files, \
+writing code, and running commands.
+";
+
+/// The kernel-safe core working principles — the preamble's tool-agnostic
+/// subset: the plan-first and one-step bullets are workflow-only (row 6's
+/// grep) and stay exclusively in the workflow const; the file-tool mutation
+/// discipline is the [`PromptBlock::FileToolRules`] block.
+const KERNEL_CODING_PRINCIPLES: &str = "\
+CORE PRINCIPLES:
+- Chain consecutive obvious steps: when the next action needs no user input \
+and no decision, take it in the same turn (retry a failed call with corrected \
+args, re-run a test after a fix). Tool results are continuations of your turn, \
+not new questions — keep going until you hit a real choice point or need the \
+user.
+- Read before you write. Understand existing code before modifying it.
+- Be precise. Use exact string matches for file_edit (its schema lists the \
+regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
+line-ops array `ops`).
+- To cut round-trips, read several files at once with read_files. Edit existing \
+files with file_edit (targeted) — or `multi_edit` for several files in one \
+atomic call — not a full file_write rewrite; for large files, write the first \
+section, then file_write mode:\"append\" the rest.
+- Explain what you're doing briefly.
+- Ask questions when unsure, unless you know the user is not available.
+";
+
+/// Kernel-safe tool-call discipline — the generation-time rules WITHOUT the
+/// plan-tool examples (create_plan/update_plan/complete_step are workflow
+/// tools absent from a free agent's registry).
+const KERNEL_TOOL_CALL_DISCIPLINE: &str = "\
+TOOL-CALL DISCIPLINE — generation-time rules for every call:
+- CONTENT FIRST, CALL SECOND — the JSON body of a tool call delivers text you \
+already wrote; it is never the place where the text gets invented. A multi-arg \
+call is valid only when its content is fully written in this same message: \
+write the content in your reply first, then emit the call carrying that exact \
+text. If you catch yourself opening a call with no content drafted, you are \
+not ready to call — write the content, then call.
+- SCHEMA-FIRST PRE-FLIGHT — before emitting, name the tool and its required \
+fields, then check each is present and non-blank in your call: memory_write → \
+tier, title, content; ask_user → question + options (≥2); spawn_agent → \
+name, task; file_edit/file_write → path (+ new_string/content); shell → \
+command, purpose; search → pattern. If you cannot name the fields, re-read \
+the schema BEFORE emitting — never emit to find out. No call goes out with \
+an empty argument object when it has required fields — a blank required \
+field means the content was never written.
+- ESCAPE TRAPS — a lone backslash starts an illegal JSON escape (\\x, \\d): \
+write Windows paths with forward slashes, C:/repo/path.
+- MALFORMED-JSON RECOVERY — the error NAMES the failing call and its required \
+fields: the call went out with no arguments, or with arguments that are not \
+valid JSON. It is NOT a hint to shrink the call or tweak one field: rewrite \
+the COMPLETE call with every required field, and emit the corrected call once.
+- TWO IDENTICAL FAILURES IN A ROW = STOP EMITTING — you are stuck in a loop: \
+re-read the tool's schema, re-draft the complete arguments from scratch, then \
+emit one carefully built call.
+";
+
+/// The file-tools-first discipline — kernel-worded (no workflow text; the
+/// workflow's version of this lives in APP_RULES, which the workflow head
+/// keeps byte-verbatim).
+const FILE_TOOL_RULES: &str = "\
+FILE TOOL RULES — file mutation goes through the file tools, not the shell. \
+file_edit / file_write are the sanctioned writers (diff preview, line-ending \
+safety, stale-read gate). Shell one-liners (Set-Content, sed -i, python \
+scripts) are a last resort for paths the file tools refuse (the knowledge \
+records — memory_amend to amend, memory_update's find/replace_with to repair \
+stray text) or a verified tool freeze, with the justification stated.
+";
+
+/// One kernel prompt block, selected by name (§5.9.1 :624, serde
+/// snake_case). The library is kernel-owned, additive, and byte-stable; the
+/// caller composes a session's head by listing blocks, and the head keeps
+/// the caller's listed order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptBlock {
+    /// The core working principles ([`KERNEL_CODING_PRINCIPLES`]).
+    CoreCodingPrinciples,
+    /// Generation-time call rules ([`KERNEL_TOOL_CALL_DISCIPLINE`]).
+    ToolCallDiscipline,
+    /// When-to-use-which-tool ([`TOOL_STRATEGY`]).
+    ToolStrategy,
+    /// The typed-record + hygiene conventions ([`MEMORY_RECORDS`]).
+    MemoryRecords,
+    /// The file-tools-first discipline ([`FILE_TOOL_RULES`]).
+    FileToolRules,
+}
+
+/// How much of the constitution rides the stable head (§5.9.1 :621) —
+/// applied by [`assemble_spec_head`] itself, so the spec field always
+/// governs its own head wherever it is assembled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstitutionMode {
+    /// No constitution text at all.
+    None,
+    /// Only the global `agent.md`.
+    Global,
+    /// Only the project `agent.md`.
+    Project,
+    /// Global first, then project — today's behavior (the default).
+    Both,
+}
+
+/// The caller-supplied prompt spec (§5.9.1 :617-622) — the free agent's
+/// stable-head recipe. REQUIRED for `NoPolicy` builds (the factory errors
+/// with the `prompt_required` code without one); `coding_default()` is the
+/// explicit convenience the mnemo console/GUI free mode passes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptSpec {
+    /// The caller's identity line(s) — the head's FIRST section. The kernel
+    /// carries no default identity (G1: never a silent coding agent).
+    pub identity: String,
+    /// The kernel blocks to include, kept in the caller's listed order.
+    pub blocks: Vec<PromptBlock>,
+    /// Caller text appended after the blocks (before the constitution).
+    pub extra_stable: Option<String>,
+    /// Which `agent.md` sources ride the head.
+    pub constitution: ConstitutionMode,
+}
+
+impl PromptSpec {
+    /// The mnemo coding default — the console/GUI free mode's explicit
+    /// convenience (§5.9.1 :631-632): the kernel-safe coding identity + the
+    /// full block library + the full constitution.
+    pub fn coding_default() -> Self {
+        Self {
+            identity: KERNEL_CODING_DEFAULT_IDENTITY.to_string(),
+            blocks: vec![
+                PromptBlock::CoreCodingPrinciples,
+                PromptBlock::ToolCallDiscipline,
+                PromptBlock::ToolStrategy,
+                PromptBlock::MemoryRecords,
+                PromptBlock::FileToolRules,
+            ],
+            extra_stable: None,
+            constitution: ConstitutionMode::Both,
+        }
+    }
+}
+
+/// The block library's map — a block's kernel text (G1: blocks are selected
+/// by name; the kernel carries no implicit set).
+pub fn prompt_block_text(block: &PromptBlock) -> &'static str {
+    match block {
+        PromptBlock::CoreCodingPrinciples => KERNEL_CODING_PRINCIPLES,
+        PromptBlock::ToolCallDiscipline => KERNEL_TOOL_CALL_DISCIPLINE,
+        PromptBlock::ToolStrategy => TOOL_STRATEGY,
+        PromptBlock::MemoryRecords => MEMORY_RECORDS,
+        PromptBlock::FileToolRules => FILE_TOOL_RULES,
+    }
+}
+
+/// The free agent's stable head (§5.9.1 :626-627): identity + the selected
+/// blocks + `extra_stable` + constitution, in that fixed order. Same
+/// empty-skip + raw-bytes + "\n\n" semantics as `assemble_stable_head`
+/// (policy.rs) so callers' caching assumptions hold; the constitution
+/// section rides the same shared pusher (byte-identical).
+pub fn assemble_spec_head(spec: &PromptSpec, c: &Constitution) -> String {
+    // §5.9.1 :621: the spec's constitution mode filters the loaded sources
+    // BEFORE the sections push (None drops both; Both = today's bytes).
+    let c = c.restricted(spec.constitution);
+    let mut out = String::new();
+    push_spec_section(&mut out, &spec.identity);
+    for block in &spec.blocks {
+        push_spec_section(&mut out, prompt_block_text(block));
+    }
+    if let Some(extra) = &spec.extra_stable {
+        push_spec_section(&mut out, extra);
+    }
+    crate::agent::policy::push_constitution_sections(&mut out, &c);
+    out
+}
+
+/// push_section's empty-skip semantics (skip if trim-empty, then RAW bytes
+/// + "\n\n") — shared by [`assemble_spec_head`].
+fn push_spec_section(out: &mut String, text: &str) {
+    if !text.trim().is_empty() {
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+}
+
 /// Build the **stable head** of the system prompt: the six compiled prompt
 /// blocks + the global + project constitution.
 ///
@@ -1927,5 +2117,104 @@ mod tests {
         );
         // Two calls produce identical bytes — the literal is byte-stable.
         assert_eq!(CONTEXT_FOOTER, CONTEXT_FOOTER);
+    }
+
+    /// 2c.1/G1 (§5.9.1 :626-627): the free head composes identity + the
+    /// selected blocks in the CALLER'S listed order + extra_stable +
+    /// constitution, with the same empty-skip/raw-bytes/blank-line
+    /// semantics as the workflow assembler; the blocks are listed here in a
+    /// NON-declaration order to pin the listed-order contract.
+    #[test]
+    fn prompt_spec_blocks_compose_in_fixed_order() {
+        let mut expected = String::new();
+        expected.push_str("IDENTITY LINE");
+        expected.push_str("\n\n");
+        expected.push_str(TOOL_STRATEGY);
+        expected.push_str("\n\n");
+        expected.push_str(KERNEL_CODING_PRINCIPLES);
+        expected.push_str("\n\n");
+        expected.push_str(MEMORY_RECORDS);
+        expected.push_str("\n\n");
+        expected.push_str("EXTRA STABLE TEXT");
+        expected.push_str("\n\n");
+        expected.push_str("# HARD RULES — GLOBAL (agent.md)\n\n");
+        expected.push_str("GLOBAL TEXT");
+        expected.push_str("\n\n");
+        expected.push_str("# HARD RULES — PROJECT (agent.md)\n\n");
+        expected.push_str("PROJECT TEXT");
+        expected.push_str("\n\n");
+        let spec = PromptSpec {
+            identity: "IDENTITY LINE".into(),
+            blocks: vec![
+                PromptBlock::ToolStrategy,
+                PromptBlock::CoreCodingPrinciples,
+                PromptBlock::MemoryRecords,
+            ],
+            extra_stable: Some("EXTRA STABLE TEXT".into()),
+            constitution: ConstitutionMode::Both,
+        };
+        let c = Constitution {
+            global: "GLOBAL TEXT".into(),
+            project: "PROJECT TEXT".into(),
+        };
+        assert_eq!(assemble_spec_head(&spec, &c), expected);
+    }
+
+    /// 2c.1/G1 (row 6's grep): the free coding-default head carries NO
+    /// workflow text — no WORKFLOW LIFECYCLE section, no APP RULES, no
+    /// plan-first/create_plan/complete_step mentions — and starts with the
+    /// (plan-free) default identity.
+    #[test]
+    fn kernel_head_has_no_workflow_text() {
+        let spec = PromptSpec::coding_default();
+        let head = assemble_spec_head(&spec, &Constitution::default());
+        assert!(
+            head.starts_with(KERNEL_CODING_DEFAULT_IDENTITY),
+            "the free head starts with the caller's identity"
+        );
+        assert!(
+            !head.contains("WORKFLOW LIFECYCLE"),
+            "no lifecycle section in the free head"
+        );
+        assert!(!head.contains("APP RULES"), "no app-rules section");
+        assert!(!head.contains("plan-first"), "no plan-first text");
+        assert!(!head.contains("create_plan"), "no create_plan text");
+        assert!(!head.contains("complete_step"), "no complete_step text");
+    }
+
+    /// 2c.1/G1 (§5.9.1 :621): the spec's constitution mode filters the
+    /// loaded sources at the head build — None drops both, Global keeps
+    /// only the global file, Project only the project file, Both = today's
+    /// bytes.
+    #[test]
+    fn prompt_spec_constitution_modes_filter_head() {
+        let c = Constitution {
+            global: "GLOBAL TEXT".into(),
+            project: "PROJECT TEXT".into(),
+        };
+        let base = |mode: ConstitutionMode| {
+            assemble_spec_head(
+                &PromptSpec {
+                    identity: "I".into(),
+                    blocks: Vec::new(),
+                    extra_stable: None,
+                    constitution: mode,
+                },
+                &c,
+            )
+        };
+        assert_eq!(base(ConstitutionMode::None), "I\n\n");
+        assert_eq!(
+            base(ConstitutionMode::Global),
+            "I\n\n# HARD RULES — GLOBAL (agent.md)\n\nGLOBAL TEXT\n\n"
+        );
+        assert_eq!(
+            base(ConstitutionMode::Project),
+            "I\n\n# HARD RULES — PROJECT (agent.md)\n\nPROJECT TEXT\n\n"
+        );
+        assert_eq!(
+            base(ConstitutionMode::Both),
+            "I\n\n# HARD RULES — GLOBAL (agent.md)\n\nGLOBAL TEXT\n\n# HARD RULES — PROJECT (agent.md)\n\nPROJECT TEXT\n\n"
+        );
     }
 }

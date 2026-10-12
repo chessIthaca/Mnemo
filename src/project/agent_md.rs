@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::agent::prompt::ConstitutionMode;
 use crate::error::Result;
 
 /// The two constitution files, in load order: global first, then project.
@@ -25,6 +26,26 @@ impl Constitution {
     /// Whether both constitutions are empty.
     pub fn is_empty(&self) -> bool {
         self.global.trim().is_empty() && self.project.trim().is_empty()
+    }
+
+    /// The constitution restricted to the prompt spec's constitution mode
+    /// (2c.1/G1, §5.9.1 :621): the excluded sources drop to empty; `Both`
+    /// returns an exact copy (today's behavior — the byte-golden's path).
+    /// Applied by the free head's assembler (`assemble_spec_head`), so the
+    /// spec field always governs its own head.
+    pub fn restricted(&self, mode: ConstitutionMode) -> Constitution {
+        match mode {
+            ConstitutionMode::Both => self.clone(),
+            ConstitutionMode::Global => Constitution {
+                global: self.global.clone(),
+                project: String::new(),
+            },
+            ConstitutionMode::Project => Constitution {
+                global: String::new(),
+                project: self.project.clone(),
+            },
+            ConstitutionMode::None => Constitution::default(),
+        }
     }
 }
 

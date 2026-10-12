@@ -308,4 +308,43 @@ pipe trap). Both crates are #![deny(warnings)]: a green cargo test proves zero w
 
 The 2b close-out shape: Landed (the per-step commits) / the test results / the acceptance
 check-offs (the row → the test name → the result) / the deviations (each + why) / the
-remaining risk.
+remaining risk.## G. Landed amendments (the executor's dated picks)
+
+Amendment (2027-01-14, step 2c.1 — the landed D1/D2 picks, supersede §B
+D1/D2's provisional wording where they differ):
+- NO identity extraction from CODING_SYSTEM_PREAMBLE — the workflow const
+  stays byte-verbatim (the 2a.0 golden guards it; byte-isolation made the
+  extraction unnecessary). The free library carries its own identity:
+  `KERNEL_CODING_DEFAULT_IDENTITY` (pub(crate), prompt.rs) — the coding line
+  WITHOUT the plan-first-workflow phrasing (row 6's grep passes on the
+  composed head).
+- The block texts (probed): TOOL_STRATEGY + MEMORY_RECORDS enter the library
+  VERBATIM (tool-agnostic); CoreCodingPrinciples → KERNEL_CODING_PRINCIPLES
+  (the tool-agnostic core: no plan-first/complete_step text; the file-tool
+  bullets excluded); ToolCallDiscipline → KERNEL_TOOL_CALL_DISCIPLINE (the
+  discipline without the plan-tool examples); FileToolRules → FILE_TOOL_RULES
+  (new kernel-worded file-mutation discipline, no .coding literals —
+  state-dir-neutral for G3).
+- The constitution mode applies INSIDE `assemble_spec_head` (the spec field
+  governs its own head — §5.9.1's letter). The trait's constitution_mode()
+  was DROPPED (not in §5.2's trait sketch); the ConstitutionHolder is
+  untouched (the workflow bytes unchanged). `Constitution::restricted`
+  (agent_md.rs) is the filter helper.
+- NoPolicy carries `spec: Arc<PromptSpec>` (REQUIRED — no spec-free
+  constructor); `with_coding_default()` = the kernel's explicit fallback
+  (the loop's bare default, the factory's unwired arm, and the
+  wired-factory-Err fallback at factory.rs :1005-1022 with a documented
+  deviation comment). `build_inner` stays infallible — the Engine (3a) owns
+  propagating `prompt_required` at spawn (EngineError); the trait's
+  build_policy → Result<_, KernelError> and the app impl wraps in Ok.
+- Tests: prompt_spec_blocks_compose_in_fixed_order (the listed-order
+  contract, push-built expected), kernel_head_has_no_workflow_text (row 6's
+  grep), prompt_spec_constitution_modes_filter_head (all four modes
+  byte-checked), no_policy_requires_identity (row 25's kernel form: the
+  prompt_required code), no_policy_with_spec_builds_spec_head; the bare-loop
+  default flip is pinned by
+  agent::tests::volatile_tail_then_stable_footer_appended_and_popped (now
+  asserting the free identity prefix); the holder tests ride
+  with_coding_default().
+- The battery green: cargo test -p mnemo; -p mnemo --features
+  browser,embeddings; --workspace; build --workspace; the goldens trio 3/3.

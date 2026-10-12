@@ -111,7 +111,7 @@ mod tests {
 
     #[async_trait]
     impl ModelResolver for MockResolver {
-        fn resolve(&self, _context: ModelContext<'_>) -> Option<ModelRef> {
+        fn resolve(&self, _context: ModelContext) -> Option<ModelRef> {
             None
         }
         fn build_turn_provider(

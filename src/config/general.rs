@@ -852,6 +852,13 @@ pub struct ModelsConfig {
     /// UI's spawn button with a parent). Falls back to the workflow-state
     /// override, then the default.
     pub subagent: Option<ModelRef>,
+    /// Model for a headless / policy-less agent loop (`[models.free]`, the
+    /// routing contract master-spec :241-246): `NoPolicy` emits the
+    /// `["free"]` routing key, so a free-running agent resolves this slot,
+    /// then the default. Unset = the default model (every existing config
+    /// behaves exactly as before — the field serde-defaults with the
+    /// section).
+    pub free: Option<ModelRef>,
     /// Model for compaction summaries — the auto-compaction summary call and
     /// the run-all between-items compact. Unset = the turn's model (today's
     /// behavior: no config, no change). Like [`Self::reviewing`], this slot
@@ -2825,6 +2832,7 @@ model = "deepseek-v4-flash"
             context: ContextConfig::default(),
             ui: UiConfig::default(),
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),
@@ -2875,6 +2883,7 @@ model = "deepseek-v4-flash"
         let path = dir.path().join("config.toml");
         let cfg = GeneralConfig {
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),
@@ -2933,6 +2942,7 @@ reasoning_effort = "off"
     fn models_section_reasoning_effort_round_trips() {
         let cfg = GeneralConfig {
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),

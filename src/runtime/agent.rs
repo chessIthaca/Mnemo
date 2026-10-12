@@ -1838,7 +1838,7 @@ mod tests {
     impl crate::model_resolver::ModelResolver for FallbackResolver {
         fn resolve(
             &self,
-            _ctx: crate::model_resolver::ModelContext<'_>,
+            _ctx: crate::model_resolver::ModelContext,
         ) -> Option<crate::config::ModelRef> {
             Some(crate::config::ModelRef {
                 endpoint: "primary".into(),
@@ -2765,7 +2765,7 @@ mod tests {
         impl ModelResolver for NoOverrideResolver {
             fn resolve(
                 &self,
-                _ctx: crate::model_resolver::ModelContext<'_>,
+                _ctx: crate::model_resolver::ModelContext,
             ) -> Option<crate::config::ModelRef> {
                 None // no override → default provider
             }
@@ -3014,15 +3014,23 @@ mod tests {
         impl ModelResolver for StatefulResolver {
             fn resolve(
                 &self,
-                ctx: crate::model_resolver::ModelContext<'_>,
+                ctx: crate::model_resolver::ModelContext,
             ) -> Option<crate::config::ModelRef> {
-                match ctx.workflow_state {
-                    crate::workflow::WorkflowState::Planning => Some(crate::config::ModelRef {
+                // 2a.6: the state reads off the routing key (Planning ->
+                // "planning", Executing/Reviewing -> "executing").
+                let state_slot = ctx
+                    .route
+                    .slots
+                    .iter()
+                    .map(String::as_str)
+                    .find(|s| matches!(*s, "planning" | "executing" | "complete"));
+                match state_slot {
+                    Some("planning") => Some(crate::config::ModelRef {
                         endpoint: "primary".into(),
                         model: "plan-model".into(),
                         reasoning_effort: None,
                     }),
-                    crate::workflow::WorkflowState::Executing => Some(crate::config::ModelRef {
+                    Some("executing") => Some(crate::config::ModelRef {
                         endpoint: "primary".into(),
                         model: "exec-model".into(),
                         reasoning_effort: None,
@@ -3209,10 +3217,17 @@ mod tests {
         impl ModelResolver for LazyResolver {
             fn resolve(
                 &self,
-                ctx: crate::model_resolver::ModelContext<'_>,
+                ctx: crate::model_resolver::ModelContext,
             ) -> Option<crate::config::ModelRef> {
-                match ctx.workflow_state {
-                    crate::workflow::WorkflowState::Executing => Some(crate::config::ModelRef {
+                // 2a.6: the state reads off the routing key.
+                let state_slot = ctx
+                    .route
+                    .slots
+                    .iter()
+                    .map(String::as_str)
+                    .find(|s| matches!(*s, "planning" | "executing" | "complete"));
+                match state_slot {
+                    Some("executing") => Some(crate::config::ModelRef {
                         endpoint: "primary".into(),
                         model: "exec-model".into(),
                         reasoning_effort: None,
@@ -3392,7 +3407,7 @@ mod tests {
         impl ModelResolver for PinResolver {
             fn resolve(
                 &self,
-                _ctx: crate::model_resolver::ModelContext<'_>,
+                _ctx: crate::model_resolver::ModelContext,
             ) -> Option<crate::config::ModelRef> {
                 None
             }

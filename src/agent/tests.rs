@@ -10869,7 +10869,7 @@ async fn run_turn_uses_resolved_override_provider() {
 
     #[async_trait::async_trait]
     impl ModelResolver for CannedResolver {
-        fn resolve(&self, _ctx: ModelContext<'_>) -> Option<ModelRef> {
+        fn resolve(&self, _ctx: ModelContext) -> Option<ModelRef> {
             *self.called.lock().unwrap() = true;
             Some(ModelRef {
                 endpoint: "canned".into(),
@@ -10995,8 +10995,13 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
     }
     #[async_trait::async_trait]
     impl ModelResolver for SkillScopedResolver {
-        fn resolve(&self, ctx: ModelContext<'_>) -> Option<ModelRef> {
-            if ctx.skill_name == Some(self.skill) {
+        fn resolve(&self, ctx: ModelContext) -> Option<ModelRef> {
+            if ctx
+                .route
+                .slots
+                .iter()
+                .any(|s| s == &format!("skill:{}", self.skill))
+            {
                 *self.called.lock().unwrap() = true;
                 Some(ModelRef {
                     endpoint: "skill-ep".into(),
@@ -11194,8 +11199,13 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
     }
     #[async_trait::async_trait]
     impl ModelResolver for SkillScopedResolver {
-        fn resolve(&self, ctx: ModelContext<'_>) -> Option<ModelRef> {
-            if ctx.skill_name == Some(self.skill) {
+        fn resolve(&self, ctx: ModelContext) -> Option<ModelRef> {
+            if ctx
+                .route
+                .slots
+                .iter()
+                .any(|s| s == &format!("skill:{}", self.skill))
+            {
                 Some(ModelRef {
                     endpoint: "skill-ep".into(),
                     model: "skill-model".into(),
@@ -13541,7 +13551,7 @@ async fn mid_run_default_swap_never_overrides_a_forced_model() {
 
     #[async_trait::async_trait]
     impl ModelResolver for CannedResolver {
-        fn resolve(&self, _ctx: ModelContext<'_>) -> Option<ModelRef> {
+        fn resolve(&self, _ctx: ModelContext) -> Option<ModelRef> {
             None
         }
         fn build_turn_provider(
@@ -13720,7 +13730,7 @@ struct RoutingStubResolver {
 impl crate::model_resolver::ModelResolver for RoutingStubResolver {
     fn resolve(
         &self,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         None
     }
@@ -13732,7 +13742,7 @@ impl crate::model_resolver::ModelResolver for RoutingStubResolver {
     fn resolve_routed(
         &self,
         target: model_routing::RouteTarget,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
             model_routing::RouteTarget::Cheap => self.cheap.clone(),
@@ -14156,7 +14166,7 @@ struct LateTargetResolver {
 impl crate::model_resolver::ModelResolver for LateTargetResolver {
     fn resolve(
         &self,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         None
     }
@@ -14171,7 +14181,7 @@ impl crate::model_resolver::ModelResolver for LateTargetResolver {
     fn resolve_routed(
         &self,
         _target: model_routing::RouteTarget,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         // Call 1 = the turn-start resolution; later calls = the per-iteration
         // arm re-resolving after the target appeared mid-turn.
@@ -14470,7 +14480,7 @@ struct LaneStubResolver {
 impl crate::model_resolver::ModelResolver for LaneStubResolver {
     fn resolve(
         &self,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         None
     }
@@ -14482,7 +14492,7 @@ impl crate::model_resolver::ModelResolver for LaneStubResolver {
     fn resolve_routed(
         &self,
         target: model_routing::RouteTarget,
-        _ctx: crate::model_resolver::ModelContext<'_>,
+        _ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         match target {
             // The lane tests never configure the pre-prompt targets.
@@ -15044,7 +15054,7 @@ struct LaneUsageResolver {
 impl crate::model_resolver::ModelResolver for LaneUsageResolver {
     fn resolve(
         &self,
-        ctx: crate::model_resolver::ModelContext<'_>,
+        ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         self.inner.resolve(ctx)
     }
@@ -15056,7 +15066,7 @@ impl crate::model_resolver::ModelResolver for LaneUsageResolver {
     fn resolve_routed(
         &self,
         target: model_routing::RouteTarget,
-        ctx: crate::model_resolver::ModelContext<'_>,
+        ctx: crate::model_resolver::ModelContext,
     ) -> Option<crate::config::ModelRef> {
         self.inner.resolve_routed(target, ctx)
     }

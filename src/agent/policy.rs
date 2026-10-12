@@ -108,7 +108,7 @@ pub struct RoleSpec {
 /// skill name the resolver walks, then default. `WorkflowPolicy` emits exactly today's
 /// chain (the golden table test, 2a.0); `NoPolicy` emits `["free"]` →
 /// `[models.free]` (routing contract :241-246).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteKey {
     /// Ordered slot names, e.g. `["bug_fixing", "executing"]`.
     pub slots: Vec<String>,

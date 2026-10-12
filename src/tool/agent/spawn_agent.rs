@@ -1097,7 +1097,7 @@ mod tests {
     impl crate::model_resolver::ModelResolver for CannedResolver {
         fn resolve(
             &self,
-            _context: crate::model_resolver::ModelContext<'_>,
+            _context: crate::model_resolver::ModelContext,
         ) -> Option<crate::config::ModelRef> {
             None
         }
@@ -1260,7 +1260,7 @@ mod tests {
     /// depends on (model_resolver.rs): `resolve(Reviewing, is_subagent=false)`
     /// → the reviewing slot falling back to executing; `resolve(Reviewing,
     /// is_subagent=true)` → the subagent slot. Records every context it was
-    /// asked with as `(state == Reviewing, is_subagent)` — the pin must NOT
+    /// asked with as `(deliberate-slot, is_subagent)` — the pin must NOT
     /// consult the per-turn state chain anymore ([models.reviewing] is
     /// reviewer-spawn-only), so every pin test asserts `asked` stays EMPTY:
     /// `resolve` always returns None here, and a regressed pin would visibly
@@ -1314,12 +1314,17 @@ mod tests {
     impl crate::model_resolver::ModelResolver for StateResolver {
         fn resolve(
             &self,
-            context: crate::model_resolver::ModelContext<'_>,
+            context: crate::model_resolver::ModelContext,
         ) -> Option<crate::config::ModelRef> {
-            self.asked.lock().unwrap().push((
-                context.workflow_state == crate::workflow::WorkflowState::Reviewing,
-                context.is_subagent,
-            ));
+            // 2a.6: the workflow state is no longer on the ctx (the routing
+            // key carries Reviewing as the "executing" slot); the pin tests
+            // only assert `asked` stays EMPTY, never the flag values, so the
+            // first component records whether the ctx carried any deliberate
+            // (skill/subagent/bug_fixing) slot.
+            let deliberate = context.route.slots.iter().any(|s| {
+                s.starts_with("skill:") || s == "subagent" || s == "bug_fixing"
+            });
+            self.asked.lock().unwrap().push((deliberate, context.is_subagent));
             // The reviewer pin must NOT ride the per-turn state chain anymore
             // (decision 2026-12-06): [models.reviewing] is resolved solely by
             // resolve_reviewer_model below. Always return None here so a

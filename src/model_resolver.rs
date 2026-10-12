@@ -64,40 +64,75 @@ pub struct ModelInfo {
 /// (top-of-stack) plan — it engages the `[models.bug_fixing]` slot while the
 /// active plan is a bug-fixing plan in its active lifecycle (see
 /// [`ModelResolver::resolve`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelContext<'a> {
-    /// The current workflow state (Planning / Executing / Reviewing (which
-    /// resolves the executing slot — `[models.reviewing]` is
-    /// reviewer-spawn-only) / Complete / Skill).
-    pub workflow_state: WorkflowState,
-    /// The active skill's name, when the workflow is in the Skill state.
-    pub skill_name: Option<&'a str>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelContext {
+    /// The routing key: the ordered config slot names the resolver walks
+    /// (2a.6). Built by [`ModelContext::new`] via [`build_route_key`] from
+    /// the workflow state, the active skill, the active plan's kind and the
+    /// subagent flag — `WorkflowPolicy::route` emits exactly the same chain
+    /// (the routing contract, master-spec :241-246); `NoPolicy` emits
+    /// `["free"]` → `[models.free]` → default.
+    pub route: crate::agent::policy::RouteKey,
     /// Whether this agent is a subagent (spawned via `spawn_agent` or the UI
-    /// spawn button with a parent). Subagents get the `[models.subagent]`
-    /// override considered before the state override.
+    /// spawn button with a parent). Guards the `subagent` slot during the
+    /// walk.
     pub is_subagent: bool,
-    /// The kind of the active (top-of-stack) plan, if any. `Some(BugFixing)`
-    /// while a bug-fixing plan is executing (or reviewing) makes the resolver
-    /// consult `[models.bug_fixing]` before the state slot; `None` (no plan)
-    /// and `Some(Implementation)`/`Some(Research)` keep today's behavior.
-    pub plan_kind: Option<PlanKind>,
 }
 
-impl<'a> ModelContext<'a> {
-    /// Build a context from its parts.
+impl ModelContext {
+    /// Build a context from its parts (the signature every call site keeps —
+    /// the grep-count acceptance; the route key is derived from the parts via
+    /// [`build_route_key`]).
     pub fn new(
         workflow_state: WorkflowState,
-        skill_name: Option<&'a str>,
+        skill_name: Option<&str>,
         is_subagent: bool,
         plan_kind: Option<PlanKind>,
     ) -> Self {
         Self {
-            workflow_state,
-            skill_name,
+            route: build_route_key(workflow_state, skill_name, plan_kind, is_subagent),
             is_subagent,
-            plan_kind,
         }
     }
+}
+
+/// The turn's routing key: today's ordered slot chain, extracted (2a.6) so
+/// `WorkflowPolicy::route` can emit exactly the same list (the routing-table
+/// golden pins both). The order mirrors `ConfigModelResolver::resolve`'s
+/// pre-2a.6 arm order: the skill override, the subagent override, the
+/// bug-fixing plan-kind override, then the state slot. Reviewing resolves
+/// `executing` (`[models.reviewing]` is reviewer-spawn-only); Skill and
+/// Subagent carry NO state slot — their own arms or the default cover them.
+pub(crate) fn build_route_key(
+    workflow_state: WorkflowState,
+    skill_name: Option<&str>,
+    plan_kind: Option<PlanKind>,
+    is_subagent: bool,
+) -> crate::agent::policy::RouteKey {
+    let mut slots = Vec::new();
+    if let Some(name) = skill_name {
+        slots.push(format!("skill:{name}"));
+    }
+    if is_subagent {
+        slots.push("subagent".to_string());
+    }
+    if plan_kind == Some(PlanKind::BugFixing)
+        && matches!(
+            workflow_state,
+            WorkflowState::Executing | WorkflowState::Reviewing
+        )
+    {
+        slots.push("bug_fixing".to_string());
+    }
+    match workflow_state {
+        WorkflowState::Planning => slots.push("planning".to_string()),
+        WorkflowState::Executing | WorkflowState::Reviewing => {
+            slots.push("executing".to_string());
+        }
+        WorkflowState::Complete => slots.push("complete".to_string()),
+        WorkflowState::Skill | WorkflowState::Subagent => {}
+    }
+    crate::agent::policy::RouteKey { slots }
 }
 
 /// Resolves a per-context model override for a turn.
@@ -107,7 +142,7 @@ impl<'a> ModelContext<'a> {
 pub trait ModelResolver: Send + Sync {
     /// Resolve the model to use for the given turn context, or `None` to fall
     /// back to the main agent's default model.
-    fn resolve(&self, context: ModelContext<'_>) -> Option<ModelRef>;
+    fn resolve(&self, context: ModelContext) -> Option<ModelRef>;
 
     /// Resolve the model a spawned `role:"reviewer"` agent runs on.
     ///
@@ -139,7 +174,7 @@ pub trait ModelResolver: Send + Sync {
     fn resolve_routed(
         &self,
         _target: RouteTarget,
-        _context: ModelContext<'_>,
+        _context: ModelContext,
     ) -> Option<ModelRef> {
         None
     }
@@ -306,82 +341,49 @@ impl ConfigModelResolver {
 }
 
 impl ModelResolver for ConfigModelResolver {
-    fn resolve(&self, context: ModelContext<'_>) -> Option<ModelRef> {
+    fn resolve(&self, context: ModelContext) -> Option<ModelRef> {
         let config = self
             .config
             .read()
             .expect("ConfigModelResolver config lock poisoned");
         let models = &config.general.models;
 
-        // 1. Skill override (highest priority).
-        if let Some(name) = context.skill_name {
-            if let Some(m) = models.skill.get(name) {
-                if let Some(resolved) = config.resolve_model_ref(Some(m)) {
-                    return Some(resolved);
+        // Walk the routing key's slots in order (2a.6): each name maps to a
+        // config slot; the first slot whose model RESOLVES (set AND the
+        // endpoint still existing) wins; otherwise the walk continues — an
+        // unset entry or a dangling reference falls through exactly as the
+        // pre-2a.6 arms did. After the last slot: the default model. The
+        // state slot is always last in every key, so the old walk's tail
+        // (the state override or the default) is preserved.
+        for slot in &context.route.slots {
+            let candidate = if let Some(name) = slot.strip_prefix("skill:") {
+                match models.skill.get(name) {
+                    Some(m) => Some(m),
+                    // No config entry for this skill — fall through to the
+                    // next slot (the pre-2a.6 arm-1 behavior).
+                    None => continue,
                 }
-            }
-        }
-
-        // 2. Subagent override (only for subagents).
-        if context.is_subagent {
-            if let Some(resolved) = config.resolve_model_ref(models.subagent.as_ref()) {
+            } else {
+                match slot.as_str() {
+                    "subagent" => {
+                        if !context.is_subagent {
+                            continue;
+                        }
+                        models.subagent.as_ref()
+                    }
+                    "bug_fixing" => models.bug_fixing.as_ref(),
+                    "planning" => models.planning.as_ref(),
+                    "executing" => models.executing.as_ref(),
+                    "complete" => models.complete.as_ref(),
+                    "free" => models.free.as_ref(),
+                    _ => continue,
+                }
+            };
+            if let Some(resolved) = config.resolve_model_ref(candidate) {
                 return Some(resolved);
             }
         }
-
-        // 3. Bug-fixing plan-kind override (2027-01-07): while the ACTIVE
-        // (top-of-stack) plan's kind is bug_fixing and the workflow is in
-        // that plan's active lifecycle (Executing or Reviewing),
-        // [models.bug_fixing] wins over the state slot — a bug-fixing
-        // session can run on a max-reasoning model while implementation
-        // plans keep [models.executing]. The slot is validated as its own
-        // link: unset or dangling (endpoint deleted) falls through to the
-        // state chain below, which is exactly today's behavior. Deliberately
-        // NOT engaged in the Complete state (the plan is finished — the
-        // complete slot governs), for subagents (arm 2's role state), or
-        // while a skill is active (arm 1's deliberate context switch).
-        if context.plan_kind == Some(PlanKind::BugFixing)
-            && matches!(
-                context.workflow_state,
-                WorkflowState::Executing | WorkflowState::Reviewing
-            )
-        {
-            if let Some(resolved) = config.resolve_model_ref(models.bug_fixing.as_ref()) {
-                return Some(resolved);
-            }
-        }
-
-        // 4. Workflow-state override.
-        //
-        // Design decision: the Skill state has NO dedicated state-override
-        // field — it is covered exclusively by the skill-name lookup above.
-        // So while a skill is active, the executing/planning/complete
-        // overrides do NOT apply: if no skill override matched, the agent
-        // falls back to the DEFAULT model (not the underlying pre-skill
-        // state's override). This keeps skill runs on a single, predictable
-        // model (the skill's configured one, or the default) rather than
-        // silently switching mid-skill when the pre-skill state changes.
-        let state_model = match context.workflow_state {
-            WorkflowState::Planning => models.planning.as_ref(),
-            WorkflowState::Executing => models.executing.as_ref(),
-            // [models.reviewing] is reviewer-spawn-only (2026-12-06): the
-            // main agent does NOT switch models when it enters the Reviewing
-            // state — it keeps the executing model through the review
-            // closing sequence. The reviewing slot itself is consumed solely
-            // by resolve_reviewer_model (the spawn_agent reviewer pin).
-            WorkflowState::Reviewing => models.executing.as_ref(),
-            WorkflowState::Complete => models.complete.as_ref(),
-            WorkflowState::Skill => None,
-            // Subagent (2026-01-03): a parented sub-agent's role state, never
-            // a lifecycle phase — so NO lifecycle-state override applies. Its
-            // model is `[models.subagent]` (arm 2 above) or the DEFAULT model;
-            // it deliberately does NOT inherit the main plan's state model
-            // (previously a sub-agent spawned mid-Executing silently ran
-            // `models.executing` because its workflow mirrored the main
-            // plan's derived state — that mirroring is gone).
-            WorkflowState::Subagent => None,
-        };
-        config.resolve_model_ref(state_model)
+        config.resolve_model_ref(None)
     }
 
     fn resolve_reviewer_model(&self) -> Option<ModelRef> {
@@ -413,23 +415,18 @@ impl ModelResolver for ConfigModelResolver {
         config.resolve_model_ref(models.summarize.as_ref())
     }
 
-    fn resolve_routed(&self, target: RouteTarget, context: ModelContext<'_>) -> Option<ModelRef> {
+    fn resolve_routed(&self, target: RouteTarget, context: ModelContext) -> Option<ModelRef> {
         // Explicit pins beat a routing decision: a skill (a deliberate context
         // switch), a subagent (its own role slot), and the bug-fixing
-        // plan-kind slot all keep their model. This mirrors resolve()'s own
-        // priority order and is the single place the guard lives, so every
-        // caller gets it.
-        if context.skill_name.is_some() || context.workflow_state == WorkflowState::Skill {
-            return None;
-        }
-        if context.is_subagent || context.workflow_state == WorkflowState::Subagent {
-            return None;
-        }
-        if context.plan_kind == Some(PlanKind::BugFixing)
-            && matches!(
-                context.workflow_state,
-                WorkflowState::Executing | WorkflowState::Reviewing
-            )
+        // plan-kind slot all keep their model. Read off the routing key
+        // (2a.6): any skill/subagent/bug-fixing slot in the key means a
+        // deliberate context is engaged — refuse the routed target and let
+        // the caller keep the resolve() model.
+        if context
+            .route
+            .slots
+            .iter()
+            .any(|slot| slot.starts_with("skill:") || slot == "subagent" || slot == "bug_fixing")
         {
             return None;
         }
@@ -679,13 +676,13 @@ mod tests {
         }));
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         let cheap = r
-            .resolve_routed(RouteTarget::Cheap, ctx)
+            .resolve_routed(RouteTarget::Cheap, ctx.clone())
             .expect("cheap target");
         assert_eq!(cheap.endpoint, "deepseek");
         assert_eq!(cheap.model, "deepseek-v4-flash");
         assert_eq!(cheap.reasoning_effort.as_deref(), Some("minimal"));
         let capable = r
-            .resolve_routed(RouteTarget::Capable, ctx)
+            .resolve_routed(RouteTarget::Capable, ctx.clone())
             .expect("capable target");
         assert_eq!(capable.endpoint, "openai");
         assert_eq!(capable.model, "o3");
@@ -697,8 +694,8 @@ mod tests {
         let ctx = ModelContext::new(WorkflowState::Executing, None, false, None);
         // Unset: no routing config at all (the default config shape).
         let plain = resolver(config_with_endpoints(ModelsConfig::default()));
-        assert!(plain.resolve_routed(RouteTarget::Cheap, ctx).is_none());
-        assert!(plain.resolve_routed(RouteTarget::Capable, ctx).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Capable, ctx.clone()).is_none());
 
         // Dangling: the endpoint no longer exists -> today's model.
         let dangling = resolver(config_with_routing(RoutingConfig {
@@ -710,8 +707,8 @@ mod tests {
             capable: Some(capable_ref()),
             ..RoutingConfig::default()
         }));
-        assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx).is_none());
-        assert!(dangling.resolve_routed(RouteTarget::Capable, ctx).is_some());
+        assert!(dangling.resolve_routed(RouteTarget::Cheap, ctx.clone()).is_none());
+        assert!(dangling.resolve_routed(RouteTarget::Capable, ctx.clone()).is_some());
     }
 
     #[test]
@@ -731,15 +728,15 @@ mod tests {
             ..RoutingConfig::default()
         }));
         let medium = r
-            .resolve_routed(RouteTarget::Medium, ctx)
+            .resolve_routed(RouteTarget::Medium, ctx.clone())
             .expect("lane_medium target");
         assert_eq!(medium.endpoint, "deepseek");
         assert_eq!(medium.model, "medium-model");
         // An unset rung falls through without error: the caller keeps the
         // turn's configured model.
-        assert!(r.resolve_routed(RouteTarget::High, ctx).is_none());
+        assert!(r.resolve_routed(RouteTarget::High, ctx.clone()).is_none());
         let escalate = r
-            .resolve_routed(RouteTarget::Escalate, ctx)
+            .resolve_routed(RouteTarget::Escalate, ctx.clone())
             .expect("escalate target");
         assert_eq!(escalate.model, "top-model");
         assert_eq!(escalate.reasoning_effort.as_deref(), Some("max"));
@@ -754,14 +751,14 @@ mod tests {
             }),
             ..RoutingConfig::default()
         }));
-        assert!(dangling.resolve_routed(RouteTarget::Escalate, ctx).is_none());
+        assert!(dangling.resolve_routed(RouteTarget::Escalate, ctx.clone()).is_none());
 
         // Default config (routing flag off, so no classification happens and
         // `routing_policy()` returns None): every rung resolves to nothing.
         let plain = resolver(config_with_endpoints(ModelsConfig::default()));
-        assert!(plain.resolve_routed(RouteTarget::Medium, ctx).is_none());
-        assert!(plain.resolve_routed(RouteTarget::High, ctx).is_none());
-        assert!(plain.resolve_routed(RouteTarget::Escalate, ctx).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Medium, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::High, ctx.clone()).is_none());
+        assert!(plain.resolve_routed(RouteTarget::Escalate, ctx.clone()).is_none());
     }
 
     #[test]
@@ -852,9 +849,9 @@ mod tests {
             ModelContext::new(WorkflowState::Skill, Some("new_release"), false, None),
         ] {
             assert_eq!(
-                baseline.resolve(ctx),
+                baseline.resolve(ctx.clone()),
                 routed.resolve(ctx),
-                "routing must not touch resolve()"
+                "routing must not touch resolve()",
             );
         }
     }
@@ -876,6 +873,7 @@ mod tests {
             }
         };
         let models = || ModelsConfig {
+            free: None,
             planning: Some(m("m-planning")),
             executing: Some(m("m-executing")),
             bug_fixing: Some(m("m-bug-fixing")),

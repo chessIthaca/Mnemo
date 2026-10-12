@@ -24,12 +24,33 @@ use crate::workflow::{Workflow, WorkflowState};
 /// direct reads (acceptance :785-788).
 pub struct WorkflowPolicy {
     pub(crate) workflow: Arc<Mutex<Workflow>>,
+    /// The owning agent loop, attached by the factory once the loop is
+    /// final (Arc-wrapped) — 2a.6. Facts the Workflow doesn't carry (today:
+    /// the subagent flag) read through this back-ref; an empty Weak (before
+    /// the attach, or after the loop is dropped) reads as not-a-subagent,
+    /// matching the flag's default.
+    loop_ref: std::sync::OnceLock<std::sync::Weak<crate::agent::AgentLoop>>,
 }
 
 impl WorkflowPolicy {
-    /// Wrap the loop's workflow (factory build path, 2a.2).
+    /// Wrap the loop's workflow (factory build path, 2a.2). The factory
+    /// also calls [`WorkflowPolicy::attach_loop`] once the loop is Arc'd
+    /// (2a.6).
     pub fn new(workflow: Arc<Mutex<Workflow>>) -> Self {
-        Self { workflow }
+        Self {
+            workflow,
+            loop_ref: std::sync::OnceLock::new(),
+        }
+    }
+    /// Attach the owning agent loop (2a.6). Idempotent: the first attach
+    /// wins.
+    pub fn attach_loop(&self, loop_weak: std::sync::Weak<crate::agent::AgentLoop>) {
+        let _ = self.loop_ref.set(loop_weak);
+    }
+    /// The loop back-ref (2a.6): `None` until attached or after the loop
+    /// is dropped — read via `upgrade()`.
+    pub fn loop_ref(&self) -> Option<std::sync::Weak<crate::agent::AgentLoop>> {
+        self.loop_ref.get().cloned()
     }
     /// The workflow handle (kernel helpers occasionally need the state map
     /// during migration; shrinks as sites flip).
@@ -71,8 +92,31 @@ impl AgentPolicy for WorkflowPolicy {
         GateVerdict::Allow
     }
     async fn route(&self) -> RouteKey {
-        // 2a.6 delegates to today's slot-chain builder.
-        RouteKey { slots: vec![] }
+        // 2a.6: the policy emits today's slot chain — the same builder the
+        // kernel's compat constructor uses
+        // (crate::model_resolver::build_route_key), sourcing: the workflow
+        // state + the active plan's kind from its own workflow handle, the
+        // skill name from the workflow's active skill overlay, and the
+        // subagent flag from the loop back-ref (an unattached or dropped
+        // loop reads as not-a-subagent — the flag's default). NoPolicy's
+        // route() returns ["free"]; this emit keeps production loops on
+        // the state/subagent chain (the routing golden pins the outcome
+        // table); the kernel consult flip lands with the 2b/2c engine seam.
+        let route_key = {
+            let wf = self.workflow.lock().await;
+            let is_subagent = self
+                .loop_ref()
+                .and_then(|weak| weak.upgrade())
+                .map(|loop_| loop_.is_subagent())
+                .unwrap_or(false);
+            crate::model_resolver::build_route_key(
+                wf.state(),
+                wf.active_skill().map(|s| s.name.as_str()),
+                wf.active_plan_kind(),
+                is_subagent,
+            )
+        };
+        route_key
     }
     async fn on_prompt(&self, text: &str) -> PromptHook {
         // 2a.5: the unattended marker read moves here (the runtime arms

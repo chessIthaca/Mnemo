@@ -1034,11 +1034,22 @@ impl AgentLoopFactory {
         .with_plans_dir(plans_dir);
 
         // 2a.2: attach the workflow agent's policy — the app wrapper over
-        // this agent's own workflow (zero behavior: nothing consults it
-        // until 2a.3+; the kernel default is NoPolicy).
-        agent.set_policy(Arc::new(
+        // this agent's own workflow. Since 2a.3 the kernel consults it (the
+        // tool surface, the volatile tail, the prompt/turn-end hooks, and —
+        // 2a.6 — the routing key); the kernel default stays NoPolicy. The
+        // loop back-ref attaches at the build's tail once the loop is
+        // Arc'd.
+        let workflow_policy = Arc::new(
             crate::app::workflow_policy::WorkflowPolicy::new(agent.workflow_handle()),
-        ));
+        );
+        // The trait-object move is a canonical unsizing coercion; the
+        // concrete Arc stays alive for the tail's back-ref attach.
+        // (Arc::clone cannot infer through the dyn annotation — clone into
+        // a concrete-typed alias first, then coerce at the annotated move.)
+        let policy_concrete: Arc<crate::app::workflow_policy::WorkflowPolicy> =
+            Arc::clone(&workflow_policy);
+        let policy_dyn: Arc<dyn crate::agent::policy::AgentPolicy> = policy_concrete;
+        agent.set_policy(policy_dyn);
 
         if let Some(id) = agent_id {
             agent = agent.with_agent_id(id);
@@ -1133,7 +1144,11 @@ impl AgentLoopFactory {
         // None for test factories (the UI falls back).
         agent.set_default_display_effort(self.default_display_effort());
 
-        Arc::new(agent)
+        let agent = Arc::new(agent);
+        // 2a.6: attach the loop back-ref — the policy's subagent-slot source
+        // (idempotent OnceLock; the first attach wins).
+        workflow_policy.attach_loop(Arc::downgrade(&agent));
+        agent
     }
 
     /// Build a `ToolRegistry` wired to the given (per-agent) workflow, stamped

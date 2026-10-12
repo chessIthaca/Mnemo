@@ -436,6 +436,10 @@ export interface ModelsConfig {
   complete: ModelRefConfig | null;
   /** Model override for subagents (null = use default). */
   subagent: ModelRefConfig | null;
+  /** Model for a headless / policy-less agent loop ([models.free]): a
+   *  free-running agent resolves this slot, then the default (null = use
+   *  default). */
+  free: ModelRefConfig | null;
   /** Model for compaction summaries — the auto-compaction summary call and
    *  the run-all between-items compact (null = ride the turn's model). */
   summarize: ModelRefConfig | null;

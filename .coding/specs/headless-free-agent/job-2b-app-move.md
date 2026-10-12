@@ -160,3 +160,203 @@ crossed off and the drift documented in the commit message).
 - The review rounds to a terminal PASS per step; the finish gate
   fail-closes on FINDINGS.
 - The goldens gate every phase; the boundary test is add-only green.
+
+## Audit — the per-site records (2b.0; append-only)
+
+### A1. The kernel's workflow-field consumers (verified read 2027-01-11, tree d340acb)
+
+- `src/agent/loop_impl.rs:144` + `AgentLoopParams` `:783` — AgentLoop HOLDS
+  `Arc<tokio::sync::Mutex<Workflow>>` ("Each agent owns its own Workflow
+  (built by the AgentLoopFactory)", the doc :2397-2400). Every consumer
+  below flows from this field.
+- `loop_impl.rs:2401-03` `workflow_handle()` — the IPC-layer getter
+  (`get_workflow_state(agent_id)`), returning the Arc clone. 2b shape: the
+  handle moves app-side (the policy implements whatever the IPC needs —
+  the kernel stops returning the concrete type).
+- `loop_impl.rs:2440-47` `workflow_expects_progress(unattended: bool)` —
+  matches Executing|Reviewing || (unattended && Planning). ZERO live
+  callers since 2a.5 (the keeper doc :2419-25: "the state predicate moved
+  verbatim into WorkflowPolicy::on_turn_end (the auto-continue gate now
+  consults the policy); this fn has zero live callers"). → feeds DECISION
+  2: retire the fn or keep it reading a policy-supplied label; nothing
+  real depends on it.
+- `loop_impl.rs:2453-56` `workflow_state_label()` —
+  `format!("{:?}", wf.state())` — the Parked event's evidence label
+  (consumed by `runtime/channels.rs` per the doc :2450). 2b shape: the
+  policy supplies the label (a `current_state_label()` query returns a
+  String; the kernel never names the enum).
+- `src/agent/turn.rs:1390-95` `read_plan_scope()` — locks `self.workflow`
+  ("under ONE workflow lock", the doc :1390-94); feeds the budget gate +
+  the spend attribution; 2a.8 already flipped the CALLER to the policy
+  consult (the kernel fn stays as today's implementation the app-side
+  policy calls INTO via the workflow handle).
+- `src/agent/turn.rs:1920` — the finish-capture guard
+  `wf_state == WorkflowState::Complete && result.success` (the Complete-
+  plan capture; state VALUE comparison).
+- `loop_impl.rs:272` `pinned_state: Mutex<Option<WorkflowState>>` — the
+  STATE-SCOPED explicit picker pin (:1589-1634: stamped on first serve,
+  holds in its own state, cedes on a state change with a configured slot;
+  :2093-2106 `set_explicit_provider` clears the stamp on a fresh pick).
+  The model-picker needs the CURRENT state VALUE to scope pins → DECISION
+  3 overlap: a policy query returning an opaque state value can replace
+  the typed field.
+- `src/agent/dispatch.rs:29 → :143` — `denial_message(name: &str, state:
+  WorkflowState, verdict: ResearchWrite)` — a VALUE parameter rendering
+  state-dependent denial text; no field access.
+- `src/agent/factory.rs:90` — the `Workflow` import wiring AgentLoopParams;
+  `:86-88` imports `crate::tool::workflow::skill` tools (the boundary
+  token `tool::workflow` hits the KERNEL here — a real scan hit);
+  `:1776` sits inside the `#[cfg(test)]` module (test-scoped).
+- `factory.rs:686-98` `set_backlog`/`set_backlog_notifier` — the factory
+  holds `BacklogWiring{store: Arc<Mutex<BacklogStore>>, on_changed}`
+  (`:97`'s type from crate::backlog); called by the IPC layer
+  (src-tauri/src/main.rs:129). → DECISION 4 evidence: the wiring slot +
+  the two setters are exactly what the app-side policy factory absorbs.
+### A2. The prompt state-gating (verified read 2027-01-11; CENSUS CORRECTION)
+
+- Census correction: the cited ":1054-1108 (the STATE consts' state-
+  gating)" region is `crate::agent/prompt.rs`'s `#[cfg(test)] mod tests`
+  (starts :625 — the nudge tests :1048-1099). It is NOT production
+  state-gating. Production prompt.rs state-touch is FAR smaller than the
+  census implied. (The test module also imports
+  `crate::app::workflow_policy::workflow_section` :631 — boundary-hit
+  tokens in test code confirmed.)
+- `prompt.rs:434-436` `build_stable_head(&Constitution)` — STATE-FREE
+  (2a.4-complete: `assemble_stable_head(&KernelPromptBlocks::workflow(),
+  constitution)`); `kernel_prompt_blocks()` :443-452 hands the six
+  file-private consts to the policy. No workflow dependency.
+- `prompt.rs:475-509` `build_volatile_tail(caps, app_tail: &str, memories)`
+  — STATE-FREE: the workflow section rides in as the policy-assembled
+  `app_tail` string (the doc :454-461: "assembled by the agent's policy
+  (2a.4: WorkflowPolicy::volatile_tail wraps the same bytes the
+  kernel-side workflow_section produced pre-2a.4)").
+- `prompt.rs:522-535` `build_system_prompt(caps, workflow: &Workflow,
+  ...)` — the BACK-COMPAT wrapper (the doc :511-521: "tests and any
+  single-message caller"; production composes head+tail directly). It
+  imports `crate::app::workflow_policy::workflow_section` at :531 → the
+  BOUNDARY tokens `crate::app` + `&Workflow` both hit kernel sources.
+  2b shape: the wrapper MOVES under crate::app (it is a test
+  convenience; the app owns both the type and workflow_section).
+- `prompt.rs:384-398` `append_plan_nudge(tail, state: WorkflowState,
+  user_message)` — fires only on `WorkflowState::Complete` + a work-verb
+  message. The ONE production state VALUE dependency: turn.rs:3544-48
+  calls it with `self.workflow.lock().await.state()`. 2b shape: the nudge
+  (fn + looks_like_work_intent + PLAN_NUDGE_TEXT) moves under crate::app,
+  and turn.rs's call flips to a policy consult
+  (`policy.append_plan_nudge(&mut tail, latest_user_msg.as_deref())`) —
+  the policy reads its own workflow for the state; the kernel stops
+  touching the type (feeds DECISIONS 1 + 2).
+- Verdict for DECISION 1: the prompt seam is ALREADY policy-shaped
+  (2a.4); the remaining flips are the wrapper relocation + the nudge
+  consult. WorkflowState does not need to enter any kernel fn signature
+  after these two moves.
+### A3. The peripheral sites (verified read 2027-01-11; census corrections)
+
+- `src/model_resolver.rs:106-136` `build_route_key(workflow_state:
+  WorkflowState, skill_name, plan_kind, is_subagent) ->
+  crate::agent::policy::RouteKey` — the 2a.6 slot-walk extractor (skill →
+  subagent → bug_fixing → state slot), doc :100-101: "WorkflowPolicy::route
+  can emit exactly the same list (the routing-table golden pins both)". The
+  `:44` import `{PlanKind, WorkflowState}` feeds exactly this fn. 2b shape
+  (DECISION 3): build_route_key MOVES under crate::app (the policy's route
+  delegate owns it); the kernel's `ModelContext::new` compat ctor stops
+  building route keys from typed state (2a.6 already made it accept the
+  prebuilt RouteKey); `RouteKey` itself stays kernel-side (it lives in
+  crate::agent::policy — the policy's type).
+- `src/runtime/turn_resolve.rs` — production WorkflowState uses are VALUE
+  params of the transition bookkeeping (`workflow_transition_counts(from:
+  Option<WorkflowState>, to: WorkflowState)` feeding TurnResolveLatch);
+  tests :464-477. Run-All/auto-feed bookkeeping consumes state values
+  (DECISION 6 family).
+- `src/runtime/channels.rs:24, :262-263, :592-593, :843-844` —
+  `AgentEvent::WorkflowStateChanged { state: WorkflowState, top_plan_id }`
+  — the IPC EVENT WIRE TYPE carries the state VALUE end-to-end (the
+  serialization shim :843-844 forwards it; its Serializable twin :592-593).
+  2b shape: the event carries an opaque representation (a String label or
+  u8 tag), the app maps its enum into it (DECISION 6 family).
+- Census correction — `src/runtime/agent.rs`: the PRODUCTION import block
+  (:11-24) carries NO workflow dependency (failure_triage, AgentLoop,
+  consolidation, provider, channels, correction only). BOTH census hits
+  (:1497, :3138) are `#[cfg(test)]`-module (the mock harness imports +
+  a :3130-41 test fixture's `create_plan_with_kind`). The auto-continue
+  gate reads ONLY AgentLoop accessors — production-clean already.
+- Census correction — `src/host/runtime.rs`: ALL hits (:751, :795,
+  :809-813) sit inside `#[cfg(test)]` (the `parent_in_state` test harness
+  :793+ driving AgentLoop into states). Production host/runtime.rs has NO
+  workflow import — 2a.7's consult flipped the last production read.
+- `src/memory/indexer/plans.rs:11` `use crate::workflow::PlanFile` —
+  PRODUCTION: the indexer parses `.coding/plans/*.md` through PlanFile
+  (`scan_plans(dir, out, errors, config)`, :15-21).
+- `src/memory/finish_capture.rs:46` `use crate::workflow::{PlanFile,
+  PlanKind}` — PRODUCTION: the finish-capture digests read the completed
+  plan file and test `PlanKind::BugFixing` for the BUG digest (:59-63).
+- DECISION 5 evidence: the memory module (kernel-adjacent) depends on the
+  plan-file FORMAT parser + one PlanKind VALUE test. Both usage shapes are
+  parse-and-classify (no workflow SEMANTICS). Recorded inversion shapes:
+  (a) the plan-file format parsing relocates kernel-side (a neutral
+  parser module, e.g. crate::memory::indexer's own plan_format or a
+  kernel-side crate::plan_parse), with the app's workflow/plan_file.rs
+  keeping plan semantics and delegating serialization; (b) a source-record
+  trait the app implements. Final pick at 2b.1 planning; both keep the
+  boundary tokens out of kernel sources.
+### The decisions — resolved (2b.0, 2027-01-11; evidence: A1-A3)
+
+1. **WorkflowState ownership** — WorkflowState/PlanKind are APP types (U7).
+   After 2b.3 the kernel names them NOWHERE: no typed fields, params, or
+   fns. State flows reach the kernel only as (a) policy consults (the
+   2a.5/2a.7/2a.8 pattern), or (b) opaque representations (String label /
+   u8 tag on the wire events + the transition bookkeeping) mapped by the
+   app at the emit sites.
+2. **The kernel field removal path** — AgentLoop's `workflow: Arc<Mutex<Workflow>>`
+   (:144) + the AgentLoopParams mirror (:783) LEAVE the kernel. Consumers:
+   `workflow_expects_progress` (zero live callers since 2a.5, A1) → RETIRE
+   at 2b.3; `workflow_state_label` + `read_plan_scope` + :1920's
+   Complete-and-success capture guard + the nudge read (:3546) → policy
+   consults; `workflow_handle()` (the IPC getter) → the app factory/policy
+   implements what the IPC needs. Which side holds the Arc<Mutex<Workflow>>
+   post-move is 2b.3's mechanical detail (probed then; today WorkflowPolicy
+   reaches the workflow via the loop back-ref).
+3. **Route-key placement** — `build_route_key` moves under crate::app (the
+   policy's route delegate owns it; the routing-table golden travels with
+   it). The kernel's `ModelContext::new` compat ctor stops building typed
+   route keys (2a.6 already made it accept the prebuilt key). `RouteKey`
+   STAYS kernel-side — it lives in crate::agent::policy (the policy's own
+   type; the routing-table golden pins parity both sides). The
+   `pinned_state` stamp (:272) consults the policy for the state value it
+   scopes pins by.
+4. **The tool/workflow relocation** — the five modules (ask_user, backlog,
+   plan, skill, mod) move under crate::app; the kernel's imports flip to
+   D5's register pattern: the app-side policy factory attaches the app
+   tools post-construction (WorkflowPolicy::register_tools has been a
+   deliberate no-op since 2a.1 — 2b.2/2b.3 gives it its real body or moves
+   the wiring to the policy factory impl). `set_backlog`/
+   `set_backlog_notifier` (:686-98) leave the kernel factory for the app's
+   policy factory; src-tauri/src/main.rs:129's IPC call re-targets it.
+5. **The memory module's plan-file reads** — indexer/plans.rs (:11) and
+   finish_capture.rs (:46) consume the plan-file FORMAT parse-only. Audit
+   recommendation (final pick at 2b.1 planning): the plan-file format
+   parsing relocates kernel-side as a neutral parser; the app's
+   workflow/plan_file.rs keeps plan semantics and delegates serialization.
+   Alternative: a source-record trait the app implements. Either keeps
+   boundary tokens out of kernel sources.
+6. **The auto-continue split + the boundary test's test-code treatment** —
+   the split already holds post-2a.5 (the gate consults on_turn_end; the
+   kernel keeps budget/count mechanics; runtime/agent.rs production is
+   workflow-type-free per A3). Remaining kernel state-value consumers
+   (turn_resolve's transition counts, channels' WorkflowStateChanged wire
+   field) receive the opaque representation. Boundary test: the scan
+   EXCLUDES #[cfg(test)] module contents (balanced-close strip before
+   token-scanning); tokens stay exactly master-spec :255-258's list
+   (`crate::workflow`, `crate::backlog`, `crate::skill`, `crate::app`,
+   `tool::workflow`); the scanner reads CARGO_MANIFEST_DIR/src at test
+   time; the test's home is decided at 2b.3.
+
+Census corrections carried: host/runtime.rs and runtime/agent.rs are
+production-clean (test-only hits); prompt.rs's :1054-1108 was test code
+(A2). The remaining PRODUCTION kernel sites = loop_impl (field, pinned
+stamp, handle, label, keeper), turn.rs (read_plan_scope, :1920, :3546,
+:50), dispatch.rs (:29→:143), model_resolver.rs (:44+build_route_key),
+runtime/{turn_resolve, channels}, memory/{indexer/plans, finish_capture},
+factory.rs (:86-88 tool::workflow tools, :90, :686-98), tool/mod.rs (:31
++ the opens), skill/mod.rs (:31), tool/agent/spawn_agent.rs (:38),
+prompt.rs (the :531 app import + the wrapper).

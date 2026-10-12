@@ -45,6 +45,7 @@ pub mod failure_triage;
 pub mod failure_triage_knn;
 pub mod model_routing;
 pub mod prompt;
+pub mod policy;
 pub mod reflex;
 pub mod review_scope;
 pub mod steering_stats;

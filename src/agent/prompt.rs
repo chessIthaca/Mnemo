@@ -11,6 +11,7 @@
 //! prompt, re-read from disk each turn. The workflow section tells the model
 //! where it is — especially after a restart.
 
+use crate::agent::policy::{assemble_stable_head, KernelPromptBlocks};
 use crate::memory::{Memory, ScoredMemory};
 use crate::project::Constitution;
 use crate::provider::Capabilities;
@@ -480,13 +481,6 @@ pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ign
 
 /// Append a section to the head, skipping empty ones (mirrors how the
 /// constitution sections are skipped).
-fn push_section(out: &mut String, text: &str) {
-    if !text.trim().is_empty() {
-        out.push_str(text);
-        out.push_str("\n\n");
-    }
-}
-
 /// Build the **stable head** of the system prompt: the six compiled prompt
 /// blocks + the global + project constitution.
 ///
@@ -503,28 +497,23 @@ fn push_section(out: &mut String, text: &str) {
 /// conversation: measured 2026-09-14, 5.1-9.0% cache hit and 115-120K tokens
 /// re-billed per `complete_step`.
 pub fn build_stable_head(constitution: &Constitution) -> String {
-    let mut prompt = String::new();
+    assemble_stable_head(&KernelPromptBlocks::workflow(), constitution)
+}
 
-    push_section(&mut prompt, CODING_SYSTEM_PREAMBLE);
-    push_section(&mut prompt, WORKFLOW_LIFECYCLE);
-    push_section(&mut prompt, APP_RULES);
-    push_section(&mut prompt, TOOL_CALL_DISCIPLINE);
-    push_section(&mut prompt, TOOL_STRATEGY);
-    push_section(&mut prompt, MEMORY_RECORDS);
-
-    // Constitution — global first, then project.
-    if !constitution.global.trim().is_empty() {
-        prompt.push_str("# HARD RULES — GLOBAL (agent.md)\n\n");
-        prompt.push_str(&constitution.global);
-        prompt.push_str("\n\n");
+/// The six compiled blocks as the policy's `KernelPromptBlocks` (2a.1):
+/// the app wrapper's WorkflowPolicy supplies exactly this set, so
+/// `stable_head` stays byte-identical (cache contract :237-240). Lives
+/// beside the consts (they are file-private here) instead of widening
+/// them to pub(crate) — E0603's minimal fix.
+pub fn kernel_prompt_blocks() -> KernelPromptBlocks {
+    KernelPromptBlocks {
+        preamble: CODING_SYSTEM_PREAMBLE,
+        lifecycle: WORKFLOW_LIFECYCLE,
+        rules: APP_RULES,
+        discipline: TOOL_CALL_DISCIPLINE,
+        strategy: TOOL_STRATEGY,
+        memory_records: MEMORY_RECORDS,
     }
-    if !constitution.project.trim().is_empty() {
-        prompt.push_str("# HARD RULES — PROJECT (agent.md)\n\n");
-        prompt.push_str(&constitution.project);
-        prompt.push_str("\n\n");
-    }
-
-    prompt
 }
 
 /// Build the **volatile tail** of the system prompt: the recalled-memories

@@ -2419,21 +2419,22 @@ impl AgentLoop {
     /// Whether the workflow is in a state where the plan loop expects the
     /// agent to keep making progress — Executing (an in-progress plan with
     /// steps still to complete) or Reviewing (the closing sequence: review →
-    /// fix → commit → finish). Used by the auto-continue logic in
-    /// `run_turn_with_retry` to decide whether to push a synthetic "continue"
-    /// message after a normal turn end (Finish::Stop) instead of parking for
-    /// user input. Reviewing must self-resume too: a turn that ends
-    /// mid-closing-sequence there used to park until the user typed "c"
-    /// (observed live 2026-12-31, twice — the agent stalled after a garbled
-    /// tool result and waited for a manual nudge). Planning additionally
-    /// expects progress when `unattended` is true (a run-all dispatched
-    /// agent — its Prompt embedded the unattended preamble): a premature
-    /// turn end mid-exploration would otherwise park with nobody watching
-    /// and halt the whole run (backlog a6a7727a, live 2027-01-07).
-    /// Interactive Planning still parks — a deliberate turn end there is
-    /// usually a question-wait for the user, and a synthetic continue
-    /// would self-answer it. Any other state (Complete, Skill, Subagent)
-    /// is terminal/overlay/role — no synthetic turns there. Subagent in
+    /// fix → commit → finish). Keeper for kernel diagnostics since 2a.5:
+    /// the state predicate moved verbatim into WorkflowPolicy::on_turn_end
+    /// (the auto-continue gate now consults the policy), so this fn has
+    /// zero live callers; the semantics records below stay accurate.
+    /// Reviewing must self-resume too: a turn that ends mid-closing-sequence
+    /// used to park until the user typed "c" (observed live 2026-12-31,
+    /// twice — the agent stalled after a garbled tool result and waited
+    /// for a manual nudge). Planning additionally expects progress when
+    /// `unattended` is true (a run-all dispatched agent — its Prompt
+    /// embedded the unattended preamble): a premature turn end
+    /// mid-exploration would otherwise park with nobody watching and halt
+    /// the whole run (backlog a6a7727a, live 2027-01-07). Interactive
+    /// Planning still parks — a deliberate turn end there is usually a
+    /// question-wait for the user, and a synthetic continue would
+    /// self-answer it. Any other state (Complete, Skill, Subagent) is
+    /// terminal/overlay/role — no synthetic turns there. Subagent in
     /// particular is a parented sub-agent's role state, never a
     /// plan-lifecycle phase, so it can never expect progress on its own.
     pub async fn workflow_expects_progress(&self, unattended: bool) -> bool {

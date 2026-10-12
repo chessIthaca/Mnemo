@@ -36,7 +36,7 @@ impl ToolSurface {
 }
 
 /// Per-call veto beyond the filter (master-spec :215-217): the plan-mutation
-/// gate and the research write verdict move into `WorkflowPolicy` in 2a.3.
+/// gate and the research write verdict move into `WorkflowPolicy` in 2b/2c.
 /// Default: [`GateVerdict::Allow`].
 #[derive(Debug, Clone)]
 pub enum GateVerdict {

@@ -51,10 +51,21 @@ impl AgentPolicy for WorkflowPolicy {
         String::new()
     }
     async fn tool_surface(&self) -> ToolSurface {
-        // 2a.3 delegates to the workflow's allowed_tools (today's filter).
-        ToolSurface::constant()
+        // 2a.3: the real delegate — one lock, both filters, exactly today's
+        // reads. advertise is the plan-frozen schema filter (byte-stable
+        // while a plan is active — turn.rs :553-564's advertisement); gate
+        // is the per-state enforcement filter (dispatch.rs :253).
+        let wf = self.workflow.lock().await;
+        ToolSurface {
+            advertise: Some(wf.schema_filter()),
+            gate: Some(wf.allowed_tools()),
+        }
     }
     async fn gate_call(&self, _name: &str, _args: &Value) -> GateVerdict {
+        // 2a: Allow — the surface filter above does all of today's
+        // enforcement work; the plan-mutation gate and the research-write
+        // verdict keep their tool-side homes in dispatch.rs until 2b/2c
+        // (master-spec :215-216).
         GateVerdict::Allow
     }
     async fn route(&self) -> RouteKey {

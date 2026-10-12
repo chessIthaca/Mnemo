@@ -563,8 +563,14 @@ impl AgentLoop {
             // finish during Executing) are still rejected — advertisement is
             // frozen, enforcement is not.
             let tool_filter = {
-                let wf = self.workflow.lock().await;
-                wf.schema_filter()
+                // 2a.3: the advertisement consult — the policy owns the
+                // plan-frozen schema filter (byte-stable advertisement);
+                // NoPolicy falls back to the raw read.
+                let surface = self.policy.tool_surface().await;
+                match surface.advertise {
+                    Some(f) => f,
+                    None => self.workflow.lock().await.schema_filter(),
+                }
             };
             // Build the tool schemas (filtered by workflow state).
             let mut tool_schemas = self.tools.schemas(provider.capabilities(), &tool_filter);

@@ -249,8 +249,14 @@ impl AgentLoop {
         let safety = tool.safety();
         let category = tool.category();
         {
-            let wf = self.workflow.lock().await;
-            let filter = wf.allowed_tools();
+            // 2a.3: the gate consult — the policy owns the enforcement
+            // filter (WorkflowPolicy wraps the workflow's allowed_tools();
+            // NoPolicy falls back to the raw read).
+            let surface = self.policy.tool_surface().await;
+            let filter = match surface.gate {
+                Some(f) => f,
+                None => self.workflow.lock().await.allowed_tools(),
+            };
             // The one carve-out: a RESEARCH plan may still write its own
             // artifacts under `.coding/**` with the file tools. The verdict is
             // computed once — it also picks the denial text below.
@@ -263,7 +269,11 @@ impl AgentLoop {
                 && research_write != ResearchWrite::Artifact
             {
                 return (
-                    ToolResult::error(denial_message(&tc.name, wf.state(), research_write)),
+                    ToolResult::error(denial_message(
+                        &tc.name,
+                        self.workflow.lock().await.state(),
+                        research_write,
+                    )),
                     Vec::new(),
                 );
             }

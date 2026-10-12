@@ -482,13 +482,9 @@ pub fn build_volatile_tail(
     // Recalled memories (auto-recalled based on the user's prompt).
     if let Some(mem) = memories {
         if !mem.trim().is_empty() {
-            prompt.push_str("# RECALLED MEMORIES
-
-");
+            prompt.push_str("# RECALLED MEMORIES\n\n");
             prompt.push_str(mem);
-            prompt.push_str("
-
-");
+            prompt.push_str("\n\n");
         }
     }
 
@@ -497,21 +493,15 @@ pub fn build_volatile_tail(
 
     // Capability notes (the kernel keeps CAPABILITIES per the step file
     // :639; same bytes workflow_section emitted pre-2a.4).
-    prompt.push_str("
-# CAPABILITIES
-
-");
+    prompt.push_str("\n# CAPABILITIES\n\n");
     if caps.supports_tool_choice {
-        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).
-");
+        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).\n");
     } else {
-        prompt.push_str("- Tool choice: not supported. Choose tools freely.
-");
+        prompt.push_str("- Tool choice: not supported. Choose tools freely.\n");
     }
     if !caps.reliable_finish_reason {
         prompt.push_str(
-            "- Finish reason may be unreliable; tool calls are detected by their presence.
-",
+            "- Finish reason may be unreliable; tool calls are detected by their presence.\n",
         );
     }
 

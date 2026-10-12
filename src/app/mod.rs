@@ -6,7 +6,8 @@
 //!
 //! The TUI's `AppState` / `TranscriptEntry` / `handle_agent_event` types were
 //! removed when we swapped to Tauri. The frontend manages its own state via
-//! Zustand. Only the panic hook remains here.
+//! Zustand. Only the panic hook remains from that era — this module also
+//! hosts the kernel-policy wrapper (below).
 
 //! The app-side kernel-policy implementation (wrapper): [`workflow_policy`].
 //! Added in 2a; job 2b moves the full app module graph under `mnemo::app`.

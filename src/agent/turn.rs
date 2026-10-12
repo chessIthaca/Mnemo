@@ -484,7 +484,19 @@ impl AgentLoop {
             // are written regardless of the budget flag — it gates only the
             // caps), and the failed-cycle marker says this iteration's
             // request IS the retry.
-            let plan_scope = self.read_plan_scope().await;
+            // 2a.8: the live plan scope consults the agent's policy —
+            // WorkflowPolicy::spend_tags reads the SAME two workflow fields
+            // read_plan_scope assembled (the row's plan_id/step_index are
+            // unchanged); NoPolicy returns the default (empty) tags,
+            // indistinguishable from no-plan-live, so the kernel falls back
+            // to its own read — byte-identical rows for policy and
+            // no-policy loops.
+            let plan_scope = match self.policy().spend_tags().await {
+                tags if tags.plan_id.is_some() => {
+                    Some((tags.plan_id.expect("checked above"), tags.step_index))
+                }
+                _ => self.read_plan_scope().await,
+            };
             let retry_pending = self.take_pending_lane_retry();
             // The deterministic budget gate: when a cap is reached, PAUSE the
             // plan through a pending question — never a hard kill (the plan
@@ -2207,6 +2219,14 @@ impl AgentLoop {
                     }
                 }
             }
+
+            // 2a.8: the policy's per-tool hook — one consult per executed
+            // tool call, the attempt-final result (an auto-retry replaces
+            // the failed first attempt in `result` right above, so the
+            // hook sees exactly what the model sees). NoPolicy's hook is a
+            // no-op; WorkflowPolicy's is a documented no-op until the
+            // 2b/2c engine seam — the advisory seam, master-spec :223.
+            self.policy().after_tool(&tc.name, &result).await;
 
             // Merge the per-tool-call stop signal (Interrupt/Cancel from
             // approval or ask_user) into the turn-level stop_reason.

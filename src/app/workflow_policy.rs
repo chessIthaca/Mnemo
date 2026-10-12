@@ -150,12 +150,29 @@ impl AgentPolicy for WorkflowPolicy {
         }
     }
     async fn spend_tags(&self) -> SpendTags {
-        SpendTags::default()
+        // 2a.8: the plan/step tags read off the workflow — the same two
+        // fields turn.rs::read_plan_scope assembled (the active plan id +
+        // the current step's index); the spend-row shape is unchanged, and
+        // the kernel's empty-tag fallback keeps NoPolicy-era loops on the
+        // kernel's own read.
+        let wf = self.workflow.lock().await;
+        SpendTags {
+            plan_id: wf.plan_id().map(str::to_string),
+            step_index: wf.current_step().map(|s| s.index),
+        }
     }
     fn spawn_roles(&self) -> &[RoleSpec] {
         &[]
     }
-    async fn on_session_end(&self) {}
+    async fn on_session_end(&self) {
+        // 2a.8: the hook exists for the seam (master-spec :230) and the
+        // runtime's spawn_consolidation consults it before the memory
+        // session teardown. The consolidation itself stays kernel-side in
+        // 2a (end_session + consolidate_session in the runtime task); the
+        // Workflow carries nothing session-shaped to flush at end, so the
+        // delegate is a documented no-op — the 2b/2c engine seam owns real
+        // session-end work.
+    }
 }
 
 // ---------------------------------------------------------------------------

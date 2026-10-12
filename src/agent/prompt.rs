@@ -454,10 +454,11 @@ pub fn kernel_prompt_blocks() -> KernelPromptBlocks {
 /// Build the **volatile tail** of the system prompt: the recalled-memories
 /// block (when present) + the workflow-state section.
 ///
-/// The workflow section's static per-state guidance comes from the compiled
-/// STATE_* consts; the dynamic lines — CURRENT PLAN / GOAL / PROGRESS /
-/// CURRENT STEP, the skill goal, the sub-agent notes, CAPABILITIES — are
-/// interpolated from live workflow state.
+/// The workflow section rides in via `app_tail: &str` — assembled by the
+/// agent's policy (2a.4: WorkflowPolicy::volatile_tail wraps the same bytes
+/// the kernel-side workflow_section produced pre-2a.4; CAPABILITIES stays
+/// kernel-side per the step file :639). This fn owns the recalled-memories
+/// block and the caps-driven CAPABILITIES block.
 ///
 /// This changes per step/turn (PROGRESS bumps, CURRENT STEP text, recall
 /// results). Production (`turn.rs`) appends it AFTER the conversation history,
@@ -481,9 +482,13 @@ pub fn build_volatile_tail(
     // Recalled memories (auto-recalled based on the user's prompt).
     if let Some(mem) = memories {
         if !mem.trim().is_empty() {
-            prompt.push_str("# RECALLED MEMORIES\\n\\n");
+            prompt.push_str("# RECALLED MEMORIES
+
+");
             prompt.push_str(mem);
-            prompt.push_str("\\n\\n");
+            prompt.push_str("
+
+");
         }
     }
 
@@ -492,15 +497,21 @@ pub fn build_volatile_tail(
 
     // Capability notes (the kernel keeps CAPABILITIES per the step file
     // :639; same bytes workflow_section emitted pre-2a.4).
-    prompt.push_str("# CAPABILITIES\\n\\n");
+    prompt.push_str("
+# CAPABILITIES
+
+");
     if caps.supports_tool_choice {
-        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).\\n");
+        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).
+");
     } else {
-        prompt.push_str("- Tool choice: not supported. Choose tools freely.\\n");
+        prompt.push_str("- Tool choice: not supported. Choose tools freely.
+");
     }
     if !caps.reliable_finish_reason {
         prompt.push_str(
-            "- Finish reason may be unreliable; tool calls are detected by their presence.\\n",
+            "- Finish reason may be unreliable; tool calls are detected by their presence.
+",
         );
     }
 
@@ -512,8 +523,9 @@ pub fn build_volatile_tail(
 ///
 /// This is a back-compat wrapper: tests and any single-message caller use it
 /// to get the same string the old monolithic builder produced. Production
-/// (`turn.rs`) calls [`build_stable_head`] and [`build_volatile_tail`]
-/// separately so the head can live in `messages[0]` (cache-stable), the tail
+/// (`turn.rs`) consults the agent's policy for the head (the constitution
+/// holder's `policy.stable_head`, 2a.4) and composes the tail via
+/// [`build_volatile_tail`] so the head can live in `messages[0]` (cache-stable), the tail
 /// can be appended after the conversation history (cache-immune), and
 /// [`CONTEXT_FOOTER`] can be appended as the final message after the tail
 /// (cache-stable sentinel — this wrapper deliberately does NOT include it).
@@ -659,6 +671,25 @@ mod tests {
         assert!(
             wfs < caps_pos,
             "the workflow section must precede capabilities"
+        );
+        // 2a.4 round-1 regression (HIGH): the separator bytes are pinned
+        // too — real newlines + the blank-line separator between the
+        // workflow section and CAPABILITIES. The doubling slipped INSIDE
+        // the re-signed string literals, invisible to find()-based order
+        // checks and every newline-free content assertion.
+        assert!(
+            tail.contains("# RECALLED MEMORIES\n\n"),
+            "memories header needs its real newline + blank line"
+        );
+        assert!(
+            tail.contains(
+                "\n\n# CAPABILITIES\n\n- Tool choice: supported (you may be directed to call specific tools).\n"
+            ),
+            "capabilities block needs the blank-line separator + real newlines"
+        );
+        assert!(
+            !tail.contains("\\n"),
+            "the tail must contain real newlines, not literal backslash-n text"
         );
     }
 

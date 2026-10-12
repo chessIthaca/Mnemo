@@ -483,6 +483,10 @@ impl ConstitutionHolder {
     /// so caching it avoids a few-KB string concatenation every turn. For
     /// `Static` (tests), the head is rebuilt every call (tests don't need the
     /// cache and value the simplicity).
+    ///
+    /// `policy` supplies the kernel prompt blocks (2a.4): both `NoPolicy`
+    /// and the factory-attached `WorkflowPolicy` produce today's bytes
+    /// (`assemble_stable_head(&KernelPromptBlocks::workflow(), …)`).
     pub(crate) fn stable_head(&self, policy: &dyn crate::agent::policy::AgentPolicy) -> String {
         match self {
             ConstitutionHolder::Source {

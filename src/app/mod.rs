@@ -8,6 +8,11 @@
 //! removed when we swapped to Tauri. The frontend manages its own state via
 //! Zustand. Only the panic hook remains here.
 
+//! The app-side kernel-policy implementation (wrapper): [`workflow_policy`].
+//! Added in 2a; job 2b moves the full app module graph under `mnemo::app`.
+
+pub mod workflow_policy;
+
 /// Install a panic hook that prints the panic before the process exits.
 /// (The Tauri webview doesn't need terminal restoration, but we keep a
 /// hook so panics in the brain surface cleanly.)

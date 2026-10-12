@@ -1033,6 +1033,13 @@ impl AgentLoopFactory {
         // per-build override (main dir or per-agent dir).
         .with_plans_dir(plans_dir);
 
+        // 2a.2: attach the workflow agent's policy — the app wrapper over
+        // this agent's own workflow (zero behavior: nothing consults it
+        // until 2a.3+; the kernel default is NoPolicy).
+        agent.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent.workflow_handle()),
+        ));
+
         if let Some(id) = agent_id {
             agent = agent.with_agent_id(id);
         }

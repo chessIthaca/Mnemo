@@ -454,6 +454,11 @@ pub struct AgentLoop {
     /// that writes the row; overwritten each iteration, so a request that
     /// never reports usage cannot mis-attribute the next one.
     pub(crate) spend_attribution: std::sync::Mutex<Option<budget::SpendAttribution>>,
+    /// The kernel→app policy seam (2a.2): the free agent by default
+    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)); the factory attaches
+    /// [`WorkflowPolicy`](crate::app::workflow_policy::WorkflowPolicy) for
+    /// the workflow agent. Nothing consults it until 2a.3+.
+    pub(crate) policy: Arc<dyn crate::agent::policy::AgentPolicy>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -873,6 +878,7 @@ impl AgentLoop {
             plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
             pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
             spend_attribution: std::sync::Mutex::new(None),
+            policy: Arc::new(crate::agent::policy::NoPolicy),
         }
     }
 
@@ -2385,6 +2391,20 @@ impl AgentLoop {
     /// this is per-agent, not shared.
     pub fn workflow_handle(&self) -> Arc<tokio::sync::Mutex<crate::workflow::Workflow>> {
         Arc::clone(&self.workflow)
+    }
+
+    /// The agent's policy handle (2a.2) — the free agent
+    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)) by default; the
+    /// factory attaches the workflow agent's
+    /// [`WorkflowPolicy`](crate::app::workflow_policy::WorkflowPolicy).
+    pub fn policy(&self) -> Arc<dyn crate::agent::policy::AgentPolicy> {
+        Arc::clone(&self.policy)
+    }
+
+    /// Attach (or replace) the agent's policy — used by the factory at
+    /// build time (2a.2) and later by the engine/session builders (3a).
+    pub fn set_policy(&mut self, policy: Arc<dyn crate::agent::policy::AgentPolicy>) {
+        self.policy = policy;
     }
 
     /// Whether the workflow is in a state where the plan loop expects the

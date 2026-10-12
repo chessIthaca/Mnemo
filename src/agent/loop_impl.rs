@@ -483,7 +483,7 @@ impl ConstitutionHolder {
     /// so caching it avoids a few-KB string concatenation every turn. For
     /// `Static` (tests), the head is rebuilt every call (tests don't need the
     /// cache and value the simplicity).
-    pub(crate) fn stable_head(&self) -> String {
+    pub(crate) fn stable_head(&self, policy: &dyn crate::agent::policy::AgentPolicy) -> String {
         match self {
             ConstitutionHolder::Source {
                 source,
@@ -493,7 +493,10 @@ impl ConstitutionHolder {
                 let changed = src.reload_if_changed();
                 let mut cache = cached_head.lock().expect("head cache lock poisoned");
                 if changed || cache.is_none() {
-                    let head = super::prompt::build_stable_head(src.constitution());
+                    let head = policy.stable_head(
+                        &super::policy::KernelPromptBlocks::workflow(),
+                        src.constitution(),
+                    );
                     *cache = Some(head.clone());
                     head
                 } else {
@@ -502,7 +505,9 @@ impl ConstitutionHolder {
                         .expect("head cache invariant: Some after is_none check")
                 }
             }
-            ConstitutionHolder::Static(c) => super::prompt::build_stable_head(c),
+            ConstitutionHolder::Static(c) => {
+                policy.stable_head(&super::policy::KernelPromptBlocks::workflow(), c)
+            }
         }
     }
 }
@@ -2773,9 +2778,9 @@ mod tests {
         };
 
         // First call builds and caches the head.
-        let head1 = holder.stable_head();
+        let head1 = holder.stable_head(&crate::agent::policy::NoPolicy);
         // Second call with no file change returns the cached head (identical).
-        let head2 = holder.stable_head();
+        let head2 = holder.stable_head(&crate::agent::policy::NoPolicy);
         assert_eq!(
             head1, head2,
             "head must be cached across calls when constitution unchanged"
@@ -2792,7 +2797,7 @@ mod tests {
         }
 
         // Third call rebuilds because the constitution changed.
-        let head3 = holder.stable_head();
+        let head3 = holder.stable_head(&crate::agent::policy::NoPolicy);
         assert_ne!(head3, head1, "head must rebuild when constitution changes");
     }
 }

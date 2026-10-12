@@ -3495,11 +3495,17 @@ impl AgentLoop {
         // The stable head is cached and rebuilt only when the constitution
         // changes (L4) — re-reads agent.md on mtime change internally.
         let (stable_head, mut volatile_tail) = {
-            let wf = self.workflow.lock().await;
-            let stable_head = self.constitution.stable_head();
+            let stable_head = self.constitution.stable_head(&*self.policy);
+            // 2a.4: the tail consults the policy — the workflow section is
+            // the app's volatile_tail (the policy locks the workflow
+            // internally); NoPolicy falls back to an empty app tail.
+            let app_tail = self
+                .policy
+                .volatile_tail(provider.capabilities())
+                .await;
             let mut volatile_tail = prompt::build_volatile_tail(
                 provider.capabilities(),
-                &wf,
+                &app_tail,
                 memory_context.as_deref(),
             );
             // Eager Complete → Planning nudge: when the agent is resting
@@ -3517,7 +3523,7 @@ impl AgentLoop {
                 .map(|m| m.content.as_text());
             prompt::append_plan_nudge(
                 &mut volatile_tail,
-                wf.state(),
+                self.workflow.lock().await.state(),
                 latest_user_msg.as_deref(),
             );
             (stable_head, volatile_tail)

@@ -15,7 +15,7 @@ use crate::agent::policy::{assemble_stable_head, KernelPromptBlocks};
 use crate::memory::{Memory, ScoredMemory};
 use crate::project::Constitution;
 use crate::provider::Capabilities;
-use crate::workflow::{Workflow, WorkflowState};
+use crate::workflow::Workflow;
 
 /// The coding system preamble — the base instructions.
 ///
@@ -300,69 +300,6 @@ assumed IN main — ABSENCE of an unmerged marker means merged (verify with \
 git_read when it matters).
 ";
 
-/// The default static guidance for the PLANNING state of the volatile tail's
-/// workflow section.
-const STATE_PLANNING: &str = "\
-PLANNING: read tools only. Explore, then create_plan your steps. Write tools \
-unlock only when a plan exists — no project changes without one.
-";
-
-/// The static guidance shown under the current step in EXECUTING; the dynamic
-/// CURRENT PLAN / GOAL / PROGRESS / CURRENT STEP lines are interpolated from
-/// live workflow state.
-const STATE_EXECUTING: &str = "Complete the current step, then complete_step. Stay in scope.\n";
-
-/// The static guidance for the REVIEWING state — the closing-sequence
-/// driver.
-///
-/// Deliberately a POINTER, not a restatement: this block lives in the volatile
-/// tail, which sits after the cached stable head and is re-processed on every
-/// turn. The verdict rule, the bug checklist and the reviewer-only authorship
-/// rule are stated once, in `APP_RULES` (cached). Keeping a second copy here
-/// cost ~200 tokens per Reviewing turn and bought nothing — the head is in
-/// context either way. Enforced by
-/// `reviewing_state_block_points_at_app_rules_without_duplicating_them`.
-const STATE_REVIEWING: &str = "\
-All steps complete — REVIEWING: run the closing sequence (APP RULES) — \
-spawn_agent role:\"reviewer\" (omit the model param — the configured \
-reviewing model is authoritative) over ALL uncommitted changes, then fix EVERY \
-finding yourself (the write tools are available to YOU, not the reviewer), \
-re-run the tests, commit, and finish(report path). No complete_step / \
-create_plan here — the plan is done; update_plan IS available (fix-findings \
-scope changes and appended follow-on steps — the workflow accepts full edits \
-in Reviewing; complete_step stays hidden, so appended steps can't be checked \
-off mid-review). backlog_add / backlog_status are available too — a user \
-request to queue or update a backlog item is never blocked mid-review.
-";
-
-/// The static guidance for the COMPLETE state.
-///
-/// Directive (user request 2026-09-06: "more eager switching to plan"): tells
-/// the agent WHEN to plan (code-change task) vs. when to answer freeform (pure
-/// question), so it doesn't explain how it *would* fix something instead of
-/// actually planning + executing it. The code-level nudge
-/// ([`append_plan_nudge`]) reinforces this when a work verb is detected in the
-/// user's latest message.
-const STATE_COMPLETE: &str = "\
-All steps complete. If the user's message implies code changes (fix, add, \
-implement, refactor, update + a code reference), treat it as a NEW TASK: \
-explore with read tools, then call create_plan — do NOT answer freeform. \
-Only answer freeform for pure questions (how/where/what). Skills (e.g. \
-merge_to_main) may also start here.
-";
-
-/// The static guidance for the SUBAGENT state — a parented sub-agent's role
-/// state (2026-01-03): a single-task worker, not a plan-lifecycle owner. The
-/// plan context above it is the parent's, shown read-only.
-const STATE_SUBAGENT: &str = "\
-You are a background sub-agent: a single-task worker spawned by a parent. \
-Work the task in your spawn prompt to completion and put your findings in \
-your final answer (the parent reads it). The plan context above is your \
-parent's — read-only orientation, not a work order: you cannot create or \
-advance plans, and your tools are exactly your spawn-time allow-list. When \
-done, stop — no plan lifecycle applies to you.
-";
-
 /// The directive text appended to the volatile tail when the agent is resting
 /// in Complete state and the user's latest message looks like a code-change
 /// task. Reinforces [`STATE_COMPLETE`] at the point of decision.
@@ -536,7 +473,7 @@ pub fn kernel_prompt_blocks() -> KernelPromptBlocks {
 /// content at 160 chars.
 pub fn build_volatile_tail(
     caps: &Capabilities,
-    workflow: &Workflow,
+    app_tail: &str,
     memories: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
@@ -544,14 +481,28 @@ pub fn build_volatile_tail(
     // Recalled memories (auto-recalled based on the user's prompt).
     if let Some(mem) = memories {
         if !mem.trim().is_empty() {
-            prompt.push_str("# RECALLED MEMORIES\n\n");
+            prompt.push_str("# RECALLED MEMORIES\\n\\n");
             prompt.push_str(mem);
-            prompt.push_str("\n\n");
+            prompt.push_str("\\n\\n");
         }
     }
 
-    // Workflow section.
-    prompt.push_str(&workflow_section(caps, workflow));
+    // The app tail — the workflow section, assembled by the policy (2a.4).
+    prompt.push_str(app_tail);
+
+    // Capability notes (the kernel keeps CAPABILITIES per the step file
+    // :639; same bytes workflow_section emitted pre-2a.4).
+    prompt.push_str("# CAPABILITIES\\n\\n");
+    if caps.supports_tool_choice {
+        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).\\n");
+    } else {
+        prompt.push_str("- Tool choice: not supported. Choose tools freely.\\n");
+    }
+    if !caps.reliable_finish_reason {
+        prompt.push_str(
+            "- Finish reason may be unreliable; tool calls are detected by their presence.\\n",
+        );
+    }
 
     prompt
 }
@@ -573,41 +524,12 @@ pub fn build_system_prompt(
     memories: Option<&str>,
 ) -> String {
     let mut prompt = build_stable_head(constitution);
-    prompt.push_str(&build_volatile_tail(caps, workflow, memories));
+    prompt.push_str(&build_volatile_tail(
+        caps,
+        &crate::app::workflow_policy::workflow_section(workflow),
+        memories,
+    ));
     prompt
-}
-
-/// Truncate a step's display text to a short punchline for the volatile tail.
-///
-/// The tail is the only part re-processed per `complete_step` (the R5
-/// byte-stable footer keeps everything before it cached), so the CURRENT STEP
-/// line must stay short: the bold header when present, else the first 120
-/// chars. Char-safe (`chars().take` never splits a UTF-8 sequence).
-fn short_step_text(text: &str) -> String {
-    const MAX: usize = 120;
-    if text.chars().count() <= MAX {
-        text.to_string()
-    } else {
-        let head: String = text.chars().take(MAX).collect();
-        format!("{head}…")
-    }
-}
-
-/// One-line, budget-truncated form of a plan's Bug/Context for the
-/// volatile tail (backlog 77ff8f45): a fresh session picking up an
-/// in-flight plan gets the symptom + the context gist in the footer —
-/// the tail is its only plan-derived injection. The full detail,
-/// including a bug plan's `## Detailed steps`, stays in the plan file
-/// (the crash-resumption document). Whitespace-collapsed to one line and
-/// char-safe (`chars().take` never splits a UTF-8 sequence).
-fn short_context_line(text: &str, budget: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= budget {
-        collapsed
-    } else {
-        let head: String = collapsed.chars().take(budget).collect();
-        format!("{head}…")
-    }
 }
 
 /// Format recalled memories into a compact section for the system prompt.
@@ -698,172 +620,47 @@ pub fn format_primer(memories: &[Memory]) -> String {
     out
 }
 
-/// Push one state's static guidance, skipping empty sections and
-/// normalizing the trailing newline — byte-identical to the compiled consts,
-/// which each end with exactly one `\n`.
-fn push_state_text(out: &mut String, text: &str) {
-    let t = text.trim_end();
-    if !t.is_empty() {
-        out.push_str(t);
-        out.push('\n');
-    }
-}
-
-/// Build the workflow section of the system prompt.
-///
-/// The static per-state guidance comes from the compiled STATE_* consts; the
-/// dynamic lines — CURRENT PLAN / GOAL / PROGRESS / CURRENT STEP, the skill
-/// name/goal, the sub-agent plan context, the CAPABILITIES block — are interpolated
-/// from live workflow state.
-fn workflow_section(caps: &Capabilities, workflow: &Workflow) -> String {
-    let state = workflow.state();
-    let mut s = String::new();
-
-    s.push_str("# WORKFLOW STATE\n\n");
-    s.push_str(&format!("Current state: {state}\n\n"));
-
-    match state {
-        WorkflowState::Planning => {
-            push_state_text(&mut s, STATE_PLANNING);
-        }
-        WorkflowState::Executing => {
-            if let Some(plan) = workflow.plan() {
-                // Show the nesting breadcrumb when this is a sub-plan, so the
-                // agent knows there's a parent to fall back to.
-                let parents = workflow.parent_titles();
-                if parents.is_empty() {
-                    s.push_str(&format!("CURRENT PLAN: {}\n", plan.title));
-                } else {
-                    s.push_str(&format!(
-                        "CURRENT PLAN (sub-plan, depth {}): {} ▸ {}\n",
-                        workflow.plan_depth(),
-                        parents.join(" ▸ "),
-                        plan.title
-                    ));
-                }
-                s.push_str(&format!("GOAL: {}\n", plan.goal));
-                // Backlog 77ff8f45: surface the Bug + Context in the
-                // resume footer — a fresh session picking up an
-                // in-flight plan gets the symptom + the context gist
-                // here; the full detail, including a bug plan's
-                // Detailed steps, stays in the plan file (the
-                // crash-resumption document). One line each — the tail
-                // is re-processed per step bump, so every token is paid
-                // on every bump.
-                if let Some(bug) = &plan.bug_symptom {
-                    s.push_str(&format!("BUG: {}\n", short_context_line(bug, 160)));
-                }
-                if !plan.context.trim().is_empty() {
-                    s.push_str(&format!(
-                        "CONTEXT: {}\n",
-                        short_context_line(plan.context.trim(), 240)
-                    ));
-                }
-                s.push_str(&format!(
-                    "PROGRESS: {}/{} steps complete\n",
-                    plan.completed_count(),
-                    plan.steps.len()
-                ));
-                if let Some(step) = plan.current_step() {
-                    // Show the step HEADER (the bold punchline) when present,
-                    // else a truncated body. The full step text stays
-                    // available in the conversation (the create_plan /
-                    // update_plan results). Keeping this line short matters:
-                    // with the R5 CONTEXT_FOOTER the volatile tail is the
-                    // only part re-processed per complete_step, so every
-                    // token here is paid on every step bump.
-                    let current = step
-                        .header
-                        .as_deref()
-                        .map(short_step_text)
-                        .unwrap_or_else(|| short_step_text(&step.text));
-                    s.push_str(&format!("CURRENT STEP: \"{current}\" ← resume here\n\n",));
-                    push_state_text(&mut s, STATE_EXECUTING);
-                }
-            }
-        }
-        WorkflowState::Reviewing => {
-            push_state_text(&mut s, STATE_REVIEWING);
-        }
-        WorkflowState::Complete => {
-            push_state_text(&mut s, STATE_COMPLETE);
-        }
-        WorkflowState::Skill => {
-            if let Some(skill) = workflow.active_skill() {
-                s.push_str(&format!(
-                    "You are running the skill \"{name}\". Drive toward this goal:\n\n{prompt}\n\n",
-                    name = skill.name,
-                    prompt = skill.prompt
-                ));
-                s.push_str(&format!(
-                    "Goal achieved → skill_end (exits to {target}); rollback → \
-                     abandon_skill. Security controls still apply to every tool \
-                     call. If the user hand-edits a skill file mid-run, \
-                     skill_reload re-reads the library (no restart).\n",
-                    target = skill.target_state
-                ));
-            } else {
-                // Defensive: Skill state with no active skill overlay. This
-                // shouldn't happen (start_skill sets both atomically), but if
-                // it does, tell the agent to end the skill so the workflow
-                // recovers to a sane state.
-                s.push_str(
-                    "A skill is nominally active but no skill overlay is recorded. Call \
-                     skill_end or abandon_skill to return to a normal workflow state.\n",
-                );
-            }
-        }
-        WorkflowState::Subagent => {
-            // Parented sub-agent: the plan stack below is the READ-ONLY MIRROR
-            // of the main plan (loaded from the shared plans dir by
-            // build_inner) — orientation, not a work order. The sub-agent's
-            // actual task arrives in its spawn prompt; it cannot mutate plans
-            // and its tool surface comes from its spawn-time allow-list.
-            if let Some(plan) = workflow.plan() {
-                let parents = workflow.parent_titles();
-                if parents.is_empty() {
-                    s.push_str(&format!("PARENT PLAN (read-only context): {}\n", plan.title));
-                } else {
-                    s.push_str(&format!(
-                        "PARENT PLAN (read-only context, depth {}): {} ▸ {}\n",
-                        workflow.plan_depth(),
-                        parents.join(" ▸ "),
-                        plan.title
-                    ));
-                }
-                s.push_str(&format!("GOAL: {}\n", plan.goal));
-                s.push_str(&format!(
-                    "PROGRESS: {}/{} steps complete\n\n",
-                    plan.completed_count(),
-                    plan.steps.len()
-                ));
-            }
-            push_state_text(&mut s, STATE_SUBAGENT);
-        }
-    }
-
-    // Capability notes.
-    s.push_str("\n# CAPABILITIES\n\n");
-    if caps.supports_tool_choice {
-        s.push_str("- Tool choice: supported (you may be directed to call specific tools).\n");
-    } else {
-        s.push_str("- Tool choice: not supported. Choose tools freely.\n");
-    }
-    if !caps.reliable_finish_reason {
-        s.push_str(
-            "- Finish reason may be unreliable; tool calls are detected by their presence.\n",
-        );
-    }
-
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::Constitution;
     use crate::workflow::Workflow;
     use tempfile::tempdir;
+    use crate::app::workflow_policy::workflow_section;
+    use crate::workflow::WorkflowState;
+
+    /// The composed volatile tail's section ORDER is pinned (2a.4, step file
+    /// :649-652): no existing test asserted the composed order — memories,
+    /// the per-state workflow section, then CAPABILITIES — so this golden is
+    /// added BEFORE the policy flip (green on today's shape; red on any
+    /// reorder).
+    #[test]
+    fn volatile_tail_section_order_pinned() {
+        const RECALLED_HEADER: &str = "# RECALLED MEMORIES";
+        const WORKFLOW_HEADER: &str = "# WORKFLOW STATE";
+        const CAPABILITIES_HEADER: &str = "# CAPABILITIES";
+        let dir = tempdir().unwrap();
+        let wf = Workflow::new(dir.path());
+        let caps = Capabilities::openai();
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), Some("memory text"));
+        let mem = tail
+            .find(RECALLED_HEADER)
+            .expect("memories header must appear");
+        let wfs = tail
+            .find(WORKFLOW_HEADER)
+            .expect("workflow header must appear");
+        let caps_pos = tail
+            .find(CAPABILITIES_HEADER)
+            .expect("capabilities header must appear");
+        assert!(
+            mem < wfs,
+            "the memories block must precede the workflow section"
+        );
+        assert!(
+            wfs < caps_pos,
+            "the workflow section must precede capabilities"
+        );
+    }
 
     #[test]
     fn planning_prompt_mentions_planning() {
@@ -1569,7 +1366,7 @@ mod tests {
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("closing sequence (APP RULES)"),
             "Reviewing block points at the head's closing sequence"
@@ -1697,7 +1494,7 @@ mod tests {
         assert!(!head.contains("Build X"), "head excludes plan title");
         // `caps` + `wf` are only used by the tail; reference them so the
         // compiler doesn't warn about unused vars in this assertion-only test.
-        let _ = build_volatile_tail(&caps, &wf, None);
+        let _ = build_volatile_tail(&caps, &workflow_section(&wf), None);
     }
 
     #[test]
@@ -1748,7 +1545,7 @@ mod tests {
         let caps = Capabilities::openai();
 
         // With memories: tail has both workflow state + memories.
-        let tail_with_mem = build_volatile_tail(&caps, &wf, Some("memory text"));
+        let tail_with_mem = build_volatile_tail(&caps, &workflow_section(&wf), Some("memory text"));
         assert!(
             tail_with_mem.contains("WORKFLOW STATE"),
             "tail has workflow state"
@@ -1767,7 +1564,7 @@ mod tests {
         );
 
         // Without memories: tail has workflow state but no memories block.
-        let tail_no_mem = build_volatile_tail(&caps, &wf, None);
+        let tail_no_mem = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail_no_mem.contains("WORKFLOW STATE"),
             "tail still has workflow state"
@@ -1791,7 +1588,7 @@ mod tests {
         wf.create_plan("P", "G", "C", vec![format!("**Header A** — {long_body}")])
             .unwrap();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("CURRENT STEP: \"Header A\""),
             "tail shows the header"
@@ -1809,7 +1606,7 @@ mod tests {
         assert!(plain.chars().count() > 120);
         wf2.create_plan("P2", "G", "C", vec![plain.to_string()])
             .unwrap();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         let head_120: String = plain.chars().take(120).collect();
         assert!(
             tail2.contains(&format!("CURRENT STEP: \"{head_120}…\"")),
@@ -1841,7 +1638,7 @@ mod tests {
         )
         .unwrap();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("BUG: the app crashes on open"),
             "tail surfaces the bug symptom: {tail}"
@@ -1861,7 +1658,7 @@ mod tests {
         let long_context = "c ".repeat(300);
         wf2.create_plan("P2", "G", &long_context, vec!["s".into()])
             .unwrap();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         let head_240: String = long_context.trim().chars().take(240).collect();
         assert!(
             tail2.contains(&format!("CONTEXT: {head_240}…")),
@@ -1873,7 +1670,7 @@ mod tests {
         // them) — the crash-resumption read path.
         let mut resumed = Workflow::new(dir.path().join("plans"));
         resumed.load_latest().unwrap();
-        let tail3 = build_volatile_tail(&caps, &resumed, None);
+        let tail3 = build_volatile_tail(&caps, &workflow_section(&resumed), None);
         assert!(
             tail3.contains("BUG: the app crashes on open"),
             "the resumed tail surfaces the bug: {tail3}"
@@ -1897,7 +1694,7 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["s".into()]).unwrap();
         wf.enter_subagent_state();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("Current state: Subagent"),
             "tail reports the Subagent role state"
@@ -1924,7 +1721,7 @@ mod tests {
         // none): the guidance still renders, without any plan lines.
         let mut wf2 = Workflow::new(dir.path().join("plans2"));
         wf2.enter_subagent_state();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         assert!(
             tail2.contains("Current state: Subagent"),
             "state line renders without a plan"
@@ -2112,7 +1909,7 @@ mod tests {
             project: "Use edition 2021".into(),
         };
         let head = build_stable_head(&constitution);
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             !head.contains(CONTEXT_FOOTER),
             "head does not contain the footer (turn.rs adds it separately)"

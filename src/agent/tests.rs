@@ -917,7 +917,7 @@ async fn phase_events_cycle_across_requests_and_tools() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow: workflow,
+            workflow: workflow.clone(),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2496,7 +2496,7 @@ async fn run_turn_records_session_id_on_tool_events() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: workflow.clone(),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3362,11 +3362,11 @@ async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() 
     let (provider, captured, captured_tails) =
         CapturingProvider::new_with_model_with_tails("deepseek-v4-flash");
     let trailing = provider.trailing_handle();
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow,
+            workflow: workflow.clone(),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3375,6 +3375,14 @@ async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() 
         },
         crate::project::Constitution::default(),
     );
+    // 2a.4: this test mirrors the production composition — the factory
+    // attaches WorkflowPolicy to every workflow agent (2a.2); apply the
+    // same policy here so the tail consult composes the workflow section
+    // (NoPolicy's empty app-tail is the free-agent trajectory, not the
+    // workflow agent's).
+    agent.set_policy(Arc::new(
+        crate::app::workflow_policy::WorkflowPolicy::new(workflow.clone()),
+    ));
 
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
@@ -3745,11 +3753,11 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
 
     let (provider, captured, captured_tails) = CapturingProvider::new_local_with_tails();
     let trailing = provider.trailing_handle();
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow,
+            workflow: workflow.clone(),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3758,6 +3766,14 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
         },
         crate::project::Constitution::default(),
     );
+    // 2a.4: this test mirrors the production composition — the factory
+    // attaches WorkflowPolicy to every workflow agent (2a.2); apply the
+    // same policy here so the tail consult composes the workflow section
+    // (NoPolicy's empty app-tail is the free-agent trajectory, not the
+    // workflow agent's).
+    agent.set_policy(Arc::new(
+        crate::app::workflow_policy::WorkflowPolicy::new(workflow.clone()),
+    ));
 
     let (fanin_tx, _fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);

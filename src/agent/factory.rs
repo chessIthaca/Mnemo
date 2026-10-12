@@ -109,6 +109,129 @@ pub struct AgentRootSpec {
 /// The shared, stateless deps live here; `build()` creates a fresh `Workflow`
 /// (loading the latest plan from `plans_dir`) + a fresh `ToolRegistry` (wired
 /// to that workflow) + a new `AgentLoop` on every call.
+/// The kernel tool groups (2c.2/G2, §5.9.2 :635-641): a
+/// [`ToolSelection`] names the groups the factory registers.
+/// `AskUser`/`Host` are surface slots for the app's and the Engine's
+/// own tools (3a/3c); kernel-side only `Host` has a member today (the
+/// reviewer channel), so a free-mode selection that excludes `Host`
+/// drops `write_review_report` (row 5's letter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolGroup {
+    /// The read surface: read_files, expand_result, search, search_read.
+    Read,
+    /// The write surface: file_edit, multi_edit, file_write,
+    /// convert_line_endings (the spec's file_append is the file_write
+    /// append mode — no separate kernel tool).
+    Write,
+    /// The shell.
+    Shell,
+    /// The git pair: git, git_read.
+    Git,
+    /// web_fetch.
+    Web,
+    /// The headless/on-screen browser tools (the `browser` feature).
+    Browser,
+    /// The graph_* tools.
+    Codegraph,
+    /// The memory_* tools.
+    Memory,
+    /// The image_* tools.
+    Images,
+    /// spawn_agent + list_models (§5.9.2 :641).
+    Spawn,
+    /// The app's ask_user (registered app-side; kernel-side no member
+    /// post-2b).
+    AskUser,
+    /// The progressive-disclosure loader (load_tools) + the McpReveal
+    /// wiring (§5.9.2 :641).
+    Mcp,
+    /// The reviewer channel (write_review_report) today; the Engine's
+    /// host tools land in 3c.
+    Host,
+}
+
+impl ToolGroup {
+    /// Every group, in declaration order — [`ToolSelection::all`]'s
+    /// include list.
+    pub const ALL: &'static [ToolGroup] = &[
+        ToolGroup::Read,
+        ToolGroup::Write,
+        ToolGroup::Shell,
+        ToolGroup::Git,
+        ToolGroup::Web,
+        ToolGroup::Browser,
+        ToolGroup::Codegraph,
+        ToolGroup::Memory,
+        ToolGroup::Images,
+        ToolGroup::Spawn,
+        ToolGroup::AskUser,
+        ToolGroup::Mcp,
+        ToolGroup::Host,
+    ];
+}
+
+/// The per-agent tool-surface selection (2c.2/G2, §5.9.2 :635-642):
+/// the kernel groups the factory registers + per-name carve-outs.
+/// The workflow path passes NO selection — the factory's `None` field
+/// registers every group in today's exact order (the byte-golden);
+/// the Engine's SpawnOptions (3a) supplies the per-agent values.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolSelection {
+    /// The groups to register (an empty list = no kernel groups).
+    #[serde(default)]
+    pub include: Vec<ToolGroup>,
+    /// Per-name carve-outs (tools skipped inside the selected groups).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl ToolSelection {
+    /// Every group, no exclusions — the factory-level full set (what
+    /// the `None` field means; §5.9.2 :642).
+    pub fn all() -> Self {
+        Self {
+            include: ToolGroup::ALL.to_vec(),
+            exclude: Vec::new(),
+        }
+    }
+
+    /// The free agent's constant surface (§5.2's "the constant
+    /// surface"): every kernel group EXCEPT `Host` — the reviewer
+    /// channel is the workflow's, so a free agent advertises no review
+    /// tool (row 5).
+    pub fn free_default() -> Self {
+        Self {
+            include: ToolGroup::ALL
+                .iter()
+                .copied()
+                .filter(|g| *g != ToolGroup::Host)
+                .collect(),
+            exclude: Vec::new(),
+        }
+    }
+
+    /// Whether the group is included.
+    pub fn includes(&self, group: ToolGroup) -> bool {
+        self.include.contains(&group)
+    }
+
+    /// Whether the named tool rides the selection: its group must be
+    /// included AND its name must not be excluded.
+    pub fn selects(&self, group: ToolGroup, name: &str) -> bool {
+        self.includes(group) && !self.exclude.iter().any(|e| e == name)
+    }
+}
+
+/// The group-level gate (2c.2/G2, §5.9.2 :639: the factory registers
+/// only the selected groups): `None` selection = full (today).
+fn group_allowed(sel: Option<&ToolSelection>, group: ToolGroup) -> bool {
+    match sel {
+        None => true,
+        Some(sel) => sel.includes(group),
+    }
+}
+
 pub struct AgentLoopFactory {
     /// The shared provider. Behind an `RwLock` so the model can be swapped at
     /// runtime (the status-bar model picker): the IPC layer builds a new client
@@ -208,6 +331,11 @@ pub struct AgentLoopFactory {
     /// / skill / subagent. `None` in tests / when no `[models]` section is
     /// configured. Set once at startup via `with_model_resolver`.
     model_resolver: Option<Arc<dyn crate::model_resolver::ModelResolver>>,
+    /// The per-agent tool-surface selection (2c.2/G2, §5.9.2). `None` (the
+    /// default) = every kernel group, today's exact registration order (the
+    /// byte-golden). The Engine's SpawnOptions (3a) supplies per-agent
+    /// selections at spawn; the workflow path never sets one.
+    tool_selection: Option<ToolSelection>,
     /// The shared headless debug browser. Lazily spawned on first tool call;
     /// the IPC layer injects the *same* `Arc` (via [`browser_slot`]) so the
     /// right-panel Browser tab and the agent drive one browser. Defaults to a
@@ -400,6 +528,10 @@ impl AgentLoopFactory {
             // `with_tool_choice` (backlog e2c47d5f). Until then the search
             // tools keep their regex auto-delegation heuristics byte-identically.
             tool_choice: None,
+            // No tool-surface selection at construction (2c.2/G2): every
+            // kernel group registers — today's exact registration order.
+            // The Engine (3a) supplies per-agent selections at spawn.
+            tool_selection: None,
         }
     }
 
@@ -451,6 +583,15 @@ impl AgentLoopFactory {
                 .enabled
                 .store(on, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Set the per-agent tool-surface selection (2c.2/G2, §5.9.2): the
+    /// kernel groups the factory registers for agents built after this
+    /// call. `None` (the default) = every group, today's exact order. The
+    /// workflow path never sets one.
+    pub fn with_tool_selection(mut self, selection: ToolSelection) -> Self {
+        self.tool_selection = Some(selection);
+        self
     }
 
     /// Wire the shared Laya failure-triage gate (backlog 1a4049c1): every
@@ -1148,6 +1289,7 @@ impl AgentLoopFactory {
         agent
     }
 
+
     /// Build a `ToolRegistry` wired to the given (per-agent) workflow, stamped
     /// with this agent's runtime id (so the `spawn_agent` tool becomes
     /// parent-aware). `agent_id` is `None` for id-less builds (tests).
@@ -1163,6 +1305,9 @@ impl AgentLoopFactory {
         root: Option<&AgentRootSpec>,
         plans_dir: &Path,
     ) -> ToolRegistry {
+        // 2c.2 (G2): the tool-surface selection — None = every kernel
+        // group, today's exact registration order (the byte-golden).
+        let selection = self.tool_selection.as_ref();
         // The sandbox is Clone (just a PathBuf) — clone the inner value so
         // each tool gets its own owned copy, matching the tool constructors'
         // `Sandbox` (by-value) signature. A root-spec agent uses the spec's
@@ -1182,17 +1327,20 @@ impl AgentLoopFactory {
         };
         let mut registry =
             ToolRegistry::with_groups(crate::tool::LoadedGroups::new(), mcp_table.clone());
-        self.register_agent_tools(&mut registry, &sandbox, root);
+        self.register_agent_tools(&mut registry, &sandbox, root, selection);
         // 2b.2/2b.3: the app-owned tools (the plan/skill sets moved in 2b.3,
         // ask_user + the backlog trio) register via the policy factory — D5:
         // kernel-called, app-owned. The delegate sits at the position the
         // plan-tool block held, and the app impl preserves today's relative
         // order (plan tools, ask_user, backlog, skill tools), so the
-        // registry's insertion ORDER stays byte-stable.
+        // registry's insertion ORDER stays byte-stable. NOT G2-gated: the
+        // app surface is the app factory's own (the workflow path = today's
+        // set). The app-side group honoring lands with the Engine surface
+        // (3a/3c).
         self.register_policy_factory_tools(&mut registry, agent_id, root, plans_dir, &sandbox, workflow);
-        self.register_vision_tool(&mut registry, &sandbox);
-        self.register_memory_tools(&mut registry, root);
-        self.register_codegraph_tools(&mut registry, root);
+        self.register_vision_tool(&mut registry, &sandbox, selection);
+        self.register_memory_tools(&mut registry, root, selection);
+        self.register_codegraph_tools(&mut registry, root, selection);
         // The reviewer-round scope wiring (backlog 85313a7e) needs the project
         // root the git reads run in — resolved the way `register_agent_tools`
         // resolves it (the agent's own root when it has one, else the
@@ -1201,9 +1349,9 @@ impl AgentLoopFactory {
             Some(spec) => spec.project_root.clone(),
             None => self.project_root.clone(),
         };
-        self.register_spawn_tool(&mut registry, workflow, &project_root, agent_id);
+        self.register_spawn_tool(&mut registry, workflow, &project_root, agent_id, selection);
         #[cfg(feature = "browser")]
-        self.register_browser_tools(&mut registry, &sandbox);
+        self.register_browser_tools(&mut registry, &sandbox, selection);
         // The reveal half of progressive disclosure — registered last so it
         // shares the reveal-set the registry was built with. MCP groups
         // reveal through the shared manager into this registry's dynamic
@@ -1211,18 +1359,33 @@ impl AgentLoopFactory {
         let mcp_reveal = self.mcp.as_ref().map(|manager| {
             crate::mcp::McpReveal::new(std::sync::Arc::clone(manager), registry.dynamic_slot())
         });
+        // 2c.2 (G2): the caller's exclude = a per-name carve-out on the WHOLE
+        // array (§5.9.2 :639-641: the tool array never advertises tools the
+        // caller excluded) — pruned after every registration (the app's
+        // included), BEFORE the deferred snapshot, so excluded tools neither
+        // advertise nor reveal.
+        if let Some(sel) = selection {
+            for name in &sel.exclude {
+                registry.unregister(name);
+            }
+        }
         // The static deferred tools' schemas render in the reveal response —
         // snapshot them (Arc clones) before LoadToolsTool registers; static
         // tools never change at runtime.
         let deferred = Self::deferred_snapshot(&registry);
-        registry.register(Box::new(
-            crate::tool::agent::load_tools::LoadToolsTool::new(
-                registry.loaded_groups(),
-                mcp_table,
-                mcp_reveal,
-                deferred,
-            ),
-        ));
+        // 2c.2 (G2): the reveal loader rides the `mcp` group (§5.9.2 :641:
+        // load_tools registered only with Mcp) — a selected surface without
+        // Mcp gets no loader, and its deferred groups never reveal.
+        if group_allowed(selection, ToolGroup::Mcp) {
+            registry.register(Box::new(
+                crate::tool::agent::load_tools::LoadToolsTool::new(
+                    registry.loaded_groups(),
+                    mcp_table,
+                    mcp_reveal,
+                    deferred,
+                ),
+            ));
+        }
         registry
     }
 
@@ -1246,6 +1409,7 @@ impl AgentLoopFactory {
         registry: &mut ToolRegistry,
         sandbox: &Sandbox,
         root: Option<&AgentRootSpec>,
+        sel: Option<&ToolSelection>,
     ) {
         // A root-spec agent's graph/git bindings come from the spec (the
         // worktree's), not the factory's — even when the spec's graph is
@@ -1259,30 +1423,52 @@ impl AgentLoopFactory {
             Some(spec) => spec.project_root.clone(),
             None => self.project_root.clone(),
         };
-        registry.register(Box::new(
-            ReadFilesTool::new(sandbox.clone())
-                .with_codegraph(codegraph.clone())
-                .with_optimizer(Arc::clone(&self.optimizer)),
-        ));
+        // 2c.2 (G2): the per-name gate — None selection = register (today's
+        // order); some = the name's group must be included and the name not
+        // excluded. The app-owned policy-factory tools are NOT gated here
+        // (that surface is the app factory's own).
+        let want = |group: ToolGroup, name: &str| match sel {
+            None => true,
+            Some(sel) => sel.selects(group, name),
+        };
+        if want(ToolGroup::Read, "read_files") {
+            registry.register(Box::new(
+                ReadFilesTool::new(sandbox.clone())
+                    .with_codegraph(codegraph.clone())
+                    .with_optimizer(Arc::clone(&self.optimizer)),
+            ));
+        }
         // Progressive disclosure (backlog e4a50d22 lever 3): serve back a
         // tool result that was archived for size — by id, or by keyword. A
         // `None` store just yields a helpful error on call.
-        registry.register(Box::new(ExpandResultTool::new(self.memory.clone())));
-        registry.register(Box::new(FileEditTool::new(sandbox.clone())));
-        registry.register(Box::new(MultiEditTool::new(sandbox.clone())));
-        registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
-        registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
-        registry.register(Box::new(
-            ShellTool::new(sandbox.clone())
-                .with_filter_config(Arc::clone(&self.shell_filter))
-                // Same handle as GitTool: `shell git merge|push` must raise the
-                // always-on core-operation prompt too (follow-up A, 2027-01-11).
-                .with_core_operations(Arc::clone(&self.core_operations))
-                // Token-optimizer lever 2 (backlog e4a50d22): the shared
-                // `[general.optimizer]` handle, read per call so a config
-                // save lands on the next command without a rebuild.
-                .with_optimizer(Arc::clone(&self.optimizer)),
-        ));
+        if want(ToolGroup::Read, "expand_result") {
+            registry.register(Box::new(ExpandResultTool::new(self.memory.clone())));
+        }
+        if want(ToolGroup::Write, "file_edit") {
+            registry.register(Box::new(FileEditTool::new(sandbox.clone())));
+        }
+        if want(ToolGroup::Write, "multi_edit") {
+            registry.register(Box::new(MultiEditTool::new(sandbox.clone())));
+        }
+        if want(ToolGroup::Write, "file_write") {
+            registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
+        }
+        if want(ToolGroup::Write, "convert_line_endings") {
+            registry.register(Box::new(ConvertLineEndingsTool::new(sandbox.clone())));
+        }
+        if want(ToolGroup::Shell, "shell") {
+            registry.register(Box::new(
+                ShellTool::new(sandbox.clone())
+                    .with_filter_config(Arc::clone(&self.shell_filter))
+                    // Same handle as GitTool: `shell git merge|push` must raise the
+                    // always-on core-operation prompt too (follow-up A, 2027-01-11).
+                    .with_core_operations(Arc::clone(&self.core_operations))
+                    // Token-optimizer lever 2 (backlog e4a50d22): the shared
+                    // `[general.optimizer]` handle, read per call so a config
+                    // save lands on the next command without a rebuild.
+                    .with_optimizer(Arc::clone(&self.optimizer)),
+            ));
+        }
         let mut search_tool = SearchTool::new(sandbox.clone(), codegraph.clone())
             .with_staleness_log(self.staleness_log.clone());
         let mut search_read_tool = SearchReadTool::new(sandbox.clone(), codegraph.clone())
@@ -1301,31 +1487,49 @@ impl AgentLoopFactory {
             search_tool = search_tool.with_tool_choice(handle.clone());
             search_read_tool = search_read_tool.with_tool_choice(handle.clone());
         }
-        registry.register(Box::new(search_tool));
-        registry.register(Box::new(search_read_tool));
-        registry.register(Box::new(WebFetchTool::new()));
-        registry.register(Box::new(GitTool::with_core_operations(
-            &project_root,
-            self.core_operations.clone(),
-        )));
+        if want(ToolGroup::Read, "search") {
+            registry.register(Box::new(search_tool));
+        }
+        if want(ToolGroup::Read, "search_read") {
+            registry.register(Box::new(search_read_tool));
+        }
+        if want(ToolGroup::Web, "web_fetch") {
+            registry.register(Box::new(WebFetchTool::new()));
+        }
+        if want(ToolGroup::Git, "git") {
+            registry.register(Box::new(GitTool::with_core_operations(
+                &project_root,
+                self.core_operations.clone(),
+            )));
+        }
         // git_read is the read-only view into git (op = diff | log | show | status):
         // the reviewer subagent's only way to see uncommitted changes (it has
         // no shell/git), and the bridge from a memory record's commit pointer
         // to shipped code. AutoRun by construction, which is exactly why it
         // stays separate from the NeedsApproval `git` tool — it must remain
         // visible in the read-only Planning/Complete states.
-        registry.register(Box::new(GitReadTool::new(&project_root)));
+        if want(ToolGroup::Git, "git_read") {
+            registry.register(Box::new(GitReadTool::new(&project_root)));
+        }
         // write_review_report is the reviewer subagent's single output channel
-        // (writes only under .coding/reviews/). Always registered; gated by
-        // the workflow ToolFilter, and built through the single construction
-        // point below so its provenance wiring cannot drift from its test.
-        registry.register(Box::new(self.build_write_review_report_tool(&project_root)));
+        // (writes only under .coding/reviews/). Always registered in the FULL
+        // set; gated by the workflow ToolFilter, and built through the single
+        // construction point below so its provenance wiring cannot drift from
+        // its test. 2c.2 (G2, row 5): the reviewer channel rides the Host
+        // group — a free-mode selection without `Host` advertises no review
+        // tool.
+        if want(ToolGroup::Host, "write_review_report") {
+            registry.register(Box::new(self.build_write_review_report_tool(&project_root)));
+        }
         // list_models is read-only discovery (which models are configured) so
         // the agent can pick one for spawn_agent's `model` parameter. Omitted
         // when no model resolver is wired (tests / no `[models]` section) —
-        // there's nothing to list.
-        if let Some(resolver) = &self.model_resolver {
-            registry.register(Box::new(ListModelsTool::new(Some(Arc::clone(resolver)))));
+        // there's nothing to list. 2c.2 (G2, §5.9.2 :641): registered only
+        // with the Spawn group.
+        if want(ToolGroup::Spawn, "list_models") {
+            if let Some(resolver) = &self.model_resolver {
+                registry.register(Box::new(ListModelsTool::new(Some(Arc::clone(resolver)))));
+            }
         }
     }
 
@@ -1385,7 +1589,16 @@ impl AgentLoopFactory {
     /// are NeedsApproval — visible in every workflow state, gated per call by
     /// their approval prompt.
     #[cfg(feature = "browser")]
-    fn register_browser_tools(&self, registry: &mut ToolRegistry, sandbox: &Sandbox) {
+    fn register_browser_tools(
+        &self,
+        registry: &mut ToolRegistry,
+        sandbox: &Sandbox,
+        sel: Option<&ToolSelection>,
+    ) {
+        if !group_allowed(sel, ToolGroup::Browser) {
+            // 2c.2 (G2): the selection excludes the Browser group.
+            return;
+        }
         use crate::tool::browser as bt;
         let ctx = || bt::Ctx {
             manager: Arc::clone(&self.browser),
@@ -1441,7 +1654,16 @@ impl AgentLoopFactory {
     /// Register the image_* vision tools always, against the shared swappable
     /// slot. When the slot is empty, execute returns a clear "not configured"
     /// error — Settings can enable vision without rebuilding registries.
-    fn register_vision_tool(&self, registry: &mut ToolRegistry, sandbox: &Sandbox) {
+    fn register_vision_tool(
+        &self,
+        registry: &mut ToolRegistry,
+        sandbox: &Sandbox,
+        sel: Option<&ToolSelection>,
+    ) {
+        if !group_allowed(sel, ToolGroup::Images) {
+            // 2c.2 (G2): the selection excludes the Images group.
+            return;
+        }
         let vision = self.vision.clone() as Arc<dyn ImageDescriber>;
         registry.register(Box::new(ImageUiToArtifactTool::new(
             sandbox.clone(),
@@ -1472,7 +1694,16 @@ impl AgentLoopFactory {
 
     /// Register the memory tools when a memory store is configured. Omitted
     /// in tests that build a factory without memory.
-    fn register_memory_tools(&self, registry: &mut ToolRegistry, root: Option<&AgentRootSpec>) {
+    fn register_memory_tools(
+        &self,
+        registry: &mut ToolRegistry,
+        root: Option<&AgentRootSpec>,
+        sel: Option<&ToolSelection>,
+    ) {
+        if !group_allowed(sel, ToolGroup::Memory) {
+            // 2c.2 (G2): the selection excludes the Memory group.
+            return;
+        }
         if let Some(store) = &self.memory {
             // The knowledge-file backing (typed records as files): typed
             // writes land in files (the truth) + the derived rows come from
@@ -1566,7 +1797,12 @@ impl AgentLoopFactory {
         &self,
         registry: &mut ToolRegistry,
         root: Option<&AgentRootSpec>,
+        sel: Option<&ToolSelection>,
     ) {
+        if !group_allowed(sel, ToolGroup::Codegraph) {
+            // 2c.2 (G2): the selection excludes the Codegraph group.
+            return;
+        }
         // A root-spec agent's graph_* tools bind to the worktree's graph.
         let graph = match root {
             Some(spec) => spec.codegraph.clone(),
@@ -1617,7 +1853,12 @@ impl AgentLoopFactory {
         workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         project_root: &Path,
         agent_id: Option<crate::runtime::AgentId>,
+        sel: Option<&ToolSelection>,
     ) {
+        if !group_allowed(sel, ToolGroup::Spawn) {
+            // 2c.2 (G2): the selection excludes the Spawn group.
+            return;
+        }
         if let Some(spawner) = self.spawner.read().expect("spawner lock poisoned").clone() {
             let mut tool = match agent_id {
                 Some(id) => SpawnAgentTool::new(spawner).with_parent(id),
@@ -1785,6 +2026,37 @@ mod tests {
             ),
         ));
         factory
+    }
+
+    /// Build the kernel-only factory (2c.2's tool-selection tests): the
+    /// `make_factory` shape WITHOUT the app policy factory — the registry
+    /// carries no app-owned tools (the free agent's shape; row 5's letter).
+    fn make_free_factory(dir: &std::path::Path) -> AgentLoopFactory {
+        let provider: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(vec![]));
+        let sandbox = Arc::new(Sandbox::new(dir).unwrap());
+        let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+        let store: Arc<dyn MemoryStoreTrait> =
+            Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+        let gpath = dir.join("global.md");
+        let ppath = dir.join("project.md");
+        std::fs::write(&gpath, "").unwrap();
+        std::fs::write(&ppath, "").unwrap();
+        let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
+        AgentLoopFactory::new(
+            provider,
+            source,
+            Some(store),
+            sandbox,
+            dir.to_path_buf(),
+            None,
+            Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+            ContextManager::new(128_000, 0.5),
+            dir.join("plans"),
+            None,
+        )
+        .with_staleness_log(crate::index_staleness::StalenessLog::at(
+            dir.join(".mnemo-staleness"),
+        ))
     }
 
     /// A mock vision model for registration tests — never makes a network call.
@@ -3219,6 +3491,205 @@ mod tests {
             registry.iter().count(),
             expected.len(),
             "registered tool count should match the expected set exactly"
+        );
+    }
+
+    /// A minimal canned resolver (2c.2's list_models gating test): the
+    /// factory wiring just needs the slot PRESENT so `list_models`
+    /// registers; nothing resolves in these tests.
+    struct StubResolver;
+
+    #[async_trait::async_trait]
+    impl crate::model_resolver::ModelResolver for StubResolver {
+        fn resolve(
+            &self,
+            _ctx: crate::model_resolver::ModelContext,
+        ) -> Option<crate::config::ModelRef> {
+            Some(crate::config::ModelRef {
+                endpoint: "stub".into(),
+                model: "stub-model".into(),
+                reasoning_effort: None,
+            })
+        }
+        fn build_turn_provider(
+            &self,
+            _model: &crate::config::ModelRef,
+            _fill_rate: f64,
+        ) -> Option<(
+            Arc<dyn crate::provider::LlmClient>,
+            crate::agent::context::ContextManager,
+        )> {
+            None
+        }
+    }
+
+    #[test]
+    fn tool_selection_registers_only_read_group() {
+        // 2c.2 (G2, row 26's kernel form): a selection of just Read must
+        // register exactly the read tools and nothing else — no write, no
+        // shell, no reviewer channel (Host), no loader (Mcp), no
+        // memory/vision/spawn, and no app tools (no policy factory wired).
+        let dir = tempdir().unwrap();
+        let factory = make_free_factory(dir.path()).with_tool_selection(ToolSelection {
+            include: vec![ToolGroup::Read],
+            exclude: Vec::new(),
+        });
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
+        for name in ["read_files", "expand_result", "search", "search_read"] {
+            assert!(
+                registry.get(name).is_some(),
+                "expected read tool '{name}' registered"
+            );
+        }
+        let names: Vec<String> = registry
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(
+            names.len(),
+            4_usize,
+            "the Read-only selection must register exactly the read tools; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn free_default_excludes_the_reviewer_channel() {
+        // 2c.2 (G2, row 5): the free agent's constant surface = every kernel
+        // group EXCEPT Host — the reviewer channel (write_review_report) is
+        // the workflow's, so a free agent advertises no review tool. The
+        // workflow (None) default stays full (the expected-names test above).
+        let dir = tempdir().unwrap();
+        let factory =
+            make_free_factory(dir.path()).with_tool_selection(ToolSelection::free_default());
+        factory.set_spawner(Arc::new(MockSpawner));
+        assert!(registry_contains(
+            &factory,
+            &dir,
+            "write_review_report"
+        ) == false, "no review tool in the free surface");
+        for name in [
+            "read_files",
+            "file_edit",
+            "file_write",
+            "shell",
+            "search",
+            "web_fetch",
+            "git",
+            "load_tools",
+            "memory_write",
+            "memory_search",
+            "spawn_agent",
+        ] {
+            assert!(
+                registry_contains(&factory, &dir, name),
+                "expected '{name}' in the free surface"
+            );
+        }
+        let count = registry_len(&factory, &dir);
+        // The browser family is feature-gated (10 offscreen + 6 on-screen).
+        let expected = if cfg!(feature = "browser") { 44 } else { 28 };
+        assert_eq!(
+            count,
+            expected,
+            "the free surface = the kernel tools minus the review tool and the app tools (spawner wired, no resolver)"
+        );
+    }
+
+    /// Build a registry through the factory's production path — the shared
+    /// harness of the tool-selection tests.
+    fn registry_for_factory(factory: &AgentLoopFactory, dir: &tempfile::TempDir) -> ToolRegistry {
+        let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+        factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        )
+    }
+
+    fn registry_contains(
+        factory: &AgentLoopFactory,
+        dir: &tempfile::TempDir,
+        name: &str,
+    ) -> bool {
+        registry_for_factory(factory, dir).get(name).is_some()
+    }
+
+    fn registry_len(factory: &AgentLoopFactory, dir: &tempfile::TempDir) -> usize {
+        registry_for_factory(factory, dir).iter().count()
+    }
+
+    #[test]
+    fn list_models_and_spawn_require_the_spawn_group() {
+        // 2c.2 (G2, §5.9.2 :641): list_models registers only with the Spawn
+        // group; spawn_agent likewise rides its group gate.
+        let dir = tempdir().unwrap();
+        let factory = make_free_factory(dir.path())
+            .with_model_resolver(Arc::new(StubResolver) as Arc<dyn crate::model_resolver::ModelResolver>)
+            .with_tool_selection(ToolSelection {
+                include: vec![ToolGroup::Spawn],
+                exclude: Vec::new(),
+            });
+        factory.set_spawner(Arc::new(MockSpawner));
+        let registry = registry_for_factory(&factory, &dir);
+        assert!(registry.get("spawn_agent").is_some(), "spawn with the Spawn group");
+        assert!(
+            registry.get("list_models").is_some(),
+            "list_models registers with the Spawn group + a resolver"
+        );
+        // And WITHOUT the group — even with both wires in — absent:
+        let dir2 = tempdir().unwrap();
+        let factory2 = make_free_factory(dir2.path())
+            .with_model_resolver(Arc::new(StubResolver) as Arc<dyn crate::model_resolver::ModelResolver>)
+            .with_tool_selection(ToolSelection {
+                include: vec![ToolGroup::Read],
+                exclude: Vec::new(),
+            });
+        factory2.set_spawner(Arc::new(MockSpawner));
+        let registry2 = registry_for_factory(&factory2, &dir2);
+        assert!(
+            registry2.get("list_models").is_none(),
+            "list_models must not register without the Spawn group"
+        );
+        assert!(
+            registry2.get("spawn_agent").is_none(),
+            "spawn_agent must not register without the Spawn group"
+        );
+    }
+
+    #[test]
+    fn tool_selection_exclude_carves_named_tools() {
+        // 2c.2 (G2): the exclude leg of selects() — a named carve-out skips
+        // just that tool inside an included group.
+        let dir = tempdir().unwrap();
+        let factory =
+            make_free_factory(dir.path()).with_tool_selection(ToolSelection {
+                include: ToolSelection::free_default().include,
+                exclude: vec!["memory_search".to_string()],
+            });
+        factory.set_spawner(Arc::new(MockSpawner));
+        let registry = registry_for_factory(&factory, &dir);
+        assert!(
+            registry.get("memory_search").is_none(),
+            "memory_search must be carved out"
+        );
+        assert!(
+            registry.get("memory_write").is_some(),
+            "the rest of the Memory group stays"
+        );
+        let count = registry.iter().count();
+        // The browser family is feature-gated (10 offscreen + 6 on-screen).
+        let expected = if cfg!(feature = "browser") { 43 } else { 27 };
+        assert_eq!(
+            count,
+            expected,
+            "free surface minus the carved tool"
         );
     }
 

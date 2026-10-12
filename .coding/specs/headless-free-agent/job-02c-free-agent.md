@@ -347,4 +347,46 @@ D1/D2's provisional wording where they differ):
   asserting the free identity prefix); the holder tests ride
   with_coding_default().
 - The battery green: cargo test -p mnemo; -p mnemo --features
-  browser,embeddings; --workspace; build --workspace; the goldens trio 3/3.
+  browser,embeddings; --workspace; build --workspace; the goldens trio 3/3.Amendment (2027-01-14, step 2c.2 — the landed D3 picks, supersede §B D3 where
+they differ):
+- ToolGroup/ToolSelection/group_allowed live at factory.rs MODULE scope
+  (nested impl-block items are illegal Rust — the first placement attempt was
+  caught by cargo and re-landed module-level).
+- The group map (the landed letter, §5.9.2 :634-642): Read = read_files,
+  expand_result, search, search_read (expand_result unlisted in the spec's
+  Read shorthand — the read family picked); Write = file_edit, multi_edit,
+  file_write, convert_line_endings (the spec's file_append = the file_write
+  append mode — no separate kernel tool); Shell/Git/Web/Browser/Codegraph/
+  Memory = whole-body gated (the fn-top group_allowed); Spawn = spawn_agent +
+  list_models; Mcp = load_tools + the McpReveal wiring; AskUser = kernel-side
+  none (app-owned post-2b; enum-only); Host = write_review_report (row 5's
+  letter — a free agent advertises no review tool).
+- The EXCLUDE = a post-registration PRUNE on the WHOLE array
+  (ToolRegistry::unregister + the build_registry prune, before the deferred
+  snapshot) — the spec's "the tool array never advertises tools the caller
+  excluded" reads whole-array, not just the kernel's per-name sites; the
+  prune also covers the app-owned tools when the caller names them.
+- The factory field: tool_selection: Option<ToolSelection> — None = full =
+  today's exact registration order (the byte-golden
+  expected_tool_names_registered_when_fully_wired untouched and green);
+  with_tool_selection = the builder. The Engine's per-agent SpawnOptions
+  supply remains a 3a-forward.
+- ToolSelection::free_default() = every group except Host (the free agent's
+  constant surface).
+- The kernel-only test factory (make_free_factory — the make_factory shape
+  minus the app policy-factory wire; the wire = production's 2b.3 shape and
+  the app surface is UNGATED in 2c, so the G2 gating tests must run
+  kernel-only to isolate the selection).
+- Tests: tool_selection_registers_only_read_group (row 26's kernel form;
+  the names diagnostic then converted to the count message),
+  free_default_excludes_the_reviewer_channel (row 5),
+  list_models_and_spawn_require_the_spawn_group (the Spawn gating + the
+  resolver-conditional shape), tool_selection_exclude_carves_named_tools
+  (the exclude leg), + StubResolver (the minimal ModelResolver mock) +
+  registry_for_factory/registry_contains/registry_len helpers. The free
+  surface counts are FEATURE-AWARE (the browser family = 16 feature-gated
+  tools: 44 with, 28 without; the carved = 43/27 — cfg!(feature =
+  "browser") branches).
+- The battery green: cargo test -p mnemo; the feature build
+  (--features browser,embeddings); --workspace; build --workspace; the
+  goldens trio 3/3.

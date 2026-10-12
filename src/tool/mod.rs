@@ -1165,6 +1165,15 @@ impl ToolRegistry {
             .insert(tool.name().to_string(), std::sync::Arc::from(tool));
     }
 
+    /// Remove a registered tool by name (2c.2/G2: the `ToolSelection`
+    /// exclude = a per-name carve-out — the tool array never advertises
+    /// tools the caller excluded). Not for dynamically revealed MCP tools
+    /// (they ride the shared slot, not this map). Returns whether it was
+    /// present.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Look up a tool by name (registered or dynamically revealed).
     /// Returns an owned `Arc` clone so callers can hold the tool across
     /// awaits without borrowing the registry.

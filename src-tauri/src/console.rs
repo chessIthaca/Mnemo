@@ -906,7 +906,7 @@ struct ReplState {
     /// Each agent's last observed workflow state, for the Complete→Executing
     /// transition that triggers inactive-subagent cleanup (mirrors the GUI
     /// forwarder's `prev_workflow_state`).
-    prev_workflow_state: std::collections::HashMap<AgentId, mnemo::workflow::WorkflowState>,
+    prev_workflow_state: std::collections::HashMap<AgentId, String>,
 }
 
 /// Print the idle prompt marker (`> `) and flush — called at startup and
@@ -1008,10 +1008,9 @@ async fn handle_event(
             // Complete → Executing = a fresh plan started — cancel INACTIVE
             // subagents from the previous plan (running ones are left
             // alone), mirroring the GUI forwarder.
-            let was_complete = state.prev_workflow_state.get(&id)
-                == Some(&mnemo::workflow::WorkflowState::Complete);
-            state.prev_workflow_state.insert(id, new_state);
-            if was_complete && new_state == mnemo::workflow::WorkflowState::Executing {
+            let was_complete = state.prev_workflow_state.get(&id).is_some_and(|s| s == "complete");
+            state.prev_workflow_state.insert(id, new_state.clone());
+            if was_complete && new_state == "executing" {
                 runtime.cleanup_inactive_subagents(id).await;
             }
         }
@@ -1223,7 +1222,18 @@ pub(crate) async fn run_console() -> i32 {
     // here: console opens no store (review finding 7 keeps `backlog_add` and
     // its siblings out of console registries — the policy factory's
     // None-wired backlog slot reproduces that exactly while `ask_user` stays).
-    let policy_factory = Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new());
+    // 2b.3: the skill library loads bin-side (the kernel factory's skills
+    // surface retired) — the same `.coding/skills/*.toml` dir the GUI arm
+    // loads, handed to the app factory so the skill tools resolve.
+    let skills_dir = brain.project.lock().await.skills_dir.clone();
+    let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
+    let policy_factory = Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new(
+        brain.factory.memory_handle(),
+        brain.factory.knowledge_handle(),
+        brain.factory.codegraph_handle(),
+        brain.factory.reviews_dir(),
+        Some(skills),
+    ));
     let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> = policy_factory.clone();
     brain.factory.set_policy_factory(factory_dyn);
     let laya_cfg = brain.config.lock().await.general.general.laya.clone();

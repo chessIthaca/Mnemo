@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::memory::{MemoryRecordType, MemorySearchConfig};
-use crate::workflow::PlanFile;
+use crate::memory::plan_format::PlanFile;
 
 use super::{budgeted_digest, first_commit_hash, first_content_line, truncate_title, SourceRecord};
 

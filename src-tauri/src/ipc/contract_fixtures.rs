@@ -25,8 +25,8 @@ use serde_json::Value;
 
 use mnemo::config::{OptimizerConfig, SafetyMode};
 use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
-use mnemo::workflow::plan_file::PlanFile;
-use mnemo::workflow::WorkflowState;
+use mnemo::app::workflow::plan_file::PlanFile;
+use mnemo::app::workflow::WorkflowState;
 
 use crate::ipc::settings::{BudgetWire, RoutingWire};
 
@@ -38,7 +38,7 @@ use crate::ipc::settings::{
     GetSettingsUi, LayaWire, ModelsConfigWire, ProjectWire, SaveEndpointsResponse,
     SaveSettingsResponse,
 };
-use mnemo::backlog::{BacklogItem, BacklogStatus};
+use mnemo::app::backlog::{BacklogItem, BacklogStatus};
 
 /// Resolve the absolute path of a fixture under
 /// `frontend/src/lib/ipc-fixtures/` from the app crate's manifest dir

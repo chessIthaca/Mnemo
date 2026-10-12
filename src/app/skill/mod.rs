@@ -29,6 +29,7 @@ use std::sync::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::app::workflow::WorkflowState;
+use crate::project::skills_seed::SHIPPED_SKILLS;
 
 /// The spec for one skill, loaded from a `.coding/skills/<name>.toml` file.
 ///
@@ -276,35 +277,6 @@ impl SkillLibrary {
     }
 }
 
-/// The skills shipped with the app, compiled into the binary as
-/// `(name, toml_text)` pairs via `include_str!`. [`crate::project::Project::init`]
-/// seeds each into a project's `.coding/skills/` directory (write-if-missing),
-/// so every new project — and an existing one whose skill files were deleted —
-/// starts with the same baseline skill set as the main installation, without
-/// depending on the app's source tree being present at runtime.
-///
-/// The baseline is `merge_to_main` (landing a working branch) plus
-/// `create_skill` (plan-free skill authoring — its prompt is written to read
-/// correctly OUTSIDE the app repo too, so a seeded copy is never misleading).
-/// The skills that deliberately do NOT ship are declared in
-/// [`REPO_LOCAL_SKILLS`], and the guard test
-/// `every_repo_skill_is_shipped_or_declared_repo_local` makes every future
-/// repo skill pick a side instead of silently never shipping.
-///
-/// Adding a shipped skill takes TWO edits: drop the TOML into the repo's own
-/// `.coding/skills/<name>.toml` AND add one entry here (the file is embedded
-/// at compile time; nothing is read from disk at runtime).
-pub const SHIPPED_SKILLS: &[(&str, &str)] = &[
-    (
-        "merge_to_main",
-        include_str!("../../../.coding/skills/merge_to_main.toml"),
-    ),
-    (
-        "create_skill",
-        include_str!("../../../.coding/skills/create_skill.toml"),
-    ),
-];
-
 /// Is `name` one of the skills shipped with the app ([`SHIPPED_SKILLS`])?
 ///
 /// `skill_create` refuses these names. A shipped file is the source of truth
@@ -342,27 +314,6 @@ pub const REPO_LOCAL_SKILLS: &[(&str, &str)] = &[
          pull_request ruleset 23755694 PR path are meaningless in a user's project",
     ),
 ];
-
-/// Seed the [`SHIPPED_SKILLS`] into `skills_dir` (a project's
-/// `.coding/skills/`): the directory is created when missing and each shipped
-/// skill is written as `<name>.toml` — but ONLY when that file does not
-/// already exist, so a user-modified or project-specific skill is never
-/// overwritten. Re-seeding a populated directory is a no-op; deleting a skill
-/// file (or the whole directory) makes the next project init self-heal it.
-///
-/// Returns the underlying I/O error when the directory cannot be created or a
-/// first write fails.
-pub fn seed_skills(skills_dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(skills_dir)?;
-    for (name, text) in SHIPPED_SKILLS {
-        let path = skills_dir.join(format!("{name}.toml"));
-        if path.exists() {
-            continue;
-        }
-        std::fs::write(&path, text)?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

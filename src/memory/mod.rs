@@ -17,6 +17,7 @@ pub mod finish_capture;
 pub mod indexer;
 pub mod knowledge;
 pub mod maintenance;
+pub mod plan_format;
 pub mod schema;
 pub mod strength;
 pub mod types;

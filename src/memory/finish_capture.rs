@@ -43,7 +43,7 @@ use crate::memory::indexer::{budgeted_digest, first_commit_hash};
 use crate::memory::{
     Memory, MemoryClass, MemoryFilter, MemoryRecordType, MemoryStoreTrait, MemoryTier,
 };
-use crate::workflow::{PlanFile, PlanKind};
+use crate::memory::plan_format::{PlanFile, PlanKind};
 
 /// What a finish capture wrote.
 #[derive(Debug, Default)]

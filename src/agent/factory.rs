@@ -36,8 +36,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::Mutex;
-
 use crate::agent::context::ContextManager;
 use crate::agent::{reflex::ReflexHandle, step_verify::StepVerifyHandle, AgentLoop, AgentLoopConfig};
 use crate::config::{BudgetConfig, OptimizerConfig, SafetyMode, ShellFilterConfig, VerifyConfig};
@@ -48,7 +46,6 @@ use crate::provider::vision::{ImageDescriber, SwappableVision};
 use crate::provider::{LlmClient, SwappableProvider};
 use crate::runtime::AgentSpawner;
 use crate::safety_rules::SafetyRules;
-use crate::skill::SkillLibrary;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::agent::{
     convert_line_endings::ConvertLineEndingsTool,
@@ -79,14 +76,7 @@ use crate::tool::memory::{
     AutoTypingHandle, MemoryAmendTool, MemoryConsolidateTool, MemoryDeleteTool,
     MemorySupersedeTool, MemoryUpdateTool, MemoryWriteTool,
 };
-use crate::tool::workflow::plan::{
-    AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
-};
-use crate::tool::workflow::skill::{
-    AbandonSkillTool, SkillCreateTool, SkillEndTool, SkillReloadTool, SkillStartTool,
-};
 use crate::tool::ToolRegistry;
-use crate::workflow::Workflow;
 
 /// A per-agent root override for parallel run-all worktree agents
 /// (plan ffd7a86f).
@@ -212,13 +202,7 @@ pub struct AgentLoopFactory {
     /// NoPolicyFactory — production and the kernel test helpers wire the
     /// app implementation via set_policy_factory before the first build.
     policy_factory: RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>,
-    /// The skill library — the `.coding/skills/` dir plus the LIVE registry it
-    /// holds. Shared across all agents, and reloadable in place: a skill file
-    /// authored mid-session (`skill_create`) or edited by hand + `skill_reload`
-    /// is picked up without rebuilding anything. The skill tools consult it to
-    /// validate + look up a skill's tool allow-list + prompt. `None` when no
-    /// skills dir was configured (tests).
-    skills: Option<Arc<SkillLibrary>>,
+
     /// An optional per-context model resolver. When present, every built agent
     /// gets it wired in so the turn driver can pick a model per workflow state
     /// / skill / subagent. `None` in tests / when no `[models]` section is
@@ -360,8 +344,7 @@ impl AgentLoopFactory {
             descendant_tracker: RwLock::new(None),
             policy_factory: RwLock::new(None),
             // No skill registry at construction — the IPC layer wires it in
-            // via `with_skills` once the project's skills dir is known.
-            skills: None,
+
             // No model resolver at construction — the IPC layer wires it in
             // via `with_model_resolver` once the live config handle is known.
             model_resolver: None,
@@ -553,15 +536,14 @@ impl AgentLoopFactory {
         self
     }
 
-    /// Wire in the [`SkillLibrary`] (the `.coding/skills/` dir + the registry
-    /// loaded from it). Called once by the IPC layer at startup. Affects agents
-    /// built **after** this call (the library is read per `build`), so the IPC
-    /// layer sets it before building the main agent. When `None`, the skill
-    /// tools are omitted (no skills available).
-    pub fn with_skills(mut self, skills: Arc<SkillLibrary>) -> Self {
-        self.skills = Some(skills);
-        self
+
+    pub fn knowledge_handle(&self) -> Option<Arc<KnowledgeStore>> {
+        self.knowledge.clone()
     }
+
+    /// The knowledge-store handle (2b.3): the bin arms construct the app
+    /// policy factory from this accessor — the plan/skill registrations it
+    /// owns carry the same wiring the kernel registrations had.
 
     /// Wire in a per-context [`ModelResolver`]. Called once by the IPC layer
     /// at startup. Affects agents built **after** this call (the resolver is
@@ -846,12 +828,6 @@ impl AgentLoopFactory {
         self.memory.clone()
     }
 
-    /// A handle to the shared skill library (if any). The IPC layer's
-    /// `enter_skill` command uses this to validate + look up a skill when the
-    /// UI button starts a skill.
-    pub fn skills_handle(&self) -> Option<Arc<SkillLibrary>> {
-        self.skills.clone()
-    }
 
     /// The proxy cache ceiling the factory's context managers are built
     /// with — the startup snapshot (backlog ffd4bac3): the run-all
@@ -948,11 +924,24 @@ impl AgentLoopFactory {
         // `enter_subagent_state()`: a sub-agent is a single-task worker, not
         // a plan-lifecycle owner, and no behavioral gate may key on a state
         // it never owned.
-        let workflow = Arc::new(Mutex::new({
-            let mut wf = Workflow::new(plans_dir.clone());
-            let _ = wf.load_latest();
-            wf
-        }));
+        // 2b.3: the workflow construction moved app-side (the kernel never
+        // names the app type): the wired factory's create_workflow builds
+        // it — loading the latest plan from disk so a newly-spawned agent
+        // resumes an in-flight plan, and stamping the Subagent state when
+        // the loop's own flag says so (the spawn path's belt-and-braces
+        // post-build stamp rides the app side through the same handle). The
+        // unwired (NoPolicy) factories get the kernel UnwiredWorkflow —
+        // every consult reads the neutral defaults.
+        let factory_slot0 = self
+            .policy_factory
+            .read()
+            .expect("policy_factory lock poisoned");
+        let workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> =
+            match factory_slot0.as_ref() {
+                Some(pf) => pf.create_workflow(&plans_dir, false),
+                None => Arc::new(crate::agent::workflow_handle::UnwiredWorkflow),
+            };
+        drop(factory_slot0);
 
         // Fresh per-agent tool registry, wired to this agent's workflow and
         // stamped with this agent's id (for the parent-aware spawn_agent tool).
@@ -1019,14 +1008,9 @@ impl AgentLoopFactory {
                         agent_id: agent_id.clone(),
                         project_root: self.project_root.clone(),
                         plans_dir: plans_dir,
-                        // The unsize coercion needs the annotated move (the
-                        // 2a.5-era lesson): Arc::clone's generic T would
-                        // otherwise infer through the dyn target.
-                        workflow: {
-                            let handle: Arc<dyn std::any::Any + Send + Sync> =
-                                agent.workflow_handle();
-                            handle
-                        },
+                        // The handle passes straight through — the ctx field
+                        // IS the neutral trait type since 2b.3 (no cast).
+                        workflow: agent.workflow_handle(),
                     };
                     pf.build_policy(&ctx)
                 }
@@ -1148,7 +1132,7 @@ impl AgentLoopFactory {
     /// + conditionals (skills/spawner/memory are optional) are unchanged.
     fn build_registry(
         &self,
-        workflow: &Arc<Mutex<Workflow>>,
+        workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         agent_id: Option<crate::runtime::AgentId>,
         root: Option<&AgentRootSpec>,
         plans_dir: &Path,
@@ -1173,14 +1157,13 @@ impl AgentLoopFactory {
         let mut registry =
             ToolRegistry::with_groups(crate::tool::LoadedGroups::new(), mcp_table.clone());
         self.register_agent_tools(&mut registry, &sandbox, root);
-        self.register_workflow_tools(&mut registry, workflow, root, plans_dir);
-        // 2b.2: the app-owned tools (ask_user + the backlog trio whose wiring
-        // is app-side) register via the policy factory — D5: kernel-called,
-        // app-owned. Placed right after register_workflow_tools (the moved
-        // block sat at its tail) so the registry's insertion ORDER is
-        // byte-stable vs pre-2b.2.
-        self.register_policy_factory_tools(&mut registry, agent_id, plans_dir);
-        self.register_skill_tools(&mut registry, workflow, &sandbox);
+        // 2b.2/2b.3: the app-owned tools (the plan/skill sets moved in 2b.3,
+        // ask_user + the backlog trio) register via the policy factory — D5:
+        // kernel-called, app-owned. The delegate sits at the position the
+        // plan-tool block held, and the app impl preserves today's relative
+        // order (plan tools, ask_user, backlog, skill tools), so the
+        // registry's insertion ORDER stays byte-stable.
+        self.register_policy_factory_tools(&mut registry, agent_id, root, plans_dir, &sandbox, workflow);
         self.register_vision_tool(&mut registry, &sandbox);
         self.register_memory_tools(&mut registry, root);
         self.register_codegraph_tools(&mut registry, root);
@@ -1222,7 +1205,7 @@ impl AgentLoopFactory {
     /// (`plans_dir.parent().join("reviews")`). Used to construct the
     /// `write_review_report` tool so the reviewer subagent's single output
     /// channel writes to the same dir `finish` later validates.
-    fn reviews_dir(&self) -> std::path::PathBuf {
+    pub fn reviews_dir(&self) -> std::path::PathBuf {
         self.plans_dir
             .parent()
             .map(|p| p.join("reviews"))
@@ -1334,81 +1317,6 @@ impl AgentLoopFactory {
         StepVerifyHandle::new(Arc::clone(&self.verify), Arc::clone(&self.optimizer)).with_root(root)
     }
 
-    /// Register the plan-workflow tools (always present). These mutate the
-    /// per-agent `Workflow` (create/complete/update/abandon a plan) and write
-    /// the project's own `.coding/plans/` bookkeeping.
-    fn register_workflow_tools(
-        &self,
-        registry: &mut ToolRegistry,
-        workflow: &Arc<Mutex<Workflow>>,
-        root: Option<&AgentRootSpec>,
-        plans_dir: &Path,
-    ) {
-        let mut create = CreatePlanTool::new(workflow.clone());
-        if let Some(store) = &self.memory {
-            create = create.with_memory(store.clone());
-        }
-        registry.register(Box::new(create));
-        // The harness-run verify handle rides the plan-step tick (the
-        // cost-saving chain's verification item): a successful skeleton
-        // complete_step runs `[general.verify]`'s command and appends the
-        // compact evidence note — no model roundtrip spent deciding to run.
-        let mut complete_step = CompleteStepTool::new(workflow.clone())
-            .with_step_verify(self.step_verify_handle(root));
-        // The budget layer's evidence row (backlog a25a5323): with the store
-        // wired, a successful verification records its outcome in the
-        // `spend_events` ledger for the per-plan cost report.
-        if let Some(store) = &self.memory {
-            complete_step = complete_step.with_memory(store.clone());
-        }
-        registry.register(Box::new(complete_step));
-        registry.register(Box::new(UpdatePlanTool::new(workflow.clone())));
-        // abandon_plan supersedes the abandoned plan's lingering crash
-        // markers when the memory store is wired (Phase 4 hygiene — mirrors
-        // finish's marker supersede; see AbandonPlanTool::with_memory).
-        let mut abandon = AbandonPlanTool::new(workflow.clone());
-        if let Some(store) = &self.memory {
-            abandon = abandon.with_memory(store.clone());
-        }
-        registry.register(Box::new(abandon));
-        // finish is the only path from Reviewing → Complete, gated on a review
-        // report under .coding/reviews/ (the closing sequence's exit gate).
-        // The reviews dir is the factory's main-derived path (NOT the per-agent
-        // workflow's plans_dir) so a per-agent plans dir doesn't redirect it.
-        // Phase 4: the finish hook also auto-captures the PLAN:/BUG: digests
-        // (memory) and gates bug_fixing regression tests on the code graph.
-        let mut finish = FinishTool::new(workflow.clone(), self.reviews_dir());
-        if let Some(store) = &self.memory {
-            finish = finish.with_memory(store.clone());
-        }
-        // The knowledge-file backing: the BUG: capture lands in a knowledge
-        // file (the truth) instead of an authored row — same store-derived
-        // path as the memory tools' backing.
-        if let Some(knowledge) = &self.knowledge {
-            finish = finish.with_knowledge(knowledge.clone());
-        }
-        // A root-spec agent's finish gate validates regression tests against
-        // the worktree's graph (the spec's), not the factory's.
-        let finish_graph = match root {
-            Some(spec) => spec.codegraph.clone(),
-            None => self.codegraph.clone(),
-        };
-        if let Some(graph) = &finish_graph {
-            finish = finish.with_codegraph(graph.clone());
-        }
-        registry.register(Box::new(finish));
-        // current_plan is a read-only query (available in every state, like
-        // ask_user + memory tools) so the agent can recover when disoriented
-        // about which stacked plan is active.
-        // current_plan reads the plan file for THIS agent's workflow stack —
-        // the build's plans dir (main dir, per-agent dir, or worktree dir),
-        // not the factory's main dir (a worktree agent must see its own
-        // plans, not the main agent's).
-        registry.register(Box::new(CurrentPlanTool::new(
-            workflow.clone(),
-            plans_dir.to_path_buf(),
-        )));
-    }
 
     /// Register the app-owned tools via the policy factory (2b.2; D5:
     /// kernel-called, app-owned). The app impl does the registering; the
@@ -1419,7 +1327,10 @@ impl AgentLoopFactory {
         &self,
         registry: &mut ToolRegistry,
         agent_id: Option<crate::runtime::AgentId>,
+        root: Option<&AgentRootSpec>,
         plans_dir: &Path,
+        sandbox: &Sandbox,
+        workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     ) {
         let slot = self
             .policy_factory
@@ -1429,48 +1340,16 @@ impl AgentLoopFactory {
             agent_id,
             project_root: self.project_root.clone(),
             plans_dir: plans_dir.to_path_buf(),
+            root: root.cloned(),
+            sandbox: sandbox.clone(),
+            step_verify: self.step_verify_handle(root),
+            workflow: Arc::clone(workflow),
         };
         if let Some(pf) = slot.as_ref() {
             pf.register_tools(registry, &ctx);
         }
     }
 
-    /// Register the skill tools — `skill_start` (gated to Complete + Planning
-    /// by ToolFilter), `skill_end` + `abandon_skill` (only meaningful while a
-    /// skill is active; exposed by the Skill filter unconditionally),
-    /// `skill_reload` (every workflow state, an active skill included) and
-    /// `skill_create` (Executing-only in the base states; under a skill it
-    /// needs an explicit allow-list entry — the `create_skill` overlay grants
-    /// it, so authoring needs no plan). All AutoRun — protection is on the
-    /// operations inside the skill (e.g. git merge/push are never_auto_for),
-    /// not the entry or the authoring. Omitted entirely when no skill library
-    /// is configured (tests).
-    fn register_skill_tools(
-        &self,
-        registry: &mut ToolRegistry,
-        workflow: &Arc<Mutex<Workflow>>,
-        sandbox: &Sandbox,
-    ) {
-        if let Some(skills) = &self.skills {
-            registry.register(Box::new(SkillStartTool::new(
-                workflow.clone(),
-                Arc::clone(skills),
-            )));
-            registry.register(Box::new(SkillEndTool::new(workflow.clone())));
-            registry.register(Box::new(AbandonSkillTool::new(workflow.clone())));
-            registry.register(Box::new(SkillReloadTool::new(Arc::clone(skills))));
-            // The authoring tool gets the AGENT's sandbox (a root-spec agent
-            // gets its worktree's), so skill_create obeys the same path policy
-            // the file tools do: the link-free creation ladder + the `.coding/`
-            // hardlink guard. A worktree agent therefore cannot author into
-            // another tree's skills dir — by design, mirroring every other
-            // write (review HIGH 1, 2027-01-16).
-            registry.register(Box::new(SkillCreateTool::new(
-                Arc::clone(skills),
-                sandbox.clone(),
-            )));
-        }
-    }
 
     /// Register the headless-browser tools (always present when the `browser`
     /// feature is selected). They share the
@@ -1709,7 +1588,7 @@ impl AgentLoopFactory {
     fn register_spawn_tool(
         &self,
         registry: &mut ToolRegistry,
-        workflow: &Arc<Mutex<Workflow>>,
+        workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         project_root: &Path,
         agent_id: Option<crate::runtime::AgentId>,
     ) {
@@ -1750,15 +1629,33 @@ impl AgentLoopFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 2b.3: the production imports retired with the kernel decoupling; the
+    // tests keep the concrete app types (cfg(test) — scan-excluded).
+    use crate::app::workflow::Workflow;
+    use tokio::sync::Mutex;
+
+    /// The concrete app workflow behind a loop's neutral handle (2b.3): the
+    /// tests read the rich surface through the same app→app downcast the IPC
+    /// uses.
+    fn concrete(
+        handle: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
+    ) -> Arc<Mutex<Workflow>> {
+        handle
+            .as_any_arc()
+            .downcast_ref::<Arc<Mutex<Workflow>>>()
+            .expect("the loop's workflow handle wraps the concrete app workflow")
+            .clone()
+    }
     use crate::config::SafetyMode;
     use crate::memory::embedder::HashEmbedder;
     use crate::memory::MemoryStore;
     use crate::provider::{
         Capabilities, FinishReason, LlmEvent, Message, ProviderKind, ToolSchema,
     };
-    use crate::tool::workflow::plan::CreatePlanTool;
+    use crate::app::tool::workflow::plan::CreatePlanTool;
     use crate::tool::Tool;
-    use crate::workflow::WorkflowState;
+    use crate::app::skill::SkillLibrary;
+    use crate::app::workflow::WorkflowState;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use serde_json::json;
@@ -1831,7 +1728,9 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
-        AgentLoopFactory::new(
+        // Test hygiene (backlog fc1d57fe): the staleness log lives in the
+        // temp dir — no test may write the real ~/.mnemo.
+        let factory = AgentLoopFactory::new(
             provider,
             source,
             Some(store),
@@ -1843,11 +1742,23 @@ mod tests {
             dir.join("plans"),
             vision,
         )
-        // Test hygiene (backlog fc1d57fe): the staleness log lives in the
-        // temp dir — no test may write the real ~/.mnemo.
         .with_staleness_log(crate::index_staleness::StalenessLog::at(
             dir.join(".mnemo-staleness"),
-        ))
+        ));
+        // 2b.3: the production shape wires the app policy factory — without
+        // it a build's loop gets the UnwiredWorkflow handle and every
+        // concrete-reading assert fails. The None wiring = the test base
+        // (per-test wirings replace it — the plain-slot write, last wins).
+        factory.set_policy_factory(Arc::new(
+            crate::app::policy_factory::WorkflowPolicyFactory::new(
+                None,
+                None,
+                None,
+                std::path::PathBuf::new(),
+                None,
+            ),
+        ));
+        factory
     }
 
     /// A mock vision model for registration tests — never makes a network call.
@@ -1877,28 +1788,28 @@ mod tests {
 
         // Both start in Planning (no plan on disk).
         {
-            let wf_a_arc = agent_a.workflow_handle();
-            let wf_b_arc = agent_b.workflow_handle();
-            let wf_a = wf_a_arc.lock().await;
-            let wf_b = wf_b_arc.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let wf_a = handle.lock().await;
+            let handle = concrete(&agent_b.workflow_handle());
+            let wf_b = handle.lock().await;
             assert_eq!(wf_a.state(), WorkflowState::Planning);
             assert_eq!(wf_b.state(), WorkflowState::Planning);
         }
 
         // Create a plan in agent A's workflow directly.
         {
-            let wf_a_arc = agent_a.workflow_handle();
-            let mut wf_a = wf_a_arc.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let mut wf_a = handle.lock().await;
             wf_a.create_plan("A's plan", "goal", "ctx", vec!["step1".into()])
                 .unwrap();
         }
 
         // Agent A is now Executing; agent B must still be Planning.
         {
-            let wf_a_arc = agent_a.workflow_handle();
-            let wf_b_arc = agent_b.workflow_handle();
-            let wf_a = wf_a_arc.lock().await;
-            let wf_b = wf_b_arc.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let wf_a = handle.lock().await;
+            let handle = concrete(&agent_b.workflow_handle());
+            let wf_b = handle.lock().await;
             assert_eq!(wf_a.state(), WorkflowState::Executing);
             assert_eq!(
                 wf_b.state(),
@@ -1920,8 +1831,8 @@ mod tests {
         // Agent A creates a plan (writes it to disk).
         let agent_a = factory.build();
         {
-            let wf_a_arc = agent_a.workflow_handle();
-            let mut wf_a = wf_a_arc.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let mut wf_a = handle.lock().await;
             wf_a.create_plan("Resume me", "goal", "ctx", vec!["a".into(), "b".into()])
                 .unwrap();
             wf_a.complete_step(0).unwrap();
@@ -1930,8 +1841,8 @@ mod tests {
         // Agent B is built from the same factory — it should load the plan
         // from disk and resume at step 1 (Executing, one step done).
         let agent_b = factory.build();
-        let wf_b_arc = agent_b.workflow_handle();
-        let wf_b = wf_b_arc.lock().await;
+        let handle = concrete(&agent_b.workflow_handle());
+        let wf_b = handle.lock().await;
         assert_eq!(wf_b.state(), WorkflowState::Executing);
         assert!(wf_b.plan().is_some());
         assert_eq!(wf_b.plan().unwrap().completed_count(), 1);
@@ -2131,7 +2042,12 @@ mod tests {
         let spawner = Arc::new(RecordingSpawner::new());
         factory.set_spawner(spawner.clone());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         // The spawn path: a reviewer spawn through the REGISTERED tool must
         // carry the harness-rendered contract even though the task supplies
@@ -2180,7 +2096,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         // Default config: no vision model, browser inspection off — the
         // `image_*` and on-screen `browser_*` tools hide themselves.
@@ -2208,7 +2129,12 @@ mod tests {
             let f2 = make_factory_with(dir.path(), Some(Arc::new(MockDescriber)));
             f2.set_browser_inspection(true);
             let wf2 = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans2"))));
-            let r2 = f2.build_registry(&wf2, None, None, f2.plans_dir());
+            let r2 = f2.build_registry(
+                &crate::app::workflow::as_handle(wf2.clone()),
+                None,
+                None,
+                f2.plans_dir(),
+            );
             let (n0, c0) = tools_array_chars(&r2, &ToolFilter::Executing);
             r2.load_group("browser");
             r2.load_group("image");
@@ -2745,7 +2671,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         let caps = crate::provider::Capabilities::openai();
 
         assert!(
@@ -2807,7 +2738,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         let (_, before) = tools_array_chars(&registry, &crate::tool::ToolFilter::Executing);
         assert!(
@@ -2848,7 +2784,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory_with(dir.path(), Some(Arc::new(MockDescriber)));
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         // All 7 image_* tools are registered when a vision client is configured.
         for name in [
             "image_analysis",
@@ -2870,7 +2811,12 @@ mod tests {
         let dir2 = tempdir().unwrap();
         let factory_no_vision = make_factory(dir2.path());
         let workflow2 = Arc::new(Mutex::new(Workflow::new(dir2.path().join("plans"))));
-        let registry_no_vision = factory_no_vision.build_registry(&workflow2, None, None, factory_no_vision.plans_dir());
+        let registry_no_vision = factory_no_vision.build_registry(
+            &crate::app::workflow::as_handle(workflow2.clone()),
+            None,
+            None,
+            factory_no_vision.plans_dir(),
+        );
         assert!(
             registry_no_vision.get("image_analysis").is_some(),
             "image_* tools stay registered against the empty swappable slot"
@@ -2996,7 +2942,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         assert!(
             registry.get("spawn_agent").is_none(),
             "spawn_agent should NOT be registered without a spawner"
@@ -3004,7 +2955,12 @@ mod tests {
 
         // Once a spawner is wired in, every subsequent build gets the tool.
         factory.set_spawner(Arc::new(MockSpawner));
-        let registry2 = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry2 = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         assert!(
             registry2.get("spawn_agent").is_some(),
             "spawn_agent should be registered once a spawner is wired in"
@@ -3018,7 +2974,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         assert!(
             registry.get("list_models").is_none(),
             "list_models should NOT be registered without a model resolver"
@@ -3031,7 +2992,12 @@ mod tests {
                 Arc::new(crate::provider::trace::LlmRequestLog::new()),
             ),
         ));
-        let registry2 = factory2.build_registry(&workflow, None, None, factory2.plans_dir());
+        let registry2 = factory2.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory2.plans_dir(),
+        );
         assert!(
             registry2.get("list_models").is_some(),
             "list_models should be registered once a model resolver is wired in"
@@ -3082,18 +3048,25 @@ mod tests {
         // registration being silently dropped when the grouped helpers are
         // edited.
         let dir = tempdir().unwrap();
-        let mut factory = make_factory(dir.path());
-        factory = factory.with_skills(Arc::new(SkillLibrary::from_registry(
+        let factory = make_factory(dir.path());
+        // 2b.3: the skill tools register app-side — the library flows to the
+        // app factory's ctor (the kernel's skills surface retired).
+        let skills = Arc::new(SkillLibrary::from_registry(
             dir.path().join(".coding/skills"),
-            crate::skill::SkillRegistry::new(),
-        )));
+            crate::app::skill::SkillRegistry::new(),
+        ));
         factory.set_spawner(Arc::new(MockSpawner));
         // The app-owned tools ride the app policy factory (2b.2): wire the
         // app factory into the kernel factory (the production build() path)
         // and carry the backlog store on it — fully wired = the Ready path's
         // shape.
-        let policy_factory =
-            Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new());
+        let policy_factory = Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new(
+            None,
+            None,
+            None,
+            std::path::PathBuf::new(),
+            Some(skills.clone()),
+        ));
         let factory_dyn: Arc<dyn crate::agent::policy::AgentPolicyFactory> =
             policy_factory.clone();
         factory.set_policy_factory(factory_dyn);
@@ -3101,7 +3074,12 @@ mod tests {
             crate::app::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
         )));
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         let expected = vec![
             // agent/file tools
@@ -3230,16 +3208,21 @@ mod tests {
         use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
 
         let dir = tempdir().unwrap();
-        let mut factory = make_factory(dir.path());
-        factory = factory.with_skills(Arc::new(SkillLibrary::from_registry(
+        let factory = make_factory(dir.path());
+        let skills = Arc::new(SkillLibrary::from_registry(
             dir.path().join(".coding/skills"),
-            crate::skill::SkillRegistry::new(),
-        )));
+            crate::app::skill::SkillRegistry::new(),
+        ));
         factory.set_spawner(Arc::new(MockSpawner));
         // 2b.2: the backlog trio registers via the app policy factory (D5) —
         // wire it the way production does before asserting the filter reads.
-        let policy_factory2 =
-            Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new());
+        let policy_factory2 = Arc::new(crate::app::policy_factory::WorkflowPolicyFactory::new(
+            None,
+            None,
+            None,
+            std::path::PathBuf::new(),
+            Some(skills),
+        ));
         let factory_dyn2: Arc<dyn crate::agent::policy::AgentPolicyFactory> =
             policy_factory2.clone();
         factory.set_policy_factory(factory_dyn2);
@@ -3247,7 +3230,12 @@ mod tests {
             crate::app::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
         )));
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         let skill_filter = ToolFilter::Skill(vec![]);
         let mut reads = Vec::new();
@@ -3320,7 +3308,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
         let snap = AgentLoopFactory::deferred_snapshot(&registry);
         let names: Vec<&str> = snap.iter().map(|t| t.name()).collect();
         for name in [
@@ -3351,7 +3344,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let factory = make_factory(dir.path());
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
-        let registry = factory.build_registry(&workflow, None, None, factory.plans_dir());
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            None,
+            None,
+            factory.plans_dir(),
+        );
 
         // No backlog store → no backlog_add.
         assert!(
@@ -3402,17 +3400,16 @@ mod tests {
         );
 
         // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some()).
+        // Simulate sub-agent construction (as IpcSpawner does for parent_id.is_some())
+        // — the spawn path's compound stamp (2b.3: the kernel rides the
+        // neutral handle; the plan-mutation deny + the role state ride
+        // app-side under one call).
         agent.set_plan_mutations_allowed(false);
-        {
-            let wfa = agent.workflow_handle();
-            let mut wf = wfa.lock().await;
-            wf.set_plan_mutations_allowed(false);
-        }
+        agent.workflow_handle().stamp_subagent_invariants().await;
         assert!(!agent.plan_mutations_allowed());
 
         // The create_plan tool itself now denies (defense in depth).
-        let wf = agent.workflow_handle();
-        let tool = CreatePlanTool::new(wf);
+        let tool = CreatePlanTool::new(concrete(&agent.workflow_handle()));
         let res = tool
             .execute(json!({"title":"T","goal":"G","context":"Sub-agent denial fixture: edit src/widget.rs and verify with cargo test.","steps":["edit src/widget.rs"]}))
             .await;
@@ -3436,8 +3433,8 @@ mod tests {
         let agent = factory.build_with_id_and_plans_dir(42, per_agent_dir.clone());
 
         // The agent's workflow uses the per-agent dir.
-        let wf = agent.workflow_handle();
-        let wf_guard = wf.lock().await;
+        let handle = concrete(&agent.workflow_handle());
+        let wf_guard = handle.lock().await;
         assert_eq!(
             wf_guard.plans_dir(),
             per_agent_dir,
@@ -3490,15 +3487,20 @@ mod tests {
 
         // The workflow uses the worktree plans dir (plan bookkeeping lands
         // on the item's branch).
-        let wf = agent.workflow_handle();
-        let wf_guard = wf.lock().await;
+        let handle = concrete(&agent.workflow_handle());
+        let wf_guard = handle.lock().await;
         assert_eq!(wf_guard.plans_dir(), plans_dir);
         drop(wf_guard);
 
         // The registry's file tools bind to the OVERRIDE root: a write
         // lands in the worktree, never in the factory's project dir.
         let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(plans_dir.clone())));
-        let registry = factory.build_registry(&workflow, Some(42), Some(&spec), &plans_dir);
+        let registry = factory.build_registry(
+            &crate::app::workflow::as_handle(workflow.clone()),
+            Some(42),
+            Some(&spec),
+            &plans_dir,
+        );
         let tool = registry
             .iter()
             .find(|t| t.name() == "file_write")
@@ -3530,18 +3532,18 @@ mod tests {
 
         // Create a plan in agent A's workflow directly.
         {
-            let wf_a = agent_a.workflow_handle();
-            let mut wf = wf_a.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let mut wf = handle.lock().await;
             wf.create_plan("A's plan", "goal", "ctx", vec!["step1".into()])
                 .unwrap();
         }
 
         // Agent A is Executing; agent B must still be Planning (no plan).
         {
-            let wf_a = agent_a.workflow_handle();
-            let wf_b = agent_b.workflow_handle();
-            let wf_a = wf_a.lock().await;
-            let wf_b = wf_b.lock().await;
+            let handle = concrete(&agent_a.workflow_handle());
+            let wf_a = handle.lock().await;
+            let handle = concrete(&agent_b.workflow_handle());
+            let wf_b = handle.lock().await;
             assert_eq!(wf_a.state(), WorkflowState::Executing);
             assert_eq!(wf_b.state(), WorkflowState::Planning);
         }
@@ -3571,7 +3573,7 @@ mod tests {
         // build_inner's load_latest derives Executing from the shared plan…
         let child = factory.build_with_id(9);
         {
-            let handle = child.workflow_handle();
+            let handle = concrete(&child.workflow_handle());
             let wf = handle.lock().await;
             assert_eq!(
                 wf.state(),
@@ -3579,15 +3581,11 @@ mod tests {
                 "load_latest derives the main plan's state (the mirror load)"
             );
         }
-        // …then the spawn path's parented stamps replace it (spawn.rs).
+        // …then the spawn path's parented stamps replace it (spawn.rs) —
+        // 2b.3: the compound stamp rides the neutral handle.
+        child.workflow_handle().stamp_subagent_invariants().await;
         {
-            let handle = child.workflow_handle();
-            let mut wf = handle.lock().await;
-            wf.set_plan_mutations_allowed(false);
-            wf.enter_subagent_state();
-        }
-        {
-            let handle = child.workflow_handle();
+            let handle = concrete(&child.workflow_handle());
             let wf = handle.lock().await;
             assert_eq!(wf.state(), WorkflowState::Subagent);
             assert!(
@@ -3599,7 +3597,7 @@ mod tests {
         assert!(
             // `false`: subagents are never run-all dispatched (the
             // unattended flag is derived from the MAIN agent's Prompt).
-            !child.workflow_expects_progress(false).await,
+            !child.workflow_handle().expects_progress(false).await,
             "a Subagent-state loop never expects progress (auto-continue parks)"
         );
     }

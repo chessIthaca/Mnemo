@@ -195,6 +195,33 @@ pub struct Workflow {
     review_required: bool,
 }
 
+impl ToolFilter {
+    /// Derive the filter from the workflow state.
+    ///
+    /// Returns `None` for [`WorkflowState::Skill`] — the skill filter is NOT
+    /// derived from the state alone (it depends on the active skill's stored
+    /// tool list) and is constructed directly by
+    /// [`Workflow::allowed_tools`](Workflow::allowed_tools).
+    /// Returning `None` here makes a caller that forgets to handle the Skill
+    /// case fail loudly at the call site rather than silently degrading to a
+    /// wrong-but-plausible `Planning` filter.
+    ///
+    /// Returns `None` for [`WorkflowState::Subagent`] for the same reason: a
+    /// sub-agent's tool surface comes from its spawn-time allow-list
+    /// (`compute_subagent_allowlist` → `set_tool_allowlist` /
+    /// `set_reviewer_allowlist`), never from a lifecycle state it doesn't
+    /// own.
+    pub fn from_state(state: WorkflowState) -> Option<Self> {
+        match state {
+            WorkflowState::Planning => Some(ToolFilter::Planning),
+            WorkflowState::Executing => Some(ToolFilter::Executing),
+            WorkflowState::Reviewing => Some(ToolFilter::Reviewing),
+            WorkflowState::Complete => Some(ToolFilter::Complete),
+            WorkflowState::Skill | WorkflowState::Subagent => None,
+        }
+    }
+}
+
 impl Workflow {
     /// Create a new workflow with no plan (Planning state).
     pub fn new(plans_dir: impl Into<PathBuf>) -> Self {
@@ -3297,5 +3324,167 @@ mod tests {
         wf2.load_latest().unwrap();
         assert_eq!(wf2.state(), WorkflowState::Executing);
         assert!(wf2.active_skill().is_none());
+    }
+}
+// ── 2b.3: the kernel-neutral handle (AgentWorkflowHandle) ──────────────────
+// The loop holds this Arc opaquely from 2b.3 on; every kernel consult rides
+// the trait's opaque representations (the state token, the completion flag,
+// the plan scope, the tool-filter envelope). The Arc-level impl keeps the
+// pre-2b.3 lock shape (`self.workflow.lock().await.<read>`) at the handle's
+// own level, so the token formatting above stays byte-stable with what the
+// kernel's old `format!("{:?}", state)` reads produced.
+#[async_trait::async_trait]
+impl crate::agent::workflow_handle::AgentWorkflowHandle
+    for std::sync::Arc<tokio::sync::Mutex<Workflow>>
+{
+    async fn state(&self) -> String {
+        // The state token uses the SERDE shape (lowercase) — the wire
+        // contract the fixtures pin (the enum's rename_all; the pre-2b.3
+        // event field serialized identically).
+        format!("{:?}", self.lock().await.state()).to_lowercase()
+    }
+
+    async fn is_complete(&self) -> bool {
+        self.lock().await.state() == WorkflowState::Complete
+    }
+
+    async fn plan_scope(&self) -> Option<(String, Option<usize>)> {
+        // The pre-2b.3 read_plan_scope body (turn.rs :1395-99): the active
+        // plan's id + the current step's index, None planless.
+        let wf = self.lock().await;
+        let plan_id = wf.plan_id()?.to_string();
+        Some((plan_id, wf.current_step().map(|s| s.index)))
+    }
+
+    async fn allowed_tools(&self) -> crate::tool::ToolFilter {
+        self.lock().await.allowed_tools()
+    }
+
+    async fn schema_filter(&self) -> crate::tool::ToolFilter {
+        self.lock().await.schema_filter()
+    }
+
+    async fn completing_step_exits_executing(&self, step_index: usize) -> bool {
+        self.lock().await.completing_step_exits_executing(step_index)
+    }
+
+    async fn plan_gate_snapshot(
+        &self,
+    ) -> (String, Option<String>, Option<String>, Option<String>) {
+        let wf = self.lock().await;
+        (
+            format!("{:?}", wf.state()).to_lowercase(),
+            wf.top_plan_id().map(|s| s.to_string()),
+            wf.plan().map(|p| p.title.clone()),
+            wf.plan().map(|p| p.goal.clone()),
+        )
+    }
+
+    async fn active_skill_name(&self) -> Option<String> {
+        self.lock().await.active_skill().map(|s| s.name.clone())
+    }
+
+    async fn lane_step_snapshot(&self) -> Option<(String, usize, String)> {
+        let wf = self.lock().await;
+        let step = wf.current_step()?;
+        let plan_id = wf.plan_id()?.to_string();
+        Some((plan_id, step.index, step.text.clone()))
+    }
+
+    async fn stamp_subagent_invariants(&self) {
+        // The spawn path's compound stamp (the pre-2b.3 three-line write):
+        // the plan-mutation deny, then the dedicated role state — the plan
+        // stack stays loaded as the read-only mirror.
+        let mut wf = self.lock().await;
+        wf.set_plan_mutations_allowed(false);
+        wf.enter_subagent_state();
+    }
+
+    async fn set_role_allowlist(&self, is_reviewer: bool, names: Vec<String>) {
+        // The pre-2b.3 spawn-time intersection write, verbatim: the
+        // reviewer arm enforces strictly, the worker arm plainly.
+        let mut wf = self.lock().await;
+        if is_reviewer {
+            wf.set_reviewer_allowlist(Some(names));
+        } else {
+            wf.set_tool_allowlist(Some(names));
+        }
+    }
+
+    async fn next_review_round(&self) -> (u32, Option<String>) {
+        let wf = self.lock().await;
+        let rounds = wf.review_rounds();
+        let round = rounds.len() as u32 + 1;
+        let previous_base = if round >= 2 {
+            rounds.last().map(|s| s.base.clone())
+        } else {
+            None
+        };
+        (round, previous_base)
+    }
+
+    async fn record_review_round(&self, base: &str) -> std::result::Result<(), String> {
+        self.lock()
+            .await
+            .record_review_round(base)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn expects_progress(&self, unattended: bool) -> bool {
+        // The pre-2b.3 keeper body, verbatim (the state predicate the
+        // parking test asserts; production consults the policy).
+        let wf = self.lock().await;
+        let state = wf.state();
+        matches!(state, WorkflowState::Executing | WorkflowState::Reviewing)
+            || (unattended && state == WorkflowState::Planning)
+    }
+
+    fn as_any_arc(&self) -> std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        // The Any-escape needs the POINTEE to BE the Arc<Mutex<Workflow>> —
+        // a bare Arc::clone coerced to Arc<dyn Any> would make the Any point
+        // at the inner Mutex (losing the lockable Arc the IPC and the
+        // policy factory recover). Wrap the cloned Arc in another Arc: the
+        // Any's concrete = Arc<Mutex<Workflow>> (proven by the
+        // as_handle_roundtrip test).
+        std::sync::Arc::new(std::sync::Arc::clone(self))
+    }
+}
+/// Wrap a concrete workflow `Arc` as the neutral handle (2b.3): the trait is
+/// implemented ON the `Arc<Mutex<Workflow>>` type itself — the handle's
+/// `as_any_arc` escape needs the Arc level — so the dyn object is an `Arc`
+/// over the `Arc`. Bin-side and test constructors call this instead of
+/// spelling the double wrap.
+pub fn as_handle(
+    workflow: std::sync::Arc<tokio::sync::Mutex<Workflow>>,
+) -> std::sync::Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> {
+    std::sync::Arc::new(workflow)
+}
+#[cfg(test)]
+mod handle_roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn as_handle_roundtrip_recovers_the_concrete() {
+        let wf = std::sync::Arc::new(tokio::sync::Mutex::new(Workflow::new(
+            "handle_roundtrip_plans",
+        )));
+        let h = as_handle(wf.clone());
+        let any = h.as_any_arc();
+        let t = any.type_id();
+        eprintln!("DBGtid={t:?}");
+        for (name, id) in [
+            ("Arc<Mutex<W>>", std::any::TypeId::of::<std::sync::Arc<tokio::sync::Mutex<Workflow>>>()),
+            ("Arc<Arc<Mutex<W>>>", std::any::TypeId::of::<std::sync::Arc<std::sync::Arc<tokio::sync::Mutex<Workflow>>>>()),
+            ("Mutex<W>", std::any::TypeId::of::<tokio::sync::Mutex<Workflow>>()),
+            ("Arc<W>", std::any::TypeId::of::<std::sync::Arc<Workflow>>()),
+            ("W", std::any::TypeId::of::<Workflow>()),
+        ] {
+            eprintln!("DBG{name}={}", t == id);
+        }
+        assert!(
+            any.downcast_ref::<std::sync::Arc<tokio::sync::Mutex<Workflow>>>()
+                .is_some(),
+            "as_any_arc must wrap the concrete Arc<Mutex<Workflow>>"
+        );
     }
 }

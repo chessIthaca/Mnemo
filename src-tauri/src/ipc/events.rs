@@ -46,7 +46,6 @@ use mnemo::runtime::turn_resolve::{
     ResolveAction, TurnResolveLatch,
 };
 use mnemo::runtime::{AgentCommand, AgentEvent, AgentId, AgentManager, SerializedEvent};
-use mnemo::workflow::WorkflowState;
 
 use crate::ipc::approval::PendingApprovals;
 pub(crate) use mnemo::host::runtime::cleanup_inactive_subagents;
@@ -68,7 +67,12 @@ fn watchdog_note(agent_id: AgentId, event: &SerializableAgentEvent) -> Option<St
         }
         SerializableAgentEvent::Error { .. } => format!("agent{agent_id} Error(final)"),
         SerializableAgentEvent::WorkflowStateChanged { state, .. } => {
-            format!("agent{agent_id} workflow → {state}")
+            // The watchdog note keeps the pre-2b.3 Debug shape (first letter
+            // capitalized) — the event FIELD itself is the serde shape.
+            format!(
+                "agent{agent_id} workflow → {}",
+                mnemo::agent::workflow_handle::capitalize_token(state)
+            )
         }
         SerializableAgentEvent::ApprovalRequest { tool_name, .. } => {
             format!("agent{agent_id} approval: {tool_name}")
@@ -351,7 +355,7 @@ pub fn spawn(
     // Each agent's workflow state the last time we saw a WorkflowStateChanged
     // event. Used to detect a fresh plan started from Complete (Complete →
     // Executing), which triggers cleanup of inactive subagents.
-    let mut prev_workflow_state: std::collections::HashMap<AgentId, WorkflowState> =
+    let mut prev_workflow_state: std::collections::HashMap<AgentId, String> =
         std::collections::HashMap::new();
     // Each agent's top plan id the last time we saw a WorkflowStateChanged
     // event (backlog bba2c82d). At a root-plan abandonment the event's own
@@ -463,22 +467,25 @@ pub fn spawn(
             // it exits and its tab disappears. RUNNING subagents are never
             // touched (they finish on their own and are removed via Exited).
             if let SerializableAgentEvent::WorkflowStateChanged { state, top_plan_id } = &serial {
-                let new_state = *state;
-                let prev_state = prev_workflow_state.get(&agent_id).copied();
-                let was_complete = prev_state == Some(WorkflowState::Complete);
+                let new_state = state.clone();
+                // The owned snapshot (2b.3): the map insert below mutably
+                // borrows, so the prev state must not still be borrowed —
+                // clone it out, compare via as_deref.
+                let prev_state = prev_workflow_state.get(&agent_id).cloned();
+                let was_complete = prev_state.as_deref() == Some("complete");
                 // (backlog bba2c82d) The abandoned plan's id comes from
                 // the PREVIOUS top — read BEFORE the map update: after
                 // the abandonment pop the event's own top_plan_id is the
                 // post-pop top, and the live main_agent_top_plan_id no
                 // longer names the abandoned plan either.
                 let prev_top = prev_top_plan_id.get(&agent_id).cloned().flatten();
-                prev_workflow_state.insert(agent_id, new_state);
+                prev_workflow_state.insert(agent_id, new_state.clone());
                 prev_top_plan_id.insert(agent_id, top_plan_id.clone());
                 // Plan-loop gate evidence: only a REAL state transition
                 // counts (a failed workflow tool can emit its unchanged
                 // state — belt-and-braces behind the emission-side
                 // result.success gating; see workflow_transition_counts).
-                if workflow_transition_counts(prev_state, new_state) {
+                if workflow_transition_counts(prev_state.as_deref(), new_state.as_str()) {
                     turn_resolve.note_workflow_changed(agent_id);
                 }
                 // Root-plan abandonment (backlog 45dcf577): latched
@@ -486,7 +493,7 @@ pub fn spawn(
                 // dispatched item's `Failed` (failure means exactly "the
                 // plan was abandoned"). The captured plan id (bba2c82d)
                 // is the linkage evidence for the Failed guard.
-                if crate::ipc::run_all::is_root_plan_abandonment(prev_state, new_state) {
+                if crate::ipc::run_all::is_root_plan_abandonment(prev_state.as_deref(), new_state.as_str()) {
                     turn_resolve.note_plan_abandoned(agent_id, prev_top);
                 }
                 // Stamp the in-flight backlog item `InFlight` when the MAIN
@@ -497,7 +504,7 @@ pub fn spawn(
                 // are main-agent bookkeeping, and a child entering
                 // `Executing` must not stamp the main's item while it is
                 // still pre-planning.
-                if crate::ipc::run_all::should_stamp_in_flight(prev_state, new_state) {
+                if crate::ipc::run_all::should_stamp_in_flight(prev_state.as_deref(), new_state.as_str()) {
                     // Parallel run-all (plan ffd7a86f, review R1): route by
                     // OWNERSHIP, not by a live main_agent_id() — a spawned
                     // run-all agent is parentless, and after the main
@@ -533,7 +540,7 @@ pub fn spawn(
                         }
                     }
                 }
-                if was_complete && new_state == WorkflowState::Executing {
+                if was_complete && new_state == "executing" {
                     cleanup_inactive_subagents(&manager_arc, agent_id).await;
                 }
             }
@@ -1410,7 +1417,7 @@ async fn try_flush_deferred_main_resolution(
             let state = app.state::<IpcState>();
             let wf_complete = crate::ipc::run_all::main_agent_workflow_state(&state)
                 .await
-                .map_or(false, |s| s == WorkflowState::Complete);
+                .map_or(false, |s| s == "Complete");
             if wf_complete {
                 // Off the forwarder's critical path (review L2): evidence
                 // is read BEFORE the spawn (the next Started clears it);
@@ -1508,7 +1515,7 @@ async fn try_flush_deferred_spawned_resolutions(
                 let wf_complete =
                     crate::ipc::run_all::agent_workflow_state(&state, lane_id)
                         .await
-                        .map_or(false, |s| s == WorkflowState::Complete);
+                        .map_or(false, |s| s == "complete");
                 if wf_complete {
                     // Off the forwarder's critical path (review L2):
                     // evidence is read BEFORE the spawn (the next Started
@@ -1911,7 +1918,7 @@ mod watchdog_note_tests {
     use mnemo::provider::FinishReason;
     use mnemo::runtime::channels::{ParkReason, SerializableAgentEvent};
     use mnemo::runtime::AgentId;
-    use mnemo::workflow::WorkflowState;
+    use mnemo::app::workflow::WorkflowState;
 
     /// Review finding 4 (2026-08-20): every state-changing event arm must
     /// produce its note; streaming/display-only events must be skipped.
@@ -1945,7 +1952,7 @@ mod watchdog_note_tests {
             (
                 7,
                 SerializableAgentEvent::WorkflowStateChanged {
-                    state: WorkflowState::Reviewing,
+                    state: format!("{:?}", WorkflowState::Reviewing).to_lowercase(),
                     top_plan_id: None,
                 },
                 "agent7 workflow → Reviewing",

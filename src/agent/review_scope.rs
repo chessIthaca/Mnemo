@@ -18,8 +18,8 @@
 //! - [`render_review_preamble`] is appended to EVERY reviewer spawn's task by
 //!   the spawn tool, so the contract cannot be forgotten.
 //! - For round >= 2 it also renders the delta scope for the round: the base
-//!   revision the previous round verified (stamped on the plan frame,
-//!   [`crate::workflow::Workflow::record_review_round`]), the
+//!   revision the previous round verified (stamped on the plan frame by the
+//!   workflow's `record_review_round`), the
 //!   delta-since-`<base>` instruction (naming the reviewer's own `git_read`
 //!   ops), and the mechanically-derived changed file set — so the reviewer
 //!   verifies the delta instead of the whole tree.

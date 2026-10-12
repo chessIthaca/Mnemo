@@ -443,7 +443,7 @@ fn main() {
                 let _ = window.set_title(&startup::window_title(needs_project, &backlog_root));
             }
 
-            let backlog = Arc::new(tokio::sync::Mutex::new(mnemo::backlog::BacklogStore::open(
+            let backlog = Arc::new(tokio::sync::Mutex::new(mnemo::app::backlog::BacklogStore::open(
                 backlog_root
                     .join(Project::CODING_DIR_NAME)
                     .join("backlog.jsonl"),
@@ -494,9 +494,25 @@ fn main() {
                     // trio). The backlog store + notifier live on the app factory
                     // (the app-owned wiring) — the kernel factory only sees the
                     // trait. Wired before the first agent build (the policy and
-                    // its tool registrations are read per build).
-                    let policy_factory =
-                        Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new());
+                    // its tool registrations are read per build). The skill
+                    // library loads HERE (2b.3: the kernel factory's skills
+                    // surface retired — the bin loads the same
+                    // `.coding/skills/*.toml` dir the brain used to wire and
+                    // hands it to the app factory, so the skill tools and
+                    // `enter_skill`'s handle resolve app→app).
+                    let skills_dir = tauri::async_runtime::block_on(async {
+                        brain.project.lock().await.skills_dir.clone()
+                    });
+                    let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
+                    let policy_factory = Arc::new(
+                        mnemo::app::policy_factory::WorkflowPolicyFactory::new(
+                            brain.factory.memory_handle(),
+                            brain.factory.knowledge_handle(),
+                            brain.factory.codegraph_handle(),
+                            brain.factory.reviews_dir(),
+                            Some(skills),
+                        ),
+                    );
                     let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> =
                         policy_factory.clone();
                     brain.factory.set_policy_factory(factory_dyn);
@@ -587,6 +603,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: Some(Arc::clone(&policy_factory)),
                         runtime: ipc::state::AgentRuntimeContext {
                             manager,
                             agent_loops,
@@ -772,6 +789,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -867,6 +885,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(

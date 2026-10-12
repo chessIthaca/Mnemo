@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use mnemo::provider::{ApprovalPreview, FinishReason};
 use mnemo::runtime::channels::{RecallHit, SerializableAgentEvent};
 use mnemo::tool::{ToolOutputStream, ToolResult};
-use mnemo::workflow::WorkflowState;
+use mnemo::app::workflow::WorkflowState;
 
 use serde_json::{json, Value};
 
@@ -193,7 +193,7 @@ fn event_fixtures_match_serde() {
         (
             "event-workflow-state-changed",
             SerializableAgentEvent::WorkflowStateChanged {
-                state: WorkflowState::Executing,
+                state: format!("{:?}", WorkflowState::Executing).to_lowercase(),
                 top_plan_id: Some("plan-1a2b3c".into()),
             },
         ),

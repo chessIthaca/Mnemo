@@ -26,7 +26,6 @@ use crate::provider::{LlmClient, LlmEvent, Message, ToolCall};
 use crate::runtime::{AgentCommand, AgentEvent, AgentId};
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{OutputSink, ToolCall as ParsedToolCall, ToolFilter, ToolResult};
-use crate::workflow::WorkflowState;
 
 /// The file tools [`ToolFilter::ExecutingResearch`] denies wholesale — the set
 /// a research plan may nevertheless use on an ARTIFACT target (`.coding/**`).
@@ -140,7 +139,7 @@ fn judge_research_write(sandbox: &Sandbox, path: &Path) -> ResearchWrite {
 /// different remedies ("push an implementation sub-plan" does not unlock a
 /// protected file), so one shared message would send the model after the wrong
 /// fix.
-fn denial_message(name: &str, state: WorkflowState, verdict: ResearchWrite) -> String {
+fn denial_message(name: &str, state_token: String, verdict: ResearchWrite) -> String {
     match verdict {
         ResearchWrite::Protected => format!(
             "tool '{name}' is not allowed here: the target is a protected, app-owned file \
@@ -149,14 +148,14 @@ fn denial_message(name: &str, state: WorkflowState, verdict: ResearchWrite) -> S
              dedicated tools (plan/memory/safety/git) instead"
         ),
         ResearchWrite::NotAnArtifact => format!(
-            "tool '{name}' is not allowed here: the active plan is a research plan ({state}), \
+            "tool '{name}' is not allowed here: the active plan is a research plan ({state_token}), \
              which may write only its own artifacts under .coding/ — source, docs and other \
              app-owned files stay read-only; push an implementation sub-plan to change source"
         ),
         // The carve-out is granted, so this arm is unreachable from the gate —
         // or the call is not a carve-out candidate at all.
         ResearchWrite::Artifact | ResearchWrite::NotApplicable => format!(
-            "tool '{name}' is not allowed in the current workflow state ({state})"
+            "tool '{name}' is not allowed in the current workflow state ({state_token})"
         ),
     }
 }
@@ -255,7 +254,7 @@ impl AgentLoop {
             let surface = self.policy.tool_surface().await;
             let filter = match surface.gate {
                 Some(f) => f,
-                None => self.workflow.lock().await.allowed_tools(),
+                None => self.workflow.allowed_tools().await,
             };
             // The one carve-out: a RESEARCH plan may still write its own
             // artifacts under `.coding/**` with the file tools. The verdict is
@@ -271,7 +270,9 @@ impl AgentLoop {
                 return (
                     ToolResult::error(denial_message(
                         &tc.name,
-                        self.workflow.lock().await.state(),
+                        crate::agent::workflow_handle::capitalize_token(
+                            &self.workflow.state().await,
+                        ),
                         research_write,
                     )),
                     Vec::new(),
@@ -348,9 +349,8 @@ impl AgentLoop {
                 match step_number {
                     Some(n) if n >= 1 => self
                         .workflow
-                        .lock()
-                        .await
-                        .completing_step_exits_executing((n - 1) as usize),
+                        .completing_step_exits_executing((n - 1) as usize)
+                        .await,
                     _ => false,
                 }
             }
@@ -895,7 +895,7 @@ impl AgentLoop {
     ) -> (ToolResult, Vec<AgentCommand>) {
         // Parse + validate the question + options.
         let (question, options) =
-            match crate::tool::workflow::ask_user::parse_ask_user_args(&parsed_call.arguments) {
+            match crate::agent::ask_user_args::parse_ask_user_args(&parsed_call.arguments) {
                 Ok(q) => q,
                 Err(e) => return (ToolResult::error(e), Vec::new()),
             };

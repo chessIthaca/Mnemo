@@ -27,7 +27,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Mutex;
 
 use crate::agent::review_scope::{render_review_preamble, ReviewScope, ReviewScoper};
 use crate::memory::MemoryStoreTrait;
@@ -35,7 +34,6 @@ use crate::model_resolver::ModelResolver;
 use crate::provider::ToolSchema;
 use crate::runtime::AgentSpawner;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-use crate::workflow::Workflow;
 
 /// Arguments for `spawn_agent`.
 #[derive(Debug, Deserialize)]
@@ -130,8 +128,9 @@ pub struct SpawnAgentTool {
 /// spawn forwards the task verbatim exactly as it did before.
 pub struct ReviewScopeWiring {
     /// The agent's workflow — its active plan frame carries the round stamps
-    /// ([`Workflow::review_rounds`]) and receives the new one.
-    workflow: Arc<Mutex<Workflow>>,
+    /// ([`Workflow::review_rounds`]) and receives the new one. Held as the
+    /// neutral handle since 2b.3 (the round facts ride its opaque surface).
+    workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The repository the git reads run in (the agent's project root).
     root: PathBuf,
     /// The git-facing scope reader — [`GitReviewScoper`] in production, a
@@ -195,7 +194,7 @@ impl SpawnAgentTool {
     /// chaining — the factory calls this right after construction.
     pub fn with_review_scope(
         mut self,
-        workflow: Arc<Mutex<Workflow>>,
+        workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         root: PathBuf,
         scoper: Arc<dyn ReviewScoper>,
     ) -> Self {
@@ -423,20 +422,9 @@ impl Tool for SpawnAgentTool {
         let mut stamped_base: Option<String> = None;
         let task = match (role.as_deref(), self.review_scope.as_ref()) {
             (Some("reviewer"), Some(wiring)) => {
-                let (round, previous_base) = {
-                    // Snapshot-and-drop: the workflow lock is shared with every
-                    // workflow tool, so it is released before any git
-                    // round-trip (never held across I/O).
-                    let wf = wiring.workflow.lock().await;
-                    let rounds = wf.review_rounds();
-                    let round = rounds.len() as u32 + 1;
-                    let previous_base = if round >= 2 {
-                        rounds.last().map(|s| s.base.clone())
-                    } else {
-                        None
-                    };
-                    (round, previous_base)
-                };
+                // 2b.3: the round facts ride the neutral handle (the lock
+                // lives app-side — never held across I/O).
+                let (round, previous_base) = wiring.workflow.next_review_round().await;
                 // HEAD is this round's base: the dispatcher suspends while the
                 // reviewer works, so the tree it starts looking at is the tree
                 // this sha names.
@@ -502,8 +490,8 @@ impl Tool for SpawnAgentTool {
                 if let (Some(base), Some(wiring)) =
                     (stamped_base.as_deref(), self.review_scope.as_ref())
                 {
-                    let mut wf = wiring.workflow.lock().await;
-                    if let Err(e) = wf.record_review_round(base) {
+                    // 2b.3: the stamp write rides the neutral handle.
+                    if let Err(e) = wiring.workflow.record_review_round(base).await {
                         stamp_note = Some(e.to_string());
                     }
                 }
@@ -539,6 +527,7 @@ impl Tool for SpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::app::workflow::Workflow;
     use super::*;
     use std::path::Path;
     use std::sync::Mutex;
@@ -658,7 +647,7 @@ mod tests {
         let (_dir, workflow) = workflow_with_plan();
         let spawner = Arc::new(MockSpawner::ok(1));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -699,7 +688,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(2));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -737,7 +726,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(3));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper {
                 head: Err("not a git repository".to_string()),
@@ -771,7 +760,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(4));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper {
                 head: Ok("head9999".to_string()),
@@ -796,7 +785,7 @@ mod tests {
         let (_dir, workflow) = workflow_with_plan();
         let spawner = Arc::new(MockSpawner::ok(5));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -836,7 +825,7 @@ mod tests {
             result: Err("boom".to_string()),
         });
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -861,7 +850,7 @@ mod tests {
         let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
         let spawner = Arc::new(MockSpawner::ok(9));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );

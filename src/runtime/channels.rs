@@ -21,7 +21,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::provider::{ApprovalPreview, FinishReason};
 use crate::tool::ToolResult;
-use crate::workflow::WorkflowState;
 
 /// A unique agent identifier.
 pub type AgentId = u64;
@@ -258,9 +257,11 @@ pub enum AgentEvent {
         /// "unchanged", so the popup keeps the last one instead of blanking.
         quality: Option<crate::agent::optimizer::QualityReport>,
     },
-    /// The workflow state changed.
+    /// The workflow state changed. `state` is the state TOKEN (the
+    /// neutral handle's opaque representation since 2b.3 — the same Debug
+    /// string the pre-2b.3 label reads produced).
     WorkflowStateChanged {
-        state: WorkflowState,
+        state: String,
         /// The id of the ROOT plan (bottom of the plan stack), if any. Constant
         /// across sub-plan push/pop and skill transitions; changes only when a
         /// fresh top-level plan starts (`create_plan` from Planning or
@@ -590,7 +591,9 @@ pub enum SerializableAgentEvent {
         quality: Option<crate::agent::optimizer::QualityReport>,
     },
     WorkflowStateChanged {
-        state: WorkflowState,
+        /// The state token (the neutral handle's opaque representation since
+        /// 2b.3 — mirrors [`AgentEvent::WorkflowStateChanged`]).
+        state: String,
         /// The id of the ROOT plan (bottom of the plan stack), if any. Constant
         /// across sub-plan push/pop and skill transitions; changes only when a
         /// fresh top-level plan starts. Lets the frontend reset per-top-plan

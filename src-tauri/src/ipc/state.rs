@@ -29,7 +29,7 @@ use mnemo::tool::agent::sandbox::Sandbox;
 
 use crate::ipc::approval::PendingApprovals;
 use crate::ipc::questions::PendingQuestions;
-use mnemo::backlog::BacklogStore;
+use mnemo::app::backlog::BacklogStore;
 
 /// The shared state accessible to all Tauri commands.
 ///
@@ -45,6 +45,11 @@ use mnemo::backlog::BacklogStore;
 /// anywhere today and would risk a deadlock if a future command did so while
 /// another task held `manager` then waited on `agent_loops`.
 pub struct IpcState {
+    /// The app policy factory (2b.3): the IPC's `enter_skill` reads its
+    /// skill-library handle app→app — the kernel factory's skills surface
+    /// retired with the registration move. `None` on the arms that build
+    /// no agent (no skill path to serve).
+    pub app_policy_factory: Option<Arc<mnemo::app::policy_factory::WorkflowPolicyFactory>>,
     /// The agent runtime: manager, per-agent loops, factory, safety.
     pub runtime: AgentRuntimeContext,
     /// The project: project handle, config, sandbox.

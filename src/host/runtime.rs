@@ -149,18 +149,17 @@ pub async fn spawn_agent_shared(
     if parent_id.is_some() {
         // Sub-agent under main-only plan policy: deny plan mutations.
         agent_loop.set_plan_mutations_allowed(false);
-        let workflow_arc = agent_loop.workflow_handle();
-        let mut wf = workflow_arc.lock().await;
-        wf.set_plan_mutations_allowed(false);
-        // Stamp the dedicated sub-agent role state: build_inner's load_latest
-        // derived the MAIN plan's lifecycle state (Executing/Reviewing/…)
-        // from the shared plans dir, but a sub-agent is a single-task worker,
-        // not a plan-lifecycle owner. The plan stack stays loaded (the
-        // read-only mirror that feeds `current_plan` for reviewers and the UI
-        // staircase); only the state is replaced. The tool allow-list below
-        // completes the Subagent invariants before registration — no turn
-        // runs before then, so `allowed_tools` is never consulted in between.
-        wf.enter_subagent_state();
+        // 2b.3: the two workflow writes ride the neutral handle's compound
+        // stamp (the plan-mutation deny + the dedicated sub-agent role state
+        // — the plan stack stays loaded as the read-only mirror that feeds
+        // `current_plan` for reviewers and the UI staircase; only the state
+        // is replaced). The tool allow-list below completes the Subagent
+        // invariants before registration — no turn runs before then, so
+        // `allowed_tools` is never consulted in between.
+        agent_loop
+            .workflow_handle()
+            .stamp_subagent_invariants()
+            .await;
         // Mark the loop as a subagent so the per-context model resolver
         // considers the `[models.subagent]` override (e.g. a fast coding model
         // for background agents, distinct from the main agent's model).
@@ -179,17 +178,15 @@ pub async fn spawn_agent_shared(
     // parent state changes mid-spawn.
     let allowlist = compute_subagent_allowlist(&agent_loops, parent_id, &role).await;
     if let Some(list) = allowlist {
-        let workflow_arc = agent_loop.workflow_handle();
-        let mut wf = workflow_arc.lock().await;
-        if role.as_deref() == Some("reviewer") {
-            // A reviewer allow-list is enforced STRICTLY (ToolFilter::Reviewer:
-            // only the listed tools + current_plan are visible — no auto-granted
-            // memory/ask/backlog tools), so a reviewer can query but never
-            // mutate memory, the backlog, the plan, or the review.
-            wf.set_reviewer_allowlist(Some(list));
-        } else {
-            wf.set_tool_allowlist(Some(list));
-        }
+        // 2b.3: the role allow-list write rides the neutral handle — the
+        // reviewer arm enforces it STRICTLY (ToolFilter::Reviewer: only the
+        // listed tools + current_plan are visible — no auto-granted memory/
+        // ask/backlog tools), so a reviewer can query but never mutate
+        // memory, the backlog, the plan, or the review.
+        agent_loop
+            .workflow_handle()
+            .set_role_allowlist(role.as_deref() == Some("reviewer"), list)
+            .await;
     }
 
     // A clone of the manager's fan-in sender, used below (outside the lock) to
@@ -383,11 +380,7 @@ async fn compute_subagent_allowlist(
         // held across the registry snapshot or the intersection.
         let filter = match parent.policy().tool_surface().await.gate {
             Some(filter) => filter,
-            None => {
-                let wf = parent.workflow_handle();
-                let wf = wf.lock().await;
-                wf.allowed_tools()
-            }
+            None => parent.workflow_handle().allowed_tools().await,
         };
         // Collect owned (name, category, safety) tuples so the borrow of
         // `parent` ends here (the Arc is dropped at the block close). No
@@ -748,7 +741,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentLoop;
     use crate::tool::ToolRegistry;
-    use crate::workflow::Workflow;
+    use crate::app::workflow::Workflow;
 
     #[test]
     fn reviewer_base_tools_never_name_plan_mutations() {
@@ -792,7 +785,7 @@ mod tests {
     /// can drive state transitions.
     async fn parent_in_state(
         parent_id: AgentId,
-        state: crate::workflow::WorkflowState,
+        state: crate::app::workflow::WorkflowState,
     ) -> (
         Arc<tokio::sync::Mutex<std::collections::HashMap<AgentId, Arc<AgentLoop>>>>,
         Arc<tokio::sync::Mutex<Workflow>>,
@@ -806,11 +799,11 @@ mod tests {
         {
             let mut wf = workflow.lock().await;
             match state {
-                crate::workflow::WorkflowState::Planning => {} // default
-                crate::workflow::WorkflowState::Executing => {
+                crate::app::workflow::WorkflowState::Planning => {} // default
+                crate::app::workflow::WorkflowState::Executing => {
                     wf.create_plan("p", "g", "c", vec!["s".into()]).unwrap();
                 }
-                crate::workflow::WorkflowState::Complete => {
+                crate::app::workflow::WorkflowState::Complete => {
                     wf.create_plan("p", "g", "c", vec!["s".into()]).unwrap();
                     wf.complete_step(0).unwrap();
                     wf.finish().unwrap();
@@ -837,10 +830,10 @@ mod tests {
             ),
         ));
         registry.register(Box::new(
-            crate::tool::workflow::plan::CreatePlanTool::new(workflow.clone()),
+            crate::app::tool::workflow::plan::CreatePlanTool::new(workflow.clone()),
         ));
         registry.register(Box::new(
-            crate::tool::workflow::plan::CompleteStepTool::new(workflow.clone()),
+            crate::app::tool::workflow::plan::CompleteStepTool::new(workflow.clone()),
         ));
         // Read-only queries the reviewer's base list names — registered so the
         // intersection keeps them (the production main agent registers these).
@@ -872,8 +865,8 @@ mod tests {
         )));
         // The read-only backlog query (the reviewer's base list names it).
         registry.register(Box::new(
-            crate::tool::workflow::backlog::BacklogListTool::new(Arc::new(
-                tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogListTool::new(Arc::new(
+                tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     dir.path().join("backlog.jsonl"),
                 )),
             )),
@@ -883,7 +876,7 @@ mod tests {
             crate::agent::AgentLoopConfig {
                 provider,
                 tools: Arc::new(registry),
-                workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox,
                 safety_mode: crate::config::SafetyMode::Autonomous,
                 context_manager: crate::agent::context::ContextManager::new(128_000, 0.5),
@@ -921,9 +914,11 @@ mod tests {
             crate::agent::AgentLoopConfig {
                 provider: Arc::new(NoopProvider),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow: Arc::new(tokio::sync::Mutex::new(Workflow::new(
-                    plans_dir.clone(),
-                ))),
+                workflow: crate::app::workflow::as_handle(Arc::new(
+                    tokio::sync::Mutex::new(Workflow::new(
+                        plans_dir.clone(),
+                    )),
+                )),
                 sandbox: Arc::new(
                     crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
                 ),
@@ -953,9 +948,11 @@ mod tests {
             crate::agent::AgentLoopConfig {
                 provider: Arc::new(NoopProvider),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow: Arc::new(tokio::sync::Mutex::new(Workflow::new(
-                    dir.path().join("plans"),
-                ))),
+                workflow: crate::app::workflow::as_handle(Arc::new(
+                    tokio::sync::Mutex::new(Workflow::new(
+                        dir.path().join("plans"),
+                    )),
+                )),
                 sandbox: Arc::new(
                     crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
                 ),
@@ -1016,7 +1013,7 @@ mod tests {
         // read-only role tools (git_read, write_review_report) ARE kept even
         // though the parent lacks them (they're AutoRun / safe).
         let (agent_loops, _wf) =
-            parent_in_state(1, crate::workflow::WorkflowState::Planning).await;
+            parent_in_state(1, crate::app::workflow::WorkflowState::Planning).await;
         let list = compute_subagent_allowlist(&agent_loops, Some(1), &Some("reviewer".into()))
             .await
             .expect("reviewer spawn with a parent returns a list");
@@ -1062,7 +1059,7 @@ mod tests {
         // so they still must NOT appear. This proves the role restricts
         // further than the parent (reviewer = read-only ∩ parent).
         let (agent_loops, _wf) =
-            parent_in_state(2, crate::workflow::WorkflowState::Executing).await;
+            parent_in_state(2, crate::app::workflow::WorkflowState::Executing).await;
         let list = compute_subagent_allowlist(&agent_loops, Some(2), &Some("reviewer".into()))
             .await
             .expect("reviewer spawn with a parent returns a list");
@@ -1125,7 +1122,7 @@ mod tests {
         // absent (Planning hides them) but file_read + create_plan are
         // present. This is the core "subagent ⊆ parent" property.
         let (agent_loops, _wf) =
-            parent_in_state(3, crate::workflow::WorkflowState::Planning).await;
+            parent_in_state(3, crate::app::workflow::WorkflowState::Planning).await;
         let list = compute_subagent_allowlist(&agent_loops, Some(3), &None)
             .await
             .expect("unrestricted spawn with a parent returns a list");

@@ -116,25 +116,40 @@ pub struct RouteKey {
 }
 
 /// Build context handed to [`AgentPolicy::register_tools`] (master-spec
-/// :207).
+/// :207). Extended in 2b.3: the registrations the app factory owns (the
+/// plan/skill tools) need the per-agent bits — the root spec, the resolved
+/// sandbox, the step-verify handle (derived kernel-side from the root),
+/// and the agent's own workflow handle (recovered app→app via
+/// `as_any_arc`; every kernel consumer rides the trait's opaque
+/// representations).
 pub struct PolicyBuildCtx {
     pub agent_id: Option<crate::runtime::AgentId>,
     pub project_root: std::path::PathBuf,
     pub plans_dir: std::path::PathBuf,
+    /// The agent's root spec (a worktree agent) — a kernel type, legal here.
+    pub root: Option<crate::agent::factory::AgentRootSpec>,
+    /// The agent's sandbox (the root-spec's or the factory's).
+    pub sandbox: crate::tool::agent::sandbox::Sandbox,
+    /// The step-verify handle derived from the root (the kernel keeps the
+    /// derivation; only the derived handle crosses).
+    pub step_verify: crate::agent::step_verify::StepVerifyHandle,
+    /// The agent's own workflow handle.
+    pub workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
 }
 
-/// The build context handed to [`AgentPolicyFactory::build_policy`] (2b.2).
-/// The workflow handle is intentionally opaque: the kernel still owns the
-/// loop's workflow (`Arc<Mutex<Workflow>>` — the 2a-era field, removed in
-/// 2b.3) but this seam cannot name the app type (the boundary contract,
-/// master-spec :255-258), so the app-side factory casts it to its own
-/// workflow type. The cast retires together with the field in 2b.3.
+/// The build context handed to [`AgentPolicyFactory::build_policy`] (2b.2;
+/// the workflow field typed via the neutral handle trait in 2b.3 — the
+/// kernel passes the same `Arc<dyn AgentWorkflowHandle>` it stores on the
+/// loop, and the app side recovers its concrete lockable workflow through
+/// `as_any_arc`, an app→app cast).
 pub struct PolicyFactoryCtx {
     pub agent_id: Option<crate::runtime::AgentId>,
     pub project_root: std::path::PathBuf,
     pub plans_dir: std::path::PathBuf,
-    /// The loop's workflow handle, opaque at the seam (cast app-side).
-    pub workflow: Arc<dyn std::any::Any + Send + Sync>,
+    /// The loop's workflow handle (kernel-typed via the neutral trait —
+    /// 2b.3); the app side recovers its concrete, lockable Arc through
+    /// `as_any_arc`.
+    pub workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
 }
 
 /// What [`AgentPolicyFactory::build_policy`] hands back: the policy the
@@ -158,6 +173,17 @@ pub struct PolicyBuildResult {
 /// default is [`NoPolicyFactory`] — production and the kernel test helpers
 /// wire the app implementation at startup/factory-help time.
 pub trait AgentPolicyFactory: Send + Sync {
+    /// Create the agent's OWN workflow (2b.3): the kernel hands the plans
+    /// dir + whether this agent is a subagent (the Subagent state stamp is
+    /// an app-side fact), and receives the neutral handle. The kernel never
+    /// constructs the app workflow type itself — the workflow lives app-side
+    /// from construction on.
+    fn create_workflow(
+        &self,
+        plans_dir: &std::path::Path,
+        is_subagent: bool,
+    ) -> Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>;
+
     /// Build the policy wrapping the agent's own workflow (the opaque
     /// handle in `ctx`). Called once per built agent, before the final
     /// Arc-wrap; the returned `attach_loop` hook is invoked at the build's
@@ -178,6 +204,14 @@ pub trait AgentPolicyFactory: Send + Sync {
 pub struct NoPolicyFactory;
 
 impl AgentPolicyFactory for NoPolicyFactory {
+    fn create_workflow(
+        &self,
+        _plans_dir: &std::path::Path,
+        _is_subagent: bool,
+    ) -> Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> {
+        Arc::new(crate::agent::workflow_handle::UnwiredWorkflow)
+    }
+
     fn build_policy(&self, _ctx: &PolicyFactoryCtx) -> PolicyBuildResult {
         PolicyBuildResult {
             policy: Arc::new(NoPolicy),

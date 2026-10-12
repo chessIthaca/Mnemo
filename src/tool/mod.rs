@@ -19,7 +19,6 @@ pub mod browser;
 pub mod error_message;
 pub mod memory;
 pub mod steering;
-pub use crate::app::tool::workflow; // job 2b: relocated; the alias keeps crate::tool::workflow resolving
 
 use std::collections::HashMap;
 
@@ -28,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::provider::{ApprovalPreview, Capabilities, ToolSchema};
-use crate::workflow::WorkflowState;
 
 /// A tool's category — determines how it's gated by the workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,14 +405,12 @@ pub enum ToolFilter {
     /// Executing a `kind: "research"` plan — [`Executing`](Self::Executing)
     /// minus the source-mutating file tools.
     ///
-    /// DISPATCH-ONLY since 2027-01-11: [`Workflow::schema_filter`] no longer
+    /// DISPATCH-ONLY since 2027-01-11: the workflow's `schema_filter` no longer
     /// advertises this surface for research plans — a per-kind advertised
     /// array rewrote the head on every plan-KIND change and collapsed the
     /// provider's prefix cache to 6,016 tokens with 15.7–17.9s TTFT
     /// (`.coding/analysis/cache-hit-6-report.md`, cause 2). The restriction
     /// itself is unchanged and still enforced here, at the gate.
-    ///
-    /// [`Workflow::schema_filter`]: crate::workflow::Workflow::schema_filter
     ///
     /// A research plan is *defined* as work that produces no source-code
     /// changes (it is the kind that skips review on completion). Denying
@@ -500,30 +496,6 @@ pub enum ToolFilter {
 }
 
 impl ToolFilter {
-    /// Derive the filter from the workflow state.
-    ///
-    /// Returns `None` for [`WorkflowState::Skill`] — the skill filter is NOT
-    /// derived from the state alone (it depends on the active skill's stored
-    /// tool list) and is constructed directly by
-    /// [`Workflow::allowed_tools`](crate::workflow::Workflow::allowed_tools).
-    /// Returning `None` here makes a caller that forgets to handle the Skill
-    /// case fail loudly at the call site rather than silently degrading to a
-    /// wrong-but-plausible `Planning` filter.
-    ///
-    /// Returns `None` for [`WorkflowState::Subagent`] for the same reason: a
-    /// sub-agent's tool surface comes from its spawn-time allow-list
-    /// (`compute_subagent_allowlist` → `set_tool_allowlist` /
-    /// `set_reviewer_allowlist`), never from a lifecycle state it doesn't
-    /// own.
-    pub fn from_state(state: WorkflowState) -> Option<Self> {
-        match state {
-            WorkflowState::Planning => Some(ToolFilter::Planning),
-            WorkflowState::Executing => Some(ToolFilter::Executing),
-            WorkflowState::Reviewing => Some(ToolFilter::Reviewing),
-            WorkflowState::Complete => Some(ToolFilter::Complete),
-            WorkflowState::Skill | WorkflowState::Subagent => None,
-        }
-    }
 
     /// Whether this filter is an explicit allow-list that NAMES `name`.
     ///
@@ -1817,8 +1789,8 @@ mod tests {
         // points at a never-written path; schema listing never executes, so
         // the store stays an empty in-memory instance.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogAddTool::new(
-                std::sync::Arc::new(tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogAddTool::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 ))),
                 None,
@@ -1827,8 +1799,8 @@ mod tests {
         // The real BacklogStatusTool — same rationale as above: the
         // all-state visibility regression must exercise the shipped tool.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogStatusTool::new(
-                std::sync::Arc::new(tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogStatusTool::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 ))),
                 None,
@@ -1837,8 +1809,8 @@ mod tests {
         // The real BacklogListTool — same rationale: the read-only-query
         // visibility regression must exercise the shipped tool.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogListTool::new(std::sync::Arc::new(
-                tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogListTool::new(std::sync::Arc::new(
+                tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 )),
             )),

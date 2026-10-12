@@ -141,7 +141,12 @@ pub struct AgentLoop {
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) workflow: Arc<tokio::sync::Mutex<crate::workflow::Workflow>>,
+    /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
+    /// the loop never names the app workflow type, and every consult rides
+    /// the trait's opaque representations (the state token, the completion
+    /// flag, the plan scope, the tool-filter envelope). The app side
+    /// recovers the concrete lockable Arc through `as_any_arc`.
+    pub(crate) workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The path sandbox — used by the approval gate to determine whether a
     /// tool call is project-scoped (for `AutoApproveProject` mode). Each
     /// agent shares the same sandbox (it's immutable after construction).
@@ -269,7 +274,15 @@ pub struct AgentLoop {
     /// pick re-stamps on its first serve; the pending-swap completion path
     /// in `run_turn` writes `explicit_provider` directly and intentionally
     /// leaves the stamp alone (same pick, completing).
-    pub(crate) pinned_state: std::sync::Mutex<Option<crate::workflow::WorkflowState>>,
+    /// The state the explicit picker was first served in (2a.6), held as
+    /// the handle's state TOKEN since 2b.3 — the opaque representation the
+    /// trait hands out; the comparison semantics are unchanged (hold in the
+    /// stamped state, cede on a state change with a configured slot). Reset
+    /// to `None` by [`set_explicit_provider`](Self::set_explicit_provider)
+    /// so a fresh pick re-stamps on its first serve; the pending-swap
+    /// completion path in `run_turn` writes `explicit_provider` directly and
+    /// intentionally leaves the stamp alone (same pick, completing).
+    pub(crate) pinned_state: std::sync::Mutex<Option<String>>,
     /// Endpoint stickiness recorded by the automatic 429 fallback
     /// ([`try_429_fallback`](Self::try_429_fallback)): model id →
     /// (the endpoint that 429'd, an alternate ModelRef serving the same model
@@ -455,9 +468,9 @@ pub struct AgentLoop {
     /// never reports usage cannot mis-attribute the next one.
     pub(crate) spend_attribution: std::sync::Mutex<Option<budget::SpendAttribution>>,
     /// The kernel→app policy seam (2a.2): the free agent by default
-    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)); the factory attaches
-    /// [`WorkflowPolicy`](crate::app::workflow_policy::WorkflowPolicy) for
-    /// the workflow agent. Nothing consults it until 2a.3+.
+    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)); the factory attaches the
+    /// app's WorkflowPolicy for the workflow agent. Nothing consults it until
+    /// 2a.3+.
     pub(crate) policy: Arc<dyn crate::agent::policy::AgentPolicy>,
 }
 
@@ -779,8 +792,9 @@ pub struct AgentLoopConfig {
     pub provider: Arc<dyn LlmClient>,
     /// The tool registry (shared, immutable after construction).
     pub tools: Arc<ToolRegistry>,
-    /// The workflow state machine (shared across agents).
-    pub workflow: Arc<tokio::sync::Mutex<crate::workflow::Workflow>>,
+    /// The workflow handle (kernel-neutral since 2b.3 — the state machine
+    /// lives app-side behind the trait).
+    pub workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The project sandbox (root dir + path validation).
     pub sandbox: Arc<Sandbox>,
     /// The initial safety mode (also wired as a shared handle).
@@ -1521,13 +1535,11 @@ impl AgentLoop {
     /// This variant threads no routing decision; use
     /// [`resolve_turn_provider_routed`](Self::resolve_turn_provider_routed)
     /// for the turn's pre-prompt routing arm (backlog 091e694d).
-    pub(crate) fn resolve_turn_provider(
+    pub(crate) async fn resolve_turn_provider(
         &self,
-        workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
-        plan_kind: Option<crate::workflow::PlanKind>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
-        self.resolve_turn_provider_routed(workflow_state, skill_name, plan_kind, None)
+        self.resolve_turn_provider_routed(skill_name, None).await
     }
 
     /// [`resolve_turn_provider`](Self::resolve_turn_provider) with the turn's
@@ -1540,11 +1552,9 @@ impl AgentLoop {
     /// target that is unset, dangling, or refused by
     /// [`resolve_routed`](crate::model_resolver::ModelResolver::resolve_routed)
     /// falls through to that chain, unchanged.
-    pub(crate) fn resolve_turn_provider_routed(
+    pub(crate) async fn resolve_turn_provider_routed(
         &self,
-        workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
-        plan_kind: Option<crate::workflow::PlanKind>,
         route: Option<model_routing::RouteTarget>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
         // 1. Configured skill override beats everything — including the
@@ -1559,15 +1569,17 @@ impl AgentLoop {
         // slot can fire in that context. That keeps pin > subagent/state.
         if let Some(name) = skill_name {
             if let Some(resolver) = self.model_resolver.as_ref() {
-                let skill_only = crate::model_resolver::ModelContext::new(
-                    crate::workflow::WorkflowState::Skill,
-                    Some(name),
-                    false,
-                    // The skill arm is skill-slot-only: only the skill slot
-                    // can fire in this probe context, so the plan kind is
-                    // deliberately not engaged here.
-                    None,
-                );
+                // The skill arm is skill-slot-only: only the skill slot can
+                // fire in this probe context. 2b.3: the probe key builds
+                // kernel-side from plain strings — the slot encoding is
+                // `skill:{name}` and the Skill state carries no state slot
+                // (build_route_key's arm, mirrored here byte-exactly).
+                let skill_only = crate::model_resolver::ModelContext {
+                    route: crate::agent::policy::RouteKey {
+                        slots: vec![format!("skill:{name}")],
+                    },
+                    is_subagent: false,
+                };
                 if let Some(model_ref) = resolver.resolve(skill_only) {
                     // 429 endpoint stickiness reroutes the same model id to
                     // its recorded alternate endpoint; the skill model
@@ -1619,11 +1631,17 @@ impl AgentLoop {
             // itself resolves None, so a pin survives unconfigured skill
             // turns exactly as before).
             let pin_holds = {
+                // 2b.3: the state rides the handle's token; the "is the
+                // state configured?" check rides the policy's live route
+                // consult (the state/skill/kind derivation lives app-side).
+                let current_state_token = self.workflow.state().await;
+                let live_route = self.policy().route().await;
                 let mut stamp = self
                     .pinned_state
                     .lock()
                     .expect("pinned_state lock poisoned");
-                match *stamp {
+                let stamped_now = stamp.clone();
+                match stamped_now.as_deref() {
                     None => {
                         // First serve of this pin — it belongs to the state
                         // of the turn that first serves it (normally the
@@ -1633,21 +1651,19 @@ impl AgentLoop {
                         // e.g. pick in Planning, then `create_plan` flips to
                         // Executing before the next turn: the first serve
                         // stamps Executing, not the pick-time state.
-                        *stamp = Some(workflow_state);
+                        *stamp = Some(current_state_token);
                         true
                     }
-                    Some(stamped) if stamped == workflow_state => true,
+                    Some(stamped) if stamped == current_state_token => true,
                     Some(_) => self
                         .model_resolver
                         .as_ref()
                         .map(|resolver| {
                             resolver
-                                .resolve(crate::model_resolver::ModelContext::new(
-                                    workflow_state,
-                                    skill_name,
-                                    self.is_subagent(),
-                                    plan_kind,
-                                ))
+                                .resolve(crate::model_resolver::ModelContext {
+                                    route: live_route.clone(),
+                                    is_subagent: self.is_subagent(),
+                                })
                                 .is_none()
                         })
                         // No resolver attached → nothing is ever configured
@@ -1735,12 +1751,12 @@ impl AgentLoop {
         // fire cannot smuggle routing past an explicit choice. Unset, dangling
         // or refused -> `None` -> the chain below runs exactly as before.
         if let Some(target) = route {
-            let ctx = crate::model_resolver::ModelContext::new(
-                workflow_state,
-                skill_name,
+            // 2b.3: the live route comes from the policy consult — the
+            // state/skill/kind derivation lives app-side.
+            let ctx = crate::model_resolver::ModelContext {
+                route: self.policy().route().await,
                 is_subagent,
-                plan_kind,
-            );
+            };
             if let Some(model_ref) = resolver.resolve_routed(target, ctx) {
                 // Same endpoint stickiness as every other arm: a recorded 429
                 // fallback reroutes the ENDPOINT of this model, never the
@@ -1759,12 +1775,10 @@ impl AgentLoop {
                 return built;
             }
         }
-        let model_ref = resolver.resolve(crate::model_resolver::ModelContext::new(
-            workflow_state,
-            skill_name,
+        let model_ref = resolver.resolve(crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
             is_subagent,
-            plan_kind,
-        ));
+        });
         let Some(model_ref) = model_ref else {
             // No override resolved for this context — default provider,
             // unless 429 endpoint stickiness reroutes the default model to
@@ -2398,14 +2412,15 @@ impl AgentLoop {
     /// read a specific agent's plan via `get_workflow_state(agent_id)`. Each
     /// agent owns its own `Workflow` (built by the `AgentLoopFactory`), so
     /// this is per-agent, not shared.
-    pub fn workflow_handle(&self) -> Arc<tokio::sync::Mutex<crate::workflow::Workflow>> {
+    pub fn workflow_handle(
+        &self,
+    ) -> Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> {
         Arc::clone(&self.workflow)
     }
 
     /// The agent's policy handle (2a.2) — the free agent
     /// ([`NoPolicy`](crate::agent::policy::NoPolicy)) by default; the
-    /// factory attaches the workflow agent's
-    /// [`WorkflowPolicy`](crate::app::workflow_policy::WorkflowPolicy).
+    /// factory attaches the workflow agent's WorkflowPolicy (app-side).
     pub fn policy(&self) -> Arc<dyn crate::agent::policy::AgentPolicy> {
         Arc::clone(&self.policy)
     }
@@ -2416,43 +2431,15 @@ impl AgentLoop {
         self.policy = policy;
     }
 
-    /// Whether the workflow is in a state where the plan loop expects the
-    /// agent to keep making progress — Executing (an in-progress plan with
-    /// steps still to complete) or Reviewing (the closing sequence: review →
-    /// fix → commit → finish). Keeper for kernel diagnostics since 2a.5:
-    /// the state predicate moved verbatim into WorkflowPolicy::on_turn_end
-    /// (the auto-continue gate now consults the policy), so this fn has
-    /// zero live callers; the semantics records below stay accurate.
-    /// Reviewing must self-resume too: a turn that ends mid-closing-sequence
-    /// used to park until the user typed "c" (observed live 2026-12-31,
-    /// twice — the agent stalled after a garbled tool result and waited
-    /// for a manual nudge). Planning additionally expects progress when
-    /// `unattended` is true (a run-all dispatched agent — its Prompt
-    /// embedded the unattended preamble): a premature turn end
-    /// mid-exploration would otherwise park with nobody watching and halt
-    /// the whole run (backlog a6a7727a, live 2027-01-07). Interactive
-    /// Planning still parks — a deliberate turn end there is usually a
-    /// question-wait for the user, and a synthetic continue would
-    /// self-answer it. Any other state (Complete, Skill, Subagent) is
-    /// terminal/overlay/role — no synthetic turns there. Subagent in
-    /// particular is a parented sub-agent's role state, never a
-    /// plan-lifecycle phase, so it can never expect progress on its own.
-    pub async fn workflow_expects_progress(&self, unattended: bool) -> bool {
-        let wf = self.workflow.lock().await;
-        let state = wf.state();
-        matches!(
-            state,
-            crate::workflow::WorkflowState::Executing | crate::workflow::WorkflowState::Reviewing
-        ) || (unattended && state == crate::workflow::WorkflowState::Planning)
-    }
 
     /// The workflow state as a short evidence label (e.g. "Reviewing") —
     /// carried by [`crate::runtime::channels::AgentEvent::Parked`] so the
     /// watchdog ring and the UI can see the pre-stall state without
     /// re-deriving it.
     pub async fn workflow_state_label(&self) -> String {
-        let wf = self.workflow.lock().await;
-        format!("{:?}", wf.state())
+        // The Parked label keeps the pre-2b.3 Debug shape (first letter
+        // capitalized); the token underneath is the serde shape.
+        crate::agent::workflow_handle::capitalize_token(&self.workflow.state().await)
     }
 
     /// Whether this agent has spawned background agents (reviewers, parallel

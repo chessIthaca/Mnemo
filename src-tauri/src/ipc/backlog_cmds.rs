@@ -21,7 +21,7 @@ use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_prompt_dispatched;
 use crate::ipc::run_all::{extract_checkpoint_sha, run_all_dispatch_next};
 use crate::ipc::state::{IpcState, RunAllState};
-use mnemo::backlog::{
+use mnemo::app::backlog::{
     BacklogItem, BacklogPosition, BacklogStatus, BacklogStore, normalize_new_item_text,
 };
 
@@ -635,7 +635,7 @@ mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
     use super::{resolve_run_all_concurrency, spawned_views, BacklogItemView};
     use crate::ipc::state::{RunAllState, SpawnedRun};
-    use mnemo::backlog::{BacklogItem, BacklogStatus};
+    use mnemo::app::backlog::{BacklogItem, BacklogStatus};
 
     /// Parallel run-all (plan ffd7a86f): an explicit concurrency param
     /// wins; the parallel checkbox decides when absent (3 lanes); always
@@ -731,7 +731,7 @@ mod tests {
     /// back to the text-only validator, which rejected them. The command
     /// needs Tauri state, so the wiring is pinned as a source contract;
     /// the validators themselves are unit-tested in
-    /// `mnemo::backlog::tests`.
+    /// `mnemo::app::backlog::tests`.
     #[test]
     fn backlog_add_routes_through_the_shape_validator() {
         let src = normalize_lf(include_str!("backlog_cmds.rs"));
@@ -905,7 +905,7 @@ mod tests {
     /// must route through the guarded store setter (reload → find live
     /// item → persist) and emit the change event — the command needs Tauri
     /// state, so the wiring is pinned as a source contract; the setter
-    /// itself is unit-tested in `mnemo::backlog::tests`.
+    /// itself is unit-tested in `mnemo::app::backlog::tests`.
     #[test]
     fn backlog_set_deferred_routes_through_the_store_setter() {
         let src = normalize_lf(include_str!("backlog_cmds.rs"));
@@ -956,7 +956,7 @@ mod tests {
     /// run. The command needs Tauri state, so the isolation is pinned as a
     /// source contract; the clear-finished store semantics (soft-delete
     /// exactly done/failed/cant-resolve, keep pending+in-flight) are
-    /// unit-tested in `mnemo::backlog::tests`.
+    /// unit-tested in `mnemo::app::backlog::tests`.
     #[test]
     fn backlog_clear_finished_touches_only_the_store_and_the_event() {
         let src = normalize_lf(include_str!("backlog_cmds.rs"));

@@ -1485,6 +1485,19 @@ mod tests {
     use crate::config::SafetyMode;
     use crate::error::Result;
     use crate::memory::embedder::HashEmbedder;
+
+    /// The concrete app workflow behind a loop's neutral handle (2b.3): the
+    /// arm tests attach policies through the same app→app downcast the IPC
+    /// uses.
+    fn concrete(
+        handle: &std::sync::Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
+    ) -> std::sync::Arc<tokio::sync::Mutex<crate::app::workflow::Workflow>> {
+        handle
+            .as_any_arc()
+            .downcast_ref::<std::sync::Arc<tokio::sync::Mutex<crate::app::workflow::Workflow>>>()
+            .expect("the loop's workflow handle wraps the concrete app workflow")
+            .clone()
+    }
     use crate::memory::MemoryStore;
     use crate::provider::{
         Capabilities, FinishReason, LlmClient, LlmEvent, ProviderKind, ToolSchema,
@@ -1492,9 +1505,9 @@ mod tests {
     use crate::tool::agent::sandbox::Sandbox;
     use crate::tool::agent::{file_read::FileReadTool, file_write::FileWriteTool};
     use crate::tool::memory::{MemoryRecallTool, MemoryWriteTool};
-    use crate::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
+    use crate::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
     use crate::tool::ToolRegistry;
-    use crate::workflow::Workflow;
+    use crate::app::workflow::Workflow;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use tempfile::tempdir;
@@ -1557,7 +1570,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -1624,7 +1637,7 @@ mod tests {
                         caps: Capabilities::openai(),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow: workflow.clone(),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox.clone(),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -1707,7 +1720,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -1943,7 +1956,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -2070,7 +2083,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -2189,7 +2202,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(200_000, 0.5),
@@ -2319,7 +2332,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(200_000, 0.5),
@@ -2450,7 +2463,7 @@ mod tests {
             AgentLoopConfig {
                 provider: fallback.clone(),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(200_000, 0.5),
@@ -2530,7 +2543,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.75),
@@ -2659,7 +2672,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: fallback.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -2821,7 +2834,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: primary.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -3082,12 +3095,11 @@ mod tests {
             primary_exec: Arc::clone(&primary_exec),
         });
 
-        let agent_loop = Arc::new(
-            AgentLoop::new(
+        let mut agent_loop = AgentLoop::new(
                 AgentLoopConfig {
                     provider: primary_plan.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow.clone(),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -3096,8 +3108,15 @@ mod tests {
                 },
                 crate::project::Constitution::default(),
             )
-            .with_model_resolver(resolver),
-        );
+            .with_model_resolver(resolver);
+        // 2b.3: the state-aware routing rides the policy's route consult —
+        // attach the WorkflowPolicy so the route derives from the live state.
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(
+                &agent_loop.workflow_handle(),
+            )),
+        ));
+        let agent_loop = Arc::new(agent_loop);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
@@ -3135,7 +3154,7 @@ mod tests {
                 "g",
                 "c",
                 vec!["step one".into()],
-                crate::workflow::PlanKind::Research,
+                crate::app::workflow::PlanKind::Research,
                 None,
             )
             .unwrap();
@@ -3277,12 +3296,11 @@ mod tests {
             primary_exec: Arc::clone(&primary_exec),
         });
 
-        let agent_loop = Arc::new(
-            AgentLoop::new(
+        let mut agent_loop = AgentLoop::new(
                 AgentLoopConfig {
                     provider: primary_default.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow.clone(),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -3291,8 +3309,15 @@ mod tests {
                 },
                 crate::project::Constitution::default(),
             )
-            .with_model_resolver(resolver),
-        );
+            .with_model_resolver(resolver);
+        // 2b.3: the state-aware routing rides the policy's route consult —
+        // attach the WorkflowPolicy so the route derives from the live state.
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(
+                &agent_loop.workflow_handle(),
+            )),
+        ));
+        let agent_loop = Arc::new(agent_loop);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
@@ -3325,7 +3350,7 @@ mod tests {
                 "g",
                 "c",
                 vec!["step one".into()],
-                crate::workflow::PlanKind::Research,
+                crate::app::workflow::PlanKind::Research,
                 None,
             )
             .unwrap();
@@ -3458,7 +3483,7 @@ mod tests {
                 AgentLoopConfig {
                     provider: pinned.clone(),
                     tools: Arc::new(registry),
-                    workflow: workflow.clone(),
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -3525,7 +3550,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -3602,7 +3627,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -3673,7 +3698,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -3818,7 +3843,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -3914,7 +3939,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4022,7 +4047,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4255,7 +4280,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4373,7 +4398,7 @@ mod tests {
                     },
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4506,7 +4531,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4610,7 +4635,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4711,7 +4736,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4825,7 +4850,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -4910,7 +4935,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -5070,7 +5095,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::ApproveEachAction,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -5167,7 +5192,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::ApproveEachAction,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -5319,7 +5344,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -5453,7 +5478,7 @@ mod tests {
                     caps,
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -5966,7 +5991,7 @@ mod tests {
                     backoffs: backoffs.clone(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6050,7 +6075,7 @@ mod tests {
                     captured: captured.clone(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6167,7 +6192,7 @@ mod tests {
                     captured,
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6235,7 +6260,7 @@ mod tests {
                     caps: Capabilities::openai(),
                 }),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6354,7 +6379,7 @@ mod tests {
             AgentLoopConfig {
                 provider: provider.clone(),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6486,7 +6511,7 @@ mod tests {
             AgentLoopConfig {
                 provider: provider.clone(),
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6587,7 +6612,7 @@ mod tests {
             AgentLoopConfig {
                 provider: provider,
                 tools: Arc::new(registry),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6696,7 +6721,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6706,7 +6731,7 @@ mod tests {
             crate::project::Constitution::default(),
         );
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -6802,14 +6827,14 @@ mod tests {
                 "goal",
                 "ctx",
                 vec!["step".into()],
-                crate::workflow::PlanKind::Implementation,
+                crate::app::workflow::PlanKind::Implementation,
                 None,
             )
             .unwrap();
         workflow.lock().await.complete_step(0).unwrap();
         assert_eq!(
             workflow.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing,
+            crate::app::workflow::WorkflowState::Reviewing,
             "setup: the root Implementation plan must be in Reviewing"
         );
         // Sibling dual-handle idiom (see the Prompt twin above).
@@ -6821,7 +6846,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6832,7 +6857,7 @@ mod tests {
         )
         .with_agent_id(1);
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -6925,7 +6950,7 @@ mod tests {
         )));
         assert_eq!(
             workflow.lock().await.state(),
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             "setup: a fresh workflow must be in Planning"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6936,7 +6961,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -6947,7 +6972,7 @@ mod tests {
         )
         .with_agent_id(1);
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -7018,7 +7043,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7116,7 +7141,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -7127,7 +7152,7 @@ mod tests {
         )
         .with_agent_id(1);
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -7365,7 +7390,7 @@ mod tests {
                         stream_gate: std::sync::Mutex::new(Some(stream_gate_rx)),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7462,7 +7487,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7554,7 +7579,7 @@ mod tests {
                 "goal",
                 "ctx",
                 vec!["step".into()],
-                crate::workflow::PlanKind::Implementation,
+                crate::app::workflow::PlanKind::Implementation,
                 None,
             )
             .unwrap();
@@ -7567,7 +7592,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -7578,7 +7603,7 @@ mod tests {
         )
         .with_agent_id(1);
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -7668,7 +7693,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7781,7 +7806,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7862,7 +7887,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -7960,7 +7985,7 @@ mod tests {
                 "goal",
                 "ctx",
                 vec!["step".into()],
-                crate::workflow::PlanKind::Implementation,
+                crate::app::workflow::PlanKind::Implementation,
                 None,
             )
             .unwrap();
@@ -7970,7 +7995,7 @@ mod tests {
         workflow.lock().await.complete_step(0).unwrap();
         assert_eq!(
             workflow.lock().await.state(),
-            crate::workflow::WorkflowState::Reviewing,
+            crate::app::workflow::WorkflowState::Reviewing,
             "setup: the root Implementation plan must be in Reviewing"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7981,7 +8006,7 @@ mod tests {
                     calls: Arc::clone(&calls),
                 }),
                 tools: Arc::new(ToolRegistry::new()),
-                workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -7992,7 +8017,7 @@ mod tests {
         )
         .with_agent_id(1);
         agent_loop.set_policy(Arc::new(
-            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+            crate::app::workflow_policy::WorkflowPolicy::new(concrete(&agent_loop.workflow_handle())),
         ));
         let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -8069,7 +8094,7 @@ mod tests {
                 "goal",
                 "ctx",
                 vec!["step".into()],
-                crate::workflow::PlanKind::Implementation,
+                crate::app::workflow::PlanKind::Implementation,
                 None,
             )
             .unwrap();
@@ -8085,7 +8110,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),
@@ -8260,7 +8285,7 @@ mod tests {
                         calls: Arc::clone(&calls),
                     }),
                     tools: Arc::new(ToolRegistry::new()),
-                    workflow,
+                    workflow: crate::app::workflow::as_handle(workflow.clone()),
                     sandbox,
                     safety_mode: SafetyMode::Autonomous,
                     context_manager: ContextManager::new(128_000, 0.5),

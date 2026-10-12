@@ -17,7 +17,6 @@ use tauri::State;
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::runtime::AgentId;
-use mnemo::workflow::WorkflowState;
 
 use crate::ipc::agent::AgentInfo;
 use crate::ipc::backlog_cmds::{resolve_item_view, BacklogItemView};
@@ -33,7 +32,7 @@ pub struct StartupSnapshot {
     pub context_caps: Vec<(AgentId, u32)>,
     /// EVERY agent's workflow state (closes the stale-non-active gap — the
     /// old startup fetched only the active agent's state).
-    pub workflow_states: Vec<(AgentId, WorkflowState)>,
+    pub workflow_states: Vec<(AgentId, String)>,
     /// The backlog (same as `backlog_list` — the frontend-facing views, with
     /// image paths resolved to data URLs and the run-all checkpoint sha
     /// parsed from each note).
@@ -126,11 +125,11 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
         .iter()
         .map(|(id, l)| (*id, l.context_manager().max_tokens() as u32))
         .collect();
-    let mut workflow_states: Vec<(AgentId, WorkflowState)> = Vec::new();
+    let mut workflow_states: Vec<(AgentId, String)> = Vec::new();
     for (id, l) in agent_loops.iter() {
-        let wf = l.workflow_handle();
+        let wf = crate::ipc::agent::workflow_concrete(&l.workflow_handle());
         let wf = wf.lock().await;
-        workflow_states.push((*id, wf.state()));
+        workflow_states.push((*id, format!("{:?}", wf.state()).to_lowercase()));
     }
     drop(agent_loops);
 

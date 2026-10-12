@@ -377,3 +377,58 @@ config_io.rs, events.rs) stay unwired (NoPolicy) — every one of them
 asserts bookkeeping, not policy semantics (reviewer-2b2's checklist + the
 battery; no test covers console policy semantics, noted as the accepted
 gap the boundary test's 2b.3 pass will not narrow).
+### A5. The 2b.3 design freeze (the re-probe census, tree aeba3b6)
+
+The neutral kernel trait `AgentWorkflowHandle` (src/agent/workflow_handle.rs,
+kernel-defined; implemented on Workflow app-side): `state() -> String` (the
+canonical state token — the pin stamps, the event label, the denial text, the
+wire field), `is_complete() -> bool` (the :1920 capture guard + the nudge's
+param flip), `plan_scope() -> Option<(String, Option<usize>)>` (the
+:498 spend-fallback; read_plan_scope_retires), `allowed_tools() -> ToolFilter`
+(the dispatch gate's None-fallback :258), `as_any(&self) -> &dyn Any` (the
+app-side escape: the src-tauri get_workflow_state handler :719-745 downcasts
+app→app to the concrete Workflow and keeps its rich reads — src-tauri sits
+outside the lib scan). THE WORKFLOW CONSTRUCTION FLIPS TO THE APP: the
+kernel's :969-987 Workflow::new(plans_dir) moves behind AgentPolicyFactory::
+create_workflow(&self, plans_dir: &Path, is_subagent: bool) ->
+Arc<dyn AgentWorkflowHandle> (the app stamps Subagent from the loop's own
+flag — no state-name tokens); build_policy's PolicyFactoryCtx.workflow re-
+types to the dyn handle and the app's downcast goes through as_any — the
+2b.2 Any-field duality collapses. Consumer flips: loop_impl's
+field/params → the dyn handle; pinned_state → Option<String> tokens;
+workflow_state_label → the token; expects_progress REMOVES (zero callers
+since 2a.5); read_plan_scope REMOVES; the ModelContext::new production
+sites (:1562/:1645/:1738/:1762 loop_impl + turn :1218) flip to
+{route: the consulted RouteKey, is_subagent} with build_route_key
+:106-136 moving to the app (the golden rewrites onto the app fn, parity
+pinned; ModelContext::new deletes from production — the 38 resolver
+tests construct the struct literally, scan-excluded); dispatch's
+denial_message param → the token; prompt.rs's build_system_prompt moves
+under src/app (append_plan_nudge stays kernel with the bool param —
+volatile_tail takes only caps so the nudge cannot ride the tail);
+tool/mod.rs's :31 import + from_state :518 REMOVE (zero callers
+app-wide — the state→filter map lives only in the workflow's own
+allowed_tools); spawn_agent.rs's :38/:134/:198 workflow params → the dyn
+handle (the exact review-scoper surface frozen in A6); channels.rs's
+WorkflowStateChanged.field :262-263 → String (the shims :592/:843 follow);
+turn_resolve's transition counts → String tokens; THE SKILLS MIGRATE:
+the kernel factory's skills field/with_skills/skills_handle :884 carry
+crate::app::skill::SkillLibrary (app-typed since 2b.1) — the field moves to
+the app factory (main.rs's with_skills re-targets it; the IPC enter_skill
+handler re-targets the app-side skills_handle — src-tauri app-legal), and
+the :83-88 plan/skill tool registrations move into WorkflowPolicyFactory's
+register_tools (PolicyFactoryCtx carries the per-agent dyn workflow + the
+app downcasts via as_any). THE MEMORY MODULE (decision 5 confirmed): the
+single-parser relocation — src/memory/plan_format.rs (declared in
+src/memory/mod.rs) carries the minimal structured parse (the plan-id/title/
+the bug_symptom/the BugFixing-kind flag + the fields plan_record :43-79
+and finish_capture consume); the app's workflow/plan_file.rs DELEGATES its
+parse to the kernel parser (app→kernel legal) and reconstructs the rich
+PlanFile. THE ALIAS RETIREMENT: lib.rs's three pub-uses + tool/mod.rs :22's
+re-export delete; the app-side alias-import hygiene flips
+(src/app/skill/mod.rs :31 → crate::app::workflow). THE BOUNDARY TEST
+(home: src/lib.rs's #[cfg(test)] module): a mechanical walk of src/
+excluding src/app/**/*.rs, stripping #[cfg(test)] blocks by balanced
+braces and SKIPPING comment/doc lines (// /// //! — the token rule is
+code-only), asserting zero of master-spec :255-258's five tokens, the
+failure listing file:line.

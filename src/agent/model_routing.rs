@@ -225,9 +225,8 @@ pub struct RouteDecisionRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<String>,
     /// The 0-based index of the plan step a lane row classified (backlog
-    /// ad56c7bd; the same index [`Step`] carries). Absent on pre-prompt rows.
-    ///
-    /// [`Step`]: crate::workflow::plan_file::Step
+    /// ad56c7bd; the same index the plan-file `Step` type carries). Absent on
+    /// pre-prompt rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_index: Option<usize>,
     /// True when routing was IN EFFECT for this turn: enforcement was on (not

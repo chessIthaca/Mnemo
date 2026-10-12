@@ -15,7 +15,6 @@ use crate::agent::policy::{assemble_stable_head, KernelPromptBlocks};
 use crate::memory::{Memory, ScoredMemory};
 use crate::project::Constitution;
 use crate::provider::Capabilities;
-use crate::workflow::Workflow;
 
 /// The coding system preamble — the base instructions.
 ///
@@ -383,10 +382,12 @@ fn looks_like_work_intent(text: &str) -> bool {
 /// (Executing) or is about to create one (Planning), so the nudge is moot.
 pub(crate) fn append_plan_nudge(
     tail: &mut String,
-    state: crate::workflow::WorkflowState,
+    is_complete: bool,
     user_message: Option<&str>,
 ) {
-    if state == crate::workflow::WorkflowState::Complete {
+    // 2b.3: the state arrives as the completion flag (the neutral handle's
+    // is_complete) — the kernel never names the workflow state type.
+    if is_complete {
         if let Some(msg) = user_message {
             if looks_like_work_intent(msg) {
                 tail.push_str("\n# PLAN NUDGE\n\n");
@@ -519,21 +520,6 @@ pub fn build_volatile_tail(
 /// can be appended after the conversation history (cache-immune), and
 /// [`CONTEXT_FOOTER`] can be appended as the final message after the tail
 /// (cache-stable sentinel — this wrapper deliberately does NOT include it).
-pub fn build_system_prompt(
-    caps: &Capabilities,
-    workflow: &Workflow,
-    constitution: &Constitution,
-    memories: Option<&str>,
-) -> String {
-    let mut prompt = build_stable_head(constitution);
-    prompt.push_str(&build_volatile_tail(
-        caps,
-        &crate::app::workflow_policy::workflow_section(workflow),
-        memories,
-    ));
-    prompt
-}
-
 /// Format recalled memories into a compact section for the system prompt.
 ///
 /// Each entry shows the tier, title, stable id, score, and the first 160
@@ -626,10 +612,10 @@ pub fn format_primer(memories: &[Memory]) -> String {
 mod tests {
     use super::*;
     use crate::project::Constitution;
-    use crate::workflow::Workflow;
+    use crate::app::workflow::Workflow;
     use tempfile::tempdir;
     use crate::app::workflow_policy::workflow_section;
-    use crate::workflow::WorkflowState;
+    use crate::app::workflow::WorkflowState;
 
     /// The composed volatile tail's section ORDER is pinned (2a.4, step file
     /// :649-652): no existing test asserted the composed order — memories,
@@ -689,7 +675,7 @@ mod tests {
         let wf = Workflow::new(dir.path());
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("PLANNING"));
         assert!(prompt.contains("create_plan"));
     }
@@ -703,7 +689,7 @@ mod tests {
         let wf = Workflow::new(dir.path());
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(
             prompt.contains("research"),
             "lifecycle should encourage research planning"
@@ -924,7 +910,7 @@ mod tests {
         .unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("Build feature X"));
         assert!(prompt.contains("CURRENT STEP"));
         assert!(prompt.contains("step 1"));
@@ -939,7 +925,7 @@ mod tests {
             global: "Never commit to main".into(),
             project: "Use edition 2021".into(),
         };
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("Never commit to main"));
         assert!(prompt.contains("Use edition 2021"));
         assert!(prompt.contains("HARD RULES — GLOBAL"));
@@ -954,7 +940,7 @@ mod tests {
         wf.complete_step(0).unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("complete"));
     }
 
@@ -975,15 +961,15 @@ mod tests {
             "G",
             "C",
             vec!["a".into()],
-            crate::workflow::PlanKind::Research,
+            crate::app::workflow::PlanKind::Research,
             None,
         )
         .unwrap();
         wf.complete_step(0).unwrap();
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Complete);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Complete);
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(
             prompt.contains("NEW TASK"),
             "STATE_COMPLETE should frame code-change messages as a new task"
@@ -1051,7 +1037,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Complete,
+            true,
             Some("fix the bug in login.rs"),
         );
         assert!(tail.contains("PLAN NUDGE"), "nudge header appended");
@@ -1065,7 +1051,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Complete,
+            true,
             Some("how does the login work?"),
         );
         assert!(!tail.contains("PLAN NUDGE"), "no nudge for a pure question");
@@ -1079,7 +1065,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Executing,
+            false,
             Some("fix the bug in login.rs"),
         );
         assert!(!tail.contains("PLAN NUDGE"), "no nudge outside Complete");
@@ -1090,7 +1076,7 @@ mod tests {
     fn append_plan_nudge_skips_when_no_user_message() {
         // Complete + no user message (e.g. a tool-result-only turn) → no nudge.
         let mut tail = String::from("base tail\n");
-        append_plan_nudge(&mut tail, crate::workflow::WorkflowState::Complete, None);
+        append_plan_nudge(&mut tail, true, None);
         assert!(
             !tail.contains("PLAN NUDGE"),
             "no nudge without a user message"
@@ -1105,13 +1091,13 @@ mod tests {
         wf.start_skill(
             "merge_to_main",
             "Merge this branch into main and delete it.",
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             vec!["git".into(), "skill_end".into()],
         )
         .unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("merge_to_main"), "prompt names the skill");
         assert!(
             prompt.contains("Merge this branch into main and delete it."),
@@ -1653,7 +1639,7 @@ mod tests {
             "G",
             "the root cause lives in src/app.rs:42",
             vec!["s1".into()],
-            crate::workflow::PlanKind::BugFixing,
+            crate::app::workflow::PlanKind::BugFixing,
             Some("the app crashes on open"),
             Some("- Reproduce — run cargo test crashy"),
         )

@@ -29,32 +29,11 @@
 //! intercepts `ask_user` before calling `execute`).
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::json;
 
+use crate::agent::ask_user_args::AskUserArgs;
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-
-/// Arguments for `ask_user`.
-#[derive(Debug, Deserialize)]
-struct AskUserArgs {
-    /// The question to ask the user.
-    question: String,
-    /// The clickable options (at least 2; 2–6 recommended). Each has a short
-    /// label and an optional longer description.
-    #[serde(default)]
-    options: Vec<AskUserOption>,
-}
-
-/// One option in an `ask_user` question.
-#[derive(Debug, Deserialize)]
-struct AskUserOption {
-    /// The short button label.
-    label: String,
-    /// An optional longer description shown under the label.
-    #[serde(default)]
-    description: Option<String>,
-}
 
 /// The `ask_user` workflow tool — ask the user a question.
 ///
@@ -148,40 +127,10 @@ impl Tool for AskUserTool {
     }
 }
 
-/// Parse + validate `ask_user` arguments from a raw JSON value.
-///
-/// Used by the dispatch layer to extract the question + options before
-/// emitting the `UserQuestion` event. Returns the question text + the
-/// serializable options, or an error string.
-pub(crate) fn parse_ask_user_args(
-    args: &serde_json::Value,
-) -> Result<(String, Vec<crate::runtime::QuestionOption>), String> {
-    let a: AskUserArgs = serde_json::from_value(args.clone())
-        .map_err(|e| format!("invalid ask_user arguments: {e}"))?;
-    if a.question.trim().is_empty() {
-        return Err("ask_user requires a non-empty 'question'".into());
-    }
-    if a.options.len() < 2 {
-        return Err(format!(
-            "ask_user requires at least 2 options (got {}) — for an open-ended question, skip \
-             this tool and post the question as text in your response",
-            a.options.len()
-        ));
-    }
-    let options = a
-        .options
-        .into_iter()
-        .map(|o| crate::runtime::QuestionOption {
-            label: o.label,
-            description: o.description,
-        })
-        .collect();
-    Ok((a.question, options))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ask_user_args::parse_ask_user_args;
 
     #[test]
     fn parses_args_with_options() {

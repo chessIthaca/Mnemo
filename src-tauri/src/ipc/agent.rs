@@ -15,12 +15,25 @@ use serde::Serialize;
 use tauri::State;
 
 use mnemo::runtime::channels::{AgentCommand, AgentId, SerializableAgentEvent};
-use mnemo::workflow::{PlanFile, WorkflowState};
+use mnemo::app::workflow::{PlanFile, WorkflowState};
 
 use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_agent_event;
 use crate::ipc::settings::{parse_safety_mode, safety_mode_wire};
 use crate::ipc::state::{IpcState, UserIntervention};
+
+/// The concrete app workflow behind a loop's neutral handle (2b.3): the
+/// IPC reads the rich surface app→app — the legal direction. The kernel
+/// never names the app type; the bin side may.
+pub(crate) fn workflow_concrete(
+    handle: &std::sync::Arc<dyn mnemo::agent::workflow_handle::AgentWorkflowHandle>,
+) -> std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>> {
+    handle
+        .as_any_arc()
+        .downcast_ref::<std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>>>()
+        .expect("the loop's workflow handle wraps the concrete app workflow")
+        .clone()
+}
 
 /// Lock the manager + send a command to an agent, mapping the error with
 /// `label`. Shared by the 6 send-command Tauri commands (send_prompt,
@@ -204,7 +217,7 @@ pub struct PlanAncestorInfo {
 }
 
 /// The active skill overlay, returned by `get_workflow_state` when a skill is
-/// running. Mirrors [`mnemo::workflow::ActiveSkill`] minus the `tools`
+/// running. Mirrors [`mnemo::app::workflow::ActiveSkill`] minus the `tools`
 /// list (which is an internal detail the frontend doesn't need).
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveSkillInfo {
@@ -724,7 +737,7 @@ pub async fn get_workflow_state(
     let agent_loop = agent_loops
         .get(&agent_id)
         .ok_or_else(|| format!("no agent loop for agent {agent_id}"))?;
-    let workflow = agent_loop.workflow_handle();
+    let workflow = workflow_concrete(&agent_loop.workflow_handle());
     let workflow = workflow.lock().await;
     let skill = workflow.active_skill().map(|s| ActiveSkillInfo {
         name: s.name.clone(),
@@ -784,7 +797,7 @@ pub async fn get_plan(
     let agent_loop = agent_loops
         .get(&agent_id)
         .ok_or_else(|| format!("no agent loop for agent {agent_id}"))?;
-    let workflow = agent_loop.workflow_handle();
+    let workflow = workflow_concrete(&agent_loop.workflow_handle());
     let workflow = workflow.lock().await;
     let plans_dir = workflow.plans_dir().to_path_buf();
     drop(workflow);
@@ -837,14 +850,13 @@ pub async fn enter_skill(
     skill: String,
     prompt: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let factory = state
-        .runtime
-        .factory
+    // Look up the skill in the library held by the APP policy factory (2b.3:
+    // the kernel factory's skills surface retired with the registration
+    // move — the IPC reads the handle app→app).
+    let library = state
+        .app_policy_factory
         .as_ref()
-        .ok_or_else(|| "agent factory unavailable (brain failed to start)".to_string())?;
-    // Look up the skill in the library held by the factory.
-    let library = factory
-        .skills_handle()
+        .and_then(|f| f.skills_handle())
         .ok_or_else(|| "no skill library configured".to_string())?;
     let spec = library
         .read(|r| r.get(&skill).cloned())
@@ -854,7 +866,7 @@ pub async fn enter_skill(
     let agent_loop = agent_loops
         .get(&agent_id)
         .ok_or_else(|| format!("no agent loop for agent {agent_id}"))?;
-    let workflow_arc = agent_loop.workflow_handle();
+    let workflow_arc = workflow_concrete(&agent_loop.workflow_handle());
     drop(agent_loops);
 
     let current = {

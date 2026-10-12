@@ -41,7 +41,6 @@ use crate::agent::context::ContextManager;
 use crate::agent::model_routing::{RouteTarget, RoutingPolicy};
 use crate::config::{Config, ModelRef};
 use crate::provider::LlmClient;
-use crate::workflow::{PlanKind, WorkflowState};
 
 /// A configured endpoint and the model ids it serves — the payload of
 /// [`ModelResolver::list_models`].
@@ -80,59 +79,28 @@ pub struct ModelContext {
 }
 
 impl ModelContext {
-    /// Build a context from its parts (the signature every call site keeps —
-    /// the grep-count acceptance; the route key is derived from the parts via
-    /// [`build_route_key`]).
+    #[cfg(test)]
+    /// Build a context from its parts (the TEST-compat constructor — the
+    /// 38 call sites in this file's tests; production consults the policy's
+    /// `route()` for the live chain since 2b.3, so this ctor lives only in
+    /// the test build, where the app-side `build_route_key` remains
+    /// reachable).
     pub fn new(
-        workflow_state: WorkflowState,
+        workflow_state: crate::app::workflow::WorkflowState,
         skill_name: Option<&str>,
         is_subagent: bool,
-        plan_kind: Option<PlanKind>,
+        plan_kind: Option<crate::app::workflow::PlanKind>,
     ) -> Self {
         Self {
-            route: build_route_key(workflow_state, skill_name, plan_kind, is_subagent),
+            route: crate::app::workflow_policy::build_route_key(
+                workflow_state,
+                skill_name,
+                plan_kind,
+                is_subagent,
+            ),
             is_subagent,
         }
     }
-}
-
-/// The turn's routing key: today's ordered slot chain, extracted (2a.6) so
-/// `WorkflowPolicy::route` can emit exactly the same list (the routing-table
-/// golden pins both). The order mirrors `ConfigModelResolver::resolve`'s
-/// pre-2a.6 arm order: the skill override, the subagent override, the
-/// bug-fixing plan-kind override, then the state slot. Reviewing resolves
-/// `executing` (`[models.reviewing]` is reviewer-spawn-only); Skill and
-/// Subagent carry NO state slot — their own arms or the default cover them.
-pub(crate) fn build_route_key(
-    workflow_state: WorkflowState,
-    skill_name: Option<&str>,
-    plan_kind: Option<PlanKind>,
-    is_subagent: bool,
-) -> crate::agent::policy::RouteKey {
-    let mut slots = Vec::new();
-    if let Some(name) = skill_name {
-        slots.push(format!("skill:{name}"));
-    }
-    if is_subagent {
-        slots.push("subagent".to_string());
-    }
-    if plan_kind == Some(PlanKind::BugFixing)
-        && matches!(
-            workflow_state,
-            WorkflowState::Executing | WorkflowState::Reviewing
-        )
-    {
-        slots.push("bug_fixing".to_string());
-    }
-    match workflow_state {
-        WorkflowState::Planning => slots.push("planning".to_string()),
-        WorkflowState::Executing | WorkflowState::Reviewing => {
-            slots.push("executing".to_string());
-        }
-        WorkflowState::Complete => slots.push("complete".to_string()),
-        WorkflowState::Skill | WorkflowState::Subagent => {}
-    }
-    crate::agent::policy::RouteKey { slots }
 }
 
 /// Resolves a per-context model override for a turn.
@@ -604,6 +572,9 @@ impl ModelResolver for ConfigModelResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 2b.3: the production imports retired with the kernel decoupling; the
+    // tests keep the typed workflow enums (cfg(test) — scan-excluded).
+    use crate::app::workflow::{PlanKind, WorkflowState};
     use crate::config::{Endpoint, GeneralConfig, ModelsConfig, RoutingConfig};
     use std::collections::HashMap;
 

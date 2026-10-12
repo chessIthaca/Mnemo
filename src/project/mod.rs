@@ -16,6 +16,7 @@
 pub mod agent_md;
 pub mod git_ops;
 pub mod scaffold;
+pub mod skills_seed;
 pub mod worktrees;
 
 pub use agent_md::{Constitution, ConstitutionSource};
@@ -48,7 +49,7 @@ pub struct Project {
     /// `<coding_dir>/config.toml` — optional project-specific overrides.
     pub config_toml: PathBuf,
     /// `<coding_dir>/skills` — skill definition files (`<name>.toml`), loaded
-    /// at startup into a [`SkillRegistry`](crate::skill::SkillRegistry).
+    /// at startup into the app-side skill registry.
     pub skills_dir: PathBuf,
     /// `<coding_dir>/mcp.toml` — optional per-project MCP server overrides,
     /// union-merged over the global `~/.mnemo/mcp.toml` with the project
@@ -180,7 +181,7 @@ impl Project {
     /// `.gitattributes` entries (merge-append — a deleted ignore rule comes
     /// back, existing user lines are never reordered or overwritten).
     fn seed_init_artifacts(project: &Project) -> Result<()> {
-        crate::skill::seed_skills(&project.skills_dir).map_err(|e| {
+        crate::project::skills_seed::seed_skills(&project.skills_dir).map_err(|e| {
             Error::Project(format!(
                 "failed to seed skills into {}: {e}",
                 project.skills_dir.display()
@@ -283,7 +284,7 @@ mod tests {
         // Shipped skills are seeded at init: the skills dir exists and every
         // embedded shipped skill landed as a parseable TOML file.
         assert!(project.skills_dir.is_dir(), "skills dir scaffolded");
-        for (name, _) in crate::skill::SHIPPED_SKILLS {
+        for (name, _) in crate::project::skills_seed::SHIPPED_SKILLS {
             let path = project.skills_dir.join(format!("{name}.toml"));
             assert!(path.is_file(), "shipped skill {name} seeded at init");
         }
@@ -330,7 +331,7 @@ prompt = "Custom project-specific merge flow."
         Project::init(dir.path()).unwrap();
         std::fs::remove_dir_all(dir.path().join(".coding/skills")).unwrap();
         Project::init(dir.path()).unwrap();
-        for (name, _) in crate::skill::SHIPPED_SKILLS {
+        for (name, _) in crate::project::skills_seed::SHIPPED_SKILLS {
             let path = dir
                 .path()
                 .join(".coding/skills")

@@ -12,6 +12,19 @@ use crate::provider::{
     ToolSchema,
 };
 use crate::runtime::{AgentEvent, PhaseKind};
+
+/// The concrete app workflow behind a loop's neutral handle (2b.3): the
+/// tests read the rich surface through the same app→app downcast the IPC
+/// uses.
+fn concrete(
+    handle: &std::sync::Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
+) -> std::sync::Arc<tokio::sync::Mutex<crate::app::workflow::Workflow>> {
+    handle
+        .as_any_arc()
+        .downcast_ref::<std::sync::Arc<tokio::sync::Mutex<crate::app::workflow::Workflow>>>()
+        .expect("the loop's workflow handle wraps the concrete app workflow")
+        .clone()
+}
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::agent::{
     file_read::FileReadTool, file_write::FileWriteTool, git::GitTool,
@@ -19,9 +32,9 @@ use crate::tool::agent::{
 };
 use crate::tool::memory::retrieval::MemorySearchTool;
 use crate::tool::memory::MemoryWriteTool;
-use crate::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
+use crate::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
 use crate::tool::ToolRegistry;
-use crate::workflow::Workflow;
+use crate::app::workflow::Workflow;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::sync::Arc;
@@ -42,7 +55,7 @@ fn test_config(
     AgentLoopConfig {
         provider,
         tools,
-        workflow,
+        workflow: crate::app::workflow::as_handle(workflow.clone()),
         sandbox,
         safety_mode: SafetyMode::Autonomous,
         context_manager: context::ContextManager::new(128_000, 0.5),
@@ -253,7 +266,7 @@ fn make_registry(
     // abandon_plan — registered so the review-exit gate test exercises the
     // escape hatch through dispatch (otherwise the unknown-tool check
     // fires before the gate is reached).
-    registry.register(Box::new(crate::tool::workflow::plan::AbandonPlanTool::new(
+    registry.register(Box::new(crate::app::tool::workflow::plan::AbandonPlanTool::new(
         workflow.clone(),
     )));
     // spawn_agent — registered so the failed-reviewer respawn gate (which
@@ -263,7 +276,7 @@ fn make_registry(
     // unknown-tool check) is what subagent tests exercise. The reviews dir
     // mirrors the factory's derivation (plans_dir.parent().join("reviews")
     // with plans_dir = <root>/plans → <root>/reviews).
-    registry.register(Box::new(crate::tool::workflow::plan::FinishTool::new(
+    registry.register(Box::new(crate::app::tool::workflow::plan::FinishTool::new(
         workflow.clone(),
         sandbox.root().join("reviews"),
     )));
@@ -917,7 +930,7 @@ async fn phase_events_cycle_across_requests_and_tools() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2303,7 +2316,7 @@ async fn create_plan_never_needs_approval() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2335,7 +2348,7 @@ async fn create_plan_never_needs_approval() {
 
     // The plan was created and the workflow transitioned to Executing.
     let wf = workflow.lock().await;
-    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
 }
 
 #[tokio::test]
@@ -2386,7 +2399,7 @@ async fn git_merge_prompts_even_in_autonomous_mode() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2496,7 +2509,7 @@ async fn run_turn_records_session_id_on_tool_events() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2564,7 +2577,7 @@ async fn run_turn_records_error_request_stats() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2659,7 +2672,7 @@ async fn run_turn_records_summarize_request_stats() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2771,7 +2784,7 @@ async fn run_turn_records_request_stats_on_usage() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2852,7 +2865,7 @@ async fn run_turn_records_request_stats_on_usage() {
                 .named("a100"),
             ),
             tools: registry2,
-            workflow: workflow2,
+            workflow: crate::app::workflow::as_handle(workflow2.clone()),
             sandbox: sandbox2,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2953,7 +2966,7 @@ async fn cache_heuristic_skipped_after_summarization() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(100, 0.5),
@@ -3200,7 +3213,7 @@ async fn constitution_reread_after_agent_md_edit() {
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3273,7 +3286,7 @@ async fn volatile_tail_then_stable_footer_appended_and_popped() {
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3366,7 +3379,7 @@ async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() 
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3479,7 +3492,7 @@ async fn deepseek_head_stays_byte_stable_across_plan_progress_bumps() {
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3567,7 +3580,7 @@ async fn plan_frozen_tools_head_and_footer_byte_stable_across_executing_reviewin
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3593,7 +3606,7 @@ async fn plan_frozen_tools_head_and_footer_byte_stable_across_executing_reviewin
         let mut wf = workflow.lock().await;
         wf.complete_step(0).unwrap();
         wf.complete_step(1).unwrap();
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Reviewing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Reviewing);
     }
 
     // Iteration 2: Reviewing.
@@ -3654,7 +3667,7 @@ async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
             "G",
             "C",
             vec!["step 1".into()],
-            crate::workflow::PlanKind::Research,
+            crate::app::workflow::PlanKind::Research,
             None,
         )
         .unwrap();
@@ -3668,7 +3681,7 @@ async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3757,7 +3770,7 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -3993,7 +4006,7 @@ async fn complete_with_retry_records_error_stats_per_attempt() {
         AgentLoopConfig {
             provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -4124,7 +4137,7 @@ async fn auto_compaction_emits_compacting_phase_inside_sending() {
         AgentLoopConfig {
             provider,
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             // Tiny context window — summarize_at = 5 tokens; the user message
@@ -4212,7 +4225,7 @@ async fn auto_compaction_announces_only_once_per_turn() {
         AgentLoopConfig {
             provider,
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             // Tiny context window — summarize_at = 5 tokens; every iteration is
@@ -4774,7 +4787,7 @@ async fn safety_rule_auto_approves_in_approve_each_mode() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -4873,7 +4886,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -4931,7 +4944,7 @@ async fn describe_image_errors_when_no_vision_client() {
                 reason: FinishReason::Stop,
             }])),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -4977,7 +4990,7 @@ fn is_multimodal_reflects_provider_caps() {
                 name: String::new(),
             }),
             tools: registry.clone(),
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -5003,7 +5016,7 @@ fn is_multimodal_reflects_provider_caps() {
                 name: String::new(),
             }),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -5274,7 +5287,7 @@ async fn dispatch_denies_finish_for_subagent_even_in_reviewing() {
         let mut wf = workflow.lock().await;
         wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
         wf.complete_step(0).unwrap();
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Reviewing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Reviewing);
     }
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
@@ -5302,11 +5315,11 @@ async fn dispatch_denies_finish_for_subagent_even_in_reviewing() {
         result.output
     );
     // The review is not closed out.
-    let wf = agent.workflow_handle();
-    let wf = wf.lock().await;
+    let handle = concrete(&agent.workflow_handle());
+    let wf = handle.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Reviewing,
+        crate::app::workflow::WorkflowState::Reviewing,
         "finish must not have transitioned the workflow"
     );
 }
@@ -5354,7 +5367,7 @@ async fn dispatch_denies_reviewer_respawn_while_failure_pending() {
 async fn dispatch_clears_failure_pending_on_ask_user() {
     // The failed-reviewer latch clears when the agent asks the user — after
     // that, a reviewer spawn is allowed again (whatever the user decided).
-    use crate::tool::workflow::ask_user::AskUserTool;
+    use crate::app::tool::workflow::ask_user::AskUserTool;
 
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
@@ -5375,7 +5388,7 @@ async fn dispatch_clears_failure_pending_on_ask_user() {
         AgentLoopConfig {
             provider: provider,
             tools: Arc::new(registry),
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -5795,7 +5808,7 @@ async fn dispatch_allows_parallel_work_tools_while_descendants_running() {
         let wf = workflow.lock().await;
         assert_eq!(
             wf.state(),
-            crate::workflow::WorkflowState::Executing,
+            crate::app::workflow::WorkflowState::Executing,
             "create_plan must have transitioned Planning → Executing"
         );
     }
@@ -5821,7 +5834,7 @@ async fn dispatch_allows_parallel_work_tools_while_descendants_running() {
     let wf = workflow.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Planning,
+        crate::app::workflow::WorkflowState::Planning,
         "abandon_plan must have popped the plan"
     );
 }
@@ -5879,7 +5892,7 @@ async fn dispatch_allows_nonfinal_complete_step_while_descendants_running() {
     let wf = workflow.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Executing,
+        crate::app::workflow::WorkflowState::Executing,
         "a non-final step must not exit Executing"
     );
     assert_eq!(
@@ -5971,7 +5984,7 @@ async fn dispatch_blocks_final_complete_step_while_descendants_running() {
     let wf = workflow.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Executing,
+        crate::app::workflow::WorkflowState::Executing,
         "the plan must not have exited Executing"
     );
     assert_eq!(
@@ -6039,7 +6052,7 @@ async fn dispatch_blocks_finish_while_descendants_running() {
     let wf = workflow.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Reviewing,
+        crate::app::workflow::WorkflowState::Reviewing,
         "the plan must not have completed"
     );
 }
@@ -6107,7 +6120,7 @@ async fn dispatch_allows_subplan_final_step_while_descendants_running() {
     let wf = workflow.lock().await;
     assert_eq!(
         wf.state(),
-        crate::workflow::WorkflowState::Executing,
+        crate::app::workflow::WorkflowState::Executing,
         "popping to the parent plan stays Executing"
     );
     assert_eq!(
@@ -6137,7 +6150,7 @@ async fn dispatch_allows_state_transition_when_no_descendants_running() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -6171,7 +6184,7 @@ async fn dispatch_allows_state_transition_when_no_descendants_running() {
         result.output
     );
     let wf = workflow.lock().await;
-    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
 }
 
 #[tokio::test]
@@ -6205,7 +6218,7 @@ async fn dispatch_no_tracker_allows_state_transition() {
         result.output
     );
     let wf = workflow.lock().await;
-    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
 }
 
 #[tokio::test]
@@ -6220,7 +6233,7 @@ async fn dispatch_denies_tool_outside_skill_allow_list() {
         wf.start_skill(
             "narrow",
             "do the skill",
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             vec!["file_read".into()],
         )
         .unwrap();
@@ -6267,7 +6280,7 @@ async fn dispatch_allows_skill_end_even_when_the_allow_list_omits_it() {
         wf.start_skill(
             "narrow",
             "do the skill",
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             // The allow-list deliberately OMITS skill_end — the defect shape.
             vec!["file_read".into()],
         )
@@ -6279,7 +6292,7 @@ async fn dispatch_allows_skill_end_even_when_the_allow_list_omits_it() {
     // make_dispatch_fixture registry carries no skill tools.
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(
-        crate::tool::workflow::skill::SkillEndTool::new(workflow.clone()),
+        crate::app::tool::workflow::skill::SkillEndTool::new(workflow.clone()),
     ));
     let registry = Arc::new(registry);
     let provider = Arc::new(MockProvider {
@@ -6375,7 +6388,7 @@ async fn research_workflow(dir: &tempfile::TempDir) -> Arc<tokio::sync::Mutex<Wo
             "G",
             "C",
             vec!["step one".into()],
-            crate::workflow::PlanKind::Research,
+            crate::app::workflow::PlanKind::Research,
             None,
         )
         .unwrap();
@@ -6602,7 +6615,7 @@ async fn dispatch_allows_read_tool_on_skill_allow_list() {
         wf.start_skill(
             "narrow",
             "do the skill",
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             vec!["file_read".into()],
         )
         .unwrap();
@@ -6659,7 +6672,7 @@ async fn dispatch_approval_request_includes_file_write_preview() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -6754,7 +6767,7 @@ async fn deny_all_latches_and_skips_remaining_tool_calls() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -7649,7 +7662,7 @@ async fn run_turn_records_cancelled_request_stats() {
         AgentLoopConfig {
             provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -7767,7 +7780,7 @@ async fn run_turn_usage_then_interrupt_records_no_cancelled_row() {
         AgentLoopConfig {
             provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8241,7 +8254,7 @@ async fn ask_user_two_questions_round_trip() {
     // answers by clicking an option, then asks Q2, the user answers freeform.
     // Asserts both answers reach the agent (as the ToolResult) — one question
     // at a time (the turn blocks on each oneshot).
-    use crate::tool::workflow::ask_user::AskUserTool;
+    use crate::app::tool::workflow::ask_user::AskUserTool;
     use crate::tool::ToolRegistry;
 
     let dir = tempdir().unwrap();
@@ -8262,7 +8275,7 @@ async fn ask_user_two_questions_round_trip() {
         AgentLoopConfig {
             provider: provider,
             tools: Arc::new(registry),
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8369,7 +8382,7 @@ async fn ask_user_two_questions_round_trip() {
 async fn ask_user_interrupt_returns_error() {
     // T2: an Interrupt arriving while ask_user is awaiting the answer must
     // return an error result (not hang). Mirrors the approval interrupt path.
-    use crate::tool::workflow::ask_user::AskUserTool;
+    use crate::app::tool::workflow::ask_user::AskUserTool;
     use crate::tool::ToolRegistry;
 
     let dir = tempdir().unwrap();
@@ -8389,7 +8402,7 @@ async fn ask_user_interrupt_returns_error() {
         AgentLoopConfig {
             provider: provider,
             tools: Arc::new(registry),
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8490,7 +8503,7 @@ async fn resolve_turn_provider_uses_override_when_configured() {
     // uses the default snapshot.
     use crate::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::{ConfigModelResolver, ModelContext, ModelResolver};
-    use crate::workflow::WorkflowState;
+    use crate::app::workflow::WorkflowState;
     let config = crate::config::Config {
         general: GeneralConfig {
             models: ModelsConfig {
@@ -8551,7 +8564,6 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
     use crate::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
     use crate::provider::Capabilities;
-    use crate::workflow::WorkflowState;
 
     /// A provider whose `model()` returns a fixed id, so the test can tell
     /// which model a built provider is for.
@@ -8631,11 +8643,11 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8646,9 +8658,16 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
     )
     .with_model_resolver(resolver);
 
+    // 2b.3: the state-aware routing rides the policy's route consult —
+    // attach the WorkflowPolicy so the route derives from the live state.
+    agent.set_policy(Arc::new(crate::app::workflow_policy::WorkflowPolicy::new(
+        concrete(&agent.workflow_handle()),
+    )));
+
     // Sanity: WITHOUT a forced model, planning resolves to the state override.
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("state override should resolve without a forced model");
     assert_eq!(
         provider.model(),
@@ -8663,7 +8682,8 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
         reasoning_effort: None,
     });
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("forced model should resolve");
     assert_eq!(
         provider.model(),
@@ -8760,7 +8780,7 @@ async fn summarize_provider_routes_through_the_summarize_slot() {
             AgentLoopConfig {
                 provider: turn_provider.clone(),
                 tools: registry,
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8811,7 +8831,6 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
     use crate::agent::context::ContextManager;
     use crate::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::WorkflowState;
 
     /// A provider whose `model()` returns a fixed id — tells the test which
     /// model resolved (and never completes; resolution only inspects the id).
@@ -8889,11 +8908,11 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -8904,9 +8923,16 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
     )
     .with_model_resolver(resolver);
 
+    // 2b.3: the state-aware routing rides the policy's route consult —
+    // attach the WorkflowPolicy so the route derives from the live state.
+    agent.set_policy(Arc::new(crate::app::workflow_policy::WorkflowPolicy::new(
+        concrete(&agent.workflow_handle()),
+    )));
+
     // Sanity: WITHOUT a picker pin, planning resolves to the state override.
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("state override should resolve without a pin");
     assert_eq!(
         provider.model(),
@@ -8925,7 +8951,8 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
     // fires when `[models.skill.<name>]` is set — see
     // `skill_override_beats_explicit_picker_pin` for the configured case).
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("explicit provider should resolve");
     assert_eq!(
         provider.model(),
@@ -8933,7 +8960,8 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
         "the picker's explicit provider must beat the config override chain"
     );
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Skill, Some("merge_to_main"), None)
+        .resolve_turn_provider(Some("merge_to_main"))
+        .await
         .expect("explicit provider should resolve");
     assert_eq!(
         provider.model(),
@@ -9010,7 +9038,6 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     use crate::agent::context::ContextManager;
     use crate::config::{GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::WorkflowState;
 
     let config = crate::config::Config {
         general: GeneralConfig {
@@ -9050,11 +9077,11 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -9065,6 +9092,12 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     )
     .with_model_resolver(resolver);
 
+    // 2b.3: the state-aware routing rides the policy's route consult —
+    // attach the WorkflowPolicy so the route derives from the live state.
+    agent.set_policy(Arc::new(crate::app::workflow_policy::WorkflowPolicy::new(
+        concrete(&agent.workflow_handle()),
+    )));
+
     // The picker pins deepseek while the agent is in Planning.
     let picked: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "deepseek-v4-flash",
@@ -9073,7 +9106,8 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
 
     // In the pin's own state it still beats the planning slot (2026-08-22).
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("pin should resolve in its own state");
     assert_eq!(
         provider.model(),
@@ -9082,9 +9116,16 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     );
 
     // create_plan flips Planning → Executing: the CONFIGURED executing
-    // model takes over (the user-reported fix).
+    // model takes over (the user-reported fix). 2b.3: the synthetic state
+    // arg retired — drive the LIVE workflow.
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.create_plan("Pin yield plan", "goal", "ctx", vec!["step1".into()])
+        .unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Executing, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("executing override should resolve");
     assert_eq!(
         provider.model(),
@@ -9093,9 +9134,14 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     );
 
     // The pin is dormant, not deleted: abandon_plan back to Planning
-    // resumes it.
+    // resumes it. 2b.3: drive the LIVE workflow.
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.abandon_plan().unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("pin should resolve again back in its state");
     assert_eq!(
         provider.model(),
@@ -9119,7 +9165,6 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     use crate::agent::context::ContextManager;
     use crate::config::{GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::{PlanKind, WorkflowState};
 
     let config = crate::config::Config {
         general: GeneralConfig {
@@ -9158,11 +9203,11 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -9173,6 +9218,12 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     )
     .with_model_resolver(resolver);
 
+    // 2b.3: the state-aware routing rides the policy's route consult —
+    // attach the WorkflowPolicy so the route derives from the live state.
+    agent.set_policy(Arc::new(crate::app::workflow_policy::WorkflowPolicy::new(
+        concrete(&agent.workflow_handle()),
+    )));
+
     // The picker pins deepseek while the agent is in Planning.
     let picked: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "deepseek-v4-flash",
@@ -9180,7 +9231,8 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     agent.set_explicit_provider(picked, ContextManager::new(128_000, 0.5));
     // In the pin's own state it still beats the planning slot (2026-08-22).
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("pin should resolve in its own state");
     assert_eq!(
         provider.model(),
@@ -9190,9 +9242,23 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
 
     // create_plan(kind=bug_fixing) flips Planning → Executing with an
     // active bug plan: the CONFIGURED bug-fixing slot takes over (the pin
-    // goes dormant — the pin_holds probe sees the plan kind).
+    // goes dormant — the pin_holds probe sees the plan kind). 2b.3: drive
+    // the LIVE workflow.
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.create_plan_with_kind(
+        "Bug plan",
+        "goal",
+        "ctx",
+        vec!["step1".into()],
+        crate::app::workflow::PlanKind::BugFixing,
+        None,
+    )
+    .unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Executing, None, Some(PlanKind::BugFixing))
+        .resolve_turn_provider(None)
+        .await
         .expect("bug-fixing slot should resolve");
     assert_eq!(
         provider.model(),
@@ -9202,12 +9268,23 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
 
     // The same Executing state under an IMPLEMENTATION plan resolves no
     // slot here (no [models.executing] configured) → the pin resumes.
+    // 2b.3: drive the LIVE workflow (abandon → a fresh implementation plan).
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.abandon_plan().unwrap();
+    wf.create_plan_with_kind(
+        "Impl plan",
+        "goal",
+        "ctx",
+        vec!["step1".into()],
+        crate::app::workflow::PlanKind::Implementation,
+        None,
+    )
+    .unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(
-            WorkflowState::Executing,
-            None,
-            Some(PlanKind::Implementation),
-        )
+        .resolve_turn_provider(None)
+        .await
         .expect("pin should resume for an implementation plan");
     assert_eq!(
         provider.model(),
@@ -9216,8 +9293,14 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     );
 
     // The pin is dormant, not deleted: back in Planning it serves again.
+    // 2b.3: drive the LIVE workflow (abandon returns to Planning).
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.abandon_plan().unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("pin should resolve again back in its state");
     assert_eq!(
         provider.model(),
@@ -9236,7 +9319,6 @@ async fn picker_pin_survives_state_change_when_no_model_configured() {
     use crate::agent::context::ContextManager;
     use crate::config::{GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::WorkflowState;
 
     let config = crate::config::Config {
         general: GeneralConfig {
@@ -9271,7 +9353,7 @@ async fn picker_pin_survives_state_change_when_no_model_configured() {
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -9287,13 +9369,10 @@ async fn picker_pin_survives_state_change_when_no_model_configured() {
     });
     agent.set_explicit_provider(picked, ContextManager::new(128_000, 0.5));
 
-    for (state, label) in [
-        (WorkflowState::Planning, "the pin's own state"),
-        (WorkflowState::Executing, "an unconfigured state"),
-        (WorkflowState::Complete, "another unconfigured state"),
-    ] {
+    for label in ["the pin's own state", "an unconfigured state", "another unconfigured state"] {
         let (provider, _cm) = agent
-            .resolve_turn_provider(state, None, None)
+            .resolve_turn_provider(None)
+            .await
             .expect("pin should keep serving");
         assert_eq!(
             provider.model(),
@@ -9313,7 +9392,6 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
     use crate::agent::context::ContextManager;
     use crate::config::{GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::WorkflowState;
 
     let config = crate::config::Config {
         general: GeneralConfig {
@@ -9360,11 +9438,11 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let agent = AgentLoop::new(
+    let mut agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -9375,17 +9453,32 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
     )
     .with_model_resolver(resolver);
 
+    // 2b.3: the state-aware routing rides the policy's route consult —
+    // attach the WorkflowPolicy so the route derives from the live state.
+    agent.set_policy(Arc::new(crate::app::workflow_policy::WorkflowPolicy::new(
+        concrete(&agent.workflow_handle()),
+    )));
+
     // First pin, picked in Planning: serves Planning, yields to executing.
     let first: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "deepseek-v4-flash",
     });
     agent.set_explicit_provider(first, ContextManager::new(128_000, 0.5));
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("first pin should serve in Planning");
     assert_eq!(provider.model(), "deepseek-v4-flash");
+    // 2b.3: the synthetic state arg retired — drive the LIVE workflow
+    // (create_plan flips Planning → Executing).
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.create_plan("Fresh pick plan", "goal", "ctx", vec!["step1".into()])
+        .unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Executing, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("executing override should resolve");
     assert_eq!(
         provider.model(),
@@ -9399,7 +9492,8 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
         Arc::new(FixedModelProvider { model: "kimi-k3" });
     agent.set_explicit_provider(second, ContextManager::new(128_000, 0.5));
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Executing, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("fresh pick should serve in the state it was made in");
     assert_eq!(
         provider.model(),
@@ -9408,9 +9502,16 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
     );
 
     // finish flips Executing → Complete: the configured complete slot still
-    // takes over from the re-stamped pin.
+    // takes over from the re-stamped pin. 2b.3: drive the LIVE workflow
+    // (complete the step → Reviewing, finish → Complete).
+    let handle = concrete(&agent.workflow_handle());
+    let mut wf = handle.lock().await;
+    wf.complete_step(0).unwrap();
+    wf.finish().unwrap();
+    drop(wf);
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Complete, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("complete override should resolve");
     assert_eq!(
         provider.model(),
@@ -9537,7 +9638,7 @@ async fn set_explicit_provider_deferred_when_context_smaller() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
@@ -9617,7 +9718,7 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
@@ -9742,7 +9843,7 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
         AgentLoopConfig {
             provider: old_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
@@ -9901,7 +10002,7 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
         AgentLoopConfig {
             provider: old_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
@@ -10204,7 +10305,7 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(20_000, 0.5),
@@ -10324,7 +10425,7 @@ async fn boundary_session_raises_the_limit_instead_of_aborting() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(40_000, 0.25)
@@ -10497,7 +10598,7 @@ async fn legitimate_long_turn_compactions_reset_budget() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(40_000, 0.5),
@@ -10622,7 +10723,7 @@ async fn compaction_invalidates_the_recall_delta_cache() {
         AgentLoopConfig {
             provider: provider.clone(),
             tools: registry,
-            workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(40_000, 0.5),
@@ -10713,7 +10814,6 @@ async fn skill_override_beats_explicit_picker_pin() {
     use crate::agent::context::ContextManager;
     use crate::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
     use crate::model_resolver::ConfigModelResolver;
-    use crate::workflow::WorkflowState;
     use std::collections::HashMap;
 
     /// A provider whose `model()` returns a fixed id — resolution only inspects
@@ -10810,7 +10910,7 @@ async fn skill_override_beats_explicit_picker_pin() {
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -10829,7 +10929,8 @@ async fn skill_override_beats_explicit_picker_pin() {
 
     // 2026-08-22 must stay fixed: pin still beats a plain state override.
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Planning, None, None)
+        .resolve_turn_provider(None)
+        .await
         .expect("pinned provider should resolve for state turns");
     assert_eq!(
         provider.model(),
@@ -10840,7 +10941,8 @@ async fn skill_override_beats_explicit_picker_pin() {
     // The regression: with an active skill that has a configured override,
     // the skill model must win over the pin.
     let (provider, _cm) = agent
-        .resolve_turn_provider(WorkflowState::Skill, Some("merge_to_main"), None)
+        .resolve_turn_provider(Some("merge_to_main"))
+        .await
         .expect("skill override should resolve even with a picker pin");
     assert_eq!(
         provider.model(),
@@ -10981,9 +11083,9 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
     // the default provider, whose text is "from-default") and passes after.
     use crate::config::ModelRef;
     use crate::model_resolver::{ModelContext, ModelResolver};
-    use crate::skill::{SkillRegistry, SkillSpec};
-    use crate::tool::workflow::skill::SkillStartTool;
-    use crate::workflow::WorkflowState;
+    use crate::app::skill::{SkillRegistry, SkillSpec};
+    use crate::app::tool::workflow::skill::SkillStartTool;
+    use crate::app::workflow::WorkflowState;
     use std::sync::Mutex as StdMutex2;
 
     /// A resolver that returns an override ONLY while the named skill is
@@ -11085,7 +11187,7 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
         tools: vec!["skill_end".into(), "file_read".into()],
         prompt: "Merge the branch into main.".into(),
     });
-    let skills = Arc::new(crate::skill::SkillLibrary::from_registry(
+    let skills = Arc::new(crate::app::skill::SkillLibrary::from_registry(
         dir.path().join("skills"),
         skills,
     ));
@@ -11133,7 +11235,7 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -11183,9 +11285,9 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
     // the skill ends mid-turn.
     use crate::config::ModelRef;
     use crate::model_resolver::{ModelContext, ModelResolver};
-    use crate::skill::{SkillRegistry, SkillSpec};
-    use crate::tool::workflow::skill::{SkillEndTool, SkillStartTool};
-    use crate::workflow::WorkflowState;
+    use crate::app::skill::{SkillRegistry, SkillSpec};
+    use crate::app::tool::workflow::skill::{SkillEndTool, SkillStartTool};
+    use crate::app::workflow::WorkflowState;
 
     /// Resolver returning an override only while `merge_to_main` is active —
     /// mirrors ConfigModelResolver's `[models.skill.merge_to_main]` lookup.
@@ -11283,7 +11385,7 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
         tools: vec!["skill_end".into(), "file_read".into()],
         prompt: "Merge the branch into main.".into(),
     });
-    let skills = Arc::new(crate::skill::SkillLibrary::from_registry(
+    let skills = Arc::new(crate::app::skill::SkillLibrary::from_registry(
         dir.path().join("skills"),
         skills,
     ));
@@ -11330,7 +11432,7 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -11489,7 +11591,7 @@ async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
             AgentLoopConfig {
                 provider: provider,
                 tools: registry,
-                workflow: workflow,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
                 sandbox: sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: context::ContextManager::new(128_000, 0.5),
@@ -11695,7 +11797,7 @@ async fn auto_recall_emits_memory_recalled_event() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -11798,7 +11900,7 @@ async fn same_turn_memory_write_invalidates_auto_recall_cache() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -11900,7 +12002,7 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -13107,7 +13209,7 @@ async fn bad_json_below_threshold_or_non_permanent_keeps_the_ladder() {
             test_config(
                 provider.clone(),
                 make_registry((*sandbox).clone(), workflow.clone()),
-                workflow,
+            workflow,
                 sandbox.clone(),
             ),
             crate::project::Constitution::default(),
@@ -13496,7 +13598,7 @@ async fn mid_run_swap_lands_while_reviewing() {
         let mut wf = workflow.lock().await;
         wf.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
         wf.complete_step(0).unwrap();
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Reviewing);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Reviewing);
     }
     let swap_target: Arc<dyn LlmClient> = Arc::new(SwapTargetProvider {
         model: "swap-target".into(),
@@ -14300,7 +14402,7 @@ async fn failed_tool_result_is_serialized_for_the_provider_as_an_error() {
         AgentLoopConfig {
             provider: provider,
             tools: registry,
-            workflow: workflow,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -14714,7 +14816,7 @@ async fn budget_cap_pauses_the_plan_and_a_bypass_continues_the_turn() {
     // ...and the plan was never killed: still live, still Executing.
     let wf = workflow.lock().await;
     assert_eq!(wf.plan_id().as_deref(), Some(plan_id.as_str()));
-    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
 }
 
 #[tokio::test]
@@ -14754,7 +14856,7 @@ async fn budget_cap_end_turn_answer_leaves_the_plan_paused_and_resumable() {
     assert!(outcome.stop_reason.is_none());
     // The plan is still live and Executing — paused, never killed.
     let wf = workflow.lock().await;
-    assert_eq!(wf.state(), crate::workflow::WorkflowState::Executing);
+    assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
     assert!(
         wf.plan_id().is_some(),
         "the plan survives the end-turn answer"

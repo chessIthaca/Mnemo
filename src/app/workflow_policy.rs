@@ -59,6 +59,67 @@ impl WorkflowPolicy {
     }
 }
 
+/// Compose the full system prompt (back-compat wrapper, moved app-side in
+/// 2b.3): the stable head + the volatile tail over this workflow's section.
+/// Production composes via the policy (2a.4: the constitution holder's
+/// `stable_head` + `build_volatile_tail`); this wrapper serves the tests and
+/// any back-compat caller.
+pub fn build_system_prompt(
+    caps: &crate::provider::Capabilities,
+    workflow: &Workflow,
+    constitution: &crate::project::Constitution,
+    memories: Option<&str>,
+) -> String {
+    let mut prompt = crate::agent::prompt::build_stable_head(constitution);
+    prompt.push_str(&crate::agent::prompt::build_volatile_tail(
+        caps,
+        &workflow_section(workflow),
+        memories,
+    ));
+    prompt
+}
+
+/// The turn's routing key: today's ordered slot chain, moved app-side in
+/// 2b.3 (the kernel's compat constructor retired with the route consult;
+/// `WorkflowPolicy::route` is its sole production caller — the routing-table
+/// golden pins the parity). The order mirrors `ConfigModelResolver::resolve`'s
+/// pre-2a.6 arm order: the skill override, the subagent override, the
+/// bug-fixing plan-kind override, then the state slot. Reviewing resolves
+/// `executing` (`[models.reviewing]` is reviewer-spawn-only); Skill and
+/// Subagent carry NO state slot — their own arms or the default cover them.
+pub fn build_route_key(
+    workflow_state: crate::app::workflow::WorkflowState,
+    skill_name: Option<&str>,
+    plan_kind: Option<crate::app::workflow::PlanKind>,
+    is_subagent: bool,
+) -> crate::agent::policy::RouteKey {
+    use crate::app::workflow::{PlanKind, WorkflowState};
+    let mut slots = Vec::new();
+    if let Some(name) = skill_name {
+        slots.push(format!("skill:{name}"));
+    }
+    if is_subagent {
+        slots.push("subagent".to_string());
+    }
+    if plan_kind == Some(PlanKind::BugFixing)
+        && matches!(
+            workflow_state,
+            WorkflowState::Executing | WorkflowState::Reviewing
+        )
+    {
+        slots.push("bug_fixing".to_string());
+    }
+    match workflow_state {
+        WorkflowState::Planning => slots.push("planning".to_string()),
+        WorkflowState::Executing | WorkflowState::Reviewing => {
+            slots.push("executing".to_string());
+        }
+        WorkflowState::Complete => slots.push("complete".to_string()),
+        WorkflowState::Skill | WorkflowState::Subagent => {}
+    }
+    crate::agent::policy::RouteKey { slots }
+}
+
 #[async_trait]
 impl AgentPolicy for WorkflowPolicy {
     fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String {
@@ -109,7 +170,7 @@ impl AgentPolicy for WorkflowPolicy {
                 .and_then(|weak| weak.upgrade())
                 .map(|loop_| loop_.is_subagent())
                 .unwrap_or(false);
-            crate::model_resolver::build_route_key(
+            build_route_key(
                 wf.state(),
                 wf.active_skill().map(|s| s.name.as_str()),
                 wf.active_plan_kind(),

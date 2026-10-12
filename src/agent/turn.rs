@@ -47,7 +47,6 @@ use crate::provider::{
 use crate::runtime::{AgentCommand, AgentEvent, AgentId, PhaseKind};
 use crate::tool::agent::git::resolve_git_subcommand;
 use crate::tool::ToolResult;
-use crate::workflow::WorkflowState;
 
 /// The per-row payload for [`AgentLoop::record_stats_row`] (R21): the token,
 /// timing, and tag fields of a request_stats row. The identity fields (id,
@@ -495,7 +494,7 @@ impl AgentLoop {
                 tags if tags.plan_id.is_some() => {
                     Some((tags.plan_id.expect("checked above"), tags.step_index))
                 }
-                _ => self.read_plan_scope().await,
+                _ => self.workflow.plan_scope().await,
             };
             let retry_pending = self.take_pending_lane_retry();
             // The deterministic budget gate: when a cap is reached, PAUSE the
@@ -581,7 +580,7 @@ impl AgentLoop {
                 let surface = self.policy.tool_surface().await;
                 match surface.advertise {
                     Some(f) => f,
-                    None => self.workflow.lock().await.schema_filter(),
+                    None => self.workflow.schema_filter().await,
                 }
             };
             // Build the tool schemas (filtered by workflow state).
@@ -1214,13 +1213,12 @@ impl AgentLoop {
         target: model_routing::RouteTarget,
     ) -> Option<crate::config::ModelRef> {
         let resolver = self.model_resolver.as_ref()?;
-        let wf = self.workflow.lock().await;
-        let ctx = crate::model_resolver::ModelContext::new(
-            wf.state(),
-            wf.active_skill().map(|s| s.name.as_str()),
-            self.is_subagent(),
-            wf.active_plan_kind(),
-        );
+        // 2b.3: the context rides the policy's live route consult (the
+        // state/skill/kind derivation lives app-side).
+        let ctx = crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
+            is_subagent: self.is_subagent(),
+        };
         resolver.resolve_routed(target, ctx)
     }
 
@@ -1246,17 +1244,12 @@ impl AgentLoop {
             return None;
         }
         let policy = self.model_resolver.as_ref()?.routing_policy()?;
-        // The live step, under the workflow lock; the guard is dropped before
-        // the first await (decide + resolve both await). The plan's IDENTITY
+        // The live step, via the neutral handle (2b.3 — the guard lives
+        // app-side); the plan's IDENTITY
         // is its id, never its title -- agent-generated titles repeat, and the
         // memo must never serve a new plan a decision made for its
         // predecessor (ad56c7bd review finding L1).
-        let (plan_id, step_index, step_text) = {
-            let wf = self.workflow.lock().await;
-            let step = wf.current_step()?;
-            let plan_id = wf.plan_id()?.to_string();
-            (plan_id, step.index, step.text.clone())
-        };
+        let (plan_id, step_index, step_text) = self.workflow.lane_step_snapshot().await?;
         let epoch = self
             .escalation_epoch
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1385,17 +1378,6 @@ impl AgentLoop {
                 None
             }
         }
-    }
-
-    /// The live plan's `(id, current step)` under ONE workflow lock —
-    /// `None` when no plan is active (chat turns and subagents run
-    /// planless). Shared by the budget gate and the spend attribution
-    /// (backlog a25a5323), so a single read serves both and the ledger rows
-    /// are written regardless of the budget flag.
-    async fn read_plan_scope(&self) -> Option<(String, Option<usize>)> {
-        let wf = self.workflow.lock().await;
-        let plan_id = wf.plan_id()?.to_string();
-        Some((plan_id, wf.current_step().map(|s| s.index)))
     }
 
     /// The deterministic budget gate (backlog a25a5323, the cost-saving
@@ -1858,14 +1840,13 @@ impl AgentLoop {
                 || tc.name == "skill_end"
                 || tc.name == "abandon_skill")
         {
-            let (wf_state, step_index, top_plan_id, plan_title, plan_goal) = {
-                let wf = self.workflow.lock().await;
-                let state = wf.state();
-                let top_plan_id = wf.top_plan_id().map(|s| s.to_string());
-                let plan = wf.plan();
-                let plan_title = plan.map(|p| p.title.clone());
-                let plan_goal = plan.map(|p| p.goal.clone());
-                let step_index = if tc.name == "complete_step" {
+            // 2b.3: the gate's workflow-sourced fields ride the neutral
+            // handle's snapshot (the state token, the plan identity); the
+            // completing step number stays kernel-side — it is parsed from
+            // the tool's own arguments.
+            let (wf_state, top_plan_id, plan_title, plan_goal) =
+                self.workflow.plan_gate_snapshot().await;
+            let step_index = if tc.name == "complete_step" {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .ok()
                         .and_then(|v| match v.get("step_index") {
@@ -1881,16 +1862,14 @@ impl AgentLoop {
                             _ => None,
                         })
                         .map(|i| i as u32)
-                } else {
-                    None
-                };
-                (state, step_index, top_plan_id, plan_title, plan_goal)
+            } else {
+                None
             };
             let _ = fanin_tx
                 .send((
                     agent_id,
                     AgentEvent::WorkflowStateChanged {
-                        state: wf_state,
+                        state: wf_state.clone(),
                         top_plan_id: top_plan_id.clone(),
                     },
                 ))
@@ -1917,7 +1896,7 @@ impl AgentLoop {
             // (e.g. merge_to_main) re-enters Complete for the same
             // plan. Guard on the root plan id so each plan is captured
             // at most once per session.
-            if wf_state == WorkflowState::Complete && result.success {
+            if wf_state == "complete" && result.success {
                 let already_captured = top_plan_id
                     .as_deref()
                     .map(|id| self.captured_complete_plan_id().as_deref() == Some(id))
@@ -2681,18 +2660,20 @@ impl AgentLoop {
         // returns a model, build the throwaway provider + context
         // manager for it; otherwise fall back to the live default pair.
         let (provider, context_manager) = {
-            let wf = self.workflow.lock().await;
-            let skill_name = wf.active_skill().map(|s| s.name.as_str());
-            let plan_kind = wf.active_plan_kind();
+            // 2b.3: the skill name rides the neutral handle; the state and
+            // plan-kind locals retired with the route consult inside the
+            // resolve chain (the derivation lives app-side).
+            let skill_name = self.workflow.active_skill_name().await;
             // `route` is the turn's pre-prompt routing decision (backlog
             // 091e694d): the routed variant applies it above the
             // state/subagent chain and below the explicit-pin arms; with no
             // route the plain chain runs unchanged.
             let resolved = match route {
                 Some(target) => {
-                    self.resolve_turn_provider_routed(wf.state(), skill_name, plan_kind, Some(target))
+                    self.resolve_turn_provider_routed(skill_name.as_deref(), Some(target))
+                        .await
                 }
-                None => self.resolve_turn_provider(wf.state(), skill_name, plan_kind),
+                None => self.resolve_turn_provider(skill_name.as_deref()).await,
             };
             match resolved {
                 Some((p, cm)) => (p, cm),
@@ -3541,11 +3522,11 @@ impl AgentLoop {
                 .rev()
                 .find(|m| m.role == Role::User)
                 .map(|m| m.content.as_text());
-            prompt::append_plan_nudge(
-                &mut volatile_tail,
-                self.workflow.lock().await.state(),
-                latest_user_msg.as_deref(),
-            );
+        prompt::append_plan_nudge(
+            &mut volatile_tail,
+            self.workflow.is_complete().await,
+            latest_user_msg.as_deref(),
+        );
             (stable_head, volatile_tail)
         };
 

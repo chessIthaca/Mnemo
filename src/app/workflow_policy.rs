@@ -74,12 +74,36 @@ impl AgentPolicy for WorkflowPolicy {
         // 2a.6 delegates to today's slot-chain builder.
         RouteKey { slots: vec![] }
     }
-    async fn on_prompt(&self, _text: &str) -> PromptHook {
-        PromptHook::default()
+    async fn on_prompt(&self, text: &str) -> PromptHook {
+        // 2a.5: the unattended marker read moves here (the runtime arms
+        // consult this hook with None = the runtime's own derivation;
+        // Some SETS the flag outright). tail_rewrite stays None in 2a —
+        // the plan nudge is kernel-side same-turn (turn.rs :3524); it
+        // rides this hook in later phases.
+        let unattended =
+            Some(text.starts_with(crate::runtime::channels::UNATTENDED_PROMPT_PREFIX));
+        PromptHook {
+            unattended,
+            tail_rewrite: None,
+        }
     }
     async fn after_tool(&self, _name: &str, _result: &ToolResult) {}
-    async fn on_turn_end(&self, _t: &crate::agent::policy::TurnSummary) -> Continuation {
-        Continuation::Stop
+    async fn on_turn_end(&self, t: &crate::agent::policy::TurnSummary) -> Continuation {
+        // 2a.5: the state predicate moves here — workflow_expects_progress's
+        // logic verbatim (loop_impl :2442-2445; the fn stays for kernel
+        // diagnostics). note is None: the gate's own streak mechanics push
+        // the synthetic-continue message kernel-side.
+        let wf = self.workflow.lock().await;
+        let state = wf.state();
+        if matches!(
+            state,
+            WorkflowState::Executing | WorkflowState::Reviewing
+        ) || (t.unattended && state == WorkflowState::Planning)
+        {
+            Continuation::Continue { note: None }
+        } else {
+            Continuation::Stop
+        }
     }
     async fn spend_tags(&self) -> SpendTags {
         SpendTags::default()

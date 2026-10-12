@@ -78,8 +78,17 @@ pub enum Continuation {
 pub struct TurnSummary {
     /// `true` for `Finish::Stop` without error, per the emit gate.
     pub success: bool,
-    /// The stop reason the runtime observed (`crate::agent::StopReason`).
-    pub stop_reason: crate::agent::StopReason,
+    /// The stop reason the runtime observed — `None` = the plain
+    /// `Finish::Stop` end (the gate's None arm), `Some(v)` = the special
+    /// stop the runtime folded (Steer/Interrupt/Cancel/Compact/
+    /// CompactWithSteers/Clear; the enum has NO plain-Stop variant,
+    /// verified at the 2a.5 gate).
+    pub stop_reason: Option<crate::agent::StopReason>,
+    /// The agent's unattended flag at turn end (the gate's own field,
+    /// carried so the policy's predicate can run its
+    /// `unattended :: Planning` arm — workflow_expects_progress's second
+    /// condition, 2a.5).
+    pub unattended: bool,
 }
 
 /// Opaque tags stamped on Spend/Savings rows (master-spec :226-227).

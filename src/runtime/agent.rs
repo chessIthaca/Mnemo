@@ -333,10 +333,24 @@ impl AgentTask {
                 // question-wait for the user, and a synthetic continue would
                 // self-answer it.
                 None => {
-                    let expects_progress = self
-                        .agent_loop
-                        .workflow_expects_progress(self.unattended)
-                        .await;
+                    // 2a.5: the state predicate moved into the agent's policy
+                    // (WorkflowPolicy replicates workflow_expects_progress
+                    // verbatim; NoPolicy-shaped loops carry on-turn-end Stop
+                    // and park — the runtime arm tests attach the policy
+                    // explicitly). The descendants/subagent/streak mechanics
+                    // below are unchanged.
+                    let summary = crate::agent::policy::TurnSummary {
+                        success: true,
+                        stop_reason: None,
+                        unattended: self.unattended,
+                    };
+                    let expects_progress = matches!(
+                        self.agent_loop
+                            .policy()
+                            .on_turn_end(&summary)
+                            .await,
+                        crate::agent::policy::Continuation::Continue { .. }
+                    );
                     let descendants_running =
                         self.agent_loop.has_running_descendants().await;
                     let subagent = self.agent_loop.is_subagent();
@@ -802,7 +816,10 @@ impl AgentTask {
                     // so interactive Planning question-waits park as
                     // before. A Suggestion must not touch it (see the
                     // field doc).
-                    self.unattended = text.starts_with(UNATTENDED_PROMPT_PREFIX);
+                    let hook = self.agent_loop.policy().on_prompt(&text).await;
+                    self.unattended = hook
+                        .unattended
+                        .unwrap_or_else(|| text.starts_with(UNATTENDED_PROMPT_PREFIX));
                     // Start a memory session on the first prompt (if a memory
                     // store is available).
                     if self.session_id.is_none() {
@@ -1328,7 +1345,10 @@ impl AgentTask {
                     // compaction must clear unattended, or a later
                     // Planning question-wait would be self-answered).
                     self.auto_continue_streak = 0;
-                    self.unattended = text.starts_with(UNATTENDED_PROMPT_PREFIX);
+                    let hook = self.agent_loop.policy().on_prompt(&text).await;
+                    self.unattended = hook
+                        .unattended
+                        .unwrap_or_else(|| text.starts_with(UNATTENDED_PROMPT_PREFIX));
                     let content = self.build_user_content(fanin_tx, text, &images).await;
                     self.messages.push(Message {
                         content,
@@ -6646,7 +6666,7 @@ mod tests {
         // cloned inline into the config's provider field (binding a concrete
         // Arc then Arc::clone-ing into the field hits E0308 here).
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(AgentLoop::new(
+        let mut agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -6661,7 +6681,11 @@ mod tests {
                 vision: None,
             },
             crate::project::Constitution::default(),
+        );
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
         ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);
@@ -6767,7 +6791,7 @@ mod tests {
         );
         // Sibling dual-handle idiom (see the Prompt twin above).
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(AgentLoop::new(
+        let mut agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -6783,7 +6807,11 @@ mod tests {
             },
             crate::project::Constitution::default(),
         )
-        .with_agent_id(1));
+        .with_agent_id(1);
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+        ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);
@@ -6878,25 +6906,27 @@ mod tests {
             "setup: a fresh workflow must be in Planning"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(
-            AgentLoop::new(
-                AgentLoopConfig {
-                    provider: Arc::new(CountingMockProvider {
-                        caps: Capabilities::openai(),
-                        calls: Arc::clone(&calls),
-                    }),
-                    tools: Arc::new(ToolRegistry::new()),
-                    workflow,
-                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
-                    safety_mode: SafetyMode::Autonomous,
-                    context_manager: ContextManager::new(128_000, 0.5),
-                    memory: None,
-                    vision: None,
-                },
-                crate::project::Constitution::default(),
-            )
-            .with_agent_id(1),
-        );
+        let mut agent_loop = AgentLoop::new(
+            AgentLoopConfig {
+                provider: Arc::new(CountingMockProvider {
+                    caps: Capabilities::openai(),
+                    calls: Arc::clone(&calls),
+                }),
+                tools: Arc::new(ToolRegistry::new()),
+                workflow,
+                sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: ContextManager::new(128_000, 0.5),
+                memory: None,
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        )
+        .with_agent_id(1);
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+        ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);
@@ -7056,25 +7086,27 @@ mod tests {
             dir.path().join("plans"),
         )));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(
-            AgentLoop::new(
-                AgentLoopConfig {
-                    provider: Arc::new(CountingMockProvider {
-                        caps: Capabilities::openai(),
-                        calls: Arc::clone(&calls),
-                    }),
-                    tools: Arc::new(ToolRegistry::new()),
-                    workflow,
-                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
-                    safety_mode: SafetyMode::Autonomous,
-                    context_manager: ContextManager::new(128_000, 0.5),
-                    memory: None,
-                    vision: None,
-                },
-                crate::project::Constitution::default(),
-            )
-            .with_agent_id(1),
-        );
+        let mut agent_loop = AgentLoop::new(
+            AgentLoopConfig {
+                provider: Arc::new(CountingMockProvider {
+                    caps: Capabilities::openai(),
+                    calls: Arc::clone(&calls),
+                }),
+                tools: Arc::new(ToolRegistry::new()),
+                workflow,
+                sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: ContextManager::new(128_000, 0.5),
+                memory: None,
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        )
+        .with_agent_id(1);
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+        ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);
@@ -7505,25 +7537,27 @@ mod tests {
             .unwrap();
         workflow.lock().await.complete_step(0).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(
-            AgentLoop::new(
-                AgentLoopConfig {
-                    provider: Arc::new(CountingMockProvider {
-                        caps: Capabilities::openai(),
-                        calls: Arc::clone(&calls),
-                    }),
-                    tools: Arc::new(ToolRegistry::new()),
-                    workflow,
-                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
-                    safety_mode: SafetyMode::Autonomous,
-                    context_manager: ContextManager::new(128_000, 0.5),
-                    memory: None,
-                    vision: None,
-                },
-                crate::project::Constitution::default(),
-            )
-            .with_agent_id(1),
-        );
+        let mut agent_loop = AgentLoop::new(
+            AgentLoopConfig {
+                provider: Arc::new(CountingMockProvider {
+                    caps: Capabilities::openai(),
+                    calls: Arc::clone(&calls),
+                }),
+                tools: Arc::new(ToolRegistry::new()),
+                workflow,
+                sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: ContextManager::new(128_000, 0.5),
+                memory: None,
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        )
+        .with_agent_id(1);
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+        ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);
@@ -7917,25 +7951,27 @@ mod tests {
             "setup: the root Implementation plan must be in Reviewing"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let agent_loop = Arc::new(
-            AgentLoop::new(
-                AgentLoopConfig {
-                    provider: Arc::new(CountingMockProvider {
-                        caps: Capabilities::openai(),
-                        calls: Arc::clone(&calls),
-                    }),
-                    tools: Arc::new(ToolRegistry::new()),
-                    workflow,
-                    sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
-                    safety_mode: SafetyMode::Autonomous,
-                    context_manager: ContextManager::new(128_000, 0.5),
-                    memory: None,
-                    vision: None,
-                },
-                crate::project::Constitution::default(),
-            )
-            .with_agent_id(1),
-        );
+        let mut agent_loop = AgentLoop::new(
+            AgentLoopConfig {
+                provider: Arc::new(CountingMockProvider {
+                    caps: Capabilities::openai(),
+                    calls: Arc::clone(&calls),
+                }),
+                tools: Arc::new(ToolRegistry::new()),
+                workflow,
+                sandbox: Arc::new(Sandbox::new(dir.path()).unwrap()),
+                safety_mode: SafetyMode::Autonomous,
+                context_manager: ContextManager::new(128_000, 0.5),
+                memory: None,
+                vision: None,
+            },
+            crate::project::Constitution::default(),
+        )
+        .with_agent_id(1);
+        agent_loop.set_policy(Arc::new(
+            crate::app::workflow_policy::WorkflowPolicy::new(agent_loop.workflow_handle()),
+        ));
+        let agent_loop = Arc::new(agent_loop);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
         let task = AgentTask::new(1, "test".into(), agent_loop);

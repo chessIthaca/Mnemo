@@ -352,9 +352,13 @@ async fn compute_subagent_allowlist(
     // Snapshot the parent's current ToolFilter + the set of tools its registry
     // actually registers, each paired with its real category + safety (read off
     // the &dyn Tool so the filter is consulted with the exact tuple, not a
-    // name-only guess). The filter + registry are read under their respective
-    // locks, then released before we build the allow-list (no lock held across
-    // the intersection).
+    // name-only guess). Since 2a.7 the parent's allowed set comes from the
+    // agent's policy (tool_surface().gate — WorkflowPolicy's delegate is the
+    // same allowed_tools() read since 2a.3); None (a NoPolicy parent loop,
+    // e.g. the test harness) keeps the raw workflow read. tool_surface()
+    // takes and drops the parent's workflow lock inside the policy, so the
+    // one-lock-at-a-time discipline is preserved and the registry snapshot
+    // below needs no lock.
     let (filter, registered): (ToolFilter, Vec<(String, ToolCategory, SafetyLevel)>) = {
         let loops = agent_loops.lock().await;
         // Fail CLOSED: a KNOWN parent_id whose loop is missing from the map
@@ -371,11 +375,23 @@ async fn compute_subagent_allowlist(
             }
         };
         drop(loops);
-        let wf = parent.workflow_handle();
-        let wf = wf.lock().await;
-        let filter = wf.allowed_tools();
+        // 2a.7: the parent's allowed set consults the agent's policy —
+        // WorkflowPolicy::tool_surface's gate IS allowed_tools() (the 2a.3
+        // delegate), so a policy-carrying parent filters identically; a
+        // None gate (NoPolicy parent loops, the test harness) keeps the
+        // raw workflow read, scoped inside the arm so the lock is never
+        // held across the registry snapshot or the intersection.
+        let filter = match parent.policy().tool_surface().await.gate {
+            Some(filter) => filter,
+            None => {
+                let wf = parent.workflow_handle();
+                let wf = wf.lock().await;
+                wf.allowed_tools()
+            }
+        };
         // Collect owned (name, category, safety) tuples so the borrow of
-        // `parent` ends here (the Arc is dropped at the block close).
+        // `parent` ends here (the Arc is dropped at the block close). No
+        // lock is held across this snapshot.
         let registered = parent
             .tools()
             .iter()

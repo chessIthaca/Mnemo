@@ -559,3 +559,43 @@ Amendment (2027-01-15, step 2c.6 — the landed D8 picks):
   verification (this step touched only src/config/settings_dto.rs + this
   file). The clippy habit-leg: unchanged storm state (backlog a439d8c2),
   zero new sites.
+
+
+Amendment (2027-01-15, step 2c.7 — the close, §F report):
+- LANDED (boundary commits on wt/mnemo): f348992 (2c.1 G1), 1993e39 (2c.2
+  G2), 9723ae2 + cbdc50c (2c.3 G3), 6fe6768 (2c.4 G4), 4e4462b (2c.5 §5.4),
+  fec4314 (2c.6), + this close.
+- TESTS at the final tree: -p mnemo (test_exit=0, 2714 passing) + --workspace
+  (ws_exit=0) + --features browser,embeddings (feat_exit=0) + build
+  --workspace (build_exit=0); goldens trio 3/3 in-suite; the three greps green.
+- CHECK-OFFS (row → test → result): Row 5 →
+  free_default_excludes_the_reviewer_channel +
+  list_models_and_spawn_require_the_spawn_group → green (hallucinated calls
+  ride the unknown-tool path — the free registry never contains them). Row 6
+  → kernel_head_has_no_workflow_text +
+  expected_tool_names_registered_when_fully_wired → green. Row 7 →
+  free_slot_resolves_configured_or_falls_back_to_default (2a.6, verified) +
+  free_patch_set_clear_keep → green. Row 8 → the sandbox-layer protected set
+  refuses .coding/plans/** policy-independently (sandbox.rs +
+  file_write.rs:463-505 + agent::tests:6702-6730) — NO gate_call deny needed
+  (the broader-block pick was conditional); recall injection = the volatile
+  tail's kernel half (auto_recall_emits_memory_recalled_event); session-end
+  consolidation = the loop's shutdown path (loop_impl.rs:407-409) → green.
+  Row 11 (mechanism) → the five 2c.5 tests → green (Engine exposure = 3c).
+  Row 25 → no_policy_requires_identity → green. Row 26 →
+  tool_selection_registers_only_read_group → green. Rows 27/28 (kernel) →
+  the workspace suite + minimal_bootstrap_never_writes_gitignore + the
+  disjoint-stats test + the IPC shape unchanged → green (engine re-verify =
+  3a).
+- DEVIATIONS: (1) ApproveViaApi's named-field variant vs §5.4's tuple sketch
+  (internally-tagged serde cannot carry a newtype variant of a plain enum).
+  (2) SafetyMode serializes kebab-case — the first serde draft asserted
+  PascalCase; the literal was fixed. (3) console.rs render arm + the
+  reviewer test's 6th arg — app fallout, fixed in-step. (4) The 2c.6 apply
+  arm's `.map(to_ref)` — the lint-clean form; the 7 sibling sites ride the
+  sweep. (5) The clippy habit-leg BLOCKED by the pre-existing rustc-1.95
+  storm (~250 sites / ~40 files; every site intersected with 2c's hunks —
+  the 3 in-hunk sites found were fixed; zero new); sweep queued (a439d8c2).
+- REMAINING RISK: clippy stays red tree-wide until the a439d8c2 sweep; the
+  engine-form rows re-verify in 3a/3c; the GUI cannot express the free slot
+  yet (phase-3 exposure by design).

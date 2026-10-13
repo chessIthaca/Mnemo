@@ -18,6 +18,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::agent::policy::PermissionPolicy;
 use crate::config::Config;
+use crate::agent::policy::ExternalPolicy;
 use crate::headless::error::EngineError;
 use crate::headless::host_tools::HostTool;
 use crate::headless::session::{pump_task, AgentSession, EngineInner};
@@ -196,6 +197,26 @@ impl Engine {
         )
         .await
         .map_err(EngineError::spawn_failed)?;
+        // 3c/G6 tier 3 (§5.9.6): layer the external policy over the built
+        // base — post-build (the loop's policy is interior-mutable since
+        // 3c; nothing reads it between the build and the first prompt),
+        // so no per-spawn factory threading. The layer keeps every
+        // unselected hook on the base policy (R1: gate-only — the spec
+        // can never change the tool array mid-session).
+        if let Some(spec) = opts.external_policy {
+            let loop_arc = self
+                .inner
+                .host
+                .agent_loops
+                .lock()
+                .await
+                .get(&agent)
+                .cloned()
+                .ok_or_else(|| EngineError::spawn_failed("the agent's loop vanished mid-spawn"))?;
+            let external = std::sync::Arc::new(ExternalPolicy::new(loop_arc.policy(), spec));
+            external.set_loop(std::sync::Arc::downgrade(&loop_arc));
+            loop_arc.set_policy(external);
+        }
         let id = SessionId::new(agent);
         self.inner.sessions.lock().await.insert(id, agent);
         Ok(AgentSession {

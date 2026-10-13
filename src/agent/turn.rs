@@ -606,7 +606,7 @@ impl AgentLoop {
                 // 2a.3: the advertisement consult — the policy owns the
                 // plan-frozen schema filter (byte-stable advertisement);
                 // NoPolicy falls back to the raw read.
-                let surface = self.policy.tool_surface().await;
+                let surface = self.policy().tool_surface().await;
                 match surface.advertise {
                     Some(f) => f,
                     None => self.workflow.schema_filter().await,
@@ -3525,12 +3525,12 @@ impl AgentLoop {
         // The stable head is cached and rebuilt only when the constitution
         // changes (L4) — re-reads agent.md on mtime change internally.
         let (stable_head, mut volatile_tail) = {
-            let stable_head = self.constitution.stable_head(&*self.policy);
+            let stable_head = self.constitution.stable_head(&*self.policy());
             // 2a.4: the tail consults the policy — the workflow section is
             // the app's volatile_tail (the policy locks the workflow
             // internally); NoPolicy falls back to an empty app tail.
             let app_tail = self
-                .policy
+                .policy()
                 .volatile_tail(provider.capabilities())
                 .await;
             let mut volatile_tail = prompt::build_volatile_tail(

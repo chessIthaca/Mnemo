@@ -503,6 +503,15 @@ impl AgentSession {
         })
         .await?;
         let mut final_text = String::new();
+        // 3c/G6 tier 3 (row 32, §5.9.6): a turn end answered `Continue`
+        // runs ANOTHER turn — the agent only parks when it has nothing
+        // more to run, and the logical turn this prompt started spans
+        // those model turns. Keep pumping (accumulating the deltas; the
+        // last Finished's reason wins) until the agent PARKS or the
+        // task exits — returning at the first per-turn `Finished` would
+        // hand back turn one's text while a continued turn two is still
+        // streaming, a stale "completion".
+        let mut finish_reason = None;
         loop {
             match rx.recv().await {
                 Ok(SessionEvent { agent, event, .. }) => {
@@ -512,20 +521,33 @@ impl AgentSession {
                         continue;
                     }
                     match event {
+                        SerializableAgentEvent::Started => {
+                            // Each model turn starts fresh — under a
+                            // tier-3 Continue the earlier turns' text is
+                            // conversation history, not this turn's
+                            // "final text" (row 32; §5.3 row 10).
+                            final_text.clear();
+                        }
                         SerializableAgentEvent::TextDelta { text } => {
                             final_text.push_str(&text)
                         }
                         SerializableAgentEvent::Finished { reason } => {
                             // (Parking is engine-scoped — the pump set it.)
+                            // One MODEL turn's end — under a tier-3
+                            // Continue the session runs on; record the
+                            // reason and keep pumping for the park.
+                            finish_reason = Some(reason);
+                        }
+                        SerializableAgentEvent::Parked { .. } => {
                             return Ok(TurnOutcome {
                                 final_text,
-                                finish_reason: Some(reason),
+                                finish_reason,
                             })
                         }
                         SerializableAgentEvent::Exited => {
                             return Ok(TurnOutcome {
                                 final_text,
-                                finish_reason: None,
+                                finish_reason,
                             })
                         }
                         _ => {}

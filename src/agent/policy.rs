@@ -645,3 +645,283 @@ mod tests {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// 3c: G6 tier 3 — the external policy (master-spec §5.9.6 :697-716)
+// ---------------------------------------------------------------------------
+
+/// What an unanswered (or mismatched-form) hook resolves to. The
+/// per-kind mapping is documented on [`ExternalPolicy`]'s hook arms:
+/// the gate-ish hooks honor Allow (proceed) / Deny (veto); the turn-end
+/// hook ALWAYS parks on a timeout — an auto-continue is an explicit act,
+/// never a timeout default (a silent infinite loop is a footgun no
+/// caller should inherit from a broken host). `Stop` is the turn-end
+/// verb and a no-op at the gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutAction {
+    /// Proceed (or the kind's neutral default).
+    #[default]
+    Allow,
+    /// Veto — meaningful at the gate; inert where the kind has no deny
+    /// form (post-hoc observations, prompt rewrites, teardown).
+    Deny,
+    /// Park the turn end — the turn-end verb; a no-op at the gates.
+    Stop,
+}
+
+/// The 3c default for [`ExternalPolicySpec::timeout_ms`]: 120 s (§5.9.6
+/// "with the timeout default applied" — matching the host-tool default).
+pub fn external_policy_default_timeout_ms() -> u64 {
+    120_000
+}
+
+/// The tier-3 external-policy spec (G6, §5.9.6) — pure wire data: which
+/// hooks fire, how long the kernel waits per hook, and what an
+/// unanswered hook resolves to. The HOST implements the policy; the
+/// kernel only emits `AgentEvent::PolicyHook` and awaits the host's
+/// `PolicyAnswer` — the same request/response shape as approvals,
+/// questions, and host tools, so an orchestrator in any language can
+/// gate calls (R1: gate-only — the spec can never change the tool
+/// array mid-session).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalPolicySpec {
+    /// The hooks that fire; each selected kind emits at its site, an
+    /// unselected kind keeps the base policy's behavior.
+    pub hooks: Vec<crate::runtime::channels::HookKind>,
+    /// The per-hook await timeout in milliseconds (default 120 s).
+    #[serde(default = "external_policy_default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// What an unanswered hook resolves to (default Allow).
+    #[serde(default)]
+    pub on_timeout: TimeoutAction,
+}
+
+impl Default for ExternalPolicySpec {
+    fn default() -> Self {
+        Self {
+            hooks: Vec::new(),
+            timeout_ms: external_policy_default_timeout_ms(),
+            on_timeout: TimeoutAction::Allow,
+        }
+    }
+}
+
+/// The tier-3 policy layer (G6, §5.9.6): a LAYER over the session's base
+/// policy, never a replacement — every UNSELECTED hook (and the
+/// head/tail/surface/route/spend/roles) delegates to `inner` (the
+/// engine's free `NoPolicy` base today; tier 2's `DeclarativePolicy`
+/// once guardrails exist). Each SELECTED hook emits a `PolicyHook` event
+/// with a fresh monotonic `hook_{n}` id + awaits the host's `PolicyAnswer`
+/// under the spec's timeout. An unanswered hook — or an answer with the
+/// WRONG form for the kind — is a protocol error resolved exactly like a
+/// timeout, per the on_timeout mapping documented on the hook arms.
+pub struct ExternalPolicy {
+    /// The base policy every unselected hook + surface consult delegates
+    /// to.
+    inner: Arc<dyn AgentPolicy>,
+    /// The wire spec (hooks / timeout / on_timeout).
+    spec: ExternalPolicySpec,
+    /// The loop back-ref (2a.6's pattern) — set post-build by the engine;
+    /// the hooks need the loop's agent id + fan-in sender to emit.
+    loop_ref: std::sync::Mutex<std::sync::Weak<crate::agent::AgentLoop>>,
+    /// Monotonic per-session hook ids (`hook_1`, `hook_2`, …).
+    hook_counter: std::sync::atomic::AtomicU64,
+}
+
+impl ExternalPolicy {
+    /// Wrap the base policy with the external layer (the spec selects the
+    /// hooks; the engine calls [`Self::set_loop`] right after building).
+    pub fn new(inner: Arc<dyn AgentPolicy>, spec: ExternalPolicySpec) -> Self {
+        Self {
+            inner,
+            spec,
+            loop_ref: std::sync::Mutex::new(std::sync::Weak::new()),
+            hook_counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The post-Arc loop back-ref (2a.6's pattern) — the engine sets it
+    /// at spawn, before the first turn.
+    pub fn set_loop(&self, weak: std::sync::Weak<crate::agent::AgentLoop>) {
+        *self.loop_ref.lock().expect("external policy loop_ref poisoned") = weak;
+    }
+
+    /// Whether the kind is selected in the spec.
+    fn selected(&self, kind: crate::runtime::channels::HookKind) -> bool {
+        self.spec.hooks.contains(&kind)
+    }
+
+    /// The gate hooks' on_timeout verdict (Allow proceeds; Deny vetoes;
+    /// Stop is a no-op at a gate — the turn-end verb).
+    fn gate_timeout_verdict(&self) -> GateVerdict {
+        match self.spec.on_timeout {
+            TimeoutAction::Allow | TimeoutAction::Stop => GateVerdict::Allow,
+            TimeoutAction::Deny => GateVerdict::Deny {
+                message: format!(
+                    "the external policy's tool gate timed out after {} ms without an answer",
+                    self.spec.timeout_ms
+                ),
+            },
+        }
+    }
+
+    /// Emit one hook + await the answer under the spec timeout. `None` =
+    /// no loop / no id / no fan-in (pre-task) / the fan-in closed / the
+    /// timeout elapsed / the responder dropped — every path maps to the
+    /// caller's on_timeout resolution.
+    async fn ask(
+        &self,
+        kind: crate::runtime::channels::HookKind,
+        payload: serde_json::Value,
+    ) -> Option<crate::runtime::channels::PolicyAnswer> {
+        let hook_id = format!(
+            "hook_{}",
+            self.hook_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        );
+        let loop_arc = self
+            .loop_ref
+            .lock()
+            .expect("external policy loop_ref poisoned")
+            .upgrade()?;
+        let agent_id = loop_arc.agent_id()?;
+        let fanin = loop_arc.event_fanin_sender()?;
+        let (responder, answer_rx) = tokio::sync::oneshot::channel();
+        fanin
+            .send((
+                agent_id,
+                crate::runtime::channels::AgentEvent::PolicyHook {
+                    hook_id,
+                    hook_kind: kind,
+                    payload,
+                    responder,
+                },
+            ))
+            .await
+            .ok()?;
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(self.spec.timeout_ms),
+            answer_rx,
+        )
+        .await
+        {
+            Ok(Ok(answer)) => Some(answer),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+}
+
+#[async_trait]
+impl AgentPolicy for ExternalPolicy {
+    fn register_tools(&self, reg: &mut ToolRegistry, ctx: &PolicyBuildCtx) {
+        self.inner.register_tools(reg, ctx)
+    }
+
+    fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String {
+        self.inner.stable_head(k, c)
+    }
+
+    async fn volatile_tail(&self, caps: &Capabilities) -> String {
+        self.inner.volatile_tail(caps).await
+    }
+
+    async fn tool_surface(&self) -> ToolSurface {
+        self.inner.tool_surface().await
+    }
+
+    async fn gate_call(&self, name: &str, args: &Value) -> GateVerdict {
+        if !self.selected(crate::runtime::channels::HookKind::ToolGate) {
+            return self.inner.gate_call(name, args).await;
+        }
+        let payload = serde_json::json!({"tool": name, "args": args});
+        match self
+            .ask(crate::runtime::channels::HookKind::ToolGate, payload)
+            .await
+        {
+            Some(crate::runtime::channels::PolicyAnswer::Gate { verdict }) => verdict,
+            // A mismatched form (a Prompt/Continuation answered to a
+            // gate) is a protocol error — the on_timeout resolution
+            // applies.
+            _ => self.gate_timeout_verdict(),
+        }
+    }
+
+    async fn route(&self) -> RouteKey {
+        self.inner.route().await
+    }
+
+    async fn on_prompt(&self, text: &str) -> PromptHook {
+        if !self.selected(crate::runtime::channels::HookKind::PromptIntake) {
+            return self.inner.on_prompt(text).await;
+        }
+        let payload = serde_json::json!({"text": text});
+        match self
+            .ask(crate::runtime::channels::HookKind::PromptIntake, payload)
+            .await
+        {
+            Some(crate::runtime::channels::PolicyAnswer::Prompt { hook }) => hook,
+            // The intake hook can only REWRITE a tail, never block a
+            // prompt — an unanswered (or mismatched) hook falls to the
+            // default hook; on_timeout has no deny form here
+            // (documented mapping).
+            _ => PromptHook::default(),
+        }
+    }
+
+    async fn after_tool(&self, name: &str, result: &ToolResult) {
+        if self.selected(crate::runtime::channels::HookKind::AfterTool) {
+            let payload = serde_json::json!({"tool": name, "result": result});
+            // The answer acknowledges the observation; the call already
+            // ran — a Deny is informational only.
+            let _ = self
+                .ask(crate::runtime::channels::HookKind::AfterTool, payload)
+                .await;
+        }
+        self.inner.after_tool(name, result).await
+    }
+
+    async fn on_turn_end(&self, t: &TurnSummary) -> Continuation {
+        if !self.selected(crate::runtime::channels::HookKind::TurnEnd) {
+            return self.inner.on_turn_end(t).await;
+        }
+        let payload = serde_json::json!({
+            "success": t.success,
+            "unattended": t.unattended,
+            "stop_reason": t.stop_reason.as_ref().map(|reason| format!("{reason:?}")),
+        });
+        match self
+            .ask(crate::runtime::channels::HookKind::TurnEnd, payload)
+            .await
+        {
+            Some(crate::runtime::channels::PolicyAnswer::Continuation { continuation }) => {
+                continuation
+            }
+            // An unanswered turn end ALWAYS parks — even with
+            // on_timeout: Allow (an auto-continue is an explicit act,
+            // never a timeout default; a broken host must not spin the
+            // session into an infinite loop). Deny/Stop map to Stop
+            // identically (documented mapping).
+            _ => Continuation::Stop,
+        }
+    }
+
+    async fn spend_tags(&self) -> SpendTags {
+        self.inner.spend_tags().await
+    }
+
+    fn spawn_roles(&self) -> &[RoleSpec] {
+        self.inner.spawn_roles()
+    }
+
+    async fn on_session_end(&self) {
+        if self.selected(crate::runtime::channels::HookKind::SessionEnd) {
+            // The answer acknowledges; the session ends regardless — no
+            // on_timeout form can block teardown (documented mapping).
+            let _ = self
+                .ask(crate::runtime::channels::HookKind::SessionEnd, serde_json::json!({}))
+                .await;
+        }
+        self.inner.on_session_end().await
+    }
+}

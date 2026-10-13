@@ -352,11 +352,13 @@ impl AgentTask {
                         stop_reason: None,
                         unattended: self.unattended,
                     };
+                    let continuation = self
+                        .agent_loop
+                        .policy()
+                        .on_turn_end(&summary)
+                        .await;
                     let expects_progress = matches!(
-                        self.agent_loop
-                            .policy()
-                            .on_turn_end(&summary)
-                            .await,
+                        &continuation,
                         crate::agent::policy::Continuation::Continue { .. }
                     );
                     let descendants_running =
@@ -384,12 +386,27 @@ impl AgentTask {
                         // "do not ask" rule — say explicitly that no user
                         // input is coming so it proceeds on best judgment
                         // instead of waiting for an answer.
-                        let note = if self.unattended {
-                            "[harness note] continue from where you left off. \
-                             (You are running unattended — no user input is \
-                             coming; use your best judgment.)"
-                        } else {
-                            "[harness note] continue from where you left off."
+                        // 3c/G6 tier 3 (§5.9.6): a Continue may carry the
+                        // HOST's note (an external policy's PolicyAnswer) —
+                        // it becomes the next turn's user message verbatim
+                        // (the row-32 leg-b contract). None (the workflow
+                        // auto-continue path) keeps the harness note,
+                        // byte-identical to the pre-3c behavior; the Stop
+                        // arm is unreachable (expects_progress guards).
+                        let note = match continuation {
+                            crate::agent::policy::Continuation::Continue {
+                                note: Some(host_note),
+                            } => host_note,
+                            _ => {
+                                let harness_note = if self.unattended {
+                                    "[harness note] continue from where you left off. \
+                                     (You are running unattended — no user input is \
+                                      coming; use your best judgment.)"
+                                } else {
+                                    "[harness note] continue from where you left off."
+                                };
+                                harness_note.to_string()
+                            }
                         };
                         self.messages.push(Message::user_text(note));
                         // Loop: run the follow-up turn.
@@ -3129,7 +3146,7 @@ mod tests {
             primary_exec: Arc::clone(&primary_exec),
         });
 
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
                 AgentLoopConfig {
                     provider: primary_plan.clone(),
                     tools: Arc::new(registry),
@@ -3330,7 +3347,7 @@ mod tests {
             primary_exec: Arc::clone(&primary_exec),
         });
 
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
                 AgentLoopConfig {
                     provider: primary_default.clone(),
                     tools: Arc::new(registry),
@@ -6748,7 +6765,7 @@ mod tests {
         // cloned inline into the config's provider field (binding a concrete
         // Arc then Arc::clone-ing into the field hits E0308 here).
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -6873,7 +6890,7 @@ mod tests {
         );
         // Sibling dual-handle idiom (see the Prompt twin above).
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -6988,7 +7005,7 @@ mod tests {
             "setup: a fresh workflow must be in Planning"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -7168,7 +7185,7 @@ mod tests {
             dir.path().join("plans"),
         )));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -7619,7 +7636,7 @@ mod tests {
             .unwrap();
         workflow.lock().await.complete_step(0).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),
@@ -8033,7 +8050,7 @@ mod tests {
             "setup: the root Implementation plan must be in Reviewing"
         );
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut agent_loop = AgentLoop::new(
+        let agent_loop = AgentLoop::new(
             AgentLoopConfig {
                 provider: Arc::new(CountingMockProvider {
                     caps: Capabilities::openai(),

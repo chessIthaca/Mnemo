@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::policy::PermissionPolicy;
 pub use crate::host::notifier::HostEvent;
 pub use crate::runtime::channels::SessionLimits;
+use crate::agent::policy::ExternalPolicySpec;
 use crate::headless::host_tools::HostToolSpec;
 use crate::runtime::channels::{AgentId, Approval, PolicyAnswer, SerializableAgentEvent, UserAnswer};
 use crate::tool::ToolResult;
@@ -122,6 +123,14 @@ pub struct SpawnOptions {
     /// map wins the lookup, so a shadowing shim is dead weight).
     #[serde(default)]
     pub host_tools: Vec<HostToolSpec>,
+    /// The tier-3 external policy (G6, §5.9.6) — for each selected hook
+    /// the kernel emits a `PolicyHook` session event and awaits the
+    /// `PolicyAnswer` command under the spec's timeout. A LAYER over the
+    /// session's base (the free policy today, the guardrails once tier 2
+    /// lands): unselected hooks keep the base's behavior. R1: gate-only
+    /// — the policy can never change the tool array mid-session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_policy: Option<ExternalPolicySpec>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

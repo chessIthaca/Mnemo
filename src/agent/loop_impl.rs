@@ -561,7 +561,7 @@ pub struct AgentLoop {
     /// ([`NoPolicy`](crate::agent::policy::NoPolicy)); the factory attaches the
     /// app's WorkflowPolicy for the workflow agent. Nothing consults it until
     /// 2a.3+.
-    pub(crate) policy: Arc<dyn crate::agent::policy::AgentPolicy>,
+    pub(crate) policy: std::sync::RwLock<Arc<dyn crate::agent::policy::AgentPolicy>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -995,6 +995,18 @@ impl AgentLoop {
         *self.event_fanin.lock().expect("event_fanin lock poisoned") = Some(tx);
     }
 
+    /// The live fan-in sender (3c/G6 tier 3): the external policy's hook
+    /// emission path — `None` only before the agent task runs (the
+    /// sender is minted per spawn) or after the task is gone.
+    pub(crate) fn event_fanin_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>> {
+        self.event_fanin
+            .lock()
+            .expect("event_fanin lock poisoned")
+            .clone()
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -1075,7 +1087,9 @@ impl AgentLoop {
             // 2c.1/G1: the bare-loop default carries the kernel's EXPLICIT
             // coding default (never a silent assembly; the factory may
             // overwrite via set_policy).
-            policy: Arc::new(crate::agent::policy::NoPolicy::with_coding_default()),
+            policy: std::sync::RwLock::new(Arc::new(
+                crate::agent::policy::NoPolicy::with_coding_default(),
+            )),
         }
     }
 
@@ -2595,14 +2609,21 @@ impl AgentLoop {
     /// The agent's policy handle (2a.2) — the free agent
     /// ([`NoPolicy`](crate::agent::policy::NoPolicy)) by default; the
     /// factory attaches the workflow agent's WorkflowPolicy (app-side).
+    /// Interior-mutable since 3c (mirroring `permission`): the engine
+    /// layers policies post-build, before the first prompt.
     pub fn policy(&self) -> Arc<dyn crate::agent::policy::AgentPolicy> {
-        Arc::clone(&self.policy)
+        Arc::clone(&self.policy.read().expect("policy lock poisoned"))
     }
 
     /// Attach (or replace) the agent's policy — used by the factory at
-    /// build time (2a.2) and later by the engine/session builders (3a).
-    pub fn set_policy(&mut self, policy: Arc<dyn crate::agent::policy::AgentPolicy>) {
-        self.policy = policy;
+    /// build time (2a.2), later by the engine/session builders (3a), and
+    /// since 3c by the engine's tier-3 wrap: the layer is swapped in
+    /// POST-build, before the first prompt consults it (nothing reads the
+    /// policy between the build and the first turn). `&self` +
+    /// interior mutability (like `set_permission`) so an `Arc`-wrapped
+    /// loop can be re-pointed.
+    pub fn set_policy(&self, policy: Arc<dyn crate::agent::policy::AgentPolicy>) {
+        *self.policy.write().expect("policy lock poisoned") = policy;
     }
 
 

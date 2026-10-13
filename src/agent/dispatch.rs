@@ -251,7 +251,7 @@ impl AgentLoop {
             // 2a.3: the gate consult — the policy owns the enforcement
             // filter (WorkflowPolicy wraps the workflow's allowed_tools();
             // NoPolicy falls back to the raw read).
-            let surface = self.policy.tool_surface().await;
+            let surface = self.policy().tool_surface().await;
             let filter = match surface.gate {
                 Some(f) => f,
                 None => self.workflow.allowed_tools().await,
@@ -491,6 +491,27 @@ impl AgentLoop {
             }
         }
 
+        // 3c (§5.9.6): the per-call policy veto — consulted BEFORE the
+        // safety/approval machinery. WorkflowPolicy answers Allow today
+        // (the app is inert here — verified: `gate_call` had zero
+        // pre-3c call sites); the live veto users are the engine's
+        // external policy (tier 3) + the declarative gate rules (tier 2,
+        // D4). A Deny refuses the call outright — even under
+        // OverridePermissions (a veto is not an approval skip — R3);
+        // RequireApproval forces the gated branch (like `never_auto_for`).
+        let mut gate_requires_approval = false;
+        match self
+            .policy()
+            .gate_call(&parsed_call.name, &parsed_call.arguments)
+            .await
+        {
+            crate::agent::policy::GateVerdict::Deny { message } => {
+                return (ToolResult::error(message), Vec::new());
+            }
+            crate::agent::policy::GateVerdict::RequireApproval => gate_requires_approval = true,
+            crate::agent::policy::GateVerdict::Allow => {}
+        }
+
         let mode = *self.safety_mode.read().expect("safety_mode lock poisoned");
         // A tool whose *specific arguments* mark it as a core operation via
         // `never_auto_for()` (e.g. `git merge` / `git push`) must show the
@@ -500,7 +521,7 @@ impl AgentLoop {
         // enforces the hard user-sanction invariant those operations depend
         // on: landing commits on main / pushing to a remote always requires a
         // contemporaneous user approval.
-        let force_prompt = tool.never_auto_for(&parsed_call.arguments);
+        let force_prompt = tool.never_auto_for(&parsed_call.arguments) || gate_requires_approval;
         // Live-output sink for this call: throttled partial output from a
         // running tool is forwarded to the UI as ToolOutputDelta events tagged
         // with this call's id, so concurrent calls land in their own cards. The

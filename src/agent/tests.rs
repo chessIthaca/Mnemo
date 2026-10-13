@@ -3729,7 +3729,7 @@ async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() 
     let (provider, captured, captured_tails) =
         CapturingProvider::new_with_model_with_tails("deepseek-v4-flash");
     let trailing = provider.trailing_handle();
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
@@ -4120,7 +4120,7 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
 
     let (provider, captured, captured_tails) = CapturingProvider::new_local_with_tails();
     let trailing = provider.trailing_handle();
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: Arc::new(provider),
             tools: registry,
@@ -8997,7 +8997,7 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
@@ -9262,7 +9262,7 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
@@ -9431,7 +9431,7 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
@@ -9557,7 +9557,7 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
@@ -9792,7 +9792,7 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
     let default_provider: Arc<dyn crate::provider::LlmClient> = Arc::new(FixedModelProvider {
         model: "default-model",
     });
-    let mut agent = AgentLoop::new(
+    let agent = AgentLoop::new(
         AgentLoopConfig {
             provider: default_provider,
             tools: registry,
@@ -16167,5 +16167,283 @@ async fn lane_memo_is_fresh_for_a_new_plan_that_repeats_the_title() {
         passes.load(std::sync::atomic::Ordering::Relaxed),
         2,
         "a new plan must classify again, never reuse the previous plan's memo"
+    );
+}
+/// G6 tier 3 (row 32's unit half, §D): the [`ExternalPolicy`] layer's
+/// per-kind on_timeout mapping, driven agent-level (the
+/// savings_and_spend pattern — a real loop, a fan-in channel, direct
+/// hook consults). The answered legs verify the round trip (a fresh
+/// monotonic `hook_{n}` id, the kind, the per-kind payload on the way
+/// out; the verdict on the way back). The unanswered legs verify the
+/// mapping table: a gate resolves by `on_timeout` (Allow proceeds /
+/// Deny vetoes — a wrong-form answer is a protocol error and maps the
+/// same way), while a turn end ALWAYS parks — even under
+/// `on_timeout: Allow` (an auto-continue is an explicit act, never a
+/// timeout default). Unselected kinds delegate to the base policy and
+/// never emit.
+#[tokio::test]
+async fn external_policy_on_timeout_mapping() {
+    use crate::agent::policy::{
+        AgentPolicy, Continuation, ExternalPolicy, ExternalPolicySpec, GateVerdict, PromptHook,
+        TimeoutAction, TurnSummary,
+    };
+    use crate::runtime::channels::{HookKind, PolicyAnswer};
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    // The provider is never consulted — the test drives the hook
+    // methods directly; the loop only needs a legal client to build.
+    let provider = Arc::new(MockProvider::single(vec![LlmEvent::Finish {
+        reason: FinishReason::Stop,
+    }]));
+    let agent = Arc::new(AgentLoop::new(
+        test_config(provider, registry, workflow.clone(), sandbox),
+        crate::project::Constitution::default(),
+    ));
+    // The emission needs the id + the fan-in (the ask site's two loop
+    // facts): mirror the production stamps.
+    *agent.agent_id.lock().expect("agent_id lock poisoned") = Some(7);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    agent.set_event_fanin(fanin_tx);
+    let base = agent.policy();
+    // The shared gate payload — hoisted so the join! futures borrow a
+    // binding that outlives them (an inline json! temporary is freed at
+    // the statement's end).
+    let gate_args = serde_json::json!({"city": "Oslo"});
+
+    // Layer A — on_timeout: Allow, both the gate and the turn end
+    // selected.
+    let a = Arc::new(ExternalPolicy::new(
+        base.clone(),
+        ExternalPolicySpec {
+            hooks: vec![HookKind::ToolGate, HookKind::TurnEnd],
+            timeout_ms: 80,
+            on_timeout: TimeoutAction::Allow,
+        },
+    ));
+    a.set_loop(Arc::downgrade(&agent));
+
+    // (1) An answered gate: the hook carries a fresh id, the kind, and
+    // the tool gate's payload; the verdict rides back.
+    let (verdict, ()) = tokio::join!(
+        a.gate_call("get_weather", &gate_args),
+        async {
+            let (id, event) = fanin_rx.recv().await.expect("the gate hook event");
+            assert_eq!(id, 7);
+            let AgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+                responder,
+            } = event
+            else {
+                panic!("the emission is a PolicyHook: {event:?}");
+            };
+            assert_eq!(hook_id, "hook_1", "ids are monotonic from hook_1");
+            assert_eq!(hook_kind, HookKind::ToolGate);
+            assert_eq!(
+                payload,
+                serde_json::json!({"tool": "get_weather", "args": {"city": "Oslo"}})
+            );
+            responder
+                .send(PolicyAnswer::Gate {
+                    verdict: GateVerdict::Deny {
+                        message: "vetoed by the host".into(),
+                    },
+                })
+                .expect("the answer is accepted");
+        }
+    );
+    match verdict {
+        GateVerdict::Deny { message } => assert_eq!(message, "vetoed by the host"),
+        other => panic!("the host's Deny rides back: {other:?}"),
+    }
+
+    // (2) A wrong-form answer is a protocol error: the gate falls to
+    // on_timeout (Allow).
+    let (verdict, ()) = tokio::join!(
+        a.gate_call("get_weather", &gate_args),
+        async {
+            let (_, event) = fanin_rx.recv().await.expect("the gate hook event");
+            let AgentEvent::PolicyHook {
+                hook_id, responder, ..
+            } = event
+            else {
+                panic!("the emission is a PolicyHook: {event:?}");
+            };
+            assert_eq!(hook_id, "hook_2");
+            responder
+                .send(PolicyAnswer::Prompt {
+                    hook: PromptHook::default(),
+                })
+                .expect("the answer is accepted");
+        }
+    );
+    assert!(
+        matches!(verdict, GateVerdict::Allow),
+        "a wrong-form answer resolves like a timeout (Allow): {verdict:?}"
+    );
+
+    // (3) An unanswered gate: the 80 ms timeout elapses, then Allow.
+    let started = std::time::Instant::now();
+    let verdict = a
+        .gate_call("get_weather", &serde_json::json!({"city": "Oslo"}))
+        .await;
+    assert!(
+        matches!(verdict, GateVerdict::Allow),
+        "on_timeout: Allow proceeds: {verdict:?}"
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(80),
+        "the gate actually waited the timeout"
+    );
+    let (_, event) = fanin_rx.recv().await.expect("the timed-out gate's event");
+    let AgentEvent::PolicyHook {
+        hook_id, hook_kind, ..
+    } = event
+    else {
+        panic!("the emission is a PolicyHook: {event:?}");
+    };
+    assert_eq!(hook_id, "hook_3");
+    assert_eq!(hook_kind, HookKind::ToolGate);
+
+    // (4) An answered turn end: the host's Continue { note } rides
+    // back verbatim.
+    let summary = TurnSummary {
+        success: true,
+        stop_reason: None,
+        unattended: false,
+    };
+    let (continuation, ()) = tokio::join!(
+        a.on_turn_end(&summary),
+        async {
+            let (_, event) = fanin_rx
+                .recv()
+                .await
+                .expect("the turn-end hook event");
+            let AgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+                responder,
+            } = event
+            else {
+                panic!("the emission is a PolicyHook: {event:?}");
+            };
+            assert_eq!(hook_id, "hook_4");
+            assert_eq!(hook_kind, HookKind::TurnEnd);
+            assert_eq!(
+                payload,
+                serde_json::json!({
+                    "success": true,
+                    "unattended": false,
+                    "stop_reason": null,
+                })
+            );
+            responder
+                .send(PolicyAnswer::Continuation {
+                    continuation: Continuation::Continue {
+                        note: Some("the host says continue".into()),
+                    },
+                })
+                .expect("the answer is accepted");
+        }
+    );
+    match continuation {
+        Continuation::Continue { note } => {
+            assert_eq!(note.as_deref(), Some("the host says continue"))
+        }
+        other => panic!("the host's Continue rides back: {other:?}"),
+    }
+
+    // (5) An unanswered turn end parks even under on_timeout: Allow —
+    // the documented deviation (an auto-continue is never a timeout
+    // default).
+    let continuation = a.on_turn_end(&summary).await;
+    assert!(
+        matches!(continuation, Continuation::Stop),
+        "an unanswered turn end ALWAYS parks: {continuation:?}"
+    );
+    let (_, event) = fanin_rx
+        .recv()
+        .await
+        .expect("the timed-out turn end's event");
+    let AgentEvent::PolicyHook {
+        hook_id, hook_kind, ..
+    } = event
+    else {
+        panic!("the emission is a PolicyHook: {event:?}");
+    };
+    assert_eq!(hook_id, "hook_5");
+    assert_eq!(hook_kind, HookKind::TurnEnd);
+
+    // Layer B — on_timeout: Deny, ToolGate only: the gate vetoes on
+    // timeout with the spec's message; the unselected turn end
+    // delegates to the base (NoPolicy parks) and never emits.
+    let b = Arc::new(ExternalPolicy::new(
+        base.clone(),
+        ExternalPolicySpec {
+            hooks: vec![HookKind::ToolGate],
+            timeout_ms: 80,
+            on_timeout: TimeoutAction::Deny,
+        },
+    ));
+    b.set_loop(Arc::downgrade(&agent));
+    let verdict = b
+        .gate_call("get_weather", &serde_json::json!({"city": "Oslo"}))
+        .await;
+    match verdict {
+        GateVerdict::Deny { message } => assert_eq!(
+            message,
+            "the external policy's tool gate timed out after 80 ms without an answer"
+        ),
+        other => panic!("on_timeout: Deny vetoes: {other:?}"),
+    }
+    let (_, event) = fanin_rx.recv().await.expect("the timed-out gate's event");
+    let AgentEvent::PolicyHook {
+        hook_id, hook_kind, ..
+    } = event
+    else {
+        panic!("the emission is a PolicyHook: {event:?}");
+    };
+    assert_eq!(hook_id, "hook_1", "layer B's own counter starts fresh");
+    assert_eq!(hook_kind, HookKind::ToolGate);
+
+    // (6) An answered Allow (the happy path) + the unselected kind's
+    // delegation: the turn end delegates to the base and never emits.
+    let (verdict, ()) = tokio::join!(
+        b.gate_call("get_weather", &gate_args),
+        async {
+            let (_, event) = fanin_rx.recv().await.expect("the gate hook event");
+            let AgentEvent::PolicyHook {
+                hook_id, responder, ..
+            } = event
+            else {
+                panic!("the emission is a PolicyHook: {event:?}");
+            };
+            assert_eq!(hook_id, "hook_2");
+            responder
+                .send(PolicyAnswer::Gate {
+                    verdict: GateVerdict::Allow,
+                })
+                .expect("the answer is accepted");
+        }
+    );
+    assert!(
+        matches!(verdict, GateVerdict::Allow),
+        "the answered Allow rides back: {verdict:?}"
+    );
+    let continuation = b.on_turn_end(&summary).await;
+    assert!(
+        matches!(continuation, Continuation::Stop),
+        "the unselected kind delegates to the base policy (NoPolicy parks)"
+    );
+    assert!(
+        fanin_rx.try_recv().is_err(),
+        "an unselected kind never emits"
     );
 }

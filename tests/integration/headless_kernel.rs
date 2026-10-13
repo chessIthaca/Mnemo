@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use mnemo::agent::policy::PermissionPolicy;
+use mnemo::agent::policy::{Continuation, GateVerdict, PermissionPolicy};
 use mnemo::headless::{Engine, EngineOptions, MemoryBackend};
 use mnemo::workspace::Workspace;
 
@@ -73,8 +73,8 @@ use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    HostEvent, HostToolSpec, PendingInteraction, SessionCommand, SessionEvent, SessionLimits,
-    SpawnOptions, Transcript,
+    ExternalPolicySpec, HostEvent, HookKind, HostToolSpec, PendingInteraction, PolicyAnswer,
+    SessionCommand, SessionEvent, SessionLimits, SpawnOptions, TimeoutAction, Transcript,
 };
 use mnemo::provider::{
     Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind, Role,
@@ -1251,5 +1251,295 @@ async fn host_tool_round_trip_and_timeout_row_31() {
     assert!(
         tool_msg.contains("timed out after 150 ms"),
         "the model sees the abandoned-call error: {tool_msg}"
+    );
+}/// Row 32 (G6 tier 3, §5.9.6): the external policy's three legs, one
+/// engine, a fresh session each. (a) A selected ToolGate answered with
+/// Deny vetoes the call BEFORE the host-tool branch — the model sees
+/// the deny message as the call's result (no `HostToolCall` ever
+/// fires), and the snapshot reports the pending hook mid-flight. (b) A
+/// selected TurnEnd answered `Continue { note }` runs another turn and
+/// the HOST's note arrives as its user message verbatim (the runtime's
+/// note-honoring arm); answering `Stop` at the next turn end parks. (c)
+/// `on_timeout: Allow` + a short timeout with nobody answering the
+/// gate: the call PROCEEDS (the host-tool branch fires; R4's per-tool
+/// timeout resolves it) and the turn still finishes.
+#[tokio::test]
+async fn external_policy_gate_and_turn_end_row_32() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![
+        // Leg (a): the model calls the gated host tool (denied), then
+        // ends the turn on the deny message.
+        g5_tool_turn("get_weather", r#"{"city": "Oslo"}"#),
+        g5_text_turn(&["it was denied"]),
+        // Leg (b): turn one ends plain; the TurnEnd answer continues
+        // with the host's note; the second turn ends plain; the next
+        // TurnEnd answer stops.
+        g5_text_turn(&["turn one"]),
+        g5_text_turn(&["turn two done"]),
+        // Leg (c): the gate times out unanswered (Allow → proceed),
+        // the host tool then times out unanswered (150 ms), the model
+        // ends.
+        g5_tool_turn("get_weather", r#"{"city": "Oslo"}"#),
+        g5_text_turn(&["it proceeded"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+
+    // Leg (a) — the gate vetoes before the host-tool branch: the deny
+    // message reaches the model as the call's result.
+    let session = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![HostToolSpec {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: None,
+            }],
+            external_policy: Some(ExternalPolicySpec {
+                hooks: vec![HookKind::ToolGate],
+                timeout_ms: 5_000,
+                on_timeout: TimeoutAction::Allow,
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (leg a)");
+    let mut rx = session.events();
+    let answer = async {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            if let SerializableAgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+            } = ev.event
+            {
+                assert_eq!(hook_id, "hook_1");
+                assert_eq!(hook_kind, HookKind::ToolGate);
+                assert_eq!(
+                    payload,
+                    serde_json::json!({"tool": "get_weather", "args": {"city": "Oslo"}})
+                );
+                // The pump stashed the responder — the snapshot reports
+                // the pending hook mid-flight (§5.9.5: engine-local,
+                // always accurate).
+                let pending = session.snapshot().await.expect("snapshot").pending;
+                assert!(
+                    matches!(pending, Some(PendingInteraction::PolicyHook { .. })),
+                    "the snapshot reports the pending policy hook: {pending:?}"
+                );
+                session
+                    .send(SessionCommand::PolicyAnswer {
+                        hook_id,
+                        answer: PolicyAnswer::Gate {
+                            verdict: GateVerdict::Deny {
+                                message: "denied by the external policy".into(),
+                            },
+                        },
+                    })
+                    .await
+                    .expect("the answer resolves the pending hook");
+                return;
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(
+        session.run_to_completion("check the weather in Oslo"),
+        answer
+    );
+    let outcome = outcome.expect("leg-a turn completes");
+    assert_eq!(outcome.final_text, "it was denied");
+    let reqs = llm.requests();
+    assert!(
+        reqs.len() >= 2,
+        "the denied call still produced a second request"
+    );
+    let tool_msg = reqs[1]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("request 2 carries the denied call's error result")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("denied by the external policy"),
+        "the model sees the deny message: {tool_msg}"
+    );
+
+    // Leg (b) — the TurnEnd answer continues with the host's note; the
+    // second TurnEnd answer stops.
+    let session = engine
+        .spawn(SpawnOptions {
+            external_policy: Some(ExternalPolicySpec {
+                hooks: vec![HookKind::TurnEnd],
+                timeout_ms: 5_000,
+                on_timeout: TimeoutAction::Allow,
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (leg b)");
+    let mut rx = session.events();
+    let answer = async {
+        let first_id = loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            if let SerializableAgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+            } = ev.event
+            {
+                assert_eq!(hook_id, "hook_1");
+                assert_eq!(hook_kind, HookKind::TurnEnd);
+                assert_eq!(
+                    payload,
+                    serde_json::json!({
+                        "success": true,
+                        "unattended": false,
+                        "stop_reason": null,
+                    })
+                );
+                break hook_id;
+            }
+        };
+        session
+            .send(SessionCommand::PolicyAnswer {
+                hook_id: first_id,
+                answer: PolicyAnswer::Continuation {
+                    continuation: Continuation::Continue {
+                        note: Some("the host says: continue and finish".into()),
+                    },
+                },
+            })
+            .await
+            .expect("the Continue answer resolves the pending hook");
+        let second_id = loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            if let SerializableAgentEvent::PolicyHook {
+                hook_id, hook_kind, ..
+            } = ev.event
+            {
+                assert_eq!(hook_id, "hook_2");
+                assert_eq!(hook_kind, HookKind::TurnEnd);
+                break hook_id;
+            }
+        };
+        session
+            .send(SessionCommand::PolicyAnswer {
+                hook_id: second_id,
+                answer: PolicyAnswer::Continuation {
+                    continuation: Continuation::Stop,
+                },
+            })
+            .await
+            .expect("the Stop answer resolves the pending hook");
+    };
+    let (outcome, ()) = tokio::join!(session.run_to_completion("start the task"), answer);
+    let outcome = outcome.expect("leg-b session completes");
+    assert_eq!(outcome.final_text, "turn two done");
+    // The host's note arrived as the second turn's user message —
+    // verbatim, not the kernel's harness note.
+    let reqs = llm.requests();
+    let note_msg = reqs[3]
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .expect("the second turn's request carries the host's note")
+        .content
+        .as_text();
+    assert_eq!(
+        note_msg, "the host says: continue and finish",
+        "the host's note is the next turn's user message verbatim"
+    );
+
+    // Leg (c) — on_timeout: Allow, nobody answers the gate: the call
+    // proceeds (the host-tool branch fires; R4's 150 ms per-tool
+    // timeout resolves it), the turn still finishes.
+    let session = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![HostToolSpec {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(150),
+            }],
+            external_policy: Some(ExternalPolicySpec {
+                hooks: vec![HookKind::ToolGate],
+                timeout_ms: 150,
+                on_timeout: TimeoutAction::Allow,
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (leg c)");
+    let mut rx = session.events();
+    let watch = async {
+        // Nobody answers the gate — record that BOTH the consult and
+        // the (proceeded) host-tool call fired.
+        let mut saw_hook = false;
+        let mut saw_host_call = false;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            match ev.event {
+                SerializableAgentEvent::PolicyHook { hook_kind, .. } => {
+                    assert_eq!(hook_kind, HookKind::ToolGate);
+                    saw_hook = true;
+                }
+                SerializableAgentEvent::HostToolCall { name, .. } => {
+                    assert_eq!(name, "get_weather");
+                    saw_host_call = true;
+                }
+                _ => {}
+            }
+            if saw_hook && saw_host_call {
+                return;
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(
+        session.run_to_completion("check the weather — nobody will answer"),
+        watch
+    );
+    let outcome = outcome.expect("leg-c turn completes despite the unanswered gate");
+    assert_eq!(outcome.final_text, "it proceeded");
+    let reqs = llm.requests();
+    let tool_msg = reqs[5]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("leg-c request 2 carries the per-tool timeout error")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("timed out after 150 ms"),
+        "the call proceeded to the host-tool branch (R4 timeout): {tool_msg}"
     );
 }

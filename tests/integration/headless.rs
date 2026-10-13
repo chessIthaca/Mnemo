@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    Engine, EngineError, EngineOptions, EventReceiver, MemoryBackend, RecvError, SessionCommand,
-    SessionEvent, SessionId, SessionLimits, SpawnOptions, Transcript,
+    Engine, EngineError, EngineOptions, EventReceiver, ExternalPolicySpec, HookKind,
+    MemoryBackend, RecvError, SessionCommand, SessionEvent, SessionId, SessionLimits,
+    SpawnOptions, TimeoutAction, Transcript,
 };
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
@@ -71,6 +72,15 @@ fn public_types_serde_roundtrip() {
             ..SessionLimits::default()
         }),
         host_tools: Vec::new(),
+        // 3c/G6 tier 3: a representative external-policy spec — the
+        // hooks array, the timeout, and the timeout action all ride
+        // the wire (the field's None form round-trips via the default
+        // above).
+        external_policy: Some(ExternalPolicySpec {
+            hooks: vec![HookKind::ToolGate, HookKind::TurnEnd],
+            timeout_ms: 30_000,
+            on_timeout: TimeoutAction::Deny,
+        }),
     });
 
     // SessionCommand — every 3a variant.

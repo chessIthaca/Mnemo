@@ -398,6 +398,22 @@ async fn limits_max_turns_parks_the_session() {
         .await
         .expect_err("a parked session rejects the prompt");
     assert_eq!(err.code(), "session_parked");
+
+    // The raw send surface parks too (engine-scoped, the pump sets it —
+    // review round-1 F3), and a re-acquired handle sees the same state
+    // (F1: Engine::session).
+    let again = engine
+        .session(&session.id())
+        .await
+        .expect("the handle re-acquires while the session is live");
+    let err = again
+        .send(SessionCommand::Prompt {
+            text: "raw".into(),
+            images: vec![],
+        })
+        .await
+        .expect_err("the raw surface parks too");
+    assert_eq!(err.code(), "session_parked");
     engine.shutdown().await.expect("engine shuts down");
 }
 
@@ -521,4 +537,30 @@ async fn two_engines_isolated() {
 
     engine_a.shutdown().await.expect("engine a shuts down");
     engine_b.shutdown().await.expect("engine b shuts down");
+}
+
+/// Review round-1 F5: an Approve naming an unknown (or already
+/// resolved) request id errors `unknown_request` on a LIVE session —
+/// never `session_closed` (a caller must not read a stale id as the
+/// session ending).
+#[tokio::test]
+async fn unknown_approval_errors_unknown_request_not_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![]);
+    let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
+        .provider(llm)
+        .start()
+        .await
+        .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let err = session
+        .send(SessionCommand::Approve {
+            request_id: "no-such-request".into(),
+            decision: Approval::Approve,
+        })
+        .await
+        .expect_err("the unknown id errors");
+    assert_eq!(err.code(), "unknown_request");
+    engine.shutdown().await.expect("engine shuts down");
 }

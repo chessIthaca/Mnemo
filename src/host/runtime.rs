@@ -224,11 +224,11 @@ pub async fn spawn_agent_shared(
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         fanin_tx = mgr.fanin_sender();
         let mut task = AgentTask::new(agent_id, name.clone(), agent_loop.clone());
-    // 3a.6 (G5): the resume seed — applied before the task runs, so the
-    // seeded history is the first request's byte prefix.
-    if let Some(messages) = initial_messages {
-        task.seed_messages(messages);
-    }
+        // 3a.6 (G5): the resume seed — applied before the task runs, so
+        // the seeded history is the first request's byte prefix.
+        if let Some(messages) = initial_messages {
+            task.seed_messages(messages);
+        }
         tokio::spawn(task.run(cmd_rx, fanin_tx.clone()));
         let mut handle = AgentHandle::new(agent_id, name.clone(), cmd_tx);
         if let Some(pid) = parent_id {

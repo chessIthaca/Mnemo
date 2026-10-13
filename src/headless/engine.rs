@@ -10,7 +10,7 @@
 //! event pump + the multi-subscriber session bus. The memory-backend /
 //! index / embedder option consumption lands in 3b.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -155,7 +155,21 @@ impl Engine {
             agent,
             inner: self.inner.clone(),
             bus: self.bus.clone(),
-            parked: Default::default(),
+        })
+    }
+
+    /// Re-acquire a live session's handle by id (§5.3 :299): `None`
+    /// once the session ended (closed or shut down). The handle sees
+    /// the SAME parked state — parking is engine-scoped (the pump sets
+    /// it on Finished{LimitReached}), never per-handle (review round-1
+    /// F1/F3).
+    pub async fn session(&self, id: &SessionId) -> Option<AgentSession> {
+        let agent = *self.inner.sessions.lock().await.get(id)?;
+        Some(AgentSession {
+            id: *id,
+            agent,
+            inner: self.inner.clone(),
+            bus: self.bus.clone(),
         })
     }
 
@@ -277,6 +291,7 @@ async fn start_inner(
         sessions: Mutex::new(HashMap::new()),
         pending_approvals: Mutex::new(HashMap::new()),
         pending_questions: Mutex::new(HashMap::new()),
+        parked: Mutex::new(HashSet::new()),
     });
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
 

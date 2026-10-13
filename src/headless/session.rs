@@ -9,7 +9,7 @@
 //! approval/question maps) lives here — the session's moving parts in
 //! one place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
@@ -38,6 +38,12 @@ pub(crate) struct EngineInner {
     pub(crate) pending_approvals: Mutex<HashMap<String, oneshot::Sender<Approval>>>,
     /// Question responders by question id.
     pub(crate) pending_questions: Mutex<HashMap<String, oneshot::Sender<UserAnswer>>>,
+    /// Parked sessions (G7, §5.9.7): agents whose Finished{LimitReached}
+    /// the pump saw — every later Prompt errors `session_parked`.
+    /// Engine-scoped, not per-handle (review round-1 F3): the pump is
+    /// the single writer, so the raw send()/events() surface and any
+    /// re-acquired handle see the same state.
+    pub(crate) parked: Mutex<HashSet<AgentId>>,
 }
 
 /// §5.3 :350-354 — the constant answer a zero-subscriber question gets
@@ -60,9 +66,26 @@ pub(crate) async fn pump_task(
         // notifications, dead-agent removal).
         match &event {
             AgentEvent::Started => inner.host.bookkeeping.on_started(agent).await,
-            AgentEvent::Finished { .. } => {
+            AgentEvent::Finished { reason } => {
+                // G7 (§5.9.7): a limit hit parks the session — the pump
+                // observes EVERY Finished, so parking is engine-scoped
+                // (the raw send surface + re-acquired handles see it;
+                // review round-1 F3).
+                if matches!(
+                    reason,
+                    crate::provider::FinishReason::LimitReached { .. }
+                ) {
+                    inner.parked.lock().await.insert(agent);
+                }
                 inner.host.bookkeeping.on_turn_ended(agent, true).await
             }
+            // Review round-1 F4: the console's final-error arm — a
+            // non-retrying Error ends the turn's work with success=false
+            // (a later bookkeeping Finished, if any, mirrors the
+            // console's own second call).
+            AgentEvent::Error {
+                retrying: false, ..
+            } => inner.host.bookkeeping.on_turn_ended(agent, false).await,
             AgentEvent::Exited => inner.host.bookkeeping.on_exited(agent).await,
             _ => {}
         }
@@ -111,9 +134,6 @@ pub struct AgentSession {
     pub(crate) agent: AgentId,
     pub(crate) inner: Arc<EngineInner>,
     pub(crate) bus: broadcast::Sender<SessionEvent>,
-    /// G7 (§5.9.7): set when a Finished{LimitReached} is observed — a
-    /// parked session rejects every later prompt with `session_parked`.
-    pub(crate) parked: std::sync::atomic::AtomicBool,
 }
 
 impl AgentSession {
@@ -139,9 +159,10 @@ impl AgentSession {
                 self.id
             )));
         }
-        // G7 (§5.9.7): a parked session (a limit was hit) takes no more
-        // prompts — the spec's "parks the session".
-        if self.parked.load(std::sync::atomic::Ordering::SeqCst)
+        // G7 (§5.9.7): a parked session (a limit was hit — the pump set
+        // it engine-scoped on Finished{LimitReached}) takes no more
+        // prompts; the check rides ANY handle (review round-1 F3).
+        if self.inner.parked.lock().await.contains(&self.agent)
             && matches!(command, SessionCommand::Prompt { .. })
         {
             return Err(EngineError::session_parked(
@@ -174,9 +195,9 @@ impl AgentSession {
                 let responder = self.inner.pending_approvals.lock().await.remove(&request_id);
                 match responder {
                     Some(responder) => responder.send(decision).map_err(|_| {
-                        EngineError::session_closed("the approval already resolved")
+                        EngineError::unknown_request("the approval already resolved")
                     }),
-                    None => Err(EngineError::session_closed(format!(
+                    None => Err(EngineError::unknown_request(format!(
                         "no pending approval '{request_id}'"
                     ))),
                 }
@@ -188,9 +209,9 @@ impl AgentSession {
                 let responder = self.inner.pending_questions.lock().await.remove(&question_id);
                 match responder {
                     Some(responder) => responder.send(answer).map_err(|_| {
-                        EngineError::session_closed("the question already resolved")
+                        EngineError::unknown_request("the question already resolved")
                     }),
-                    None => Err(EngineError::session_closed(format!(
+                    None => Err(EngineError::unknown_request(format!(
                         "no pending question '{question_id}'"
                     ))),
                 }
@@ -297,12 +318,17 @@ impl AgentSession {
     /// turn finishes (§5.3 :322 — §7 row 10: the final text; the stream
     /// shows Started … Finished in order).
     pub async fn run_to_completion(&self, prompt: &str) -> Result<TurnOutcome, EngineError> {
+        // Subscribe BEFORE the send (review round-1 F2): a Finished
+        // landing between the send and a later subscribe would never be
+        // seen and the loop below would block forever — the
+        // wall-clock-immediate shape (Finished at the first request
+        // head, zero provider work) makes that window real.
+        let mut rx = self.events();
         self.send(SessionCommand::Prompt {
             text: prompt.to_string(),
             images: vec![],
         })
         .await?;
-        let mut rx = self.events();
         let mut final_text = String::new();
         loop {
             match rx.recv().await {
@@ -317,15 +343,7 @@ impl AgentSession {
                             final_text.push_str(&text)
                         }
                         SerializableAgentEvent::Finished { reason } => {
-                            // G7 (§5.9.7): a limit hit parks the session —
-                            // later prompts error `session_parked`.
-                            if matches!(
-                                reason,
-                                crate::provider::FinishReason::LimitReached { .. }
-                            ) {
-                                self.parked
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
+                            // (Parking is engine-scoped — the pump set it.)
                             return Ok(TurnOutcome {
                                 final_text,
                                 finish_reason: Some(reason),

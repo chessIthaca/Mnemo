@@ -552,3 +552,41 @@ Amendment (2027-01-15, step 3a.5 — the landed D5+D9 picks):
   typed but UNENFORCED (3b's spend accounting); idle_ms + the
   BudgetConfig-default interplay = 3b; the app-side JS binding surface
   = job 4; the review round closes this job (the master tick follows).
+### Review round 1 (job 3a) — FINDINGS (0 high, 7 low) → ALL RESOLVED — 2027-01-17
+
+Report: .coding/reviews/2026-10-13-job-3a-engine-review.md (base ffff73b;
+ all 8 risk-focus items traced CLEAN — the limiter Send safety, the G5
+ contract fidelity, layering, serde tolerance, the export timeout, the
+ free-gate containment). Dispositions:
+- F1 Engine::session() MISSING from the D4 surface list → LANDED now,
+  not deferred: `pub async fn session(&self, id: &SessionId) ->
+  Option<AgentSession>` (async — the registry is a tokio Mutex; the
+  §5.3 :299 sketch's sync signature is indicative). Correct by
+  construction WITH F3's move.
+- F2 run_to_completion subscribed AFTER sending (a lost Finished in the
+  window hangs the call; the wall-clock-immediate shape makes it real)
+  → FIXED: `events()` is created before `send(..)`.
+- F3 the parked flag was per-handle + maintained ONLY by
+  run_to_completion (the raw send()/events() surface never parked) →
+  FIXED: the flag moved into EngineInner (Mutex<HashSet<AgentId>>), the
+  PUMP is the single writer (it observes every Finished), send()
+  consults it on ANY handle; run_to_completion's local store dropped.
+  Asserted: the raw-surface + re-acquired-handle checks extend
+  limits_max_turns_parks_the_session.
+- F4 the pump missed the console's final-Error arm → MIRRORED:
+  AgentEvent::Error{retrying:false} → on_turn_ended(agent, false) (a
+  later bookkeeping Finished mirrors the console's second call).
+- F5 Approve/Answer on an unknown/already-resolved id reported
+  session_closed (misusing the frozen stable wire contract) → FIXED:
+  EngineError::unknown_request + the four fallback sites (None arms +
+  send-error arms). Asserted: unknown_approval_errors_unknown_request_
+  not_closed.
+- F6 the seed_messages block indent (runtime.rs :227-231) → FIXED
+  (8-space alignment with the block).
+- F7 README/PLAN.md don't yet mention mnemo::headless → DEFERRED BY
+  DESIGN (the reviewer concurs): the module-doc exposure rides 3c's
+  completed public surface (README section + PLAN.md provider-strategy
+  note); job 5's final acceptance verifies. Recorded here so it is
+  lost nowhere.
+- Battery after the fixes: kernel 3006+45, features 3033+45,
+  workspace + build green; clippy zero NEW sites in the fix hunks.

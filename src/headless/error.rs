@@ -86,6 +86,16 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// The request id is unknown or already resolved (review round-1
+    /// F5): an Approve/Answer naming it cannot be honored — the session
+    /// itself is LIVE (never read this as closed).
+    pub(crate) fn unknown_request(message: impl Into<String>) -> Self {
+        Self {
+            code: "unknown_request".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

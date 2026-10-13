@@ -1,0 +1,22 @@
+{
+  "configured_model": null,
+  "counts": {
+    "episodic": 2,
+    "procedural": 4,
+    "semantic": 3,
+    "total": 10,
+    "working": 1
+  },
+  "dim": 384,
+  "fingerprint_matches": true,
+  "fingerprints": [
+    [
+      "hash",
+      384
+    ]
+  ],
+  "model_id": "hash",
+  "status": {
+    "ok": true
+  }
+}

@@ -10,13 +10,20 @@
 //!
 //! Nothing here reads stdin, writes stdout, or touches a Tauri handle.
 
+pub mod codegraph_api;
 pub mod engine;
 pub mod error;
+pub mod memory_api;
 pub mod session;
 pub mod types;
 
+pub use codegraph_api::{CodegraphApi, CodegraphGraph, CodegraphStatus};
 pub use engine::{Engine, EngineBuilder};
 pub use error::EngineError;
+pub use memory_api::{
+    MemoryApi, MemoryCounts, MemoryDebugOverview, MemoryDebugWire, MemoryIndexStatus,
+    ScoredMemoryDebugWire,
+};
 pub use session::AgentSession;
 pub use types::{
     EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,

@@ -32,7 +32,14 @@ use crate::ipc::settings::{BudgetWire, RoutingWire};
 
 use crate::ipc::agent::{ActiveSkillInfo, AgentInfo, PlanAncestorInfo, WorkflowStateInfo};
 use crate::ipc::backlog_cmds::{BacklogChangedPayload, BacklogItemView, RunAllProgress};
-use crate::ipc::codegraph_cmds::{CodegraphGraph, CodegraphStatus};
+use mnemo::headless::{
+    CodegraphGraph, CodegraphStatus, MemoryCounts, MemoryDebugOverview, MemoryDebugWire,
+    MemoryIndexStatus, ScoredMemoryDebugWire,
+};
+use mnemo::memory::{
+    CacheEfficiency, ModelBreakdown, ProjectStats, SavingsDayBreakdown, SavingsKindBreakdown,
+    SavingsStats, SessionStats,
+};
 use crate::ipc::settings::{
     GetSettingsContext, GetSettingsGeneral, GetSettingsResponse, GetSettingsSteeringNotes,
     GetSettingsUi, LayaWire, ModelsConfigWire, ProjectWire, SaveEndpointsResponse,
@@ -405,4 +412,141 @@ fn normalize_lf_converts_crlf_and_keeps_lf() {
     // A lone \r (classic-Mac line ending) is left alone — only CRLF pairs
     // are normalized.
     assert_eq!(normalize_lf("a\rb"), "a\rb");
+}
+/// Row 19 (master-spec §7 :838-840): the stats + memory + code-graph IPC
+/// surfaces stay BYTE-IDENTICAL across the 3b.2 rewire (job-03b step
+/// file §C D2): the memory-debug + codegraph wire types move into the
+/// kernel lib (mnemo::headless) and the IPC commands become thin
+/// callers — these fixtures are the pins. The get_{savings,session,
+/// project}_stats commands are thin serde reads of the KERNEL-owned
+/// stats DTOs (untouched by the rewire); their samples below pin those
+/// shapes too. The codegraph DTOs are also pinned by
+/// `dto_fixtures_match_serde` — re-asserted here for the row-19 name.
+#[test]
+fn stats_memory_codegraph_ipc_unchanged() {
+    let mut generated: Vec<String> = Vec::new();
+
+    // ── the memory-debug wire types (3b.2 moves them into mnemo) ──────
+    let wire = MemoryDebugWire {
+        id: "m-1".into(),
+        tier: "working".into(),
+        title: "T".into(),
+        content: "hello".into(),
+        strength: 0.5,
+        access_count: 2,
+        created_at: 100,
+        last_accessed_at: 200,
+        source_session_ids: vec!["s-1".into()],
+        data: serde_json::json!({"k": "v"}),
+    };
+    assert_fixture("dto-memory-debug-wire", &wire, &mut generated);
+    let scored = ScoredMemoryDebugWire {
+        memory: wire,
+        score: 0.75,
+    };
+    assert_fixture("dto-scored-memory-wire", &scored, &mut generated);
+    let counts = MemoryCounts {
+        working: 1,
+        episodic: 2,
+        semantic: 3,
+        procedural: 4,
+        total: 10,
+    };
+    assert_fixture("dto-memory-counts", &counts, &mut generated);
+    let overview = MemoryDebugOverview {
+        status: serde_json::json!({"ok": true}),
+        model_id: "hash".into(),
+        dim: 384,
+        configured_model: None,
+        fingerprints: vec![("hash".into(), 384)],
+        fingerprint_matches: true,
+        counts,
+    };
+    assert_fixture("dto-memory-debug-overview", &overview, &mut generated);
+
+    // ── the stats DTOs behind get_{savings,session,project}_stats ────
+    let savings = SavingsStats {
+        saved_tokens_total: 1200,
+        event_count: 3,
+        per_kind: vec![SavingsKindBreakdown {
+            kind: "compaction".into(),
+            event_count: 2,
+            saved_tokens: 800,
+        }],
+        per_day: vec![SavingsDayBreakdown {
+            day: 20_000,
+            event_count: 2,
+            saved_tokens: 800,
+        }],
+        recent: Vec::new(),
+        cache: CacheEfficiency {
+            prompt_tokens: 1000,
+            cached_tokens: 400,
+            cached_not_null_requests: 2,
+            request_count: 3,
+        },
+    };
+    assert_fixture("dto-savings-stats", &savings, &mut generated);
+    let session = SessionStats {
+        session_id: "s-1".into(),
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        reasoning_tokens: 10,
+        cached_tokens: 60,
+        ttft_ms_total: 300,
+        generation_ms_total: 2000,
+        timed_requests: 2,
+        request_count: 3,
+        per_model: vec![ModelBreakdown {
+            model: "gpt-5".into(),
+            endpoint: Some("openai".into()),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            reasoning_tokens: 10,
+            cached_tokens: 60,
+            ttft_ms_total: 300,
+            generation_ms_total: 2000,
+            timed_requests: 2,
+            request_count: 3,
+        }],
+        created_at: 100,
+        ended_at: Some(200),
+    };
+    assert_fixture("dto-session-stats", &session, &mut generated);
+    let project = ProjectStats {
+        prompt_tokens: 1000,
+        completion_tokens: 500,
+        reasoning_tokens: 100,
+        cached_tokens: 600,
+        request_count: 3,
+        ..Default::default()
+    };
+    assert_fixture("dto-project-stats", &project, &mut generated);
+
+    // ── the derived-index status behind memory_index_status ────────
+    let index_status = MemoryIndexStatus {
+        authored_count: 12,
+        derived_count: 34,
+        last_built_at: Some(1_700_000_000),
+    };
+    assert_fixture("dto-memory-index-status", &index_status, &mut generated);
+
+    // ── the code-graph wire types — re-pinned by the row-19 test too ─
+    let codegraph_status = CodegraphStatus {
+        available: true,
+        indexing: false,
+        files: 120,
+        symbols: 3400,
+        edges: 8900,
+        last_indexed_at: Some(1_700_000_000),
+    };
+    assert_fixture("dto-codegraph-status", &codegraph_status, &mut generated);
+
+    if !generated.is_empty() {
+        panic!(
+            "newly generated {} fixture(s) — review for sanity and re-run to assert them:\n{}",
+            generated.len(),
+            generated.join("\n")
+        );
+    }
 }

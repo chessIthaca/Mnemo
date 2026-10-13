@@ -1,0 +1,17 @@
+{
+  "access_count": 2,
+  "content": "hello",
+  "created_at": 100,
+  "data": {
+    "k": "v"
+  },
+  "id": "m-1",
+  "last_accessed_at": 200,
+  "score": 0.75,
+  "source_session_ids": [
+    "s-1"
+  ],
+  "strength": 0.5,
+  "tier": "working",
+  "title": "T"
+}

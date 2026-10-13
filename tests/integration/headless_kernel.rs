@@ -597,3 +597,79 @@ async fn memory_disabled_consumes_no_store() {
     );
     engine.shutdown().await.expect("engine shuts down");
 }
+// --- 3b.2: D2 (the §5.6 data-API fixtures) ---
+
+/// §5.6 row 17 (canonical): `memory: false` (MemoryBackend::Disabled)
+/// means no store — `Engine::memory()` errors code `memory_disabled` —
+/// and `index_codegraph: false` means `Engine::codegraph()` reports the
+/// unavailable shape (no graph was opened, no watcher started).
+#[tokio::test]
+async fn memory_disabled_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["ok"])]);
+    let mut options = opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    options.memory = MemoryBackend::Disabled;
+    options.index_codegraph = false;
+    let engine = Engine::builder(options)
+        .provider(llm)
+        .start()
+        .await
+        .expect("engine starts");
+    let err = match engine.memory() {
+        Err(err) => err,
+        Ok(_) => panic!("a Disabled engine errors"),
+    };
+    assert_eq!(err.code(), "memory_disabled");
+    let status = engine.codegraph().status().await.expect("status reads");
+    assert!(
+        !status.available,
+        "index_codegraph: false reports unavailable"
+    );
+    engine.shutdown().await.expect("engine shuts down");
+}
+
+/// §5.6 row 17: a FREE agent can call `memory_search` and the code-graph
+/// tool — the 2c free gate already allows them; this pins it end-to-end
+/// through the engine (the scripted mock drives both dispatches, then
+/// the text final). The post-turn transcript proves both tools really
+/// executed (their tool_use entries rode the conversation).
+#[tokio::test]
+async fn free_agent_uses_memory_and_codegraph_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    // The store + graph DBs need their parent dir to open cleanly.
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![
+        g5_tool_turn("memory_search", r#"{"query": "how does recall rank"}"#),
+        g5_tool_turn("graph_search", r#"{"query": "Engine"}"#),
+        g5_text_turn(&["done"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm)
+    .start()
+    .await
+    .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let outcome = session
+        .run_to_completion("search memory and the graph")
+        .await
+        .expect("turn completes");
+    assert_eq!(outcome.final_text, "done");
+    // Both dispatches rode the conversation — the transcript carries
+    // their tool_use entries.
+    let transcript = session.history().await.expect("history export");
+    let json = serde_json::to_string(&transcript).unwrap_or_default();
+    assert!(
+        json.contains("memory_search"),
+        "the free agent dispatched memory_search"
+    );
+    assert!(
+        json.contains("graph_search"),
+        "the free agent dispatched graph_search"
+    );
+    engine.shutdown().await.expect("engine shuts down");
+}

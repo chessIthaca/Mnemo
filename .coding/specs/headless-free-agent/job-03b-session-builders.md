@@ -71,3 +71,58 @@ Job 3a closed the engine + session surface (review PASS at c38e7b2; master 7/11)
 - Battery: kernel 3006+46, features 3033+46, workspace + build green;
   clippy zero NEW sites in own hunks (brain.rs:116 BrainOutcome stays
   the documented pre-existing).
+### 3b.2 (D2) — MemoryApi + CodegraphApi + the IPC rewire — landed 2027-01-18
+
+- The row-19 pins captured FIRST via the app's EXISTING golden-fixture
+  system (contract_fixtures.rs → frontend/src/lib/ipc-fixtures/) — NOT a
+  new inline-literal test file: my first attempt clobbered the committed
+  ipc/contract_fixtures.rs + duplicated its mod registration (E0428) —
+  RECOVERED via git restore, then added the §9-named test
+  `stats_memory_codegraph_ipc_unchanged` INTO the existing machinery
+  (assert_fixture two-pass: capture → assert). New pins:
+  dto-memory-debug-wire, dto-scored-memory-wire, dto-memory-counts,
+  dto-memory-debug-overview, dto-savings-stats, dto-session-stats,
+  dto-project-stats, dto-memory-index-status (+ the codegraph shapes
+  re-asserted, already pinned by dto_fixtures_match_serde).
+- src/headless/memory_api.rs: the 4 debug wire types + MemoryIndexStatus
+  + to_wire + memory_counts moved VERBATIM; MemoryApi::from_parts
+  (store Option, embedder_status, configured_model) with overview/list/
+  search/resolve_link/backlinks/access_log/index_status + the maintenance
+  trio as delegates (cleanup/rebuild_search to mnemo::memory::
+  maintenance; rebuild_index to indexer::rebuild_derived — its report
+  type is IndexReport). Fidelity fixes en route: list is FOUR-TIER when
+  unfiltered (per-tier limit, matching the IPC), backlinks degrades to
+  Ok(empty) on no-store, access_log is sync (Vec return).
+- src/headless/codegraph_api.rs: CodegraphStatus (from_parts/unavailable
+  now pub) + CodegraphGraph moved; CodegraphApi::status (Result,
+  blocking-pool stats + the indexing flag) / progress
+  (startup_index_snapshot → Option<(usize, usize)>) / refresh (the sync
+  flag-set F1 contract preserved, tokio spawn) / rebuild (awaited full
+  pass) / query (slice; None graph → Ok(empty), unknown from_symbol →
+  empty).
+- Engine accessors: `_brain` renamed `brain` (memory_store + embedder_
+  status + factory.codegraph_handle() read); Engine gains
+  `configured_embedding_model` (resolved in start_inner BEFORE wire_brain
+  consumes the config, the hash-sentinel filter applied);
+  Engine::memory() errors code `memory_disabled` (error.rs constructor)
+  on a Disabled store; Engine::codegraph() → the unavailable shape.
+- The IPC rewire: memory_debug.rs is now thin (a pub(crate) memory_api
+  helper + forward); codegraph_cmds.rs lost the type defs +
+  stats_via_blocking/log_refresh (status/refresh/graph forward through
+  the API; the unavailable-refresh/graph error-on-None stays IPC-side);
+  memory_maintenance's memory_index_status forwards (its type def
+  deleted; the trio commands stay as-is — already thin over
+  mnemo::memory::maintenance); contract_fixtures imports from
+  mnemo::headless.
+- Tests: memory_disabled_errors + free_agent_uses_memory_and_codegraph_
+  tools (headless_kernel.rs, both canonical) — the free-agent test
+  scripts g5_tool_turn("memory_search") + g5_tool_turn("graph_search")
+  + a text final, then asserts both tool_use entries rode the transcript
+  (session.history()); .coding is created so the store/graph open.
+- In-flight fixes: Error::msg → the thiserror variants (Error::Memory/
+  Error::Runtime with to_string); Option<Arc<Concrete>>→Option<Arc<dyn>>
+  map-cast; the backlinks Result-vs-IntoIter E0631 (the un-unwrapped
+  backlinks_for Result); expect_err needed Debug (restructured with
+  match); stats()/refresh() Result-threaded like the IPC.
+- Battery: kernel 3006+48, features 3033+48, workspace (3033+48+331+app
+  tests), build green; clippy ZERO findings in all seven 3b.2 hunks.

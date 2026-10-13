@@ -23,6 +23,8 @@ use crate::headless::session::{pump_task, AgentSession, EngineInner};
 use crate::headless::types::{
     EngineOptions, EventReceiver, HostEvent, SessionEvent, SessionId, SpawnOptions,
 };
+use crate::headless::codegraph_api::CodegraphApi;
+use crate::headless::memory_api::MemoryApi;
 use crate::host::brain::{wire_brain, Brain, BrainMemoryOptions};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
 use crate::host::runtime::{spawn_agent_shared, HostRuntime};
@@ -47,8 +49,9 @@ impl HostNotifier for BusNotifier {
 /// session event pump, started from explicit options.
 pub struct Engine {
     /// The brain, held for the engine's lifetime so its Drop-managed
-    /// pieces (the CodeGraph file watcher) stay alive.
-    _brain: Brain,
+    /// pieces (the CodeGraph file watcher) stay alive — and read by
+    /// `memory()`/`codegraph()` (3b.2 D2) for the store + graph handles.
+    brain: Brain,
     /// The shared state (host core + session registry + responder maps).
     inner: Arc<EngineInner>,
     /// The session event bus — `AgentSession::events()` subscribes.
@@ -58,6 +61,10 @@ pub struct Engine {
     /// The default permission policy for spawned sessions (§5.4); a
     /// `SpawnOptions::permissions` overrides it per session.
     default_permissions: PermissionPolicy,
+    /// The CONFIGURED embedding model (`bundled_embedding_model`, the
+    /// "hash" sentinel mapped to None) — the memory overview's line
+    /// (3b.2 D2).
+    configured_embedding_model: Option<String>,
     /// The event pump task — `shutdown` aborts it.
     pump: tokio::task::JoinHandle<()>,
     /// The runtime this engine owns when started via
@@ -201,6 +208,30 @@ impl Engine {
         Ok(())
     }
 
+    /// §5.6's memory data API — the debug/read + maintenance surface,
+    /// ONE implementation shared with the app's IPC commands. Errors
+    /// code `memory_disabled` when `EngineOptions.memory` was
+    /// `Disabled` (no store: no recall, no consolidation, no capture).
+    pub fn memory(&self) -> Result<MemoryApi, EngineError> {
+        let store = self
+            .brain
+            .memory_store
+            .clone()
+            .ok_or_else(EngineError::memory_disabled)?;
+        Ok(MemoryApi::from_parts(
+            Some(store),
+            self.brain.embedder_status.clone(),
+            self.configured_embedding_model.clone(),
+        ))
+    }
+
+    /// §5.6's code-graph data API — status, refresh, rebuild, query. An
+    /// `index_codegraph: false` engine gets the unavailable shape (no
+    /// graph was opened, no watcher started).
+    pub fn codegraph(&self) -> CodegraphApi {
+        CodegraphApi::from_parts(self.brain.factory.codegraph_handle())
+    }
+
     /// Start from a plain (non-async) context — the engine owns a static
     /// tokio runtime, so it works from a plain `fn main` (§7 row 15).
     pub fn start_blocking(opts: EngineOptions) -> Result<Engine, EngineError> {
@@ -248,6 +279,17 @@ async fn start_inner(
             config_dir.display()
         ))
     })?;
+
+    // 3b.2 (D2): the memory overview's configured-model line — resolved
+    // BEFORE wire_brain consumes the config. The "hash" sentinel
+    // (keyword-only opt-out) is not a real model id — map it to None
+    // (the same filter the IPC overview applies).
+    let configured_embedding_model = config
+        .general
+        .general
+        .bundled_embedding_model
+        .clone()
+        .filter(|m| !m.eq_ignore_ascii_case(crate::config::EMBEDDING_MODEL_SENTINEL_HASH));
 
     // The host-events bus: the engine ALWAYS has one.
     let (host_events_tx, _) = broadcast::channel(256);
@@ -316,11 +358,12 @@ async fn start_inner(
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
 
     Ok(Engine {
-        _brain: brain,
+        brain,
         inner,
         bus,
         host_events_tx,
         default_permissions: opts.permissions,
+        configured_embedding_model,
         pump,
         _owned_runtime: None,
     })

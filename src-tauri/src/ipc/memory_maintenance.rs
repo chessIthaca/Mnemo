@@ -24,6 +24,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
+use mnemo::headless::MemoryIndexStatus;
 use mnemo::memory::consolidation::corpus_digest;
 use mnemo::memory::maintenance::{self, MaintenancePhase};
 use mnemo::memory::MemoryStore;
@@ -425,36 +426,17 @@ pub async fn memory_rebuild_index(
     Ok(())
 }
 
-/// The derived-index status behind the Settings → Memory card: record counts
-/// by class + the last index-run timestamp.
-#[derive(Debug, Clone, Serialize)]
-pub struct MemoryIndexStatus {
-    /// Authored (agent/user-written) memory count.
-    pub authored_count: usize,
-    /// Derived (indexer-built digest) memory count.
-    pub derived_count: usize,
-    /// Unix seconds of the most recent index run; `None` when never indexed.
-    pub last_built_at: Option<i64>,
-}
-
 /// Read the derived-index status — the Settings → Memory card loads it on
-/// open and re-reads it after a rebuild completes.
+/// open and re-reads it after a rebuild completes. 3b.2 (D2): the logic
+/// lives in `mnemo::headless::MemoryApi::index_status` — ONE implementation
+/// shared with `Engine::memory()`; the wire type moved to the lib verbatim
+/// (pinned by the row-19 contract fixtures).
 #[tauri::command]
 pub async fn memory_index_status(
     state: State<'_, IpcState>,
 ) -> Result<MemoryIndexStatus, IpcError> {
-    let store = state
-        .runtime
-        .memory_store
-        .clone()
-        .ok_or_else(|| IpcError::msg("memory store unavailable"))?;
-    let (authored_count, derived_count) = store.count_by_class().await?;
-    let last_built_at = store.index_state_last_built().await?;
-    Ok(MemoryIndexStatus {
-        authored_count,
-        derived_count,
-        last_built_at,
-    })
+    let api = crate::ipc::memory_debug::memory_api(&state, None);
+    Ok(api.index_status().await?)
 }
 
 #[cfg(test)]

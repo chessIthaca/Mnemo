@@ -37,10 +37,8 @@
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use mnemo::codegraph::extract::Symbol;
-use mnemo::codegraph::query::{GraphSliceFilter, GraphView};
-use mnemo::codegraph::store::EdgeRow;
-use mnemo::codegraph::{CodeGraph, IndexStats};
+use mnemo::codegraph::CodeGraph;
+use mnemo::headless::{CodegraphApi, CodegraphGraph, CodegraphStatus};
 
 use crate::ipc::error::IpcError;
 use crate::ipc::memory_maintenance::{should_forward_progress, PROGRESS_EVERY};
@@ -55,63 +53,6 @@ use mnemo::host::index_progress::{
 };
 use crate::ipc::state::IpcState;
 
-/// The Graph tab's status line: is the graph available, how big is it, and
-/// is an indexing pass running right now.
-#[derive(Debug, Clone, Serialize)]
-pub struct CodegraphStatus {
-    /// False when codegraph is disabled (`[general] codegraph = false`),
-    /// the DB failed to open, or the brain failed to build — the tab shows
-    /// an "unavailable" state instead of empty counts.
-    pub available: bool,
-    /// True while an indexing pass is running (startup or a refresh).
-    pub indexing: bool,
-    /// Number of indexed files — every searchable file (source + content-only
-    /// rows), 0 when unavailable.
-    pub files: usize,
-    /// Number of stored symbols (0 when unavailable).
-    pub symbols: usize,
-    /// Number of stored edges (0 when unavailable).
-    pub edges: usize,
-    /// Unix seconds of the most recent `indexed_at`, if any file is indexed.
-    pub last_indexed_at: Option<i64>,
-}
-
-impl CodegraphStatus {
-    /// The `available: false` shape (counts zeroed, not indexing).
-    fn unavailable() -> Self {
-        Self {
-            available: false,
-            indexing: false,
-            files: 0,
-            symbols: 0,
-            edges: 0,
-            last_indexed_at: None,
-        }
-    }
-
-    /// Build the live shape from the graph's stats + indexing flag.
-    fn from_parts(stats: mnemo::codegraph::store::GraphStats, indexing: bool) -> Self {
-        Self {
-            available: true,
-            indexing,
-            files: stats.files,
-            symbols: stats.symbols,
-            edges: stats.edges,
-            last_indexed_at: stats.last_indexed_at,
-        }
-    }
-}
-
-/// A visualization subgraph: the selected nodes plus every edge whose both
-/// endpoints are among them.
-#[derive(Debug, Clone, Serialize)]
-pub struct CodegraphGraph {
-    /// The selected symbols, id-sorted.
-    pub nodes: Vec<Symbol>,
-    /// Edges between the selected symbols only.
-    pub edges: Vec<EdgeRow>,
-}
-
 /// The graph handle from IPC state: `None` when the brain failed to build
 /// (no factory) or codegraph is disabled/unavailable (no handle on the
 /// factory).
@@ -119,24 +60,14 @@ fn graph_handle(state: &IpcState) -> Option<std::sync::Arc<CodeGraph>> {
     state.runtime.factory.as_ref()?.codegraph_handle()
 }
 
-/// Read the graph's stats on the blocking pool (the SQLite lock is sync).
-async fn stats_via_blocking(graph: std::sync::Arc<CodeGraph>) -> Result<CodegraphStatus, IpcError> {
-    let indexing = graph.is_indexing();
-    let stats = tokio::task::spawn_blocking(move || graph.stats())
-        .await
-        .map_err(|e| format!("codegraph stats task failed: {e}"))?
-        .map_err(IpcError::from)?;
-    Ok(CodegraphStatus::from_parts(stats, indexing))
-}
-
 /// The Graph tab's status: availability, counts, and the indexing flag.
 /// Never errors — an unavailable graph reports `available: false`.
+/// 3b.2 (D2): the logic lives in `mnemo::headless::CodegraphApi::status`
+/// — ONE implementation shared with `Engine::codegraph()`.
 #[tauri::command]
 pub async fn codegraph_status(state: State<'_, IpcState>) -> Result<CodegraphStatus, IpcError> {
-    let Some(graph) = graph_handle(&state) else {
-        return Ok(CodegraphStatus::unavailable());
-    };
-    Ok(stats_via_blocking(graph).await?)
+    let api = CodegraphApi::from_parts(graph_handle(&state));
+    Ok(api.status().await?)
 }
 
 /// Trigger a background re-index of the graph. Idempotent: when a pass is
@@ -150,38 +81,17 @@ pub async fn codegraph_status(state: State<'_, IpcState>) -> Result<CodegraphSta
 /// is unavailable.
 #[tauri::command]
 pub async fn codegraph_refresh(state: State<'_, IpcState>) -> Result<CodegraphStatus, IpcError> {
+    // The unavailable graph still ERRORS on an explicit refresh request —
+    // checked here before the API takes over (the API's own `refresh`
+    // degrades a `None` graph to the unavailable shape instead).
     let graph = graph_handle(&state)
         .ok_or_else(|| IpcError::msg("codegraph unavailable (disabled or failed to open)"))?;
-    // A pass is already running — don't stack a second one (the store writes
-    // would serialize safely, but the parse work would be duplicated).
-    if graph.is_indexing() {
-        return Ok(stats_via_blocking(graph).await?);
-    }
-    // Set the flag before spawning so the status we return (and the tab's
-    // poller) deterministically sees the scheduled pass (review F1: the old
-    // code raced the spawned task's entry).
-    graph.set_indexing(true);
-    let runner = graph.clone();
-    // index() owns the indexing flag (set on entry, cleared by a drop guard
-    // on every exit path); the parse itself is CPU + disk bound → blocking
-    // pool, mirroring the startup pass in main.rs.
-    tauri::async_runtime::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || runner.index(None)).await;
-        match result {
-            Ok(Ok(stats)) => log_refresh(&stats),
-            Ok(Err(e)) => eprintln!("codegraph: refresh failed: {e}"),
-            Err(e) => eprintln!("codegraph: refresh task panicked: {e}"),
-        }
-    });
-    Ok(stats_via_blocking(graph).await?)
-}
-
-/// Log a successful refresh pass (kept out of the command body for clarity).
-fn log_refresh(stats: &IndexStats) {
-    eprintln!(
-        "codegraph: refreshed — {} files scanned, {} re-parsed, {} symbols, {} edges in {}ms",
-        stats.files_scanned, stats.files_reindexed, stats.symbols, stats.edges, stats.elapsed_ms
-    );
+    // 3b.2 (D2): the schedule logic — the already-running guard, the SYNC
+    // flag-set before the spawn (review F1: the returned status must
+    // deterministically report the scheduled pass), the spawn + the
+    // scheduled status — lives in `CodegraphApi::refresh`.
+    let api = CodegraphApi::from_parts(Some(graph));
+    Ok(api.refresh().await?)
 }
 
 /// A visualization subgraph. With no filters: the top
@@ -191,6 +101,8 @@ fn log_refresh(stats: &IndexStats) {
 /// nodes. With `from_symbol` (+ optional `depth`, default 1): that symbol's
 /// both-directions neighborhood — a stale/unknown id yields an EMPTY graph
 /// (not an error), so the tab survives a re-index racing a click.
+/// 3b.2 (D2): the slice logic (blocking-pool snapshot + selection) lives
+/// in `CodegraphApi::query`.
 #[tauri::command]
 pub async fn codegraph_graph(
     state: State<'_, IpcState>,
@@ -201,30 +113,15 @@ pub async fn codegraph_graph(
 ) -> Result<CodegraphGraph, IpcError> {
     let graph = graph_handle(&state)
         .ok_or_else(|| IpcError::msg("codegraph unavailable (disabled or failed to open)"))?;
-    // Snapshot + slice on the blocking pool (sync SQLite lock + O(nodes)
-    // selection — never on a tokio worker). The owned filter strings move
-    // into the closure (spawn_blocking requires 'static); the borrowed
-    // `GraphSliceFilter` is constructed inside.
-    let slice = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let filter = GraphSliceFilter {
-            name: name.as_deref(),
-            kind: kind.as_deref(),
-            from_symbol: from_symbol.as_deref(),
+    let api = CodegraphApi::from_parts(Some(graph));
+    Ok(api
+        .query(
+            name.as_deref(),
+            kind.as_deref(),
+            from_symbol.as_deref(),
             depth,
-        };
-        let view: GraphView = graph.view().map_err(|e| e.to_string())?;
-        Ok(view.slice(&filter))
-    })
-    .await
-    .map_err(|e| format!("codegraph graph task failed: {e}"))??;
-    // Unknown `from_symbol` (slice → None) yields an EMPTY graph, not an
-    // error — a re-index can retire the clicked node between render and
-    // click, and the tab must survive that.
-    let slice = slice.unwrap_or_default();
-    Ok(CodegraphGraph {
-        nodes: slice.nodes,
-        edges: slice.edges,
-    })
+        )
+        .await?)
 }
 
 // ── Settings → Memory & Search: code-index rebuild ──────────────────────────

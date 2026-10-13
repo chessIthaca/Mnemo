@@ -1,0 +1,13 @@
+{
+  "cached_tokens": 600,
+  "completion_tokens": 500,
+  "generation_ms_total": 0,
+  "per_day": [],
+  "per_model": [],
+  "prompt_tokens": 1000,
+  "reasoning_tokens": 100,
+  "request_count": 3,
+  "session_count": 0,
+  "timed_requests": 0,
+  "ttft_ms_total": 0
+}

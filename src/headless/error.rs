@@ -68,6 +68,15 @@ impl EngineError {
         }
     }
 
+    /// The engine runs with `MemoryBackend::Disabled` — there is no memory
+    /// store to talk to (§5.6, row 17; 3b.2 D2).
+    pub(crate) fn memory_disabled() -> Self {
+        Self {
+            code: "memory_disabled".to_string(),
+            message: "memory is disabled (MemoryBackend::Disabled)".to_string(),
+        }
+    }
+
     /// The history export is mid-flight — the turn holds the conversation
     /// while a tool blocks (a pending approval/question); retry between
     /// turns (3a.6, G5).

@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use mnemo::config::{global_config_dir, Config, SafetyMode};
 use mnemo::app::project::Project;
 use mnemo::provider::trace::LlmRequestLog;
-use mnemo::runtime::AgentManager;
+use mnemo::AgentManager;
 use mnemo::tool::agent::sandbox::Sandbox;
 use tauri::{Emitter, Manager, PhysicalPosition, WebviewBuilder, WebviewUrl, WindowBuilder};
 
@@ -29,8 +29,8 @@ mod webview_udf;
 use ipc::IpcState;
 use ipc::PendingApprovals;
 use ipc::PendingQuestions;
-pub(crate) use mnemo::host::brain::{build_brain, Brain, BrainOutcome};
-use mnemo::host::notifier::{HostEvent, HostNotifier};
+pub(crate) use mnemo::brain::{build_brain, Brain, BrainOutcome};
+use mnemo::notifier::{HostEvent, HostNotifier};
 
 /// Read just the `enable_browser_inspection` flag from `config.toml`, without
 /// loading the full [`Config`] (which reads four files). Used at the very top
@@ -518,7 +518,7 @@ fn main() {
                             Some(skills),
                         ),
                     );
-                    let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> =
+                    let factory_dyn: Arc<dyn mnemo::AgentPolicyFactory> =
                         policy_factory.clone();
                     brain.factory.set_policy_factory(factory_dyn);
 

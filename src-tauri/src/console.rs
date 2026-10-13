@@ -30,13 +30,12 @@ use std::sync::Arc;
 
 use mnemo::config::Config;
 use mnemo::provider::trace::LlmRequestLog;
-use mnemo::runtime::channels::{AgentEvent, Approval, QuestionOption, UserAnswer};
-use mnemo::runtime::{
-    AgentCommand, AgentId,
+use mnemo::{
+    AgentCommand, AgentEvent, AgentId, Approval, QuestionOption, UserAnswer,
 };
 use mnemo::tool::ToolResult;
 
-use mnemo::host::runtime::HostRuntime;
+use mnemo::headless::HostRuntime;
 #[cfg(test)]
 use mnemo::runtime::ParentAwareSpawner;
 
@@ -1213,7 +1212,7 @@ pub(crate) async fn run_console() -> i32 {
         brain.factory.reviews_dir(),
         Some(skills),
     ));
-    let factory_dyn: Arc<dyn mnemo::agent::policy::AgentPolicyFactory> = policy_factory.clone();
+    let factory_dyn: Arc<dyn mnemo::AgentPolicyFactory> = policy_factory.clone();
     brain.factory.set_policy_factory(factory_dyn);
     let laya_cfg = brain.config.lock().await.general.general.laya.clone();
     let (laya, pending_laya_start) = crate::attach_laya(&brain, &laya_cfg);

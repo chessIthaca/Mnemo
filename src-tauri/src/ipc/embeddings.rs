@@ -5,7 +5,7 @@
 //! Bundled embedding model commands — the Tauri glue. Job 4 D6 moved
 //! the download/load core (the progress poller, the blocking model
 //! build, the install guard + swap) into the lib at
-//! `mnemo::host::embed_download`; what stays here is the command
+//! `mnemo::embed_download`; what stays here is the command
 //! surface (the catalog wire, the Settings download command) and the
 //! startup twins the app's hook consumes — each building the app's
 //! `embedder://status` sink over the shared status Arc.
@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
-use mnemo::host::embed_download::{
+use mnemo::embed_download::{
     embedding_model_catalog, spawn_download, spawn_startup_load_task, DownloadOutcome,
     EmbedderStatusSink,
 };

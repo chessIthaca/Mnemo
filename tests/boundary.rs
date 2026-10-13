@@ -69,7 +69,6 @@ fn kernel_builds_without_app_feature() {
 /// fact 5) are D4's worklist; D4's commit drops this attribute and the
 /// scan enforces the boundary from then on.
 #[test]
-#[ignore = "D4 greens this — the §B fact 5 worklist routes to the public surface"]
 fn tauri_uses_only_public_api() {
     let mut sources = Vec::new();
     app_sources(Path::new("src-tauri/src"), &mut sources);

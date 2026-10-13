@@ -12,13 +12,13 @@
 //! takes effect without a restart.
 //!
 //! Job 4 D4 (§5.8 :538): the vision + embedder + live-toggle core MOVED
-//! into the lib (`mnemo::host::rewire`) — the GUI and the headless
+//! into the lib (`mnemo::rewire`) — the GUI and the headless
 //! `Setup::patch_settings` share ONE implementation. This wrapper keeps
 //! only the app-owned pieces: the managed-classifier leg (the Laya
 //! runtime — job 4 D5 moves it), the re-embed spawn policy, and the
 //! `classifier://status` emit.
 
-use mnemo::host::rewire::{rewire_vision_embedder, RewireTargets};
+use mnemo::rewire::{rewire_vision_embedder, RewireTargets};
 use tauri::Emitter;
 
 use crate::ipc::state::IpcState;
@@ -149,5 +149,5 @@ pub(super) fn rewire_vision_embedder_and_classifier(
 /// (startup-error fallback). Shared by `save_settings` and `save_endpoints`;
 /// the core lives in the lib (job 4 D4).
 pub(super) fn sync_model_resolver(state: &IpcState, cfg: &mnemo::config::Config) {
-    mnemo::host::rewire::sync_model_resolver(state.runtime.model_resolver.as_ref(), cfg);
+    mnemo::rewire::sync_model_resolver(state.runtime.model_resolver.as_ref(), cfg);
 }

@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 use tauri::{Emitter, State};
 
-use mnemo::runtime::channels::AgentCommand;
+use mnemo::AgentCommand;
 
 use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_prompt_dispatched;

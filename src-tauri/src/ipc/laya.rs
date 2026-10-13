@@ -5,7 +5,7 @@
 //! The managed-Laya IPC layer — the commands + the Tauri glue. Job 4 D5
 //! (§5.1 :168) moved the Tauri-free core (the manager, the setup
 //! pipeline, the server lifecycle — all of it unit-tested there) into
-//! the lib at `mnemo::host::laya`. What stays here is exactly the
+//! the lib at `mnemo::laya`. What stays here is exactly the
 //! app-side surface: the `classifier://status` forwarding sink, the
 //! wrappers that keep the `Option<AppHandle>` signatures the app's
 //! callers (the startup hook, the console fallback, the fine-tune
@@ -23,7 +23,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use mnemo::config::Config;
-use mnemo::host::laya::StatusSink;
+use mnemo::laya::StatusSink;
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};
 
 use crate::ipc::state::IpcState;
@@ -32,7 +32,7 @@ use crate::ipc::state::IpcState;
 // the server lifecycle. Re-exported so the app's callers keep their
 // `crate::ipc::laya::…` paths (IpcState's field type, the startup hook,
 // the fine-tune hot-swap, the Settings rewire).
-pub use mnemo::host::laya::{
+pub use mnemo::laya::{
     build_managed_classifier, checkpoint_catalog, english_checkpoint, fresh_disabled,
     hide_console_window, LayaCheckpoint, LayaManager,
 };
@@ -60,7 +60,7 @@ pub async fn start_managed_server(
     port: u16,
 ) -> Option<u16> {
     let sink = status_sink(app);
-    mnemo::host::laya::start_managed_server(&sink, manager, checkpoint, port).await
+    mnemo::laya::start_managed_server(&sink, manager, checkpoint, port).await
 }
 
 /// Start (or restart) the managed `laya-serve` serving `models` — the
@@ -74,7 +74,7 @@ pub(super) async fn start_server_models(
     progress: Option<&LayaCheckpoint>,
 ) -> Option<u16> {
     let sink = status_sink(app);
-    mnemo::host::laya::start_server_models(&sink, manager, models, port, progress).await
+    mnemo::laya::start_server_models(&sink, manager, models, port, progress).await
 }
 
 /// Fire-and-forget setup (Settings → Classifier → Download) — the lib
@@ -88,7 +88,7 @@ pub fn spawn_setup_task(
     classifier_slot: Option<Arc<RwLock<Option<Arc<dyn Classifier>>>>>,
 ) {
     let sink = status_sink(&app);
-    mnemo::host::laya::spawn_setup_task(sink, manager, checkpoint, config, classifier_slot);
+    mnemo::laya::spawn_setup_task(sink, manager, checkpoint, config, classifier_slot);
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ pub async fn laya_setup(app: AppHandle, state: State<'_, IpcState>) -> Result<()
     }
     // The autostart decision is re-derived from the LIVE config when the
     // (multi-minute) setup finishes — the core re-reads it at completion
-    // (see `mnemo::host::laya::spawn_setup_task`) — so no snapshot rides
+    // (see `mnemo::laya::spawn_setup_task`) — so no snapshot rides
     // along from download start.
     spawn_setup_task(
         Some(app),

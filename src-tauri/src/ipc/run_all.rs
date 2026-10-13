@@ -229,9 +229,7 @@ use std::sync::atomic::Ordering;
 
 use tauri::Manager;
 
-use mnemo::runtime::channels::{
-    AgentCommand, SerializableAgentEvent, UNATTENDED_PROMPT_PREFIX,
-};
+use mnemo::{AgentCommand, SerializableAgentEvent, UNATTENDED_PROMPT_PREFIX};
 use mnemo::app::workflow::{PlanFile, Workflow, WorkflowState};
 
 use crate::ipc::backlog_cmds::{dispatch_next_impl, emit_backlog_changed};
@@ -573,7 +571,7 @@ fn plan_open_note(main_state: Option<String>) -> String {
         // is NOT rolled back.
         Some(ws) => format!(
             "plan loop did not close (workflow: {}) — item left in_flight; work kept in tree; run waits for the plan to close (the next turn resolution re-checks)",
-            mnemo::agent::workflow_handle::capitalize_token(&ws)
+            mnemo::capitalize_token(&ws)
         ),
         // The workflow state could not be verified — never mark Done on an
         // unverifiable closure, never destroy possibly-good work.
@@ -598,7 +596,7 @@ pub(crate) async fn main_agent_workflow_state(state: &IpcState) -> Option<String
 /// main agent's).
 pub(crate) async fn agent_workflow_state(
     state: &IpcState,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> Option<String> {
     let agent_loops = state.runtime.agent_loops.lock().await;
     let agent_loop = agent_loops.get(&agent_id)?;
@@ -747,7 +745,7 @@ mod tests {
         // bug-fixing slot's model + effort.
         let bug = resolver
             .resolve(mnemo::model_resolver::ModelContext {
-                route: mnemo::agent::policy::RouteKey {
+                route: mnemo::RouteKey {
                     slots: vec!["bug_fixing".into(), "executing".into()],
                 },
                 is_subagent: false,
@@ -760,7 +758,7 @@ mod tests {
         // A dispatched FEATURE item: implementation plan → the executing slot.
         let feature = resolver
             .resolve(mnemo::model_resolver::ModelContext {
-                route: mnemo::agent::policy::RouteKey {
+                route: mnemo::RouteKey {
                     slots: vec!["executing".into()],
                 },
                 is_subagent: false,
@@ -3779,7 +3777,7 @@ fn should_between_items_compact(
 ) -> bool {
     match usage {
         Some((used, max)) if max > 0 => {
-            let threshold = mnemo::agent::context::ContextManager::effective_summarize_threshold(
+            let threshold = mnemo::ContextManager::effective_summarize_threshold(
                 max as usize,
                 fill_rate,
                 ceiling,
@@ -4696,7 +4694,7 @@ async fn land_spawned_branch(
 /// same cleanup the forwarder's `Exited` arm performs (dropping the handle
 /// closes the agent's inbox; its `Exited` event then runs the idempotent
 /// remainder of that arm).
-async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::runtime::AgentId) {
+async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::AgentId) {
     state.runtime.manager.lock().await.remove(agent_id);
     state.runtime.agent_loops.lock().await.remove(&agent_id);
 }
@@ -4729,7 +4727,7 @@ fn lanes_in_flight(r: &crate::ipc::state::RunAllState) -> bool {
 }
 
 /// Remove a spawned run entry from the run state (plan ffd7a86f).
-async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::runtime::AgentId) {
+async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::AgentId) {
     let guard = state.backlog.run_all.lock().await;
     if let Some(r) = guard.as_ref() {
         r.spawned
@@ -4743,7 +4741,7 @@ async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::runtime::AgentId)
 /// event forwarder's routing check (cheap: one run-state lock + scan).
 pub(crate) async fn owns_spawned_run(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> bool {
     let state = app.state::<IpcState>();
     let guard = state.backlog.run_all.lock().await;
@@ -4791,7 +4789,7 @@ pub(crate) async fn owns_spawned_run(
 /// eligible remains).
 pub async fn on_spawned_turn_resolved(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
     success: bool,
     error: Option<String>,
     loop_evidence: bool,
@@ -5301,7 +5299,7 @@ pub async fn on_spawned_turn_resolved(
 /// explains). No-op when the agent owns no spawned run.
 pub(crate) async fn drain_spawned_on_exit(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) {
     let state = app.state::<IpcState>();
     // Find + take THIS agent's spawned run.
@@ -5468,7 +5466,7 @@ pub(crate) async fn drain_spawned_on_exit(
 /// agent owns no spawned run.
 pub(crate) async fn stamp_spawned_in_flight(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
     top_plan_id: Option<&str>,
 ) {
     let state = app.state::<IpcState>();
@@ -6740,7 +6738,7 @@ pub(crate) async fn orphan_work_landed_at(
 /// worktree's top-level plans dir (which only the main agent uses).
 fn spawned_plans_dir(
     worktree: &std::path::Path,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> std::path::PathBuf {
     worktree
         .join(".coding")
@@ -6891,7 +6889,7 @@ pub(crate) async fn main_agent_top_plan_id(state: &IpcState) -> Option<String> {
 /// sibling of [`main_agent_top_plan_id`] for spawned run-all agents).
 pub(crate) async fn agent_top_plan_id(
     state: &IpcState,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> Option<String> {
     let agent_loops = state.runtime.agent_loops.lock().await;
     let agent_loop = agent_loops.get(&agent_id)?;

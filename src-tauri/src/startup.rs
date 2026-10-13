@@ -12,7 +12,7 @@
 #[cfg(test)]
 use mnemo::config::{Config, Endpoint};
 
-pub(crate) use mnemo::host::startup::resolve_startup_provider;
+pub(crate) use mnemo::startup::resolve_startup_provider;
 #[cfg(test)]
 use mnemo::host::startup::{project_flag_from_args, should_reembed_at_startup};
 

@@ -43,7 +43,7 @@ use mnemo::headless::{CodegraphApi, CodegraphGraph, CodegraphStatus};
 use crate::ipc::error::IpcError;
 use crate::ipc::memory_maintenance::{should_forward_progress, PROGRESS_EVERY};
 
-pub(crate) use mnemo::host::index_progress::{
+pub(crate) use mnemo::index_progress::{
     startup_index_snapshot, IndexProgressEvent, INDEX_PROGRESS_CHANNEL,
 };
 #[cfg(test)]

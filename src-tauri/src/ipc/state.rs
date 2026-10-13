@@ -19,11 +19,11 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
-use mnemo::agent::factory::AgentLoopFactory;
+use mnemo::AgentLoopFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::memory::MemoryStore;
 use mnemo::app::project::Project;
-use mnemo::runtime::{AgentId, AgentManager};
+use mnemo::{AgentId, AgentManager};
 use mnemo::safety_rules::SafetyRules;
 use mnemo::tool::agent::sandbox::Sandbox;
 
@@ -88,7 +88,7 @@ pub struct IpcState {
     /// `None` only in tests that construct `IpcState` directly.
     pub watchdog: Option<Arc<crate::watchdog::Watchdog>>,
 }
-pub(crate) use mnemo::host::runtime::AgentLoopMap;
+pub(crate) use mnemo::headless::AgentLoopMap;
 
 
 /// The agent-runtime slice of [`IpcState`].

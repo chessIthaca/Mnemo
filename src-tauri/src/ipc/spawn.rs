@@ -13,14 +13,14 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use mnemo::agent::factory::AgentLoopFactory;
-use mnemo::runtime::channels::AgentId;
-use mnemo::runtime::{AgentManager, AgentSpawner, ParentAwareSpawner};
+use mnemo::AgentLoopFactory;
+use mnemo::AgentId;
+use mnemo::{AgentManager, AgentSpawner, ParentAwareSpawner};
 
 use crate::ipc::agent::AgentInfo;
 use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_prompt_dispatched;
-pub(crate) use mnemo::host::runtime::{spawn_agent_shared, WorktreeBinding};
+pub(crate) use mnemo::headless::{spawn_agent_shared, WorktreeBinding};
 use crate::ipc::state::IpcState;
 
 /// Spawn a new agent with the given name.
@@ -240,7 +240,7 @@ impl AgentSpawner for IpcSpawner {
         name: &str,
         task: &str,
         role: Option<String>,
-        permission: mnemo::agent::policy::PermissionPolicy,
+        permission: mnemo::PermissionPolicy,
     ) -> Result<AgentId, String> {
         // The plain spawn path has no parent and no forced model — delegate to
         // spawn_with_parent with both as None.
@@ -274,7 +274,7 @@ impl ParentAwareSpawner for IpcSpawner {
         // SpawnOptions (a free parent's OverridePermissions reaches the
         // child there); today's children are factory-built, which wires
         // ApproveViaApi.
-        _permission: mnemo::agent::policy::PermissionPolicy,
+        _permission: mnemo::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
             self.factory.clone(),
@@ -308,14 +308,14 @@ impl ParentAwareSpawner for IpcSpawner {
 }
 
 #[async_trait::async_trait]
-impl mnemo::runtime::DescendantTracker for IpcSpawner {
+impl mnemo::DescendantTracker for IpcSpawner {
     /// Whether the agent with `agent_id` has any running spawned descendants.
     ///
     /// Delegates to [`AgentManager::has_running_descendants`] (which walks the
     /// `parent_id` chain so a grandchild counts too). The manager lock is held
     /// only for the duration of the (synchronous) walk, then released — no
     /// await is performed while holding it.
-    async fn has_running_descendants(&self, agent_id: mnemo::runtime::AgentId) -> bool {
+    async fn has_running_descendants(&self, agent_id: mnemo::AgentId) -> bool {
         let mgr = self.manager.lock().await;
         mgr.has_running_descendants(agent_id)
     }

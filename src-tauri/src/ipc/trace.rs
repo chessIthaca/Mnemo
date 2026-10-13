@@ -130,9 +130,9 @@ pub async fn set_trace_logging(state: State<'_, IpcState>, enabled: bool) -> Res
 #[tauri::command]
 pub fn get_steering_stats(
     state: State<'_, IpcState>,
-) -> Result<mnemo::agent::steering_stats::SteeringStatsSnapshot, IpcError> {
+) -> Result<mnemo::SteeringStatsSnapshot, IpcError> {
     Ok(match state.runtime.factory.as_ref() {
         Some(factory) => factory.steering().snapshot(),
-        None => mnemo::agent::steering_stats::SteeringStats::new().snapshot(),
+        None => mnemo::SteeringStats::new().snapshot(),
     })
 }

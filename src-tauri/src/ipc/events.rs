@@ -40,15 +40,15 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use mnemo::runtime::channels::SerializableAgentEvent;
-use mnemo::runtime::turn_resolve::{
+use mnemo::SerializableAgentEvent;
+use mnemo::turn_resolve::{
     completion_suggestion_text, reviewer_failure_suggestion_text, workflow_transition_counts,
     ResolveAction, TurnResolveLatch,
 };
-use mnemo::runtime::{AgentCommand, AgentEvent, AgentId, AgentManager, SerializedEvent};
+use mnemo::{AgentCommand, AgentEvent, AgentId, AgentManager, SerializedEvent};
 
 use crate::ipc::approval::PendingApprovals;
-pub(crate) use mnemo::host::runtime::cleanup_inactive_subagents;
+pub(crate) use mnemo::headless::cleanup_inactive_subagents;
 use crate::ipc::state::IpcState;
 
 /// The Tauri event channel name for agent events.
@@ -71,7 +71,7 @@ fn watchdog_note(agent_id: AgentId, event: &SerializableAgentEvent) -> Option<St
             // capitalized) — the event FIELD itself is the serde shape.
             format!(
                 "agent{agent_id} workflow → {}",
-                mnemo::agent::workflow_handle::capitalize_token(state)
+                mnemo::capitalize_token(state)
             )
         }
         SerializableAgentEvent::ApprovalRequest { tool_name, .. } => {
@@ -1487,7 +1487,7 @@ async fn try_flush_deferred_spawned_resolutions(
     turn_resolve: &mut TurnResolveLatch,
 ) {
     let state = app.state::<IpcState>();
-    let lanes: Vec<mnemo::runtime::AgentId> = {
+        let lanes: Vec<mnemo::AgentId> = {
         let guard = state.backlog.run_all.lock().await;
         guard.as_ref().map_or(Vec::new(), |r| {
             r.spawned

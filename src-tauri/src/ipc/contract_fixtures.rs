@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use mnemo::config::{OptimizerConfig, SafetyMode};
-use mnemo::runtime::channels::{QuestionOption, SerializableAgentEvent};
+use mnemo::{QuestionOption, SerializableAgentEvent};
 use mnemo::app::workflow::plan_file::PlanFile;
 use mnemo::app::workflow::WorkflowState;
 

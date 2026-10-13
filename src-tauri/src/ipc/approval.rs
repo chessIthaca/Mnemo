@@ -24,9 +24,9 @@ use std::sync::Mutex;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use mnemo::agent::approval::needs_approval;
+use mnemo::needs_approval;
 use mnemo::config::SafetyMode;
-use mnemo::runtime::{AgentId, Approval};
+use mnemo::{AgentId, Approval};
 use mnemo::tool::agent::sandbox::Sandbox;
 use mnemo::tool::SafetyLevel;
 

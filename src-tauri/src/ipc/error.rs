@@ -56,8 +56,8 @@ impl From<&str> for IpcError {
     }
 }
 
-impl From<mnemo::host::maintenance::MaintenanceBusy> for IpcError {
-    fn from(e: mnemo::host::maintenance::MaintenanceBusy) -> Self {
+impl From<mnemo::maintenance::MaintenanceBusy> for IpcError {
+    fn from(e: mnemo::maintenance::MaintenanceBusy) -> Self {
         IpcError::msg(e.message)
     }
 }

@@ -16,7 +16,7 @@ use tauri::State;
 
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
-use mnemo::runtime::AgentId;
+use mnemo::AgentId;
 
 use crate::ipc::agent::AgentInfo;
 use crate::ipc::backlog_cmds::{resolve_item_view, BacklogItemView};

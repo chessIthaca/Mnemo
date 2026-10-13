@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::State;
 
-use mnemo::runtime::channels::{AgentCommand, AgentId, SerializableAgentEvent};
+use mnemo::{AgentCommand, AgentId, SerializableAgentEvent};
 use mnemo::app::workflow::{PlanFile, WorkflowState};
 
 use crate::ipc::error::IpcError;
@@ -26,7 +26,7 @@ use crate::ipc::state::{IpcState, UserIntervention};
 /// IPC reads the rich surface app→app — the legal direction. The kernel
 /// never names the app type; the bin side may.
 pub(crate) fn workflow_concrete(
-    handle: &std::sync::Arc<dyn mnemo::agent::workflow_handle::AgentWorkflowHandle>,
+    handle: &std::sync::Arc<dyn mnemo::AgentWorkflowHandle>,
 ) -> std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>> {
     handle
         .as_any_arc()
@@ -312,7 +312,7 @@ pub async fn send_suggestion(
     send_cmd(
         &state,
         agent_id,
-        AgentCommand::Suggestion(mnemo::runtime::SteerPayload { text, images }),
+        AgentCommand::Suggestion(mnemo::SteerPayload { text, images }),
         "send suggestion",
     )
     .await
@@ -413,7 +413,7 @@ pub async fn clear_conversation(
 pub async fn approve(
     state: State<'_, IpcState>,
     tool_call_id: String,
-    approval: mnemo::runtime::Approval,
+    approval: mnemo::Approval,
 ) -> Result<bool, IpcError> {
     Ok(state.approvals.resolve(&tool_call_id, approval))
 }
@@ -429,7 +429,7 @@ pub async fn approve(
 pub async fn answer_question(
     state: State<'_, IpcState>,
     question_id: String,
-    answer: mnemo::runtime::UserAnswer,
+    answer: mnemo::UserAnswer,
 ) -> Result<bool, IpcError> {
     Ok(state.questions.resolve(&question_id, answer))
 }

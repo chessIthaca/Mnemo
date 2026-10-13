@@ -34,7 +34,7 @@ use mnemo::provider::LlmClient;
 use crate::ipc::error::IpcError;
 use crate::ipc::state::IpcState;
 
-pub(crate) use mnemo::host::maintenance::{
+pub(crate) use mnemo::maintenance::{
     claim_busy, should_forward_progress, BusyGuard, PROGRESS_EVERY, RECONCILE_CHANNEL,
 };
 

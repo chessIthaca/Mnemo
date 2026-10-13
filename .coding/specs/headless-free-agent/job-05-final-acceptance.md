@@ -285,3 +285,45 @@ host modules (`pub use crate::host::{laya, embed_download, rewire, ...}`
 as the public API). Type list first, then file-by-file rewrites
 (console.rs last — biggest); drop the `#[ignore]` on
 `tauri_uses_only_public_api` in the FINAL D4 commit; battery per chunk.
+
+### 5.4 D4 — the src-tauri public-API route (landed 2026-10-13)
+
+- **The facade** (two files): src/lib.rs root re-exports — TYPES
+  (`needs_approval`, `ContextManager`, `AgentLoopFactory`,
+  `{read_rows, training_log_path, FailureLogRow}`,
+  `{AgentPolicyFactory, PermissionPolicy, RouteKey}`,
+  `{SteeringStats, SteeringStatsSnapshot}`,
+  `{capitalize_token, AgentWorkflowHandle}`, channels
+  `{AgentCommand, AgentEvent, AgentId, Approval, QuestionOption,
+  SerializableAgentEvent, UNATTENDED_PROMPT_PREFIX, UserAnswer}`,
+  runtime `{AgentManager, AgentSpawner, DescendantTracker,
+  ParentAwareSpawner, SerializedEvent, SteerPayload}`) + MODULES
+  (`laya`, `embed_download`, `rewire`, `maintenance`, `index_progress`,
+  `brain`, `notifier`, `startup`, `turn_resolve` — the deeply-consumed
+  host/runtime slices, one name deep); src/headless/mod.rs gains the
+  host::runtime seams (`HostRuntime`, `AgentLoopMap`,
+  `spawn_agent_shared`, `WorktreeBinding`, `cleanup_inactive_subagents`).
+  Types only — no blanket re-exports; the block doc names the contract.
+- **The rewrites**: 19 src-tauri files (ipc/{agent, approval,
+  backlog_cmds, codegraph_cmds, config_io, contract_fixtures,
+  embeddings, error, events, files, finetune, laya, memory_maintenance,
+  questions, rewire, run_all, spawn, startup, state, trace}.rs +
+  main.rs + console.rs) — imports to bare `mnemo::`/`mnemo::headless::`
+  paths, inline qualified paths swapped, doc mentions swept where the
+  token crossed them. `mnemo::app::*`/`mnemo::config::*`/
+  `mnemo::memory::*`/`mnemo::provider::*`/`mnemo::tool::*` untouched
+  (never banned).
+- **The scan is the worklist** (three tooling lessons, all paid for):
+  (1) the original 100-match search TRUNCATED — trace.rs, main.rs, and
+  src-tauri/startup.rs (steering_stats, brain/notifier/startup
+  imports, a second AgentPolicyFactory site) surfaced only when the
+  un-ignored scan ran; (2) `count` OVERRIDES `replace_all` in the edit
+  tools — `count: 1` replaced exactly one occurrence, `count: 0` was a
+  no-op, and multi_edit REJECTS multi-match anchors without an explicit
+  count — the bad batches cost two extra scan rounds; (3) the scan
+  reports line numbers in STRIPPED coordinates (post-#[cfg(test)]-
+  removal), not raw file coords — reconcile before anchoring.
+- **Proofs**: `cargo test --test boundary` — 2 passed, 0 ignored (the
+  `#[ignore]` DROPPED in this commit — the boundary ENFORCES from
+  d7ff39e's tree forward); battery `cargo test --workspace` exit 0
+  (83 integration; the app crate compiles every rewritten path).

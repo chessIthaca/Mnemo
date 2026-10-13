@@ -41,6 +41,41 @@ pub mod tool;
 pub mod webview_args;
 pub mod workspace;
 
+// The app-integration seam (job 5 D4, §5.9.10 :750-753): the public
+// surface the mnemo app consumes, re-exported so the app crate (and
+// any second consumer) reaches it on BARE `mnemo::` paths — never
+// through the kernel module tree. `tests/boundary.rs::
+// tauri_uses_only_public_api` enforces the app side; this block is the
+// lib side of the same contract. Types only — no blanket re-exports;
+// add deliberately, with the consumer named.
+pub use crate::agent::approval::needs_approval;
+pub use crate::agent::context::ContextManager;
+pub use crate::agent::factory::AgentLoopFactory;
+pub use crate::agent::failure_triage::{read_rows, training_log_path, FailureLogRow};
+pub use crate::agent::policy::{AgentPolicyFactory, PermissionPolicy, RouteKey};
+pub use crate::agent::steering_stats::{SteeringStats, SteeringStatsSnapshot};
+pub use crate::agent::workflow_handle::{capitalize_token, AgentWorkflowHandle};
+pub use crate::runtime::channels::{
+    AgentCommand, AgentEvent, AgentId, Approval, QuestionOption, SerializableAgentEvent,
+    UNATTENDED_PROMPT_PREFIX, UserAnswer,
+};
+pub use crate::runtime::{
+    AgentManager, AgentSpawner, DescendantTracker, ParentAwareSpawner, SerializedEvent,
+    SteerPayload,
+};
+// Deeply-consumed host/runtime modules — the app's ipc layer names
+// many symbols in each; module re-exports keep the imports one name
+// deep (`mnemo::laya::…`, `mnemo::embed_download::…`, …).
+pub use crate::host::embed_download;
+pub use crate::host::index_progress;
+pub use crate::host::laya;
+pub use crate::host::maintenance;
+pub use crate::host::rewire;
+pub use crate::host::brain;
+pub use crate::host::notifier;
+pub use crate::host::startup;
+pub use crate::runtime::turn_resolve;
+
 #[cfg(test)]
 mod boundary {
     use std::fs;

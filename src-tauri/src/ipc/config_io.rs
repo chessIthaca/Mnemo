@@ -14,15 +14,15 @@
 
 use std::sync::Arc;
 
-use mnemo::agent::context::ContextManager;
-use mnemo::agent::factory::AgentLoopFactory;
+use mnemo::ContextManager;
+use mnemo::AgentLoopFactory;
 use mnemo::config::{Config, Endpoint};
 use mnemo::provider::client_factory::{build_client, provider_kind};
 use mnemo::provider::policy::reasoning_effort_off_wire_value;
 use mnemo::provider::trace::LlmRequestLog;
 use mnemo::provider::LlmClient;
-use mnemo::runtime::channels::SerializableAgentEvent;
-use mnemo::runtime::AgentId;
+use mnemo::SerializableAgentEvent;
+use mnemo::AgentId;
 use tauri::{AppHandle, State};
 
 use crate::ipc::error::IpcError;

@@ -43,6 +43,14 @@ pub use session::AgentSession;
 pub use crate::config::keys::{KeySource, Secret};
 pub use crate::config::mcp::McpServerWire;
 pub use crate::host::brain::SharedResources;
+/// Job 5 D4 (§5.9.10 :750-753): the host-runtime integration seams
+/// the app's wiring consumes (IpcState's loop map, the shared spawn
+/// path, the console runtime, the subagent sweep) — bare headless
+/// paths on the app side.
+pub use crate::host::runtime::{
+    cleanup_inactive_subagents, spawn_agent_shared, AgentLoopMap, HostRuntime,
+    WorktreeBinding,
+};
 pub use setup::{
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,
     InitProjectOptions, McpTestResult, ProjectInfo, ProjectReadiness, SafetyRuleDto,

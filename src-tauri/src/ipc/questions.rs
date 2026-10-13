@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use tokio::sync::oneshot;
 
-use mnemo::runtime::{AgentId, UserAnswer};
+use mnemo::{AgentId, UserAnswer};
 
 /// A pending question awaiting the user's answer.
 #[derive(Debug)]

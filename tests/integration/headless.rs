@@ -100,6 +100,26 @@ fn public_types_serde_roundtrip() {
     roundtrip(&SessionEvent {
         agent: 7,
         event: SerializableAgentEvent::Started,
+        rates: None,
+    });
+
+    // 3b.5 (§5.7): a Usage event carries its derived rates — the wire
+    // pins both the numbers and the field name a binding reads.
+    roundtrip(&SessionEvent {
+        agent: 7,
+        event: SerializableAgentEvent::Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 40,
+            reasoning_tokens: 10,
+            cached_tokens: 800,
+            ttft_ms: Some(400),
+            generation_ms: Some(200),
+        },
+        rates: Some(mnemo::headless::UsageRates {
+            input_tok_per_s: Some(2500.0),
+            output_tok_per_s: Some(200.0),
+            cache_hit_ratio: 0.8,
+        }),
     });
 
     // The small types.

@@ -96,6 +96,15 @@ impl EngineError {
         }
     }
 
+    /// A stats read failed (§5.7, 3b.5) — the store errored on a stats
+    /// pull (`Engine::stats` / `stored_stats`).
+    pub(crate) fn stats_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "stats_failed".to_string(),
+            message: message.into(),
+        }
+    }
+
     /// The request id is unknown or already resolved (review round-1
     /// F5): an Approve/Answer naming it cannot be honored — the session
     /// itself is LIVE (never read this as closed).

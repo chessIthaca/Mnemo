@@ -739,3 +739,375 @@ async fn engine_start_emits_index_host_events() {
     );
     engine.shutdown().await.expect("engine shuts down");
 }
+// --- 3b.5: D5 — the stats pull + rates (§5.7 rows 17/18) ---
+
+/// A scripted provider whose `model()` name switches when a response
+/// carrying [`MODEL_SWITCH_MARKER`] is popped — the ModelChanged
+/// fixture (§5.7's serve seam announces each change; the scripted
+/// turns serve the seed name and stay silent, the compact's summarize
+/// reply carries the marker, and the next turn's serve announces
+/// EXACTLY one switch).
+struct StepModelLlm {
+    responses: std::sync::Mutex<VecDeque<Vec<LlmEvent>>>,
+    step: std::sync::atomic::AtomicUsize,
+    caps: Capabilities,
+}
+
+const MODEL_STEPS: [&str; 2] = ["m-seed", "m-switched"];
+
+/// The text marker that steps the mock's model name — one
+/// deterministic model switch at a scripted point (the compact's
+/// summarize reply carries it).
+const MODEL_SWITCH_MARKER: &str = "SWITCH-MODEL";
+
+impl StepModelLlm {
+    fn new(responses: Vec<Vec<LlmEvent>>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            step: std::sync::atomic::AtomicUsize::new(0),
+            caps: Capabilities::openai(),
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        MODEL_STEPS[self
+            .step
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .min(MODEL_STEPS.len() - 1)]
+    }
+}
+
+#[async_trait]
+impl LlmClient for StepModelLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        self.name()
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        let next = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default();
+        if next.iter().any(|ev| {
+            matches!(&ev, LlmEvent::TextDelta { text } if text.contains(MODEL_SWITCH_MARKER))
+        }) {
+            self.step
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(Box::pin(futures::stream::iter(next)))
+    }
+}
+
+/// One text turn carrying a usage report — the token/timing counts the
+/// Usage event (and its rates) carry.
+fn g5_usage(text: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::TextDelta { text: text.into() },
+        LlmEvent::Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 40,
+            reasoning_tokens: 10,
+            cached_tokens: 800,
+            ttft_ms: Some(400),
+            generation_ms: Some(200),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]
+}
+
+/// §5.7 row 18 (the rates half): a Usage event rides `events()` with
+/// its derived rates — the pump's computation, correct to the
+/// formulas the variant documents (input = prompt/ttft, output =
+/// completion/generation) plus the cache-hit ratio.
+#[tokio::test]
+async fn usage_rates_formula() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![g5_usage("ok")]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm)
+    .start()
+    .await
+    .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    let outcome = session
+        .run_to_completion("hi")
+        .await
+        .expect("the turn completes");
+    assert_eq!(outcome.final_text, "ok");
+    // Drain the bus — the Usage event (with its rates) is in there.
+    let mut usage = None;
+    while let Ok(Some(ev)) = rx.try_recv() {
+        if matches!(ev.event, SerializableAgentEvent::Usage { .. }) {
+            usage = Some(ev);
+        }
+    }
+    let ev = usage.expect("a Usage event rode events()");
+    let rates = ev.rates.expect("the Usage event carries its rates");
+    assert_eq!(rates.input_tok_per_s, Some(2500.0), "1000 tok / 0.4 s");
+    assert_eq!(rates.output_tok_per_s, Some(200.0), "40 tok / 0.2 s");
+    assert_eq!(rates.cache_hit_ratio, 0.8, "800 / 1000 cached");
+    engine.shutdown().await.expect("shutdown");
+}
+
+/// §5.7 row 18 (canonical): on a scripted provider with usage + one
+/// model switch + one output-compaction saving, `events()` carries
+/// Usage (with UsageRates correct to the formula), ModelChanged and
+/// Savings; `AgentSession::stats()` totals equal the sum of those
+/// events, and `Engine::stats().savings_stats.saved_tokens_total`
+/// includes the saving. The compact drives the survival checkpoint's
+/// savings lever (`compaction_survival` defaults on). The Spend half of
+/// the row is PLAN-GATED and pins SILENT here: the headless registry
+/// ships no plan tools (create_plan is app-layer), so every scripted
+/// turn is planless and clears the attribution — the Spend fan itself
+/// is covered by savings_and_spend_emitted_where_persisted (3b.4);
+/// wiring the plan tools into the headless factory (a later job) will
+/// let it script end-to-end.
+#[tokio::test]
+async fn stats_totals_match_events() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    // Four plain turns (the second carries the usage report) grow the
+    // transcript past the checkpoint's keep-recent window (6 messages)
+    // so the compact actually drops a region — that checkpoint lever
+    // is the compact's Savings row. The summarize reply carries the
+    // model-switch marker; the final turn's serve announces EXACTLY
+    // one ModelChanged.
+    let llm = StepModelLlm::new(vec![
+        g5_text_turn(&["answer"]),
+        g5_usage("second"),
+        g5_text_turn(&["third"]),
+        g5_text_turn(&["fourth"]),
+        g5_text_turn(&["summary SWITCH-MODEL"]),
+        g5_text_turn(&["done"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm)
+    .start()
+    .await
+    .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    let outcome = session
+        .run_to_completion("plan then answer")
+        .await
+        .expect("turn 1 completes");
+    assert_eq!(outcome.final_text, "answer");
+
+    // Turns 2-4 — the transcript must exceed the checkpoint's
+    // keep-recent window (6 messages) so the compact drops a region
+    // (the empty-region path records no Savings row). Turn 2 carries
+    // the usage report.
+    let outcome = session
+        .run_to_completion("second")
+        .await
+        .expect("turn 2 completes");
+    assert_eq!(outcome.final_text, "second");
+    let outcome = session
+        .run_to_completion("third")
+        .await
+        .expect("turn 3 completes");
+    assert_eq!(outcome.final_text, "third");
+    let outcome = session
+        .run_to_completion("fourth")
+        .await
+        .expect("turn 4 completes");
+    assert_eq!(outcome.final_text, "fourth");
+
+    // The output-compaction saving: Compact drives the checkpoint
+    // lever — wait for its Savings event (the command runs async in
+    // the task; the poll bounds the wait hermetically). The poll CONSUMES
+    // the bus, so it collects too — the drain later only sees what
+    // arrived after it.
+    let mut collected: Vec<SessionEvent> = Vec::new();
+    session
+        .send(SessionCommand::Compact)
+        .await
+        .expect("compact sends");
+    let mut saw_savings = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !saw_savings && std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            Ok(Ok(ev)) => {
+                if matches!(ev.event, SerializableAgentEvent::Savings { .. }) {
+                    saw_savings = true;
+                }
+                collected.push(ev);
+            }
+            Ok(Err(_)) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(saw_savings, "the compact's Savings event rode events()");
+
+    let outcome = session
+        .run_to_completion("done")
+        .await
+        .expect("turn 2 completes");
+    assert_eq!(outcome.final_text, "done");
+
+    // Drain the bus (one session, no spawned children — every event is
+    // this session's) + settle laps for any pump lag.
+    for _ in 0..20 {
+        while let Ok(Some(ev)) = rx.try_recv() {
+            collected.push(ev);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Derive the expected totals from the collected events (row 18:
+    // stats() equals the SUM of what events() carried).
+    let mut usage_events = Vec::new();
+    let mut model_changes = Vec::new();
+    let mut savings = Vec::new();
+    let mut spend_count = 0u64;
+    for ev in &collected {
+        match &ev.event {
+            SerializableAgentEvent::Usage { .. } => usage_events.push(ev),
+            SerializableAgentEvent::ModelChanged {
+                model,
+                reasoning_effort,
+                ..
+            } => model_changes.push((model.clone(), reasoning_effort.clone())),
+            SerializableAgentEvent::Savings {
+                lever, tokens_saved, ..
+            } => savings.push((lever.clone(), *tokens_saved)),
+            SerializableAgentEvent::Spend { .. } => spend_count += 1,
+            _ => {}
+        }
+    }
+    assert!(!usage_events.is_empty(), "the scripted usage rode events()");
+    assert!(!savings.is_empty(), "the compact's savings rode events()");
+    // The Spend ledger is PLAN-GATED and pins silent here (row 18's
+    // documented deviation): the headless registry ships no plan tools
+    // (create_plan is app-layer), so every scripted turn is planless
+    // and clears the attribution. The Spend fan itself is covered by
+    // savings_and_spend_emitted_where_persisted (3b.4).
+    assert_eq!(
+        spend_count, 0,
+        "a planless session never bills — the Spend fan needs a live plan"
+    );
+    assert_eq!(model_changes.len(), 1, "exactly one model switch announced");
+
+    // Rates on every Usage event — correct to the formula.
+    for ev in &usage_events {
+        let SerializableAgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            ttft_ms,
+            generation_ms,
+            ..
+        } = &ev.event
+        else {
+            unreachable!("matched Usage above")
+        };
+        assert_eq!(
+            ev.rates,
+            Some(mnemo::headless::UsageRates::from_usage(
+                *prompt_tokens,
+                *completion_tokens,
+                *cached_tokens,
+                *ttft_ms,
+                *generation_ms
+            )),
+            "the rates follow the documented formulas"
+        );
+    }
+
+    let mut prompt_sum = 0u64;
+    let mut completion_sum = 0u64;
+    let mut reasoning_sum = 0u64;
+    let mut cached_sum = 0u64;
+    for ev in &usage_events {
+        if let SerializableAgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            reasoning_tokens,
+            cached_tokens,
+            ..
+        } = &ev.event
+        {
+            prompt_sum += *prompt_tokens as u64;
+            completion_sum += *completion_tokens as u64;
+            reasoning_sum += *reasoning_tokens as u64;
+            cached_sum += *cached_tokens as u64;
+        }
+    }
+    let stats = session.stats();
+    assert_eq!(stats.requests, usage_events.len() as u64);
+    assert_eq!(stats.prompt_tokens, prompt_sum);
+    assert_eq!(stats.completion_tokens, completion_sum);
+    assert_eq!(stats.reasoning_tokens, reasoning_sum);
+    assert_eq!(stats.cached_tokens, cached_sum);
+    assert_eq!(stats.model_switches, 1);
+    assert_eq!(stats.current_model, Some(model_changes[0].0.clone()));
+    assert_eq!(stats.current_reasoning_effort, model_changes[0].1);
+    let mut expected_saved = std::collections::BTreeMap::new();
+    for (lever, saved) in &savings {
+        *expected_saved.entry(lever.clone()).or_insert(0i64) += *saved;
+    }
+    assert_eq!(
+        stats.saved_tokens_by_kind, expected_saved,
+        "saved tokens tally per lever"
+    );
+
+    // The durable session half: stored_stats() reads the loop's
+    // current session rows from the store (the same read the IPC's
+    // get_session_stats performs; poll-bounded — the row writes are
+    // fire-and-forget).
+    let mut stored_ok = false;
+    for _ in 0..100 {
+        match session.stored_stats().await {
+            Ok(stored) if stored.prompt_tokens as u64 >= prompt_sum => {
+                stored_ok = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => panic!("stored_stats() errored: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stored_ok, "stored_stats() reads the turn's durable rows");
+
+    // The engine pull: the durable savings ledger includes the compact's
+    // saving (the row write is fire-and-forget — poll bounded).
+    let saved_total: i64 = savings.iter().map(|(_, s)| *s).sum();
+    let mut included = false;
+    for _ in 0..100 {
+        let engine_stats = engine.stats().await.expect("the engine stats read");
+        if engine_stats.savings_stats.saved_tokens_total >= saved_total {
+            included = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        included,
+        "Engine::stats().savings_stats.saved_tokens_total includes the saving"
+    );
+    engine.shutdown().await.expect("engine shuts down");
+}

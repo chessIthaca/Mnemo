@@ -173,6 +173,13 @@ pub struct SessionEvent {
     pub agent: AgentId,
     /// The event body (today's `SerializableAgentEvent` JSON shape).
     pub event: SerializableAgentEvent,
+    /// The per-request derived rates (§5.7, 3b.5) — attached when
+    /// `event` is a Usage: input/output tok/s + the cache-hit ratio,
+    /// computed by the engine's pump (the runtime emits only the raw
+    /// counts). Absent on every other event, and omitted from the wire
+    /// when `None` (the pre-3b.5 JSON shape is unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rates: Option<crate::headless::stats::UsageRates>,
 }
 
 /// The receive error for [`EventReceiver::recv`] (§5.3 :341).

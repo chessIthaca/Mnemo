@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
 
 use crate::headless::error::EngineError;
+use crate::headless::stats::{SessionStats, UsageRates};
 use crate::headless::types::{
     EventReceiver, PendingInteraction, SessionCommand, SessionEvent, SessionId, SessionSnapshot,
     Transcript, TurnOutcome,
@@ -44,6 +45,13 @@ pub(crate) struct EngineInner {
     /// the single writer, so the raw send()/events() surface and any
     /// re-acquired handle see the same state.
     pub(crate) parked: Mutex<HashSet<AgentId>>,
+    /// The live session tallies (§5.7, 3b.5): the pump folds each
+    /// agent's events into its entry as they flow —
+    /// [`AgentSession::stats`](AgentSession::stats) reads the running
+    /// totals (the default shape until something flows). Engine-scoped
+    /// like `parked` (the pump is the single writer); `std::sync` —
+    /// the fold is sync, so `stats()` never awaits.
+    pub(crate) tallies: std::sync::Mutex<HashMap<AgentId, SessionStats>>,
 }
 
 /// §5.3 :350-354 — the constant answer a zero-subscriber question gets
@@ -89,6 +97,37 @@ pub(crate) async fn pump_task(
             AgentEvent::Exited => inner.host.bookkeeping.on_exited(agent).await,
             _ => {}
         }
+        // 3b.5 (§5.7): the live tally + the per-request derived rates —
+        // computed HERE (the headless layer), not the runtime. The
+        // rates wrap a Usage; every event folds into the agent's
+        // running totals, so stats() always equals the sum of what
+        // the bus carried.
+        let rates = if let AgentEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            ttft_ms,
+            generation_ms,
+            ..
+        } = &event
+        {
+            Some(UsageRates::from_usage(
+                *prompt_tokens,
+                *completion_tokens,
+                *cached_tokens,
+                *ttft_ms,
+                *generation_ms,
+            ))
+        } else {
+            None
+        };
+        inner
+            .tallies
+            .lock()
+            .expect("tallies lock poisoned")
+            .entry(agent)
+            .or_default()
+            .tally(&event);
         let forwarded = event.into_serializable();
         // Stash the approval responder for SessionCommand::Approve.
         if let Some(responder) = forwarded.approval_sender {
@@ -122,6 +161,7 @@ pub(crate) async fn pump_task(
         let _ = bus.send(SessionEvent {
             agent,
             event: forwarded.event,
+            rates,
         });
     }
 }
@@ -273,6 +313,49 @@ impl AgentSession {
         })
     }
 
+    /// §5.7's live session stats — the running totals the pump folded
+    /// from this agent's events (Usage / Savings / ModelChanged /
+    /// ContextUsage); a session that has emitted nothing reports the
+    /// default shape. Always equals the sum of what `events()`
+    /// delivered — the pump folds before it broadcasts.
+    pub fn stats(&self) -> SessionStats {
+        self.inner
+            .tallies
+            .lock()
+            .expect("tallies lock poisoned")
+            .get(&self.agent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// §5.7's durable half — the store's `session_stats` rows for the
+    /// loop's CURRENT session id (the same read the IPC's
+    /// `get_session_stats` performs). Errors `session_closed` when
+    /// the agent task has ended or no prompt has been served yet (no
+    /// session id), and `memory_disabled` on a
+    /// `MemoryBackend::Disabled` engine.
+    pub async fn stored_stats(&self) -> Result<crate::memory::types::SessionStats, EngineError> {
+        let session_id = {
+            let loops = self.inner.host.agent_loops.lock().await;
+            let agent_loop = loops
+                .get(&self.agent)
+                .ok_or_else(|| EngineError::session_closed("the agent task has ended"))?;
+            agent_loop
+                .session_id()
+                .ok_or_else(|| EngineError::session_closed("no prompt served yet — no session id"))?
+        };
+        let store = self
+            .inner
+            .host
+            .factory
+            .memory_handle()
+            .ok_or_else(EngineError::memory_disabled)?;
+        store
+            .session_stats(&session_id)
+            .await
+            .map_err(|e| EngineError::stats_failed(format!("session stats read failed: {e}")))
+    }
+
     /// The export plumbing: send ExportHistory through the command
     /// channel and await the reply (the task answers between turns from
     /// its live state; mid-request from the pre-request snapshot).
@@ -332,7 +415,7 @@ impl AgentSession {
         let mut final_text = String::new();
         loop {
             match rx.recv().await {
-                Ok(SessionEvent { agent, event }) => {
+                Ok(SessionEvent { agent, event, .. }) => {
                     if agent != self.agent {
                         // Other agents' events ride the same bus, tagged —
                         // they never end this session's turn.

@@ -20,6 +20,7 @@ use crate::agent::policy::PermissionPolicy;
 use crate::config::Config;
 use crate::headless::error::EngineError;
 use crate::headless::session::{pump_task, AgentSession, EngineInner};
+use crate::headless::stats::{EngineStats, TraceApi};
 use crate::headless::types::{
     EngineOptions, EventReceiver, HostEvent, SessionEvent, SessionId, SpawnOptions,
 };
@@ -232,6 +233,38 @@ impl Engine {
         CodegraphApi::from_parts(self.brain.factory.codegraph_handle())
     }
 
+    /// §5.7's engine-wide stats pull — the store's project + savings
+    /// aggregates plus the steering-effectiveness snapshot (the same
+    /// counters the app's Trace tab reads). Errors `memory_disabled`
+    /// on a `MemoryBackend::Disabled` engine: both aggregates are
+    /// store reads (the steering half needs no store).
+    pub async fn stats(&self) -> Result<EngineStats, EngineError> {
+        let store = self
+            .brain
+            .factory
+            .memory_handle()
+            .ok_or_else(EngineError::memory_disabled)?;
+        let project_stats = store
+            .project_stats()
+            .await
+            .map_err(|e| EngineError::stats_failed(format!("project stats read failed: {e}")))?;
+        let savings_stats = store
+            .savings_stats()
+            .await
+            .map_err(|e| EngineError::stats_failed(format!("savings stats read failed: {e}")))?;
+        Ok(EngineStats {
+            project_stats,
+            savings_stats,
+            steering_snapshot: self.brain.factory.steering().snapshot(),
+        })
+    }
+
+    /// §5.7's trace pull — list/get/clear over the shared LLM request
+    /// log (the same log the app's Trace tab reads).
+    pub fn trace(&self) -> TraceApi {
+        TraceApi::from_parts(self.brain.trace.clone())
+    }
+
     /// Start from a plain (non-async) context — the engine owns a static
     /// tokio runtime, so it works from a plain `fn main` (§7 row 15).
     pub fn start_blocking(opts: EngineOptions) -> Result<Engine, EngineError> {
@@ -357,6 +390,7 @@ async fn start_inner(
         pending_approvals: Mutex::new(HashMap::new()),
         pending_questions: Mutex::new(HashMap::new()),
         parked: Mutex::new(HashSet::new()),
+        tallies: std::sync::Mutex::new(HashMap::new()),
     });
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
 

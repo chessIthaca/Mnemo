@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 pub mod memory_api;
 pub mod session;
+pub mod stats;
 pub mod types;
 
 pub use codegraph_api::{CodegraphApi, CodegraphGraph, CodegraphStatus};
@@ -25,6 +26,7 @@ pub use memory_api::{
     ScoredMemoryDebugWire,
 };
 pub use session::AgentSession;
+pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{
     EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
     SessionCommand, SessionEvent, SessionId, SessionLimits, SessionSnapshot, SpawnOptions,

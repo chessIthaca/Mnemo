@@ -50,6 +50,8 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
         None, // no role — UI spawns are unrestricted
         true, // own_plans_dir — UI spawns get .coding/plans/agents/<id>/
         None, // no worktree binding — a main-tree agent
+        // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+        None,
     )
     .await?;
 
@@ -178,6 +180,8 @@ pub(crate) async fn spawn_run_all_agent(
             worktree,
             codegraph,
         }),
+        // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+        None,
     )
     .await
 }
@@ -271,6 +275,8 @@ impl ParentAwareSpawner for IpcSpawner {
             role,
             false, // own_plans_dir — subagents share the main dir (can't mutate)
             None, // no worktree binding — subagents inherit the parent's root
+            // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+            None,
         )
         .await?;
         // Emit a PromptDispatched event for the spawned agent so its task

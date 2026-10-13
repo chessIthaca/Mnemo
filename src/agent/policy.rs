@@ -303,6 +303,42 @@ impl AgentPolicyFactory for NoPolicyFactory {
     fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
 }
 
+/// 3a.5 (D5): the ENGINE's policy factory — [`NoPolicy::ungated`]:
+/// the free agent's real dispatch semantics (row 11's engine form: the
+/// workflow state never gates the engine's sessions). Registered by the
+/// headless Engine on ITS factory; [`NoPolicyFactory`] keeps the
+/// workflow fallback everywhere else.
+pub struct FreePolicyFactory;
+
+impl AgentPolicyFactory for FreePolicyFactory {
+    fn create_workflow(
+        &self,
+        _plans_dir: &std::path::Path,
+        _is_subagent: bool,
+    ) -> Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> {
+        Arc::new(crate::agent::workflow_handle::UnwiredWorkflow)
+    }
+
+    fn build_policy(
+        &self,
+        ctx: &PolicyFactoryCtx,
+    ) -> Result<PolicyBuildResult, KernelError> {
+        // The engine's config may carry no free spec (an empty config
+        // dir): fall back to the coding-default head IN THE FACTORY —
+        // the factory-level fallback (factory.rs :1194) attaches the
+        // NON-ungated default, silently re-gating the engine's agents.
+        let spec = ctx.prompt.clone().map(Arc::new).unwrap_or_else(|| {
+            Arc::new(crate::agent::prompt::PromptSpec::coding_default())
+        });
+        Ok(PolicyBuildResult {
+            policy: Arc::new(NoPolicy::with_spec(spec).ungated()),
+            attach_loop: Box::new(|_| {}),
+        })
+    }
+
+    fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
+}
+
 /// The kernel's six compiled prompt blocks (prompt.rs consts), handed to the
 /// policy so `stable_head` can stay byte-identical (cache contract :237-240).
 /// The app wrapper supplies `KernelPromptBlocks::workflow()`; job 2b relocates
@@ -384,12 +420,18 @@ pub trait AgentPolicy: Send + Sync {
 pub struct NoPolicy {
     /// The caller-supplied prompt spec (the head's recipe).
     spec: Arc<PromptSpec>,
+    /// 3a.5 (D5): the ENGINE's sessions — the dispatch gate answers
+    /// [`ToolFilter::Free`] (the workflow state never gates the agent).
+    /// Default `false`: a plain NoPolicy build keeps the dispatch
+    /// fallback to the workflow read (the kernel/tests' pre-3a.5
+    /// semantics — workflow agents without an attached policy).
+    ungated: bool,
 }
 
 impl NoPolicy {
     /// Build the free-agent policy over a caller-supplied spec (G1).
     pub fn with_spec(spec: Arc<PromptSpec>) -> Self {
-        Self { spec }
+        Self { spec, ungated: false }
     }
 
     /// The kernel's explicit fallback — the loop's bare default and the
@@ -400,7 +442,17 @@ impl NoPolicy {
     pub fn with_coding_default() -> Self {
         Self {
             spec: Arc::new(crate::agent::prompt::PromptSpec::coding_default()),
+            ungated: false,
         }
+    }
+
+    /// 3a.5 (D5, row 11's engine form): the UNGATED variant — the
+    /// dispatch gate answers [`ToolFilter::Free`], so the workflow state
+    /// never gates this agent's tools. The engine's FreePolicyFactory
+    /// builds this; every other NoPolicy build keeps the fallback.
+    pub fn ungated(mut self) -> Self {
+        self.ungated = true;
+        self
     }
 }
 
@@ -419,7 +471,19 @@ impl AgentPolicy for NoPolicy {
         String::new()
     }
     async fn tool_surface(&self) -> ToolSurface {
-        ToolSurface::constant()
+        if self.ungated {
+            // 3a.5: the free agent's gate — a `gate: None` answer falls
+            // back to the workflow read at dispatch (dispatch.rs
+            // :255-258), which refuses mutation tools in Complete
+            // state. The workflow state must NEVER gate the engine's
+            // free sessions (row 11's engine form).
+            ToolSurface {
+                advertise: None,
+                gate: Some(ToolFilter::Free),
+            }
+        } else {
+            ToolSurface::constant()
+        }
     }
     async fn gate_call(&self, _name: &str, _args: &Value) -> GateVerdict {
         GateVerdict::Allow

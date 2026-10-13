@@ -525,7 +525,7 @@ impl AgentLoop {
             );
         if gated
             && matches!(
-                self.permission,
+                self.permission(),
                 crate::agent::policy::PermissionPolicy::OverridePermissions
             )
         {

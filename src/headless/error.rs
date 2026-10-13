@@ -50,6 +50,23 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// A session spawn failed (the shared path errored).
+    pub(crate) fn spawn_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "spawn_failed".to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// The session is closed — every `send` on it fails with this code
+    /// (§5.3, row 15).
+    pub(crate) fn session_closed(message: impl Into<String>) -> Self {
+        Self {
+            code: "session_closed".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

@@ -565,6 +565,8 @@ fn main() {
                             None,  // no role — the main agent is unrestricted
                             false, // own_plans_dir — main keeps .coding/plans/
                             None,  // no worktree binding — the main agent works the main tree
+                            // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+                            None,
                         )
                         .await
                         .expect("main agent spawn must succeed");

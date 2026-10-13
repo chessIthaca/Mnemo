@@ -81,6 +81,11 @@ pub async fn spawn_agent_shared(
     role: Option<String>,
     own_plans_dir: bool,
     worktree: Option<WorktreeBinding>,
+    // 3a.5 (§5.4 :303-314): the per-session permission policy — `None`
+    // keeps the factory build's default (every pre-3a.5 caller); `Some`
+    // is applied post-build via [`AgentLoop::set_permission`] (the
+    // Engine resolves the engine default vs. the SpawnOptions override).
+    permission: Option<crate::agent::policy::PermissionPolicy>,
 ) -> Result<(AgentId, String), String> {
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
@@ -187,6 +192,13 @@ pub async fn spawn_agent_shared(
             .workflow_handle()
             .set_role_allowlist(role.as_deref() == Some("reviewer"), list)
             .await;
+    }
+
+    // 3a.5 (§5.4): apply the per-session permission override (the engine
+    // resolves engine default vs. SpawnOptions) BEFORE the task starts —
+    // the loop is built but not yet running, so the swap is race-free.
+    if let Some(permission) = permission {
+        agent_loop.set_permission(permission);
     }
 
     // A clone of the manager's fan-in sender, used below (outside the lock) to
@@ -581,11 +593,11 @@ impl ParentAwareSpawner for HostSpawner {
         parent_id: Option<AgentId>,
         model: Option<crate::config::ModelRef>,
         role: Option<String>,
-        // §5.4 :377: the parent's policy. Accepted for the 3a Engine's
-        // SpawnOptions (a free parent's OverridePermissions reaches the
-        // child there); today's children are factory-built, which wires
-        // ApproveViaApi.
-        _permission: crate::agent::policy::PermissionPolicy,
+        // §5.4 :377: the parent's policy, FORWARDED into the shared
+        // spawn path (3a.5 made it real) — a free parent's
+        // OverridePermissions reaches the child; the factory default
+        // (ApproveViaApi) is what factory-built children carry.
+        permission: crate::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
             self.factory.clone(),
@@ -597,7 +609,8 @@ impl ParentAwareSpawner for HostSpawner {
             model,
             role,
             false, // own_plans_dir — subagents share the main dir (can't mutate)
-            None, // no worktree binding — subagents inherit the parent's root
+            None,  // no worktree binding — subagents inherit the parent's root
+            Some(permission),
         )
         .await?;
         Ok(id)
@@ -687,6 +700,8 @@ impl HostRuntime {
             None,
             false,
             None,
+            // the main agent keeps the factory build's default policy
+            None,
         )
         .await
         .map_err(|e| format!("main agent spawn failed: {e}"))?;
@@ -704,6 +719,16 @@ impl HostRuntime {
             main_id,
             bookkeeping,
         })
+    }
+
+    /// Hand the fan-in receiver to a dedicated pump (the 3a.5 engine's
+    /// event pump). One-shot: the real receiver moves out and a CLOSED
+    /// channel takes its place — a later recv sees `None`. The console
+    /// never calls this (its REPL owns the receiver directly).
+    pub fn take_fanin_rx(&mut self) -> tokio::sync::mpsc::Receiver<(AgentId, AgentEvent)> {
+        let (tx, closed) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        std::mem::replace(&mut self.fanin_rx, closed)
     }
 }
 

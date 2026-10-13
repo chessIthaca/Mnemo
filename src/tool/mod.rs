@@ -462,6 +462,14 @@ pub enum ToolFilter {
     PlanFrozen,
     /// Complete: read agent tools + `create_plan` + all memory tools.
     Complete,
+    /// The FREE agent's dispatch gate (3a.5, row 11's engine form):
+    /// everything the registration offered — no workflow state ever
+    /// gates a free agent.
+    /// [`NoPolicy`](crate::agent::policy::NoPolicy) answers with this
+    /// gate; the free default registration offers all groups but Host,
+    /// so the pair is the free surface. The hard rules above the arm
+    /// (`write_review_report` reviewer-only) still apply.
+    Free,
     /// A skill is active — only the named tools in the allow-list are visible
     /// (plus all memory tools, which are always available). Seeded from the
     /// active skill's `tools` field at `start_skill` time. The always-available
@@ -524,6 +532,12 @@ impl ToolFilter {
         if name == "write_review_report" && !matches!(self, ToolFilter::Reviewer(_)) {
             return false;
         }
+        // 3a.5 (row 11's engine form): the FREE gate — everything the
+        // registration offered, regardless of workflow state. Placed
+        // after the hard rules above so they still bind.
+        if matches!(self, ToolFilter::Free) {
+            return true;
+        }
         // `skill_create` (authoring a skill file) is EXECUTING-ONLY in the base
         // states: the arms below allow it in Executing / ExecutingResearch /
         // PlanFrozen, and Planning/Reviewing/Complete deny it. Under a SKILL it
@@ -540,6 +554,10 @@ impl ToolFilter {
             return false;
         }
         match self {
+            // 3a.5: the free gate — everything the registration offered
+            // (normally unreachable: the early return above handles Free;
+            // this arm keeps the match exhaustive).
+            ToolFilter::Free => true,
             ToolFilter::Planning => match category {
                 // HARD RULE: no changes without a plan. Only read (AutoRun)
                 // tools are visible — every mutation (file_edit/write/append,

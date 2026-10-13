@@ -12,11 +12,13 @@
 
 pub mod engine;
 pub mod error;
+pub mod session;
 pub mod types;
 
-pub use engine::Engine;
+pub use engine::{Engine, EngineBuilder};
 pub use error::EngineError;
+pub use session::AgentSession;
 pub use types::{
     EngineOptions, EventReceiver, HostEvent, MemoryBackend, RecvError, SessionCommand,
-    SessionEvent, SessionId, SessionLimits, SpawnOptions, Transcript,
+    SessionEvent, SessionId, SessionLimits, SpawnOptions, Transcript, TurnOutcome,
 };

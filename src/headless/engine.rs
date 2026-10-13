@@ -6,22 +6,27 @@
 //! host wiring: an EXPLICIT workspace + config (G4 — no discovery, no
 //! global-config read, no picker), the brain built through the same
 //! [`wire_brain`] tail the app uses, and the [`HostRuntime`] core (3a.2).
-//! `spawn` + `AgentSession` land in 3a.5; the memory-backend / index /
-//! embedder option consumption lands in 3b (typed on `EngineOptions`
-//! now, wired there).
+//! 3a.5 adds `spawn` (the per-session permission threading, §5.4) + the
+//! event pump + the multi-subscriber session bus. The memory-backend /
+//! index / embedder option consumption lands in 3b.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::agent::policy::PermissionPolicy;
 use crate::config::Config;
 use crate::headless::error::EngineError;
-use crate::headless::types::{EngineOptions, EventReceiver, HostEvent};
+use crate::headless::session::{pump_task, AgentSession, EngineInner};
+use crate::headless::types::{
+    EngineOptions, EventReceiver, HostEvent, SessionEvent, SessionId, SpawnOptions,
+};
 use crate::host::brain::{wire_brain, Brain};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
-use crate::host::runtime::HostRuntime;
+use crate::host::runtime::{spawn_agent_shared, HostRuntime};
+use crate::provider::LlmClient;
 
 /// The fan-out notifier: every host event lands on the engine's broadcast
 /// bus so any number of `host_events()` subscribers see it (the GUI
@@ -38,26 +43,57 @@ impl HostNotifier for BusNotifier {
     }
 }
 
-/// A headless engine (§5.3 :295): the brain + the shared host core,
-/// started from explicit options. Cheap to hold; `spawn` (3a.5) opens
-/// sessions on it.
+/// A headless engine (§5.3 :295): the brain + the shared host core + the
+/// session event pump, started from explicit options.
 pub struct Engine {
     /// The brain, held for the engine's lifetime so its Drop-managed
     /// pieces (the CodeGraph file watcher) stay alive.
     _brain: Brain,
-    /// The shared host core (3a.2): manager, loop map, spawner, fan-in
-    /// receiver, bookkeeping. `spawn` (3a.5) reads it.
-    _host: HostRuntime,
-    /// The host-event bus — `host_events()` subscribes here.
+    /// The shared state (host core + session registry + responder maps).
+    inner: Arc<EngineInner>,
+    /// The session event bus — `AgentSession::events()` subscribes.
+    bus: broadcast::Sender<SessionEvent>,
+    /// The host-event bus — `host_events()` subscribes.
     host_events_tx: broadcast::Sender<HostEvent>,
     /// The default permission policy for spawned sessions (§5.4); a
-    /// `SpawnOptions::permissions` (3a.5) overrides it per session.
-    _default_permissions: PermissionPolicy,
+    /// `SpawnOptions::permissions` overrides it per session.
+    default_permissions: PermissionPolicy,
+    /// The event pump task — `shutdown` aborts it.
+    pump: tokio::task::JoinHandle<()>,
     /// The runtime this engine owns when started via
     /// [`start_blocking`](Engine::start_blocking) — `None` when the
-    /// caller's runtime hosts it. Held purely for its lifetime
-    /// (background loads), like the brain's graph watcher.
+    /// caller's runtime hosts it. Held purely for its lifetime.
     _owned_runtime: Option<tokio::runtime::Runtime>,
+}
+
+/// The Rust-only builder (§5.3 :292-294's first slice — job 4 completes
+/// it): engine options plus injection seams a serde type cannot carry.
+pub struct EngineBuilder {
+    opts: EngineOptions,
+    provider: Option<Arc<dyn LlmClient>>,
+}
+
+impl EngineBuilder {
+    /// Start a builder from options.
+    pub fn new(opts: EngineOptions) -> Self {
+        Self {
+            opts,
+            provider: None,
+        }
+    }
+
+    /// Replace the factory's base provider — the scripted-mock seam for
+    /// the engine fixtures (and custom endpoints before job 4's register
+    /// surface).
+    pub fn provider(mut self, provider: Arc<dyn LlmClient>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    /// Build + start (identical to [`Engine::start`] plus the injections).
+    pub async fn start(self) -> Result<Engine, EngineError> {
+        start_inner(self.opts, self.provider).await
+    }
 }
 
 impl Engine {
@@ -66,86 +102,87 @@ impl Engine {
     /// workspace — the root missing, or `require_git` unmet on a non-repo
     /// root — is [`EngineError`] code `no_project`.
     pub async fn start(opts: EngineOptions) -> Result<Engine, EngineError> {
-        // The workspace gates — row 9 + the §5.9.3 :664 require_git rule.
-        if !opts.workspace.root.is_dir() {
-            return Err(EngineError::no_project(format!(
-                "workspace root '{}' is not a directory",
-                opts.workspace.root.display()
-            )));
-        }
-        if opts.workspace.require_git && !opts.workspace.is_git_repo() {
-            return Err(EngineError::no_project(format!(
-                "workspace root '{}' is not a git repository (require_git)",
-                opts.workspace.root.display()
-            )));
-        }
+        EngineBuilder::new(opts).start().await
+    }
 
-        // The config dir: explicit → $MNEMO_HOME → ~/.mnemo (§5.3 :287).
-        // G4: the engine resolves it itself — `global_config_dir()` stays
-        // app-only (Setup::open(None) + the app).
-        let config_dir = match opts.config_dir {
-            Some(dir) => dir,
-            None => default_config_dir(),
+    /// The Rust-only builder (the injection seams).
+    pub fn builder(opts: EngineOptions) -> EngineBuilder {
+        EngineBuilder::new(opts)
+    }
+
+    /// Spawn a session (§5.3 :303-314): a parentless agent with its own
+    /// plans dir, running under the resolved permission policy — the
+    /// `SpawnOptions::permissions` override, else the engine default
+    /// (§5.4's engine exposure).
+    pub async fn spawn(&self, opts: SpawnOptions) -> Result<AgentSession, EngineError> {
+        if let Some(name) = &opts.policy {
+            return Err(EngineError::spawn_failed(format!(
+                "unknown policy '{name}' — the registry lands with job 4's builder"
+            )));
+        }
+        let name = opts.name.unwrap_or_else(|| "session".to_string());
+        let model = match opts.model.as_deref() {
+            Some(spec) => Some(parse_model_ref(spec).map_err(EngineError::spawn_failed)?),
+            None => None,
         };
-        let config = Config::load(&config_dir).map_err(|e| {
-            EngineError::start_failed(format!(
-                "config load from '{}' failed: {e}",
-                config_dir.display()
-            ))
-        })?;
-
-        // The host-events bus: the engine ALWAYS has one (the GUI forwards
-        // to webview channels; a headless host reads host_events()).
-        let (host_events_tx, _) = broadcast::channel(256);
-        let notifier: SharedNotifier = Arc::new(BusNotifier {
-            tx: host_events_tx.clone(),
-        });
-
-        // The brain — the SAME wiring tail the app uses, with the
-        // engine's explicit inputs (never the app's discovery). A
-        // headless start is never a "switched open" (no picker flow).
-        let rt = tokio::runtime::Handle::current();
-        let workspace = Arc::new(opts.workspace.clone());
-        let brain = wire_brain(config_dir, config, workspace, false, Some(notifier), rt)
-            .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
-
-        // The shared host core — the same assembly the console delegates
-        // to (manager, spawner, the main agent, bookkeeping).
-        let host = HostRuntime::start(brain.factory.clone())
-            .await
-            .map_err(EngineError::start_failed)?;
-
-        Ok(Engine {
-            _brain: brain,
-            _host: host,
-            host_events_tx,
-            _default_permissions: opts.permissions,
-            _owned_runtime: None,
+        let permission = opts
+            .permissions
+            .unwrap_or_else(|| self.default_permissions.clone());
+        let (agent, _) = spawn_agent_shared(
+            self.inner.host.factory.clone(),
+            self.inner.host.manager.clone(),
+            self.inner.host.agent_loops.clone(),
+            name,
+            None, // no initial prompt — sessions drive via send
+            None, // parentless — a session is its own main
+            model,
+            None, // no role
+            true, // own plans dir (a parentless session agent)
+            None, // no worktree binding (the option wires with 3c)
+            Some(permission),
+        )
+        .await
+        .map_err(EngineError::spawn_failed)?;
+        let id = SessionId::new(agent);
+        self.inner.sessions.lock().await.insert(id, agent);
+        Ok(AgentSession {
+            id,
+            agent,
+            inner: self.inner.clone(),
+            bus: self.bus.clone(),
         })
     }
 
-    /// The engine's host-event bus (§5.3 :300): every background event
-    /// (the memory reconcile, the code-graph index progress) reaches
-    /// every subscriber.
+    /// The engine's host-event bus (§5.3 :300).
     pub fn host_events(&self) -> EventReceiver<HostEvent> {
         EventReceiver {
             rx: self.host_events_tx.subscribe(),
         }
     }
 
-    /// Shut the engine down (§5.3 :301): ends the sessions and runs the
-    /// session-end consolidation. The session bookkeeping lands in 3a.5;
-    /// this frame already drops the pieces in dependency order (the
-    /// brain's watcher-managed lifetime, then the host core).
+    /// Shut the engine down (§5.3 :301): cancel every live session,
+    /// deregister, stop the pump. (The session-end consolidation rides
+    /// the kernel's existing shutdown path when the loops' tasks end.)
     pub async fn shutdown(self) -> Result<(), EngineError> {
-        // 3a.5: end the sessions + run the session-end consolidation
-        // (the kernel's existing shutdown path).
+        let agents: Vec<crate::runtime::AgentId> = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .copied()
+            .collect();
+        for agent in agents {
+            let mgr = self.inner.host.manager.lock().await;
+            let _ = mgr.send(agent, crate::runtime::AgentCommand::Cancel);
+        }
+        self.inner.sessions.lock().await.clear();
+        self.pump.abort();
         Ok(())
     }
 
     /// Start from a plain (non-async) context — the engine owns a static
     /// tokio runtime, so it works from a plain `fn main` (§7 row 15).
-    /// Dropping the engine drops the runtime.
     pub fn start_blocking(opts: EngineOptions) -> Result<Engine, EngineError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -157,6 +194,107 @@ impl Engine {
             ..engine
         })
     }
+}
+
+/// The shared start body: the workspace gates, the config, the buses, the
+/// brain (with the optional provider injection), the host core, the pump.
+async fn start_inner(
+    opts: EngineOptions,
+    provider: Option<Arc<dyn LlmClient>>,
+) -> Result<Engine, EngineError> {
+    // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
+    // (either the option or the workspace marker demands a repo).
+    if !opts.workspace.root.is_dir() {
+        return Err(EngineError::no_project(format!(
+            "workspace root '{}' is not a directory",
+            opts.workspace.root.display()
+        )));
+    }
+    if (opts.require_git || opts.workspace.require_git) && !opts.workspace.is_git_repo() {
+        return Err(EngineError::no_project(format!(
+            "workspace root '{}' is not a git repository (require_git)",
+            opts.workspace.root.display()
+        )));
+    }
+
+    // The config dir: explicit → $MNEMO_HOME → ~/.mnemo (§5.3 :287).
+    let config_dir = match opts.config_dir {
+        Some(dir) => dir,
+        None => default_config_dir(),
+    };
+    let config = Config::load(&config_dir).map_err(|e| {
+        EngineError::start_failed(format!(
+            "config load from '{}' failed: {e}",
+            config_dir.display()
+        ))
+    })?;
+
+    // The host-events bus: the engine ALWAYS has one.
+    let (host_events_tx, _) = broadcast::channel(256);
+    let notifier: SharedNotifier = Arc::new(BusNotifier {
+        tx: host_events_tx.clone(),
+    });
+
+    // The brain — the SAME wiring tail the app uses, with the engine's
+    // explicit inputs. A headless start is never "switched open".
+    let rt = tokio::runtime::Handle::current();
+    let workspace = Arc::new(opts.workspace.clone());
+    let brain = wire_brain(config_dir, config, workspace, false, Some(notifier), rt)
+        .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
+
+    // The optional provider injection (the builder's test seam) — BEFORE
+    // the host core builds the main agent.
+    if let Some(provider) = provider {
+        brain.factory.set_provider(provider);
+    }
+
+    // 3a.5 (D5): the engine's agents are FREE agents — NoPolicy with the
+    // UNGATED dispatch gate (the workflow state never gates them; row
+    // 11's engine form). The app keeps its own policy wiring.
+    brain
+        .factory
+        .set_policy_factory(std::sync::Arc::new(
+            crate::agent::policy::FreePolicyFactory,
+        ));
+
+    // The shared host core — the same assembly the console delegates to.
+    let mut host = HostRuntime::start(brain.factory.clone())
+        .await
+        .map_err(EngineError::start_failed)?;
+
+    // The session event pump: the fan-in receiver moves into a dedicated
+    // task (lifecycle bookkeeping + responder stashing + the broadcast).
+    let fanin = host.take_fanin_rx();
+    let (bus, _) = broadcast::channel(1024);
+    let inner = Arc::new(EngineInner {
+        host,
+        sessions: Mutex::new(HashMap::new()),
+        pending_approvals: Mutex::new(HashMap::new()),
+        pending_questions: Mutex::new(HashMap::new()),
+    });
+    let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
+
+    Ok(Engine {
+        _brain: brain,
+        inner,
+        bus,
+        host_events_tx,
+        default_permissions: opts.permissions,
+        pump,
+        _owned_runtime: None,
+    })
+}
+
+/// Parse an "endpoint/model" spec into a [`crate::config::ModelRef`].
+fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
+    let (endpoint, model) = spec
+        .split_once('/')
+        .ok_or_else(|| format!("model spec '{spec}' must be \"endpoint/model\""))?;
+    Ok(crate::config::ModelRef {
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        reasoning_effort: None,
+    })
 }
 
 /// The engine's config-dir default (§5.3 :287): `$MNEMO_HOME`, else

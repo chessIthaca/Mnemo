@@ -22,6 +22,22 @@ use crate::workspace::Workspace;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(AgentId);
 
+impl SessionId {
+    /// Crate-internal construction (the engine's spawn).
+    pub(crate) fn new(agent: AgentId) -> Self {
+        Self(agent)
+    }
+}
+
+/// The outcome of a completed turn (§5.3 :322 — `run_to_completion`):
+/// the final text. Additive fields (the stop reason, usage) land with
+/// their consumers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnOutcome {
+    /// The accumulated assistant text of the turn.
+    pub final_text: String,
+}
+
 /// Which memory subsystem an engine runs (§5.9.8; the backend wiring
 /// lands in 3b — the enum is the wire surface `EngineOptions` carries).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

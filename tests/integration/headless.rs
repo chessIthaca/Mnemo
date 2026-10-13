@@ -239,3 +239,405 @@ fn start_blocking_without_runtime() {
     let _ = engine.host_events();
     drop(engine); // the owned runtime drops with the engine
 }
+
+// --- 3a.5: the session surface (the scripted mock + the row fixtures) ---
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+
+use mnemo::headless::AgentSession;
+use mnemo::provider::{
+    Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice,
+    ToolSchema,
+};
+
+/// A scripted provider: each `complete` pops the next scripted event
+/// batch; the call counter lets tests observe progress WITHOUT an event
+/// subscriber (the zero-subscriber fixtures).
+struct ScriptedLlm {
+    responses: std::sync::Mutex<VecDeque<Vec<LlmEvent>>>,
+    calls: AtomicUsize,
+    caps: Capabilities,
+}
+
+impl ScriptedLlm {
+    fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            calls: AtomicUsize::new(0),
+            caps: Capabilities::openai(),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmClient for ScriptedLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "scripted"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let next = self
+            .responses
+            .lock()
+            .expect("script lock poisoned")
+            .pop_front()
+            .unwrap_or_default();
+        Ok(Box::pin(futures::stream::iter(next)))
+    }
+}
+
+fn text_turn(texts: &[&str]) -> Vec<LlmEvent> {
+    let mut events: Vec<LlmEvent> = texts.iter().map(|t| LlmEvent::TextDelta { text: (*t).into() }).collect();
+    events.push(LlmEvent::Finish {
+        reason: FinishReason::Stop,
+    });
+    events
+}
+
+fn tool_turn(name: &str, args: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: "call_1".into(),
+            name: name.into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: args.into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+/// A scripted engine over a fresh non-git workspace + temp config
+/// (indexing off), plus the tempdirs (they must outlive the engine).
+async fn scripted_engine(
+    responses: Vec<Vec<LlmEvent>>,
+) -> (Engine, AgentSession, tempfile::TempDir, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(ScriptedLlm::new(responses));
+    let engine = Engine::builder(opts)
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("the scripted engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    (engine, session, root, cfg)
+}
+
+fn git_init(root: &std::path::Path) {
+    let out = std::process::Command::new("git")
+        .args(["init", root.to_str().unwrap()])
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git init failed: {:?}", out);
+}
+
+/// §7 row 10: run_to_completion on a scripted provider returns the final
+/// text, and the stream shows Started … Finished in order.
+#[tokio::test]
+async fn run_to_completion_mock_provider() {
+    let (_engine, session, _root, _cfg) = scripted_engine(vec![text_turn(&["hello ", "world"])])
+        .await;
+    let mut rx = session.events();
+    let outcome = session.run_to_completion("hi").await.expect("the turn completes");
+    assert_eq!(outcome.final_text, "hello world");
+    let mut saw_started = false;
+    let mut saw_finished = false;
+    while let Ok(event) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+    {
+        match event.expect("event").event {
+            SerializableAgentEvent::Started => saw_started = true,
+            SerializableAgentEvent::Finished { .. } => {
+                saw_finished = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_started, "the stream shows Started");
+    assert!(saw_finished, "the stream shows Finished");
+}
+
+/// §7 row 12: two events() subscribers both receive every event; dropping
+/// one never stalls the other.
+#[tokio::test]
+async fn two_subscribers_both_receive() {
+    let (_engine, session, _root, _cfg) =
+        scripted_engine(vec![text_turn(&["hi"])]).await;
+    let a = session.events();
+    let b = session.events();
+    session
+        .run_to_completion("hello")
+        .await
+        .expect("the turn completes");
+    /// Drain a subscription to its Finished event — the shared body of
+    /// the two-subscriber comparison.
+    async fn drain_to_finished(
+        mut rx: mnemo::headless::EventReceiver<mnemo::headless::SessionEvent>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            let ev = ev.expect("event");
+            let kind = match &ev.event {
+                SerializableAgentEvent::Started => "started".to_string(),
+                SerializableAgentEvent::TextDelta { .. } => "text".to_string(),
+                SerializableAgentEvent::Finished { .. } => {
+                    out.push("finished".to_string());
+                    break;
+                }
+                _ => "other".to_string(),
+            };
+            out.push(kind);
+        }
+        out
+    }
+
+    let sa = drain_to_finished(a).await;
+    let sb = drain_to_finished(b).await;    assert_eq!(sa, sb, "both subscribers see the identical sequence");
+    assert!(
+        sa.contains(&"started".to_string()) && sa.contains(&"finished".to_string())
+    );
+}
+
+/// §7 row 15: every send on a closed session fails with code
+/// "session_closed".
+#[tokio::test]
+async fn closed_session_error_code() {
+    let (_engine, session, _root, _cfg) = scripted_engine(vec![]).await;
+    session.close().await.expect("close");
+    let err = session
+        .send(SessionCommand::Prompt {
+            text: "hi".into(),
+            images: vec![],
+        })
+        .await
+        .expect_err("a closed session rejects sends");
+    assert_eq!(err.code(), "session_closed");
+}
+
+/// §7 row 15: shutdown ends the sessions — the event bus closes.
+#[tokio::test]
+async fn shutdown_leaves_no_tasks() {
+    let (engine, session, _root, _cfg) = scripted_engine(vec![]).await;
+    let mut rx = session.events();
+    engine.shutdown().await.expect("shutdown");
+    // The session handle holds a bus-sender clone — drop it so the
+    // channel's lifetime reflects the engine's alone (the pump aborted,
+    // no engine tasks remain).
+    drop(session);
+    drop(_root);
+    drop(_cfg);
+    match rx.recv().await {
+        Err(RecvError::Closed) => {}
+        other => panic!("the bus must close after shutdown: {:?}", other.is_ok()),
+    }
+}
+
+/// §5.3 :350-354 (row 14): a question with ZERO subscribers gets the
+/// immediate constant Freeform answer — the turn never blocks (the second
+/// LLM call happens without any subscriber).
+#[tokio::test]
+async fn ask_user_without_subscriber_answers_constant() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(ScriptedLlm::new(vec![
+        tool_turn(
+            "ask_user",
+            r#"{"question":"which?","options":[{"label":"A"},{"label":"B"}]}"#,
+        ),
+        text_turn(&["decided"]),
+    ]));
+    let engine = Engine::builder(opts)
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    // NO events() subscription — zero subscribers at question time.
+    session
+        .send(SessionCommand::Prompt {
+            text: "ask".into(),
+            images: vec![],
+        })
+        .await
+        .expect("prompt");
+    for _ in 0..100 {
+        if llm.calls() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        llm.calls(),
+        2,
+        "the constant answer unblocked ask_user — the second request ran"
+    );
+}
+
+/// §7 row 11 (engine form): under OverridePermissions a core operation
+/// (git merge) executes with NO approval request — one ApprovalBypassed
+/// audit event (reason "core_op") instead.
+#[tokio::test]
+async fn override_permissions_runs_merge_push_without_approval() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    git_init(root.path());
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let engine = Engine::builder(opts)
+        .provider(std::sync::Arc::new(ScriptedLlm::new(vec![
+            tool_turn("git", r#"{"subcommand":"merge","branch":"feat-x"}"#),
+            text_turn(&["merged"]),
+        ])))
+        .start()
+        .await
+        .expect("starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    session
+        .run_to_completion("merge it")
+        .await
+        .expect("the turn completes");
+    let mut bypassed = 0;
+    let mut approval_requested = false;
+    let mut saw_tool_result = false;
+    while let Ok(ev) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+    {
+        match ev.expect("event").event {
+            SerializableAgentEvent::ApprovalBypassed { tool, reason } => {
+                assert_eq!(tool, "git");
+                assert_eq!(reason, "core_op");
+                bypassed += 1;
+            }
+            SerializableAgentEvent::ApprovalRequest { .. } => approval_requested = true,
+            SerializableAgentEvent::ToolResult { .. } => saw_tool_result = true,
+            SerializableAgentEvent::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(bypassed, 1, "exactly one bypass audit event");
+    assert!(!approval_requested, "OverridePermissions never prompts");
+    assert!(saw_tool_result, "the gated call executed directly");
+}
+
+/// §7 row 11 (engine form): under ApproveViaApi the approval surfaces as
+/// ApprovalRequest and SessionCommand::Approve resolves it — the call
+/// then executes.
+#[tokio::test]
+async fn approve_via_api_prompts_and_honours_decision() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    git_init(root.path());
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let engine = Engine::builder(opts)
+        .provider(std::sync::Arc::new(ScriptedLlm::new(vec![
+            tool_turn("git", r#"{"subcommand":"commit","message":"x"}"#),
+            text_turn(&["done"]),
+        ])))
+        .start()
+        .await
+        .expect("starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            permissions: Some(PermissionPolicy::ApproveViaApi {
+                safety_mode: SafetyMode::ApproveEachAction,
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn");
+    let mut rx = session.events();
+    session
+        .send(SessionCommand::Prompt {
+            text: "commit".into(),
+            images: vec![],
+        })
+        .await
+        .expect("prompt");
+    let mut approval_requested = false;
+    let mut saw_tool_result = false;
+    while let Ok(ev) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+    {
+        match ev.expect("event").event {
+            SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } => {
+                approval_requested = true;
+                session
+                    .send(SessionCommand::Approve {
+                        request_id: tool_call_id,
+                        decision: Approval::Approve,
+                    })
+                    .await
+                    .expect("the approval resolves");
+            }
+            SerializableAgentEvent::ToolResult { .. } => saw_tool_result = true,
+            SerializableAgentEvent::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(approval_requested, "ApproveViaApi surfaces the request");
+    assert!(saw_tool_result, "the approved call executed");
+}
+
+/// §7 row 8 (engine form): a free agent (NoPolicy — the engine default)
+/// cannot write under .coding/plans/** — the sandbox refuses, the ToolResult
+/// is an error.
+#[tokio::test]
+async fn free_agent_writes_no_plans() {
+    let (_engine, session, root, _cfg) = scripted_engine(vec![
+        tool_turn(
+            "file_write",
+            r#"{"path":".coding/plans/stack.json","content":"x"}"#,
+        ),
+        text_turn(&["ok"]),
+    ])
+    .await;
+    let mut rx = session.events();
+    session
+        .run_to_completion("write the stack")
+        .await
+        .expect("the turn completes");
+    let mut refusal: Option<(bool, String)> = None;
+    while let Ok(ev) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+    {
+        if let SerializableAgentEvent::ToolResult { result, .. } = ev.expect("event").event {
+            refusal = Some((result.success, result.output));
+            break;
+        }
+    }
+    let (success, output) = refusal.expect("the file_write call produced a result");
+    assert!(!success, "the plan write is refused: {output}");
+    assert!(
+        !root.path().join(".coding/plans/stack.json").exists(),
+        "nothing landed under .coding/plans"
+    );
+}

@@ -156,7 +156,7 @@ pub struct AgentLoop {
     /// branch entirely, emitting `AgentEvent::ApprovalBypassed` for
     /// calls that would have been gated. See
     /// [`crate::agent::policy::PermissionPolicy`].
-    pub permission: crate::agent::policy::PermissionPolicy,
+    pub(crate) permission: std::sync::RwLock<crate::agent::policy::PermissionPolicy>,
     /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
     /// the loop never names the app workflow type, and every consult rides
     /// the trait's opaque representations (the state token, the completion
@@ -865,12 +865,31 @@ impl AgentLoop {
     /// Set the approval policy (2c.5, §5.4). The factory wires
     /// `ApproveViaApi` for GUI/console loops (today's semantics); the
     /// kernel default (`OverridePermissions`) is the free agent's.
+    /// 3a.5: the field is RwLock-backed so a BUILT loop can swap it
+    /// ([`AgentLoop::set_permission`]) — the same live-swap shape as
+    /// `set_provider`.
     pub fn with_permission(
         mut self,
         permission: crate::agent::policy::PermissionPolicy,
     ) -> Self {
-        self.permission = permission;
+        self.permission = std::sync::RwLock::new(permission);
         self
+    }
+
+    /// The current approval policy (2c.5 → 3a.5: read through the lock —
+    /// the engine's per-session spawn may have swapped it post-build).
+    pub fn permission(&self) -> crate::agent::policy::PermissionPolicy {
+        self.permission
+            .read()
+            .expect("permission lock poisoned")
+            .clone()
+    }
+
+    /// Set the approval policy on a built loop — the 3a.5 Engine's
+    /// spawn path (`spawn_agent_shared`) applies the per-session
+    /// override after the factory build.
+    pub fn set_permission(&self, permission: crate::agent::policy::PermissionPolicy) {
+        *self.permission.write().expect("permission lock poisoned") = permission;
     }
 
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
@@ -897,9 +916,11 @@ impl AgentLoop {
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
             steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
-            permission: crate::agent::policy::PermissionPolicy::ApproveViaApi {
-                safety_mode,
-            },
+            permission: std::sync::RwLock::new(
+                crate::agent::policy::PermissionPolicy::ApproveViaApi {
+                    safety_mode,
+                },
+            ),
             tools,
             workflow,
             sandbox,

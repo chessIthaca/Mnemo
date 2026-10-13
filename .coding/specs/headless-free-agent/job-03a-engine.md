@@ -348,3 +348,77 @@ Amendment (2027-01-15, step 3a.4 — the landed D4 picks):
   ZERO sites in src/headless/** + the tests; brain.rs:116 (the
   3a.1-documented large_enum_variant) is that file's only site, outside
   this step's hunks.
+
+Amendment (2027-01-15, step 3a.5 — the landed D5+D9 picks):
+- The session surface: src/headless/session.rs — EngineInner (the host
+  core + the live-session registry + the pending approval/question
+  responder maps), pump_task (fan-in → the lifecycle bookkeeping at the
+  same per-event points as the console's run loop → responder stashing →
+  the zero-subscriber constant Freeform answer → the broadcast),
+  AgentSession { id, events(), send(), run_to_completion(), close() }.
+  send maps the public SessionCommand → AgentCommand (Suggestion carries
+  SteerPayload{text, images: []}); Approve/Answer resolve through the
+  pump's responder maps; every send on a closed session → code
+  "session_closed". The event bus is ENGINE-WIDE (capacity 1024) with
+  the agent tag — lineage-scoped buses are a later refinement; the
+  run_to_completion loop skips other agents' events and breaks on the
+  session's own Finished/Exited.
+- The engine: EngineBuilder (the job-4 builder's FIRST slice, landed for
+  testability: .provider(Arc<dyn LlmClient>) → factory.set_provider
+  BEFORE the main-agent build); Engine::spawn resolves the permission
+  (SpawnOptions override | the engine default) and passes it through
+  spawn_agent_shared's NEW permission param; model = "endpoint/model"
+  parsed to ModelRef; policy: Some → spawn_failed (the registry is job
+  4); worktree option typed, wired with 3c; shutdown cancels every live
+  session + aborts the pump; HostRuntime::take_fanin_rx moves the
+  receiver into the pump (a closed channel takes its place).
+- The kernel plumbing: AgentLoop.permission is RwLock-backed with
+  permission()/set_permission() (the set_provider precedent — the
+  per-session swap is applied post-build, race-free before the task
+  starts); spawn_agent_shared's 11th param permission: Option<
+  PermissionPolicy> (None = the factory default �� every pre-3a.5
+  caller); HostSpawner::spawn_with_parent FORWARDS its 2c.5 permission
+  param (the discarded-param review forward is closed).
+- THE FREE GATE (the step's real discovery): the engine's git fixtures
+  exposed that NoPolicy's gate:None falls back to the workflow read
+  (dispatch.rs :255-258), which refuses mutation tools in Complete —
+  and UnwiredWorkflow.allowed_tools ALSO returns Complete. First
+  attempt (NoPolicy answers ToolFilter::Free unconditionally) broke 5
+  kernel tests that model WORKFLOW agents riding that fallback. The
+  landed design: NoPolicy gains `ungated: bool` (default false — the
+  old semantics everywhere) + NoPolicy::ungated(); the new
+  FreePolicyFactory builds NoPolicy::with_spec(spec).ungated() and the
+  ENGINE sets it on its factory (the app keeps its wiring). SUBTLETY:
+  factory.rs :1194's build_policy fallback attaches the NON-ungated
+  coding default on error — the factory therefore falls back to the
+  coding-default spec ITSELF (never errors). ToolFilter::Free (allows()
+  early-return true after the write_review_report hard rule) is the
+  gate; the ADVERTISE side still falls back to UnwiredWorkflow's
+  Complete schema (the mock ignores schemas; real-provider free
+  advertisement is a 3b polish — documented forward).
+- Tests (headless.rs, the ScriptedLlm mock + 8): run_to_completion_
+  mock_provider, two_subscribers_both_receive, closed_session_error_
+  code, shutdown_leaves_no_tasks (the session handle holds a bus-sender
+  clone — dropped before the Closed assertion), ask_user_without_
+  subscriber_answers_constant (zero subscribers proven via the mock's
+  call counter — no subscriber ever created), override_permissions_
+  runs_merge_push_without_approval (git merge → ApprovalBypassed{git,
+  core_op}, NO ApprovalRequest), approve_via_api_prompts_and_honours_
+  decision (ApproveViaApi+ApproveEachAction → ApprovalRequest →
+  Approve resolves → executed), free_agent_writes_no_plans (the
+  sandbox refusal + nothing lands under .coding/plans).
+- In-flight repairs: expect_err needed Engine: Debug → match; the mock
+  returns crate::error::Result + Box::pin (the factory MockProvider's
+  exact shape); a killed run's zombie exe locked the link (Stop-Process
+  between runs); a shutdown test hung on the session's sender clone.
+- The battery at the final tree: the module 15/15 + test -p mnemo
+  (test_exit=0, 2726) + --features browser,embeddings (feat_exit=0,
+  2753) + --workspace (ws_exit=0, 3073) + build --workspace
+  (build_exit=0); the goldens trio in-suite; clippy: ZERO sites in
+  src/headless/** and zero NEW sites (dispatch :1312/:1317/:1353 +
+  loop_impl :279/:371 are pre-existing storm, outside this step's
+  hunks).
+- Forwards: history/snapshot/stats + the TurnOutcome extensions = 3a.6;
+  the worktree option + HostToolResult/PolicyAnswer arms = 3c; the
+  policy registry + the builder's full surface = job 4; the free
+  ADVERTISE surface + memory/index/embedder consumption = 3b.

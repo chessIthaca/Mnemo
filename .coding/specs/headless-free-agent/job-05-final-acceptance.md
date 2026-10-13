@@ -327,3 +327,38 @@ as the public API). Type list first, then file-by-file rewrites
   `#[ignore]` DROPPED in this commit — the boundary ENFORCES from
   d7ff39e's tree forward); battery `cargo test --workspace` exit 0
   (83 integration; the app crate compiles every rewritten path).
+
+### 5.5 D5 — the Engine core for the app: the STOP-SPLIT EXECUTED (2026-10-13)
+
+The master's :770-772 rule fired. Probe (tree 5d97bc1) found the
+§5.9.10 :747-753 unification item is ONE coherent design question, not
+a mechanical landing, with two blockers:
+
+1. **The second-brain problem.** `Engine::brain()` is `pub(crate)`
+   (engine.rs:138) — an Engine constructed app-side builds its OWN
+   brain. "IpcState holds an Engine" as specced would fork the app into
+   two brain halves sharing only the memory store (the D7
+   `.memory_store` seam, engine.rs:113); the app's live config Arc (the
+   brain.config tokio-Mutex the GUI's classifier/rewire legs flip) is
+   NOT reachable from an Engine today. Doing it right needs a NEW
+   design decision — a pub brain-injection seam on EngineBuilder
+   (mirroring `.memory_store`/`.shared_resources`) or a documented
+   deliberate two-lane architecture.
+2. **The console rebuild exceeds the threshold.** console.rs is 2,733
+   lines with its own AgentManager/AgentLoopFactory/HostRuntime loop
+   wiring (:33-41, :1180, :1216, :1497-1501) — the rebuild alone is
+   ~3k+ lines of the hairiest app file.
+
+Landing half of it (an Engine handle with no consumer) would add dead
+surface — a certain review finding. **Filed as backlog
+`#51f3be28-c726-4599-a16a-c3364465b34d`** with the full recipe: the
+probed seams (main.rs :393/:459-474, console.rs :1180, EngineOptions
+types.rs:60-98, the headless surface it would serve), the fix direction
+(brain-share seam → IpcState field → one proving consumer → console in
+slices), and the acceptance (boundary scan stays green, workspace
+battery, the fixtures).
+
+The G10 acceptance (§7 row 34) does NOT block on this: its three legs
+are the no-default build (D1 ✓), the boundary test (D4 ✓, enforcing),
+and "GUI + console behave as before" (the battery, green at 5d97bc1 —
+no code changed in D5, so that battery state stands).

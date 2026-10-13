@@ -224,8 +224,9 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
     (§E deviation 2 — the tauri-tree proof's shape).
   - `tauri_uses_only_public_api` (`#[ignore]`d until D4): walks
     src-tauri/src production sources, `#[cfg(test)]` items stripped
-    by the twin of the lib-side stripper (src/lib.rs:113, copied
-    verbatim + documented to keep in sync deliberately), line
+    by the twin of the lib-side stripper (the cfg(test) `boundary`
+    module in src/lib.rs, copied verbatim + documented to keep in
+    sync deliberately), line
     comments exempt (docs may NAME a path while explaining a
     migration), asserting NO `mnemo::agent::`/`mnemo::runtime::`/
     `mnemo::host::` tokens — `mnemo::app::`/`mnemo::headless::`/root

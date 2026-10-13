@@ -336,6 +336,12 @@ pub struct AgentLoopFactory {
     /// byte-golden). The Engine's SpawnOptions (3a) supplies per-agent
     /// selections at spawn; the workflow path never sets one.
     tool_selection: Option<ToolSelection>,
+    /// The steering counters every built loop shares (2c.4/G4, §5.9.4):
+    /// one instance per factory, cloned into each loop via
+    /// `AgentLoop::with_steering` — the de-globalized replacement for the
+    /// deleted process-wide `SteeringStats::shared()` singleton. Read by
+    /// the IPC layer via [`steering`](Self::steering).
+    steering: Arc<crate::agent::steering_stats::SteeringStats>,
     /// The shared headless debug browser. Lazily spawned on first tool call;
     /// the IPC layer injects the *same* `Arc` (via [`browser_slot`]) so the
     /// right-panel Browser tab and the agent drive one browser. Defaults to a
@@ -403,6 +409,14 @@ pub struct AgentLoopFactory {
 }
 
 impl AgentLoopFactory {
+    /// The factory's steering counters (2c.4/G4) — the instance-scoped
+    /// replacement for the deleted process-wide singleton. The IPC
+    /// `get_steering_stats` command reads this; every loop this factory
+    /// builds reports here.
+    pub fn steering(&self) -> &Arc<crate::agent::steering_stats::SteeringStats> {
+        &self.steering
+    }
+
     /// Create a factory holding the shared, stateless deps.
     ///
     /// Every subsequent [`build`](Self::build) clones the shared deps and
@@ -457,6 +471,7 @@ impl AgentLoopFactory {
             safety_rules,
             safety_mode,
             plans_dir,
+            steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
             vision: SwappableVision::new(vision),
             // The provider slot starts populated with the initial provider so
             // the `memory_consolidate` tool can run full extraction on its
@@ -1129,7 +1144,10 @@ impl AgentLoopFactory {
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).
-        .with_plans_dir(plans_dir.clone());
+        .with_plans_dir(plans_dir.clone())
+        // G4 (2c.4): every loop this factory builds shares its steering
+        // counters — the instance-scoped metric.
+        .with_steering(Arc::clone(&self.steering));
 
         // 2b.2: the agent's policy comes from the app-side policy factory
         // (master-spec :266-269) — the kernel never names the app policy
@@ -1989,6 +2007,24 @@ mod tests {
     /// Build a factory over a temp dir with a mock provider + in-memory memory.
     fn make_factory(dir: &std::path::Path) -> AgentLoopFactory {
         make_factory_with(dir, None)
+    }
+
+    /// G4 (2c.4, §5.9.4; acceptance row 28): the steering counters are
+    /// factory-scoped — the process-wide `SteeringStats::shared()`
+    /// singleton is deleted (any survivor fails to compile, the
+    /// tripwire). Two factories must never share one counter set, and a
+    /// fresh factory's set starts zeroed.
+    #[test]
+    fn two_factories_have_disjoint_steering_stats() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = make_factory(dir_a.path());
+        let b = make_factory(dir_b.path());
+        assert!(!Arc::ptr_eq(a.steering(), b.steering()));
+        assert_eq!(
+            b.steering().snapshot(),
+            crate::agent::steering_stats::SteeringStats::new().snapshot(),
+        );
     }
 
     /// Build a factory with an optional vision model (to exercise the

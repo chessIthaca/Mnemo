@@ -448,7 +448,7 @@ impl AgentLoop {
                     &self.graph,
                     &tc.name,
                     pattern,
-                    crate::agent::steering_stats::SteeringStats::shared(),
+                    &self.steering,
                     agent_id,
                 ) {
                     return (redirect, Vec::new());
@@ -469,7 +469,7 @@ impl AgentLoop {
         if tc.name == "file_edit" {
             if let Some(path) = parsed_call.arguments.get("path").and_then(|v| v.as_str()) {
                 if let Some(redirect) = file_edit_redirect(
-                    crate::agent::steering_stats::SteeringStats::shared(),
+                    &self.steering,
                     agent_id,
                     path,
                 ) {
@@ -483,7 +483,7 @@ impl AgentLoop {
         // whole call — nothing executes, so nothing writes.
         if tc.name == "multi_edit" {
             if let Some(redirect) = multi_edit_redirect(
-                crate::agent::steering_stats::SteeringStats::shared(),
+                &self.steering,
                 agent_id,
                 &parsed_call.arguments,
             ) {
@@ -728,7 +728,7 @@ impl AgentLoop {
         buffered: &mut Vec<AgentCommand>,
         sink: OutputSink,
     ) -> ToolResult {
-        let steering = crate::agent::steering_stats::SteeringStats::shared();
+        let steering = &self.steering;
         steering.observe_call(agent_id, &parsed_call.name);
         let tool_fut = self.tools.dispatch_streaming(parsed_call, sink);
         tokio::pin!(tool_fut);

@@ -141,6 +141,12 @@ pub struct AgentLoop {
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
+    /// The steering counters this loop reports to (2c.4/G4): injected by
+    /// the factory via `with_steering` so every loop the same factory
+    /// builds shares one instance — the process-wide singleton is
+    /// deleted. A loop built without wiring keeps its own fresh,
+    /// isolated set.
+    pub(crate) steering: Arc<crate::agent::steering_stats::SteeringStats>,
     /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
     /// the loop never names the app workflow type, and every consult rides
     /// the trait's opaque representations (the state token, the completion
@@ -834,6 +840,18 @@ impl AgentLoop {
         )
     }
 
+    /// Wire the FACTORY's steering counters (2c.4/G4) into this loop so
+    /// every loop the same factory builds reports to one instance-scoped
+    /// set — the replacement for the deleted process-wide
+    /// `SteeringStats::shared()` singleton.
+    pub fn with_steering(
+        mut self,
+        steering: Arc<crate::agent::steering_stats::SteeringStats>,
+    ) -> Self {
+        self.steering = steering;
+        self
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -857,6 +875,7 @@ impl AgentLoop {
             )),
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
+            steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
             tools,
             workflow,
             sandbox,

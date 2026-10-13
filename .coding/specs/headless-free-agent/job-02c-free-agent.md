@@ -437,3 +437,36 @@ D4 where they differ):
   goldens trio 3/3. Headless build N/A at 2c.3 (the `headless` feature
   arrives with the headless API in a later job; the step file carries no
   no-default-features command).
+Amendment (2027-01-14, step 2c.4 — the landed D5/G4 picks):
+- The deletion: `SteeringStats::shared()` + its SHARED `OnceLock` are GONE
+  (steering_stats.rs) — the tripwire holds: any survivor fails to compile
+  (the battery compiled with the deletion; the grep `SteeringStats::shared`
+  returns only history/docs). The struct doc re-worded: factory-scoped, not
+  process-wide. The orphaned `OnceLock` import was caught pre-build by a
+  literal probe; the orphaned `Arc` was caught by the battery (one burned
+  cycle) — both trims landed with the deletion (the double-cycle lesson is
+  queued as backlog 1ead68c3, a deletion-hygiene rule for agent.md).
+- The factory (D5's letter): `AgentLoopFactory` gains private
+  `steering: Arc<SteeringStats>` built once in `new()` + the pub accessor
+  `steering()`; the build chain threads it into every loop via the new
+  `AgentLoop::with_steering` builder (chained after `with_plans_dir`) —
+  one counter set per factory instance, shared by all its loops.
+- The loop: `AgentLoop.steering` (pub(crate)), default a fresh isolated
+  set in `from_config` (direct test constructions stay unwired by design);
+  the four dispatch reads flipped off the singleton to `&self.steering`
+  (the three redirect gates :451/:472/:486 + the :731 rebind — the local
+  `steering` binding survives, rebound to the field).
+- The trace reroute: `get_steering_stats` now takes
+  `State<'_, IpcState>` and reads `state.runtime.factory` — the app
+  instance's factory (the 3a Engine reroute noted in D5 lands with the
+  Engine). No factory (the brain failed to build) → a zeroed fresh
+  snapshot, same shape; the IPC surface + the frontend mirror are
+  unchanged (state injection is server-side).
+- The test (row 28's kernel form):
+  `two_factories_have_disjoint_steering_stats` in factory.rs — two
+  `make_factory` builds never share a counter set (`!Arc::ptr_eq`) and a
+  fresh factory's snapshot equals a virgin one (the Snapshot derives
+  PartialEq/Debug, the zeroed-equality assert compiles).
+- The battery green: default + browser,embeddings + the goldens trio 3/3
+  + workspace test/build + clippy --workspace --all-targets -- -D
+  warnings.

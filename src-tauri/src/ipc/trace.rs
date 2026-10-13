@@ -120,12 +120,19 @@ pub async fn set_trace_logging(state: State<'_, IpcState>, enabled: bool) -> Res
 /// the marker's target tools (the nudge changed the agent's next choice).
 ///
 /// Mirrors the read-only stats commands (`get_index_progress`,
-/// `get_trace_logging`): stateless over the process-wide
-/// [`mnemo::agent::steering_stats::SteeringStats::shared`] counters — no
-/// `spawn_blocking` needed (a single mutex snapshot, no I/O, no shared-lock
-/// contention with the request path beyond one counter lock).
+/// `get_trace_logging`): a single mutex snapshot over the app instance's
+/// factory-owned counters (2c.4/G4 — the process-wide singleton is
+/// deleted; the counters moved onto the factory, injected into every
+/// loop it builds) — no `spawn_blocking` needed (no I/O, no shared-lock
+/// contention with the request path beyond one counter lock). When no
+/// factory exists (the brain failed to build) nothing was ever observed:
+/// zeros, the same snapshot shape.
 #[tauri::command]
-pub fn get_steering_stats() -> Result<mnemo::agent::steering_stats::SteeringStatsSnapshot, IpcError>
-{
-    Ok(mnemo::agent::steering_stats::SteeringStats::shared().snapshot())
+pub fn get_steering_stats(
+    state: State<'_, IpcState>,
+) -> Result<mnemo::agent::steering_stats::SteeringStatsSnapshot, IpcError> {
+    Ok(match state.runtime.factory.as_ref() {
+        Some(factory) => factory.steering().snapshot(),
+        None => mnemo::agent::steering_stats::SteeringStats::new().snapshot(),
+    })
 }

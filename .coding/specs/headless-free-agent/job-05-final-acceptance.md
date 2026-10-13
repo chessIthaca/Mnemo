@@ -433,3 +433,43 @@ the facade block, the example header).
 Leak check (§8 tail): `git worktree list` unchanged; no `alf/*`
 branches (the deviation stands — the arc runs on wt/mnemo);
 `git status --short` clean at the boundary commit.
+
+### 5.7 D7 — review rounds to PASS → the close (landed 2026-10-13)
+
+- THREE review rounds over the job-5 delta (base 10ccef4), all
+  reviewer-authored under .coding/reviews/:
+  - Round 1 (2026-10-13-job5-final-acceptance-g10.md): FINDINGS
+    (1 high, 4 low) — all five verified real, all fixed in 41fd030.
+    H1 (high): the example's CI-run claim was false — corrected to
+    PENDING (the example header + §F 5.2) and the gap FILED as
+    backlog #c96a96ca (wiring the round trip needs a provider seam
+    the example can reach — the stop-split discipline, not a silent
+    drop). L1: the §9 name-audit correction annotated in-place where
+    a reader finds it (§B fact 10 + §E.3). L2: the boundary scan
+    broadened to the bare/alias forms (7 banned tokens — the `use
+    mnemo as`/grouped evasion routes closed) + a string-aware `//`
+    split. L3: the stripper citation made module-level in
+    tests/boundary.rs. L4: the facade lead sentence scoped to name
+    the nine module aliases.
+  - Round 2 (-round2.md): FINDINGS (0 high, 1 low) — F1: L3 was
+    half-landed (§F 5.3 still carried the stale `src/lib.rs:113`
+    pointer; the 41fd030 message overclaimed "both citations").
+    Fixed in e979afa; the battery re-run green.
+  - Round 3 (-round3.md): PASS — F1 verified on all three criteria,
+    the stale pointer surviving only inside the immutable review
+    records, no new defects in either fix delta.
+- Stop-splits standing at close (all filed + tracked, none silently
+  dropped): D5 the app-unification (#51f3be28); D6 the clippy gate
+  leg (#5da6c9b2 — 183 pre-existing lib lints, none in the job-5
+  delta); D7 the example's configured-run CI wiring (#c96a96ca).
+- Battery at close: cargo test --workspace exit 0 (re-run after the
+  F1 fix; both crates; zero warnings by construction under
+  #![deny(warnings)]).
+- CLOSE: job 5 lands the G10 proof — the kernel/app/headless feature
+  lattice, the second-consumer example, the live boundary
+  enforcement, the src-tauri public-API route, the Engine core at
+  the app's holdouts, the §7 rows 1-35 sweep, the §8 battery, the
+  §9 audit. The master umbrella closes at 11/11
+  (.coding/plans/694f5a97.md); the completion record is
+  .coding/knowledge/spec/2027-01-11-headless-free-agent-master-arc-complete-g1-g10-1.md
+  — the tree clean on wt/mnemo past this commit.

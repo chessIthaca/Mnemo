@@ -566,6 +566,7 @@ impl AgentLoop {
                         stop_signal,
                         &mut buffered,
                         output_sink.clone(),
+                        fanin_tx,
                     )
                     .await;
                 return (result, buffered);
@@ -648,6 +649,7 @@ impl AgentLoop {
                     stop_signal,
                     &mut buffered,
                     output_sink.clone(),
+                    fanin_tx,
                 )
                 .await;
             return (result, buffered);
@@ -670,6 +672,7 @@ impl AgentLoop {
                 stop_signal,
                 &mut buffered,
                 output_sink.clone(),
+                fanin_tx,
             )
             .await;
         (result, buffered)
@@ -735,6 +738,104 @@ impl AgentLoop {
     /// - On a `Suggestion`/`Prompt` (steer), the command is buffered and the
     ///   loop continues re-polling the pinned future (the steer is re-injected
     ///   by the caller after the tool completes).
+    /// G2 (§5.9.2): the kernel↔host round-trip for one host-tool call —
+    /// emit [`AgentEvent::HostToolCall`], then await the host's answer with
+    /// the same interrupt semantics as [`Self::dispatch_with_interrupt`]:
+    /// an Interrupt/Cancel arriving mid-wait resolves the call as an error
+    /// result (the stop signal set, the turn stops right after it), any
+    /// other command is buffered for the turn loop; a closed command
+    /// channel stops command polling but the answer still settles the call.
+    /// The per-tool timeout resolves to an error result and the turn
+    /// CONTINUES — an absent host can never hang the agent (R4) — and the
+    /// answer (or the timeout error) folds back through the normal
+    /// `ToolResult` path, so output compaction and the read cache treat it
+    /// like any tool result.
+    async fn dispatch_host_tool(
+        &self,
+        parsed_call: &ParsedToolCall,
+        agent_id: AgentId,
+        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
+        stop_signal: &mut Option<crate::agent::StopReason>,
+        buffered: &mut Vec<AgentCommand>,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
+        timeout_ms: u64,
+    ) -> ToolResult {
+        let (responder_tx, mut responder_rx) =
+            oneshot::channel::<crate::runtime::channels::HostToolOutcome>();
+        let send_failed = fanin_tx
+            .send((
+                agent_id,
+                AgentEvent::HostToolCall {
+                    call_id: parsed_call.id.clone(),
+                    name: parsed_call.name.clone(),
+                    args: parsed_call.arguments.clone(),
+                    responder: responder_tx,
+                },
+            ))
+            .await
+            .is_err();
+        if send_failed {
+            // The engine's pump is gone — no host will ever see this
+            // call. An error result (not a panic): the turn continues and
+            // the model can react.
+            return ToolResult::error("the host event channel is closed (the session is gone)");
+        }
+        // ONE sleep, pinned, selected on each loop — a buffered command
+        // must never restart the timeout.
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        tokio::pin!(sleep);
+        let timeout_error = || {
+            ToolResult::error(format!(
+                "host tool '{}' timed out after {} ms without a result — the call was abandoned and the turn continues",
+                parsed_call.name, timeout_ms
+            ))
+        };
+        let settle = |outcome: std::result::Result<
+            crate::runtime::channels::HostToolOutcome,
+            oneshot::error::RecvError,
+        >| match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => ToolResult::error(error),
+            // The host's responder dropped without an answer (the engine
+            // dropped mid-call) — the same abandoned-call semantics as the
+            // timeout.
+            Err(_) => timeout_error(),
+        };
+        loop {
+            tokio::select! {
+                outcome = &mut responder_rx => return settle(outcome),
+                _ = &mut sleep => return timeout_error(),
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd @ (AgentCommand::Interrupt | AgentCommand::Cancel)) => {
+                        let (reason, interrupted_msg) = if matches!(cmd, AgentCommand::Interrupt) {
+                            (
+                                crate::agent::StopReason::Interrupt,
+                                "interrupted while awaiting the host tool's result",
+                            )
+                        } else {
+                            (
+                                crate::agent::StopReason::Cancel,
+                                "cancelled while awaiting the host tool's result",
+                            )
+                        };
+                        *stop_signal = Some(reason);
+                        return ToolResult::error(interrupted_msg);
+                    }
+                    Some(other) => buffered.push(other),
+                    None => {
+                        // The command channel closed — interrupts can no
+                        // longer arrive, but the host's answer still can:
+                        // settle on the responder or the timeout.
+                        return tokio::select! {
+                            outcome = &mut responder_rx => settle(outcome),
+                            _ = &mut sleep => timeout_error(),
+                        };
+                    }
+                },
+            }
+        }
+    }
+
     /// - On channel close (`None`), the command channel is no longer polled —
     ///   the tool future is awaited to completion and its result returned
     ///   (not a synthetic error; see the arm's inline comment).
@@ -757,7 +858,31 @@ impl AgentLoop {
         stop_signal: &mut Option<crate::agent::StopReason>,
         buffered: &mut Vec<AgentCommand>,
         sink: OutputSink,
+        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
     ) -> ToolResult {
+        // G2 (§5.9.2): a host tool's execution is a round-trip, not an
+        // in-process call — the shim's `execute` never runs; dispatch
+        // emits the HostToolCall event and awaits the host's answer (or
+        // the per-tool timeout). The branch precedes the steering metrics
+        // on purpose: an external execution is outside the steering-lane
+        // contract.
+        if let Some(timeout_ms) = self
+            .tools
+            .get(&parsed_call.name)
+            .and_then(|t| t.host_tool_timeout_ms())
+        {
+            return self
+                .dispatch_host_tool(
+                    parsed_call,
+                    agent_id,
+                    cmd_rx,
+                    stop_signal,
+                    buffered,
+                    fanin_tx,
+                    timeout_ms,
+                )
+                .await;
+        }
         let steering = &self.steering;
         steering.observe_call(agent_id, &parsed_call.name);
         let tool_fut = self.tools.dispatch_streaming(parsed_call, sink);

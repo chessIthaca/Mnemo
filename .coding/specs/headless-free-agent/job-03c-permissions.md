@@ -294,3 +294,43 @@ PASS, findings fixed, commit `feat(3c.N)` on `wt/mnemo`.
   `policy_hook_into_serializable_extracts_sender`,
   `policy_hook_wire_vocabulary` (channels.rs, 24/24). Battery: workspace
   green, exit 0 (3010 + 51 + integration).
+### 3c.2 (D2) — G2 host tools end-to-end — landed 2027-01-19
+
+- **The registration path (deviation from §A's build-threading sketch):**
+  host tools ride the registry's shared dynamic slot (the MCP
+  late-registration path — `ToolSlot` is interior-mutable and the registry
+  sits behind an `Arc<ToolRegistry>` on the loop, so no `&mut` exists
+  post-build). `spawn_agent_shared` gained ONE param (`host_tools:
+  Vec<Arc<dyn Tool>>`), zero build-variant churn; a slot-pushed tool
+  appears immediately (a shim has no deferred group — no reveal gating).
+  D4 NOTE: slot-resident host tools are outside `unregister`'s per-name
+  carve-out (it touches only the main map), so ToolSelection's exclude
+  for host tools filters ENGINE-side at push time (D4's land).
+- **The marker (deviation from the step file's `host_tool() -> bool`):**
+  `Tool::host_tool_timeout_ms() -> Option<u64>` — ONE defaulted trait
+  method answers both dispatch questions (is it a host tool + how long
+  to wait); the dispatch branch is a single registry lookup.
+- `dispatch_with_interrupt` gained `fanin_tx` + the branch at its HEAD —
+  deliberately BEFORE the steering `observe_call`: an external execution
+  is outside the steering-lane contract. `dispatch_host_tool` mirrors the
+  interrupt semantics: ONE pinned sleep (a buffered command must never
+  restart the timeout), Interrupt/Cancel → error result + stop signal +
+  buffered passthrough, a closed command channel settles on the
+  answer/timeout only.
+- **Two G2 mechanisms, documented apart:** `Engine::register_tool(Arc<dyn
+  Tool>)` = Rust in-process custom tools (Host group, `execute` runs
+  normally — NOT a round-trip); `SpawnOptions.host_tools` specs = the
+  round-trip shims. Duplicate names within the spawn's combined list
+  refuse the spawn (engine-side check); the slot push also checks
+  `contains_name`; a name colliding with a kernel built-in is the
+  caller's contract (the registry's main map wins the `get` lookup, so a
+  shadowing shim is dead weight + a duplicate schema).
+- `SafetyLevel` gained serde (`auto_run`/`needs_approval`) — the wire form
+  of `HostToolSpec.safety`.
+- Row-31 test (`host_tool_round_trip_and_timeout_row_31`):
+  `tokio::join!(run_to_completion, answer)` — concurrent immutable session
+  borrows (AgentSession is NOT Clone; both entry points are `&self`);
+  leg 1 asserts the mid-flight `snapshot().pending` reports
+  `PendingInteraction::HostToolCall` (the §5.9.5 coverage D1 deferred
+  here), leg 2 the 150 ms timeout error reaching the model with the turn
+  still finishing. Battery: 3012 + 52 + integration, exit 0.

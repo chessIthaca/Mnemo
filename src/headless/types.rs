@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::policy::PermissionPolicy;
 pub use crate::host::notifier::HostEvent;
 pub use crate::runtime::channels::SessionLimits;
+use crate::headless::host_tools::HostToolSpec;
 use crate::runtime::channels::{AgentId, Approval, PolicyAnswer, SerializableAgentEvent, UserAnswer};
 use crate::tool::ToolResult;
 use crate::workspace::Workspace;
@@ -92,9 +93,8 @@ pub struct EngineOptions {
     pub auto_install_embedder: bool,
 }
 
-/// Session spawn options (§5.3 :303-314, the 3a subset — the
-/// `guardrails` / `host_tools` / `external_policy` fields are 3c's
-/// additive land).
+/// Session spawn options (§5.3 :303-314; 3a's core + 3c's `host_tools` —
+/// the `guardrails` / `external_policy` fields are the remaining 3c land).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SpawnOptions {
     /// The session's display name.
@@ -114,6 +114,14 @@ pub struct SpawnOptions {
     /// `wall_clock_ms` enforced; hitting one ends the turn with
     /// `FinishReason::LimitReached` and parks the session.
     pub limits: Option<SessionLimits>,
+    /// Host tools registered for THIS session (G2, §5.9.2) — the model
+    /// sees them like any tool, but their execution is a kernel↔host
+    /// round-trip: dispatch emits `HostToolCall` and awaits the
+    /// `HostToolResult` command (or the per-tool timeout — default
+    /// 120 s). Never name one like a kernel tool (the registry's main
+    /// map wins the lookup, so a shadowing shim is dead weight).
+    #[serde(default)]
+    pub host_tools: Vec<HostToolSpec>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

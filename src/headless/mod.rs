@@ -13,6 +13,7 @@
 pub mod codegraph_api;
 pub mod engine;
 pub mod error;
+pub mod host_tools;
 pub mod memory_api;
 pub mod session;
 pub mod stats;
@@ -21,6 +22,7 @@ pub mod types;
 pub use codegraph_api::{CodegraphApi, CodegraphGraph, CodegraphStatus};
 pub use engine::{Engine, EngineBuilder};
 pub use error::EngineError;
+pub use host_tools::{HostTool, HostToolSpec, HOST_TOOL_DEFAULT_TIMEOUT_MS};
 pub use memory_api::{
     MemoryApi, MemoryCounts, MemoryDebugOverview, MemoryDebugWire, MemoryIndexStatus,
     ScoredMemoryDebugWire,

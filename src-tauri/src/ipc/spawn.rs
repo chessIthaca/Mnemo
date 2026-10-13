@@ -56,6 +56,8 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
         None,
         // 3a.7 (G7): the IPC path sets no session limits
         None,
+        // 3c (G2): the IPC path registers no host tools
+        vec![],
     )
     .await?;
 
@@ -190,6 +192,8 @@ pub(crate) async fn spawn_run_all_agent(
         None,
         // 3a.7 (G7): the IPC path sets no session limits
         None,
+        // 3c (G2): the IPC path registers no host tools
+        vec![],
     )
     .await
 }
@@ -289,6 +293,8 @@ impl ParentAwareSpawner for IpcSpawner {
         None,
         // 3a.7 (G7): subagents set no session limits
         None,
+        // 3c (G2): subagents register no host tools
+        vec![],
     )
     .await?;
         // Emit a PromptDispatched event for the spawned agent so its task

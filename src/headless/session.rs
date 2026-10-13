@@ -46,6 +46,12 @@ pub(crate) struct EngineInner {
     /// Policy-hook answer responders by hook id (3c/G6 tier 3) — the pump
     /// stashes them; `SessionCommand::PolicyAnswer` resolves.
     pub(crate) pending_hooks: Mutex<HashMap<String, oneshot::Sender<PolicyAnswer>>>,
+    /// Engine-registered Rust custom tools (3c/G2, §5.9.2) — the Host
+    /// group, joined into every subsequent spawn's registry (in-process
+    /// execution like any kernel tool — NOT a spec-based host tool; no
+    /// round-trip). std Mutex: the register is sync, the lock is never
+    /// held across an await.
+    pub(crate) host_tools: std::sync::Mutex<Vec<std::sync::Arc<dyn crate::tool::Tool>>>,
     /// Parked sessions (G7, §5.9.7): agents whose Finished{LimitReached}
     /// the pump saw — every later Prompt errors `session_parked`.
     /// Engine-scoped, not per-handle (review round-1 F3): the pump is

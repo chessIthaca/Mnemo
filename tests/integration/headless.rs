@@ -70,6 +70,7 @@ fn public_types_serde_roundtrip() {
             wall_clock_ms: Some(600_000),
             ..SessionLimits::default()
         }),
+        host_tools: Vec::new(),
     });
 
     // SessionCommand — every 3a variant.

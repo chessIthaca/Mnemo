@@ -42,7 +42,11 @@ pub enum ToolCategory {
 }
 
 /// Whether a tool runs automatically or needs human approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde since 3c — a [`HostToolSpec`](crate::headless::HostToolSpec)
+/// carries it on the wire (snake_case: `auto_run` / `needs_approval`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SafetyLevel {
     /// Runs without prompting (read-only tools).
     AutoRun,
@@ -360,6 +364,19 @@ pub trait Tool: Send + Sync {
     ///
     /// Default `None` — always advertised.
     fn deferred_group(&self) -> Option<&str> {
+        None
+    }
+
+    /// The host-tool marker (G2, §5.9.2): `None` (the default) — a normal
+    /// kernel tool, executed in-process via [`Tool::execute`]. `Some(ms)` —
+    /// a **host tool** whose execution lives outside the kernel: dispatch
+    /// never calls `execute`, it emits [`AgentEvent::HostToolCall`] and
+    /// awaits the host's answer for `ms` milliseconds (the shim's
+    /// effective timeout — the 120 s default when the spec carries none),
+    /// then resolves to an error result so the turn continues. One method
+    /// answers both questions (is it a host tool + how long to wait) to
+    /// keep the dispatch branch a single lookup.
+    fn host_tool_timeout_ms(&self) -> Option<u64> {
         None
     }
 

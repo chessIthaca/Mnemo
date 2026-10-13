@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, Mutex};
 use crate::agent::policy::PermissionPolicy;
 use crate::config::Config;
 use crate::headless::error::EngineError;
+use crate::headless::host_tools::HostTool;
 use crate::headless::session::{pump_task, AgentSession, EngineInner};
 use crate::headless::stats::{EngineStats, TraceApi};
 use crate::headless::types::{
@@ -118,6 +119,20 @@ impl Engine {
         EngineBuilder::new(opts)
     }
 
+    /// Register a Rust-side custom tool (G2, §5.9.2) — added to the Host
+    /// group for every SUBSEQUENT spawn, executing in-process like any
+    /// kernel tool (NOT a spec-based host tool — no kernel↔host
+    /// round-trip; `execute` runs normally). Duplicate names against
+    /// another engine tool or a spawn's spec shims refuse the spawn (the
+    /// spawn-side check); never name one like a kernel tool.
+    pub fn register_tool(&self, tool: std::sync::Arc<dyn crate::tool::Tool>) {
+        self.inner
+            .host_tools
+            .lock()
+            .expect("host tools lock poisoned")
+            .push(tool);
+    }
+
     /// Spawn a session (§5.3 :303-314): a parentless agent with its own
     /// plans dir, running under the resolved permission policy — the
     /// `SpawnOptions::permissions` override, else the engine default
@@ -136,6 +151,29 @@ impl Engine {
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
+        // 3c/G2 (§5.9.2): the session's host tools — engine-registered
+        // Rust tools plus the per-spawn spec shims. Duplicate names within
+        // the combined list refuse the spawn; a name colliding with a
+        // kernel built-in is the caller's contract (the registry's main
+        // map wins the dispatch lookup).
+        let mut host_tools: Vec<std::sync::Arc<dyn crate::tool::Tool>> = self
+            .inner
+            .host_tools
+            .lock()
+            .expect("host tools lock poisoned")
+            .clone();
+        host_tools.extend(opts.host_tools.into_iter().map(HostTool::new));
+        {
+            let mut seen = std::collections::HashSet::new();
+            for tool in &host_tools {
+                if !seen.insert(tool.name().to_string()) {
+                    return Err(EngineError::spawn_failed(format!(
+                        "duplicate host tool name '{}'",
+                        tool.name()
+                    )));
+                }
+            }
+        }
         let (agent, _) = spawn_agent_shared(
             self.inner.host.factory.clone(),
             self.inner.host.manager.clone(),
@@ -153,6 +191,8 @@ impl Engine {
             opts.resume.map(|transcript| transcript.messages),
             // 3a.7 (G7, §5.9.7): the per-session limits.
             opts.limits,
+            // 3c/G2 (§5.9.2): the session's host tools.
+            host_tools,
         )
         .await
         .map_err(EngineError::spawn_failed)?;
@@ -391,6 +431,7 @@ async fn start_inner(
         pending_questions: Mutex::new(HashMap::new()),
         pending_host_tools: Mutex::new(HashMap::new()),
         pending_hooks: Mutex::new(HashMap::new()),
+        host_tools: std::sync::Mutex::new(Vec::new()),
         parked: Mutex::new(HashSet::new()),
         tallies: std::sync::Mutex::new(HashMap::new()),
     });

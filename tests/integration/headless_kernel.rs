@@ -73,13 +73,14 @@ use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    HostEvent, PendingInteraction, SessionCommand, SessionEvent, SessionLimits, SpawnOptions,
-    Transcript,
+    HostEvent, HostToolSpec, PendingInteraction, SessionCommand, SessionEvent, SessionLimits,
+    SpawnOptions, Transcript,
 };
 use mnemo::provider::{
-    Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind,
+    Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind, Role,
     ToolChoice, ToolSchema,
 };
+use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent};
 
 /// A scripted provider that RECORDS every request's message slice — the
@@ -1110,4 +1111,145 @@ async fn stats_totals_match_events() {
         "Engine::stats().savings_stats.saved_tokens_total includes the saving"
     );
     engine.shutdown().await.expect("engine shuts down");
+}
+// --- 3c.2: G2 host tools (§7 row 31) ---
+
+/// §7 row 31 (G2): a host tool is called by the scripted model, the host
+/// answers via `HostToolResult`, and the result reaches the model (the
+/// next request carries it as the tool message; `snapshot()` reports the
+/// pending call mid-flight — §5.9.5); an unanswered call (a 150 ms
+/// per-tool timeout) resolves to the timeout error result and the turn
+/// still finishes — an absent host can never hang the agent (R4).
+#[tokio::test]
+async fn host_tool_round_trip_and_timeout_row_31() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    // Leg 1: the model calls the host tool, then ends the turn on the
+    // answer. Leg 2: another call nobody answers (the 150 ms spec
+    // timeout), then the closing reply.
+    let llm = RecordingLlm::new(vec![
+        g5_tool_turn("get_weather", r#"{"city": "Oslo"}"#),
+        g5_text_turn(&["the weather is sunny"]),
+        g5_tool_turn("get_weather", r#"{"city": "Oslo"}"#),
+        g5_text_turn(&["the call timed out"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+
+    // Leg 1 — answered: the default 120 s timeout applies, but the host
+    // answers immediately.
+    let session = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![HostToolSpec {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: None,
+            }],
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (leg 1)");
+    let mut rx = session.events();
+    // Drive the turn + the answer loop concurrently — both borrow the
+    // session immutably (`run_to_completion` + `send` are `&self`), so
+    // join them; the answer loop consumes its own subscription copy.
+    let answer = async {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("events keep flowing")
+                .expect("event arrives");
+            if let SerializableAgentEvent::HostToolCall { call_id, name, .. } = ev.event {
+                assert_eq!(name, "get_weather");
+                // The pump stashed the call — the snapshot reports it
+                // mid-flight (§5.9.5: engine-local, always accurate).
+                let pending = session.snapshot().await.expect("snapshot").pending;
+                assert!(
+                    matches!(pending, Some(PendingInteraction::HostToolCall { .. })),
+                    "the snapshot reports the pending host-tool call: {pending:?}"
+                );
+                session
+                    .send(SessionCommand::HostToolResult {
+                        call_id,
+                        result: Some(ToolResult::success("sunny, 21°C".to_string())),
+                        error: None,
+                    })
+                    .await
+                    .expect("the answer resolves the pending call");
+                return;
+            }
+        }
+    };
+    let (outcome, ()) = tokio::join!(
+        session.run_to_completion("check the weather in Oslo"),
+        answer
+    );
+    let outcome = outcome.expect("leg-1 turn completes");
+    assert_eq!(outcome.final_text, "the weather is sunny");
+    // The result reached the model: the second request carries the tool
+    // message with the host's answer.
+    let reqs = llm.requests();
+    assert!(reqs.len() >= 2, "the tool call produced a second request");
+    let tool_msg = reqs[1]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("request 2 carries the host tool's result")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("sunny, 21°C"),
+        "the model sees the host's answer: {tool_msg}"
+    );
+
+    // Leg 2 — unanswered: a 150 ms per-tool timeout resolves the call as
+    // an error result; nobody answers, and the turn still finishes.
+    let session = engine
+        .spawn(SpawnOptions {
+            host_tools: vec![HostToolSpec {
+                name: "get_weather".into(),
+                description: "Get the current weather for a city".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(150),
+            }],
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (leg 2)");
+    let outcome = session
+        .run_to_completion("check the weather again — nobody will answer")
+        .await
+        .expect("leg-2 turn completes despite the unanswered call");
+    assert_eq!(outcome.final_text, "the call timed out");
+    // The timeout error reached the model: leg 2's second request names
+    // the per-tool timeout (R4 — the turn continues).
+    let reqs = llm.requests();
+    assert!(reqs.len() >= 4, "leg 2 also produced a second request");
+    let tool_msg = reqs[3]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("leg-2 request 2 carries the timeout error")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("timed out after 150 ms"),
+        "the model sees the abandoned-call error: {tool_msg}"
+    );
 }

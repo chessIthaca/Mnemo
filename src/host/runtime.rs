@@ -93,6 +93,14 @@ pub async fn spawn_agent_shared(
     // default (unlimited); Some is applied post-build via
     // [`AgentLoop::set_limits`].
     limits: Option<crate::runtime::channels::SessionLimits>,
+    // 3c/G2 (§5.9.2): the session's host tools — spec shims plus any
+    // engine-registered custom tools. Registered post-build via the
+    // registry's shared dynamic slot (interior-mutable — the registry
+    // sits behind an Arc, so there is no `&mut` to be had); each is
+    // advertised from the first request and dispatch intercepts its
+    // calls via the `host_tool_timeout_ms` marker. `vec![]` for every
+    // pre-3c caller.
+    host_tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
 ) -> Result<(AgentId, String), String> {
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
@@ -149,6 +157,22 @@ pub async fn spawn_agent_shared(
     } else {
         factory.build_with_id(agent_id)
     };
+
+    // 3c/G2 (§5.9.2): register the session's host tools into the registry
+    // via the shared dynamic slot — the late-registration path the MCP
+    // reveal machinery uses. A shim carries no deferred group, so it is
+    // advertised from the very first request, and `get` finds it for the
+    // dispatch-time round-trip. Duplicate names across the spec shims +
+    // engine-registered tools are the caller's problem (the engine checks
+    // against the registry's built-ins at spawn).
+    if !host_tools.is_empty() {
+        let slot = agent_loop.tools.dynamic_slot();
+        for tool in host_tools {
+            if !slot.contains_name(tool.name()) {
+                slot.push(tool);
+            }
+        }
+    }
 
     // Force the agent onto a specific model for every turn when one was
     // requested (the `spawn_agent` tool's `model` parameter). This overrides
@@ -634,6 +658,8 @@ impl ParentAwareSpawner for HostSpawner {
             None,
             // subagents set no session limits (3a.7)
             None,
+            // subagents register no host tools (3c/G2)
+            vec![],
         )
         .await?;
         Ok(id)
@@ -729,6 +755,8 @@ impl HostRuntime {
             None,
             // the main agent sets no session limits (3a.7)
             None,
+            // the main agent registers no host tools (3c/G2)
+            vec![],
         )
         .await
         .map_err(|e| format!("main agent spawn failed: {e}"))?;

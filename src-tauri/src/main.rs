@@ -579,6 +579,8 @@ fn main() {
                             None,
                             // 3a.7 (G7): the main agent sets no session limits
                             None,
+                            // 3c (G2): the main agent registers no host tools
+                            vec![],
                         )
                         .await
                         .expect("main agent spawn must succeed");

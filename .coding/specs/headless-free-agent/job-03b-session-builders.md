@@ -174,3 +174,89 @@ Job 3a closed the engine + session surface (review PASS at c38e7b2; master 7/11)
 - Battery: module 25/25, kernel 3006+49, features 3033+49, workspace
   3033+49+331+app suites, build green; clippy ZERO new sites in the
   3b.3 hunks (brain.rs:116 stays the documented pre-existing).
+### 3b.4 (D4) — the live Savings/Spend events — landed 2027-01-18
+
+- AgentEvent::Savings { kind, tokens_before, tokens_after, tokens_saved,
+  measured } + AgentEvent::Spend { model, lane, tokens_in, tokens_out,
+  cached_tokens } — display-only telemetry (§5.7), fanned LIVE from the
+  loop's two persistence methods at exactly the points their ledger rows
+  persist. The wire mirrors live in SerializableAgentEvent (the Savings
+  field is `lever` — `kind` collides with the enum's serde tag key, a
+  compile-caught E0277) + into_serializable arms.
+- The route: AgentLoop::event_fanin (a clone of the agent task's own
+  fan-in sender) injected at AgentTask::run entry — the ONE task body
+  every spawn path funnels through; emit_live_event is the sync-method
+  bridge (fire-and-forget tokio::spawn, the routing id from agent_id —
+  the loop's own). record_spend_row's live event is attribution-gated
+  like the ledger but NOT store-gated (the inline budget counters update
+  the same way); record_savings_event's is un-gated (the durable row is
+  the store's half alone).
+- R8 drops: the GUI forwarder drops both BEFORE the serialization/diag
+  path (no wire emit, no watchdog ring entry, no delta-batcher
+  disturbance); console render_event gets Rendered::Silent arms.
+- Test: savings_and_spend_emitted_where_persisted (src/agent/tests.rs)
+  — the store leg (row + live event co-land, the loop's own id, field
+  parity with the durable row) + the no-store leg (the live feed is
+  un-gated). Battery: workspace green, exit 0 (f31d9ca).
+
+### 3b.5 (D5) — UsageRates + the stats pull surfaces — landed 2027-01-18
+
+- src/headless/stats.rs: UsageRates { input_tok_per_s, output_tok_per_s,
+  cache_hit_ratio } (the variant-doc formulas prompt/ttft and
+  completion/generation normalized to seconds via the ×1000/ms form;
+  cache_hit_ratio = LlmUsage's cached/prompt with the zero guard), the
+  LIVE SessionStats (the pump's tally: requests, tokens in/out/
+  reasoning/cached, saved_tokens_by_kind, model_switches, current
+  model + effort, last context usage, the ttft/generation totals with
+  mean_ttft_ms/mean_output_tok_per_s), EngineStats { project_stats,
+  savings_stats, steering_snapshot } (Serialize-only —
+  SteeringStatsSnapshot has no Deserialize; a binding receives the
+  pull, never sends it back), TraceApi (list/get/clear over the
+  shared LlmRequestLog).
+- SessionEvent gains `rates: Option<UsageRates>` (serde-defaulted,
+  wire-identical when None) — the PUMP computes the rates on Usage and
+  folds the tally (the headless layer, not the runtime), so stats()
+  always equals the sum of what events() delivered. The tally lives in
+  EngineInner (std::sync — the fold is sync, stats() never awaits).
+- AgentSession::stats() (live, infallible) + stored_stats() (the
+  store's session_stats for the loop's current session id — the same
+  read the IPC's get_session_stats performs; session_closed on a gone
+  loop or no session yet, memory_disabled on Disabled);
+  Engine::stats() (project + savings aggregates via
+  factory.memory_handle() + factory.steering().snapshot();
+  memory_disabled on Disabled) + Engine::trace() (brain.trace);
+  EngineError::stats_failed added (ad02bcf).
+- Tests: usage_rates_formula + stats_totals_match_events
+  (headless_kernel.rs, both canonical) + the stored_stats durable leg
+  + the wire fixture cases (headless.rs). Three scripted-run
+  discoveries, now pinned: (a) the manual Compact's Savings lever is
+  the survival checkpoint (compaction_survival defaults ON — the
+  informational row, saved=0; the empty-region path records nothing —
+  the transcript must exceed keep_recent 6); (b) plan_scope is
+  captured at TURN ENTRY, so a create_plan turn never stamps its own
+  iterations; (c) the Spend is plan-gated and pins SILENT headlessly —
+  the registry ships no plan tools (create_plan is app-layer), so
+  every scripted turn is planless and clears the attribution; the
+  Spend fan is covered by the 3b.4 unit test, and wiring the plan
+  tools into the headless factory is later work. StepModelLlm is the
+  ModelChanged fixture (marker-based, exactly one switch). Battery:
+  workspace green, exit 0.
+
+### 3b.6 (D6) — the contract fixture + the acceptance close — landed 2027-01-18
+
+- The round-trip fixture (public_types_serde_roundtrip) now pins the
+  3b.4/3b.5 surfaces: SessionEvent with rates:None AND the
+  Usage+rates pair (the numbers a binding reads), UsageRates embedded,
+  and the live SessionStats with a representative value. EngineStats
+  is documented Serialize-only (SteeringStatsSnapshot) — the §5.5
+  boundary noted at the fixture site.
+- Rows acceptance: 17 — the D5 surfaces landed and the codegraph
+  "ready" observable is 3b.3's engine_start_emits_index_host_events;
+  18 — stats_totals_match_events is canonical (Usage with correct
+  rates, one ModelChanged, the compact's Savings; stats() == the sum;
+  the engine pull includes the saving) with the Spend deviation
+  documented above; 19 — the IPC contract fixtures pinned byte-
+  identical in 3b.2 (contract_fixtures imports from mnemo::headless)
+  and the new types add no IPC surface change (SessionEvent.rates
+  skips when None — the pre-3b.5 JSON shape unchanged).
+- Review rounds: to PASS (the closing sequence).

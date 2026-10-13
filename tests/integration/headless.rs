@@ -122,6 +122,31 @@ fn public_types_serde_roundtrip() {
         }),
     });
 
+    // 3b.5 (§5.7): the live session stats — the binding-readiness
+    // contract for the tally a consumer reads via
+    // AgentSession::stats() (EngineStats is deliberately NOT here: it
+    // is Serialize-only — SteeringStatsSnapshot has no Deserialize, and
+    // a binding receives the pull but never sends it back).
+    roundtrip(&mnemo::headless::SessionStats {
+        requests: 2,
+        prompt_tokens: 2000,
+        completion_tokens: 80,
+        reasoning_tokens: 20,
+        cached_tokens: 1600,
+        saved_tokens_by_kind: std::collections::BTreeMap::from([(
+            "compaction_checkpoint".to_string(),
+            0,
+        )]),
+        model_switches: 1,
+        current_model: Some("m-x".into()),
+        current_reasoning_effort: Some("high".into()),
+        context_used: Some(1234),
+        context_max: Some(128_000),
+        ttft_ms_total: 400,
+        timed_requests: 1,
+        generation_ms_total: 200,
+    });
+
     // The small types.
     roundtrip(&SessionLimits {
         max_turns: Some(3),

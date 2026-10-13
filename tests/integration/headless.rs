@@ -3,11 +3,12 @@
 //! every later 3a step keeps these green (the types-first contract).
 
 use serde_json::json;
+use std::path::PathBuf;
 
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    EngineError, EngineOptions, EventReceiver, MemoryBackend, RecvError, SessionCommand,
+    Engine, EngineError, EngineOptions, EventReceiver, MemoryBackend, RecvError, SessionCommand,
     SessionEvent, SessionId, SessionLimits, SpawnOptions, Transcript,
 };
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
@@ -176,4 +177,65 @@ fn public_types_are_send_sync_static() {
     assert_send_sync_static::<Transcript>();
     assert_send_sync_static::<EngineError>();
     assert_send_sync_static::<RecvError>();
+}
+
+/// Real-start options for the engine fixtures: a fresh non-git workspace,
+/// a temp config dir, indexing off (test speed), the free default.
+fn engine_opts(workspace: mnemo::workspace::Workspace, config_dir: Option<PathBuf>) -> EngineOptions {
+    EngineOptions {
+        workspace,
+        config_dir,
+        permissions: PermissionPolicy::OverridePermissions,
+        memory: MemoryBackend::Sqlite { path: None },
+        index_codegraph: false,
+        require_git: false,
+        auto_install_embedder: false,
+    }
+}
+
+/// §7 row 9: `Engine::start` never blocks and never shows a picker — an
+/// unusable workspace (a missing root, or `require_git` on a non-repo
+/// root) is `EngineError` code `no_project`, returned promptly.
+#[tokio::test]
+async fn no_project_errors() {
+    // A missing root.
+    let opts = engine_opts(
+        Workspace::new("/definitely/not/a/real/dir"),
+        None,
+    );
+    let err = match Engine::start(opts).await {
+        Ok(_) => panic!("a missing workspace root must error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "no_project", "never a picker: {}", err);
+
+    // require_git + a non-repo root (the §5.9.3 :664 open-time gate —
+    // either the option or the workspace marker demands a repo).
+    let dir = tempfile::tempdir().unwrap();
+    let opts = engine_opts(
+        Workspace::new(dir.path()).requiring_git(),
+        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+    );
+    let err = match Engine::start(opts).await {
+        Ok(_) => panic!("require_git on a non-repo root must error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), "no_project", "never a picker: {}", err);
+}
+
+/// §7 row 15: `start_blocking` works from a plain (non-async) context —
+/// the engine owns a static tokio runtime, so a plain `fn main` can start
+/// one with no ambient reactor.
+#[test]
+fn start_blocking_without_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = engine_opts(
+        Workspace::new(dir.path()),
+        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+    );
+    let engine =
+        Engine::start_blocking(opts).expect("start_blocking builds its own runtime");
+    // The host-events bus exists before any subscriber.
+    let _ = engine.host_events();
+    drop(engine); // the owned runtime drops with the engine
 }

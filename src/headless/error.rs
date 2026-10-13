@@ -28,9 +28,28 @@ impl EngineError {
         &self.message
     }
 
-    // The kind constructors (no_project / session_closed / …) land with
-    // the engine + session code that calls them (3a.4/3a.5) — ahead-of-
-    // use fns are dead code under #![deny(warnings)].
+    // The remaining kind constructors (session_closed / spawn_failed /
+    // engine_shutdown) land with the 3a.5 session code that calls them —
+    // ahead-of-use fns are dead code under #![deny(warnings)].
+
+    /// The engine could not start: an unusable workspace (no project —
+    /// §5.3, row 9: never blocks, never shows a picker) or a failed
+    /// build.
+    pub(crate) fn no_project(message: impl Into<String>) -> Self {
+        Self {
+            code: "no_project".to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// The engine failed to build (config load, brain wiring, host
+    /// runtime).
+    pub(crate) fn start_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: "start_failed".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

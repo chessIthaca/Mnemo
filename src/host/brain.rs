@@ -161,16 +161,13 @@ pub fn build_brain(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handle)
     outcome
 }
 
-/// The measured body of [`build_brain`] — see its doc comment for the timing
-/// wrapper above.
+/// The measured body of [`build_brain`] — see its doc comment for the
+/// timing wrapper above. The APP path: the global config + the app's
+/// project discovery (pending marker → `--project` flag → cwd walk-up),
+/// then the shared wiring tail ([`wire_brain`]).
 fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handle) -> anyhow::Result<BrainOutcome> {
     let config_dir = global_config_dir();
     let config = Config::load(&config_dir)?;
-
-    // The shared request/response trace log — created first so every provider
-    // built below (default, dummy fallback, resolver) records into the same
-    // instance the IPC layer hands to the Trace tab.
-    let trace = Arc::new(LlmRequestLog::new());
 
     // Resolve the project. Resolution order:
     //   1. Pending-project marker — set by a prior `switch_project` call
@@ -231,6 +228,29 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             return Ok(BrainOutcome::NeedsProject(config));
         }
     };
+
+    wire_brain(config_dir, config, workspace, switched_open, notifier, rt)
+        .map(BrainOutcome::Ready)
+}
+
+/// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +
+/// config + workspace to a running [`Brain`] — the trace log, provider
+/// stack, memory store, sandbox, safety, resolver, factory. No discovery,
+/// no global-config read, no picker: the app reaches this through
+/// [`build_brain`]'s resolution; the headless Engine through
+/// `EngineOptions` (G4 — the engine passes its directories explicitly).
+pub(crate) fn wire_brain(
+    config_dir: std::path::PathBuf,
+    config: Config,
+    workspace: Arc<Workspace>,
+    switched_open: bool,
+    notifier: Option<SharedNotifier>,
+    rt: tokio::runtime::Handle,
+) -> anyhow::Result<Brain> {
+    // The shared request/response trace log — created first so every provider
+    // built below (default, dummy fallback, resolver) records into the same
+    // instance the IPC layer hands to the Trace tab.
+    let trace = Arc::new(LlmRequestLog::new());
 
     // Tell the trace log where to mirror records when the user opts in via the
     // Trace tab's "Log to file" checkbox. The path is configured here (where
@@ -1070,7 +1090,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         }
     });
 
-    Ok(BrainOutcome::Ready(Brain {
+    Ok(Brain {
         factory,
         memory_store: Some(store),
         workspace,
@@ -1089,5 +1109,5 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         pending_model_download: pending_download,
         pending_model_load: pending_load,
         _graph_watcher: graph_watcher,
-    }))
+    })
 }

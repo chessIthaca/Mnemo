@@ -12,5 +12,6 @@ mod ci_workflow;
 mod contract_fixtures;
 mod encoding_guard;
 mod headless;
+mod headless_kernel;
 mod ipc_bridge;
 mod workflow_integration;

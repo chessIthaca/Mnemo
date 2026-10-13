@@ -299,3 +299,52 @@ Amendment (2027-01-15, step 3a.3 — the landed D3 picks):
   3/3 in-suite; clippy: ZERO sites in the new files; workspace.rs:94
   ("items after a test module") is pre-existing 2c.3-era code outside
   this step's hunks — rides a439d8c2.
+
+Amendment (2027-01-15, step 3a.4 — the landed D4 picks):
+- The split (brain.rs): `build_brain_inner` keeps ONLY the app path — the
+  global config load + the discovery block (pending marker → `--project`
+  flag → cwd walk-up → NeedsProject) — then delegates to the NEW
+  `pub(crate) wire_brain(config_dir, config, workspace, switched_open,
+  notifier, rt) -> anyhow::Result<Brain>`: the whole wiring tail (trace,
+  provider stack, memory, sandbox, safety, resolver, factory, watcher)
+  with NO discovery and NO global read. The tail's
+  `Ok(BrainOutcome::Ready(Brain {…}))` became `Ok(Brain {…})`; the app
+  wraps via `.map(BrainOutcome::Ready)`. The trace creation moved INTO
+  wire_brain (it was never used before the tail).
+- The Engine (src/headless/engine.rs): `start(opts)` — the workspace
+  gates FIRST (root missing, or require_git unmet → `EngineError`
+  no_project — never a picker, row 9); BOTH require_git sources honored
+  (`EngineOptions.require_git || workspace.require_git` — §5.9.3 :664 +
+  the 2c.3 marker); the config from the explicit dir → $MNEMO_HOME →
+  ~/.mnemo (`default_config_dir` — deliberately NOT global_config_dir,
+  G4 :676-677); the `BusNotifier` (HostNotifier →
+  broadcast::Sender<HostEvent>) — the engine ALWAYS has a host bus;
+  wire_brain with `switched_open = false`; then HostRuntime::start over
+  the factory. `host_events()` subscribes. `shutdown(self)` is the frame
+  (3a.5 completes it — sessions + consolidation). `start_blocking`: a
+  multi-thread Runtime OWNED by the Engine (dropped with it) +
+  block_on(start) — works from a plain `fn main` (row 15).
+- The not-yet-read fields are underscore-prefixed (_brain, _host,
+  _default_permissions, _owned_runtime) — the Brain's `_graph_watcher`
+  precedent under deny(warnings); 3a.5 renames _host/
+  _default_permissions when their readers land. EngineOptions'
+  unconsumed options (memory, index_codegraph, auto_install_embedder)
+  are 3b's wiring — typed now, documented forward.
+- error.rs: no_project + start_failed landed WITH their callers (the
+  3a.3 trim rule: never ahead of use).
+- Tests: headless.rs::{no_project_errors (both gates → code
+  "no_project"), start_blocking_without_runtime (a plain #[test], the
+  owned runtime)}; headless_kernel.rs::{workspace_without_git_starts (a
+  fresh temp dir starts + shuts down clean), state_dir_outside_tree (the
+  memory db lands at the OUT-of-tree state dir + no .coding appears
+  under the root)} — 7/7 with the 3a.3 contract trio. In-flight
+  repairs: expect_err demanded Engine: Debug → a match instead (Engine
+  holds non-Debug internals); a doc-comment line lost its /// prefix in
+  the write (fixed).
+- The battery at the final tree: check -p mnemo bare (check_exit=0) +
+  test -p mnemo (test_exit=0, 2719) + --features browser,embeddings
+  (feat_exit=0, 2746) + --workspace (ws_exit=0, 3066) + build
+  --workspace (build_exit=0); the goldens trio 3/3 in-suite; clippy:
+  ZERO sites in src/headless/** + the tests; brain.rs:116 (the
+  3a.1-documented large_enum_variant) is that file's only site, outside
+  this step's hunks.

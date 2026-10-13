@@ -10,9 +10,11 @@
 //!
 //! Nothing here reads stdin, writes stdout, or touches a Tauri handle.
 
+pub mod engine;
 pub mod error;
 pub mod types;
 
+pub use engine::Engine;
 pub use error::EngineError;
 pub use types::{
     EngineOptions, EventReceiver, HostEvent, MemoryBackend, RecvError, SessionCommand,

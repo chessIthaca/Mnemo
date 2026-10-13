@@ -30,7 +30,76 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::config::keys::{KeySource, Secret};
+use crate::config::mcp::McpServerWire;
 use crate::config::settings_dto::{SettingsSaveDto, VisionModelDto};
+
+/// Which agent.md a Setup method addresses (§5.8 :557): the install's
+/// GLOBAL one (under the config dir) or a PROJECT's root one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scope {
+    /// `<config_dir>/agent.md` — the install-global constitution.
+    Global,
+    /// `<root>/agent.md` — the project's constitution.
+    Project(std::path::PathBuf),
+}
+
+/// §5.8 :556's options: whether [`Setup::init_project`] also registers
+/// the project in `projects.toml`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InitProjectOptions {
+    /// Add the project to the registry (`<config_dir>/projects.toml`).
+    pub register: bool,
+}
+
+/// §5.8 :556's result: the scaffolded project's key paths + whether it
+/// was registered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectInfo {
+    /// The project root.
+    pub root: std::path::PathBuf,
+    /// The `.coding/` side-car dir.
+    pub coding_dir: std::path::PathBuf,
+    /// The root `agent.md` path.
+    pub agent_md: std::path::PathBuf,
+    /// Was the project added to `projects.toml`?
+    pub registered: bool,
+}
+
+/// §5.8 :559-560 — a project's safety rules (the `[[rule]]` set
+/// `ApproveViaApi` consults at dispatch time), one entry per rule.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SafetyRulesDto {
+    /// The rules, in file order.
+    #[serde(default)]
+    pub rules: Vec<SafetyRuleDto>,
+}
+
+/// One safety rule in the wire form (§5.8 :559).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SafetyRuleDto {
+    /// The tool name (e.g. `"file_write"`).
+    pub tool: String,
+    /// The regex (literal rules) or the normalized safety class
+    /// (command_class rules).
+    pub pattern: String,
+    /// How `pattern` is interpreted (defaults to `literal`).
+    #[serde(default, skip_serializing_if = "crate::safety_rules::RuleKind::is_literal")]
+    pub kind: crate::safety_rules::RuleKind,
+}
+
+/// §5.8 :552's result: the outcome of a Settings-style "Test" click —
+/// connect to the named server and list its tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct McpTestResult {
+    /// Whether connect + initialize + tools/list all succeeded.
+    pub ok: bool,
+    /// How many tools the server advertises (0 unless `ok`).
+    pub tool_count: usize,
+    /// The advertised tool names (empty unless `ok`).
+    pub tool_names: Vec<String>,
+    /// The failure detail (None on success).
+    pub error: Option<String>,
+}
 use crate::config::{Config, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
 use crate::headless::types::EventReceiver;
@@ -850,6 +919,214 @@ impl Setup {
                 step,
                 error: "the embedder degraded to the hash fallback".to_string(),
             },
+        }
+    }
+
+    /// §5.8 :556 — initialize a project directory at `root`: scaffold
+    /// `.coding/` (plans + the shipped skills) + the kernel scaffold
+    /// core's git-file entries + the root `agent.md` template, and
+    /// (when `opts.register`) add the project to `projects.toml`.
+    /// Idempotent: every piece is write-if-missing / merge-append, so a
+    /// re-run only self-heals deleted artifacts.
+    pub fn init_project(
+        &self,
+        root: &Path,
+        opts: InitProjectOptions,
+    ) -> Result<ProjectInfo, EngineError> {
+        let fs = |e: std::io::Error| {
+            EngineError::start_failed(format!("initializing the project failed: {e}"))
+        };
+        let coding_dir = root.join(".coding");
+        std::fs::create_dir_all(&coding_dir).map_err(fs)?;
+        std::fs::create_dir_all(coding_dir.join("plans")).map_err(fs)?;
+        crate::project::skills_seed::seed_skills(&coding_dir.join("skills"))
+            .map_err(|e| {
+                EngineError::start_failed(format!("seeding the skills failed: {e}"))
+            })?;
+        crate::project::scaffold::seed_git_files(root).map_err(|e| {
+            EngineError::start_failed(format!("seeding the git files failed: {e}"))
+        })?;
+        let agent_md = root.join("agent.md");
+        if !agent_md.exists() {
+            std::fs::write(&agent_md, crate::project::agent_md::DEFAULT_PROJECT_TEMPLATE)
+                .map_err(fs)?;
+        }
+        let registered = if opts.register {
+            let registry_path = self.config_dir.join("projects.toml");
+            let mut registry =
+                crate::config::ProjectRegistry::load_or_default(&registry_path).map_err(
+                    |e| EngineError::start_failed(format!("loading projects.toml failed: {e}")),
+                )?;
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            registry.add(&name, &root.display().to_string());
+            registry.save(&registry_path).map_err(|e| {
+                EngineError::start_failed(format!("saving projects.toml failed: {e}"))
+            })?;
+            true
+        } else {
+            false
+        };
+        Ok(ProjectInfo {
+            root: root.to_path_buf(),
+            coding_dir,
+            agent_md,
+            registered,
+        })
+    }
+
+    /// §5.8 :557 — read an agent.md constitution. `Scope::Global` maps to
+    /// `<config_dir>/agent.md` (install isolation), `Scope::Project` to
+    /// the project root's. A missing file reads as the empty string.
+    pub fn agent_md(&self, scope: Scope) -> String {
+        let path = match scope {
+            Scope::Global => self.config_dir.join("agent.md"),
+            Scope::Project(root) => root.join("agent.md"),
+        };
+        std::fs::read_to_string(&path).unwrap_or_default()
+    }
+
+    /// §5.8 :558 — write an agent.md constitution (creating the file;
+    /// the parent must exist for a project scope — `init_project`
+    /// creates it).
+    pub async fn set_agent_md(&self, scope: Scope, text: String) -> Result<(), EngineError> {
+        let path = match scope {
+            Scope::Global => self.config_dir.join("agent.md"),
+            Scope::Project(root) => root.join("agent.md"),
+        };
+        std::fs::write(&path, text).map_err(|e| {
+            EngineError::start_failed(format!("writing {} failed: {e}", path.display()))
+        })
+    }
+
+    /// §5.8 :559 — read a project's safety rules
+    /// (`<project>/.coding/safety.toml`, the `ApproveViaApi` set). A
+    /// missing file reads as the empty DTO; a malformed one degrades to
+    /// empty (same best-effort letter as the agent's own loader — the
+    /// live rules skip invalid entries rather than fail the session).
+    pub async fn safety_rules(&self, project: &Path) -> SafetyRulesDto {
+        let path = project.join(".coding").join("safety.toml");
+        SafetyRulesDto {
+            rules: crate::safety_rules::read_rules(&path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| SafetyRuleDto {
+                    tool: r.tool,
+                    pattern: r.pattern,
+                    kind: r.kind,
+                })
+                .collect(),
+        }
+    }
+
+    /// §5.8 :560 — REPLACE a project's safety rules (writes
+    /// `<project>/.coding/safety.toml` in the kernel's exact format; a
+    /// live `SafetyRules` re-reads it on the next dispatch via the
+    /// mtime check).
+    pub async fn set_safety_rules(
+        &self,
+        project: &Path,
+        rules: SafetyRulesDto,
+    ) -> Result<(), EngineError> {
+        let path = project.join(".coding").join("safety.toml");
+        let entries: Vec<crate::safety_rules::RuleEntry> = rules
+            .rules
+            .into_iter()
+            .map(|r| crate::safety_rules::RuleEntry {
+                tool: r.tool,
+                pattern: r.pattern,
+                kind: r.kind,
+            })
+            .collect();
+        crate::safety_rules::write_rules(&path, &entries).map_err(|e| {
+            EngineError::start_failed(format!("writing the safety rules failed: {e}"))
+        })
+    }
+
+    /// §5.8 :551 — list the configured MCP servers (the global file +
+    /// the project's, when given), each tagged with its source, the
+    /// project definition winning by name. A listing never fails —
+    /// read errors degrade to the readable set.
+    pub fn mcp_servers(&self, project: Option<&Path>) -> Vec<McpServerWire> {
+        let global = self.config_dir.join("mcp.toml");
+        let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
+        crate::config::mcp::list_wires(&global, project_path.as_deref())
+    }
+
+    /// §5.8 :551 — save the MCP servers split by source (the exact core
+    /// the GUI's save runs, moved lib-side): global entries to
+    /// `<config_dir>/mcp.toml`, project entries to the project's
+    /// `.coding/mcp.toml` (never materialized for a purely-global save),
+    /// shadowed global twins restored. Live-apply when an engine is
+    /// attached: the shared config's `mcp` field + the factory's manager
+    /// swap (agents built after this save see the new set).
+    pub async fn save_mcp_servers(
+        &self,
+        project: Option<&Path>,
+        servers: Vec<McpServerWire>,
+    ) -> Result<String, EngineError> {
+        let global_path = self.config_dir.join("mcp.toml");
+        let project_path = project.map(|p| p.join(".coding").join("mcp.toml"));
+        let outcome =
+            crate::config::mcp::save_split(&global_path, project_path.as_deref(), servers)
+                .map_err(|e| {
+                    EngineError::start_failed(format!("saving the MCP servers failed: {e}"))
+                })?;
+        if let Some(live) = &self.live {
+            let mut config = live.config.lock().await;
+            config.mcp = outcome.global;
+            if let Some(manager) = live.factory.mcp_manager() {
+                manager.replace_servers(outcome.merged.clone()).await;
+            }
+        }
+        Ok(
+            "saved — servers apply to agents built after this save (a restart always picks them \
+             up); use Test to verify a connection now"
+                .into(),
+        )
+    }
+
+    /// §5.8 :552 — connect to the named MCP server and list its tools
+    /// (the 45 s budget the GUI's Test uses). With an engine attached the
+    /// factory's LIVE manager answers; a standalone Setup builds a
+    /// transient manager over the current global file.
+    pub async fn test_mcp(&self, name: &str) -> Result<McpTestResult, EngineError> {
+        let name = name.trim().to_string();
+        let manager = match self.live.as_ref().and_then(|live| live.factory.mcp_manager()) {
+            Some(manager) => manager,
+            None => {
+                let defs = crate::config::mcp::load_or_default(
+                    &self.config_dir.join("mcp.toml"),
+                )
+                .map_err(|e| {
+                    EngineError::start_failed(format!("reading the MCP config failed: {e}"))
+                })?;
+                std::sync::Arc::new(crate::mcp::McpManager::from_config(&defs))
+            }
+        };
+        let fail = |msg: String| McpTestResult {
+            ok: false,
+            tool_count: 0,
+            tool_names: Vec::new(),
+            error: Some(msg),
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(45), manager.server_tools(&name))
+            .await
+        {
+            Ok(Ok(tools)) => Ok(McpTestResult {
+                ok: true,
+                tool_count: tools.len(),
+                tool_names: tools.iter().map(|t| t.name.clone()).collect(),
+                error: None,
+            }),
+            Ok(Err(e)) => Ok(fail(e.to_string())),
+            Err(_) => Ok(fail(
+                "timed out after 45s connecting / listing tools — is the command on PATH and \
+                 does the server start?"
+                    .into(),
+            )),
         }
     }
 

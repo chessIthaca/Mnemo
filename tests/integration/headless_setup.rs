@@ -11,11 +11,14 @@
 use std::path::{Path, PathBuf};
 
 use mnemo::agent::policy::PermissionPolicy;
+use mnemo::config::mcp::{McpServerDef, McpServerWire};
 use mnemo::config::settings_dto::VisionModelDto;
+use mnemo::config::ProjectRegistry;
 use mnemo::headless::{
-    EndpointDto, Engine, EngineOptions, KeySource, MemoryBackend, RecvError, Secret, Setup,
-    SetupEvent, SetupStep,
+    EndpointDto, Engine, EngineOptions, InitProjectOptions, KeySource, MemoryBackend, RecvError,
+    SafetyRuleDto, SafetyRulesDto, Scope, Secret, Setup, SetupEvent, SetupStep,
 };
+use mnemo::safety_rules::{RuleKind, SafetyRules};
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::workspace::Workspace;
@@ -653,4 +656,163 @@ fn no_surprise_downloads_at_the_setup_surface() {
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
     let _ = setup.status(None).expect("status");
     assert_eq!(setup.embedder_status(), EmbedderStatus::Checking);
+}
+// -- D8: the project group + MCP + agent.md + safety rules --
+
+/// §5.8 :556 — `init_project` scaffolds `.coding/` (plans + the shipped
+/// skills), seeds the git-file entries (the kernel scaffold core), writes
+/// the agent.md template, and registers the project in `projects.toml`
+/// (idempotently — a re-run self-heals, never duplicates).
+#[test]
+fn init_project_scaffolds_and_registers() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let root = tempfile::tempdir().unwrap();
+    let info = setup
+        .init_project(root.path(), InitProjectOptions { register: true })
+        .expect("init");
+    assert!(info.registered);
+    assert_eq!(info.coding_dir, root.path().join(".coding"));
+    assert!(info.agent_md.is_file(), "the agent.md template");
+    assert!(root.path().join(".gitignore").is_file(), "the kernel scaffold core");
+    assert!(root.path().join(".gitattributes").is_file());
+    assert!(root.path().join(".coding").join("plans").is_dir());
+    assert!(root.path().join(".coding").join("skills").is_dir(), "the shipped skills");
+    // registered in projects.toml:
+    let registry = ProjectRegistry::load_or_default(&cfg.path().join("projects.toml")).unwrap();
+    assert_eq!(registry.len(), 1);
+    // idempotent:
+    setup
+        .init_project(root.path(), InitProjectOptions { register: true })
+        .expect("re-init");
+    let registry = ProjectRegistry::load_or_default(&cfg.path().join("projects.toml")).unwrap();
+    assert_eq!(registry.len(), 1, "a re-run never duplicates the registry entry");
+}
+
+/// §5.8 :557-558 — agent.md round-trips BOTH scopes: Global maps under
+/// the config dir (install isolation), Project to the project root.
+#[tokio::test]
+async fn agent_md_round_trips_both_scopes() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    // Global: fresh reads empty; set + read back; the file lands there.
+    assert_eq!(setup.agent_md(Scope::Global), "");
+    setup
+        .set_agent_md(Scope::Global, "# global constitution".into())
+        .await
+        .expect("set global");
+    assert_eq!(setup.agent_md(Scope::Global), "# global constitution");
+    assert!(cfg.path().join("agent.md").is_file());
+    // Project: the root agent.md.
+    let root = tempfile::tempdir().unwrap();
+    setup
+        .set_agent_md(Scope::Project(root.path().to_path_buf()), "# project".into())
+        .await
+        .expect("set project");
+    assert_eq!(
+        setup.agent_md(Scope::Project(root.path().to_path_buf())),
+        "# project"
+    );
+}
+
+/// §5.8 :559-560 — the safety rules round-trip the KERNEL format: the
+/// mtime-checked `SafetyRules` loader reads the exact file the Setup
+/// wrote (header included), both rule kinds intact.
+#[tokio::test]
+async fn safety_rules_round_trip_the_kernel_format() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let root = tempfile::tempdir().unwrap();
+    setup
+        .set_safety_rules(
+            root.path(),
+            SafetyRulesDto {
+                rules: vec![
+                    SafetyRuleDto {
+                        tool: "file_write".into(),
+                        pattern: "^file_write:src/.*$".into(),
+                        kind: RuleKind::Literal,
+                    },
+                    SafetyRuleDto {
+                        tool: "shell".into(),
+                        pattern: "cargo test".into(),
+                        kind: RuleKind::CommandClass,
+                    },
+                ],
+            },
+        )
+        .await
+        .expect("set");
+    // The kernel re-reads the exact same file (the live `ApproveViaApi`
+    // path — an mtime bump is all a live session needs):
+    let rules = SafetyRules::new(root.path().join(".coding").join("safety.toml")).unwrap();
+    assert_eq!(rules.rules().len(), 2);
+    // And the Setup surface round-trips it:
+    let back = setup.safety_rules(root.path()).await;
+    assert_eq!(back.rules.len(), 2);
+    assert_eq!(back.rules[0].tool, "file_write");
+    assert_eq!(back.rules[1].kind, RuleKind::CommandClass);
+    // The file carries the kernel's header:
+    let text = std::fs::read_to_string(root.path().join(".coding").join("safety.toml")).unwrap();
+    assert!(text.contains("Safety rules"), "the header:\n{text}");
+}
+
+/// §5.8 :551 — the MCP save splits by source EXACTLY as the app did:
+/// global entries to `<config_dir>/mcp.toml` (shadowed global twins
+/// RESTORED — a project override never deletes its baseline), project
+/// entries to `.coding/mcp.toml` (never materialized for a purely-global
+/// save), and the listing shows the union with the project definition
+/// winning the shadow.
+#[tokio::test]
+async fn mcp_save_splits_by_source_exactly_as_the_app_did() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let root = tempfile::tempdir().unwrap();
+    let def = |name: &str| -> McpServerDef {
+        serde_json::from_value(serde_json::json!({"name": name, "command": "echo"})).unwrap()
+    };
+    let servers = vec![
+        McpServerWire::new(def("global-one"), "global"),
+        McpServerWire::new(def("twin"), "global"),
+        McpServerWire::new(def("project-one"), "project"),
+        McpServerWire::new(def("twin"), "project"),
+    ];
+    setup
+        .save_mcp_servers(Some(root.path()), servers)
+        .await
+        .expect("save");
+    // Global mcp.toml: global-one + the shadowed twin restored.
+    let global_text = std::fs::read_to_string(cfg.path().join("mcp.toml")).unwrap();
+    assert!(global_text.contains("global-one"));
+    assert!(global_text.contains("twin"), "the shadowed global twin is restored");
+    // Project .coding/mcp.toml: project-one + the twin override.
+    let project_text =
+        std::fs::read_to_string(root.path().join(".coding").join("mcp.toml")).unwrap();
+    assert!(project_text.contains("project-one"));
+    assert!(project_text.contains("twin"));
+    // The listing: the union, the project twin WINNING by source.
+    let wires = setup.mcp_servers(Some(root.path()));
+    let names: Vec<(&str, &str)> = wires
+        .iter()
+        .map(|w| (w.def.name.as_str(), w.source.as_str()))
+        .collect();
+    assert!(names.contains(&("global-one", "global")));
+    assert!(names.contains(&("project-one", "project")));
+    assert!(
+        names.contains(&("twin", "project")),
+        "the project definition wins the shadow: {names:?}"
+    );
+    // A purely-global save never materializes a project file:
+    let root2 = tempfile::tempdir().unwrap();
+    setup
+        .save_mcp_servers(
+            Some(root2.path()),
+            vec![McpServerWire::new(def("only-global"), "global")],
+        )
+        .await
+        .expect("save 2");
+    assert!(
+        !root2.path().join(".coding").join("mcp.toml").exists(),
+        "a purely-global save never materializes the project file"
+    );
 }

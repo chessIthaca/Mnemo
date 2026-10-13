@@ -655,3 +655,59 @@ workspace green, exit 0 — integration 75 → 77.
   two identical `if let` lines — count: 2), and the fixture tool
   name. The bare-tempdir sqlite fallback (`no .coding/ dir`) is the
   codebase norm — the fallback-embedder fix makes it honest.
+### 4.8 — D8 landed (2026-10-13): the project group + MCP + agent.md + safety rules
+
+The last big surface (§5.8 :551-560) — the scaffold core went KERNEL,
+the Setup gained the project/MCP/constitution/safety group, and the
+app's ipc/mcp.rs save path is now glue over the lib core. Battery:
+workspace green, exit 0 — integration 77 → 81.
+
+- The scaffold MOVE (the 2b pattern): `src/app/scaffold.rs` →
+  `src/project/scaffold.rs` (byte-identical copy + the doc adjusted;
+  the app file is the re-export shim). The `project/mod.rs` letter
+  amended: job 4 D8 makes `Setup::init_project` a KERNEL surface, so
+  the scaffold core is kernel-owned; the app's `Project::init`
+  consumes it app→kernel (the legal direction). A byte-identical
+  `Copy-Item` did the move (mechanical, zero drift; every semantic
+  edit went through the file tools after).
+- `config::mcp` gains the D8 group: `SOURCE_GLOBAL`/`SOURCE_PROJECT`,
+  `McpServerWire` (the exact app wire, flattened `def` + default
+  `source`), `McpServerWire::new`, `list_wires(global, project)` (the
+  union, project-wins tagging), `SplitSave { merged, global }`, and
+  `save_split` — the app's save core VERBATIM (validate both subsets,
+  restore shadowed global twins, merged-validate, save both files,
+  never materialize an empty project file).
+- `safety_rules` gains the wire API: `RuleEntry` PUB (Clone/PartialEq)
+  + `read_rules` (missing → empty) + `write_rules` (FILE_HEADER + one
+  `[[rule]]` each — the kernel's exact shape, so a live `SafetyRules`
+  re-reads the file on the next dispatch via the mtime check);
+  `RuleKind::is_literal` PUB (the DTO's skip-rule rides it).
+- The Setup surface: `Scope { Global, Project(PathBuf) }`,
+  `InitProjectOptions { register }`, `ProjectInfo`,
+  `SafetyRulesDto { rules: Vec<SafetyRuleDto> }`, `McpTestResult`.
+  Methods: `init_project` (scaffold + skills + git files + the
+  agent.md template + the projects.toml registration, idempotent),
+  `agent_md`/`set_agent_md` (Global = `<config_dir>/agent.md` —
+  install isolation), `safety_rules`/`set_safety_rules`
+  (`<project>/.coding/safety.toml`, degrade-to-empty reads),
+  `mcp_servers(project)` / `save_mcp_servers(project, servers)` (the
+  lib split core + the live config/manager swap when engine-backed —
+  documented deviation: the project param the §5.8 sketch omits, the
+  same shape `status(project)` has), and `test_mcp` (the factory's
+  LIVE manager, or a transient `McpManager::from_config` over the
+  global file standalone; the 45 s budget).
+- The app's `ipc/mcp.rs`: the wire + tags re-exported from the lib
+  (the payload shape + every app path unchanged); `mcp_save_servers`
+  delegates to `save_split`, keeping exactly the live glue (the config
+  sync + the manager swap). `mcp_oauth_start` stays app-side (the
+  browser glue — probed, not movable).
+- Fixtures (4): `init_project_scaffolds_and_registers` (every artifact
+  + the registry + idempotency), `agent_md_round_trips_both_scopes`,
+  `safety_rules_round_trip_the_kernel_format` (the kernel `SafetyRules`
+  reads the Setup-written file — both kinds), and
+  `mcp_save_splits_by_source_exactly_as_the_app_did` (twin restored,
+  project file contents, the union listing project-wins, a
+  purely-global save materializes nothing).
+- En-route fixes: the `McpServerWire` import into setup.rs (re-export
+  ≠ import), `is_literal` pub, and one multi_edit stale-gate bounce
+  (mod.rs re-read then landed clean).

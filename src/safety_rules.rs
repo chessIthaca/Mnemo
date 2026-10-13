@@ -86,7 +86,9 @@ impl Default for RuleKind {
 impl RuleKind {
     /// Whether this kind is the default `Literal` (used to skip serializing
     /// `kind` for literal rules, keeping the TOML one-line `tool`+`pattern`).
-    fn is_literal(&self) -> bool {
+    /// PUB since job 4 D8: the Setup surface's DTO rides the same
+    /// skip-rule.
+    pub fn is_literal(&self) -> bool {
         matches!(self, Self::Literal)
     }
 }
@@ -158,16 +160,51 @@ struct SafetyFile {
     rule: Vec<RuleEntry>,
 }
 
-/// A single `[[rule]]` entry in the TOML file.
-#[derive(Debug, Serialize, Deserialize)]
-struct RuleEntry {
-    tool: String,
-    pattern: String,
+/// A single `[[rule]]` entry in the TOML file — PUB since job 4 D8: the
+/// Setup surface's wire form (`read_rules`/`write_rules`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleEntry {
+    /// The tool name this rule applies to.
+    pub tool: String,
+    /// The regex pattern (literal rules) or the normalized safety class
+    /// (command_class rules).
+    pub pattern: String,
     /// How `pattern` is interpreted. Defaults to `Literal` when absent (so old
     /// `safety.toml` files without `kind` keep working). Only serialized when
     /// not the default, so literal rules stay one-line `tool`+`pattern`.
     #[serde(default, skip_serializing_if = "RuleKind::is_literal")]
-    kind: RuleKind,
+    pub kind: RuleKind,
+}
+
+/// Read a project's rules as wire entries (job 4 D8's Setup surface,
+/// §5.8 :559): a missing file is an EMPTY list, matching
+/// [`SafetyRules::new`]'s missing-file semantics.
+pub fn read_rules(path: &Path) -> Result<Vec<RuleEntry>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let file: SafetyFile = toml::from_str(&text)?;
+    Ok(file.rule)
+}
+
+/// Write rules to a `safety.toml` (§5.8 :560) — the [`FILE_HEADER`] + one
+/// `[[rule]]` per entry, the exact shape the kernel parses (an mtime
+/// bump makes a live [`SafetyRules`] re-read it on the next call).
+pub fn write_rules(path: &Path, rules: &[RuleEntry]) -> Result<()> {
+    let file = SafetyFile {
+        rule: rules.to_vec(),
+    };
+    let mut text = String::from(FILE_HEADER);
+    text.push('\n');
+    text.push_str(&toml::to_string_pretty(&file)?);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 /// File-backed, mtime-checked safety rules.

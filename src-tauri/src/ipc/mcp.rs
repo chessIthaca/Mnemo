@@ -24,28 +24,10 @@ use mnemo::config::mcp::{self, McpServerDef};
 use crate::ipc::error::IpcError;
 use crate::ipc::state::IpcState;
 
-/// The source tag for a server defined in the installation's mcp.toml.
-pub const SOURCE_GLOBAL: &str = "global";
-/// The source tag for a server defined in the open project's
-/// `.coding/mcp.toml`.
-pub const SOURCE_PROJECT: &str = "project";
-
-/// One configured MCP server + the file it lives in. `def` is flattened
-/// so the frontend payload is the plain server fields plus `source`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpServerWire {
-    #[serde(flatten)]
-    pub def: McpServerDef,
-    /// `"global"` or `"project"` (defaults to global when absent — a
-    /// legacy frontend payload or a hand-rolled caller lands in the
-    /// global file, matching v1 behavior).
-    #[serde(default = "default_source")]
-    pub source: String,
-}
-
-fn default_source() -> String {
-    SOURCE_GLOBAL.to_string()
-}
+/// The wire + source tags MOVED lib-side (job 4 D8, §5.8 :551) —
+/// `mnemo::config::mcp` owns them now; re-exported so the frontend
+/// payload shape and every app-side path are unchanged.
+pub use mnemo::config::mcp::{McpServerWire, SOURCE_GLOBAL, SOURCE_PROJECT};
 
 /// List the configured MCP servers (the live manager — startup merged
 /// set plus any saves this session), each tagged with its source:
@@ -136,52 +118,29 @@ pub async fn mcp_save_servers(
     servers: Vec<McpServerWire>,
 ) -> Result<String, IpcError> {
     let factory = state.factory()?;
-    let mut global_defs: Vec<McpServerDef> = Vec::new();
-    let mut project_defs: Vec<McpServerDef> = Vec::new();
-    for wire in servers {
-        match wire.source.as_str() {
-            SOURCE_PROJECT => project_defs.push(wire.def),
-            _ => global_defs.push(wire.def),
-        }
-    }
-    mcp::validate_set(&global_defs).map_err(|e| format!("{e}"))?;
-    mcp::validate_set(&project_defs).map_err(|e| format!("{e}"))?;
-
+    // The split-by-source core MOVED lib-side (job 4 D8, §5.8 :551 —
+    // `mnemo::config::mcp::save_split`): validate each subset, restore
+    // shadowed global twins, merge-validate, save both files (the
+    // project file never materialized for a purely-global save). What
+    // stays app-side is exactly the live glue: the shared config's `mcp`
+    // sync + the factory manager swap.
     let global_path = mnemo::config::global_config_dir().join("mcp.toml");
-    // A project override SHADOWS its global twin (the twin is invisible in
-    // the merged list, so it cannot be part of the payload) — rewriting the
-    // global file from the payload alone would silently DELETE the shadowed
-    // baseline. Re-add shadowed twins from the CURRENT global file first
-    // (review HIGH 1).
-    let current_global = mcp::load_or_default(&global_path)?;
-    let global_defs = mcp::restore_shadowed_globals(&global_defs, &project_defs, &current_global);
-    mcp::validate_set(&global_defs).map_err(|e| format!("{e}"))?;
-    let merged = mcp::merge_servers(&global_defs, &project_defs);
-    mcp::validate_set(&merged).map_err(|e| format!("merged set invalid: {e}"))?;
-    mcp::save(&global_path, &global_defs)
-        .map_err(|e| format!("failed to write global mcp.toml: {e}"))?;
     let project_path = {
         let project = state.project.root.lock().await;
         project.mcp_toml.clone()
     };
-    // Only create the project file when there is something to put in it —
-    // a purely-global save must not materialize an empty
-    // `.coding/mcp.toml` in projects that never had one (review LOW 5).
-    if !project_defs.is_empty() || project_path.exists() {
-        mcp::save(&project_path, &project_defs)
-            .map_err(|e| format!("failed to write project mcp.toml: {e}"))?;
-    }
-
+    let outcome = mcp::save_split(&global_path, Some(&project_path), servers)
+        .map_err(|e| format!("{e}"))?;
     // Keep the in-memory Config in sync with the GLOBAL subset so a later
     // save_all round-trips it instead of clobbering the file with a stale
     // copy (the project subset lives in its own file, untouched by
     // save_all).
     {
         let mut config = state.project.config.lock().await;
-        config.mcp = global_defs;
+        config.mcp = outcome.global;
     }
     if let Some(manager) = factory.mcp_manager() {
-        manager.replace_servers(merged).await;
+        manager.replace_servers(outcome.merged).await;
     }
     Ok(
         "saved — servers apply to agents built after this save (a restart always picks them \

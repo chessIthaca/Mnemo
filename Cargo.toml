@@ -87,6 +87,13 @@ sha2 = "0.11"
 # Base64 encoding for image attachments (vision fallback + describe_image tool)
 base64 = "0.23"
 
+# Managed-Laya setup pipeline (job 4 D5, §5.1 :168 — the Tauri-free core in
+# src/host/laya.rs): the uv release asset extraction (zip on Windows,
+# tar/flate2 elsewhere). Small pure-Rust crates.
+zip = "8"
+tar = "0.4"
+flate2 = "1"
+
 # Image decode/crop/re-encode for the agentic zoom loop in the image_* tools
 # (grid → model votes → crop the full-resolution original → re-read). Already a
 # transitive dep via fastembed; pinned here so the image_* tools can name it.

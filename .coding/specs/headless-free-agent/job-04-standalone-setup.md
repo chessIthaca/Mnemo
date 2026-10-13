@@ -456,4 +456,75 @@ time absent) ✓ (D3), the GUI still reads `[ui]` unchanged ✓ (D3).
   `patch_settings_persists_without_an_engine` (integration — the
   persist + the ready state survives).
 - Battery: workspace green, exit 0 (67 integration tests + the new
-  unit test).
+  unit test).### 4.5 — D5 landed (2026-10-13): the Laya core move (D3) + classifier_setup
+
+The headline move (§5.1 :168 "the Laya manager's Tauri-free core moves
+in job 4") — the manager + the pipeline are host-agnostic now; the app
+keeps only glue. `cargo tree -p mnemo -i tauri` finds NOTHING (§B fact
+16, re-proven after the move) — the lib never names tauri.
+
+- NEW `src/host/laya.rs` (~54 KB incl. the moved tests): the constants
+  + catalog (`LayaCheckpoint`, `checkpoint_catalog`, `english_checkpoint`)
+  + the pure helpers (`uv_asset_name`/`exe_name`/`venv_bin`/`server_env`/
+  `preload_program`/`probe_body`/`probe_url`/`progress_fraction`/`dir_size`/
+  `hide_console_window` — now `pub`, finetune.rs imports it) +
+  `LayaManager` (the path helpers, the setup guard, `alloc_free_port`,
+  `spawn_server` with the generation-tagged child slot, the scoped
+  `stop_if_generation`/`owns_generation`) + `kill_child` + `Drop` +
+  `fresh_disabled` + `build_managed_classifier` + the pipeline
+  (`ensure_uv` with the GitHub digest verify + the atomic scratch
+  extract, `run_setup`'s venv/install/checkpoint-preload + the 500 ms
+  dir-size progress poller, `is_setup_progress`,
+  `setup_autostart_decision`, `spawn_setup_task`, `wait_until_ready`
+  with the idle-120 s/absolute-900 s budgets, `start_server_models`,
+  `start_managed_server`) + the tests mod moved wholesale (16 tests).
+- The Tauri seam: `StatusSink = Arc<dyn Fn(&ClassifierStatus) + Send +
+  Sync>` — `push_status`/`emit_download` write the shared status Arc
+  AND push; every former `&Option<AppHandle>` param + `app.emit` pair
+  is the sink now. The two `tauri::async_runtime::spawn` sites are
+  `tokio::spawn` (the app's runtime IS tokio — the wrappers still work).
+- The app's `ipc/laya.rs` is the thin layer (5.7 KB): `status_sink`
+  (forwards to `classifier://status`) + wrappers keeping the pre-D5
+  `Option<AppHandle>` signatures (`start_managed_server`/
+  `start_server_models`/`spawn_setup_task`) + re-exports — main.rs,
+  console.rs, finetune.rs, rewire.rs, state.rs compile UNCHANGED.
+- Deps: + `zip = "8"`, `tar = "0.4"`, `flate2 = "1"` (plain; the uv
+  release asset extraction). `anyhow`/`sha2`/`reqwest`/`tempfile` were
+  already lib deps.
+- The Setup surface (§5.8 :554): `SetupStep::LayaRuntime` (pipeline
+  tagging only — never in the missing list); `LiveHandles.classifier_slot`;
+  `Setup.laya` (an `Arc<LayaManager>` rooted at `<config_dir>/laya` —
+  install isolation) + `Setup.classifier_status` (a fresh `Disabled`
+  Arc; `for_engine` re-roots BOTH to the brain's); `laya_manager()` pub;
+  `classifier_setup(enable) -> EventReceiver<SetupEvent>` (a broadcast
+  channel + the `StatusSink` mapping `ClassifierStatus` → `SetupEvent`).
+  The flip persists BEFORE the guard claim (a failed save never wedges
+  the guard); disable = stop + `Disabled` + a single terminal `Done`;
+  enable = guard (`EngineError::setup_in_flight`, the new stable code)
+  + spawn with the LIVE config Arc (a mid-setup save still wins at the
+  autostart re-read) + the classifier-slot swap.
+- `Setup::status` now surfaces the LIVE classifier status (D1's
+  promise for D5): an enabled-but-not-running install reads `Disabled`
+  — honest, no call is attempted. `status_from_config` keeps the static
+  approximation for the engine's start gate. `patch_settings`'s doc
+  now states the split: the classifier flip rides `classifier_setup`
+  (the GUI's Download button has the same split from the settings save).
+- `LayaManager` gained a manual `Debug` (`Setup` derives `Debug`).
+- Fixtures (3): `classifier_setup_disable_persists_and_reports_done`
+  (the Done event + the Closed channel + the persisted flip + the live
+  status), `classifier_setup_rejects_a_second_enable_with_setup_in_flight`
+  (the guard + the idempotent flip), `laya_manager_roots_at_the_config_dir`
+  (G4 isolation). The enable pipeline is network-bound — never
+  exercised in tests (the app's own suite never tested it either).
+- En-route fixes: `mnemo::config::Config` → `crate::config::Config`
+  (the in-crate path), `read(&mut buf)`, `&sink` (not `.as_ref()` —
+  `start_managed_server` takes `&Option`, the async task owns the
+  `Option`), the moved test's `("linux","aarch64")` expectation typo
+  (caught by the battery), and the fixture assertions: the round-trip
+  goes through `settings().general.laya.enabled` (ONE level —
+  `GeneralSection` carries the fields; `Config.general` is the
+  `GeneralConfig` wrapper holding `[ui]` beside it) because the
+  serializer ELIDES the all-default `[general.laya]` section (absent
+  == disabled, the app's opt-in convention).
+- Battery: workspace green, exit 0 — the integration harness at 70
+  tests (67 → 70), the 16 moved app tests now run as lib unit tests.

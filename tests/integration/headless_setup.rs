@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Job 4 D1 fixtures — the standalone Setup surface (§5.8 :486-589):
-//! open/isolation, the readiness report (the ordered missing list), and
-//! the `Engine::start` precondition (the `not_configured` fail-fast; a
-//! missing embedder model is NOT fatal). The mutating surface lands
-//! with D2+.
+//! Job 4 fixtures — the standalone Setup surface (§5.8 :486-589):
+//! open/isolation + the readiness report (D1), the endpoints/keys group
+//! (D2), the settings split (D3), the live-apply (D4), the classifier
+//! surface (D5) — plus the `Engine::start` precondition
+//! (`not_configured`; a missing embedder model is NOT fatal).
 
 use std::path::{Path, PathBuf};
 
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::headless::{
-    EndpointDto, Engine, EngineOptions, KeySource, MemoryBackend, Secret, Setup, SetupStep,
+    EndpointDto, Engine, EngineOptions, KeySource, MemoryBackend, RecvError, Secret, Setup,
+    SetupEvent, SetupStep,
 };
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
@@ -452,4 +453,73 @@ fn settings_exposes_engine_config_and_preserves_ui() {
     let reloaded = mnemo::config::Config::load(cfg.path()).unwrap();
     assert_eq!(reloaded.general.ui.theme, "dark", "the [ui] table rides through");
     assert!(!reloaded.general.ui.chat_thread_line);
+}// -- D5: the classifier surface (§5.8 :554) --
+
+/// `classifier_setup(false)` persists the disable, stops nothing (no
+/// sidecar runs in a fixture), parks the shared status on `Disabled`,
+/// and the receiver yields the single terminal `Done` then closes.
+#[tokio::test]
+async fn classifier_setup_disable_persists_and_reports_done() {
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path()).unwrap();
+    // Enabled in the config — the disable leg flips it back off.
+    std::fs::write(
+        cfg.path().join("config.toml"),
+        "[general.laya]\nenabled = true\n",
+    )
+    .unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let mut rx = setup.classifier_setup(false).expect("the disable leg");
+    // The single terminal event, then the channel closes (the sender
+    // rode the call).
+    let event = rx.recv().await.expect("the Done event");
+    assert!(matches!(
+        event,
+        SetupEvent::Done {
+            step: SetupStep::LayaRuntime,
+            ..
+        }
+    ));
+    assert!(matches!(rx.recv().await, Err(RecvError::Closed)));
+    // The disable PERSISTED. The serializer elides the all-default
+    // `[general.laya]` section (the app's opt-in convention: absent ==
+    // disabled), so the round-trip goes through the settings surface,
+    // not the file text.
+    let settings = setup.settings().expect("settings");
+    assert!(!settings.general.laya.enabled);
+    // The status leg reports the live (Disabled) state.
+    let status = setup.status(None).expect("status");
+    assert_eq!(status.classifier, ClassifierStatus::Disabled);
+}
+
+/// The enable guard (§5.8 :554): a claimed setup guard rejects a second
+/// enable with `setup_in_flight` — the config flip still persisted (the
+/// idempotent write happens before the guard check). The enable pipeline
+/// itself is network-bound — never exercised in tests; the guard is what
+/// keeps a second run out.
+#[test]
+fn classifier_setup_rejects_a_second_enable_with_setup_in_flight() {
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path()).unwrap();
+    std::fs::write(cfg.path().join("config.toml"), "").unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    // Claim the guard the way a live pipeline would.
+    assert!(setup.laya_manager().begin_setup());
+    let err = setup.classifier_setup(true).expect_err("the guard rejects");
+    assert_eq!(err.code(), "setup_in_flight");
+    assert!(err.message().contains("already running"));
+    // The flip persisted BEFORE the guard rejected (idempotent) —
+    // through the settings surface (the file may elide or carry the
+    // section; both read back enabled).
+    let settings = setup.settings().expect("settings");
+    assert!(settings.general.laya.enabled);
+}
+
+/// Install isolation (G4): the Setup's manager roots at
+/// `<config_dir>/laya`, never the process-global dir.
+#[test]
+fn laya_manager_roots_at_the_config_dir() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    assert_eq!(setup.laya_manager().base_dir(), cfg.path().join("laya"));
 }

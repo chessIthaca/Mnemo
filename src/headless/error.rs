@@ -125,6 +125,16 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// A setup pipeline is already running (job 4 D5, §5.8 :554) —
+    /// [`crate::headless::setup::Setup::classifier_setup`]'s guard
+    /// rejects a second concurrent enable.
+    pub(crate) fn setup_in_flight(message: impl Into<String>) -> Self {
+        Self {
+            code: "setup_in_flight".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

@@ -33,7 +33,9 @@ use crate::config::keys::{KeySource, Secret};
 use crate::config::settings_dto::SettingsSaveDto;
 use crate::config::{Config, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
-use crate::memory::classifier::ClassifierStatus;
+use crate::headless::types::EventReceiver;
+use crate::host::laya::{LayaManager, StatusSink};
+use crate::memory::classifier::{Classifier, ClassifierStatus};
 use crate::memory::embedder::EmbedderStatus;
 
 /// One to-do of a first-run flow (§5.8 :570) — the ordered list a setup
@@ -55,6 +57,12 @@ pub enum SetupStep {
     /// Scaffold the project (`.coding/` + the `agent.md` template) —
     /// optional: engines work on plain directories (G3).
     Project,
+    /// Install the managed Laya classifier runtime (job 4 D5,
+    /// §5.8 :554): uv → venv → `laya[serve]` → the English checkpoint,
+    /// then the loopback sidecar. Never in the missing list — the
+    /// engine runs without a classifier; this step only tags
+    /// [`SetupEvent`]s from [`Setup::classifier_setup`].
+    LayaRuntime,
 }
 
 impl fmt::Display for SetupStep {
@@ -69,6 +77,9 @@ impl fmt::Display for SetupStep {
                 write!(f, "the configured embedding model (install it)")
             }
             SetupStep::Project => write!(f, "a scaffolded project (.coding + agent.md)"),
+            SetupStep::LayaRuntime => {
+                write!(f, "the managed Laya classifier runtime")
+            }
         }
     }
 }
@@ -215,6 +226,10 @@ struct LiveHandles {
     trace: Arc<crate::provider::trace::LlmRequestLog>,
     /// The brain's shared config — every later spawn reads it.
     config: Arc<tokio::sync::Mutex<Config>>,
+    /// The brain's classifier slot (D5) — the classifier-setup
+    /// autostart arm swaps it to the fresh sidecar endpoint, the same
+    /// swap the GUI's `laya_setup` performs.
+    classifier_slot: Option<Arc<std::sync::RwLock<Option<Arc<dyn Classifier>>>>>,
 }
 
 impl fmt::Debug for LiveHandles {
@@ -277,9 +292,12 @@ pub struct SetupStatus {
     /// The semantic-search leg (a missing model is NOT fatal — the
     /// engine runs on the hash fallback, `semantic: false`).
     pub embedder: EmbedderReadiness,
-    /// The classifier leg (config-derived: `Disabled` when Laya is off,
-    /// `Ready` when enabled — the live managed-runtime status lands
-    /// with the engine-backed surface, D5).
+    /// The classifier leg (D5): the LIVE managed-runtime status — the
+    /// brain's shared Arc when the Setup is engine-backed, this
+    /// Setup's own pipeline status otherwise. A config-enabled
+    /// install without a live runtime reads `Disabled` (honest: no
+    /// classifier call is attempted until
+    /// [`Setup::classifier_setup`] or an attached engine lights one).
     pub classifier: ClassifierStatus,
     /// The project facts, present when a workspace root was given.
     pub project: Option<ProjectReadiness>,
@@ -302,6 +320,14 @@ pub struct Setup {
     /// The live-engine handles (D4, §5.8 :527) — `None` until
     /// [`Setup::for_engine`]; `patch_settings` applies through them.
     live: Option<LiveHandles>,
+    /// The managed Laya classifier runtime for this config dir (D5,
+    /// §5.8 :554) — rooted at `<config_dir>/laya` (install isolation,
+    /// G4's discipline).
+    laya: Arc<LayaManager>,
+    /// The classifier status the manager drives — a fresh `Disabled`
+    /// handle; `for_engine` re-roots it to the brain's shared Arc so
+    /// the engine and any GUI attached to it see the same moves.
+    classifier_status: Arc<std::sync::RwLock<ClassifierStatus>>,
 }
 
 impl Setup {
@@ -318,10 +344,17 @@ impl Setup {
                 config_dir.display()
             ))
         })?;
+        let classifier_status = Arc::new(std::sync::RwLock::new(ClassifierStatus::Disabled));
+        let laya = Arc::new(LayaManager::with_base(
+            config_dir.join("laya"),
+            Arc::clone(&classifier_status),
+        ));
         Ok(Self {
             config_dir,
             key_source: KeySource::default(),
             live: None,
+            laya,
+            classifier_status,
         })
     }
 
@@ -389,6 +422,14 @@ impl Setup {
         Self {
             config_dir: self.config_dir.clone(),
             key_source: self.key_source.clone(),
+            // Re-root onto the brain's shared status Arc — the engine
+            // and any GUI attached to it see the same moves; the manager
+            // still roots at `<config_dir>/laya`.
+            laya: Arc::new(LayaManager::with_base(
+                self.config_dir.join("laya"),
+                brain.classifier_status.clone(),
+            )),
+            classifier_status: brain.classifier_status.clone(),
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
                 memory_store: brain.memory_store.clone(),
@@ -397,6 +438,7 @@ impl Setup {
                 safety_mode: brain.safety_mode.clone(),
                 trace: brain.trace.clone(),
                 config: brain.config.clone(),
+                classifier_slot: Some(brain.classifier_slot.clone()),
             }),
         }
     }
@@ -411,9 +453,10 @@ impl Setup {
     /// a live engine ([`Setup::open`], a first-run flow) only the
     /// persist happens. Effective on the next request.
     ///
-    /// The managed-CLASSIFIER leg (the sidecar stop/start) lands with
-    /// job 4 D5's Laya core; a standalone engine has no managed
-    /// sidecar yet.
+    /// The managed-CLASSIFIER flip does not ride this patch (D5): it
+    /// has its own surface — [`Setup::classifier_setup`] persists the
+    /// flag AND owns the sidecar stop/start + the status, the same
+    /// split the GUI's Download button has from the settings save.
     pub async fn patch_settings(&self, patch: SettingsSaveDto) -> Result<(), EngineError> {
         let current = self.load_config()?;
         let new_config =
@@ -463,6 +506,127 @@ impl Setup {
         // reloaded values.
         *live.config.lock().await = new_config;
         Ok(())
+    }
+
+    /// The managed-Laya runtime handle for this Setup's config dir
+    /// (rooted at `<config_dir>/laya` — install isolation, G4): stop
+    /// the sidecar, read the catalog + installed flags, share the
+    /// status Arc. A `for_engine` Setup drives the brain's status.
+    pub fn laya_manager(&self) -> &Arc<LayaManager> {
+        &self.laya
+    }
+
+    /// Enable or disable the managed Laya classifier runtime (§5.8
+    /// :554) — the headless twin of Settings → Classifier:
+    ///
+    /// * `enable = true`: persist `[general.laya] enabled = true`,
+    ///   claim the setup guard, then fire the download + install
+    ///   pipeline (uv → venv → `laya[serve]` → the English checkpoint)
+    ///   and autostart the sidecar when the LIVE config still selects
+    ///   it at completion (a mid-setup disable save wins). The
+    ///   returned receiver streams every status change as a
+    ///   [`SetupEvent`] tagged [`SetupStep::LayaRuntime`] —
+    ///   Installing / download fractions / Starting / Ready / Failed.
+    /// * `enable = false`: persist `enabled = false`, stop the sidecar
+    ///   (a no-op when none runs), park the shared status on
+    ///   `Disabled`, and return a receiver carrying the single terminal
+    ///   `Done`.
+    ///
+    /// A second enable while one runs fails fast with
+    /// `"setup_in_flight"` (the same guard the GUI's Download button
+    /// uses). The enable pipeline is network-bound — never exercised
+    /// in tests; the disable leg and the guard are.
+    pub fn classifier_setup(
+        &self,
+        enable: bool,
+    ) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        let (tx, rx) = tokio::sync::broadcast::channel::<SetupEvent>(64);
+        // Persist the flip first — idempotent, so a concurrent second
+        // enable is harmless before the guard rejects it.
+        let mut config = self.load_config()?;
+        config.general.general.laya.enabled = enable;
+        config
+            .save_all(&self.config_dir)
+            .map_err(|e| EngineError::start_failed(format!("saving the config failed: {e}")))?;
+        let step = SetupStep::LayaRuntime;
+        if !enable {
+            // Disable: stop the sidecar (a no-op when none runs), park
+            // the status, report completion.
+            self.laya.stop();
+            *self
+                .classifier_status
+                .write()
+                .expect("classifier status lock poisoned") = ClassifierStatus::Disabled;
+            let _ = tx.send(SetupEvent::Done { step });
+            return Ok(EventReceiver { rx });
+        }
+        // The guard: claimed only AFTER the persist succeeded, so a
+        // failed save never wedges it; the spawned pipeline's
+        // `end_setup` releases it.
+        if !self.laya.begin_setup() {
+            return Err(EngineError::setup_in_flight(
+                "a Laya setup is already running",
+            ));
+        }
+        // The autostart decision re-reads the LIVE config at
+        // completion (`mnemo::host::laya::spawn_setup_task`), so share
+        // the live Arc when an engine is attached — a fresh Arc
+        // wrapping the just-saved config otherwise.
+        let config_arc = match &self.live {
+            Some(live) => Arc::clone(&live.config),
+            None => Arc::new(tokio::sync::Mutex::new(config)),
+        };
+        let slot = self
+            .live
+            .as_ref()
+            .and_then(|live| live.classifier_slot.clone());
+        let sink: StatusSink = Arc::new(move |s: &ClassifierStatus| {
+            let _ = tx.send(Self::classifier_status_to_event(s, SetupStep::LayaRuntime));
+        });
+        crate::host::laya::spawn_setup_task(
+            Some(sink),
+            Arc::clone(&self.laya),
+            crate::host::laya::english_checkpoint(),
+            config_arc,
+            slot,
+        );
+        Ok(EventReceiver { rx })
+    }
+
+    /// Map the core's classifier status onto the setup pipeline's
+    /// event (§5.8 :554 + :588-589): install/download phases are
+    /// `Progress`, `Ready`/`Disabled` are terminal `Done`, `Failed`
+    /// carries a description.
+    fn classifier_status_to_event(s: &ClassifierStatus, step: SetupStep) -> SetupEvent {
+        match s {
+            ClassifierStatus::Disabled | ClassifierStatus::Ready => SetupEvent::Done { step },
+            ClassifierStatus::Failed => SetupEvent::Failed {
+                step,
+                error: "the managed Laya setup failed (see the log under the \
+                        config dir's laya/ tree)"
+                    .to_string(),
+            },
+            ClassifierStatus::Installing => SetupEvent::Progress {
+                step,
+                label: "installing the Laya runtime".to_string(),
+                fraction: None,
+            },
+            ClassifierStatus::Downloading { label, progress } => SetupEvent::Progress {
+                step,
+                label: format!("downloading {label}"),
+                fraction: Some(*progress),
+            },
+            ClassifierStatus::Starting => SetupEvent::Progress {
+                step,
+                label: "starting the managed sidecar".to_string(),
+                fraction: None,
+            },
+            ClassifierStatus::FineTuning { label } => SetupEvent::Progress {
+                step,
+                label: format!("fine-tuning ({label})"),
+                fraction: None,
+            },
+        }
     }
 
     /// Load the config for the endpoints group — one error mapping for
@@ -674,10 +838,20 @@ impl Setup {
     /// The readiness snapshot (§5.8 :562-571) for this config — and,
     /// when given, a workspace root's project facts. Pure fs + config
     /// reads; NO network calls (endpoints report `reachable: None`
-    /// until `test_endpoint` (D2) probes one).
+    /// until `test_endpoint` (D2) probes one). The classifier leg is
+    /// the LIVE managed-runtime status (D5): a `for_engine` Setup
+    /// shares the brain's Arc — Installing/Downloading/Starting/Ready
+    /// surface as they happen; a standalone Setup's own pipeline
+    /// moves it.
     pub fn status(&self, project: Option<&Path>) -> Result<SetupStatus, EngineError> {
         let config = self.load_config()?;
-        Ok(Self::status_from_config(&self.config_dir, &config, project))
+        let mut status = Self::status_from_config(&self.config_dir, &config, project);
+        status.classifier = self
+            .classifier_status
+            .read()
+            .expect("classifier status lock poisoned")
+            .clone();
+        Ok(status)
     }
 
     /// The shared status computation — the engine's start precondition
@@ -753,11 +927,11 @@ impl Setup {
             EmbedderStatus::Failed
         };
 
-        // The classifier leg — config-derived approximation: enabled
-        // means calls are attempted (`ClassifierStatus::Ready`'s
-        // contract); the live managed-runtime status
-        // (Installing/Downloading/Starting) rides the engine-backed
-        // surface (D5).
+        // The classifier leg — the STATIC approximation for callers
+        // with no live handle (the engine's start gate): enabled means
+        // calls are attempted (`ClassifierStatus::Ready`'s contract).
+        // The instance path ([`Setup::status`]) OVERRIDES this with
+        // the live managed-runtime status (D5).
         let classifier = if general.laya.enabled {
             ClassifierStatus::Ready
         } else {

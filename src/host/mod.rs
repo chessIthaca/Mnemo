@@ -14,6 +14,7 @@
 // optional wiring (the hash embedder / no browser) on the bare build.
 pub mod brain;
 pub mod index_progress;
+pub mod laya;
 pub mod maintenance;
 pub mod notifier;
 pub mod rewire;

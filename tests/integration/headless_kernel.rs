@@ -4,7 +4,11 @@
 
 use std::path::PathBuf;
 
-use mnemo::agent::policy::{Continuation, GateVerdict, PermissionPolicy};
+use mnemo::agent::policy::{
+    AgentPolicyFactory, Continuation, GateVerdict, KernelError, NoPolicy, PermissionPolicy,
+    PolicyBuildCtx, PolicyBuildResult, PolicyFactoryCtx,
+};
+use mnemo::agent::prompt::{ConstitutionMode, PromptSpec};
 use mnemo::headless::{Engine, EngineOptions, MemoryBackend};
 use mnemo::workspace::Workspace;
 
@@ -81,7 +85,7 @@ use mnemo::provider::{
     Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind, Role,
     ToolChoice, ToolSchema,
 };
-use mnemo::tool::{SafetyLevel, ToolResult};
+use mnemo::tool::{SafetyLevel, ToolRegistry, ToolResult};
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent};
 
 /// A scripted provider that RECORDS every request's message slice — the
@@ -1721,4 +1725,160 @@ async fn guardrails_selection_gate_rules_and_policy_registry() {
         .await
         .expect("leg c runs");
     assert_eq!(outcome.final_text, "default guardrails are a no-op");
+}
+
+// --- 3c.6 (D6): review F1's regression — the tier-1 snapshot-clone slot ---
+
+/// The sentinel factory (review F1's fixture): builds an identity-only
+/// [`NoPolicy`] head so each session's factory attribution is observable
+/// in the request wire — `assemble_spec_head` pushes the spec's identity
+/// verbatim as the system message's first section.
+struct SentinelHeadFactory {
+    identity: &'static str,
+}
+
+impl AgentPolicyFactory for SentinelHeadFactory {
+    fn create_workflow(
+        &self,
+        plans_dir: &std::path::Path,
+        is_subagent: bool,
+    ) -> std::sync::Arc<dyn mnemo::agent::workflow_handle::AgentWorkflowHandle> {
+        // Delegate the neutral workflow to the engine's own free factory.
+        mnemo::agent::policy::FreePolicyFactory.create_workflow(plans_dir, is_subagent)
+    }
+
+    fn build_policy(&self, _ctx: &PolicyFactoryCtx) -> Result<PolicyBuildResult, KernelError> {
+        // Identity-only spec (no blocks, no constitution): the head IS the
+        // sentinel line. Deliberately never refuses — F2's contract covers
+        // refusals; this fixture pins the slot isolation, not the fallback.
+        let spec = PromptSpec {
+            identity: self.identity.to_string(),
+            blocks: vec![],
+            extra_stable: None,
+            constitution: ConstitutionMode::None,
+        };
+        Ok(PolicyBuildResult {
+            policy: std::sync::Arc::new(
+                NoPolicy::with_spec(std::sync::Arc::new(spec)).ungated(),
+            ),
+            attach_loop: Box::new(|_| {}),
+        })
+    }
+
+    fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
+}
+
+/// Review F1's regression (3c.6): the tier-1 named-policy spawn writes
+/// its factory into a PER-SPAWN snapshot clone — the shared base
+/// factory's slot is never touched, so a LATER plain (or tier-2/3)
+/// spawn of the same engine builds under the engine's free default,
+/// never under the leaked named factory. The pre-fix code wrote through
+/// the SHARED `Arc<RwLock<..>>` slot: one tier-1 spawn re-built every
+/// subsequent session under the named factory (and concurrent tier-1
+/// spawns raced the one slot — the same write, so the sequential legs
+/// pin the mechanism deterministically).
+#[tokio::test]
+async fn tier1_named_factory_isolated_to_its_spawn() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![
+        // Leg 1: the sentinel-A session's turn.
+        g5_text_turn(&["sentinel a session"]),
+        // Leg 2: the sentinel-B session's turn — must see B, never A.
+        g5_text_turn(&["sentinel b session"]),
+        // Leg 3: the plain session's turn — the free default, no sentinel.
+        g5_text_turn(&["plain session"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+    engine.register_policy(
+        "mnemo.sentinel-a",
+        std::sync::Arc::new(SentinelHeadFactory {
+            identity: "SENTINEL-A identity",
+        }),
+    );
+    engine.register_policy(
+        "mnemo.sentinel-b",
+        std::sync::Arc::new(SentinelHeadFactory {
+            identity: "SENTINEL-B identity",
+        }),
+    );
+
+    // The request's system message IS the assembled stable head (§5.9.5's
+    // [head, history, tail, footer] layout).
+    let head_of = |req: usize| {
+        llm.requests()[req]
+            .iter()
+            .find(|m| m.role == Role::System)
+            .expect("the request carries the stable head")
+            .content
+            .as_text()
+    };
+
+    // Leg 1 — the tier-1 session under sentinel-A: its OWN head.
+    let session = engine
+        .spawn(SpawnOptions {
+            policy: Some("mnemo.sentinel-a".into()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("tier-1 spawn under sentinel-a");
+    let outcome = session
+        .run_to_completion("hi")
+        .await
+        .expect("leg 1 runs");
+    assert_eq!(outcome.final_text, "sentinel a session");
+    let head = head_of(0);
+    assert!(
+        head.contains("SENTINEL-A identity"),
+        "leg 1 sees its own sentinel: {head}"
+    );
+    assert!(!head.contains("SENTINEL-B"), "leg 1 never sees B: {head}");
+
+    // Leg 2 — a second tier-1 spawn (the sequential second writer): its
+    // OWN head, not the earlier factory's.
+    let session = engine
+        .spawn(SpawnOptions {
+            policy: Some("mnemo.sentinel-b".into()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("tier-1 spawn under sentinel-b");
+    let outcome = session
+        .run_to_completion("hi")
+        .await
+        .expect("leg 2 runs");
+    assert_eq!(outcome.final_text, "sentinel b session");
+    let head = head_of(1);
+    assert!(
+        head.contains("SENTINEL-B identity"),
+        "leg 2 sees its own sentinel: {head}"
+    );
+    assert!(!head.contains("SENTINEL-A"), "leg 2 never sees A: {head}");
+
+    // Leg 3 — the regression's core: a PLAIN `(None, None)` spawn AFTER
+    // the tier-1 spawns builds under the engine's free default —
+    // pre-fix the shared slot still held sentinel-B and this head
+    // carried it.
+    let session = engine
+        .spawn(SpawnOptions::default())
+        .await
+        .expect("plain spawn after the tier-1 spawns");
+    let outcome = session
+        .run_to_completion("hi")
+        .await
+        .expect("leg 3 runs");
+    assert_eq!(outcome.final_text, "plain session");
+    let head = head_of(2);
+    assert!(
+        !head.contains("SENTINEL-A") && !head.contains("SENTINEL-B"),
+        "the plain session never carries a named factory's head: {head}"
+    );
 }

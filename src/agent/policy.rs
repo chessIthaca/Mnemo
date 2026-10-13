@@ -270,7 +270,11 @@ pub trait AgentPolicyFactory: Send + Sync {
     /// tail. MAY REFUSE (2c.1/G1): a [`NoPolicy`]-semantics factory without
     /// the caller's [`PromptSpec`] errors with
     /// [`KernelError::PromptRequired`] (§5.9.1 :629-630 — never a silent
-    /// coding default; the Engine path (3a) propagates it).
+    /// coding default). The CONSUMER owns the refusal policy (review F2,
+    /// 3c.6): the infallible 2b build falls back to the explicit coding
+    /// default (`NoPolicy::with_coding_default()`, the GATED form), and
+    /// the engine's tier-1 registry (`Engine::register_policy`, headless)
+    /// documents the same contract for registered factories.
     fn build_policy(
         &self,
         ctx: &PolicyFactoryCtx,

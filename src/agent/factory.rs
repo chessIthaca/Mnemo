@@ -232,6 +232,49 @@ fn group_allowed(sel: Option<&ToolSelection>, group: ToolGroup) -> bool {
     }
 }
 
+/// The app-side policy-factory slot (2b.2; master-spec :266-269) — a lock
+/// whose CLONE is a SNAPSHOT (review F1, 3c.6): a derived factory clone
+/// seeds its own FRESH lock from the current read, so a per-spawn
+/// clone's swap (the engine's tier-1 named-policy arm) stays
+/// clone-local and dies with the clone. The factory's other
+/// interior-mutable seams (provider, context_manager, spawner,
+/// descendant_tracker) stay SHARED through their Arcs on purpose — live
+/// settings swaps must reach every clone's build — but the policy
+/// factory is per-session state: a tier-1 spawn must never leak its
+/// named factory into the base factory's slot (a later
+/// plain/tier-2/tier-3 spawn would silently build under it, and
+/// concurrent tier-1 spawns would race the one shared slot).
+#[derive(Default)]
+pub(crate) struct PolicyFactorySlot(
+    RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>,
+);
+
+impl Clone for PolicyFactorySlot {
+    fn clone(&self) -> Self {
+        Self(RwLock::new(
+            self.0
+                .read()
+                .expect("policy_factory lock poisoned")
+                .clone(),
+        ))
+    }
+}
+
+impl PolicyFactorySlot {
+    /// Swap the slot (the startup wiring; a per-spawn clone's tier-1 set).
+    fn set(&self, factory: Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>) {
+        *self.0.write().expect("policy_factory lock poisoned") = factory;
+    }
+
+    /// The slot's current factory (the build-time reads).
+    fn get(&self) -> Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>> {
+        self.0
+            .read()
+            .expect("policy_factory lock poisoned")
+            .clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentLoopFactory {
     /// The shared provider. Behind an `RwLock` so the model can be swapped at
@@ -325,7 +368,12 @@ pub struct AgentLoopFactory {
     /// (the default) builds kernel `NoPolicy`-equivalent policies via
     /// NoPolicyFactory — production and the kernel test helpers wire the
     /// app implementation via set_policy_factory before the first build.
-    policy_factory: Arc<RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>>,
+    /// A [`PolicyFactorySlot`] — snapshot-cloned (review F1, 3c.6): a
+    /// factory CLONE seeds its own fresh lock from the current read, so
+    /// the engine's per-spawn tier-1 swap never leaks into the shared
+    /// base factory (the Arc-shared live seams above stay shared by
+    /// design; this one is per-session state).
+    policy_factory: PolicyFactorySlot,
 
     /// An optional per-context model resolver. When present, every built agent
     /// gets it wired in so the turn driver can pick a model per workflow state
@@ -486,7 +534,7 @@ impl AgentLoopFactory {
             // in via `set_descendant_tracker` alongside the spawner. Until
             // then the state-transition gate is not enforced.
             descendant_tracker: Arc::new(RwLock::new(None)),
-            policy_factory: Arc::new(RwLock::new(None)),
+            policy_factory: PolicyFactorySlot::default(),
             // No skill registry at construction — the IPC layer wires it in
 
             // No model resolver at construction — the IPC layer wires it in
@@ -803,10 +851,7 @@ impl AgentLoopFactory {
         &self,
         factory: Arc<dyn crate::agent::policy::AgentPolicyFactory>,
     ) {
-        *self
-            .policy_factory
-            .write()
-            .expect("policy_factory lock poisoned") = Some(factory);
+        self.policy_factory.set(Some(factory));
     }
 
     /// Update the live git core-operations list (called by `save_settings`
@@ -1089,10 +1134,7 @@ impl AgentLoopFactory {
         // post-build stamp rides the app side through the same handle). The
         // unwired (NoPolicy) factories get the kernel UnwiredWorkflow —
         // every consult reads the neutral defaults.
-        let factory_slot0 = self
-            .policy_factory
-            .read()
-            .expect("policy_factory lock poisoned");
+        let factory_slot0 = self.policy_factory.get();
         let workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> =
             match factory_slot0.as_ref() {
                 Some(pf) => pf.create_workflow(&plans_dir, false),
@@ -1165,10 +1207,7 @@ impl AgentLoopFactory {
         // routing key). The returned attach hook runs at the build's tail
         // once the loop is Arc'd.
         let built_policy = {
-            let factory_slot = self
-                .policy_factory
-                .read()
-                .expect("policy_factory lock poisoned");
+            let factory_slot = self.policy_factory.get();
             match factory_slot.as_ref() {
                 Some(pf) => {
                     let ctx = crate::agent::policy::PolicyFactoryCtx {
@@ -1600,10 +1639,7 @@ impl AgentLoopFactory {
         sandbox: &Sandbox,
         workflow: &Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     ) {
-        let slot = self
-            .policy_factory
-            .read()
-            .expect("policy_factory lock poisoned");
+        let slot = self.policy_factory.get();
         let ctx = crate::agent::policy::PolicyBuildCtx {
             agent_id,
             project_root: self.project_root.clone(),

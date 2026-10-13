@@ -138,8 +138,21 @@ impl Engine {
     /// spawn's `policy` field resolves the name here — an unknown name
     /// fails the spawn with `spawn_failed`. The factory builds the
     /// session's policy through the existing build machinery
-    /// (`build_policy` + `attach_loop`); a same-named entry is replaced
+    /// (`build_policy` + `attach_loop`) on a PER-SPAWN snapshot clone of
+    /// the engine's factory — the named factory never leaks into
+    /// another spawn (review F1, 3c.6); a same-named entry is replaced
     /// (last registration wins). Register before spawning.
+    ///
+    /// CONTRACT (review F2, 3c.6): the build always runs with
+    /// `PolicyFactoryCtx.prompt = None` (a registered factory composes
+    /// its own head), and a REFUSING factory — e.g. a NoPolicy-semantics
+    /// factory erroring with `KernelError::PromptRequired` — does NOT
+    /// fail the spawn: the infallible 2b build's factory-level fallback
+    /// attaches `NoPolicy::with_coding_default()` (the GATED coding
+    /// default, §5.9.1) and the spawn succeeds. A registered factory
+    /// must build without a caller spec; failing the spawn on refusal
+    /// needs the build path to become fallible — job 5's follow-up, not
+    /// the 3c surface.
     pub fn register_policy(
         &self,
         name: impl Into<String>,
@@ -177,11 +190,12 @@ impl Engine {
             }
         }
         // Both tiers build on a PER-SPAWN factory clone — the shared
-        // factory is never mutated: tier 1 swaps the clone's policy
-        // factory (the named build_policy/attach_loop flow through the
-        // existing 2b machinery), tier 2 threads the tool selection so
-        // the registration table narrows the registry (R1: the array
-        // changes only at spawn).
+        // factory is never mutated: tier 1 swaps the CLONE's policy
+        // factory (the snapshot-clone slot, review F1/3c.6 — the named
+        // factory is seeded into the clone's own fresh lock, so it dies
+        // with the clone and never leaks into a later spawn), tier 2
+        // threads the tool selection so the registration table narrows
+        // the registry (R1: the array changes only at spawn).
         let factory = match (&opts.policy, &guardrails) {
             (Some(name), _) => {
                 let named = self

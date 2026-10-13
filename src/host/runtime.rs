@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::agent::factory::AgentLoopFactory;
 use crate::agent::AgentLoop;
 use crate::runtime::agent::AgentTask;
-use crate::runtime::channels::{AgentCommand, AgentHandle, AgentId};
+use crate::runtime::channels::{AgentCommand, AgentEvent, AgentHandle, AgentId};
 use crate::runtime::{AgentManager, AgentSpawner, DescendantTracker, ParentAwareSpawner};
 use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
 
@@ -611,6 +611,99 @@ impl DescendantTracker for HostSpawner {
     async fn has_running_descendants(&self, agent_id: AgentId) -> bool {
         let mgr = self.manager.lock().await;
         mgr.has_running_descendants(agent_id)
+    }
+}
+
+/// The host-side agent runtime core every frontend shares: the agent
+/// manager + per-agent loop map, the [`HostSpawner`] wired into the
+/// factory, the fan-in event receiver, the main agent's id, and the
+/// [`LifecycleBookkeeping`] — the assembly the console built inline until
+/// 3a.2 (D2) hoisted it, now the piece a headless Engine, a daemon, or the
+/// GUI can hold directly. Nothing here reads stdin, writes stdout, or
+/// touches a Tauri handle.
+///
+/// Field-level mirror of the old console assembly: `AgentManager::new(256)`,
+/// the fan-in receiver taken before the manager is wrapped, one
+/// [`HostSpawner`] serving as both `AgentSpawner` and `DescendantTracker`
+/// (set on the factory BEFORE the main spawn — the spawn tool is
+/// registered per build), the main agent via [`spawn_agent_shared`] with
+/// the GUI's exact args, and bookkeeping over the shared maps.
+pub struct HostRuntime {
+    /// The loop factory the spawner and every frontend path share.
+    pub factory: Arc<AgentLoopFactory>,
+    /// The agent manager (registration + fan-in) — one per runtime.
+    pub manager: Arc<tokio::sync::Mutex<AgentManager>>,
+    /// The per-agent loop map (steer/interrupt/approve senders).
+    pub agent_loops: AgentLoopMap,
+    /// The shared spawner (AgentSpawner + DescendantTracker in one).
+    pub spawner: Arc<HostSpawner>,
+    /// The fan-in event receiver — the runtime owns it, exactly like the
+    /// GUI's event forwarder does.
+    pub fanin_rx: tokio::sync::mpsc::Receiver<(AgentId, AgentEvent)>,
+    /// The main agent's id (prompts are sent to it).
+    pub main_id: AgentId,
+    /// Lifecycle bookkeeping (running flags, parent notifications,
+    /// dead-agent cleanup).
+    pub bookkeeping: LifecycleBookkeeping,
+}
+
+impl HostRuntime {
+    /// Build the runtime from a wired factory: create the manager, wire
+    /// the [`HostSpawner`] into the factory, spawn the main agent via the
+    /// same shared path as the GUI's main agent (id allocation, channel
+    /// setup, loop-map insert, and registration are identical), and set
+    /// up the lifecycle bookkeeping.
+    pub async fn start(factory: Arc<AgentLoopFactory>) -> Result<Self, String> {
+        let mut mgr = AgentManager::new(256);
+        // Take the fan-in receiver before wrapping the manager (the
+        // runtime owns it, like the GUI's event forwarder does).
+        let fanin_rx = mgr.take_fanin_rx().expect("fan-in receiver already taken");
+        let manager = Arc::new(tokio::sync::Mutex::new(mgr));
+        let agent_loops: AgentLoopMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // Wire the spawn_agent tool's spawner BEFORE the main agent exists
+        // (the tool is registered per build) — one HostSpawner serves as
+        // both AgentSpawner and DescendantTracker.
+        let spawner = Arc::new(HostSpawner::new(
+            factory.clone(),
+            manager.clone(),
+            agent_loops.clone(),
+        ));
+        factory.set_spawner(spawner.clone());
+        factory.set_descendant_tracker(spawner.clone());
+
+        // The main agent — identical args to the GUI's main-agent spawn:
+        // no initial prompt, no parent, no forced model, no role, and no
+        // worktree binding (the main agent works the main tree).
+        let (main_id, _) = spawn_agent_shared(
+            factory.clone(),
+            manager.clone(),
+            agent_loops.clone(),
+            "main".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map_err(|e| format!("main agent spawn failed: {e}"))?;
+
+        // The bookkeeping struct shares the manager + loop map (cloned
+        // before they move into the runtime's own fields).
+        let bookkeeping = LifecycleBookkeeping::new(manager.clone(), agent_loops.clone());
+
+        Ok(Self {
+            factory,
+            manager,
+            agent_loops,
+            spawner,
+            fanin_rx,
+            main_id,
+            bookkeeping,
+        })
     }
 }
 

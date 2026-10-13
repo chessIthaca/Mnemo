@@ -226,3 +226,32 @@ Amendment (2027-01-15, step 3a.1 — the landed D1 picks):
   (feat_exit=0) + test --workspace (ws_exit=0) + build --workspace
   (build_exit=0); the goldens trio 3/3 in-suite;
   build_brain_headless_without_notifier green under features, unchanged.
+
+Amendment (2027-01-15, step 3a.2 — the landed D2 picks):
+- HostRuntime (src/host/runtime.rs, inserted between HostSpawner's impl and
+  LifecycleBookkeeping): `pub struct { factory, manager, agent_loops,
+  spawner, fanin_rx, main_id, bookkeeping }` + `pub async fn start(factory)
+  -> Result<Self, String>` — the EXACT assembly the console built inline
+  (AgentManager::new(256), the fan-in receiver taken before the wrap, one
+  HostSpawner serving both spawner traits set on the factory BEFORE the
+  main spawn, the main agent via spawn_agent_shared with the GUI's exact
+  args, LifecycleBookkeeping over the shared maps). String errors — the
+  kernel stays anyhow-free; the Engine layer maps into EngineError.
+- The console thin-wrapper: ConsoleRuntime = { _brain, runtime:
+  HostRuntime, config, project, trace, browser, selection } — 12
+  delegation sites rewritten (fanin_rx/main_id/manager/factory/
+  agent_loops/bookkeeping → self.runtime.X); `start` delegates to
+  HostRuntime::start + keeps the console-only bits (selection computed
+  after the host core — same ordering as the old inline code); the four
+  host-core type imports moved into the tests module so BOTH
+  configurations stay warning-free (plain check AND all-targets under
+  deny(warnings)).
+- NO behavior change: the console suite green unchanged (ws_exit=0 — the
+  fixtures construct HostSpawner/AgentLoopMap directly and exercise the
+  delegation paths).
+- The battery at the final tree: check --workspace (check_exit=0) + test
+  -p mnemo (test_exit=0) + test --workspace (ws_exit=0) + test -p mnemo
+  --features browser,embeddings (feat_exit=0) + build --workspace
+  (build_exit=0); the goldens trio 3/3 in-suite; clippy: host/runtime.rs
+  EXACTLY its 5 pre-existing storm sites (zero new from the ~100-line
+  insert, verified by count), console.rs 0 (never a storm file; still 0).

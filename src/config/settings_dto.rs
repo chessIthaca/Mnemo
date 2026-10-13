@@ -73,6 +73,13 @@ pub struct ModelsConfigDto {
     pub reviewing: Option<Option<ModelRefDto>>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub complete: Option<Option<ModelRefDto>>,
+    /// Model for a headless / policy-less agent loop (`[models.free]`, the
+    /// `["free"]` routing key — a set slot resolves it, an unset slot rides
+    /// the default; pinned by model_resolver's
+    /// `free_slot_resolves_configured_or_falls_back_to_default`). Same
+    /// double-Option semantics as the other slots.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub free: Option<Option<ModelRefDto>>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub subagent: Option<Option<ModelRefDto>>,
     /// Model for compaction summaries (auto-compaction + the run-all
@@ -640,6 +647,7 @@ pub fn validate_and_apply_settings_patch(
             &models.bug_fixing,
             &models.reviewing,
             &models.complete,
+            &models.free,
             &models.subagent,
             &models.summarize,
         ] {
@@ -938,6 +946,12 @@ pub fn validate_and_apply_settings_patch(
         }
         if let Some(c) = &models.complete {
             general.models.complete = c.as_ref().map(|m| to_ref(m));
+        }
+        if let Some(f) = &models.free {
+            // Lint-clean form (clippy redundant_closure): pass the mapper
+            // directly — the seven sibling arms still fire the lint and
+            // ride the a439d8c2 sweep.
+            general.models.free = f.as_ref().map(to_ref);
         }
         if let Some(s) = &models.subagent {
             general.models.subagent = s.as_ref().map(|m| to_ref(m));
@@ -1414,6 +1428,67 @@ mod tests {
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert_eq!(
             next.general.models.bug_fixing,
+            Some(ModelRef {
+                endpoint: "ep".into(),
+                model: "old".into(),
+                reasoning_effort: None,
+            })
+        );
+    }
+
+    #[test]
+    fn free_patch_set_clear_keep() {
+        // 2c.6 (§5.2 :270-271): the free slot rides the [models] patch like
+        // the other slots — Some(Some(m)) replaces, Some(None) clears,
+        // outer None keeps — and validates against the configured endpoints.
+        // (The set→used / unset→default-ride WALK is pinned separately in
+        // model_resolver's free_slot_resolves_configured_or_falls_back_to_default
+        // — 2a.6, verify-only here per A8's row-7 verdict.)
+        let mut current = Config::default();
+        current.general.models.free = Some(ModelRef {
+            endpoint: "ep".into(),
+            model: "old".into(),
+            reasoning_effort: None,
+        });
+        // Set: Some(Some(m)) replaces (effort included).
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto {
+                free: Some(Some(ModelRefDto {
+                    endpoint: "ep2".into(),
+                    model: "m2".into(),
+                    reasoning_effort: Some("max".into()),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(
+            next.general.models.free,
+            Some(ModelRef {
+                endpoint: "ep2".into(),
+                model: "m2".into(),
+                reasoning_effort: Some("max".into()),
+            })
+        );
+        // Clear: Some(None) → None.
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto {
+                free: Some(None),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(next.general.models.free, None);
+        // Keep: outer None → unchanged.
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto::default()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(
+            next.general.models.free,
             Some(ModelRef {
                 endpoint: "ep".into(),
                 model: "old".into(),

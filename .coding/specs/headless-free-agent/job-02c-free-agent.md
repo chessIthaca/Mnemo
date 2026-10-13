@@ -530,3 +530,32 @@ Amendment (2027-01-15, step 2c.5 — the landed D6/D7 picks):
   browser,embeddings (feat_exit=0) + workspace (ws_exit=0) + build --workspace
   (pre-dates only the cfg(test)-only lint fixes — non-test code identical) +
   the goldens trio 3/3 (in-suite) + the three compile-enforced greps.
+
+
+Amendment (2027-01-15, step 2c.6 — the landed D8 picks):
+- The slot (settings_dto.rs ModelsConfigDto): `free: Option<Option<ModelRefDto>>`
+  after `complete`, the same double-Option + `deserialize_optional_nullable`
+  shape as the lifecycle slots; the validation field-list entry + the apply
+  arm (`general.models.free`) mirror planning/executing/reviewing. ONE in-hunk
+  deviation from the byte-mirror: the new arm uses `.map(to_ref)` — clippy
+  redundant_closure fires on the seven siblings' `|m| to_ref(m)` (all
+  pre-existing, riding the a439d8c2 sweep), and the new arm itself adds ZERO
+  storm sites (the settings_dto.rs count is unchanged at 12).
+- Additive wire field — the IPC parses the patch generically via serde (no
+  src-tauri change; the ipc/settings.rs ModelsConfigDto hits are tests only),
+  and the config-side consumption landed in 2a.6 (general.rs :855-861
+  `free: Option<ModelRef>`).
+- NO walk change (A8's row-7 verdict, held): the resolver walk is untouched —
+  model_resolver.rs :346 `"free" => models.free.as_ref()` + the default-ride
+  on None, pinned by `free_slot_resolves_configured_or_falls_back_to_default`
+  (:791-829, 2a.6). Row 7's wording — "[models.free] set → used; unset → the
+  default ride" — VERIFIED against that test; verify-only as specified.
+- The fixture: `free_patch_set_clear_keep` (the bug_fixing_patch_set_clear_keep
+  precedent — set replaces with the effort, Some(None) clears, outer None
+  keeps), asserting the arm end-to-end through validate_and_apply_settings_patch.
+- The battery green at the final tree: default (test_exit=0) + workspace
+  (ws_exit=0) + browser,embeddings (feat_exit=0) + the goldens trio 3/3
+  (in-suite); the three compile-enforced greps unchanged since the 2c.5
+  verification (this step touched only src/config/settings_dto.rs + this
+  file). The clippy habit-leg: unchanged storm state (backlog a439d8c2),
+  zero new sites.

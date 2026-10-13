@@ -17,6 +17,7 @@ pub mod browser;
 pub mod codegraph;
 pub mod config;
 pub mod error;
+pub mod headless;
 pub mod host;
 pub mod index_staleness;
 pub mod mcp;

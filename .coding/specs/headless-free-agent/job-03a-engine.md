@@ -255,3 +255,47 @@ Amendment (2027-01-15, step 3a.2 — the landed D2 picks):
   (build_exit=0); the goldens trio 3/3 in-suite; clippy: host/runtime.rs
   EXACTLY its 5 pre-existing storm sites (zero new from the ~100-line
   insert, verified by count), console.rs 0 (never a storm file; still 0).
+
+Amendment (2027-01-15, step 3a.3 — the landed D3 picks):
+- src/headless/{mod,types,error}.rs + `pub mod headless;` in lib.rs.
+  types.rs: SessionId (newtype over AgentId = u64, private field),
+  MemoryBackend { Sqlite { path: Option<PathBuf> } with a MANUAL Default
+  (the derive cannot express a non-unit variant), Disabled },
+  EngineOptions (§5.3 :284-293 fields; no Default — a workspace isn't
+  defaultable), SpawnOptions (the 3a subset: name / model / worktree /
+  permissions / policy / resume; guardrails / host_tools /
+  external_policy are 3c's additive land), SessionCommand (tag = "type",
+  snake_case; Prompt/Steer/CancelSteer/Interrupt/Compact/Clear/Approve/
+  Answer — HostToolResult + PolicyAnswer are 3c), SessionEvent { agent,
+  event: SerializableAgentEvent }, EventReceiver<T> + RecvError::{
+  Closed, Lagged(u64) } (the broadcast From), SessionLimits (all seven
+  §5.9.7 fields typed; 3a.7 implements max_turns/wall_clock), Transcript
+  (placeholder messages: Vec<Value>; 3a.6 fills the layout).
+- error.rs: EngineError { code, message } + code()/message() + Display +
+  std::error::Error, serde-able. The kind constructors (no_project /
+  session_closed / spawn_failed / engine_shutdown) were written
+  ahead-of-use and hit deny(warnings) dead_code — TRIMMED; each lands
+  with its 3a.4/3a.5 caller (same for EventReceiver::from_broadcast).
+- Workspace gained Serialize + Deserialize (EngineOptions carries it,
+  §5.3 :286).
+- The contract fixtures (tests/integration/headless.rs — the merged
+  integration binary's new module): public_types_serde_roundtrip
+  (serialize → deserialize → re-serialize, the JSON forms compared — no
+  PartialEq needed on the types; the tag spellings pinned: {"type":
+  "interrupt"} / {"type": "prompt", …}; the kebab-case permission shape
+  pinned: {"mode": "ApproveViaApi", "safety_mode": "autonomous"}),
+  session_command_malformed_json_errors (unknown tag / missing field /
+  wrong tag key / non-object all reject), public_types_are_send_sync_static
+  (11 types).
+- In-flight repairs: MemoryBackend's #[default] on a non-unit variant
+  (manual Default impl), EventReceiver's Clone derive (this tokio's
+  broadcast::Receiver is NOT Clone — dropped; fresh subscribers come from
+  AgentSession::events()), the dead-code trim above; EngineError's test
+  construction goes through serde (the constructors are engine-internal).
+- The battery at the final tree: test -p mnemo (test_exit=0, 2716 — the
+  three contract tests ride the integration target) +
+  --features browser,embeddings (feat_exit=0, 2743) + --workspace
+  (ws_exit=0, 3063) + build --workspace (build_exit=0); the goldens trio
+  3/3 in-suite; clippy: ZERO sites in the new files; workspace.rs:94
+  ("items after a test module") is pre-existing 2c.3-era code outside
+  this step's hunks — rides a439d8c2.

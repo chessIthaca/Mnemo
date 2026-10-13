@@ -19,14 +19,17 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 /// The conventional name of the state dir under a project root. Kept
 /// kernel-side so the kernel's default derivation and the app's
 /// project-model paths render from the same string (G3).
 pub const CODING_DIR_NAME: &str = ".coding";
 
 /// The kernel workspace: root + `state_dir` (+ the git expectation).
-/// Paths only — no filesystem writes happen here.
-#[derive(Debug, Clone)]
+/// Paths only — no filesystem writes happen here. Serde-able since 3a.3:
+/// the public `EngineOptions` carries it across the wire (§5.3 :286).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workspace {
     /// The working directory (the project root).
     pub root: PathBuf,

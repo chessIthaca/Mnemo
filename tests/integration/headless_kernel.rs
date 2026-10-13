@@ -564,3 +564,36 @@ async fn unknown_approval_errors_unknown_request_not_closed() {
     assert_eq!(err.code(), "unknown_request");
     engine.shutdown().await.expect("engine shuts down");
 }
+// --- 3b.1: D1 (the EngineOptions consumption fixture) ---
+
+/// 3b.1 (D1): MemoryBackend::Disabled + index_codegraph: false consume
+/// cleanly — the engine starts, a session runs a turn, and NO state-dir
+/// artifacts appear (no memory.db, no codegraph.db): no store, no
+/// graph, no watcher.
+#[tokio::test]
+async fn memory_disabled_consumes_no_store() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["ok"])]);
+    let mut options = opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    options.memory = MemoryBackend::Disabled;
+    options.index_codegraph = false;
+    let engine = Engine::builder(options)
+        .provider(llm)
+        .start()
+        .await
+        .expect("engine starts");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let outcome = session.run_to_completion("hi").await.expect("turn");
+    assert_eq!(outcome.final_text, "ok");
+    let state = root.path().join(".coding");
+    assert!(
+        !state.join("memory.db").exists(),
+        "a Disabled engine writes no memory store"
+    );
+    assert!(
+        !state.join("codegraph.db").exists(),
+        "index_codegraph: false writes no graph"
+    );
+    engine.shutdown().await.expect("engine shuts down");
+}

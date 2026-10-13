@@ -41,3 +41,33 @@ Job 3a closed the engine + session surface (review PASS at c38e7b2; master 7/11)
 ## G. Amendments
 
 (none yet)
+### 3b.1 (D1) — EngineOptions consumption: memory + index_codegraph — landed 2027-01-18
+
+- wire_brain (src/host/brain.rs) takes a NEW BrainMemoryOptions struct
+  { memory_enabled, memory_path, index_codegraph } — the engine's
+  decisions RESOLVED at the callers. The first shape (three plain
+  params) pushed the fn to 9 args and TRIPPED too_many_arguments
+  (a genuinely NEW clippy site — the fn sat at 6 before); the struct
+  collapses it to 7, under the threshold. No #[allow]; root-cause fix.
+- The app wrapper (build_brain) passes memory_enabled: true +
+  memory_path: None + the config's codegraph flag — behavior
+  byte-preserved. The headless Engine passes opts.memory/opts.
+  index_codegraph resolved (the caller's explicit EngineOptions govern;
+  the GUI threads the config values into EngineOptions at job 5).
+- Disabled consumption (memory: false): the store is Option — NO
+  MemoryStore at all (no memory.db, no recall/consolidation/capture);
+  the gated consumers: store_trait→factory (None), the kNN overlay
+  SKIPPED (its embedder getter is store-backed; the failure-triage
+  flag mirror still works), set_memory_search_config, the derived-index
+  reconcile, the startup re-embed, Brain.memory_store (None).
+- index_codegraph: false → no graph open, no watcher (the config's
+  flag is now only the app path's source).
+- Sqlite{path} resolves path-or-<state_dir>/memory.db.
+- Test: memory_disabled_consumes_no_store (headless_kernel.rs — the
+  §9 canonical memory_disabled_errors rides 3b.2 with Engine::memory()).
+  In-flight fixes: Option<Arc<Concrete>>→Option<Arc<dyn>> needed an
+  explicit map-cast (coercion doesn't ride through Option); a duplicate
+  MemoryBackend import in the test file.
+- Battery: kernel 3006+46, features 3033+46, workspace + build green;
+  clippy zero NEW sites in own hunks (brain.rs:116 BrainOutcome stays
+  the documented pre-existing).

@@ -23,7 +23,7 @@ use crate::headless::session::{pump_task, AgentSession, EngineInner};
 use crate::headless::types::{
     EngineOptions, EventReceiver, HostEvent, SessionEvent, SessionId, SpawnOptions,
 };
-use crate::host::brain::{wire_brain, Brain};
+use crate::host::brain::{wire_brain, Brain, BrainMemoryOptions};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
 use crate::host::runtime::{spawn_agent_shared, HostRuntime};
 use crate::provider::LlmClient;
@@ -259,8 +259,28 @@ async fn start_inner(
     // explicit inputs. A headless start is never "switched open".
     let rt = tokio::runtime::Handle::current();
     let workspace = Arc::new(opts.workspace.clone());
-    let brain = wire_brain(config_dir, config, workspace, false, Some(notifier), rt)
-        .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
+    // 3b.1 (D1): the engine's memory/index decisions govern — a
+    // headless caller's explicit EngineOptions win over the config's
+    // defaults (the GUI passes the config values into EngineOptions at
+    // job 5).
+    let (memory_enabled, memory_path) = match opts.memory {
+        crate::headless::types::MemoryBackend::Sqlite { path } => (true, path),
+        crate::headless::types::MemoryBackend::Disabled => (false, None),
+    };
+    let brain = wire_brain(
+        config_dir,
+        config,
+        workspace,
+        false,
+        Some(notifier),
+        rt,
+        BrainMemoryOptions {
+            memory_enabled,
+            memory_path,
+            index_codegraph: opts.index_codegraph,
+        },
+    )
+    .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
 
     // The optional provider injection (the builder's test seam) — BEFORE
     // the host core builds the main agent.

@@ -229,8 +229,24 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         }
     };
 
-    wire_brain(config_dir, config, workspace, switched_open, notifier, rt)
-        .map(BrainOutcome::Ready)
+    // 3b.1 (D1): the app path keeps today's behavior — the store at
+    // <state_dir>/memory.db (the Sqlite default), the codegraph flag
+    // from the loaded config.
+    let want_codegraph = config.general.general.codegraph;
+    wire_brain(
+        config_dir,
+        config,
+        workspace,
+        switched_open,
+        notifier,
+        rt,
+        BrainMemoryOptions {
+            memory_enabled: true,
+            memory_path: None,
+            index_codegraph: want_codegraph,
+        },
+    )
+    .map(BrainOutcome::Ready)
 }
 
 /// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +
@@ -239,6 +255,23 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
 /// no global-config read, no picker: the app reaches this through
 /// [`build_brain`]'s resolution; the headless Engine through
 /// `EngineOptions` (G4 — the engine passes its directories explicitly).
+/// 3b.1 (D1): the brain's memory/index decisions, RESOLVED from
+/// EngineOptions.memory + index_codegraph by the callers (the app path
+/// passes the config's values, preserving its behavior).
+pub(crate) struct BrainMemoryOptions {
+    /// `false` = MemoryBackend::Disabled: NO store — no recall, no
+    /// consolidation, no capture, no memory.db on disk (Engine::memory()
+    /// errors `memory_disabled`).
+    pub memory_enabled: bool,
+    /// MemoryBackend::Sqlite's explicit path override (`None` derives
+    /// `<state_dir>/memory.db`).
+    pub memory_path: Option<std::path::PathBuf>,
+    /// Whether to open + index the code graph (the app passes the
+    /// config's `codegraph`; the headless Engine passes
+    /// EngineOptions.index_codegraph).
+    pub index_codegraph: bool,
+}
+
 pub(crate) fn wire_brain(
     config_dir: std::path::PathBuf,
     config: Config,
@@ -246,7 +279,13 @@ pub(crate) fn wire_brain(
     switched_open: bool,
     notifier: Option<SharedNotifier>,
     rt: tokio::runtime::Handle,
+    memory: BrainMemoryOptions,
 ) -> anyhow::Result<Brain> {
+    let BrainMemoryOptions {
+        memory_enabled,
+        memory_path,
+        index_codegraph,
+    } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
     // instance the IPC layer hands to the Trace tab.
@@ -442,14 +481,25 @@ pub(crate) fn wire_brain(
     let tool_choice_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.steer_tool_choice,
     ));
-    let store = match MemoryStore::open(&workspace.state_dir.join("memory.db"), embedder) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("warning: failed to open memory store: {e}; using in-memory");
-            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap())
+    let store: Option<Arc<MemoryStore>> = if memory_enabled {
+        let db_path = memory_path.unwrap_or_else(|| workspace.state_dir.join("memory.db"));
+        match MemoryStore::open(&db_path, embedder) {
+            Ok(s) => Some(Arc::new(s)),
+            Err(e) => {
+                eprintln!("warning: failed to open memory store: {e}; using in-memory");
+                Some(Arc::new(
+                    MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap(),
+                ))
+            }
         }
+    } else {
+        // 3b.1 (D1): MemoryBackend::Disabled — NO store at all: no
+        // recall, no consolidation, no capture, no memory.db on disk.
+        None
     };
-    let store_trait: Arc<dyn crate::memory::MemoryStoreTrait> = store.clone();
+    let store_trait: Option<Arc<dyn crate::memory::MemoryStoreTrait>> = store
+        .as_ref()
+        .map(|store| store.clone() as Arc<dyn crate::memory::MemoryStoreTrait>);
 
     // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
     // slot plus the `[general.laya] failure_triage` flag mirror. The factory
@@ -469,20 +519,25 @@ pub(crate) fn wire_brain(
     // Lazy by construction: with the flag off nothing is ever read or
     // embedded. Constructed AFTER the store so the getter can capture a
     // store clone.
-    let store_for_knn = store.clone();
     let failure_triage_handle = crate::agent::failure_triage::FailureTriageHandle::new(
         classifier_slot.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(
             config.general.general.laya.failure_triage,
         )),
-    )
-    .with_knn(
-        Arc::new(crate::agent::failure_triage_knn::KnnClassifier::new(
-            Arc::new(move || store_for_knn.embedder_handle()),
-            crate::agent::failure_triage::training_log_path(),
-        )),
-        config.general.general.laya.failure_triage_knn,
     );
+    let failure_triage_handle = if let Some(store_for_knn) = store.clone() {
+        failure_triage_handle.with_knn(
+            Arc::new(crate::agent::failure_triage_knn::KnnClassifier::new(
+                Arc::new(move || store_for_knn.embedder_handle()),
+                crate::agent::failure_triage::training_log_path(),
+            )),
+            config.general.general.laya.failure_triage_knn,
+        )
+    } else {
+        // 3b.1 (D1): no store → no kNN overlay (its embedder getter is
+        // store-backed); the failure-triage flag mirror still works.
+        failure_triage_handle
+    };
 
     // The pre-prompt routing gate (backlog 091e694d): the SAME shared
     // classifier slot. The `[general.laya] routing` opt-in and the
@@ -507,7 +562,9 @@ pub(crate) fn wire_brain(
     // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
     // the loaded config — recall + memory_write read the store's snapshot per
     // call. Settings saves update it via rewire_vision_embedder_and_classifier.
-    store.set_memory_search_config(config.general.memory.clone());
+    if let Some(store) = &store {
+        store.set_memory_search_config(config.general.memory.clone());
+    }
 
     // Startup reconciliation: check whether the semantic DB matches the
     // on-disk truth (plans, reviews, knowledge records, backlog) and rebuild
@@ -525,9 +582,10 @@ pub(crate) fn wire_brain(
     // must not interleave delete_derived + index_state_clear with reconcile
     // writes — the guard serializes them (the manual command errors with
     // "already running" instead of corrupting the state table).
-    {
+    // 3b.1 (D1): no store (MemoryBackend::Disabled) → no derived-index
+    // reconcile — nothing to index into, no derived artifacts on disk.
+    if let Some(store_for_index) = store.clone() {
         let notifier = notifier.clone();
-        let store_for_index = store.clone();
         let plans_dir = workspace.state_dir.join("plans");
         let backlog_path = workspace.state_dir.join("backlog.jsonl");
         rt.spawn(async move {
@@ -692,11 +750,13 @@ pub(crate) fn wire_brain(
         pending_load.is_some(),
         &status_snapshot,
     ) {
-        let store_for_reembed = store.clone();
-        let embedder_for_reembed = store.embedder_handle();
-        rt.spawn(async move {
-            crate::memory::reembed_if_needed(&store_for_reembed, &embedder_for_reembed).await;
-        });
+        // 3b.1 (D1): no store → nothing to re-embed.
+        if let Some(store_for_reembed) = store.clone() {
+            let embedder_for_reembed = store_for_reembed.embedder_handle();
+            rt.spawn(async move {
+                crate::memory::reembed_if_needed(&store_for_reembed, &embedder_for_reembed).await;
+            });
+        }
     }
 
     // Load constitutions. We keep a live source (file paths + mtimes) so the
@@ -816,7 +876,10 @@ pub(crate) fn wire_brain(
     // mid-index error or panic keeps the handle live: the store lock is
     // poison-tolerant and the DB is a rebuildable cache, so the tools
     // degrade to per-call errors instead of being torn down.
-    let codegraph: Option<Arc<crate::codegraph::CodeGraph>> = if config.general.general.codegraph {
+    // 3b.1 (D1): gated on the caller-resolved index flag (the app passes
+    // the config's `codegraph`; the headless Engine passes
+    // EngineOptions.index_codegraph).
+    let codegraph: Option<Arc<crate::codegraph::CodeGraph>> = if index_codegraph {
         match crate::codegraph::CodeGraph::open(
             workspace.root.clone(),
             &workspace.state_dir.join("codegraph.db"),
@@ -975,7 +1038,7 @@ pub(crate) fn wire_brain(
     let factory = AgentLoopFactory::new(
         provider,
         constitution_source,
-        Some(store_trait),
+        store_trait,
         sandbox.clone(),
         workspace.root.clone(),
         Some(safety_rules.clone()),
@@ -1092,7 +1155,7 @@ pub(crate) fn wire_brain(
 
     Ok(Brain {
         factory,
-        memory_store: Some(store),
+        memory_store: store,
         workspace,
         config: Arc::new(tokio::sync::Mutex::new(config)),
         sandbox,

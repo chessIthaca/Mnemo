@@ -1223,7 +1223,7 @@ pub(crate) async fn run_console() -> i32 {
     // store on the hash embedder. Load + swap in the background — same path
     // the GUI's setup hook runs (review finding 1, 2026-08-20: without this
     // the console silently degraded to hash for the whole session).
-    if let (Some(model), Some(store)) = (&brain.pending_model_load, &brain.memory_store) {
+    if let (Some(model), Some(store)) = (&brain.pending_model_load, &brain.own_memory_store) {
         crate::ipc::embeddings::spawn_startup_load_console(
             store.clone(),
             brain.embedder_status.clone(),

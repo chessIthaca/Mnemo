@@ -1218,7 +1218,7 @@ pub async fn save_settings(
     // The brain function already parsed + applied the safety mode to
     // new_config.general.general.safety. Read it back directly instead of
     // re-parsing patch.safety (review finding 7 — avoids a redundant parse).
-    let parsed_safety = if patch.safety.is_some() {
+    let parsed_safety = if patch.engine.safety.is_some() {
         Some(new_config.general.general.safety)
     } else {
         None
@@ -1262,7 +1262,9 @@ pub async fn save_settings(
     // they take effect without a restart. The budget applies retroactively
     // (oldest over-budget payloads evicted immediately); the request cap
     // applies to records started after this point.
-    if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
+    if patch.engine.trace_memory_budget_mb.is_some()
+        || patch.engine.trace_request_body_cap_kb.is_some()
+    {
         state
             .trace
             .set_memory_budget(reloaded.general.trace.memory_budget_mb * 1024 * 1024);
@@ -1585,7 +1587,7 @@ mod settings_dto_tests {
     }
 
     #[test]
-    fn settings_save_dto_parses_vision_and_pricing() {
+    fn settings_save_wire_parses_vision_pricing_and_ui() {
         let raw = r#"{
             "safety": "auto-approve-project",
             "vision_model": { "endpoint": "qwen", "model": "qwen-vl" },
@@ -1597,17 +1599,19 @@ mod settings_dto_tests {
             "sound_stopped_errors": false,
             "pricing": [{ "model": "gpt-4o", "input_per_1m": 2.5, "output_per_1m": 10.0, "cached_per_1m": 1.25 }]
         }"#;
-        let p: SettingsSaveDto = serde_json::from_str(raw).unwrap();
-        assert_eq!(p.safety.as_deref(), Some("auto-approve-project"));
-        assert_eq!(p.vision_model.as_ref().unwrap().endpoint, "qwen");
-        assert!((p.summarize_at_fill_rate.unwrap() - 0.4).abs() < 1e-9);
-        assert_eq!(p.theme.as_deref(), Some("system"));
-        assert_eq!(p.show_token_usage, Some(false));
+        let p: SettingsSaveWire = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.engine.safety.as_deref(), Some("auto-approve-project"));
+        assert_eq!(p.engine.vision_model.as_ref().unwrap().endpoint, "qwen");
+        assert!((p.engine.summarize_at_fill_rate.unwrap() - 0.4).abs() < 1e-9);
+        // The UI half rides the same flattened wire (G9: engine + ui
+        // both `#[serde(flatten)]` — one payload, two DTOs).
+        assert_eq!(p.ui.theme.as_deref(), Some("system"));
+        assert_eq!(p.ui.show_token_usage, Some(false));
         // Each notification sound patches independently (absent = keep).
-        assert_eq!(p.sound_complete, Some(false));
-        assert_eq!(p.sound_input_needed, Some(true));
-        assert_eq!(p.sound_stopped_errors, Some(false));
-        assert_eq!(p.pricing.as_ref().unwrap().len(), 1);
+        assert_eq!(p.ui.sound_complete, Some(false));
+        assert_eq!(p.ui.sound_input_needed, Some(true));
+        assert_eq!(p.ui.sound_stopped_errors, Some(false));
+        assert_eq!(p.engine.pricing.as_ref().unwrap().len(), 1);
     }
 
     #[test]

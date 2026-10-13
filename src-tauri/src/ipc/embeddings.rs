@@ -18,7 +18,7 @@
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, State};
 
 use mnemo::host::embed_download::{
     embedding_model_catalog, spawn_download, spawn_startup_load_task, DownloadOutcome,

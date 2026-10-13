@@ -60,7 +60,7 @@ pub async fn start_managed_server(
     port: u16,
 ) -> Option<u16> {
     let sink = status_sink(app);
-    mnemo::host::laya::start_managed_server(sink.as_ref(), manager, checkpoint, port).await
+    mnemo::host::laya::start_managed_server(&sink, manager, checkpoint, port).await
 }
 
 /// Start (or restart) the managed `laya-serve` serving `models` — the
@@ -74,7 +74,7 @@ pub(super) async fn start_server_models(
     progress: Option<&LayaCheckpoint>,
 ) -> Option<u16> {
     let sink = status_sink(app);
-    mnemo::host::laya::start_server_models(sink.as_ref(), manager, models, port, progress).await
+    mnemo::host::laya::start_server_models(&sink, manager, models, port, progress).await
 }/// Fire-and-forget setup (Settings → Classifier → Download) — the lib
 /// pipeline with the app's sink; the wrapper keeps the pre-D5 signature
 /// the `laya_setup` command uses.

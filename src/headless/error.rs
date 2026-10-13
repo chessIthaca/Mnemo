@@ -126,6 +126,16 @@ impl EngineError {
         }
     }
 
+    /// A settings-patch field this surface does not own (job 4 D9,
+    /// review round 1 finding 3 — `laya_enabled`, which belongs to
+    /// `Setup::classifier_setup`): rejected whole, nothing applied.
+    pub(crate) fn unsupported_patch(message: impl Into<String>) -> Self {
+        Self {
+            code: "unsupported_patch".to_string(),
+            message: message.into(),
+        }
+    }
+
     /// A setup pipeline is already running (job 4 D5, §5.8 :554) —
     /// [`crate::headless::setup::Setup::classifier_setup`]'s guard
     /// rejects a second concurrent enable.

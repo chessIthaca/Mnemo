@@ -533,11 +533,24 @@ impl Setup {
     /// a live engine ([`Setup::open`], a first-run flow) only the
     /// persist happens. Effective on the next request.
     ///
-    /// The managed-CLASSIFIER flip does not ride this patch (D5): it
-    /// has its own surface — [`Setup::classifier_setup`] persists the
-    /// flag AND owns the sidecar stop/start + the status, the same
-    /// split the GUI's Download button has from the settings save.
+    /// The managed-CLASSIFIER flag does not ride this patch (review
+    /// round 1, finding 3): a patch carrying `laya_enabled` is
+    /// REJECTED whole with code `unsupported_patch` — the shared
+    /// validator would silently HALF-apply it (persist + config swap,
+    /// but no sidecar stop/start, no slot swap, no status). The whole
+    /// leg — flag, runtime, slot, status — lives on
+    /// [`Setup::classifier_setup`], the headless twin of the GUI's
+    /// Download button (in the GUI the flag rides `save_settings`,
+    /// which owns the full rewire leg; the GUI's two surfaces meet in
+    /// one process, the headless two in one method).
     pub async fn patch_settings(&self, patch: SettingsSaveDto) -> Result<(), EngineError> {
+        if patch.laya_enabled.is_some() {
+            return Err(EngineError::unsupported_patch(
+                "laya_enabled does not ride the settings patch — use \
+                 Setup::classifier_setup(enable), which owns the flag AND the sidecar \
+                 stop/start + the live slot + the status",
+            ));
+        }
         let current = self.load_config()?;
         let new_config =
             crate::config::settings_dto::validate_and_apply_settings_patch(&current, &patch)
@@ -602,24 +615,35 @@ impl Setup {
     /// Enable or disable the managed Laya classifier runtime (§5.8
     /// :554) — the headless twin of Settings → Classifier:
     ///
-    /// * `enable = true`: persist `[general.laya] enabled = true`,
-    ///   claim the setup guard, then fire the download + install
-    ///   pipeline (uv → venv → `laya[serve]` → the English checkpoint)
-    ///   and autostart the sidecar when the LIVE config still selects
-    ///   it at completion (a mid-setup disable save wins). The
-    ///   returned receiver streams every status change as a
-    ///   [`SetupEvent`] tagged [`SetupStep::LayaRuntime`] —
-    ///   Installing / download fractions / Starting / Ready / Failed.
-    /// * `enable = false`: persist `enabled = false`, stop the sidecar
-    ///   (a no-op when none runs), park the shared status on
-    ///   `Disabled`, and return a receiver carrying the single terminal
-    ///   `Done`.
+    /// * `enable = true`: persist `[general.laya] enabled = true` AND
+    ///   apply the flip to the LIVE config (review round 1, finding 2:
+    ///   the completing pipeline re-reads the live Arc for the
+    ///   autostart decision, so the flip must be IN it, not just on
+    ///   disk), then claim the setup guard and fire the download +
+    ///   install pipeline (uv → venv → `laya[serve]` → the English
+    ///   checkpoint). An engine-backed run autostarts the sidecar when
+    ///   the LIVE config still selects it at completion (a mid-setup
+    ///   disable wins — it flips the same Arc); a standalone Setup
+    ///   installs ONLY (nothing consumes a sidecar until an engine
+    ///   starts; the completion parks `Disabled`, and the disk keeps
+    ///   the flag for the next engine start). The returned receiver
+    ///   streams every status change as a [`SetupEvent`] tagged
+    ///   [`SetupStep::LayaRuntime`] — Installing / download fractions /
+    ///   Starting / Ready / Failed.
+    /// * `enable = false`: persist + live-apply `enabled = false`, stop
+    ///   the sidecar (a no-op when none runs), CLEAR the live
+    ///   classifier slot (the GUI leg's Disabled ⇒ no client — a stale
+    ///   handle would send calls to a dead loopback port), park the
+    ///   shared status on `Disabled`, and return a receiver carrying
+    ///   the single terminal `Done`.
     ///
     /// A second enable while one runs fails fast with
     /// `"setup_in_flight"` (the same guard the GUI's Download button
-    /// uses). The enable pipeline is network-bound — never exercised
-    /// in tests; the disable leg and the guard are.
-    pub fn classifier_setup(
+    /// uses) — the flip still persists + live-applies first
+    /// (idempotent). The enable pipeline is network-bound — never
+    /// exercised in tests; the disable leg, the guard, and the
+    /// live-apply are.
+    pub async fn classifier_setup(
         &self,
         enable: bool,
     ) -> Result<EventReceiver<SetupEvent>, EngineError> {
@@ -631,11 +655,31 @@ impl Setup {
         config
             .save_all(&self.config_dir)
             .map_err(|e| EngineError::start_failed(format!("saving the config failed: {e}")))?;
+        // The LIVE apply (review round 1, finding 2): the completing
+        // pipeline + every later spawn re-reads the brain's shared Arc —
+        // a flip that only reaches disk leaves an engine-backed enable
+        // dark and lets a mid-setup disable lose its race. Applied
+        // BEFORE the guard so the contract holds even when the guard
+        // rejects (the fixture-observable red/green).
+        let live = match &self.live {
+            Some(live) => {
+                *live.config.lock().await = config.clone();
+                Some(live)
+            }
+            None => None,
+        };
         let step = SetupStep::LayaRuntime;
         if !enable {
-            // Disable: stop the sidecar (a no-op when none runs), park
-            // the status, report completion.
+            // Disable: stop the sidecar (a no-op when none runs), clear
+            // the live classifier slot (the GUI leg's Disabled ⇒ no
+            // client — a stale handle would send calls to a dead
+            // loopback port), park the status, report completion.
             self.laya.stop();
+            if let Some(live) = live {
+                if let Some(slot) = &live.classifier_slot {
+                    *slot.write().expect("classifier slot lock poisoned") = None;
+                }
+            }
             *self
                 .classifier_status
                 .write()
@@ -643,26 +687,29 @@ impl Setup {
             let _ = tx.send(SetupEvent::Done { step });
             return Ok(EventReceiver { rx });
         }
-        // The guard: claimed only AFTER the persist succeeded, so a
-        // failed save never wedges it; the spawned pipeline's
-        // `end_setup` releases it.
+        // The guard: claimed only AFTER the persist + live apply
+        // succeeded, so a failed save never wedges it; the spawned
+        // pipeline's `end_setup` releases it.
         if !self.laya.begin_setup() {
             return Err(EngineError::setup_in_flight(
                 "a Laya setup is already running",
             ));
         }
-        // The autostart decision re-reads the LIVE config at
-        // completion (`mnemo::host::laya::spawn_setup_task`), so share
-        // the live Arc when an engine is attached — a fresh Arc
-        // wrapping the just-saved config otherwise.
-        let config_arc = match &self.live {
+        // The autostart decision re-reads the LIVE config at completion
+        // (`mnemo::host::laya::spawn_setup_task`). Engine-backed: the
+        // brain's shared Arc (the flip is IN it now). Standalone:
+        // install-ONLY — nothing consumes a sidecar until an engine
+        // starts, so the spawn's view reads disabled (the completion
+        // parks `Disabled`; the disk keeps the enabled flag for the
+        // next engine start).
+        let config_arc = match live {
             Some(live) => Arc::clone(&live.config),
-            None => Arc::new(tokio::sync::Mutex::new(config)),
+            None => {
+                config.general.general.laya.enabled = false;
+                Arc::new(tokio::sync::Mutex::new(config))
+            }
         };
-        let slot = self
-            .live
-            .as_ref()
-            .and_then(|live| live.classifier_slot.clone());
+        let slot = live.and_then(|live| live.classifier_slot.clone());
         let sink: StatusSink = Arc::new(move |s: &ClassifierStatus| {
             let _ = tx.send(Self::classifier_status_to_event(s, SetupStep::LayaRuntime));
         });
@@ -674,6 +721,18 @@ impl Setup {
             slot,
         );
         Ok(EventReceiver { rx })
+    }
+
+    /// The LIVE view of the managed-classifier flag — the value the
+    /// runtime actually reads (the brain's shared config Arc), which
+    /// can differ from disk between a flip and the next engine save.
+    /// `None` when no engine is attached (a standalone Setup has no
+    /// live view — read [`Setup::settings`] for the disk state).
+    pub async fn live_laya_enabled(&self) -> Option<bool> {
+        match &self.live {
+            Some(live) => Some(live.config.lock().await.general.general.laya.enabled),
+            None => None,
+        }
     }
 
     /// Map the core's classifier status onto the setup pipeline's

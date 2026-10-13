@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::config::mcp::{McpServerDef, McpServerWire};
-use mnemo::config::settings_dto::VisionModelDto;
+use mnemo::config::settings_dto::{SettingsSaveDto, VisionModelDto};
 use mnemo::config::ProjectRegistry;
 use mnemo::headless::{
     EndpointDto, Engine, EngineOptions, InitProjectOptions, KeySource, MemoryBackend, RecvError,
@@ -473,7 +473,7 @@ async fn classifier_setup_disable_persists_and_reports_done() {
     )
     .unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
-    let mut rx = setup.classifier_setup(false).expect("the disable leg");
+    let mut rx = setup.classifier_setup(false).await.expect("the disable leg");
     // The single terminal event, then the channel closes (the sender
     // rode the call).
     let event = rx.recv().await.expect("the Done event");
@@ -501,15 +501,18 @@ async fn classifier_setup_disable_persists_and_reports_done() {
 /// idempotent write happens before the guard check). The enable pipeline
 /// itself is network-bound — never exercised in tests; the guard is what
 /// keeps a second run out.
-#[test]
-fn classifier_setup_rejects_a_second_enable_with_setup_in_flight() {
+#[tokio::test]
+async fn classifier_setup_rejects_a_second_enable_with_setup_in_flight() {
     let cfg = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(cfg.path()).unwrap();
     std::fs::write(cfg.path().join("config.toml"), "").unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
     // Claim the guard the way a live pipeline would.
     assert!(setup.laya_manager().begin_setup());
-    let err = setup.classifier_setup(true).expect_err("the guard rejects");
+    let err = setup
+        .classifier_setup(true)
+        .await
+        .expect_err("the guard rejects");
     assert_eq!(err.code(), "setup_in_flight");
     assert!(err.message().contains("already running"));
     // The flip persisted BEFORE the guard rejected (idempotent) —
@@ -815,4 +818,24 @@ async fn mcp_save_splits_by_source_exactly_as_the_app_did() {
         !root2.path().join(".coding").join("mcp.toml").exists(),
         "a purely-global save never materializes the project file"
     );
+}
+// -- D9: review round 1 fixes --
+
+/// Review round 1, finding 3 (job 4 D9): the classifier flag is
+/// REJECTED at the patch boundary with a stable code — the shared
+/// validator would silently half-apply it (persist + config swap, no
+/// runtime leg).
+#[tokio::test]
+async fn patch_settings_rejects_the_classifier_flag_with_a_stable_code() {
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path()).unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let mut patch = SettingsSaveDto::default();
+    patch.laya_enabled = Some(true);
+    let err = setup.patch_settings(patch).await.expect_err("rejected");
+    assert_eq!(err.code(), "unsupported_patch");
+    assert!(err.message().contains("classifier_setup"));
+    // Nothing applied — the disk still reads disabled.
+    let settings = setup.settings().expect("settings");
+    assert!(!settings.general.laya.enabled);
 }

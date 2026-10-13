@@ -16,10 +16,10 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::State;
 
-use mnemo::config::mcp::{self, McpServerDef};
+use mnemo::config::mcp;
 
 use crate::ipc::error::IpcError;
 use crate::ipc::state::IpcState;

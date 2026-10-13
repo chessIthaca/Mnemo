@@ -711,3 +711,56 @@ workspace green, exit 0 — integration 77 → 81.
 - En-route fixes: the `McpServerWire` import into setup.rs (re-export
   ≠ import), `is_literal` pub, and one multi_edit stale-gate bounce
   (mod.rs re-read then landed clean).
+
+### 4.9 D9 — review round 1 fixes (report `2026-10-13-job-4-standalone-setup-review.md`)
+
+Round 1 = FINDINGS (2 high, 1 low); all three verified real by own
+reconstruction, all fixed + red-checked regressions.
+
+- **F1 (high) — the app crate uncompilable since D7, plus the battery
+  blind spot.** `own_memory_store` was `pub(crate)` but read
+  cross-crate (main.rs IpcState + 2 startup hooks), and console.rs's
+  startup twin still read the old `memory_store` field (now the dyn
+  slot — type mismatch). Fix: the field is `pub` (doc names the app
+  consumers; the pre-split field was pub for exactly that) + the
+  console twin rewired. Compiling the app for real then exposed FOUR
+  more accumulated breaks no battery had ever seen: D5's
+  `Option<&Arc>` vs `&Option<Arc>` sink args (ipc/laya.rs ×2), the
+  dropped `State` import (ipc/embeddings.rs), D8's unused imports
+  (ipc/mcp.rs ×2), D9's G9 `.engine.` nesting (ipc/settings.rs ×2)
+  and the stale UI-field unit test (now parses `SettingsSaveWire`,
+  asserting engine + ui halves). **Root cause of the blindness:
+  root-only `cargo test` builds only the root package — src-tauri
+  was NEVER compiled by any D5–D8 battery. The battery is corrected
+  to `cargo test --workspace`** (compiles + runs the app crate's
+  tests); `--features embeddings` unchanged; tauri-tree proof
+  re-empty. The compile IS F1's red check (red at 1bb38b6, green
+  after).
+- **F2 (high) — the classifier flip never reached the live config
+  Arc.** An engine-backed enable persisted to disk but left the
+  brain's shared Arc stale → the completing pipeline's autostart
+  decision read `false` → installed-but-dark; a mid-setup disable
+  lost the documented race. Fix: `classifier_setup` is now `async`;
+  BOTH arms persist → LIVE-APPLY (lock+swap into `live.config`,
+  before the guard, so the contract holds even on guard reject) →
+  then the leg. Disable additionally CLEARS `live.classifier_slot`
+  (the GUI leg's Disabled ⇒ no client — a stale handle would call a
+  dead loopback port). Standalone enable = install-ONLY (the spawn's
+  view reads disabled; nothing consumes a sidecar until an engine
+  starts; disk keeps the flag). New accessor `live_laya_enabled()`
+  (the LIVE view vs `settings()`'s disk view). Regression
+  `classifier_setup_flip_reaches_the_live_config_before_the_guard`
+  (headless.rs; guard pre-claimed so NO network runs — the fixture
+  drives `Engine::builder().provider(ScriptedLlm::empty)` past the
+  not_configured gate): red pre-fix (Arc stale after the reject),
+  green post; also pins the disable leg's live-apply.
+- **F3 (low) — `patch_settings` doc contradicted behavior.** The
+  shared validator half-applied `laya_enabled` (persist + Arc swap,
+  no runtime leg) while the doc disclaimed it. Fix: REJECTED at the
+  boundary with new stable code `unsupported_patch`
+  (error.rs ctor) naming `classifier_setup`; both docs rewritten to
+  the one-owner rule. Regression
+  `patch_settings_rejects_the_classifier_flag_with_a_stable_code`
+  (headless_setup.rs): asserts the code + message + nothing applied.
+- The two existing classifier fixtures converted to the async
+  signature (guard fixture → `#[tokio::test]`).

@@ -53,9 +53,12 @@ pub struct Brain {
     /// for an injected G8 store): the embedder machinery (the startup
     /// load, the rewire swaps), the debug API (`MemoryApi`), the kNN
     /// overlay, and `Setup::for_engine`'s live handles read THIS slot —
-    /// an injected store owns its embedding + its debug surface.
-    /// `pub(crate)` for the same reasons the old single field was.
-    pub(crate) own_memory_store: Option<Arc<MemoryStore>>,
+    /// an injected store owns its embedding + its debug surface. `pub`
+    /// because the APP crate is a documented consumer (the IpcState
+    /// wiring + the two startup hooks in `src-tauri/src/main.rs` + the
+    /// console twin in `console.rs`) — the pre-split field was `pub` for
+    /// exactly that (review round 1, finding 1).
+    pub own_memory_store: Option<Arc<MemoryStore>>,
     /// The resolved kernel workspace (2c.3 G3): the root + the state dir.
     /// The brain no longer holds the app's Project (the kernel facade must
     /// not import it) — the consumers build their own app-side Project.

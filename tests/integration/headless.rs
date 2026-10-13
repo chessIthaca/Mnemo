@@ -1118,3 +1118,59 @@ async fn shared_resources_share_one_embedder_across_engines() {
         "both engines embedded through the shared instance ({previous} embeds)"
     );
 }
+
+/// Review round 1, finding 2 (job 4 D9): the classifier flip must reach
+/// the LIVE config Arc, not just disk — the completing pipeline re-reads
+/// the Arc for the autostart decision, so a disk-only flip leaves an
+/// engine-backed enable dark and lets a mid-setup disable lose its race.
+/// The guard-rejection path asserts the red/green WITHOUT spawning the
+/// network pipeline: the flip is in the Arc even when the guard rejects,
+/// and the disable leg live-applies too.
+#[tokio::test]
+async fn classifier_setup_flip_reaches_the_live_config_before_the_guard() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    // An injected provider bypasses the not_configured gate (the
+    // fixture makes no LLM calls — the empty script is never popped).
+    let llm = std::sync::Arc::new(ScriptedLlm::new(Vec::new()));
+    let engine = Engine::builder(opts)
+        .provider(llm)
+        .start()
+        .await
+        .expect("the engine starts (provider-injected)");
+    let setup = mnemo::headless::Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let live = setup.for_engine(&engine);
+    assert_eq!(
+        live.live_laya_enabled().await,
+        Some(false),
+        "engine_opts' config leaves Laya off"
+    );
+    // Pre-claim the guard the way a running pipeline would.
+    assert!(live.laya_manager().begin_setup());
+    let err = live
+        .classifier_setup(true)
+        .await
+        .expect_err("the guard rejects");
+    assert_eq!(err.code(), "setup_in_flight");
+    // RED before the fix: the flip never reached the Arc (only disk).
+    assert_eq!(
+        live.live_laya_enabled().await,
+        Some(true),
+        "the flip is IN the live config even when the guard rejects"
+    );
+    // ... and on disk:
+    let settings = live.settings().expect("settings");
+    assert!(settings.general.laya.enabled);
+    // The disable leg live-applies too (the mid-setup race winner):
+    let mut rx = live
+        .classifier_setup(false)
+        .await
+        .expect("the disable leg");
+    let _ = rx.recv().await; // the terminal Done
+    assert_eq!(
+        live.live_laya_enabled().await,
+        Some(false),
+        "the disable wins the race — the Arc flips back immediately"
+    );
+}

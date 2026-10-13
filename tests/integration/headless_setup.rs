@@ -457,7 +457,9 @@ fn settings_exposes_engine_config_and_preserves_ui() {
     let reloaded = mnemo::config::Config::load(cfg.path()).unwrap();
     assert_eq!(reloaded.general.ui.theme, "dark", "the [ui] table rides through");
     assert!(!reloaded.general.ui.chat_thread_line);
-}// -- D5: the classifier surface (§5.8 :554) --
+}
+
+// -- D5: the classifier surface (§5.8 :554) --
 
 /// `classifier_setup(false)` persists the disable, stops nothing (no
 /// sidecar runs in a fixture), parks the shared status on `Disabled`,
@@ -529,7 +531,9 @@ fn laya_manager_roots_at_the_config_dir() {
     let cfg = tempfile::tempdir().unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
     assert_eq!(setup.laya_manager().base_dir(), cfg.path().join("laya"));
-}// -- D6: the embedding/vision surface (§5.8 :542-549) --
+}
+
+// -- D6: the embedding/vision surface (§5.8 :542-549) --
 
 /// The catalog's installed flags track THIS Setup's config-dir cache
 /// (D6: the global coupling died). A fresh dir reports nothing

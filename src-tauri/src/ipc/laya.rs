@@ -75,7 +75,9 @@ pub(super) async fn start_server_models(
 ) -> Option<u16> {
     let sink = status_sink(app);
     mnemo::host::laya::start_server_models(&sink, manager, models, port, progress).await
-}/// Fire-and-forget setup (Settings → Classifier → Download) — the lib
+}
+
+/// Fire-and-forget setup (Settings → Classifier → Download) — the lib
 /// pipeline with the app's sink; the wrapper keeps the pre-D5 signature
 /// the `laya_setup` command uses.
 pub fn spawn_setup_task(

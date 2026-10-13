@@ -24,7 +24,7 @@ use crate::host::startup::{
 };
 use crate::memory::embedder::HashEmbedder;
 use crate::memory::MemoryStore;
-use crate::project::Project;
+use crate::workspace::{CODING_DIR_NAME, Workspace, ensure_minimal_project, find_coding_dir_ancestor};
 use crate::provider::trace::LlmRequestLog;
 use crate::provider::{LlmClient, ProviderKind};
 use crate::safety_rules::SafetyRules;
@@ -47,7 +47,10 @@ pub struct Brain {
     /// `pub(crate)` so console mode can start the deferred background embedder
     /// load (the GUI's setup hook does the same; console mode has no Tauri).
     pub memory_store: Option<Arc<MemoryStore>>,
-    pub project: Arc<tokio::sync::Mutex<Project>>,
+    /// The resolved kernel workspace (2c.3 G3): the root + the state dir.
+    /// The brain no longer holds the app's Project (the kernel facade must
+    /// not import it) — the consumers build their own app-side Project.
+    pub workspace: Arc<Workspace>,
     pub config: Arc<tokio::sync::Mutex<Config>>,
     pub sandbox: Arc<Sandbox>,
     pub safety_rules: Arc<SafetyRules>,
@@ -187,10 +190,10 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // was just torn down for the restart, so the splash dialog must show
     // immediately rather than after a silent second.
     let mut switched_open = false;
-    let project: Project = if let Some(pending) = crate::config::take_pending_project() {
-        if pending.join(Project::CODING_DIR_NAME).is_dir() {
+    let workspace = if let Some(pending) = crate::config::take_pending_project() {
+        if pending.join(CODING_DIR_NAME).is_dir() {
             switched_open = true;
-            Project::from_root(&pending)
+            Arc::new(Workspace::new(&pending))
         } else {
             // Marker pointed at a non-project dir — show the picker, but say
             // WHY on stderr so a stale marker is diagnosable (backlog
@@ -203,19 +206,23 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             return Ok(BrainOutcome::NeedsProject(config));
         }
     } else if let Some(flagged) = project_flag_from_args(std::env::args()) {
-        if flagged.join(Project::CODING_DIR_NAME).exists() {
-            Project::from_root(&flagged)
+        if flagged.join(CODING_DIR_NAME).exists() {
+            Arc::new(Workspace::new(&flagged))
         } else {
             eprintln!(
                 "No project found at '{}'. Initializing...",
                 flagged.display()
             );
-            Project::init(&flagged)?
+            // The kernel-minimal bootstrap in place of the app's Project::init
+            // (G3): .coding/plans + the shipped skills + the agent.md template —
+            // the kernel never writes .gitignore/.gitattributes.
+            ensure_minimal_project(&flagged)?;
+            Arc::new(Workspace::new(&flagged))
         }
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(found) = Project::find_coding_dir_ancestor(&cwd) {
-            Project::from_root(&found)
+        if let Some(found) = find_coding_dir_ancestor(&cwd) {
+            Arc::new(Workspace::new(&found))
         } else {
             return Ok(BrainOutcome::NeedsProject(config));
         }
@@ -225,7 +232,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // Trace tab's "Log to file" checkbox. The path is configured here (where
     // coding_dir is known) but logging stays OFF by default — writing full
     // request/response bodies to disk is a deliberate opt-in.
-    trace.set_log_file_path(project.coding_dir.join("logs").join("traces.jsonl"));
+    trace.set_log_file_path(workspace.state_dir.join("logs").join("traces.jsonl"));
 
     // Always-on provider-error log: every FAILED request (HTTP >= 400,
     // transport / stream errors) is appended as one compact JSON line to
@@ -233,8 +240,8 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // opt-in checkbox — so provider errors are diagnosable after the fact
     // without full trace logging.
     trace.set_error_log_path(
-        project
-            .coding_dir
+        workspace
+            .state_dir
             .join("logs")
             .join("provider-errors.jsonl"),
     );
@@ -243,7 +250,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // mid-stream (a user interrupt — the D1 classification) is appended as
     // one compact JSON line at stamping time, so a cancel survives the trace
     // ring's rotation. Independent of the traces.jsonl opt-in checkbox.
-    trace.set_cancels_log_path(project.coding_dir.join("logs").join("cancels.jsonl"));
+    trace.set_cancels_log_path(workspace.state_dir.join("logs").join("cancels.jsonl"));
 
     // Append-only terminal-record archive (F3): every record that reaches a
     // terminal state is appended once to .coding/logs/traces-history.jsonl
@@ -251,8 +258,8 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // cannot erase earlier records retrievably. Gated on the same opt-in as
     // the mirror — full request/response bodies are sensitive.
     trace.set_history_log_path(
-        project
-            .coding_dir
+        workspace
+            .state_dir
             .join("logs")
             .join("traces-history.jsonl"),
     );
@@ -311,7 +318,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     };
 
     // The path sandbox — confines file operations to the project root.
-    let sandbox = Arc::new(Sandbox::new(&project.root)?);
+    let sandbox = Arc::new(Sandbox::new(&workspace.root)?);
 
     // Memory store — uses the bundled in-process embedder when configured
     // (failure-protected: zero-vector fallback, never dies), or the built-in
@@ -411,7 +418,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     let tool_choice_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.steer_tool_choice,
     ));
-    let store = match MemoryStore::open(&project.memory_db, embedder) {
+    let store = match MemoryStore::open(&workspace.state_dir.join("memory.db"), embedder) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("warning: failed to open memory store: {e}; using in-memory");
@@ -497,8 +504,8 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     {
         let notifier = notifier.clone();
         let store_for_index = store.clone();
-        let plans_dir = project.plans_dir.clone();
-        let backlog_path = project.coding_dir.join("backlog.jsonl");
+        let plans_dir = workspace.state_dir.join("plans");
+        let backlog_path = workspace.state_dir.join("backlog.jsonl");
         rt.spawn(async move {
             // Console mode (no app handle) has no frontend to notify — the
             // reconcile still runs, but silently (the events are dropped).
@@ -673,20 +680,23 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // effect on the next turn without restarting.
     let global_agent_md = config_dir.join("agent.md");
     let constitution_source =
-        crate::project::ConstitutionSource::new(&global_agent_md, &project.agent_md)?;
+        crate::project::ConstitutionSource::new(
+                &global_agent_md,
+                &workspace.root.join("agent.md"),
+            )?;
 
     // Safety rules — regex-based auto-approve backed by `.coding/safety.toml`.
     // A missing file is fine (rules start empty); the store is mtime-checked
     // so edits in the Safety tab take effect without restarting.
-    let safety_rules = Arc::new(match SafetyRules::new(&project.safety_toml) {
+    let safety_rules = Arc::new(match SafetyRules::new(&workspace.state_dir.join("safety.toml")) {
         Ok(sr) => sr,
         Err(e) => {
             eprintln!(
                 "warning: failed to load safety rules from {}: {e}; starting empty",
-                project.safety_toml.display()
+                workspace.state_dir.join("safety.toml").display()
             );
             // Fall back to an empty store over the same path.
-            SafetyRules::new(&project.safety_toml)
+            SafetyRules::new(&workspace.state_dir.join("safety.toml"))
                 .unwrap_or_else(|_| SafetyRules::new(std::path::Path::new(":memory:")).unwrap())
         }
     });
@@ -780,7 +790,10 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // poison-tolerant and the DB is a rebuildable cache, so the tools
     // degrade to per-call errors instead of being torn down.
     let codegraph: Option<Arc<crate::codegraph::CodeGraph>> = if config.general.general.codegraph {
-        match crate::codegraph::CodeGraph::open(project.root.clone(), &project.codegraph_db) {
+        match crate::codegraph::CodeGraph::open(
+            workspace.root.clone(),
+            &workspace.state_dir.join("codegraph.db"),
+        ) {
             Ok(graph) => {
                 let graph = Arc::new(graph);
                 let g = graph.clone();
@@ -921,7 +934,9 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             Err(e) => {
                 eprintln!(
                     "warning: failed to open codegraph at {}: {e}; graph disabled",
-                    project.codegraph_db.display()
+                    workspace.state_dir
+                    .join("codegraph.db")
+                    .display()
                 );
                 None
             }
@@ -935,11 +950,11 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         constitution_source,
         Some(store_trait),
         sandbox.clone(),
-        project.root.clone(),
+        workspace.root.clone(),
         Some(safety_rules.clone()),
         safety_mode.clone(),
         context_manager,
-        project.plans_dir.clone(),
+        workspace.state_dir.join("plans"),
         vision,
     )
     // Wire the per-context model resolver so `[models]` overrides take effect
@@ -1018,7 +1033,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // name — same philosophy as skills). Inert by construction: connections
     // happen lazily on the first load_tools("mcp.<server>") reveal; the IPC
     // layer's Settings/Test commands reuse the same Arc.
-    let project_mcp = crate::config::mcp::load_or_default(&project.mcp_toml)?;
+    let project_mcp = crate::config::mcp::load_or_default(&workspace.state_dir.join("mcp.toml"))?;
     let mcp_servers = crate::config::mcp::merge_servers(&config.mcp, &project_mcp);
     let factory = factory.with_mcp(Arc::new(crate::mcp::McpManager::from_config(&mcp_servers)));
     let factory = Arc::new(factory);
@@ -1031,7 +1046,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     let graph_watcher = codegraph.clone().and_then(|graph| {
         match crate::codegraph::watcher::GraphWatcher::spawn(
             graph,
-            project.root.clone(),
+            workspace.root.clone(),
             std::time::Duration::from_millis(800),
         ) {
             Ok(w) => {
@@ -1048,7 +1063,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     Ok(BrainOutcome::Ready(Brain {
         factory,
         memory_store: Some(store),
-        project: Arc::new(tokio::sync::Mutex::new(project)),
+        workspace,
         config: Arc::new(tokio::sync::Mutex::new(config)),
         sandbox,
         safety_rules,

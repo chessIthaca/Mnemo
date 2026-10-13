@@ -15,7 +15,7 @@ use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
-use mnemo::project::Project;
+use mnemo::app::project::Project;
 use mnemo::runtime::channels::AgentId;
 use mnemo::tool::agent::image_tools::{magic_matches, mime_from_ext};
 use mnemo::tool::agent::sandbox::Sandbox;

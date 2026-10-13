@@ -13,13 +13,14 @@
 use std::sync::{Arc, RwLock};
 
 use mnemo::config::{global_config_dir, Config, SafetyMode};
-use mnemo::project::Project;
+use mnemo::app::project::Project;
 use mnemo::provider::trace::LlmRequestLog;
 use mnemo::runtime::AgentManager;
 use mnemo::tool::agent::sandbox::Sandbox;
 use tauri::{Emitter, Manager, PhysicalPosition, WebviewBuilder, WebviewUrl, WindowBuilder};
 
 mod console;
+mod instance_marker;
 mod ipc;
 mod startup;
 mod watchdog;
@@ -394,9 +395,7 @@ fn main() {
             // the brain result (mirroring the Err path's cwd fallback) and
             // open the store before the match.
             let backlog_root = match &brain_result {
-                Ok(BrainOutcome::Ready(brain)) => tauri::async_runtime::block_on(async {
-                    brain.project.lock().await.root.clone()
-                }),
+                Ok(BrainOutcome::Ready(brain)) => brain.workspace.root.clone(),
                 // NeedsProject + Err: no project root — fall back to cwd. The
                 // backlog store tolerates a missing path (opens empty), and on
                 // the NeedsProject path no agent can run so nothing is added.
@@ -412,7 +411,7 @@ fn main() {
             // (the marker write is `let _ =`).
             let instance_conflict: Option<ipc::startup::InstanceConflict> =
                 if matches!(&brain_result, Ok(BrainOutcome::Ready(_))) {
-                    use mnemo::instance_marker::{conflict_for, InstanceMarker};
+                    use crate::instance_marker::{conflict_for, InstanceMarker};
 
                     let conflict = conflict_for(
                         &backlog_root,
@@ -500,9 +499,7 @@ fn main() {
                     // `.coding/skills/*.toml` dir the brain used to wire and
                     // hands it to the app factory, so the skill tools and
                     // `enter_skill`'s handle resolve app→app).
-                    let skills_dir = tauri::async_runtime::block_on(async {
-                        brain.project.lock().await.skills_dir.clone()
-                    });
+                    let skills_dir = brain.workspace.state_dir.join("skills");
                     let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
                     let policy_factory = Arc::new(
                         mnemo::app::policy_factory::WorkflowPolicyFactory::new(
@@ -625,7 +622,9 @@ fn main() {
                             instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
-                            root: brain.project.clone(),
+                            root: Arc::new(tokio::sync::Mutex::new(
+                                mnemo::app::project::Project::from_root(&brain.workspace.root),
+                            )),
                             config: brain.config.clone(),
                             sandbox: brain.sandbox.clone(),
                         },

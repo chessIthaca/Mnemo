@@ -4546,7 +4546,7 @@ async fn dispatch_spawned_item(
     // state (main), never from another item's in-flight work. Fails when
     // the branch already exists (a previous run of the same item never
     // landed) — surfaced, never silently reused.
-    let (worktree, branch) = mnemo::project::worktrees::provision_item_worktree(
+    let (worktree, branch) = mnemo::app::worktrees::provision_item_worktree(
         state.project.root.lock().await.root.clone(),
         item.id.clone(),
     )
@@ -4566,7 +4566,7 @@ async fn dispatch_spawned_item(
                 .lock()
                 .await
                 .annotate(&item.id, &format!("git checkpoint failed: {e}"));
-            let _ = mnemo::project::worktrees::remove_item_worktree(
+            let _ = mnemo::app::worktrees::remove_item_worktree(
                 state.project.root.lock().await.root.clone(),
                 worktree,
                 branch,
@@ -4591,7 +4591,7 @@ async fn dispatch_spawned_item(
     // Spawn the parentless worktree agent (its own plans dir inside the
     // worktree, a fresh code graph over the worktree tree). No prompt yet
     // — the record below lands first, then the send.
-    let short = mnemo::project::worktrees::item_short_id(&item.id);
+    let short = mnemo::app::worktrees::item_short_id(&item.id);
     let factory = state
         .runtime
         .factory
@@ -4647,7 +4647,7 @@ async fn dispatch_spawned_item(
         // the fill's skip arm) for a later re-dispatch.
         remove_spawned_run(state, agent_id).await;
         retire_spawned_agent(state, agent_id).await;
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             worktree,
             branch,
@@ -4685,10 +4685,10 @@ static DISPATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 async fn land_spawned_branch(
     state: &IpcState,
     spawned: &crate::ipc::state::SpawnedRun,
-) -> Result<mnemo::project::worktrees::Landed, mnemo::project::worktrees::LandError> {
+) -> Result<mnemo::app::worktrees::Landed, mnemo::app::worktrees::LandError> {
     let _guard = LANDING_LOCK.lock().await;
     let root = state.project.root.lock().await.root.clone();
-    mnemo::project::worktrees::land_item_branch(root, spawned.branch.clone()).await
+    mnemo::app::worktrees::land_item_branch(root, spawned.branch.clone()).await
 }
 
 /// Retire a spawned run-all agent after its item resolved (plan
@@ -4829,7 +4829,7 @@ pub async fn on_spawned_turn_resolved(
     let Some(item) = item else {
         // The item vanished mid-run — drop the entry + clean up.
         remove_spawned_run(&state, agent_id).await;
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             spawned.worktree.clone(),
             spawned.branch.clone(),
@@ -4892,11 +4892,11 @@ pub async fn on_spawned_turn_resolved(
                     // note carries the conflicted paths — the work still
                     // counts as Done.
                     let note = match land_spawned_branch(&state, &spawned).await {
-                        Ok(mnemo::project::worktrees::Landed::Merged) => {
+                        Ok(mnemo::app::worktrees::Landed::Merged) => {
                             remove_worktree = true;
                             None
                         }
-                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                        Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                             // Backlog b52b041a: a protected main lands via
                             // PR — the branch is KEPT (the PR's head; the
                             // human merges), only the worktree goes, and
@@ -4908,7 +4908,7 @@ pub async fn on_spawned_turn_resolved(
                                 spawned.branch
                             ))
                         }
-                        Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                        Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
                                 "backlog: landing conflict for branch {} (kept for manual resolution): {}",
                                 spawned.branch,
@@ -4920,7 +4920,7 @@ pub async fn on_spawned_turn_resolved(
                                 files.join(", ")
                             ))
                         }
-                        Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                        Err(mnemo::app::worktrees::LandError::Git(e)) => {
                             eprintln!(
                                 "backlog: landing failed for branch {}: {e}",
                                 spawned.branch
@@ -5076,10 +5076,10 @@ pub async fn on_spawned_turn_resolved(
                     // arm's landing discipline).
                     let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done, not re-dispatched".to_string();
                     match land_spawned_branch(&state, &spawned).await {
-                        Ok(mnemo::project::worktrees::Landed::Merged) => {
+                        Ok(mnemo::app::worktrees::Landed::Merged) => {
                             remove_worktree = true;
                         }
-                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                        Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                             // Backlog b52b041a: a protected main lands via
                             // PR — the branch is KEPT (the PR's head), only
                             // the worktree goes, and the note carries the
@@ -5091,7 +5091,7 @@ pub async fn on_spawned_turn_resolved(
                                 spawned.branch
                             );
                         }
-                        Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                        Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
                                 "backlog: landing conflict for branch {} (kept for manual resolution): {}",
                                 spawned.branch,
@@ -5103,7 +5103,7 @@ pub async fn on_spawned_turn_resolved(
                                 files.join(", ")
                             );
                         }
-                        Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                        Err(mnemo::app::worktrees::LandError::Git(e)) => {
                             eprintln!(
                                 "backlog: landing failed for branch {}: {e}",
                                 spawned.branch
@@ -5241,13 +5241,13 @@ pub async fn on_spawned_turn_resolved(
         // (a stale `wt/runall-*` branch would block later dispatches).
         let root = state.project.root.lock().await.root.clone();
         let _ = if keep_branch {
-            mnemo::project::worktrees::remove_worktree_only(
+            mnemo::app::worktrees::remove_worktree_only(
                 root,
                 spawned.worktree.clone(),
             )
             .await
         } else {
-            mnemo::project::worktrees::remove_item_worktree(
+            mnemo::app::worktrees::remove_item_worktree(
                 root,
                 spawned.worktree.clone(),
                 spawned.branch.clone(),
@@ -5351,19 +5351,19 @@ pub(crate) async fn drain_spawned_on_exit(
             // for duplicate re-dispatch.
             let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done".to_string();
             match land_spawned_branch(&state, &spawned).await {
-                Ok(mnemo::project::worktrees::Landed::Merged) => {
-                    let _ = mnemo::project::worktrees::remove_item_worktree(
+                Ok(mnemo::app::worktrees::Landed::Merged) => {
+                    let _ = mnemo::app::worktrees::remove_item_worktree(
                         state.project.root.lock().await.root.clone(),
                         spawned.worktree.clone(),
                         spawned.branch.clone(),
                     )
                     .await;
                 }
-                Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                     // Backlog b52b041a: a protected main lands via PR —
                     // the branch is KEPT (the PR's head), only the
                     // worktree goes, and the note carries the URL.
-                    let _ = mnemo::project::worktrees::remove_worktree_only(
+                    let _ = mnemo::app::worktrees::remove_worktree_only(
                         state.project.root.lock().await.root.clone(),
                         spawned.worktree.clone(),
                     )
@@ -5373,14 +5373,14 @@ pub(crate) async fn drain_spawned_on_exit(
                         spawned.branch
                     );
                 }
-                Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                     suffix = format!(
                         "{suffix} — merge conflict on landing (branch {} kept): {}",
                         spawned.branch,
                         files.join(", ")
                     );
                 }
-                Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                Err(mnemo::app::worktrees::LandError::Git(e)) => {
                     suffix = format!(
                         "{suffix} — landing failed (branch {} kept): {e}",
                         spawned.branch
@@ -5429,7 +5429,7 @@ pub(crate) async fn drain_spawned_on_exit(
     // work of a crashed agent is not kept; the note explains). A landed
     // branch was handled above (removed on Ok, kept on conflict).
     if !landed {
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             spawned.worktree.clone(),
             spawned.branch.clone(),
@@ -7019,13 +7019,13 @@ pub(crate) async fn adopt_orphaned_in_flight(state: &IpcState) {
     if !requeued.is_empty() {
         let root = state.project.root.lock().await.root.clone();
         for id in requeued {
-            let _ = mnemo::project::worktrees::remove_item_worktree(
+            let _ = mnemo::app::worktrees::remove_item_worktree(
                 root.clone(),
                 root.join(".worktrees").join(format!(
                     "runall-{}",
-                    mnemo::project::worktrees::item_short_id(&id)
+                    mnemo::app::worktrees::item_short_id(&id)
                 )),
-                mnemo::project::worktrees::item_branch(&id),
+                mnemo::app::worktrees::item_branch(&id),
             )
             .await;
         }

@@ -21,7 +21,7 @@ use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use mnemo::config::{global_config_dir, write_pending_project};
-use mnemo::project::Project;
+use mnemo::app::project::Project;
 
 use crate::ipc::codegraph_cmds::{emit_index_progress, IndexProgressEvent};
 use crate::ipc::error::IpcError;

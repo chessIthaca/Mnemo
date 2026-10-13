@@ -390,3 +390,50 @@ they differ):
 - The battery green: cargo test -p mnemo; the feature build
   (--features browser,embeddings); --workspace; build --workspace; the
   goldens trio 3/3.
+Amendment (2027-01-14, step 2c.3 — the landed D4/G3 picks, supersede §B
+D4 where they differ):
+- src/workspace.rs (the kernel workspace): `Workspace { root, state_dir,
+  require_git }` (+ `with_state_dir`, `requiring_git`, `root_is_git_repo` —
+  accepts `.git` as dir OR file, linked worktrees included) + the re-homed
+  `CODING_DIR_NAME` + `find_coding_dir_ancestor` (the kernel's project-
+  detection primitive; the app's Project delegates to it) +
+  `ensure_minimal_project` — the kernel-minimal bootstrap for the CLI's
+  `--project` init: `.coding/plans` + the shipped skills + the agent.md
+  template, idempotent, and NEVER `.gitignore`/`.gitattributes` (row 27's
+  letter — those stay the app's `Project::init`).
+- The project split: kernel src/project/mod.rs keeps ONLY agent_md
+  (Constitution) + git_ops + skills_seed; Project/scaffold/worktrees move to
+  src/app/{project,scaffold,worktrees}.rs; instance_marker.rs → src-tauri
+  (its one consumer main.rs; it now reads `workspace::CODING_DIR_NAME` — the
+  kernel constant stays the single source of truth).
+- The brain rewire: `Brain.project: Arc<Mutex<Project>>` →
+  `Brain.workspace: Arc<Workspace>` (never mutated post-resolve — no Mutex).
+  The resolution flow uses the kernel primitives (take_pending_project → the
+  `.coding` check; project_flag_from_args → ensure_minimal_project on a
+  non-project dir; the find_coding_dir_ancestor walk-up; NeedsProject
+  preserved on both dead ends). Every derived path is
+  `workspace.state_dir.join(...)` (memory.db, codegraph.db, mcp.toml,
+  safety.toml, plans, backlog.jsonl, the four logs/* sinks). The app
+  consumers (main.rs :399/:505/:629, console.rs :658/:1228) build their own
+  `app::project::Project::from_root(&brain.workspace.root)`; skills dirs read
+  `workspace.state_dir.join("skills")` directly.
+- require_git: `git` + `git_read` register only when `<root>/.git` exists
+  (the existence probe); the repo-gate ripple (4 tests assuming git tools)
+  fixed by `.git` markers in their tempdirs — gate behavior, not logic bugs.
+  The factory's CWD-relative `.coding` reviews fallback is rewired
+  plans_dir-derived — no in-code `.coding` join remains in the kernel.
+- Tests: workspace unit tests (default_state_dir_is_coding_dir_under_root,
+  state_dir_may_sit_anywhere, git_repo_detection_accepts_dir_and_file,
+  ancestor_walk_finds_coding_dir, minimal_bootstrap_is_idempotent_and_
+  never_writes_gitignore — row 27's kernel form) + the positive repo-gate
+  test in factory.rs. In-flight fix: the first workspace.rs append glued a
+  doc comment onto the closing brace and duplicated three test names (E0428)
+  — caught and repaired before any commit.
+- The battery green: cargo test -p mnemo; -p mnemo --features
+  browser,embeddings (the brain's gate — E0432 surfaced only there);
+  --workspace; build --workspace; clippy --workspace --all-targets
+  -- -D warnings; cargo tree -p mnemo -i tauri = "did not match any
+  packages" (the kernel has NO tauri edge — the error IS the pass); the
+  goldens trio 3/3. Headless build N/A at 2c.3 (the `headless` feature
+  arrives with the headless API in a later job; the step file carries no
+  no-default-features command).

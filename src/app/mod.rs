@@ -18,9 +18,12 @@ pub mod workflow_policy;
 /// files, the backlog store, the skill library, and the workflow tooling.
 pub mod backlog;
 pub mod policy_factory;
+pub mod project;
+pub mod scaffold;
 pub mod skill;
 pub mod tool;
 pub mod workflow;
+pub mod worktrees;
 
 /// Install a panic hook that prints the panic before the process exits.
 /// (The Tauri webview doesn't need terminal restoration, but we keep a

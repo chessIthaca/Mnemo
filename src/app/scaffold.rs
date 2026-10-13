@@ -10,7 +10,7 @@
 //! reviews, skills, `backlog.jsonl`), while the per-machine caches and
 //! ephemeral state inside it must never be — and `backlog.jsonl` must merge by
 //! concatenation across worktrees instead of conflicting. Both rules live in
-//! git's own files, so [`Project::init`](crate::project::Project::init) ensures
+//! git's own files, so [`Project::init`](crate::app::project::Project::init) ensures
 //! them here rather than leaving every new project to rediscover them:
 //!
 //! - a project whose first commit sweeps `.coding/memory.db` /

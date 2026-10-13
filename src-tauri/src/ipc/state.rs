@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use mnemo::agent::factory::AgentLoopFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::memory::MemoryStore;
-use mnemo::project::Project;
+use mnemo::app::project::Project;
 use mnemo::runtime::{AgentId, AgentManager};
 use mnemo::safety_rules::SafetyRules;
 use mnemo::tool::agent::sandbox::Sandbox;

@@ -19,7 +19,6 @@ pub mod config;
 pub mod error;
 pub mod host;
 pub mod index_staleness;
-pub mod instance_marker;
 pub mod mcp;
 pub mod memory;
 pub mod model_resolver;
@@ -31,6 +30,7 @@ pub mod shell_path;
 pub mod thread_util;
 pub mod tool;
 pub mod webview_args;
+pub mod workspace;
 
 #[cfg(test)]
 mod boundary {

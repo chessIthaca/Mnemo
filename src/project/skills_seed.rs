@@ -12,7 +12,7 @@
 use std::path::Path;
 
 /// The skills shipped with the app, compiled into the binary as
-/// `(name, toml_text)` pairs via `include_str!`. [`crate::project::Project::init`]
+/// `(name, toml_text)` pairs via `include_str!`. [`crate::app::project::Project::init`]
 /// seeds each into a project's `.coding/skills/` directory (write-if-missing),
 /// so every new project — and an existing one whose skill files were deleted —
 /// starts with the same baseline skill set as the main installation, without

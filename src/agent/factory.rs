@@ -1393,12 +1393,17 @@ impl AgentLoopFactory {
     /// the same way `FinishTool` derives it at runtime
     /// (`plans_dir.parent().join("reviews")`). Used to construct the
     /// `write_review_report` tool so the reviewer subagent's single output
-    /// channel writes to the same dir `finish` later validates.
+    /// channel writes to the same dir `finish` later validates. G3 (2c.3):
+    /// the plans-dir-less fallback is root-derived, never CWD-relative.
     pub fn reviews_dir(&self) -> std::path::PathBuf {
         self.plans_dir
             .parent()
             .map(|p| p.join("reviews"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".coding/reviews"))
+            .unwrap_or_else(|| {
+                self.project_root
+                    .join(crate::workspace::CODING_DIR_NAME)
+                    .join("reviews")
+            })
     }
 
     /// Register the file/shell/search/git agent tools (always present). These
@@ -1496,7 +1501,11 @@ impl AgentLoopFactory {
         if want(ToolGroup::Web, "web_fetch") {
             registry.register(Box::new(WebFetchTool::new()));
         }
-        if want(ToolGroup::Git, "git") {
+        // 2c.3 (G3): the Git group also requires a repo at the root (row 27's
+        // kernel form) — a non-repo directory builds without git git_read.
+        if want(ToolGroup::Git, "git")
+            && crate::workspace::Workspace::root_is_git_repo(&project_root)
+        {
             registry.register(Box::new(GitTool::with_core_operations(
                 &project_root,
                 self.core_operations.clone(),
@@ -1508,7 +1517,10 @@ impl AgentLoopFactory {
         // to shipped code. AutoRun by construction, which is exactly why it
         // stays separate from the NeedsApproval `git` tool — it must remain
         // visible in the read-only Planning/Complete states.
-        if want(ToolGroup::Git, "git_read") {
+        // 2c.3 (G3): the same repo-presence gate as `git`.
+        if want(ToolGroup::Git, "git_read")
+            && crate::workspace::Workspace::root_is_git_repo(&project_root)
+        {
             registry.register(Box::new(GitReadTool::new(&project_root)));
         }
         // write_review_report is the reviewer subagent's single output channel
@@ -2187,6 +2199,8 @@ mod tests {
         // mutates the shared Arc directly; this one exercises the factory's
         // public setter against a real built agent's git tool).
         let dir = tempdir().unwrap();
+        // 2c.3 (G3): the git pair is repo-gated — the repo marker.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let factory = make_factory(dir.path());
 
         let agent = factory.build();
@@ -3371,6 +3385,9 @@ mod tests {
         policy_factory.set_backlog(Arc::new(tokio::sync::Mutex::new(
             crate::app::backlog::BacklogStore::open(dir.path().join("backlog.jsonl")),
         )));
+        // 2c.3 (G3): the git pair is repo-gated — this test pins the fully-
+        // wired shape, which includes the git pair (the repo marker).
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
         let registry = factory.build_registry(
             &crate::app::workflow::as_handle(workflow.clone()),
@@ -3580,7 +3597,6 @@ mod tests {
             "shell",
             "search",
             "web_fetch",
-            "git",
             "load_tools",
             "memory_write",
             "memory_search",
@@ -3592,12 +3608,13 @@ mod tests {
             );
         }
         let count = registry_len(&factory, &dir);
-        // The browser family is feature-gated (10 offscreen + 6 on-screen).
-        let expected = if cfg!(feature = "browser") { 44 } else { 28 };
+        // The browser family is feature-gated (10 offscreen + 6 on-screen);
+        // the git pair is repo-gated (2c.3) — the tempdir is not a repo.
+        let expected = if cfg!(feature = "browser") { 42 } else { 26 };
         assert_eq!(
             count,
             expected,
-            "the free surface = the kernel tools minus the review tool and the app tools (spawner wired, no resolver)"
+            "the free surface = the kernel tools minus the review tool and the app tools and the (unrequired) git pair"
         );
     }
 
@@ -3684,13 +3701,44 @@ mod tests {
             "the rest of the Memory group stays"
         );
         let count = registry.iter().count();
-        // The browser family is feature-gated (10 offscreen + 6 on-screen).
-        let expected = if cfg!(feature = "browser") { 43 } else { 27 };
+        // The browser family is feature-gated (10 offscreen + 6 on-screen);
+        // the git pair is repo-gated (2c.3) — the tempdir is not a repo.
+        let expected = if cfg!(feature = "browser") { 41 } else { 25 };
         assert_eq!(
             count,
             expected,
-            "free surface minus the carved tool"
+            "free surface minus the carved tool and the (unrequired) git pair"
         );
+    }
+
+    #[test]
+    fn git_tools_register_only_when_root_is_a_repo() {
+        // 2c.3 (G3, row 27's kernel form): on a directory that is NOT a git
+        // repo the Git group does not register (no git/git_read tools), and
+        // the kernel must not create .git/.gitignore artifacts there. With a
+        // repo marker present (the gate probes `.git` existence — a real
+        // repo's dir OR a linked-worktree's plain file), both tools reappear.
+        let dir = tempdir().unwrap();
+        let factory =
+            make_free_factory(dir.path()).with_tool_selection(ToolSelection::free_default());
+        factory.set_spawner(Arc::new(MockSpawner));
+        let registry = registry_for_factory(&factory, &dir);
+        assert!(
+            registry.get("git").is_none(),
+            "no git tool on a non-repo root"
+        );
+        assert!(
+            registry.get("git_read").is_none(),
+            "no git_read tool on a non-repo root"
+        );
+        assert!(!dir.path().join(".git").exists());
+        assert!(!dir.path().join(".gitignore").exists());
+        // A repo marker flips the gate (the existence-probe contract; the
+        // real-repo shape is covered by the integration git fixtures).
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let registry2 = registry_for_factory(&factory, &dir);
+        assert!(registry2.get("git").is_some(), "git registers on a repo root");
+        assert!(registry2.get("git_read").is_some());
     }
 
     #[test]
@@ -3705,6 +3753,9 @@ mod tests {
         use crate::tool::{SafetyLevel, ToolCategory, ToolFilter};
 
         let dir = tempdir().unwrap();
+        // 2c.3 (G3): the read surface includes the repo-gated git_read — the
+        // repo marker sits the build up.
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let factory = make_factory(dir.path());
         let skills = Arc::new(SkillLibrary::from_registry(
             dir.path().join(".coding/skills"),

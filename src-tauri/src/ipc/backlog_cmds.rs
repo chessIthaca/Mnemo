@@ -552,7 +552,7 @@ pub async fn backlog_run_all(
     // Best-effort + conservative (unmerged/worktree-held branches are
     // never touched); runs before the pending-count check so a run
     // that finds no eligible items still sweeps.
-    let swept = mnemo::project::worktrees::sweep_merged_runall_branches(
+    let swept = mnemo::app::worktrees::sweep_merged_runall_branches(
         state.inner().project.root.lock().await.root.clone(),
     )
     .await;

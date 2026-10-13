@@ -587,7 +587,7 @@ pub(crate) struct ConsoleRuntime {
     manager: Arc<tokio::sync::Mutex<AgentManager>>,
     agent_loops: AgentLoopMap,
     config: Arc<tokio::sync::Mutex<Config>>,
-    project: Arc<tokio::sync::Mutex<mnemo::project::Project>>,
+    project: Arc<tokio::sync::Mutex<mnemo::app::project::Project>>,
     trace: Arc<LlmRequestLog>,
     browser: Arc<mnemo::browser::BrowserManager>,
     fanin_rx: tokio::sync::mpsc::Receiver<(AgentId, AgentEvent)>,
@@ -655,7 +655,9 @@ impl ConsoleRuntime {
         // the process lifetime).
         let factory = brain.factory.clone();
         let config = brain.config.clone();
-        let project = brain.project.clone();
+        let project = Arc::new(tokio::sync::Mutex::new(
+            mnemo::app::project::Project::from_root(&brain.workspace.root),
+        ));
         let trace = brain.trace.clone();
         let browser = brain.browser.clone();
 
@@ -1225,7 +1227,7 @@ pub(crate) async fn run_console() -> i32 {
     // 2b.3: the skill library loads bin-side (the kernel factory's skills
     // surface retired) — the same `.coding/skills/*.toml` dir the GUI arm
     // loads, handed to the app factory so the skill tools resolve.
-    let skills_dir = brain.project.lock().await.skills_dir.clone();
+    let skills_dir = brain.workspace.state_dir.join("skills");
     let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
     let policy_factory = Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new(
         brain.factory.memory_handle(),

@@ -119,7 +119,7 @@ pub(crate) async fn spawn_run_all_agent(
         // main graph was opened with). `None` when the main graph is
         // disabled or failed to open — no seeding, cold as before.
         let main_db = factory.codegraph_handle().map(|g| {
-            mnemo::project::Project::from_root(g.root().to_path_buf()).codegraph_db
+            mnemo::app::project::Project::from_root(g.root().to_path_buf()).codegraph_db
         });
         tokio::task::spawn_blocking(move || {
             let db = wt.join(".coding").join("codegraph.db");

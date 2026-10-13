@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::project::Project;
+use mnemo::workspace::CODING_DIR_NAME;
 
 /// One instance's claim on a project — the `.coding/instance.json` shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ impl InstanceMarker {
     /// Best-effort write of this marker to `<dir>/.coding/instance.json`
     /// (last writer wins — the next launch overwrites the previous one).
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
-        let coding = dir.join(Project::CODING_DIR_NAME);
+        let coding = dir.join(CODING_DIR_NAME);
         std::fs::create_dir_all(&coding)?;
         let json = serde_json::to_string_pretty(self)
             .unwrap_or_else(|_| "{}".to_string());
@@ -58,7 +58,7 @@ impl InstanceMarker {
 /// Read the marker another instance left in `<dir>/.coding/instance.json`.
 pub fn read_marker(dir: &Path) -> Option<InstanceMarker> {
     let bytes =
-        std::fs::read(dir.join(Project::CODING_DIR_NAME).join("instance.json")).ok()?;
+        std::fs::read(dir.join(CODING_DIR_NAME).join("instance.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 

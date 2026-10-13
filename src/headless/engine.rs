@@ -389,6 +389,8 @@ async fn start_inner(
         sessions: Mutex::new(HashMap::new()),
         pending_approvals: Mutex::new(HashMap::new()),
         pending_questions: Mutex::new(HashMap::new()),
+        pending_host_tools: Mutex::new(HashMap::new()),
+        pending_hooks: Mutex::new(HashMap::new()),
         parked: Mutex::new(HashSet::new()),
         tallies: std::sync::Mutex::new(HashMap::new()),
     });

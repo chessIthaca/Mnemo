@@ -38,16 +38,28 @@ impl ToolSurface {
     }
 }
 
-/// Per-call veto beyond the filter (master-spec :215-217): the plan-mutation
-/// gate and the research write verdict move into `WorkflowPolicy` in 2b/2c.
-/// Default: [`GateVerdict::Allow`].
-#[derive(Debug, Clone)]
+/// Per-call veto beyond the filter (master-spec :215-217). Consulted by the
+/// dispatch funnel BEFORE the approval branch (3c): `Deny` refuses the call
+/// outright (even under `OverridePermissions` — a veto is not an approval
+/// skip), `RequireApproval` forces the approval prompt (the bypass branch
+/// keeps its semantics under `OverridePermissions` — R3), `Allow` proceeds
+/// through the normal safety/approval machinery. Default:
+/// [`GateVerdict::Allow`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GateVerdict {
     /// The call proceeds (subject to the surface filter).
     Allow,
-    /// The call is refused with this reason (dispatch surfaces it as an
-    /// error).
-    Block { reason: String },
+    /// The call is refused with this message (dispatch surfaces it as the
+    /// tool-call error result).
+    Deny {
+        /// The refusal the model sees.
+        message: String,
+    },
+    /// The call must go through the approval prompt — dispatch forces the
+    /// gated branch. Under `OverridePermissions` the existing bypass branch
+    /// applies (`ApprovalBypassed` audit + proceed).
+    RequireApproval,
 }
 
 /// The per-agent approval policy (2c.5, §5.4 :356-378): a PER-LOOP
@@ -90,8 +102,9 @@ pub enum PermissionPolicy {
 
 /// Prompt-intake result (master-spec :220-222): the unattended-marker read
 /// and an optional volatile-tail rewrite (the Complete-state plan nudge).
-/// Default no-op.
-#[derive(Debug, Clone, Default)]
+/// Default no-op. Serde since 3c — carried by the external policy's
+/// [`PolicyAnswer::Prompt`](crate::runtime::channels::PolicyAnswer) arm.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PromptHook {
     /// `Some(v)` SETS the unattended flag outright (prefix read /
     /// plain-prompt clear). `None` leaves the runtime's own derivation
@@ -104,8 +117,11 @@ pub struct PromptHook {
 
 /// Turn-end verdict (master-spec :224-225): `Stop` parks for the user;
 /// `Continue` runs another turn, optionally with a synthetic note (today's
-/// auto-continue message).
-#[derive(Debug, Clone)]
+/// auto-continue message). Serde since 3c — carried by the external
+/// policy's [`PolicyAnswer::Continuation`]
+/// (crate::runtime::channels::PolicyAnswer) arm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Continuation {
     /// Park (the default for `NoPolicy`).
     Stop,

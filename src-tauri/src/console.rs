@@ -400,6 +400,16 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         // never prints them; the durable ledger + the stats pulls are
         // their consumers.
         AgentEvent::Savings { .. } | AgentEvent::Spend { .. } => Rendered::Silent,
+        // 3c (§5.9.2/§5.9.6): host-tool calls + external-policy hooks are
+        // headless-engine interactions — the console's app-spawned agents
+        // never produce them, but the match stays exhaustive: a one-line
+        // notice if one ever arrives.
+        AgentEvent::HostToolCall { name, .. } => {
+            Rendered::Lines(vec![format!("— host tool call: {name} (awaiting the host's result)")])
+        }
+        AgentEvent::PolicyHook { hook_kind, .. } => Rendered::Lines(vec![format!(
+            "— policy hook {hook_kind:?} (awaiting the answer)"
+        )]),
     }
 }
 

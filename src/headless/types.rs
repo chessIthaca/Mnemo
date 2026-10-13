@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::agent::policy::PermissionPolicy;
 pub use crate::host::notifier::HostEvent;
 pub use crate::runtime::channels::SessionLimits;
-use crate::runtime::channels::{AgentId, Approval, SerializableAgentEvent, UserAnswer};
+use crate::runtime::channels::{AgentId, Approval, PolicyAnswer, SerializableAgentEvent, UserAnswer};
+use crate::tool::ToolResult;
 use crate::workspace::Workspace;
 
 /// A session's stable identifier (a newtype over the kernel's `AgentId`,
@@ -162,6 +163,27 @@ pub enum SessionCommand {
         /// The chosen option or freeform text.
         answer: UserAnswer,
     },
+    /// Answer a `HostToolCall` with the call's result (G2, §5.9.2) —
+    /// `result` and `error` are mutually exclusive: `result` carries the
+    /// `ToolResult` the kernel folds back into the conversation as the
+    /// call's outcome; `error` makes the call an error result with this
+    /// text (the same shape an unanswered call's timeout produces).
+    HostToolResult {
+        /// The `call_id` from the `HostToolCall` event.
+        call_id: String,
+        /// The call's result, when the host answered with one.
+        result: Option<ToolResult>,
+        /// The call's error text, when the host answered with an error.
+        error: Option<String>,
+    },
+    /// Answer a `PolicyHook` (G6 tier 3, §5.9.6) — the hook id plus the
+    /// per-hook-family answer.
+    PolicyAnswer {
+        /// The `hook_id` from the `PolicyHook` event.
+        hook_id: String,
+        /// The host's answer.
+        answer: PolicyAnswer,
+    },
 }
 
 /// One agent event, tagged with the emitting agent (§5.3 :345-348) — the
@@ -266,12 +288,13 @@ pub struct SessionSnapshot {
     pub used_tokens: u32,
     /// The context window.
     pub max_tokens: u32,
-    /// The pending approval/question awaiting a SessionCommand answer.
+    /// The pending interaction awaiting a SessionCommand answer — an
+    /// approval, a question, a host-tool call, or a policy hook.
     pub pending: Option<PendingInteraction>,
 }
 
-/// The pending interaction a snapshot reports (§5.9.5): an approval or
-/// a question the session is blocked on.
+/// The pending interaction a snapshot reports (§5.9.5): the interaction
+/// kind the session is blocked on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PendingInteraction {
@@ -284,5 +307,16 @@ pub enum PendingInteraction {
     Question {
         /// The id from the UserQuestion event.
         question_id: String,
+    },
+    /// A host-tool call awaiting SessionCommand::HostToolResult (G2).
+    HostToolCall {
+        /// The `call_id` from the HostToolCall event.
+        call_id: String,
+    },
+    /// An external-policy hook awaiting SessionCommand::PolicyAnswer (G6
+    /// tier 3).
+    PolicyHook {
+        /// The `hook_id` from the PolicyHook event.
+        hook_id: String,
     },
 }

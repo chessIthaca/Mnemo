@@ -446,10 +446,17 @@ pub fn spawn(
                 continue;
             }
 
+            // 3c (§5.9.2/§5.9.6): the host-tool + policy-hook senders ride
+            // the same struct; this forwarder's app-spawned agents never
+            // produce those events (WorkflowPolicy registers no host tools
+            // and no external policy), so the `..` drops any stray
+            // responder — the kernel's dispatch-side timeout then resolves
+            // it instead of hanging.
             let SerializedEvent {
                 event: serial,
                 approval_sender,
                 question_sender,
+                ..
             } = event.into_serializable();
 
             // Chain marker: events reaching the forwarder at all (see

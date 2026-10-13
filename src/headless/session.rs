@@ -23,7 +23,8 @@ use crate::headless::types::{
 use crate::runtime::channels::ConversationExport;
 use crate::host::runtime::HostRuntime;
 use crate::runtime::channels::{
-    AgentEvent, AgentId, Approval, SerializableAgentEvent, SteerPayload, UserAnswer,
+    AgentEvent, AgentId, Approval, HostToolOutcome, PolicyAnswer, SerializableAgentEvent,
+    SteerPayload, UserAnswer,
 };
 use crate::runtime::AgentCommand;
 
@@ -39,6 +40,12 @@ pub(crate) struct EngineInner {
     pub(crate) pending_approvals: Mutex<HashMap<String, oneshot::Sender<Approval>>>,
     /// Question responders by question id.
     pub(crate) pending_questions: Mutex<HashMap<String, oneshot::Sender<UserAnswer>>>,
+    /// Host-tool outcome responders by call id (3c/G2) — the pump stashes
+    /// them; `SessionCommand::HostToolResult` resolves.
+    pub(crate) pending_host_tools: Mutex<HashMap<String, oneshot::Sender<HostToolOutcome>>>,
+    /// Policy-hook answer responders by hook id (3c/G6 tier 3) — the pump
+    /// stashes them; `SessionCommand::PolicyAnswer` resolves.
+    pub(crate) pending_hooks: Mutex<HashMap<String, oneshot::Sender<PolicyAnswer>>>,
     /// Parked sessions (G7, §5.9.7): agents whose Finished{LimitReached}
     /// the pump saw — every later Prompt errors `session_parked`.
     /// Engine-scoped, not per-handle (review round-1 F3): the pump is
@@ -157,6 +164,31 @@ pub(crate) async fn pump_task(
                     .insert(question_id.clone(), responder);
             }
         }
+        // Stash the host-tool responder for SessionCommand::HostToolResult
+        // (3c/G2). No zero-subscriber shortcut here: an unanswered call
+        // resolves by the dispatch-side timeout, so a silent host never
+        // hangs the agent.
+        if let Some(responder) = forwarded.host_tool_sender {
+            if let SerializableAgentEvent::HostToolCall { call_id, .. } = &forwarded.event {
+                inner
+                    .pending_host_tools
+                    .lock()
+                    .await
+                    .insert(call_id.clone(), responder);
+            }
+        }
+        // Stash the policy-hook responder for SessionCommand::PolicyAnswer
+        // (3c/G6 tier 3). Same as host tools: the hook's dispatch/turn-site
+        // timeout resolves an absent answer per the spec's on_timeout.
+        if let Some(responder) = forwarded.policy_hook_sender {
+            if let SerializableAgentEvent::PolicyHook { hook_id, .. } = &forwarded.event {
+                inner
+                    .pending_hooks
+                    .lock()
+                    .await
+                    .insert(hook_id.clone(), responder);
+            }
+        }
         // Best-effort broadcast: zero subscribers → the event drops.
         let _ = bus.send(SessionEvent {
             agent,
@@ -256,6 +288,44 @@ impl AgentSession {
                     ))),
                 }
             }
+            SessionCommand::HostToolResult {
+                call_id,
+                result,
+                error,
+            } => {
+                // The `result | error` pair (§5.9.2): exactly one must ride
+                // the answer — neither is a protocol error, not a silent
+                // success.
+                let outcome = match (result, error) {
+                    (Some(result), _) => Ok(result),
+                    (None, Some(error)) => Err(error),
+                    (None, None) => {
+                        return Err(EngineError::unknown_request(format!(
+                            "host tool result '{call_id}' carries neither result nor error"
+                        )))
+                    }
+                };
+                let responder = self.inner.pending_host_tools.lock().await.remove(&call_id);
+                match responder {
+                    Some(responder) => responder.send(outcome).map_err(|_| {
+                        EngineError::unknown_request("the host-tool call already resolved")
+                    }),
+                    None => Err(EngineError::unknown_request(format!(
+                        "no pending host-tool call '{call_id}'"
+                    ))),
+                }
+            }
+            SessionCommand::PolicyAnswer { hook_id, answer } => {
+                let responder = self.inner.pending_hooks.lock().await.remove(&hook_id);
+                match responder {
+                    Some(responder) => responder.send(answer).map_err(|_| {
+                        EngineError::unknown_request("the policy hook already resolved")
+                    }),
+                    None => Err(EngineError::unknown_request(format!(
+                        "no pending policy hook '{hook_id}'"
+                    ))),
+                }
+            }
         }
     }
 
@@ -271,7 +341,7 @@ impl AgentSession {
     }
 
     /// A snapshot (§5.3 :324 / §5.9.5): the transcript + the model + the
-    /// context usage + the pending approval/question (if any). The turn
+    /// context usage + the pending interaction (if any). The turn
     /// stats land with 3b's spend accounting.
     pub async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
         // G5: the transcript part is best-effort — mid-block (a pending
@@ -288,6 +358,9 @@ impl AgentSession {
             ),
             None => (Transcript::default(), None, 0, 0),
         };
+        // The four pending maps in a fixed order (approval → question →
+        // host tool → policy hook): only one interaction kind is normally
+        // live at a time, and the snapshot reports the first it finds.
         let pending = {
             let approvals = self.inner.pending_approvals.lock().await;
             if let Some(id) = approvals.keys().next() {
@@ -296,12 +369,23 @@ impl AgentSession {
                 })
             } else {
                 let questions = self.inner.pending_questions.lock().await;
-                questions
-                    .keys()
-                    .next()
-                    .map(|id| PendingInteraction::Question {
+                if let Some(id) = questions.keys().next() {
+                    Some(PendingInteraction::Question {
                         question_id: id.clone(),
                     })
+                } else {
+                    let host_tools = self.inner.pending_host_tools.lock().await;
+                    if let Some(id) = host_tools.keys().next() {
+                        Some(PendingInteraction::HostToolCall {
+                            call_id: id.clone(),
+                        })
+                    } else {
+                        let hooks = self.inner.pending_hooks.lock().await;
+                        hooks.keys().next().map(|id| PendingInteraction::PolicyHook {
+                            hook_id: id.clone(),
+                        })
+                    }
+                }
             }
         };
         Ok(SessionSnapshot {

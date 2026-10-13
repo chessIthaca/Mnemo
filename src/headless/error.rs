@@ -114,6 +114,17 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// The engine cannot start: the config is not ready to run (§5.8
+    /// :581-587, job 4 D1) — no usable default model (an endpoint with a
+    /// key when its kind needs one, plus the model itself). The message
+    /// names the ordered missing setup steps.
+    pub(crate) fn not_configured(message: impl Into<String>) -> Self {
+        Self {
+            code: "not_configured".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

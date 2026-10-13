@@ -317,6 +317,25 @@ fn engine_opts(workspace: mnemo::workspace::Workspace, config_dir: Option<PathBu
     }
 }
 
+/// Job 4 D1 (§5.8 :581-587): `Engine::start` without an injected provider
+/// fails fast on an unready config — the bare-start fixture below
+/// therefore seeds a READY one (an endpoint + key + default model; the
+/// dead base_url is fine: start wires the provider, it never calls it).
+fn write_ready_config(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("endpoints.toml"),
+        "[[endpoint]]\nname = \"test\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"test-model\"]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("keys.toml"), "[test]\napi_key = \"sk-test\"\n").unwrap();
+}
+
 /// §7 row 9: `Engine::start` never blocks and never shows a picker — an
 /// unusable workspace (a missing root, or `require_git` on a non-repo
 /// root) is `EngineError` code `no_project`, returned promptly.
@@ -353,9 +372,11 @@ async fn no_project_errors() {
 #[test]
 fn start_blocking_without_runtime() {
     let dir = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
     let opts = engine_opts(
         Workspace::new(dir.path()),
-        Some(tempfile::tempdir().unwrap().path().to_path_buf()),
+        Some(cfg.path().to_path_buf()),
     );
     let engine =
         Engine::start_blocking(opts).expect("start_blocking builds its own runtime");

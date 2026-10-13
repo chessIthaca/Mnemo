@@ -486,6 +486,30 @@ pub fn global_config_dir() -> PathBuf {
     config_dir_named(".mnemo")
 }
 
+/// Resolve an install's config dir (§5.8 :573-574, job 4 D1): an explicit
+/// dir wins, else `$MNEMO_HOME`, else `~/.mnemo` (the same base
+/// [`global_config_dir`] uses). The ONE resolver the engine and
+/// `Setup::open(None)` share — G4's close-grep keeps `global_config_dir`
+/// itself out of `src/headless`, and this fn (in `config/`) carries the
+/// env override it lacks.
+pub fn resolve_config_dir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    if let Some(home) = std::env::var_os("MNEMO_HOME") {
+        return PathBuf::from(home);
+    }
+    global_config_dir()
+}
+
+/// The cache dir for bundled embedding models (§5.8 :575-576). Lives in
+/// `config/` so the G4 close-grep keeps `global_config_dir` out of
+/// `src/headless`; job 4 D6 re-derives it from the ENGINE's config dir
+/// (today it is machine-global, matching the brain's startup load).
+pub fn embedder_cache_dir() -> PathBuf {
+    global_config_dir().join("models")
+}
+
 /// The pre-rename global config directory (`~/.myharness/`).
 fn legacy_config_dir() -> PathBuf {
     config_dir_named(".myharness")

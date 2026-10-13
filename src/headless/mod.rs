@@ -17,6 +17,7 @@ pub mod external_policy;
 pub mod host_tools;
 pub mod memory_api;
 pub mod session;
+pub mod setup;
 pub mod stats;
 pub mod types;
 
@@ -36,6 +37,10 @@ pub use memory_api::{
     ScoredMemoryDebugWire,
 };
 pub use session::AgentSession;
+pub use setup::{
+    EmbedderReadiness, EndpointReadiness, ProjectReadiness, Setup, SetupEvent, SetupStatus,
+    SetupStep,
+};
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{
     EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,

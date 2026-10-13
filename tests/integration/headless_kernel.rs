@@ -26,6 +26,25 @@ fn opts(workspace: Workspace, config_dir: Option<PathBuf>) -> EngineOptions {
     }
 }
 
+/// Job 4 D1 (§5.8 :581-587): `Engine::start` without an injected provider
+/// fails fast on an unready config — the bare-start fixtures below
+/// therefore seed a READY one (an endpoint + key + default model; the
+/// dead base_url is fine: start wires the provider, it never calls it).
+fn write_ready_config(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("endpoints.toml"),
+        "[[endpoint]]\nname = \"test\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"test-model\"]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("keys.toml"), "[test]\napi_key = \"sk-test\"\n").unwrap();
+}
+
 /// G3 (§5.9.3): an engine works on ANY directory — a fresh temp dir with
 /// no git repo starts cleanly (require_git false; the Git tool group
 /// simply does not register).
@@ -33,6 +52,7 @@ fn opts(workspace: Workspace, config_dir: Option<PathBuf>) -> EngineOptions {
 async fn workspace_without_git_starts() {
     let root = tempfile::tempdir().unwrap();
     let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
     let engine = Engine::start(opts(
         Workspace::new(root.path()),
         Some(cfg.path().to_path_buf()),
@@ -52,6 +72,7 @@ async fn state_dir_outside_tree() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
     let workspace = Workspace::with_state_dir(root.path(), state.path());
     let engine = Engine::start(opts(workspace, Some(cfg.path().to_path_buf())))
         .await

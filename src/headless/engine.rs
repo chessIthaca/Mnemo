@@ -11,7 +11,6 @@
 //! index / embedder option consumption lands in 3b.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex};
@@ -473,17 +472,33 @@ async fn start_inner(
         )));
     }
 
-    // The config dir: explicit → $MNEMO_HOME → ~/.mnemo (§5.3 :287).
-    let config_dir = match opts.config_dir {
-        Some(dir) => dir,
-        None => default_config_dir(),
-    };
+    // The config dir: explicit → $MNEMO_HOME → ~/.mnemo (§5.3 :287) —
+    // the ONE resolver in `config/` (job 4 D1; `Setup::open` shares it).
+    let config_dir = crate::config::resolve_config_dir(opts.config_dir);
     let config = Config::load(&config_dir).map_err(|e| {
         EngineError::start_failed(format!(
             "config load from '{}' failed: {e}",
             config_dir.display()
         ))
     })?;
+
+    // §5.8 :581-587 (job 4 D1): an unready config fails FAST with the
+    // missing setup steps rather than deep inside the brain — but only
+    // for a caller WITHOUT an injected provider (a standalone host).
+    // An INJECTED provider (tests, hosts that bring their own transport)
+    // IS the model transport, so the config's endpoint/key wiring is not
+    // load-bearing for it.
+    if provider.is_none() {
+        let status =
+            crate::headless::setup::Setup::status_from_config(&config_dir, &config, None);
+        if !status.ready_to_run {
+            return Err(EngineError::not_configured(format!(
+                "config at '{}' is not ready to run — missing: {}",
+                config_dir.display(),
+                crate::headless::setup::Setup::format_missing(&status.missing)
+            )));
+        }
+    }
 
     // 3b.2 (D2): the memory overview's configured-model line — resolved
     // BEFORE wire_brain consumes the config. The "hash" sentinel
@@ -626,15 +641,3 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
     })
 }
 
-/// The engine's config-dir default (§5.3 :287): `$MNEMO_HOME`, else
-/// `~/.mnemo`. Deliberately NOT [`crate::config::global_config_dir`] — G4
-/// (:676-677) keeps that for `Setup::open(None)` and the app.
-fn default_config_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("MNEMO_HOME") {
-        return PathBuf::from(home);
-    }
-    if let Some(dirs) = directories::BaseDirs::new() {
-        return dirs.home_dir().join(".mnemo");
-    }
-    PathBuf::from(".mnemo")
-}

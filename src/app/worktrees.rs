@@ -44,7 +44,41 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::project::git_ops::{gh_raw, git_raw};
+use crate::project::git_ops::git_raw;
+
+/// Run a `gh` (GitHub CLI) subcommand in `root`, returning stdout on
+/// success — the gh twin of [`git_raw`], same hardening
+/// (CREATE_NO_WINDOW on Windows, stderr on failure). Moved app-side by
+/// job 5 D1: its only callers are the ruleset-aware landing paths below
+/// (`main_is_protected`, `land_via_pull_request`) — kernel builds
+/// (`--features kernel,headless`) carry no gh machinery. Failures are
+/// EXPECTED and handled by the callers — gh missing / unauthenticated
+/// means the landing takes its direct path (mirroring the
+/// merge_to_main skill's decision: gh-missing also means `gh pr create`
+/// would fail).
+fn gh_raw(root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(args).current_dir(root);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to spawn gh {args:?}: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "gh {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
 
 /// The worktree root: `<main_root>/.worktrees` (gitignored — see the
 /// `.gitignore` entry).

@@ -10,6 +10,20 @@ name = "mnemo"
 path = "src/lib.rs"
 
 [features]
+# The G10 consumption lattice (job 5 D1, master-spec §5.9.10 :740-743):
+# `kernel` = the core modules (agent/runtime/host/memory/tool/... —
+# always compiled; the feature names the slice for explicit selects),
+# `headless` = the public engine surface (src/headless — Engine/
+# AgentSession/Setup/*Api; implies kernel), `app` = the workflow
+# module graph (src/app — plan-first, backlog, skills). Default = the
+# full library, so existing consumers (the app crate, the integration
+# tests) see zero change; a second consumer builds
+# `--no-default-features --features kernel,headless` — no app
+# machinery, no embeddings, no browser.
+default = ["kernel", "app", "headless"]
+kernel = []
+headless = ["kernel"]
+app = []
 # Headless-browser automation (chromiumoxide): the offscreen_browser_* tools,
 # the shared BrowserManager, and the src/browser module. Off by default —
 # coding-only/library consumers skip the heavy chromiumoxide dep tree; the

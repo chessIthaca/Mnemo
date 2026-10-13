@@ -11,12 +11,20 @@
 //! machine, job 2b) are fully usable without the TUI.
 
 pub mod agent;
+/// The workflow module graph (plan-first, backlog, skills) — G10's
+/// optional `app` slice (§5.9.10): off for second consumers building
+/// `--features kernel,headless`; on by default for the mnemo app.
+#[cfg(feature = "app")]
 pub mod app;
 #[cfg(feature = "browser")]
 pub mod browser;
 pub mod codegraph;
 pub mod config;
 pub mod error;
+/// The public headless API (§5.3) — G10's `headless` slice (§5.9.10):
+/// Engine/AgentSession/Setup/*Api, implying `kernel`. Off only for
+/// `--no-default-features` builds that want the bare kernel.
+#[cfg(feature = "headless")]
 pub mod headless;
 pub mod host;
 pub mod index_staleness;

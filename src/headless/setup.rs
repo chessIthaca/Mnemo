@@ -25,11 +25,13 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::keys::{KeySource, Secret};
-use crate::config::{Config, EndpointKind};
+use crate::config::settings_dto::SettingsSaveDto;
+use crate::config::{Config, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
 use crate::memory::classifier::ClassifierStatus;
 use crate::memory::embedder::EmbedderStatus;
@@ -192,6 +194,35 @@ pub struct EngineConfig {
     pub endpoints: Vec<EndpointDto>,
 }
 
+/// The live-engine pieces a [`Setup::patch_settings`] applies to (D4,
+/// §5.8 :538-541) — Arc-cloned out of the engine's brain by
+/// [`Setup::for_engine`], so the Setup drives the live-apply without
+/// owning the engine (every Arc is shared with the live runtime).
+#[derive(Clone)]
+struct LiveHandles {
+    /// The shared agent factory (the vision slot + the live toggles +
+    /// the core-operations/shell-filter/browser-inspection handles).
+    factory: Arc<crate::agent::factory::AgentLoopFactory>,
+    /// The concrete memory store (the embedder swap).
+    memory_store: Option<Arc<crate::memory::MemoryStore>>,
+    /// The shared embedder status (Ready gates the re-embed).
+    embedder_status: Arc<std::sync::RwLock<crate::memory::embedder::EmbedderStatus>>,
+    /// The per-context model resolver.
+    model_resolver: Arc<crate::model_resolver::ConfigModelResolver>,
+    /// The live safety mode (the approval gates read it per request).
+    safety_mode: Arc<std::sync::RwLock<SafetyMode>>,
+    /// The shared LLM request trace (the memory limits).
+    trace: Arc<crate::provider::trace::LlmRequestLog>,
+    /// The brain's shared config — every later spawn reads it.
+    config: Arc<tokio::sync::Mutex<Config>>,
+}
+
+impl fmt::Debug for LiveHandles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LiveHandles { factory, memory_store, embedder_status, … }")
+    }
+}
+
 /// The semantic-search leg (§5.8 :567): which bundled model is
 /// configured, whether it is installed in the cache, the embedder's
 /// status, and whether semantic (vs. hash-fallback) vectors are live.
@@ -268,6 +299,9 @@ pub struct Setup {
     /// is the default; `Env`/`InMemory` are host-managed READ sources
     /// (the write paths refuse them).
     key_source: KeySource,
+    /// The live-engine handles (D4, §5.8 :527) — `None` until
+    /// [`Setup::for_engine`]; `patch_settings` applies through them.
+    live: Option<LiveHandles>,
 }
 
 impl Setup {
@@ -287,6 +321,7 @@ impl Setup {
         Ok(Self {
             config_dir,
             key_source: KeySource::default(),
+            live: None,
         })
     }
 
@@ -342,6 +377,92 @@ impl Setup {
                 .map(|e| Self::endpoint_dto(e, self.key_source.has_key(&keys_path, &e.name)))
                 .collect(),
         })
+    }
+
+    /// Attach a LIVE engine (§5.8 :527, job 4 D4) — the Arc handles its
+    /// brain owns, Arc-cloned into this Setup — so
+    /// [`Setup::patch_settings`] applies on the very next request
+    /// instead of the next start. The Setup holds the shared Arcs,
+    /// never the engine itself.
+    pub fn for_engine(&self, engine: &crate::headless::Engine) -> Self {
+        let brain = engine.brain();
+        Self {
+            config_dir: self.config_dir.clone(),
+            key_source: self.key_source.clone(),
+            live: Some(LiveHandles {
+                factory: brain.factory.clone(),
+                memory_store: brain.memory_store.clone(),
+                embedder_status: brain.embedder_status.clone(),
+                model_resolver: brain.model_resolver.clone(),
+                safety_mode: brain.safety_mode.clone(),
+                trace: brain.trace.clone(),
+                config: brain.config.clone(),
+            }),
+        }
+    }
+
+    /// Validate + persist + LIVE-apply a settings patch (§5.8 :540) —
+    /// the same rules the GUI's save path enforces
+    /// (`validate_and_apply_settings_patch`), then the exact live-apply
+    /// sequence: the safety mode → the moved rewire core (vision +
+    /// embedder + the factory's live toggles) → the model resolver →
+    /// the factory's core-operations/shell-filter/browser-inspection
+    /// handles → the trace limits → the brain's shared config. Without
+    /// a live engine ([`Setup::open`], a first-run flow) only the
+    /// persist happens. Effective on the next request.
+    ///
+    /// The managed-CLASSIFIER leg (the sidecar stop/start) lands with
+    /// job 4 D5's Laya core; a standalone engine has no managed
+    /// sidecar yet.
+    pub async fn patch_settings(&self, patch: SettingsSaveDto) -> Result<(), EngineError> {
+        let current = self.load_config()?;
+        let new_config =
+            crate::config::settings_dto::validate_and_apply_settings_patch(&current, &patch)
+                .map_err(EngineError::start_failed)?;
+        new_config
+            .save_all(&self.config_dir)
+            .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
+        // Safety mode (the engine's approval gates read the flag per
+        // request; the app additionally auto-resolves pending IPC
+        // approvals — a headless engine has none parked by the GUI).
+        *live.safety_mode.write().expect("safety mode lock poisoned") =
+            new_config.general.general.safety;
+        // The rewire core: vision + embedder + the live toggles. The
+        // re-embed future spawns on tokio (the headless engine runs on
+        // tokio by construction).
+        let targets = crate::host::rewire::RewireTargets {
+            factory: Some(live.factory.clone()),
+            memory_store: live.memory_store.clone(),
+            embedder_status: live.embedder_status.clone(),
+            model_resolver: Some(live.model_resolver.clone()),
+        };
+        if let Some(task) = crate::host::rewire::rewire_vision_embedder(&targets, &new_config) {
+            tokio::spawn(task);
+        }
+        // `[models]` overrides on the next request.
+        crate::host::rewire::sync_model_resolver(Some(&live.model_resolver), &new_config);
+        // The factory's shared tool handles.
+        live.factory
+            .set_core_operations(new_config.general.git.core_operations.clone());
+        live.factory
+            .set_shell_filter_config(new_config.general.shell_filter.clone());
+        live.factory
+            .set_browser_inspection(new_config.general.general.enable_browser_inspection);
+        // The trace limits (retroactive budget; the cap from now on) —
+        // only when the patch carries trace fields (the GUI's contract).
+        if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
+            live.trace
+                .set_memory_budget(new_config.general.trace.memory_budget_mb * 1024 * 1024);
+            live.trace
+                .set_request_body_cap(new_config.general.trace.request_body_cap_kb * 1024);
+        }
+        // The brain's shared config: every later spawn reads the
+        // reloaded values.
+        *live.config.lock().await = new_config;
+        Ok(())
     }
 
     /// Load the config for the endpoints group — one error mapping for
@@ -689,5 +810,76 @@ impl Setup {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .join("; ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::policy::PermissionPolicy;
+    use crate::config::SafetyMode;
+    use crate::headless::{Engine, EngineOptions, MemoryBackend};
+    use crate::workspace::Workspace;
+
+    /// The ready config the engine fixture needs (the sibling suites'
+    /// `write_ready_config` twin — this suite is self-contained). The
+    /// endpoint serves a SECOND model so the `default_model` patch
+    /// has a visible live change to make.
+    fn write_ready_config(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\nbundled_embedding_model = \"hash\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"test-model\", \"alt-model\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("keys.toml"), "[test]\napi_key = \"sk-test\"\n").unwrap();
+    }
+
+    /// D4's live-apply pin (§5.8 :540): `patch_settings` through a
+    /// `for_engine` Setup flips the LIVE brain pieces — the safety flag
+    /// + the shared config the next spawn reads — without a restart.
+    #[tokio::test]
+    async fn patch_settings_live_applies_through_for_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let engine = Engine::start(EngineOptions {
+            workspace: Workspace::new(root.path()),
+            config_dir: Some(cfg.path().to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("a ready config starts");
+        let setup = Setup::open(Some(cfg.path().to_path_buf()))
+            .expect("open")
+            .for_engine(&engine);
+        let patch = SettingsSaveDto {
+            safety: Some("autonomous".into()),
+            default_model: Some("alt-model".into()),
+            ..Default::default()
+        };
+        setup.patch_settings(patch).await.expect("patch applies");
+        // The LIVE safety flag flipped…
+        assert_eq!(
+            *engine.brain().safety_mode.read().expect("safety lock"),
+            SafetyMode::Autonomous
+        );
+        // …and the shared config the next spawn reads carries the patch.
+        let shared = engine.brain().config.lock().await;
+        assert_eq!(
+            shared.general.general.default_model.as_deref(),
+            Some("alt-model")
+        );
+        drop(shared);
+        engine.shutdown().await.expect("shutdown");
     }
 }

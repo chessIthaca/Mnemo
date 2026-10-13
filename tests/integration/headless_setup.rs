@@ -387,6 +387,27 @@ fn resolve_endpoint_credentials_shared_chain() {
     )
     .is_err());
 }
+
+/// §5.8 :540: `patch_settings` validates + persists (the same lib rules
+/// the GUI's save path enforces); WITHOUT a live engine only the
+/// persist happens — a fresh re-read sees the applied values.
+#[tokio::test]
+async fn patch_settings_persists_without_an_engine() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    let patch = mnemo::config::settings_dto::SettingsSaveDto {
+        summarize_at_fill_rate: Some(0.42),
+        ..Default::default()
+    };
+    setup.patch_settings(patch).await.expect("patch applies");
+    // The persist: a fresh re-read sees the applied value.
+    let config = mnemo::config::Config::load(cfg.path()).unwrap();
+    assert_eq!(config.general.context.summarize_at_fill_rate, 0.42);
+    // The ready state survives the patch.
+    let fresh = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    assert!(fresh.status(None).unwrap().ready_to_run);
+}
 /// G9 (§5.9.9, row 33 leg 2): `Setup::settings()` exposes ONLY
 /// EngineConfig — the app-owned `[ui]` table is absent from the type
 /// (compile-time), and it SURVIVES a standalone engine-side save

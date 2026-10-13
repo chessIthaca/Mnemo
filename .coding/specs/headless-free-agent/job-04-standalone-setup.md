@@ -421,4 +421,39 @@ time absent) ✓ (D3), the GUI still reads `[ui]` unchanged ✓ (D3).
   Fixture: `settings_exposes_engine_config_and_preserves_ui`
   (headless_setup.rs). `endpoint_dto` dedupes the DTO mapping
   (`endpoints()` + `settings()` share it).
-- Battery: workspace green, exit 0 (66 integration tests).
+- Battery: workspace green, exit 0 (66 integration tests).### D4 — landed (feat(4.4)): the rewire move + patch_settings live-apply
+
+- NEW `src/host/rewire.rs` — the AppHandle-free rewire core MOVED from
+  ipc/rewire.rs: `RewireTargets` (factory / memory_store /
+  embedder_status / model_resolver — every handle optional, a no-op
+  when absent), `rewire_vision_embedder` (the vision rebuild + the
+  embedder rebuild + the factory's eight live toggles — the classifier
+  FLAGS from `[general.laya]`, the optimizer/verify/budget configs) +
+  `sync_model_resolver`. The re-embed future RETURNS to the caller
+  (the app spawns on `tauri::async_runtime`, the headless Setup on
+  tokio) — a full re-embed never blocks the save call. The embedder
+  cache dir derives from `config::embedder_cache_dir()` (D1's helper —
+  one derivation).
+- ipc/rewire.rs is the thin app wrapper: the lib core + the app-owned
+  pieces (the managed-CLASSIFIER leg — the Laya runtime, D5's move
+  target — the re-embed spawn policy, the `classifier://status` emit).
+  The GUI save path's behavior is byte-identical (the app tests stay
+  green).
+- `Setup::for_engine` + `Setup::patch_settings` (§5.8 :527/:540):
+  `for_engine` Arc-clones the brain's shared handles (factory / store /
+  embedder status / resolver / safety mode / trace / config) — the Setup
+  never owns the engine; `patch_settings` = validate (the same lib
+  rules the GUI's save uses) → persist → the live-apply sequence
+  (safety mode → the moved rewire → resolver →
+  core-operations/shell-filter/browser-inspection → the trace limits →
+  the brain's shared config). Without a live engine only the persist
+  happens. `Engine::brain()` (pub(crate)) is the new accessor.
+- The managed-CLASSIFIER leg of the live-apply stays app-side until D5
+  (documented in `patch_settings`'s doc comment); a standalone engine
+  has no managed sidecar yet.
+- Fixtures: `patch_settings_live_applies_through_for_engine` (in-crate
+  unit — the safety flag + the shared-config swap, no restart) +
+  `patch_settings_persists_without_an_engine` (integration — the
+  persist + the ready state survives).
+- Battery: workspace green, exit 0 (67 integration tests + the new
+  unit test).

@@ -106,6 +106,12 @@ impl EngineBuilder {
 }
 
 impl Engine {
+    /// The engine's brain (job 4 D4): `Setup::for_engine` Arc-clones
+    /// the shared handles for the live-apply; the `memory()`/`codegraph()`
+    /// accessors read the same brain.
+    pub(crate) fn brain(&self) -> &Brain {
+        &self.brain
+    }
     /// Start an engine on an EXPLICIT workspace + config (§5.3 :297).
     /// Never blocks and never shows a picker (§7 row 9): an unusable
     /// workspace — the root missing, or `require_git` unmet on a non-repo

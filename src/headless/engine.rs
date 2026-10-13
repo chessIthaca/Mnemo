@@ -539,7 +539,7 @@ async fn start_inner(
         crate::headless::types::MemoryBackend::Disabled => (false, None),
     };
     let brain = wire_brain(
-        config_dir,
+        config_dir.clone(),
         config,
         workspace,
         false,
@@ -610,7 +610,7 @@ async fn start_inner(
     // app's startup path (§5.6); each status transition forwards onto
     // the bus. No pending model / no store → the method no-ops.
     let notify_load = notifier_events.clone();
-    brain.spawn_startup_embedder_load(move |s| {
+    brain.spawn_startup_embedder_load(&config_dir, move |s| {
         notify_load.notify(HostEvent::EmbedderStatus(s));
     });
     // (3b.3 note) The graph's startup index pass already runs inside

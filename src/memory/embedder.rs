@@ -289,7 +289,6 @@ fn dim_for_model(model: &fastembed::EmbeddingModel) -> usize {
 /// Used to detect whether a model is already installed (the subdir exists +
 /// has snapshot files) and to poll download progress (dir size vs. the
 /// catalog's `size_mb`). Returns `None` for an unknown model id.
-#[cfg(feature = "embeddings")]
 pub fn hf_cache_subdir(model_id: &str) -> Option<String> {
     let repo = match model_id {
         "all-MiniLM-L6-v2" => "Qdrant/all-MiniLM-L6-v2-onnx",

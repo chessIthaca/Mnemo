@@ -528,3 +528,79 @@ keeps only glue. `cargo tree -p mnemo -i tauri` finds NOTHING (§B fact
   == disabled, the app's opt-in convention).
 - Battery: workspace green, exit 0 — the integration harness at 70
   tests (67 → 70), the 16 moved app tests now run as lib unit tests.
+### 4.6 — D6 landed (2026-10-13): embed download + the embedding/vision surface
+
+The second core move: the download/load pipeline is host-agnostic now.
+Verified BOTH ways: the plain workspace battery (exit 0; integration
+70 → 75) AND the feature-enabled run `cargo test --features embeddings`
+(exit 0 — the gated unit tests run: the late-arrival guard, the
+catalog, the hash-sentinel paths).
+
+- NEW `src/host/embed_download.rs` (~18.2 KB): `EmbedderStatusSink`
+  (the Tauri seam — `Arc<dyn Fn(&EmbedderStatus) + Send + Sync>`;
+  `push_status` replaces every write + `app.emit` pair) +
+  `EmbeddingModelDto` + `embedding_model_catalog(cache_dir)` (the list
+  gated, the empty-catalog arm ungated) + `copy_model_from` /
+  `copy_dir_recursive` (the AIR-GAPPED install §5.8 :544 — plain fs,
+  validates the HF layout `models--<org>--<name>/snapshots/<rev>/
+  model_quantized.onnx`, every build) + the gated core
+  (`cache_dir_progress`, `DownloadOutcome { StatusOnly,
+  SwapIntoStore(store) }`, `install_allowed` + `install_embedder`
+  (the late-arrival guard + the fingerprint check + re-embed + swap,
+  with the 2026-08-21 review-finding history), `run_startup_load`,
+  `spawn_startup_load_task`, `spawn_download` (the 500 ms poller with
+  the poller-abort-BEFORE-failure-propagation rule — the laya rule).
+  `dir_size` is shared from `host::laya` (pub(crate), one impl).
+- The cache-dir re-derivation (§B fact 9): `config::embedder_cache_dir()`
+  → `embedder_cache_dir(config_dir: &Path)` — `<config_dir>/models`.
+  Callers: the app's ipc/embeddings.rs (the global dir — byte-identical
+  GUI behavior), `RewireTargets.config_dir` (NEW optional field; the
+  app passes `None` = the global fallback, the Setup passes its own),
+  `status_from_config`, and `Brain::spawn_startup_embedder_load` (NEW
+  `cache_dir: &Path` param — engine.rs passes its resolved config dir
+  via a pre-`wire_brain` clone; the no-feature twin's signature
+  matches). `hf_cache_subdir` is un-gated (a pure string map — the
+  air-gapped copy needs it in every build).
+- The Setup surface (§5.8 :542-549): `embedding_models()` (installed
+  flags against THIS Setup's cache — the global coupling died),
+  `install_embedding_model(id) -> EventReceiver<SetupEvent>` (the
+  network download; the no-feature arm REFUSES with the honest
+  message), `install_embedding_model_from(id, dir)` (air-gapped),
+  `select_embedding_model(id)` (validates: "hash" or a catalog id;
+  rides `patch_settings` — persist + the rewire's rebuild + re-embed),
+  `vision_model(Some(dto)/None)` (set/clear via the patch's
+  `vision_model`/`clear_vision_model`), `embedder_status()` (LIVE —
+  the brain's Arc when engine-backed), `reembed()` (the live-store
+  swap re-run without a config change; needs `for_engine`; the
+  no-feature arm refuses), `embedder_status_to_event` (gated — its
+  callers are). `Setup.embedder_status_arc`: fresh `Checking`,
+  `for_engine` re-roots to the brain's. `EmbeddingModelDto` re-exported
+  from `headless`.
+- The app's `ipc/embeddings.rs` is the thin layer (6.4 KB):
+  `status_sink` (`embedder://status`), the wire mapping, the catalog +
+  download commands (StatusOnly — the settings-save rewire swaps the
+  live embedder, the pre-D5 split unchanged), and the startup twins
+  (`spawn_startup_download` SwapIntoStore, `spawn_startup_load`,
+  `spawn_startup_load_console` with `None`). main.rs / console.rs
+  compile UNCHANGED.
+- Fixtures (5): `embedding_catalog_flags_track_the_config_dir_cache`
+  (fresh = nothing installed; the doctored HF tree flips the flag),
+  `install_embedding_model_from_copies_into_the_config_dir_cache` (the
+  copy lands + unknown ids reject),
+  `select_embedding_model_persists_and_validates` ("hash" persists;
+  unknown rejects clean), `vision_model_set_and_clear_ride_the_settings_patch`
+  (set validates the endpoint, None clears),
+  `no_surprise_downloads_at_the_setup_surface` (a fresh open + a
+  status read stays `Checking` — the behavioral pin for D1's
+  `auto_install_embedder: false`; `EngineOptions` has no `Default`,
+  so the flag is pinned by construction sites, not a `::default()`
+  assert).
+- En-route fixes (8 compile errors + fixture shapes): the re-export
+  chain (`pub use crate::host::embed_download::EmbeddingModelDto` — a
+  private re-import doesn't re-export), the cfg-gated `use`s
+  (`EmbedderStatusSink`/`RwLock` unused ungated), the pre-move
+  `config_dir.clone()` for the load call (wire_brain consumes it),
+  `map(|_| ())`, the `Option::unwrap_or_else` PathBuf mismatch → a
+  `match`, the no-feature `let _ = &cache_dir`, the gated mapper, and
+  the fixtures (`write_ready_config(dir)` takes the dir and returns
+  `()`; one `EmbedderStatus` import was already present from D1).

@@ -214,8 +214,9 @@ pub fn progress_fraction(bytes: u64, size_mb: u64) -> f64 {
 }
 
 /// Recursively sum file sizes under a dir (0 if missing) — the same
-/// sampling primitive the embedder downloads use.
-fn dir_size(path: &Path) -> u64 {
+/// sampling primitive the embedder downloads use (D6's `embed_download`
+/// shares it: one impl in the host layer).
+pub(crate) fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {

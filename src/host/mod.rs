@@ -13,6 +13,7 @@
 // browser) are gated at their own sites inside the module, with runtime-
 // optional wiring (the hash embedder / no browser) on the bare build.
 pub mod brain;
+pub mod embed_download;
 pub mod index_progress;
 pub mod laya;
 pub mod maintenance;

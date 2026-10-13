@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use mnemo::agent::policy::PermissionPolicy;
+use mnemo::config::settings_dto::VisionModelDto;
 use mnemo::headless::{
     EndpointDto, Engine, EngineOptions, KeySource, MemoryBackend, RecvError, Secret, Setup,
     SetupEvent, SetupStep,
@@ -522,4 +523,134 @@ fn laya_manager_roots_at_the_config_dir() {
     let cfg = tempfile::tempdir().unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
     assert_eq!(setup.laya_manager().base_dir(), cfg.path().join("laya"));
+}// -- D6: the embedding/vision surface (§5.8 :542-549) --
+
+/// The catalog's installed flags track THIS Setup's config-dir cache
+/// (D6: the global coupling died). A fresh dir reports nothing
+/// installed; a doctored HF tree flips the matching entry. Under the
+/// no-embeddings build the catalog is empty — the loops are vacuous.
+#[test]
+fn embedding_catalog_flags_track_the_config_dir_cache() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    for m in setup.embedding_models() {
+        assert!(!m.installed, "'{}' flagged installed on a fresh dir", m.id);
+    }
+    // Doctor the HF tree for the catalog's light entry
+    // (all-MiniLM-L6-v2): snapshots/<rev>/model_quantized.onnx — the
+    // exact file `is_model_installed` probes for.
+    let onnx = cfg
+        .path()
+        .join("models")
+        .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
+        .join("snapshots")
+        .join("deadbeef");
+    std::fs::create_dir_all(&onnx).unwrap();
+    std::fs::write(onnx.join("model_quantized.onnx"), b"onnx").unwrap();
+    for m in setup.embedding_models() {
+        if m.id == "all-MiniLM-L6-v2" {
+            assert!(m.installed, "'{}' NOT flagged installed after the doctor", m.id);
+        }
+    }
+}
+
+/// The air-gapped install copies a model tree into the config-dir
+/// cache (no network; works in every build).
+#[test]
+fn install_embedding_model_from_copies_into_the_config_dir_cache() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let source = tempfile::tempdir().unwrap();
+    let onnx = source
+        .path()
+        .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
+        .join("snapshots")
+        .join("deadbeef");
+    std::fs::create_dir_all(&onnx).unwrap();
+    std::fs::write(onnx.join("model_quantized.onnx"), b"onnx-bytes").unwrap();
+    setup
+        .install_embedding_model_from("all-MiniLM-L6-v2", source.path())
+        .expect("install_from");
+    let copied = cfg
+        .path()
+        .join("models")
+        .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
+        .join("snapshots")
+        .join("deadbeef")
+        .join("model_quantized.onnx");
+    assert_eq!(
+        std::fs::read(&copied).unwrap(),
+        b"onnx-bytes".to_vec(),
+        "the air-gapped copy lands in the config-dir cache"
+    );
+    // Unknown ids reject; nothing lands.
+    let err = setup
+        .install_embedding_model_from("no-such-model", source.path())
+        .expect_err("unknown id");
+    assert!(err.message().contains("unknown embedding model"));
+}
+
+/// `select_embedding_model` persists the choice through the settings
+/// pipeline and validates the id first ("hash" is the explicit
+/// opt-out; an unknown id rejects without touching the config).
+#[tokio::test]
+async fn select_embedding_model_persists_and_validates() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    // Unknown ids reject.
+    let err = setup
+        .select_embedding_model("no-such-model")
+        .await
+        .expect_err("unknown id");
+    assert!(err.message().contains("unknown embedding model"));
+    // "hash" persists — the explicit keyword-only opt-out.
+    setup
+        .select_embedding_model("hash")
+        .await
+        .expect("select hash");
+    let settings = setup.settings().expect("settings");
+    assert_eq!(
+        settings.general.bundled_embedding_model.as_deref(),
+        Some("hash")
+    );
+}
+
+/// `vision_model` sets and clears through the settings pipeline — the
+/// set validates the endpoint against the configured ones.
+#[tokio::test]
+async fn vision_model_set_and_clear_ride_the_settings_patch() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let dto = VisionModelDto {
+        endpoint: "test".to_string(),
+        model: "vision-x".to_string(),
+    };
+    setup.vision_model(Some(dto)).await.expect("set");
+    let settings = setup.settings().expect("settings");
+    let vm = settings.general.vision_model.expect("vision model set");
+    assert_eq!(vm.endpoint, "test");
+    assert_eq!(vm.model, "vision-x");
+    // None clears.
+    setup.vision_model(None).await.expect("clear");
+    let settings = setup.settings().expect("settings");
+    assert!(settings.general.vision_model.is_none());
+}
+
+/// No surprise downloads at the Setup surface (D6; D1's
+/// `auto_install_embedder` flag's contract — types.rs pins the default
+/// as false, and `EngineOptions` has no Default impl: every
+/// construction site opts in explicitly). A fresh `open` + a status
+/// read never spawn an install — the status stays at the interim
+/// `Checking` until an EXPLICIT `install_embedding_model` /
+/// `select_embedding_model` (or an engine started with the flag on)
+/// moves it.
+#[test]
+fn no_surprise_downloads_at_the_setup_surface() {
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cfg.path()).unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+    let _ = setup.status(None).expect("status");
+    assert_eq!(setup.embedder_status(), EmbedderStatus::Checking);
 }

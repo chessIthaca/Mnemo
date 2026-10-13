@@ -42,6 +42,10 @@ pub struct RewireTargets {
     pub embedder_status: Arc<RwLock<EmbedderStatus>>,
     /// The per-context model resolver.
     pub model_resolver: Option<Arc<ConfigModelResolver>>,
+    /// The config dir the embedder cache derives from (D6:
+    /// `<config_dir>/models`). `None` = the machine-global dir (the
+    /// GUI's case — its config dir IS the global one).
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// The background re-embed task [`rewire_vision_embedder`] returns —
@@ -110,10 +114,15 @@ pub fn rewire_vision_embedder(targets: &RewireTargets, cfg: &Config) -> Option<R
         factory.set_budget_config(cfg.general.general.budget.clone());
     }
     if let Some(store) = &targets.memory_store {
-        // The bundled model cache lives under the global config dir
-        // (NOT .coding/, which is committed to git — model binaries
-        // are per-machine).
-        let cache_dir = crate::config::embedder_cache_dir();
+        // The bundled model cache lives under the config dir (NOT
+        // .coding/, which is committed to git — model binaries are
+        // per-machine). D6: the caller's dir — a Setup with a custom
+        // config dir isolates its installs; the machine-global one
+        // when absent (the GUI's case).
+        let cache_dir = match &targets.config_dir {
+            Some(dir) => crate::config::embedder_cache_dir(dir),
+            None => crate::config::embedder_cache_dir(&crate::config::global_config_dir()),
+        };
         let new_embedder = build_embedder(cfg, &cache_dir, targets.embedder_status.clone());
         // When the bundled model changed (or memories are stale from
         // another machine via git), re-embed all rows so the stored

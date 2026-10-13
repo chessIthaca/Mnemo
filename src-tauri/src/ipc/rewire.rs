@@ -47,6 +47,9 @@ pub(super) fn rewire_vision_embedder_and_classifier(
         memory_store: state.runtime.memory_store.clone(),
         embedder_status: state.runtime.embedder_status.clone(),
         model_resolver: state.runtime.model_resolver.clone(),
+        // The GUI's config dir IS the machine-global one (D6's `None`
+        // fallback) — byte-identical behavior.
+        config_dir: None,
     };
     if let Some(task) = rewire_vision_embedder(&targets, cfg) {
         tauri::async_runtime::spawn(task);

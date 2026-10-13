@@ -30,10 +30,13 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::config::keys::{KeySource, Secret};
-use crate::config::settings_dto::SettingsSaveDto;
+use crate::config::settings_dto::{SettingsSaveDto, VisionModelDto};
 use crate::config::{Config, EndpointKind, SafetyMode};
 use crate::headless::error::EngineError;
 use crate::headless::types::EventReceiver;
+pub use crate::host::embed_download::EmbeddingModelDto;
+#[cfg(feature = "embeddings")]
+use crate::host::embed_download::EmbedderStatusSink;
 use crate::host::laya::{LayaManager, StatusSink};
 use crate::memory::classifier::{Classifier, ClassifierStatus};
 use crate::memory::embedder::EmbedderStatus;
@@ -328,6 +331,10 @@ pub struct Setup {
     /// handle; `for_engine` re-roots it to the brain's shared Arc so
     /// the engine and any GUI attached to it see the same moves.
     classifier_status: Arc<std::sync::RwLock<ClassifierStatus>>,
+    /// The embedder status the install/select surface drives (D6) —
+    /// fresh `Checking` (no live embedder yet); `for_engine` re-roots
+    /// it to the brain's shared Arc.
+    embedder_status_arc: Arc<std::sync::RwLock<EmbedderStatus>>,
 }
 
 impl Setup {
@@ -345,6 +352,8 @@ impl Setup {
             ))
         })?;
         let classifier_status = Arc::new(std::sync::RwLock::new(ClassifierStatus::Disabled));
+        let embedder_status_arc =
+            Arc::new(std::sync::RwLock::new(EmbedderStatus::Checking));
         let laya = Arc::new(LayaManager::with_base(
             config_dir.join("laya"),
             Arc::clone(&classifier_status),
@@ -355,6 +364,7 @@ impl Setup {
             live: None,
             laya,
             classifier_status,
+            embedder_status_arc,
         })
     }
 
@@ -430,6 +440,7 @@ impl Setup {
                 brain.classifier_status.clone(),
             )),
             classifier_status: brain.classifier_status.clone(),
+            embedder_status_arc: brain.embedder_status.clone(),
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
                 memory_store: brain.memory_store.clone(),
@@ -481,6 +492,9 @@ impl Setup {
             memory_store: live.memory_store.clone(),
             embedder_status: live.embedder_status.clone(),
             model_resolver: Some(live.model_resolver.clone()),
+            // D6: the embedder cache derives from THIS Setup's config
+            // dir — install isolation for custom-dir Setups.
+            config_dir: Some(self.config_dir.clone()),
         };
         if let Some(task) = crate::host::rewire::rewire_vision_embedder(&targets, &new_config) {
             tokio::spawn(task);
@@ -625,6 +639,216 @@ impl Setup {
                 step,
                 label: format!("fine-tuning ({label})"),
                 fraction: None,
+            },
+        }
+    }
+
+    /// The curated embedding-model catalog, each entry flagged
+    /// `installed` against THIS Setup's cache (`<config_dir>/models`,
+    /// D6 — the global coupling died). Without the `embeddings`
+    /// feature the catalog is empty (the deterministic hash embedder
+    /// is the only one).
+    pub fn embedding_models(&self) -> Vec<EmbeddingModelDto> {
+        crate::host::embed_download::embedding_model_catalog(
+            &crate::config::embedder_cache_dir(&self.config_dir),
+        )
+    }
+
+    /// Download a bundled embedding model in the background (§5.8
+    /// :543): progress streams as [`SetupEvent`]s tagged
+    /// [`SetupStep::EmbedderModel`] — download fractions, then
+    /// `Done`/`Failed`. The model lands in THIS Setup's cache
+    /// (`<config_dir>/models`); the live embedder is swapped by the
+    /// next settings save (the same split the GUI's Download button
+    /// has — the rewire rebuilds from the on-disk model).
+    #[cfg(feature = "embeddings")]
+    pub fn install_embedding_model(
+        &self,
+        id: &str,
+    ) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        let cache_dir = crate::config::embedder_cache_dir(&self.config_dir);
+        let info = crate::host::embed_download::embedding_model_catalog(&cache_dir)
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| {
+                EngineError::start_failed(format!("unknown embedding model '{id}'"))
+            })?;
+        let (tx, rx) = tokio::sync::broadcast::channel::<SetupEvent>(64);
+        let sink: EmbedderStatusSink = Arc::new(move |s: &EmbedderStatus| {
+            let _ = tx.send(Self::embedder_status_to_event(s, SetupStep::EmbedderModel));
+        });
+        crate::host::embed_download::spawn_download(
+            Some(sink),
+            Arc::clone(&self.embedder_status_arc),
+            id.to_string(),
+            info.size_mb,
+            cache_dir,
+            crate::host::embed_download::DownloadOutcome::StatusOnly,
+        );
+        Ok(EventReceiver { rx })
+    }
+
+    /// Without the ONNX runtime there is nothing to download — the
+    /// deterministic hash embedder is the only one this build runs.
+    #[cfg(not(feature = "embeddings"))]
+    pub fn install_embedding_model(
+        &self,
+        id: &str,
+    ) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        Err(EngineError::start_failed(format!(
+            "the embeddings feature is required to download embedding models \
+             (this build runs the deterministic hash embedder; '{id}' cannot install)"
+        )))
+    }
+
+    /// Air-gapped install (§5.8 :544): copy an already-downloaded
+    /// model tree from `dir` (the HuggingFace cache layout) into THIS
+    /// Setup's cache. Plain fs — no network; works in every build.
+    pub fn install_embedding_model_from(
+        &self,
+        id: &str,
+        dir: &Path,
+    ) -> Result<(), EngineError> {
+        let cache_dir = crate::config::embedder_cache_dir(&self.config_dir);
+        crate::host::embed_download::copy_model_from(dir, id, &cache_dir)
+            .map(|_| ())
+            .map_err(|e| EngineError::start_failed(format!("copying '{id}' failed: {e}")))
+    }
+
+    /// Select the embedding model (§5.8 :545): persist the choice +
+    /// live-apply — the FULL settings pipeline (validate → persist →
+    /// the rewire's embedder rebuild + re-embed + the resolver), the
+    /// same one the GUI's save runs. `"hash"` is the explicit
+    /// opt-out (keyword-only memory). An unknown id rejects before
+    /// touching the config.
+    pub async fn select_embedding_model(&self, id: &str) -> Result<(), EngineError> {
+        let known = id.eq_ignore_ascii_case(crate::config::EMBEDDING_MODEL_SENTINEL_HASH)
+            || self.embedding_models().iter().any(|m| m.id == id);
+        if !known {
+            return Err(EngineError::start_failed(format!(
+                "unknown embedding model '{id}'"
+            )));
+        }
+        let mut patch = SettingsSaveDto::default();
+        patch.bundled_embedding_model = Some(id.to_string());
+        self.patch_settings(patch).await
+    }
+
+    /// The LIVE embedder status (§5.8 :546) — the brain's shared Arc
+    /// when engine-backed, this Setup's own install/select pipeline
+    /// otherwise.
+    pub fn embedder_status(&self) -> EmbedderStatus {
+        self.embedder_status_arc
+            .read()
+            .expect("embedder status lock poisoned")
+            .clone()
+    }
+
+    /// Re-embed all memories with the CURRENT config's embedder
+    /// (§5.8 :547) — the live-store swap the settings save performs,
+    /// re-run without a config change (e.g. after an air-gapped install
+    /// made the configured model loadable). Streams the status as
+    /// [`SetupEvent`]s tagged [`SetupStep::EmbedderModel`]. Needs the
+    /// live store — a standalone Setup rejects.
+    #[cfg(feature = "embeddings")]
+    pub async fn reembed(&self) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        let Some(live) = &self.live else {
+            return Err(EngineError::start_failed(
+                "no live engine attached — reembed needs the live memory store \
+                 (call for_engine first)",
+            ));
+        };
+        let Some(store) = live.memory_store.clone() else {
+            return Err(EngineError::start_failed(
+                "the attached engine runs without the memory store — reembed has \
+                 nothing to swap",
+            ));
+        };
+        let config = self.load_config()?;
+        let status = Arc::clone(&self.embedder_status_arc);
+        let cache_dir = crate::config::embedder_cache_dir(&self.config_dir);
+        let (tx, rx) = tokio::sync::broadcast::channel::<SetupEvent>(64);
+        let sink: EmbedderStatusSink = Arc::new(move |s: &EmbedderStatus| {
+            let _ = tx.send(Self::embedder_status_to_event(s, SetupStep::EmbedderModel));
+        });
+        let task_sink = Arc::clone(&sink);
+        tokio::spawn(async move {
+            // The build flips the shared status itself (Ready or the
+            // hash fallback); the install does the fingerprint check
+            // + re-embed + swap — the settings save's sequence minus
+            // the config change.
+            let built = tokio::task::spawn_blocking(move || {
+                crate::provider::client_factory::build_embedder(&config, &cache_dir, status)
+            })
+            .await;
+            match built {
+                Ok(embedder) => {
+                    crate::host::embed_download::install_embedder(store, embedder).await;
+                }
+                Err(e) => {
+                    eprintln!("error: the reembed build task panicked: {e}");
+                    task_sink(&EmbedderStatus::Failed);
+                }
+            }
+        });
+        Ok(EventReceiver { rx })
+    }
+
+    /// Without the ONNX runtime there is no re-embed to run — the hash
+    /// embedder is the only one, and its vectors are already stored.
+    #[cfg(not(feature = "embeddings"))]
+    pub async fn reembed(&self) -> Result<EventReceiver<SetupEvent>, EngineError> {
+        Err(EngineError::start_failed(
+            "the embeddings feature is required to re-embed (this build runs the \
+             deterministic hash embedder only)",
+        ))
+    }
+
+    /// Set or clear the vision model (§5.8 :549): `Some` sets/replaces
+    /// (`{ endpoint, model }`), `None` clears. Rides the full settings
+    /// pipeline (validate → persist → the rewire's vision rebuild).
+    pub async fn vision_model(&self, m: Option<VisionModelDto>) -> Result<(), EngineError> {
+        let mut patch = SettingsSaveDto::default();
+        match m {
+            Some(vm) => patch.vision_model = Some(vm),
+            None => patch.clear_vision_model = true,
+        }
+        self.patch_settings(patch).await
+    }
+
+    /// Map the embedder status onto the setup pipeline's event (§5.8
+    /// :543/:547): the download fractions are `Progress`, `Ready` is
+    /// terminal `Done`, `Failed` carries a description. The interim
+    /// states (`Checking`/`Pulling`) surface as progress; the
+    /// `Fallback` degradation as a failed step.
+    #[cfg(feature = "embeddings")]
+    fn embedder_status_to_event(s: &EmbedderStatus, step: SetupStep) -> SetupEvent {
+        match s {
+            EmbedderStatus::Ready => SetupEvent::Done { step },
+            EmbedderStatus::Failed => SetupEvent::Failed {
+                step,
+                error: "the embedding model failed to load (see the config dir's \
+                        models/ tree)"
+                    .to_string(),
+            },
+            EmbedderStatus::Checking => SetupEvent::Progress {
+                step,
+                label: "checking the embedding model".to_string(),
+                fraction: None,
+            },
+            EmbedderStatus::Pulling => SetupEvent::Progress {
+                step,
+                label: "pulling the embedding model".to_string(),
+                fraction: None,
+            },
+            EmbedderStatus::Downloading { model, progress } => SetupEvent::Progress {
+                step,
+                label: format!("downloading {model}"),
+                fraction: Some(*progress),
+            },
+            EmbedderStatus::Fallback => SetupEvent::Failed {
+                step,
+                error: "the embedder degraded to the hash fallback".to_string(),
             },
         }
     }
@@ -901,7 +1125,7 @@ impl Setup {
             .bundled_embedding_model
             .clone()
             .filter(|m| !m.eq_ignore_ascii_case(crate::config::EMBEDDING_MODEL_SENTINEL_HASH));
-        let cache_dir = crate::config::embedder_cache_dir();
+        let cache_dir = crate::config::embedder_cache_dir(config_dir);
         #[cfg(feature = "embeddings")]
         let installed = configured
             .as_deref()

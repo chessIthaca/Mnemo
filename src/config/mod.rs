@@ -502,12 +502,15 @@ pub fn resolve_config_dir(explicit: Option<PathBuf>) -> PathBuf {
     global_config_dir()
 }
 
-/// The cache dir for bundled embedding models (§5.8 :575-576). Lives in
-/// `config/` so the G4 close-grep keeps `global_config_dir` out of
-/// `src/headless`; job 4 D6 re-derives it from the ENGINE's config dir
-/// (today it is machine-global, matching the brain's startup load).
-pub fn embedder_cache_dir() -> PathBuf {
-    global_config_dir().join("models")
+/// The cache dir for bundled embedding models (§5.8 :575-576):
+/// `<config_dir>/models` — job 4 D6 re-derived it from the ENGINE's
+/// config dir (it was machine-global, ignoring a custom config dir;
+/// the brain's startup build already derived it this way). Callers
+/// pass their dir: the headless Setup its own `config_dir`, the app
+/// the machine-global one. Lives in `config/` so the G4 close-grep
+/// keeps `global_config_dir` out of `src/headless`.
+pub fn embedder_cache_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("models")
 }
 
 /// The pre-rename global config directory (`~/.myharness/`).

@@ -1193,10 +1193,14 @@ impl Brain {
     /// no model is pending or no store is wired (the checks the console
     /// performed at its call site, moved into the one implementation).
     /// Must be called inside a tokio runtime context (the engine's
-    /// `start` / the console's startup).
+    /// `start` / the console's startup). `cache_dir` is the engine's
+    /// config dir (D6: the model cache derives from it —
+    /// `<config_dir>/models` ��� never the machine-global one; the
+    /// brain's startup build already used this derivation).
     #[cfg(feature = "embeddings")]
     pub fn spawn_startup_embedder_load(
         &self,
+        cache_dir: &std::path::Path,
         emit: impl Fn(crate::memory::embedder::EmbedderStatus) + Send + Sync + 'static,
     ) {
         use crate::memory::embedder::{BundledEmbedder, EmbedderStatus};
@@ -1207,6 +1211,7 @@ impl Brain {
             return;
         };
         let status = self.embedder_status.clone();
+        let cache_dir = cache_dir.to_path_buf();
         tokio::spawn(async move {
             // ONNX init is blocking → the blocking pool (the app's twin
             // does the same). The model cache is machine-global
@@ -1216,7 +1221,7 @@ impl Brain {
             // stays intact.
             let load_status = status.clone();
             let load_model = model.clone();
-            let load_dir = crate::config::global_config_dir().join("models");
+            let load_dir = cache_dir.join("models");
             let result =
                 tokio::task::spawn_blocking(move || {
                     BundledEmbedder::new(&load_model, &load_dir, load_status)
@@ -1256,6 +1261,7 @@ impl Brain {
     #[cfg(not(feature = "embeddings"))]
     pub fn spawn_startup_embedder_load(
         &self,
+        _cache_dir: &std::path::Path,
         _emit: impl Fn(crate::memory::embedder::EmbedderStatus) + Send + Sync + 'static,
     ) {
     }

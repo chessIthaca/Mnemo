@@ -219,10 +219,17 @@ impl IpcSpawner {
 
 #[async_trait::async_trait]
 impl AgentSpawner for IpcSpawner {
-    async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<AgentId, String> {
+    async fn spawn(
+        &self,
+        name: &str,
+        task: &str,
+        role: Option<String>,
+        permission: mnemo::agent::policy::PermissionPolicy,
+    ) -> Result<AgentId, String> {
         // The plain spawn path has no parent and no forced model — delegate to
         // spawn_with_parent with both as None.
-        self.spawn_with_parent(name, task, None, None, role).await
+        self.spawn_with_parent(name, task, None, None, role, permission)
+            .await
     }
 
     fn parent_aware(&self) -> Option<&dyn ParentAwareSpawner> {
@@ -247,6 +254,11 @@ impl ParentAwareSpawner for IpcSpawner {
         parent_id: Option<AgentId>,
         model: Option<mnemo::config::ModelRef>,
         role: Option<String>,
+        // §5.4 :377: the parent's policy. Accepted for the 3a Engine's
+        // SpawnOptions (a free parent's OverridePermissions reaches the
+        // child there); today's children are factory-built, which wires
+        // ApproveViaApi.
+        _permission: mnemo::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
             self.factory.clone(),

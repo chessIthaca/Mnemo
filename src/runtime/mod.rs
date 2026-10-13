@@ -199,9 +199,19 @@ pub trait AgentSpawner: Send + Sync {
     /// `Some("reviewer")` for a read-only reviewer). `None` spawns an
     /// unrestricted sub-agent.
     ///
+    /// `permission` is the PARENT's approval policy (§5.4 :377 —
+    /// subagents inherit it); the free agent's default is
+    /// `OverridePermissions`.
+    ///
     /// Returns the new agent's id on success, or an error message describing
     /// why the spawn failed (e.g. the agent runtime is unavailable).
-    async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<AgentId, String>;
+    async fn spawn(
+        &self,
+        name: &str,
+        task: &str,
+        role: Option<String>,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Result<AgentId, String>;
 
     /// If this spawner can record a parent for the agents it spawns, return
     /// it as a [`ParentAwareSpawner`] trait object. The default returns `None`
@@ -236,6 +246,10 @@ pub trait ParentAwareSpawner: Send + Sync {
     /// `role` optionally constrains the spawned agent's tool surface (e.g.
     /// `Some("reviewer")` for a read-only reviewer). `None` spawns an
     /// unrestricted sub-agent.
+    ///
+    /// `permission` is the parent's approval policy (§5.4 :377 —
+    /// subagents inherit it; the free agent default is
+    /// `OverridePermissions`).
     async fn spawn_with_parent(
         &self,
         name: &str,
@@ -243,6 +257,7 @@ pub trait ParentAwareSpawner: Send + Sync {
         parent_id: Option<AgentId>,
         model: Option<crate::config::ModelRef>,
         role: Option<String>,
+        permission: crate::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String>;
 }
 

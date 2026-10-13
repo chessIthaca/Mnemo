@@ -551,8 +551,15 @@ impl AgentSpawner for HostSpawner {
     /// Spawn a background agent with no parent and no forced model —
     /// delegates to `spawn_with_parent` with both as `None` (mirrors
     /// `IpcSpawner`).
-    async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<AgentId, String> {
-        self.spawn_with_parent(name, task, None, None, role).await
+    async fn spawn(
+        &self,
+        name: &str,
+        task: &str,
+        role: Option<String>,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Result<AgentId, String> {
+        self.spawn_with_parent(name, task, None, None, role, permission)
+            .await
     }
 
     /// This spawner is parent-aware (tool-spawned agents record their
@@ -574,6 +581,11 @@ impl ParentAwareSpawner for HostSpawner {
         parent_id: Option<AgentId>,
         model: Option<crate::config::ModelRef>,
         role: Option<String>,
+        // §5.4 :377: the parent's policy. Accepted for the 3a Engine's
+        // SpawnOptions (a free parent's OverridePermissions reaches the
+        // child there); today's children are factory-built, which wires
+        // ApproveViaApi.
+        _permission: crate::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
             self.factory.clone(),

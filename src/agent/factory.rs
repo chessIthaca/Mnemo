@@ -1147,7 +1147,14 @@ impl AgentLoopFactory {
         .with_plans_dir(plans_dir.clone())
         // G4 (2c.4): every loop this factory builds shares its steering
         // counters — the instance-scoped metric.
-        .with_steering(Arc::clone(&self.steering));
+        .with_steering(Arc::clone(&self.steering))
+        // 2c.5 (§5.4): GUI/console loops keep today's approval
+        // semantics — ApproveViaApi over the factory's shared mode.
+        .with_permission(
+            crate::agent::policy::PermissionPolicy::ApproveViaApi {
+                safety_mode: *self.safety_mode.read().expect("safety_mode lock poisoned"),
+            },
+        );
 
         // 2b.2: the agent's policy comes from the app-side policy factory
         // (master-spec :266-269) — the kernel never names the app policy
@@ -1894,6 +1901,16 @@ impl AgentLoopFactory {
                 Some(id) => SpawnAgentTool::new(spawner).with_parent(id),
                 None => SpawnAgentTool::new(spawner),
             };
+            // 2c.5 (§5.4 :377): the spawn param assembly carries the
+            // parent's policy — subagents inherit it. The factory wires
+            // the same ApproveViaApi it sets on the loops it builds; a
+            // free parent's OverridePermissions is threaded by the 3a
+            // Engine's own registration.
+            tool = tool.with_permission(
+                crate::agent::policy::PermissionPolicy::ApproveViaApi {
+                    safety_mode: *self.safety_mode.read().expect("safety_mode lock poisoned"),
+                },
+            );
             // Give the tool access to the model resolver so its optional
             // `model` parameter can resolve a bare model id to an endpoint +
             // model. When no resolver is wired, the tool still works — it just
@@ -2370,6 +2387,9 @@ mod tests {
             name: &str,
             task: &str,
             role: Option<String>,
+            // §5.4 :377 — accepted for the trait; the reviewer-wiring
+            // witness does not assert on it.
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<crate::runtime::AgentId, String> {
             self.calls
                 .lock()
@@ -3278,6 +3298,7 @@ mod tests {
             _name: &str,
             _task: &str,
             _role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             Ok(1)
         }

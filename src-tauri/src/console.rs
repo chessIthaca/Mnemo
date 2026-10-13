@@ -344,6 +344,12 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             lines.push("  approve? [y]es / [n]o / [a]ll-no".to_string());
             Rendered::Lines(lines)
         }
+        // 2c.5 (§5.4 :365-369): the audit trail for a gated call that
+        // executed WITHOUT approval (the loop's policy is
+        // OverridePermissions) — one notice line, like steer-landed.
+        AgentEvent::ApprovalBypassed { tool, reason } => {
+            Rendered::Lines(vec![format!("· approval bypassed: {tool} ({reason})")])
+        }
         AgentEvent::Finished { .. } => Rendered::Lines(vec![String::new()]),
         // Phase transitions are UI state, not console text — silent (the
         // console REPL has no inflight bar to update).
@@ -2170,7 +2176,16 @@ mod tests {
 
         let spawner = HostSpawner::new(factory, manager.clone(), agent_loops.clone());
         let id = spawner
-            .spawn_with_parent("reviewer", "review the diff", Some(7), None, None)
+            .spawn_with_parent(
+                "reviewer",
+                "review the diff",
+                Some(7),
+                None,
+                None,
+                // §5.4 :377 — the parent's policy; the bookkeeping under
+                // test does not depend on it.
+                mnemo::agent::policy::PermissionPolicy::default(),
+            )
             .await
             .expect("spawn must succeed");
 

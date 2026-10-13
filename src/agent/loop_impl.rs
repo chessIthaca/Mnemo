@@ -147,6 +147,16 @@ pub struct AgentLoop {
     /// deleted. A loop built without wiring keeps its own fresh,
     /// isolated set.
     pub(crate) steering: Arc<crate::agent::steering_stats::SteeringStats>,
+    /// The approval policy (2c.5, §5.4): per-loop. Defaults in
+    /// `from_config` to today's semantics (`ApproveViaApi` over the
+    /// config's initial mode) so directly-built loops keep approval
+    /// gating; the factory wires it explicitly, and the free agent's
+    /// `OverridePermissions` is set via `with_permission` (the 3a
+    /// Engine's spawn path). Under Override, dispatch skips the approval
+    /// branch entirely, emitting `AgentEvent::ApprovalBypassed` for
+    /// calls that would have been gated. See
+    /// [`crate::agent::policy::PermissionPolicy`].
+    pub permission: crate::agent::policy::PermissionPolicy,
     /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
     /// the loop never names the app workflow type, and every consult rides
     /// the trait's opaque representations (the state token, the completion
@@ -852,6 +862,17 @@ impl AgentLoop {
         self
     }
 
+    /// Set the approval policy (2c.5, §5.4). The factory wires
+    /// `ApproveViaApi` for GUI/console loops (today's semantics); the
+    /// kernel default (`OverridePermissions`) is the free agent's.
+    pub fn with_permission(
+        mut self,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Self {
+        self.permission = permission;
+        self
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -876,6 +897,9 @@ impl AgentLoop {
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
             steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
+            permission: crate::agent::policy::PermissionPolicy::ApproveViaApi {
+                safety_mode,
+            },
             tools,
             workflow,
             sandbox,

@@ -119,6 +119,10 @@ pub struct SpawnAgentTool {
     /// their round on the plan frame after a successful spawn. `None` in
     /// tests — the spawn then behaves exactly as before.
     review_scope: Option<ReviewScopeWiring>,
+    /// The PARENT's approval policy (2c.5, §5.4 :377): passed to every
+    /// spawn call so subagents inherit it. Defaults to the kernel's
+    /// `OverridePermissions`; the factory wires its loops' policy here.
+    permission: crate::agent::policy::PermissionPolicy,
 }
 
 /// The wiring that lets a REVIEWER spawn render the harness preamble and stamp
@@ -149,6 +153,7 @@ impl SpawnAgentTool {
             model_resolver: None,
             memory: None,
             review_scope: None,
+            permission: crate::agent::policy::PermissionPolicy::default(),
         }
     }
 
@@ -203,6 +208,17 @@ impl SpawnAgentTool {
             root,
             scoper,
         });
+        self
+    }
+
+    /// Wire the PARENT's approval policy (2c.5, §5.4 :377) so subagents
+    /// inherit it — the factory calls this right after construction with
+    /// the same policy it sets on the loop being built.
+    pub fn with_permission(
+        mut self,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Self {
+        self.permission = permission;
         self
     }
 }
@@ -473,10 +489,17 @@ impl Tool for SpawnAgentTool {
                         // unchanged).
                         forced_model.or(reviewer_pin),
                         role.clone(),
+                        // §5.4 :377 — the child inherits the parent's
+                        // policy.
+                        self.permission.clone(),
                     )
                     .await
             }
-            _ => self.spawner.spawn(&args.name, &task, role.clone()).await,
+            _ => {
+                self.spawner
+                    .spawn(&args.name, &task, role.clone(), self.permission.clone())
+                    .await
+            }
         };
 
         match spawned {
@@ -534,7 +557,14 @@ mod tests {
 
     /// A mock spawner that records calls and returns a canned id.
     struct MockSpawner {
-        calls: Mutex<Vec<(String, String, Option<String>)>>,
+        calls: Mutex<
+            Vec<(
+                String,
+                String,
+                Option<String>,
+                crate::agent::policy::PermissionPolicy,
+            )>,
+        >,
         result: Result<u64, String>,
     }
 
@@ -549,11 +579,17 @@ mod tests {
 
     #[async_trait]
     impl AgentSpawner for MockSpawner {
-        async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<u64, String> {
+        async fn spawn(
+            &self,
+            name: &str,
+            task: &str,
+            role: Option<String>,
+            permission: crate::agent::policy::PermissionPolicy,
+        ) -> Result<u64, String> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((name.to_string(), task.to_string(), role));
+                .push((name.to_string(), task.to_string(), role, permission));
             self.result.clone()
         }
     }
@@ -936,6 +972,7 @@ mod tests {
             _name: &str,
             _task: &str,
             role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             *self.plain_calls.lock().unwrap() += 1;
             *self.role_seen.lock().unwrap() = role;
@@ -955,11 +992,54 @@ mod tests {
             parent_id: Option<u64>,
             _model: Option<crate::config::ModelRef>,
             role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             self.parent_calls.lock().unwrap().push(parent_id);
             *self.role_seen.lock().unwrap() = role;
             Ok(9)
         }
+    }
+
+    /// 2c.5 (§5.4 :377): the spawn param assembly carries the parent's
+    /// policy — subagents inherit it. The default (no wiring) is the
+    /// kernel's `OverridePermissions`.
+    #[tokio::test]
+    async fn spawn_passes_the_parent_permission_policy() {
+        use crate::agent::policy::PermissionPolicy;
+        let spawner = Arc::new(MockSpawner::ok(7));
+        let tool = SpawnAgentTool::new(spawner.clone());
+        let result = tool
+            .execute(json!({"name": "worker", "task": "do the thing"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(spawner.calls.lock().unwrap().len(), 1);
+        // Statement-local guards only (clippy::await_holding_lock): each
+        // lock is a temporary dropped by the end of its statement.
+        let inherited = spawner.calls.lock().unwrap()[0].3.clone();
+        assert_eq!(
+            inherited,
+            PermissionPolicy::OverridePermissions,
+            "the child inherits the parent's (default) policy"
+        );
+
+        let spawner = Arc::new(MockSpawner::ok(8));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_permission(
+            PermissionPolicy::ApproveViaApi {
+                safety_mode: crate::config::SafetyMode::Autonomous,
+            },
+        );
+        let result = tool
+            .execute(json!({"name": "worker", "task": "again"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let passed = spawner.calls.lock().unwrap()[0].3.clone();
+        assert_eq!(
+            passed,
+            PermissionPolicy::ApproveViaApi {
+                safety_mode: crate::config::SafetyMode::Autonomous
+            },
+            "a wired parent passes its own policy through"
+        );
     }
 
     #[tokio::test]
@@ -1129,6 +1209,7 @@ mod tests {
             _name: &str,
             _task: &str,
             _role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             Ok(1)
         }
@@ -1146,6 +1227,7 @@ mod tests {
             _parent_id: Option<u64>,
             model: Option<crate::config::ModelRef>,
             _role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             *self.model_seen.lock().unwrap() = model;
             Ok(11)

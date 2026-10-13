@@ -507,15 +507,45 @@ impl AgentLoop {
         // sink is inert until the tool actually runs — a denied call emits
         // nothing — and it never affects the result.
         let output_sink = self.output_sink(fanin_tx, agent_id, &parsed_call.id);
-        if force_prompt
+        // 2c.5 (§5.4 :365-369): the policy decides whether a gated call
+        // is even a candidate for approval. Under OverridePermissions the
+        // whole approval branch below is skipped — force_prompt prompting
+        // included — and each call that WOULD have been gated emits an
+        // ApprovalBypassed audit event (reason "core_op" when the call
+        // matched never_auto_for, else "safety_mode"), then dispatches
+        // directly. The predicates above are still evaluated (silently)
+        // so the audit reason is exact.
+        let gated = force_prompt
             || approval::needs_approval(
                 safety,
                 mode,
                 &tc.name,
                 &parsed_call.arguments,
                 &self.sandbox,
+            );
+        if gated
+            && matches!(
+                self.permission,
+                crate::agent::policy::PermissionPolicy::OverridePermissions
             )
         {
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::ApprovalBypassed {
+                        tool: tc.name.clone(),
+                        reason: if force_prompt {
+                            "core_op".to_string()
+                        } else {
+                            "safety_mode".to_string()
+                        },
+                    },
+                ))
+                .await;
+            // No approval branch at all — fall through to the direct
+            // dispatch below (§5.4 :365: no ApprovalRequest is ever
+            // emitted).
+        } else if gated {
             // Safety-rules shortcut: if a rule matches this call, skip the
             // approval prompt and execute directly. The rules file is
             // mtime-checked inside `is_safe`, so edits in the Safety tab take

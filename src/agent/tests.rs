@@ -2314,9 +2314,9 @@ async fn create_plan_never_needs_approval() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
-                workflow: crate::app::workflow::as_handle(workflow.clone()),
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
@@ -2349,6 +2349,180 @@ async fn create_plan_never_needs_approval() {
     // The plan was created and the workflow transitioned to Executing.
     let wf = workflow.lock().await;
     assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
+}
+
+#[tokio::test]
+async fn override_permissions_bypasses_core_op_with_audit_event() {
+    // 2c.5 (§5.4 :365-369): under OverridePermissions even a CORE
+    // operation (`git merge` — force_prompt) skips the approval branch —
+    // NO ApprovalRequest is emitted; the call executes directly and an
+    // ApprovalBypassed { reason: "core_op" } audit event fires instead.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("merge", "g", "c", vec!["merge feat".into()])
+            .unwrap();
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(GitTool::new(dir.path())));
+    let registry = Arc::new(registry);
+
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_merge".into(),
+                name: "git".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"subcommand":"merge","branch":"feat"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox: sandbox.clone(),
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_permission(crate::agent::policy::PermissionPolicy::OverridePermissions);
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge feat into main")];
+
+    let _outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // Drain: exactly one ApprovalBypassed (core_op), no ApprovalRequest,
+    // and the tool RAN (its ToolResult fires even though the merge fails
+    // in a bare tempdir — execution itself is the assertion).
+    let mut bypassed = 0;
+    let mut approval_requested = false;
+    let mut saw_tool_result = false;
+    while let Ok(Some((_id, event))) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), fanin_rx.recv()).await
+    {
+        match event {
+            AgentEvent::ApprovalBypassed { tool, reason } => {
+                assert_eq!(tool, "git");
+                assert_eq!(reason, "core_op", "git merge is a core operation");
+                bypassed += 1;
+            }
+            AgentEvent::ApprovalRequest { .. } => approval_requested = true,
+            AgentEvent::ToolResult { .. } => saw_tool_result = true,
+            _ => {}
+        }
+    }
+    assert_eq!(bypassed, 1, "exactly one bypass audit event");
+    assert!(!approval_requested, "OverridePermissions never prompts");
+    assert!(saw_tool_result, "the gated call executed directly");
+}
+
+#[tokio::test]
+async fn override_permissions_bypasses_safety_mode_gated_call() {
+    // 2c.5 (§5.4 :365-369): a call gated ONLY by the safety mode (git
+    // commit under ApproveEachAction — NOT a never_auto_for core op) also
+    // bypasses under OverridePermissions, with reason "safety_mode".
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    {
+        let mut wf = workflow.lock().await;
+        wf.create_plan("commit", "g", "c", vec!["commit".into()])
+            .unwrap();
+    }
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(GitTool::new(dir.path())));
+    let registry = Arc::new(registry);
+
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_commit".into(),
+                name: "git".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: r#"{"subcommand":"commit","message":"x"}"#.into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: provider,
+            tools: registry,
+                workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox: sandbox.clone(),
+            safety_mode: SafetyMode::ApproveEachAction,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_permission(crate::agent::policy::PermissionPolicy::OverridePermissions);
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("commit the work")];
+
+    let _outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let mut bypassed = 0;
+    let mut approval_requested = false;
+    while let Ok(Some((_id, event))) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), fanin_rx.recv()).await
+    {
+        match event {
+            AgentEvent::ApprovalBypassed { tool, reason } => {
+                assert_eq!(tool, "git");
+                assert_eq!(
+                    reason, "safety_mode",
+                    "git commit is gated by the mode, not never_auto_for"
+                );
+                bypassed += 1;
+            }
+            AgentEvent::ApprovalRequest { .. } => approval_requested = true,
+            _ => {}
+        }
+    }
+    assert_eq!(bypassed, 1);
+    assert!(!approval_requested, "OverridePermissions never prompts");
 }
 
 #[tokio::test]

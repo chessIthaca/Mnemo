@@ -223,6 +223,13 @@ pub enum AgentEvent {
         core_operation: bool,
         responder: oneshot::Sender<Approval>,
     },
+    /// A gated call executed WITHOUT approval (2c.5, §5.4 :365-369): the
+    /// loop's policy is `OverridePermissions`, so the approval branch was
+    /// skipped entirely — this event is the audit trail for every call
+    /// that WOULD have been gated. `reason` is `"core_op"` when the call
+    /// matched `never_auto_for` (e.g. `git merge`/`git push`), else
+    /// `"safety_mode"`.
+    ApprovalBypassed { tool: String, reason: String },
     /// The result of a tool call.
     ToolResult {
         tool_call_id: String,
@@ -569,6 +576,7 @@ pub enum SerializableAgentEvent {
         /// layer never auto-resolves these on a mode change.
         core_operation: bool,
     },
+    ApprovalBypassed { tool: String, reason: String },
     ToolResult {
         tool_call_id: String,
         result: ToolResult,
@@ -796,6 +804,11 @@ impl AgentEvent {
                     core_operation,
                 },
                 approval_sender: Some(responder),
+                question_sender: None,
+            },
+            AgentEvent::ApprovalBypassed { tool, reason } => SerializedEvent {
+                event: SerializableAgentEvent::ApprovalBypassed { tool, reason },
+                approval_sender: None,
                 question_sender: None,
             },
             AgentEvent::ToolResult {
@@ -1161,6 +1174,29 @@ mod tests {
             _ => panic!("expected ApprovalRequest"),
         }
         assert!(sender.is_some(), "sender should be extracted");
+    }
+
+    /// 2c.5 (§5.4 :365-369): ApprovalBypassed forwards without senders —
+    /// the bypass audit event needs no responder.
+    #[test]
+    fn approval_bypassed_forwards_without_senders() {
+        let event = AgentEvent::ApprovalBypassed {
+            tool: "git".into(),
+            reason: "core_op".into(),
+        };
+        let SerializedEvent {
+            event: serial,
+            approval_sender,
+            question_sender,
+        } = event.into_serializable();
+        match serial {
+            SerializableAgentEvent::ApprovalBypassed { tool, reason } => {
+                assert_eq!(tool, "git");
+                assert_eq!(reason, "core_op");
+            }
+            _ => panic!("expected ApprovalBypassed"),
+        }
+        assert!(approval_sender.is_none() && question_sender.is_none());
     }
 
     #[test]

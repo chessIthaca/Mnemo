@@ -9,6 +9,7 @@
 //! `mnemo::app` in job 2b.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -47,6 +48,44 @@ pub enum GateVerdict {
     /// The call is refused with this reason (dispatch surfaces it as an
     /// error).
     Block { reason: String },
+}
+
+/// The per-agent approval policy (2c.5, §5.4 :356-378): a PER-LOOP
+/// setting, not a new `SafetyMode` variant — `config.toml` and the GUI
+/// Settings stay unchanged, so the GUI cannot silently enter a
+/// no-approval-for-push mode.
+///
+/// - [`PermissionPolicy::OverridePermissions`] (the kernel default, the
+///   free agent): dispatch skips the whole approval branch — no
+///   `AgentEvent::ApprovalRequest` is ever emitted, `never_auto_for`
+///   (`force_prompt`) included. Each call that *would* have been gated
+///   emits `AgentEvent::ApprovalBypassed` first (an audit trail), then
+///   dispatches directly. `SafetyRules` is not consulted (it is an
+///   auto-approve allow-list — nothing to do when nothing is gated).
+/// - [`PermissionPolicy::ApproveViaApi`] (what the factory wires for
+///   GUI/console loops): today's semantics exactly — the live
+///   safety-mode read + `SafetyRules` auto-approve + `never_auto_for`.
+///   The payload is the declared INITIAL mode (the serialization
+///   surface); dispatch keeps reading the live handle (the runtime
+///   toggle stays authoritative).
+///
+/// Subagents inherit the parent's policy (§5.4 :377): the `spawn_agent`
+/// tool carries its parent loop's policy and passes it through the
+/// spawner call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode")]
+pub enum PermissionPolicy {
+    /// Skip the approval branch entirely; gated calls emit
+    /// `AgentEvent::ApprovalBypassed` and dispatch directly.
+    #[default]
+    OverridePermissions,
+    /// Today's semantics: approvals surface as `ApprovalRequest` and are
+    /// answered via the API (`SessionCommand::Approve`).
+    ApproveViaApi {
+        /// The safety mode the loop starts under (the GUI/console path
+        /// passes the factory's shared mode at build).
+        safety_mode: crate::config::SafetyMode,
+    },
 }
 
 /// Prompt-intake result (master-spec :220-222): the unattended-marker read
@@ -498,6 +537,31 @@ mod tests {
         assert!(
             !head.contains("WORKFLOW LIFECYCLE") && !head.contains("APP RULES"),
             "the free head carries no workflow text"
+        );
+    }
+
+    /// 2c.5 (§5.4 :358-359): the serde shape — internally tagged "mode",
+    /// the kernel default `OverridePermissions`.
+    #[test]
+    fn permission_policy_serde_shape_and_default() {
+        assert_eq!(
+            serde_json::to_value(PermissionPolicy::default()).unwrap(),
+            serde_json::json!({"mode": "OverridePermissions"})
+        );
+        let approve: PermissionPolicy = serde_json::from_value(serde_json::json!({
+            "mode": "ApproveViaApi",
+            "safety_mode": "autonomous"
+        }))
+        .unwrap();
+        assert_eq!(
+            approve,
+            PermissionPolicy::ApproveViaApi {
+                safety_mode: crate::config::SafetyMode::Autonomous
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&approve).unwrap(),
+            serde_json::json!({"mode": "ApproveViaApi", "safety_mode": "autonomous"})
         );
     }
 }

@@ -470,3 +470,63 @@ Amendment (2027-01-14, step 2c.4 — the landed D5/G4 picks):
 - The battery green: default + browser,embeddings + the goldens trio 3/3
   + workspace test/build + clippy --workspace --all-targets -- -D
   warnings.
+
+
+Amendment (2027-01-15, step 2c.5 — the landed D6/D7 picks):
+- The type (policy.rs): `PermissionPolicy` — `#[serde(tag = "mode")]`,
+  `#[default] OverridePermissions`, `ApproveViaApi { safety_mode }`. ONE
+  spec-letter deviation, documented per the stop rule: §5.4 :358 sketches
+  `ApproveViaApi(SafetyMode)` (tuple); the landed form is the named-field
+  struct variant — an internally-tagged enum cannot carry a newtype variant
+  whose payload serializes to a bare string (`SafetyMode` is a plain enum;
+  serde has no map to hold the tag). Wire shapes: `{"mode":"OverridePermissions"}`
+  / `{"mode":"ApproveViaApi","safety_mode":"autonomous"}`. DISCOVERY:
+  SafetyMode serializes KEBAB-CASE (`approve-each-action`/`auto-read-approve-writes`/
+  `auto-approve-project`/`autonomous`) — the first serde-test draft asserted
+  PascalCase and failed; the literal was fixed, the enum was right.
+- The loop: `AgentLoop.permission` (pub) + `with_permission`; `from_config`
+  defaults to `ApproveViaApi { safety_mode }` — directly-built loops keep
+  today's semantics (§5.4 :378), so pre-existing kernel tests are unwired by
+  default; only the two new tests opt into Override.
+- The gate (dispatch.rs): `gated = force_prompt || approval::needs_approval(...)`
+  hoisted; `if gated && Override` emits `AgentEvent::ApprovalBypassed { tool,
+  reason }` (reason `core_op` when force_prompt — the predicate still evaluated
+  silently, per D6; else `safety_mode`) and falls through to direct dispatch;
+  `else if gated` keeps today's branch byte-identical (SafetyRules auto-approve
+  + prompt). SafetyRules is NOT consulted under Override (§5.4 :374-376).
+- The factory: the loop build chains `.with_permission(ApproveViaApi {
+  safety_mode: *self.safety_mode.read() })` — GUI/console behavior unchanged,
+  the live RwLock read in dispatch untouched; the SpawnAgentTool gets the same
+  policy at construction (§5.4 :377 — subagents inherit the parent's policy).
+- The event (D7, channels.rs): `AgentEvent::ApprovalBypassed { tool, reason }`
+  beside ApprovalRequest + the SerializableAgentEvent twin + the
+  senders-None-tolerant forward arm + the test mirror
+  `approval_bypassed_forwards_without_senders`. Additive — the app-event
+  contract fixtures stayed green.
+- The seam: `AgentSpawner::spawn` + `spawn_with_parent` gain a `permission`
+  param; HostSpawner, IpcSpawner (accepts it for the 3a Engine's SpawnOptions —
+  today's children are factory-built → ApproveViaApi) and the test mocks
+  updated.
+- App fallout (caught by the workspace leg, fixed in-step): console.rs
+  `render_event` gained the audit arm `· approval bypassed: {tool} ({reason})`
+  (E0004) + the console reviewer test's `spawn_with_parent` call the 6th arg
+  (E0061).
+- Tests: `override_permissions_bypasses_core_op_with_audit_event` +
+  `override_permissions_bypasses_safety_mode_gated_call` (tests.rs),
+  `permission_policy_serde_shape_and_default` (policy.rs),
+  `approval_bypassed_forwards_without_senders` (channels.rs),
+  `spawn_passes_the_parent_permission_policy` (spawn_agent.rs).
+- The clippy habit-leg: BLOCKED pre-existing — `cargo clippy --workspace
+  --all-targets -- -D warnings` exits 101 on ~250 sites / ~40 files under the
+  active rustc 1.95.0 (2026-04-14 build; lint promotions). NOT 2c.5's: every
+  error site was intersected with the step's hunks — exactly 3 fell inside
+  (2× redundant field names in the new tests; 1× clippy::await_holding_lock in
+  the new spawn test, whose explicit `drop(calls)` was not honored —
+  restructured to statement-local guards) and all 3 were fixed in-step; the
+  remaining hits in touched files (spawn_agent.rs:560/:1632, channels.rs:142,
+  dispatch.rs:1312+, factory.rs:424/:702/:1174/:3645, loop_impl.rs:279/:371,
+  host/runtime.rs:73/…) sit outside the hunks. The sweep is queued as backlog
+  a439d8c2. The §D battery green at the final tree: default (test_exit=0) +
+  browser,embeddings (feat_exit=0) + workspace (ws_exit=0) + build --workspace
+  (pre-dates only the cfg(test)-only lint fixes — non-test code identical) +
+  the goldens trio 3/3 (in-suite) + the three compile-enforced greps.

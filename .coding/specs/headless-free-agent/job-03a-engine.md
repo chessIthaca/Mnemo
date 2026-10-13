@@ -193,3 +193,36 @@ acceptance check-offs (row → test → result: rows 9, 10, 11-engine, 12, 13, 1
 
 ## G. Amendments (the running record — append one per step at its boundary commit)
 
+
+Amendment (2027-01-15, step 3a.1 — the landed D1 picks):
+- The lift (src/host/mod.rs :11-12): the `cfg(all(feature = "browser", feature =
+  "embeddings"))` module gate is GONE — `pub mod brain;` compiles on every
+  feature combination, with the D1 rationale comment above it.
+- The coupling map (compiler-enumerated after the lift — exactly 3 sites, ALL
+  browser, NONE embeddings): the Brain struct's `browser` field, the
+  BrowserManager::new + set_webview_enabled statements, and the factory
+  chain's `.with_browser(...)` tail. Each is now item-level
+  `#[cfg(feature = "browser")]`: the field, the two creation/inspection
+  statements, a shadowing rebind (`let factory = factory.with_browser(...)`
+  after the chain ends at `.with_reflex(...)`), and the construction's
+  `browser` field. The embeddings side needed NOTHING: Embedder /
+  HashEmbedder / EmbedderStatus are ungated (client_factory.rs :23's bare
+  import proves it) and build_brain_inner's embedder startup already runs
+  the hash fallback bare — the brain was feature-ready except for the
+  browser three.
+- First-ever bare coverage: `cargo check -p mnemo` (NO features) green — the
+  brain had never compiled without both features before this step; the
+  default `cargo test -p mnemo` now compiles + runs the brain's tests
+  featureless.
+- Clippy: the un-gate surfaced 4 pre-existing brain sites to the DEFAULT
+  clippy run (the storm never compiled brain.rs bare): 3 needless borrows
+  (:689/:695/:703 — the `&workspace.*.join(...)` drops, FIXED in-step) + 1
+  large_enum_variant (:116 — BrainOutcome's Ready(Brain) vs
+  NeedsProject(Config); NOT mechanical, a Box-ing that ripples through every
+  consumer's match — left to the a439d8c2 sweep with this pointer). Net: the
+  3a.1 delta adds ZERO new storm sites to any build configuration.
+- The battery at the final tree: check -p mnemo bare (check_exit=0) + test
+  -p mnemo (test_exit=0) + test -p mnemo --features browser,embeddings
+  (feat_exit=0) + test --workspace (ws_exit=0) + build --workspace
+  (build_exit=0); the goldens trio 3/3 in-suite;
+  build_brain_headless_without_notifier green under features, unchanged.

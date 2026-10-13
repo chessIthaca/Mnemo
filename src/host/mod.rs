@@ -8,7 +8,10 @@
 //! busy-flag, and the startup code-graph index progress. Nothing in this
 //! module may depend on Tauri or on the app crate.
 
-#[cfg(all(feature = "browser", feature = "embeddings"))]
+// 3a.1 (D1): the brain module compiles on EVERY feature combination — the
+// feature-gated pieces (the bundled ONNX embedder, the shared headless
+// browser) are gated at their own sites inside the module, with runtime-
+// optional wiring (the hash embedder / no browser) on the bare build.
 pub mod brain;
 pub mod index_progress;
 pub mod maintenance;

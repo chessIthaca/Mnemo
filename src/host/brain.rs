@@ -66,6 +66,10 @@ pub struct Brain {
     pub trace: Arc<LlmRequestLog>,
     /// The shared headless debug browser — the same `Arc` wired into the
     /// factory (agent tools) and the IPC state (Browser tab commands).
+    /// 3a.1 (D1): browser-feature only — the bare build has no browser
+    /// module, so this field (and its wiring in `build_brain_inner`)
+    /// compile out.
+    #[cfg(feature = "browser")]
     pub browser: Arc<crate::browser::BrowserManager>,
     /// The shared embedder status — the same `Arc` held by `IpcState`, so
     /// the circuit breaker's transitions surface live to the UI.
@@ -682,13 +686,13 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     let constitution_source =
         crate::project::ConstitutionSource::new(
                 &global_agent_md,
-                &workspace.root.join("agent.md"),
+            workspace.root.join("agent.md"),
             )?;
 
     // Safety rules — regex-based auto-approve backed by `.coding/safety.toml`.
     // A missing file is fine (rules start empty); the store is mtime-checked
     // so edits in the Safety tab take effect without restarting.
-    let safety_rules = Arc::new(match SafetyRules::new(&workspace.state_dir.join("safety.toml")) {
+    let safety_rules = Arc::new(match SafetyRules::new(workspace.state_dir.join("safety.toml")) {
         Ok(sr) => sr,
         Err(e) => {
             eprintln!(
@@ -696,7 +700,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
                 workspace.state_dir.join("safety.toml").display()
             );
             // Fall back to an empty store over the same path.
-            SafetyRules::new(&workspace.state_dir.join("safety.toml"))
+            SafetyRules::new(workspace.state_dir.join("safety.toml"))
                 .unwrap_or_else(|_| SafetyRules::new(std::path::Path::new(":memory:")).unwrap())
         }
     });
@@ -744,12 +748,15 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     ));
     // The shared headless debug browser — one instance for the agent tools and
     // the IPC layer (the right-panel Browser tab). Lazily spawned on first use.
+    // 3a.1 (D1): browser-feature only (the bare build has no browser module).
+    #[cfg(feature = "browser")]
     let browser = crate::browser::BrowserManager::new();
     // Agent-side bootstrap: browser_navigate can create the Browser tab's
     // child webview when the tab was never opened (plan 5ae26d22).
     // In a release build, enable the WebView2 CDP attach only when the user
     // opted in via `enable_browser_inspection` (the env var exposing the port
     // was already set above in `main`). Debug builds always have it on.
+    #[cfg(feature = "browser")]
     if !cfg!(debug_assertions) && config.general.general.enable_browser_inspection {
         browser.set_webview_enabled(true);
     }
@@ -1012,9 +1019,12 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
     // the same classifier slot + the `[general.laya] reflex` flag mirror at
     // each plan-step boundary, and a Settings save flips the flag live via
     // `set_reflex_enabled` (no rebuild).
-    .with_reflex(reflex_handle)
-    // Share the headless debug browser with the IPC layer (Browser tab).
-    .with_browser(browser.clone());
+    .with_reflex(reflex_handle);
+    // Share the headless debug browser with the IPC layer (Browser tab) —
+    // 3a.1 (D1): only on the browser feature; the factory's `with_browser`
+    // is equally gated, and the bare build simply has no browser to share.
+    #[cfg(feature = "browser")]
+    let factory = factory.with_browser(browser.clone());
     // Record the startup default's DISPLAY effort (backlog 51dab4da) —
     // stamped onto every loop the factory builds (see build_inner).
     factory.set_default_display_effort(Some(startup_display_effort));
@@ -1070,6 +1080,8 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         safety_mode,
         model_resolver,
         trace,
+        // 3a.1 (D1): browser-feature only — mirrors the gated field above.
+        #[cfg(feature = "browser")]
         browser,
         embedder_status,
         classifier_status,

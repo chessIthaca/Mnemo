@@ -212,6 +212,23 @@ impl<T: Clone> EventReceiver<T> {
         self.rx.recv().await.map_err(Into::into)
     }
 
+    /// Non-blocking receive: `Ok(Some(event))` when one is buffered,
+    /// `Ok(None)` when the stream is momentarily empty (the sender may
+    /// still be live), `Err(RecvError::Closed)` once the bus closed and
+    /// drained, `Err(RecvError::Lagged(n))` after skipping `n`.
+    pub fn try_recv(&mut self) -> Result<Option<T>, RecvError> {
+        match self.rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                Err(RecvError::Closed)
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                Err(RecvError::Lagged(n))
+            }
+        }
+    }
+
     // The broadcast-wiring constructor lands with the 3a.5 session code
     // that calls it (ahead-of-use fns are dead code under
     // #![deny(warnings)]).

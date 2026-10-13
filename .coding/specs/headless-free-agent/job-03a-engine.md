@@ -503,3 +503,52 @@ Amendment (2027-01-15, step 3a.5 — the landed D5+D9 picks):
   + build --workspace (build_exit=0); clippy zero NEW sites in own
   hunks (the listed turn.rs/loop_impl/provider sites are pre-existing
   storm outside this step's diff).
+
+### 3a.8 (D8 + the close) — the two-engines isolation + the job close — landed 2027-01-17
+
+- two_engines_isolated (headless_kernel.rs): two Engines, different
+  workspaces + config dirs, one session each, CONCURRENT turns
+  (tokio::join!); each engine's bus carries ONLY its own session's
+  traffic (alpha never rides B's bus and vice versa) and each
+  transcript carries only its own conversation. The G4 observables
+  (events + transcripts never cross) verified; the per-engine state
+  placement is state_dir_outside_tree's (3a.4, green).
+- EventReceiver gained try_recv (Ok(None) on momentary empty — the
+  non-blocking drain the isolation test needs; §5.3 surface addition).
+- The G4 close-grep: headless_never_calls_global_config_dir
+  (src/headless/mod.rs #[cfg(test)]) — NO call-shaped
+  `global_config_dir(` token in any src/headless source except mod.rs
+  itself (the test's own text; skipped). engine.rs:307's doc note
+  NAMES the function to document why it is NOT used — allowed (the
+  match is call-shaped only).
+- §F acceptance check-offs (row → test → result): row 9
+  (Engine::start/NoProject) → no_project_errors → PASS; row 10 (spawn
+  + run_to_completion) → run_to_completion_mock_provider → PASS; row
+  11-engine (the permission exposure) →
+  override_permissions_runs_merge_push_without_approval +
+  approve_via_api_prompts_and_honours_decision → PASS both; row 12
+  (history/resume) → history_resume_preserves_request_bytes → PASS;
+  row 13 (snapshot) → snapshot_reports_pending_approval → PASS; row
+  14 (limits) → limits_max_turns_parks_the_session +
+  limits_wall_clock_parks_the_session → PASS both; row 15
+  (shutdown/closed) → closed_session_error_code +
+  shutdown_leaves_no_tasks → PASS; rows 5/6/8 engine-form →
+  two_subscribers_both_receive / ask_user_without_subscriber_answers_
+  constant / start_blocking_without_runtime → PASS; G4 →
+  two_engines_isolated + the grep → PASS; G5 → the byte-prefix fixture
+  → PASS; G7 → the two limits fixtures → PASS.
+- Landed: 2e306cb (docs/step file), cb1e64a (D1), 3acbdf2 (D2),
+  9afc11c (D3), dc07d97 (D4), 73d5322 (D5+D9), 94e7f83 (D6), c5b6b46
+  (D7), + this commit (D8 + the close).
+- The battery at the final tree: kernel 3006+44 (kernel_exit=0),
+  features 3033+44 (feat_exit=0), workspace (ws_exit=0), build
+  (build_exit=0); clippy zero NEW sites in own hunks (the headless/
+  filter returns none).
+- Deviations: all recorded in the per-step amendments above (the mpsc
+  reply, the 12th/13th spawn params, the shifted-position byte
+  contract, the mid-block busy/timeout export semantics, the parking
+  as engine-side).
+- Remaining risk + forwards: the token/cost/idle limit fields are
+  typed but UNENFORCED (3b's spend accounting); idle_ms + the
+  BudgetConfig-default interplay = 3b; the app-side JS binding surface
+  = job 4; the review round closes this job (the master tick follows).

@@ -72,7 +72,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
-use mnemo::headless::{PendingInteraction, SessionCommand, SessionLimits, SpawnOptions, Transcript};
+use mnemo::headless::{
+    PendingInteraction, SessionCommand, SessionEvent, SessionLimits, SpawnOptions, Transcript,
+};
 use mnemo::provider::{
     Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind,
     ToolChoice, ToolSchema,
@@ -447,4 +449,76 @@ async fn limits_wall_clock_parks_the_session() {
         "the wall-clock turn never reached the provider"
     );
     engine.shutdown().await.expect("engine shuts down");
+}
+
+// --- 3a.8: D8/G4 (the two-engines isolation fixture) ---
+
+/// §5.9.4 :680-682 (G4): two Engines — different workspaces + config
+/// dirs — run one session each CONCURRENTLY; stats, memory, trace and
+/// events never cross. Observable isolation: each engine's event bus
+/// carries only its own session's traffic (alpha never rides engine B's
+/// bus and vice versa) and each transcript carries only its own
+/// conversation.
+#[tokio::test]
+async fn two_engines_isolated() {
+    let root_a = tempfile::tempdir().unwrap();
+    let cfg_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+    let cfg_b = tempfile::tempdir().unwrap();
+
+    let llm_a = RecordingLlm::new(vec![g5_text_turn(&["alpha"])]);
+    let llm_b = RecordingLlm::new(vec![g5_text_turn(&["beta"])]);
+    let engine_a =
+        Engine::builder(opts(Workspace::new(root_a.path()), Some(cfg_a.path().to_path_buf())))
+            .provider(llm_a)
+            .start()
+            .await
+            .expect("engine a starts");
+    let engine_b =
+        Engine::builder(opts(Workspace::new(root_b.path()), Some(cfg_b.path().to_path_buf())))
+            .provider(llm_b)
+            .start()
+            .await
+            .expect("engine b starts");
+    let session_a = engine_a.spawn(SpawnOptions::default()).await.expect("spawn a");
+    let session_b = engine_b.spawn(SpawnOptions::default()).await.expect("spawn b");
+
+    // Subscribe BEFORE the concurrent turns, then run both together.
+    let mut events_a = session_a.events();
+    let mut events_b = session_b.events();
+    let (out_a, out_b) = tokio::join!(
+        session_a.run_to_completion("prompt-alpha"),
+        session_b.run_to_completion("prompt-beta"),
+    );
+    assert_eq!(out_a.expect("a completes").final_text, "alpha");
+    assert_eq!(out_b.expect("b completes").final_text, "beta");
+
+    // Each engine's bus carries ONLY its own session's traffic.
+    let drain = |rx: &mut mnemo::headless::EventReceiver<SessionEvent>| {
+        let mut text = String::new();
+        while let Ok(Some(event)) = rx.try_recv() {
+            if let SerializableAgentEvent::TextDelta { text: delta } = event.event {
+                text.push_str(&delta);
+            }
+        }
+        text
+    };
+    let text_a = drain(&mut events_a);
+    let text_b = drain(&mut events_b);
+    assert_eq!(text_a, "alpha", "engine A's bus saw only alpha");
+    assert_eq!(text_b, "beta", "engine B's bus saw only beta");
+
+    // The transcripts stay per-engine — beta's prompt never rides A's
+    // history and vice versa.
+    let hist_a = session_a.history().await.expect("a history");
+    let hist_b = session_b.history().await.expect("b history");
+    let a_json = serde_json::to_string(&hist_a.messages).unwrap();
+    let b_json = serde_json::to_string(&hist_b.messages).unwrap();
+    assert!(a_json.contains("prompt-alpha"), "a carries its own prompt");
+    assert!(!a_json.contains("prompt-beta"), "b's prompt never crosses");
+    assert!(b_json.contains("prompt-beta"), "b carries its own prompt");
+    assert!(!b_json.contains("prompt-alpha"), "a's prompt never crosses");
+
+    engine_a.shutdown().await.expect("engine a shuts down");
+    engine_b.shutdown().await.expect("engine b shuts down");
 }

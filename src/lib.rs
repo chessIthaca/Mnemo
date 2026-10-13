@@ -46,8 +46,11 @@ pub mod workspace;
 // any second consumer) reaches it on BARE `mnemo::` paths — never
 // through the kernel module tree. `tests/boundary.rs::
 // tauri_uses_only_public_api` enforces the app side; this block is the
-// lib side of the same contract. Types only — no blanket re-exports;
-// add deliberately, with the consumer named.
+// lib side of the same contract. Types only — no blanket re-exports —
+// plus the NINE NAMED MODULE ALIASES in the second block below (each
+// one name deep, consumer-named, exposing zero new items — the modules
+// are already `pub` under `mnemo::host::*`/`mnemo::runtime`); add
+// deliberately, with the consumer named.
 pub use crate::agent::approval::needs_approval;
 pub use crate::agent::context::ContextManager;
 pub use crate::agent::factory::AgentLoopFactory;

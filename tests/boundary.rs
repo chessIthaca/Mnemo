@@ -20,8 +20,8 @@
 //!   are the sanctioned surfaces, and the crate-root re-exports ride
 //!   bare `mnemo::` paths. Test code is exempt (the same rule the
 //!   lib-side `kernel_does_not_import_app` applies); the stripper
-//!   below is its twin, copied from src/lib.rs:113 so this test
-//!   target stands alone.
+//!   below is its twin — the lib-side cfg(test) `boundary` module in
+//!   src/lib.rs — so this test target stands alone.
 //!
 //! D3 lands the scanner `#[ignore]`d — D4 routes the ~60 production
 //! references (job-05 §B fact 5's worklist) and D4's commit drops the
@@ -76,19 +76,37 @@ fn tauri_uses_only_public_api() {
         !sources.is_empty(),
         "the app sources must be found (run from the workspace root)"
     );
-    const BANNED: [&str; 3] = ["mnemo::agent::", "mnemo::runtime::", "mnemo::host::"];
+    // The three banned module PATHS — BARE forms (the substring
+    // subsumes every `::`-qualified use) — plus the alias/grouped-
+    // import forms that would smuggle them past a path-only scan
+    // (review round 1, L2a: unlike the lib side, where the later
+    // crate split makes the crate-alias route structurally
+    // impossible, src-tauri imports mnemo as an external crate
+    // FOREVER — these forms can never be legitimate here).
+    // Residual, documented as the lib side documents its holes:
+    // NESTED grouped aliases (`use mnemo::{app::{x}, agent}`) are not
+    // token-matched — the practical guard is eyeballing every new
+    // `use mnemo::{` line against the ten pure-facade groups.
+    const BANNED: [&str; 7] = [
+        "mnemo::agent",
+        "mnemo::runtime",
+        "mnemo::host",
+        "use mnemo as",
+        "mnemo::{agent",
+        "mnemo::{runtime",
+        "mnemo::{host",
+    ];
     let mut violations = Vec::new();
     for path in &sources {
         let src = fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let stripped = strip_test_items(&src);
         for (idx, raw) in stripped.lines().enumerate() {
             // Line comments are exempt (docs may NAME a banned path
-            // while explaining a migration). Naive split on `//` — the
-            // banned tokens never appear inside URL strings.
-            let code = match raw.find("//") {
-                Some(at) => &raw[..at],
-                None => raw,
-            };
+            // while explaining a migration) — STRING-AWARE (review
+            // round 1, L2b): a `//` inside a string literal (a URL, a
+            // regex) is not a comment start, so a banned token later
+            // on such a line is still scanned.
+            let code = code_part(raw);
             for token in BANNED {
                 if code.contains(token) {
                     violations.push(format!(
@@ -110,6 +128,70 @@ fn tauri_uses_only_public_api() {
     );
 }
 
+/// The code part of a line — everything before a `//` line comment,
+/// STRING-AWARE (review round 1, L2b): a `//` inside a normal or raw
+/// string literal (a URL, a regex) is not a comment start, so a
+/// banned token later on such a line is still scanned. The literal
+/// discrimination mirrors the stripper's (escapes; raw strings with
+/// any hash count; `r#ident` falls through as a plain identifier).
+/// Multi-line raw strings are approximated: a continuation line's
+/// `//` still cuts — exempt-direction-only, the same narrow class the
+/// lib side documents.
+fn code_part(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => return &line[..i],
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'r' if i + 1 < bytes.len() && (bytes[i + 1] == b'#' || bytes[i + 1] == b'"') => {
+                let mut k = i + 1;
+                let mut hashes = 0;
+                while k < bytes.len() && bytes[k] == b'#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'"' {
+                    let mut m = k + 1;
+                    let mut found = false;
+                    while m < bytes.len() {
+                        if bytes[m] == b'"'
+                            && (0..hashes).all(|h| bytes.get(m + 1 + h) == Some(&b'#'))
+                        {
+                            i = m + 1 + hashes;
+                            found = true;
+                            break;
+                        }
+                        m += 1;
+                    }
+                    if !found {
+                        // Unterminated raw string: the whole line is
+                        // literal — no code part to scan after here.
+                        return line;
+                    }
+                } else {
+                    i += 1; // `r#ident` — a plain identifier char
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    line
+}
+
 /// Collect every `.rs` under `src-tauri/src` (the app's production
 /// tree; no exclusions — the whole crate is the scanned surface).
 fn app_sources(root: &Path, out: &mut Vec<PathBuf>) {
@@ -124,7 +206,8 @@ fn app_sources(root: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Strip `#[cfg(test)]`-attributed items from a source — the twin of
-/// the lib-side stripper (src/lib.rs:113, copied verbatim so this test
+/// the lib-side stripper (the cfg(test) `boundary` module in src/lib.rs,
+/// copied verbatim so this test
 /// target stands alone; keep the two in sync deliberately). Test code
 /// is the test harness and may reference kernel internals freely, so
 /// its bytes never reach the token scan. Mechanical: the attribute

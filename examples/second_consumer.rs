@@ -21,8 +21,11 @@
 //!
 //! Running it needs a configured endpoint (set `MNEMO_HOME` to a config
 //! dir with `[general] default_model` + an endpoint, or rely on the
-//! engine's dummy provider warning); CI runs it against the mock
-//! provider (§9 :924).
+//! engine's dummy provider warning). The CI run against a mock provider
+//! (§9 :924) is PENDING — backlog #c96a96ca: no workflow runs examples
+//! today, and wiring the round trip needs a provider seam the example
+//! can reach (review round 1, H1 — the earlier claim it ran was false
+//! and is corrected here).
 
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::agent::prompt::{ConstitutionMode, PromptSpec};

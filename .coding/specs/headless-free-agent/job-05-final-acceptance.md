@@ -70,7 +70,9 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
     the spec's `tests/integration/headless_kernel.rs` set landed in
     `tests/integration/headless.rs` (the G8 fixtures, job 4 D7) —
     recorded, not renamed (renaming churns the battery filters for zero
-    contract gain).
+    contract gain). [CORRECTED in §F 5.6 (review round 1, L1): the
+    claim above is FALSE — `headless_kernel.rs` EXISTS (1,905 lines,
+    the 2c/3a/3c fixtures); there is no such deviation.]
 11. **Row 35 guard**: no job may change the plan-first behavior of a
     Workflow-profile agent — the 2a goldens (stable head bytes, routing
     table) protect it; the D-final battery proves them green.
@@ -146,7 +148,10 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
    invocation (nested cargo risks target-lock stalls and doubles battery
    time; the command proof is how tauri-tree runs — §8 both, one shape).
 3. The spec's `headless_kernel.rs` test file → landed as
-   `tests/integration/headless.rs` (§B fact 10).
+    `tests/integration/headless.rs` (§B fact 10). [CORRECTED in §F 5.6
+    (review round 1, L1): FALSE — `headless_kernel.rs` EXISTS as the
+    2c/3a/3c fixture home; both files are real. This line stands as
+    written for the record, superseded by the correction.]
 4. `headless = ["kernel"]` (not bare `[]`) so §8's exact form
    `--no-default-features --features headless` carries the kernel set —
    documentation-honest the day `kernel` gains real gates.
@@ -202,8 +207,10 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
   other `From<&str>` impls in scope — `.to_string()`).
 - Smoke run: with `MNEMO_HOME` set to a bare temp dir the engine gate
   surfaces CLEANLY — `not_configured` naming exactly what's missing.
-  The configured/mock run rides CI (§9 :924; documented in the example
-  header).
+  The configured/mock run does NOT ride CI — [CORRECTED by review
+  round 1, H1: the original note here claimed it did; no workflow runs
+  examples, and wiring the round trip needs a provider seam the
+  example can reach — PENDING, backlog #c96a96ca].
 - Battery `cargo test --workspace` exit 0 (83 integration; the example
   is a default-features target too — it compiles against the full set).
 

@@ -206,3 +206,28 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
   header).
 - Battery `cargo test --workspace` exit 0 (83 integration; the example
   is a default-features target too — it compiles against the full set).
+
+### 5.3 D3 — tests/boundary.rs (landed 2026-10-13)
+
+- NEW `tests/boundary.rs` (~260 lines) — the two §9 :923 tests:
+  - `kernel_builds_without_app_feature` (GREEN): the structural G10
+    proof — Cargo.toml carries the lattice lines (default = kernel,
+    app, headless; headless = ["kernel"]) and lib.rs the two cfg
+    gates. The real app-less BUILD rides the battery as a command
+    (§E deviation 2 — the tauri-tree proof's shape).
+  - `tauri_uses_only_public_api` (`#[ignore]`d until D4): walks
+    src-tauri/src production sources, `#[cfg(test)]` items stripped
+    by the twin of the lib-side stripper (src/lib.rs:113, copied
+    verbatim + documented to keep in sync deliberately), line
+    comments exempt (docs may NAME a path while explaining a
+    migration), asserting NO `mnemo::agent::`/`mnemo::runtime::`/
+    `mnemo::host::` tokens — `mnemo::app::`/`mnemo::headless::`/root
+    re-exports are the sanctioned surfaces. The ignore names D4; D4's
+    commit drops it and the boundary ENFORCES from then on.
+- The red-by-design question resolved battery-honestly: the scan
+  lands ignored (not failing) so every commit boundary stays green —
+  the discipline the job-4 arc established; D4's commit flips
+  enforcement on with the routes in place.
+- Proofs: `cargo test --test boundary` — 1 passed, 1 ignored (the
+  designed state); battery `cargo test --workspace` exit 0 (83
+  integration + 84th boundary file; zero warnings).

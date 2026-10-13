@@ -77,6 +77,15 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// A session limit was hit (G7, §5.9.7) — the session is parked and
+    /// takes no more prompts.
+    pub(crate) fn session_parked(message: impl Into<String>) -> Self {
+        Self {
+            code: "session_parked".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

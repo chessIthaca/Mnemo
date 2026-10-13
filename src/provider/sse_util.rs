@@ -81,6 +81,9 @@ pub(crate) fn finish_reason_label(reason: &FinishReason) -> String {
         FinishReason::Length => "length".to_string(),
         FinishReason::ContentFilter => "content_filter".to_string(),
         FinishReason::Other(s) => s.clone(),
+        // G7 (§5.9.7): runtime-constructed only, never off the wire —
+        // the label matches serde's snake_case form.
+        FinishReason::LimitReached { .. } => "limit_reached".to_string(),
     }
 }
 

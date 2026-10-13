@@ -561,6 +561,31 @@ pub enum PhaseKind {
     RunningTools,
 }
 
+/// The per-session limits (§5.9.7, G7) — all optional; `None` keeps the
+/// config's `BudgetConfig` default. 3a.7 implements `max_turns` +
+/// `wall_clock_ms` (the turn loop checks them before every provider
+/// request); the token/cost/idle fields ride 3b's spend accounting
+/// (typed now so the wire shape is pinned). Lives in the kernel-neutral
+/// channels module so the host spawn path carries it without reaching
+/// into `headless`; the public surface is the `headless` re-export.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLimits {
+    /// Max LLM turns per session.
+    pub max_turns: Option<u64>,
+    /// Max provider requests per session.
+    pub max_requests: Option<u64>,
+    /// Max prompt tokens across the session.
+    pub max_prompt_tokens: Option<u64>,
+    /// Max completion tokens across the session.
+    pub max_completion_tokens: Option<u64>,
+    /// Max spend (micros) across the session.
+    pub max_cost_micros: Option<u64>,
+    /// Max session wall-clock (ms).
+    pub wall_clock_ms: Option<u64>,
+    /// Max idle time between turns (ms).
+    pub idle_ms: Option<u64>,
+}
+
 /// A serializable version of `AgentEvent` for the IPC boundary.
 ///
 /// `ApprovalRequest` becomes `ApprovalRequest` without the `responder` — the

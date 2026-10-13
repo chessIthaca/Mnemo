@@ -436,6 +436,35 @@ impl AgentLoop {
                 return Ok(outcome);
             }
 
+            // G7 (§5.9.7): session limits — checked before every provider
+            // request (after the deferred-swap early exit, mirroring the
+            // routing iteration count below). A hit ends the turn with
+            // Finished{LimitReached{which}} and parks the session. The
+            // guard is bound + dropped BEFORE the await (an if-let
+            // scrutinee temporary would live through the block and pin
+            // the future to the thread).
+            let limit_hit = self
+                .limiter
+                .lock()
+                .expect("limiter lock poisoned")
+                .begin_request();
+            if let Some(which) = limit_hit {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Finished {
+                            reason: FinishReason::LimitReached { which },
+                        },
+                    ))
+                    .await;
+                return Ok(TurnOutcome {
+                    finish_reason: FinishReason::LimitReached { which },
+                    text: String::new(),
+                    tool_calls_made: 0,
+                    stop_reason: None,
+                });
+            }
+
             // Routing log (backlog 091e694d): count this provider iteration —
             // placed after the deferred-swap early exit above, so a swap that
             // ends the turn before any request is built never counts as one

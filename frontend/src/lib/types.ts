@@ -122,7 +122,19 @@ export type FinishReason =
   | "tool_calls"
   | "length"
   | "content_filter"
-  | { other: string };
+  | { other: string }
+  | {
+      limit_reached: {
+        which:
+          | "max_turns"
+          | "max_requests"
+          | "max_prompt_tokens"
+          | "max_completion_tokens"
+          | "max_cost_micros"
+          | "wall_clock"
+          | "idle";
+      };
+    };
 
 /**
  * The phases of the agent's request loop, mirroring the backend `PhaseKind`

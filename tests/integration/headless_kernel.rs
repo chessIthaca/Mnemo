@@ -72,10 +72,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
-use mnemo::headless::{PendingInteraction, SessionCommand, SpawnOptions, Transcript};
+use mnemo::headless::{PendingInteraction, SessionCommand, SessionLimits, SpawnOptions, Transcript};
 use mnemo::provider::{
-    Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice,
-    ToolSchema,
+    Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind,
+    ToolChoice, ToolSchema,
 };
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent};
 
@@ -336,4 +336,115 @@ async fn snapshot_reports_pending_approval() {
         "between turns the snapshot carries the full transcript"
     );
     engine.shutdown().await.expect("shutdown");
+}
+
+// --- 3a.7: G7 (the limits fixtures) ---
+
+/// §5.9.7 :718-723: `max_turns` counts the session's provider requests —
+/// the third prompt's turn ends with Finished{LimitReached{max_turns}}
+/// WITHOUT reaching the provider, and the session parks (a fourth prompt
+/// errors `session_parked`).
+#[tokio::test]
+async fn limits_max_turns_parks_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["one"]), g5_text_turn(&["two"])]);
+    let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("engine starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            limits: Some(SessionLimits {
+                max_turns: Some(2),
+                ..SessionLimits::default()
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn");
+    let first = session.run_to_completion("a").await.expect("turn 1");
+    assert_eq!(first.final_text, "one");
+    let second = session.run_to_completion("b").await.expect("turn 2");
+    assert_eq!(second.final_text, "two");
+
+    // Turn 3 never reaches the provider — the limit ends it.
+    let third = session
+        .run_to_completion("c")
+        .await
+        .expect("the limited turn still completes (with an empty outcome)");
+    assert!(
+        matches!(
+            third.finish_reason,
+            Some(FinishReason::LimitReached {
+                which: LimitKind::MaxTurns
+            })
+        ),
+        "turn 3 reports LimitReached::MaxTurns, got {:?}",
+        third.finish_reason
+    );
+    assert_eq!(
+        llm.requests().len(),
+        2,
+        "the provider saw exactly the two allowed requests"
+    );
+
+    // Parked: a further prompt errors session_parked.
+    let err = session
+        .run_to_completion("d")
+        .await
+        .expect_err("a parked session rejects the prompt");
+    assert_eq!(err.code(), "session_parked");
+    engine.shutdown().await.expect("engine shuts down");
+}
+
+/// §5.9.7 :718-723: the wall-clock budget (from the limits epoch = the
+/// spawn) ends a turn with Finished{LimitReached{wall_clock}} once
+/// elapsed.
+#[tokio::test]
+async fn limits_wall_clock_parks_the_session() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["one"])]);
+    let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("engine starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            limits: Some(SessionLimits {
+                wall_clock_ms: Some(200),
+                ..SessionLimits::default()
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn");
+    let first = session.run_to_completion("a").await.expect("turn 1");
+    assert_eq!(first.final_text, "one");
+
+    // Burn past the budget; the next turn's pre-request check hits.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = session
+        .run_to_completion("b")
+        .await
+        .expect("the limited turn still completes (with an empty outcome)");
+    assert!(
+        matches!(
+            second.finish_reason,
+            Some(FinishReason::LimitReached {
+                which: LimitKind::WallClock
+            })
+        ),
+        "turn 2 reports LimitReached::WallClock, got {:?}",
+        second.finish_reason
+    );
+    assert_eq!(
+        llm.requests().len(),
+        1,
+        "the wall-clock turn never reached the provider"
+    );
+    engine.shutdown().await.expect("engine shuts down");
 }

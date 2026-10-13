@@ -569,6 +569,8 @@ fn main() {
                             None,
                             // 3a.6 (G5): the main agent never resumes
                             None,
+                            // 3a.7 (G7): the main agent sets no session limits
+                            None,
                         )
                         .await
                         .expect("main agent spawn must succeed");

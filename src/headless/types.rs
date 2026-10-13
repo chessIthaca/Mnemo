@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::policy::PermissionPolicy;
 pub use crate::host::notifier::HostEvent;
+pub use crate::runtime::channels::SessionLimits;
 use crate::runtime::channels::{AgentId, Approval, SerializableAgentEvent, UserAnswer};
 use crate::workspace::Workspace;
 
@@ -30,12 +31,17 @@ impl SessionId {
 }
 
 /// The outcome of a completed turn (§5.3 :322 — `run_to_completion`):
-/// the final text. Additive fields (the stop reason, usage) land with
-/// their consumers.
+/// the final text, plus why the turn ended (additive — the usage fields
+/// land with 3b's spend accounting).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnOutcome {
     /// The accumulated assistant text of the turn.
     pub final_text: String,
+    /// Why the turn ended (G7, §5.9.7): `LimitReached { which }` names
+    /// the session limit that parked the session. `None` on `Exited`
+    /// and pre-3a.7 payloads.
+    #[serde(default)]
+    pub finish_reason: Option<crate::provider::FinishReason>,
 }
 
 /// Which memory subsystem an engine runs (§5.9.8; the backend wiring
@@ -103,6 +109,10 @@ pub struct SpawnOptions {
     pub policy: Option<String>,
     /// A transcript to resume from (§5.9.5; the G5 land is 3a.6).
     pub resume: Option<Transcript>,
+    /// The session run limits (G7, §5.9.7) — `max_turns` +
+    /// `wall_clock_ms` enforced; hitting one ends the turn with
+    /// `FinishReason::LimitReached` and parks the session.
+    pub limits: Option<SessionLimits>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the
@@ -205,28 +215,6 @@ impl<T: Clone> EventReceiver<T> {
     // The broadcast-wiring constructor lands with the 3a.5 session code
     // that calls it (ahead-of-use fns are dead code under
     // #![deny(warnings)]).
-}
-
-/// The per-session limits (§5.9.7, G7) — all optional; `None` keeps the
-/// config's `BudgetConfig` default. 3a.7 implements `max_turns` +
-/// `wall_clock_ms`; the token/cost/idle fields ride 3b's spend accounting
-/// (typed now so the wire shape is pinned).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionLimits {
-    /// Max LLM turns per session.
-    pub max_turns: Option<u64>,
-    /// Max provider requests per session.
-    pub max_requests: Option<u64>,
-    /// Max prompt tokens across the session.
-    pub max_prompt_tokens: Option<u64>,
-    /// Max completion tokens across the session.
-    pub max_completion_tokens: Option<u64>,
-    /// Max spend (micros) across the session.
-    pub max_cost_micros: Option<u64>,
-    /// Max session wall-clock (ms).
-    pub wall_clock_ms: Option<u64>,
-    /// Max idle time between turns (ms).
-    pub idle_ms: Option<u64>,
 }
 
 /// A serialized conversation transcript (§5.9.5, G5): the full message

@@ -89,6 +89,10 @@ pub async fn spawn_agent_shared(
     // 3a.6 (G5, §5.9.5): the resume seed — the transcript's messages
     // become the initial conversation (None = a fresh session).
     initial_messages: Option<Vec<crate::provider::Message>>,
+    // 3a.7 (G7, §5.9.7): the session limits — None keeps the loop's
+    // default (unlimited); Some is applied post-build via
+    // [`AgentLoop::set_limits`].
+    limits: Option<crate::runtime::channels::SessionLimits>,
 ) -> Result<(AgentId, String), String> {
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
@@ -202,6 +206,13 @@ pub async fn spawn_agent_shared(
     // the loop is built but not yet running, so the swap is race-free.
     if let Some(permission) = permission {
         agent_loop.set_permission(permission);
+    }
+
+    // 3a.7 (G7, §5.9.7): apply the per-session limits the same way —
+    // post-build, pre-task, race-free. `set_limits` resets the counters
+    // + starts the wall-clock epoch (the session's limits epoch).
+    if let Some(limits) = limits {
+        agent_loop.set_limits(limits);
     }
 
     // A clone of the manager's fan-in sender, used below (outside the lock) to
@@ -621,6 +632,8 @@ impl ParentAwareSpawner for HostSpawner {
             Some(permission),
             // subagents never resume from a transcript (3a.6)
             None,
+            // subagents set no session limits (3a.7)
+            None,
         )
         .await?;
         Ok(id)
@@ -713,6 +726,8 @@ impl HostRuntime {
             // the main agent keeps the factory build's default policy
             None,
             // the main agent never resumes from a transcript
+            None,
+            // the main agent sets no session limits (3a.7)
             None,
         )
         .await

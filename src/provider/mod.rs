@@ -940,6 +940,36 @@ pub enum FinishReason {
     Length,
     ContentFilter,
     Other(String),
+    /// A session limit was hit (G7, §5.9.7) — constructed by the agent
+    /// runtime, never parsed off the wire. Ends the turn and parks the
+    /// session.
+    LimitReached {
+        /// Which limit was hit.
+        which: LimitKind,
+    },
+}
+
+/// Which session limit was hit (G7, §5.9.7) — the payload of
+/// [`FinishReason::LimitReached`]. The kernel enforces `max_turns` and
+/// `wall_clock` (3a.7); the request/token/cost/idle kinds ride 3b's
+/// budget wiring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// The session's turn budget ran out.
+    MaxTurns,
+    /// The request-count budget ran out (3b).
+    MaxRequests,
+    /// The prompt-token budget ran out (3b).
+    MaxPromptTokens,
+    /// The completion-token budget ran out (3b).
+    MaxCompletionTokens,
+    /// The cost budget ran out (3b; the endpoint's price table).
+    MaxCostMicros,
+    /// The session's wall-clock budget ran out.
+    WallClock,
+    /// The idle budget ran out (3b).
+    Idle,
 }
 
 /// Byte-level stall tracking for the trace graph's `stall_ms` field.

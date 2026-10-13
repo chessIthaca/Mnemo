@@ -65,6 +65,11 @@ fn public_types_serde_roundtrip() {
         resume: Some(Transcript {
             messages: vec![Message::user_text("hi")],
         }),
+        limits: Some(SessionLimits {
+            max_turns: Some(3),
+            wall_clock_ms: Some(600_000),
+            ..SessionLimits::default()
+        }),
     });
 
     // SessionCommand — every 3a variant.

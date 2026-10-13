@@ -462,3 +462,44 @@ Amendment (2027-01-15, step 3a.5 — the landed D5+D9 picks):
   browser,embeddings (feat_exit=0, 3032+41) + --workspace (ws_exit=0)
   + build --workspace (build_exit=0); clippy zero NEW sites in own
   hunks.
+
+### 3a.7 (D7) — G7: SessionLimits + LimitReached — landed 2026-01-13
+
+- SessionLimits MOVED from headless/types.rs (where 3a.3 pre-landed it)
+  to runtime/channels.rs — the kernel-neutral home so the host spawn
+  path carries it without layer-inverting into `headless`; the public
+  surface stays `mnemo::headless::SessionLimits` via re-export (the
+  HostEvent precedent). Typed FULL (all seven §5.9.7 fields); 3a.7
+  enforces max_turns + wall_clock_ms, the rest ride 3b.
+- LimitKind (7 variants) + FinishReason::LimitReached { which } live in
+  provider/mod.rs — additive; sse_util's finish_reason_label gained the
+  "limit_reached" arm (runtime-constructed, never off the wire). The
+  frontend FinishReason mirror gained the limit_reached member.
+- The enforcement: SessionLimiter (loop_impl, Mutex on the loop — the
+  set_permission precedent) checks at the TOP of run_turn's request
+  loop, after the deferred-swap early exit, mirroring the routing
+  iteration count. Counting semantics: max_turns counts PROVIDER
+  REQUESTS (tool-call chain iterations + provider-error retries — every
+  request burns budget); the wall-clock epoch = set_limits time (the
+  engine's spawn). On a hit: Finished{LimitReached{which}} + the turn
+  returns TurnOutcome{finish_reason: LimitReached}.
+- RUST GOTCHA fixed in-flight: an if-let scrutinee temporary (the
+  MutexGuard) lives through the block — pinning the future to the
+  thread (Send error). Bind to a `let` first, drop the guard before
+  the await.
+- spawn_agent_shared grew its 13th param limits (all 6 app/in-file
+  callers pass None) — runtime.rs:73 too_many_arguments stays
+  PRE-EXISTING (11→12→13 with the 3a.5/3a.6/3a.7 params;
+  struct-ification is sweep material).
+- Parking is ENGINE-side (§5.9.7 "parks the session"): AgentSession
+  watches its own stream — a Finished{LimitReached} sets the parked
+  flag; later Prompts error `session_parked` (a new EngineError code,
+  asserted via the public code() accessor). TurnOutcome gained
+  finish_reason (additive, serde default) so headless callers see WHY a
+  run ended; the headless.rs SpawnOptions fixture gained limits.
+- The battery at the final tree: the module 19/19 (15 headless + 2 G5
+  + 2 new G7) + test -p mnemo (kernel_exit=0, 3005+43) + --features
+  browser,embeddings (feat_exit=0, 3032+43) + --workspace (ws_exit=0)
+  + build --workspace (build_exit=0); clippy zero NEW sites in own
+  hunks (the listed turn.rs/loop_impl/provider sites are pre-existing
+  storm outside this step's diff).

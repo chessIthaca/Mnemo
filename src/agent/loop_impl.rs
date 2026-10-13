@@ -104,6 +104,60 @@ pub(crate) struct FallbackInfo {
     pub model: String,
 }
 
+/// The enforcement half of G7 (§5.9.7): the limits plus the counters
+/// they check. Owned by [`AgentLoop`] behind a `Mutex` — `run_turn`
+/// calls `begin_request` at the top of every provider-request iteration
+/// (no await while held).
+pub(crate) struct SessionLimiter {
+    /// The limits in force (all `None` = unlimited).
+    limits: crate::runtime::channels::SessionLimits,
+    /// Requests served so far this session (incremented by
+    /// `begin_request`; provider-error retries count — every retry is a
+    /// provider request).
+    requests_served: u64,
+    /// When the limits were applied (the session's wall-clock epoch).
+    started_at: Option<std::time::Instant>,
+}
+
+impl SessionLimiter {
+    fn unlimited() -> Self {
+        Self {
+            limits: crate::runtime::channels::SessionLimits::default(),
+            requests_served: 0,
+            started_at: None,
+        }
+    }
+
+    /// Apply a fresh limits set: resets the counters + starts the
+    /// wall-clock epoch (the session's limits epoch = when they were
+    /// applied, i.e. the engine's spawn).
+    fn apply(&mut self, limits: crate::runtime::channels::SessionLimits) {
+        self.limits = limits;
+        self.requests_served = 0;
+        self.started_at = Some(std::time::Instant::now());
+    }
+
+    /// Admit the next provider request, or report the limit it hits
+    /// (G7): `max_turns` counts requests served, `wall_clock_ms` the
+    /// elapsed time since the limits were applied. On a hit the turn
+    /// ends with `FinishReason::LimitReached` and the session parks —
+    /// every later call hits the same limit again.
+    pub(crate) fn begin_request(&mut self) -> Option<crate::provider::LimitKind> {
+        if let Some(max) = self.limits.max_turns {
+            if self.requests_served >= max {
+                return Some(crate::provider::LimitKind::MaxTurns);
+            }
+        }
+        if let (Some(budget), Some(started)) = (self.limits.wall_clock_ms, self.started_at) {
+            if started.elapsed() >= std::time::Duration::from_millis(budget) {
+                return Some(crate::provider::LimitKind::WallClock);
+            }
+        }
+        self.requests_served += 1;
+        None
+    }
+}
+
 pub struct AgentLoop {
     /// The LLM provider. Behind an `RwLock` so the model can be swapped at
     /// runtime (e.g. the status-bar model picker) without rebuilding the loop.
@@ -157,6 +211,11 @@ pub struct AgentLoop {
     /// calls that would have been gated. See
     /// [`crate::agent::policy::PermissionPolicy`].
     pub(crate) permission: std::sync::RwLock<crate::agent::policy::PermissionPolicy>,
+    /// G7 (§5.9.7): the session limits + their enforcement counters —
+    /// [`set_limits`](Self::set_limits) applies them post-build (the
+    /// `set_permission` precedent). All-`None` (the default) makes
+    /// every check a no-op.
+    pub(crate) limiter: std::sync::Mutex<SessionLimiter>,
     /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
     /// the loop never names the app workflow type, and every consult rides
     /// the trait's opaque representations (the state token, the completion
@@ -895,6 +954,18 @@ impl AgentLoop {
         *self.permission.write().expect("permission lock poisoned") = permission;
     }
 
+    /// Set the session limits on a built loop (G7, §5.9.7) — the 3a
+    /// Engine's spawn path applies the per-session limits after the
+    /// factory build (the `set_permission` precedent). Resets the
+    /// counters + starts the wall-clock epoch; `Default` limits (all
+    /// `None`) disable enforcement.
+    pub fn set_limits(&self, limits: crate::runtime::channels::SessionLimits) {
+        self.limiter
+            .lock()
+            .expect("limiter lock poisoned")
+            .apply(limits);
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -924,6 +995,7 @@ impl AgentLoop {
                     safety_mode,
                 },
             ),
+            limiter: std::sync::Mutex::new(SessionLimiter::unlimited()),
             tools,
             workflow,
             sandbox,

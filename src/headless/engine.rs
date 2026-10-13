@@ -143,6 +143,8 @@ impl Engine {
             // 3a.6 (G5): the resume seed — the transcript's messages
             // become the initial conversation (§5.9.5 :693-695).
             opts.resume.map(|transcript| transcript.messages),
+            // 3a.7 (G7, §5.9.7): the per-session limits.
+            opts.limits,
         )
         .await
         .map_err(EngineError::spawn_failed)?;
@@ -153,6 +155,7 @@ impl Engine {
             agent,
             inner: self.inner.clone(),
             bus: self.bus.clone(),
+            parked: Default::default(),
         })
     }
 

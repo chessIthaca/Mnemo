@@ -111,6 +111,9 @@ pub struct AgentSession {
     pub(crate) agent: AgentId,
     pub(crate) inner: Arc<EngineInner>,
     pub(crate) bus: broadcast::Sender<SessionEvent>,
+    /// G7 (§5.9.7): set when a Finished{LimitReached} is observed — a
+    /// parked session rejects every later prompt with `session_parked`.
+    pub(crate) parked: std::sync::atomic::AtomicBool,
 }
 
 impl AgentSession {
@@ -135,6 +138,15 @@ impl AgentSession {
                 "session {:?} is closed",
                 self.id
             )));
+        }
+        // G7 (§5.9.7): a parked session (a limit was hit) takes no more
+        // prompts — the spec's "parks the session".
+        if self.parked.load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(command, SessionCommand::Prompt { .. })
+        {
+            return Err(EngineError::session_parked(
+                "a session limit was hit — the session is parked",
+            ));
         }
         match command {
             SessionCommand::Prompt { text, images } => {
@@ -304,11 +316,26 @@ impl AgentSession {
                         SerializableAgentEvent::TextDelta { text } => {
                             final_text.push_str(&text)
                         }
-                        SerializableAgentEvent::Finished { .. } => {
-                            return Ok(TurnOutcome { final_text })
+                        SerializableAgentEvent::Finished { reason } => {
+                            // G7 (§5.9.7): a limit hit parks the session —
+                            // later prompts error `session_parked`.
+                            if matches!(
+                                reason,
+                                crate::provider::FinishReason::LimitReached { .. }
+                            ) {
+                                self.parked
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Ok(TurnOutcome {
+                                final_text,
+                                finish_reason: Some(reason),
+                            })
                         }
                         SerializableAgentEvent::Exited => {
-                            return Ok(TurnOutcome { final_text })
+                            return Ok(TurnOutcome {
+                                final_text,
+                                finish_reason: None,
+                            })
                         }
                         _ => {}
                     }

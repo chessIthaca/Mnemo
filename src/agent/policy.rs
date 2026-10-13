@@ -924,4 +924,222 @@ impl AgentPolicy for ExternalPolicy {
         }
         self.inner.on_session_end().await
     }
+}use crate::agent::factory::ToolSelection;
+
+/// G6 tier 2 (D4, §5.9.6 :706-711): one declarative gate rule. A rule
+/// matches a call when its tool name equals `tool` AND — when
+/// `arg_pattern` is set — the call's JSON-serialized arguments match
+/// the regex (`None` matches every call of the tool).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GateRule {
+    /// The tool name the rule matches (exact).
+    pub tool: String,
+    /// An optional regex over the call's JSON-serialized arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_pattern: Option<String>,
+    /// The verdict a matching call gets.
+    pub verdict: GateVerdict,
+}
+
+/// G6 tier 2 (D4, §5.9.6 :711): what a session does when the model
+/// asks the user a question. `WaitForHost` is the only live behavior —
+/// headless sessions register no `ask_user` today (the free factory's
+/// `register_tools` is a no-op); the `AnswerConstant`/`Deny`
+/// enforcement rides the app's ask_user wiring at job 5. The wire
+/// lands binding-ready, pinned by the contract fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionPolicy {
+    /// Park the question on the session — the host answers via
+    /// events (today's behavior).
+    #[default]
+    WaitForHost,
+    /// Answer with the constant, never asking the host.
+    AnswerConstant(String),
+    /// Refuse the question outright.
+    Deny,
+}
+
+/// G6 tier 2 (D4, §5.9.6 :711): the turn-end verb. Only `Stop` (the
+/// free agent's park) exists today — the enum exists so the wire shape
+/// is stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndPolicy {
+    /// Park at the turn's end (today's behavior).
+    #[default]
+    Stop,
+}
+
+/// G6 tier 2 (D4, §5.9.6 :706-716): the declarative guardrails a
+/// spawn carries — the spec [`DeclarativePolicy`] enforces. The
+/// default is exactly today's free session (the coding-default head,
+/// every group, the `["free"]` route, no rules, `WaitForHost`,
+/// `Stop`); `is_default` is the engine's exclusivity helper (a named
+/// tier-1 policy plus a DEFAULT-shaped spec is not a conflict).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Guardrails {
+    /// The prompt spec's head; `None` = the coding default
+    /// (FreePolicyFactory's exact behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptSpec>,
+    /// The tool-surface selection — the factory's registration table
+    /// narrows the registry to the selected groups at spawn (R1: the
+    /// array changes only there); `exclude` carves per-name. The wire
+    /// default is the free agent's constant surface (every group
+    /// except `Host`).
+    #[serde(default = "crate::agent::factory::ToolSelection::free_default")]
+    pub tools: ToolSelection,
+    /// The routing key's slots (default `["free"]`).
+    #[serde(default)]
+    pub route: Vec<String>,
+    /// Per-session limits; overrides the spawn option's limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<crate::runtime::channels::SessionLimits>,
+    /// The declarative gate rules (first match wins).
+    #[serde(default)]
+    pub gate_rules: Vec<GateRule>,
+    /// What a session does when the model asks the user a question.
+    #[serde(default)]
+    pub question_policy: QuestionPolicy,
+    /// The turn-end verb.
+    #[serde(default)]
+    pub turn_end: TurnEndPolicy,
+}
+
+impl Default for Guardrails {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            tools: ToolSelection::free_default(),
+            route: vec!["free".to_string()],
+            limits: None,
+            gate_rules: Vec::new(),
+            question_policy: QuestionPolicy::WaitForHost,
+            turn_end: TurnEndPolicy::Stop,
+        }
+    }
+}
+
+impl Guardrails {
+    /// Whether the spec is a no-op — today's free session, exactly
+    /// (the engine's exclusivity check).
+    pub fn is_default(&self) -> bool {
+        self.prompt.is_none()
+            && self.tools == ToolSelection::free_default()
+            && self.route.len() == 1
+            && self.route[0] == "free"
+            && self.limits.is_none()
+            && self.gate_rules.is_empty()
+            && self.question_policy == QuestionPolicy::WaitForHost
+            && self.turn_end == TurnEndPolicy::Stop
+    }
+}
+
+/// G6 tier 2 (D4, §5.9.6 :706-716): the policy a [`Guardrails`] spec
+/// builds — the engine's declarative alternative to a named tier-1
+/// factory policy and the tier-3 external layer. The free-agent base
+/// ([`NoPolicy`] over the resolved prompt spec — the spec's head else
+/// the coding default — UNGATED, FreePolicyFactory's exact product)
+/// carries every default; the spec overrides the route, the gate
+/// rules, and the turn-end verb. The tool SELECTION is not read here:
+/// the engine threads it through the per-spawn factory clone so the
+/// registration table itself narrows the array (R1 at spawn — see
+/// engine.rs's spawn).
+pub struct DeclarativePolicy {
+    /// The spec.
+    guardrails: Arc<Guardrails>,
+    /// The compiled arg patterns, parallel to `guardrails.gate_rules`.
+    arg_patterns: Vec<Option<regex::Regex>>,
+    /// The free-agent base the defaults mirror.
+    inner: NoPolicy,
+}
+
+impl DeclarativePolicy {
+    /// Build the policy over a spec. Arg patterns compile ONCE here —
+    /// a bad pattern is a spawn-time error (never a silent
+    /// match-nothing).
+    pub fn new(guardrails: Arc<Guardrails>) -> Result<Self, String> {
+        let arg_patterns = guardrails
+            .gate_rules
+            .iter()
+            .map(|rule| {
+                rule.arg_pattern
+                    .as_deref()
+                    .map(regex::Regex::new)
+                    .transpose()
+                    .map_err(|e| {
+                        format!(
+                            "gate rule for '{}': bad arg_pattern '{}': {e}",
+                            rule.tool,
+                            rule.arg_pattern.as_deref().unwrap_or_default()
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let spec = guardrails
+            .prompt
+            .clone()
+            .map(Arc::new)
+            .unwrap_or_else(|| Arc::new(PromptSpec::coding_default()));
+        Ok(Self {
+            inner: NoPolicy::with_spec(spec).ungated(),
+            guardrails,
+            arg_patterns,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentPolicy for DeclarativePolicy {
+    fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {}
+    fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String {
+        self.inner.stable_head(k, c)
+    }
+    async fn volatile_tail(&self, caps: &Capabilities) -> String {
+        self.inner.volatile_tail(caps).await
+    }
+    async fn tool_surface(&self) -> ToolSurface {
+        // The ungated engine form: advertise None — the registry is
+        // already narrowed at registration by the factory clone — and
+        // gate Free (no workflow state ever gates a session).
+        self.inner.tool_surface().await
+    }
+    async fn gate_call(&self, name: &str, args: &Value) -> GateVerdict {
+        for (rule, pattern) in self.guardrails.gate_rules.iter().zip(&self.arg_patterns) {
+            let args_match = pattern
+                .as_ref()
+                .map_or(true, |re| re.is_match(&args.to_string()));
+            if rule.tool == name && args_match {
+                return rule.verdict.clone();
+            }
+        }
+        GateVerdict::Allow
+    }
+    async fn route(&self) -> RouteKey {
+        RouteKey {
+            slots: self.guardrails.route.clone(),
+        }
+    }
+    async fn on_prompt(&self, text: &str) -> PromptHook {
+        self.inner.on_prompt(text).await
+    }
+    async fn after_tool(&self, name: &str, result: &ToolResult) {
+        self.inner.after_tool(name, result).await
+    }
+    async fn on_turn_end(&self, _t: &TurnSummary) -> Continuation {
+        match self.guardrails.turn_end {
+            TurnEndPolicy::Stop => Continuation::Stop,
+        }
+    }
+    async fn spend_tags(&self) -> SpendTags {
+        self.inner.spend_tags().await
+    }
+    fn spawn_roles(&self) -> &[RoleSpec] {
+        self.inner.spawn_roles()
+    }
+    async fn on_session_end(&self) {
+        self.inner.on_session_end().await
+    }
 }

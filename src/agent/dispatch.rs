@@ -532,7 +532,8 @@ impl AgentLoop {
         // is even a candidate for approval. Under OverridePermissions the
         // whole approval branch below is skipped — force_prompt prompting
         // included — and each call that WOULD have been gated emits an
-        // ApprovalBypassed audit event (reason "core_op" when the call
+        // ApprovalBypassed audit event (reason "gate_rule" when the
+        // policy's gate required the approval, "core_op" when the call
         // matched never_auto_for, else "safety_mode"), then dispatches
         // directly. The predicates above are still evaluated (silently)
         // so the audit reason is exact.
@@ -555,7 +556,9 @@ impl AgentLoop {
                     agent_id,
                     AgentEvent::ApprovalBypassed {
                         tool: tc.name.clone(),
-                        reason: if force_prompt {
+                        reason: if gate_requires_approval {
+                            "gate_rule".to_string()
+                        } else if tool.never_auto_for(&parsed_call.arguments) {
                             "core_op".to_string()
                         } else {
                             "safety_mode".to_string()

@@ -131,6 +131,13 @@ pub struct SpawnOptions {
     /// — the policy can never change the tool array mid-session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_policy: Option<ExternalPolicySpec>,
+
+    /// 3c/G6 tier 2 (D4, §5.9.6): the declarative guardrails — prompt
+    /// head, tool selection, route, limits, gate rules. `None` (or a
+    /// spec whose `is_default()` holds) keeps the free session; composes
+    /// with `external_policy`; exclusive with `policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardrails: Option<crate::agent::policy::Guardrails>,
 }
 
 /// A command to a live session (§5.3 :327-338) — the public mirror of the

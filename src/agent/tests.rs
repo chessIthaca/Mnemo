@@ -16446,4 +16446,159 @@ async fn external_policy_on_timeout_mapping() {
         fanin_rx.try_recv().is_err(),
         "an unselected kind never emits"
     );
+}/// G6 tier 2 (D4, row 32's declarative half): the [`Guardrails`]
+/// default is exactly today's free session (`is_default`), the
+/// non-default flips, and `DeclarativePolicy` enforces the spec — the
+/// gate rules (exact tool match, the arg-pattern regex over the
+/// JSON-serialized args, `None` matching every call, first-wins,
+/// `Allow` when nothing matches), the route override, the turn-end
+/// verb, and the free-agent defaults for everything else (the same
+/// ungated surface FreePolicyFactory builds). The tool SELECTION is
+/// not asserted here — the engine threads it through the per-spawn
+/// factory clone (engine.rs's spawn; the integration test covers the
+/// array).
+#[tokio::test]
+async fn guardrails_is_default_and_gate_rules() {
+    use crate::agent::policy::{
+        AgentPolicy, Continuation, DeclarativePolicy, GateRule, GateVerdict, Guardrails,
+        QuestionPolicy, TurnSummary,
+    };
+
+    // The default IS today's free session.
+    let default = Guardrails::default();
+    assert!(default.is_default());
+    // Every non-default flip breaks is_default — the engine's
+    // exclusivity helper must see each shape.
+    assert!(!Guardrails {
+        route: vec!["gpt4".to_string()],
+        ..Guardrails::default()
+    }
+    .is_default());
+    assert!(!Guardrails {
+        gate_rules: vec![GateRule {
+            tool: "shell".into(),
+            arg_pattern: None,
+            verdict: GateVerdict::Allow,
+        }],
+        ..Guardrails::default()
+    }
+    .is_default());
+    assert!(!Guardrails {
+        tools: crate::agent::factory::ToolSelection {
+            include: vec![crate::agent::factory::ToolGroup::Read],
+            exclude: vec![],
+        },
+        ..Guardrails::default()
+    }
+    .is_default());
+    assert!(!Guardrails {
+        question_policy: QuestionPolicy::AnswerConstant("decide yourself".into()),
+        ..Guardrails::default()
+    }
+    .is_default());
+    assert!(!Guardrails {
+        limits: Some(crate::runtime::channels::SessionLimits {
+            ..Default::default()
+        }),
+        ..Guardrails::default()
+    }
+    .is_default());
+    assert!(!Guardrails {
+        prompt: Some(crate::agent::prompt::PromptSpec::coding_default()),
+        ..Guardrails::default()
+    }
+    .is_default());
+
+    // The policy over a spec: the gate rules + the route + the
+    // turn-end verb, everything else on the free-agent base.
+    let spec = Guardrails {
+        gate_rules: vec![
+            GateRule {
+                tool: "shell".into(),
+                arg_pattern: Some("rm\\s+-rf".into()),
+                verdict: GateVerdict::Deny {
+                    message: "no destructive shell".into(),
+                },
+            },
+            GateRule {
+                tool: "file_write".into(),
+                arg_pattern: None,
+                verdict: GateVerdict::RequireApproval,
+            },
+        ],
+        route: vec!["gpt4".to_string()],
+        ..Guardrails::default()
+    };
+    let policy = DeclarativePolicy::new(std::sync::Arc::new(spec)).expect("the spec compiles");
+
+    // The arg-pattern regex matches over the JSON-serialized args.
+    let verdict = policy
+        .gate_call("shell", &serde_json::json!({"command": "rm -rf /"}))
+        .await;
+    match verdict {
+        GateVerdict::Deny { message } => assert_eq!(message, "no destructive shell"),
+        other => panic!("the matching rule's Deny: {other:?}"),
+    }
+    // A tool match without the pattern match falls through.
+    assert!(
+        matches!(
+            policy
+                .gate_call("shell", &serde_json::json!({"command": "ls"}))
+                .await,
+            GateVerdict::Allow
+        ),
+        "the rule's pattern gates the match"
+    );
+    // `None` matches EVERY call of the tool.
+    assert!(
+        matches!(
+            policy
+                .gate_call("file_write", &serde_json::json!({"path": "a"}))
+                .await,
+            GateVerdict::RequireApproval
+        )
+    );
+    // No rule matches another tool.
+    assert!(
+        matches!(
+            policy.gate_call("file_read", &serde_json::json!({})).await,
+            GateVerdict::Allow
+        )
+    );
+    // The route override.
+    assert_eq!(policy.route().await.slots, vec!["gpt4".to_string()]);
+    // The turn-end verb parks.
+    let summary = TurnSummary {
+        success: true,
+        stop_reason: None,
+        unattended: false,
+    };
+    assert!(matches!(
+        policy.on_turn_end(&summary).await,
+        Continuation::Stop
+    ));
+
+    // The free-agent defaults: the ungated surface (advertise None —
+    // the registry narrows; gate Free) over the plain spec.
+    let plain = DeclarativePolicy::new(std::sync::Arc::new(Guardrails::default()))
+        .expect("the default spec compiles");
+    let surface = plain.tool_surface().await;
+    assert!(
+        surface.advertise.is_none(),
+        "the registry narrows; the policy does not filter"
+    );
+    assert!(matches!(
+        surface.gate,
+        Some(crate::tool::ToolFilter::Free)
+    ));
+    // A bad pattern errors the build — never a silent match-nothing.
+    assert!(DeclarativePolicy::new(std::sync::Arc::new(Guardrails {
+        gate_rules: vec![GateRule {
+            tool: "shell".into(),
+            arg_pattern: Some("(unclosed".into()),
+            verdict: GateVerdict::Allow,
+        }],
+        ..Guardrails::default()
+    }))
+    .is_err());
 }

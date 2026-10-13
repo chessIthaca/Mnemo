@@ -52,6 +52,15 @@ pub(crate) struct EngineInner {
     /// round-trip). std Mutex: the register is sync, the lock is never
     /// held across an await.
     pub(crate) host_tools: std::sync::Mutex<Vec<std::sync::Arc<dyn crate::tool::Tool>>>,
+    /// Named policy factories (3c/G6 tier 1, D4) —
+    /// [`Engine::register_policy`](crate::headless::engine::Engine::register_policy)
+    /// inserts; `spawn` resolves `SpawnOptions::policy` against it
+    /// (unknown → `spawn_failed`). std Mutex: the register is sync,
+    /// the lock is never held across an await (the `host_tools`
+    /// pattern).
+    pub(crate) policy_registry: std::sync::Mutex<
+        HashMap<String, std::sync::Arc<dyn crate::agent::policy::AgentPolicyFactory>>,
+    >,
     /// Parked sessions (G7, §5.9.7): agents whose Finished{LimitReached}
     /// the pump saw — every later Prompt errors `session_parked`.
     /// Engine-scoped, not per-handle (review round-1 F3): the pump is

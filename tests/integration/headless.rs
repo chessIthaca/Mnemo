@@ -5,12 +5,12 @@
 use serde_json::json;
 use std::path::PathBuf;
 
-use mnemo::agent::policy::PermissionPolicy;
+use mnemo::agent::policy::{GateVerdict, PermissionPolicy};
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    Engine, EngineError, EngineOptions, EventReceiver, ExternalPolicySpec, HookKind,
-    MemoryBackend, RecvError, SessionCommand, SessionEvent, SessionId, SessionLimits,
-    SpawnOptions, TimeoutAction, Transcript,
+    Engine, EngineError, EngineOptions, EventReceiver, ExternalPolicySpec, GateRule,
+    Guardrails, HookKind, MemoryBackend, RecvError, SessionCommand, SessionEvent, SessionId,
+    SessionLimits, SpawnOptions, TimeoutAction, Transcript,
 };
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
@@ -80,6 +80,20 @@ fn public_types_serde_roundtrip() {
             hooks: vec![HookKind::ToolGate, HookKind::TurnEnd],
             timeout_ms: 30_000,
             on_timeout: TimeoutAction::Deny,
+        }),
+        // 3c/G6 tier 2: a representative guardrails spec (a non-default
+        // route + one gate rule, so the wire carries the enum shapes);
+        // the field's None form round-trips via the default above.
+        guardrails: Some(Guardrails {
+            route: vec!["gpt4".to_string()],
+            gate_rules: vec![GateRule {
+                tool: "shell".into(),
+                arg_pattern: Some("rm\\s+-rf".into()),
+                verdict: GateVerdict::Deny {
+                    message: "no destructive shell".into(),
+                },
+            }],
+            ..Guardrails::default()
         }),
     });
 

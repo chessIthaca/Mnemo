@@ -25,6 +25,12 @@ pub use engine::{Engine, EngineBuilder};
 pub use error::EngineError;
 pub use external_policy::{ExternalPolicySpec, HookKind, PolicyAnswer, TimeoutAction};
 pub use host_tools::{HostTool, HostToolSpec, HOST_TOOL_DEFAULT_TIMEOUT_MS};
+/// 3c/G6 tier 2 (D4, §5.9.6): the guardrails wire — kernel-side types
+/// re-exported for the public surface (the D1 placement deviation:
+/// headless defines no data of its own; the definitions live where the
+/// kernel consumers see them).
+pub use crate::agent::factory::{ToolGroup, ToolSelection};
+pub use crate::agent::policy::{GateRule, Guardrails, QuestionPolicy, TurnEndPolicy};
 pub use memory_api::{
     MemoryApi, MemoryCounts, MemoryDebugOverview, MemoryDebugWire, MemoryIndexStatus,
     ScoredMemoryDebugWire,

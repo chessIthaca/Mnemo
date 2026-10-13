@@ -73,8 +73,9 @@ use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    ExternalPolicySpec, HostEvent, HookKind, HostToolSpec, PendingInteraction, PolicyAnswer,
-    SessionCommand, SessionEvent, SessionLimits, SpawnOptions, TimeoutAction, Transcript,
+    ExternalPolicySpec, GateRule, Guardrails, HostEvent, HookKind, HostToolSpec,
+    PendingInteraction, PolicyAnswer, SessionCommand, SessionEvent, SessionLimits,
+    SpawnOptions, TimeoutAction, ToolGroup, ToolSelection, Transcript,
 };
 use mnemo::provider::{
     Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind, Role,
@@ -1542,4 +1543,182 @@ async fn external_policy_gate_and_turn_end_row_32() {
         tool_msg.contains("timed out after 150 ms"),
         "the call proceeded to the host-tool branch (R4 timeout): {tool_msg}"
     );
+}/// Row 32's declarative half (G6 tiers 2 + 1, D4, §5.9.6): the
+/// guardrails and the policy registry through a real engine. (a1) A
+/// tool selection of `include: [Read]` drops `file_edit` — the
+/// per-spawn factory clone's registration table narrows the registry
+/// at spawn (R1: the array changes only there), so the model's call
+/// to it errors. (a2) A gate rule vetoes a registered call mid-turn —
+/// the model sees the deny message as the call's result. (b) Tier 1:
+/// `register_policy` + a spawn resolving the name run a session; an
+/// unknown name fails the spawn. (c) Exclusivity — policy +
+/// non-default guardrails, and policy + external_policy, refuse the
+/// spawn; a DEFAULT-shaped guardrails alongside a named policy is a
+/// no-op, not a conflict.
+#[tokio::test]
+async fn guardrails_selection_gate_rules_and_policy_registry() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    let llm = RecordingLlm::new(vec![
+        // (a1) The narrowed session: the model calls file_edit — NOT
+        // registered under include: [Read] — and sees the error.
+        g5_tool_turn("file_edit", r#"{"path": "a.txt", "content": "x"}"#),
+        g5_text_turn(&["file_edit was not there"]),
+        // (a2) The gate rule denies the read_files call mid-turn.
+        g5_tool_turn("read_files", r#"{"path": "a.txt"}"#),
+        g5_text_turn(&["it was denied"]),
+        // (b) The named policy's session runs a plain turn.
+        g5_text_turn(&["named policy session"]),
+        // (c) A default-shaped guardrails + a named policy: a no-op.
+        g5_text_turn(&["default guardrails are a no-op"]),
+    ]);
+    let engine = Engine::builder(opts(
+        Workspace::new(root.path()),
+        Some(cfg.path().to_path_buf()),
+    ))
+    .provider(llm.clone())
+    .start()
+    .await
+    .expect("engine starts");
+
+    // (a1) include: [Read] — the registration table narrows at spawn.
+    let session = engine
+        .spawn(SpawnOptions {
+            guardrails: Some(Guardrails {
+                tools: ToolSelection {
+                    include: vec![ToolGroup::Read],
+                    exclude: vec![],
+                },
+                ..Guardrails::default()
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (a1)");
+    let outcome = session
+        .run_to_completion("edit the file")
+        .await
+        .expect("leg a1 runs");
+    assert_eq!(outcome.final_text, "file_edit was not there");
+    let reqs = llm.requests();
+    let tool_msg = reqs[1]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("leg-a1 request 2 carries the unregistered call's error")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("file_edit"),
+        "the unregistered tool's error names it: {tool_msg}"
+    );
+
+    // (a2) The gate rule vetoes a registered call: the deny message is
+    // the call's result, exactly like a tier-3 veto.
+    let session = engine
+        .spawn(SpawnOptions {
+            guardrails: Some(Guardrails {
+                gate_rules: vec![GateRule {
+                    tool: "read_files".into(),
+                    arg_pattern: None,
+                    verdict: GateVerdict::Deny {
+                        message: "reading is denied".into(),
+                    },
+                }],
+                ..Guardrails::default()
+            }),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (a2)");
+    let outcome = session
+        .run_to_completion("read the file")
+        .await
+        .expect("leg a2 runs");
+    assert_eq!(outcome.final_text, "it was denied");
+    let reqs = llm.requests();
+    let tool_msg = reqs[3]
+        .iter()
+        .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("leg-a2 request 2 carries the denied call's error")
+        .content
+        .as_text();
+    assert!(
+        tool_msg.contains("reading is denied"),
+        "the gate rule's message reaches the model: {tool_msg}"
+    );
+
+    // (b) Tier 1: register + resolve; an unknown name fails the spawn.
+    engine.register_policy(
+        "mnemo.free",
+        std::sync::Arc::new(mnemo::agent::policy::FreePolicyFactory),
+    );
+    let session = engine
+        .spawn(SpawnOptions {
+            policy: Some("mnemo.free".into()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (b) resolves the registered name");
+    let outcome = session
+        .run_to_completion("hi")
+        .await
+        .expect("leg b runs");
+    assert_eq!(outcome.final_text, "named policy session");
+    assert!(
+        engine
+            .spawn(SpawnOptions {
+                policy: Some("mnemo.missing".into()),
+                ..SpawnOptions::default()
+            })
+            .await
+            .is_err(),
+        "an unknown policy name fails the spawn"
+    );
+
+    // (c) Exclusivity: a named policy never combines with a
+    // non-default guardrails spec or an external layer; a
+    // default-shaped spec is a no-op, not a conflict.
+    assert!(
+        engine
+            .spawn(SpawnOptions {
+                policy: Some("mnemo.free".into()),
+                guardrails: Some(Guardrails {
+                    route: vec!["gpt4".to_string()],
+                    ..Guardrails::default()
+                }),
+                ..SpawnOptions::default()
+            })
+            .await
+            .is_err(),
+        "policy + non-default guardrails refuse the spawn"
+    );
+    assert!(
+        engine
+            .spawn(SpawnOptions {
+                policy: Some("mnemo.free".into()),
+                external_policy: Some(ExternalPolicySpec {
+                    hooks: vec![HookKind::ToolGate],
+                    timeout_ms: 100,
+                    on_timeout: TimeoutAction::Allow,
+                }),
+                ..SpawnOptions::default()
+            })
+            .await
+            .is_err(),
+        "policy + external_policy refuse the spawn"
+    );
+    let session = engine
+        .spawn(SpawnOptions {
+            policy: Some("mnemo.free".into()),
+            guardrails: Some(Guardrails::default()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("spawn (c): a default spec is a no-op");
+    let outcome = session
+        .run_to_completion("hi again")
+        .await
+        .expect("leg c runs");
+    assert_eq!(outcome.final_text, "default guardrails are a no-op");
 }

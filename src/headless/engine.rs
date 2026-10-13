@@ -134,16 +134,83 @@ impl Engine {
             .push(tool);
     }
 
+    /// Register a named policy factory (G6 tier 1, D4, §5.9.6): a
+    /// spawn's `policy` field resolves the name here — an unknown name
+    /// fails the spawn with `spawn_failed`. The factory builds the
+    /// session's policy through the existing build machinery
+    /// (`build_policy` + `attach_loop`); a same-named entry is replaced
+    /// (last registration wins). Register before spawning.
+    pub fn register_policy(
+        &self,
+        name: impl Into<String>,
+        factory: std::sync::Arc<dyn crate::agent::policy::AgentPolicyFactory>,
+    ) {
+        self.inner
+            .policy_registry
+            .lock()
+            .expect("policy registry lock poisoned")
+            .insert(name.into(), factory);
+    }
+
     /// Spawn a session (§5.3 :303-314): a parentless agent with its own
     /// plans dir, running under the resolved permission policy — the
     /// `SpawnOptions::permissions` override, else the engine default
     /// (§5.4's engine exposure).
     pub async fn spawn(&self, opts: SpawnOptions) -> Result<AgentSession, EngineError> {
-        if let Some(name) = &opts.policy {
-            return Err(EngineError::spawn_failed(format!(
-                "unknown policy '{name}' — the registry lands with job 4's builder"
-            )));
+        // 3c/G6 tiers 1 + 2 (D4, §5.9.6): the named-policy resolution
+        // and the declarative guardrails. A named policy (tier 1) IS
+        // the policy — exclusive with a non-default guardrails spec
+        // and with an external layer (compose guardrails +
+        // external_policy instead; a DEFAULT-shaped spec is a no-op,
+        // not a conflict).
+        let guardrails = opts.guardrails.filter(|g| !g.is_default());
+        if opts.policy.is_some() {
+            if guardrails.is_some() {
+                return Err(EngineError::spawn_failed(
+                    "policy and guardrails are exclusive — the named policy IS the policy",
+                ));
+            }
+            if opts.external_policy.is_some() {
+                return Err(EngineError::spawn_failed(
+                    "policy and external_policy are exclusive — compose guardrails + external_policy instead",
+                ));
+            }
         }
+        // Both tiers build on a PER-SPAWN factory clone — the shared
+        // factory is never mutated: tier 1 swaps the clone's policy
+        // factory (the named build_policy/attach_loop flow through the
+        // existing 2b machinery), tier 2 threads the tool selection so
+        // the registration table narrows the registry (R1: the array
+        // changes only at spawn).
+        let factory = match (&opts.policy, &guardrails) {
+            (Some(name), _) => {
+                let named = self
+                    .inner
+                    .policy_registry
+                    .lock()
+                    .expect("policy registry lock poisoned")
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::spawn_failed(format!("unknown policy '{name}'"))
+                    })?;
+                let per_spawn = (*self.inner.host.factory).clone();
+                per_spawn.set_policy_factory(named);
+                std::sync::Arc::new(per_spawn)
+            }
+            (None, Some(g)) => {
+                let per_spawn = (*self.inner.host.factory)
+                    .clone()
+                    .with_tool_selection(g.tools.clone());
+                std::sync::Arc::new(per_spawn)
+            }
+            (None, None) => self.inner.host.factory.clone(),
+        };
+        // Tier 2: the guardrails' limits override the option's.
+        let effective_limits = guardrails
+            .as_ref()
+            .and_then(|g| g.limits.clone())
+            .or(opts.limits);
         let name = opts.name.unwrap_or_else(|| "session".to_string());
         let model = match opts.model.as_deref() {
             Some(spec) => Some(parse_model_ref(spec).map_err(EngineError::spawn_failed)?),
@@ -164,6 +231,17 @@ impl Engine {
             .expect("host tools lock poisoned")
             .clone();
         host_tools.extend(opts.host_tools.into_iter().map(HostTool::new));
+        // 3c/G6 tier 2: a tool selection excluding the Host group drops
+        // the session's host tools too (the factory's registration
+        // table covers the kernel names; the Host group's members live
+        // here).
+        if let Some(guardrails) = &guardrails {
+            host_tools.retain(|tool| {
+                guardrails
+                    .tools
+                    .selects(crate::agent::factory::ToolGroup::Host, tool.name())
+            });
+        }
         {
             let mut seen = std::collections::HashSet::new();
             for tool in &host_tools {
@@ -176,7 +254,7 @@ impl Engine {
             }
         }
         let (agent, _) = spawn_agent_shared(
-            self.inner.host.factory.clone(),
+            factory,
             self.inner.host.manager.clone(),
             self.inner.host.agent_loops.clone(),
             name,
@@ -190,20 +268,23 @@ impl Engine {
             // 3a.6 (G5): the resume seed — the transcript's messages
             // become the initial conversation (§5.9.5 :693-695).
             opts.resume.map(|transcript| transcript.messages),
-            // 3a.7 (G7, §5.9.7): the per-session limits.
-            opts.limits,
+            // 3a.7 (G7, §5.9.7) + 3c/G6 tier 2: the per-session limits —
+            // the guardrails' limits override the option's.
+            effective_limits,
             // 3c/G2 (§5.9.2): the session's host tools.
             host_tools,
         )
         .await
         .map_err(EngineError::spawn_failed)?;
-        // 3c/G6 tier 3 (§5.9.6): layer the external policy over the built
-        // base — post-build (the loop's policy is interior-mutable since
-        // 3c; nothing reads it between the build and the first prompt),
-        // so no per-spawn factory threading. The layer keeps every
-        // unselected hook on the base policy (R1: gate-only — the spec
-        // can never change the tool array mid-session).
-        if let Some(spec) = opts.external_policy {
+        // 3c/G6 tiers 2 + 3 (§5.9.6): the declarative base swap, then
+        // the external layer — both post-build (the loop's policy is
+        // interior-mutable since 3c; nothing reads it between the
+        // build and the first prompt), so no per-spawn factory
+        // threading. ORDER: the external layer reads the CURRENT
+        // policy, so the declarative swap lands first (guardrails +
+        // external compose — a declarative base under the
+        // hook-consulting layer).
+        if guardrails.is_some() || opts.external_policy.is_some() {
             let loop_arc = self
                 .inner
                 .host
@@ -212,10 +293,26 @@ impl Engine {
                 .await
                 .get(&agent)
                 .cloned()
-                .ok_or_else(|| EngineError::spawn_failed("the agent's loop vanished mid-spawn"))?;
-            let external = std::sync::Arc::new(ExternalPolicy::new(loop_arc.policy(), spec));
-            external.set_loop(std::sync::Arc::downgrade(&loop_arc));
-            loop_arc.set_policy(external);
+                .ok_or_else(|| {
+                    EngineError::spawn_failed("the agent's loop vanished mid-spawn")
+                })?;
+            if let Some(guardrails) = guardrails {
+                let declarative =
+                    crate::agent::policy::DeclarativePolicy::new(std::sync::Arc::new(
+                        guardrails,
+                    ))
+                    .map_err(EngineError::spawn_failed)?;
+                loop_arc.set_policy(std::sync::Arc::new(declarative));
+            }
+            if let Some(spec) = opts.external_policy {
+                // R1: gate-only — the spec can never change the tool
+                // array mid-session; unselected hooks stay on the
+                // base policy.
+                let external =
+                    std::sync::Arc::new(ExternalPolicy::new(loop_arc.policy(), spec));
+                external.set_loop(std::sync::Arc::downgrade(&loop_arc));
+                loop_arc.set_policy(external);
+            }
         }
         let id = SessionId::new(agent);
         self.inner.sessions.lock().await.insert(id, agent);
@@ -453,6 +550,7 @@ async fn start_inner(
         pending_host_tools: Mutex::new(HashMap::new()),
         pending_hooks: Mutex::new(HashMap::new()),
         host_tools: std::sync::Mutex::new(Vec::new()),
+        policy_registry: std::sync::Mutex::new(HashMap::new()),
         parked: Mutex::new(HashSet::new()),
         tallies: std::sync::Mutex::new(HashMap::new()),
     });

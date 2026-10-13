@@ -232,22 +232,23 @@ fn group_allowed(sel: Option<&ToolSelection>, group: ToolGroup) -> bool {
     }
 }
 
+#[derive(Clone)]
 pub struct AgentLoopFactory {
     /// The shared provider. Behind an `RwLock` so the model can be swapped at
     /// runtime (the status-bar model picker): the IPC layer builds a new client
     /// and swaps it in, and every subsequent `build()` uses it. Reads are cheap
     /// (one per `build()`).
-    provider: RwLock<Arc<dyn LlmClient>>,
+    provider: Arc<RwLock<Arc<dyn LlmClient>>>,
     /// The DISPLAY-space effort of the shared default provider slot — stamped
     /// onto every loop built by this factory (the loops' no-override
     /// resolution branch reports it, backlog 51dab4da). Updated alongside
     /// `set_provider` swaps and initialized at startup from the resolved
     /// default model. `None` when unknown (test factories) — the UI falls
     /// back to the endpoint default.
-    default_display_effort: RwLock<Option<String>>,
+    default_display_effort: Arc<RwLock<Option<String>>>,
     /// The context manager template. Swapped alongside the provider so the new
     /// model's context window takes effect for freshly built agents.
-    context_manager: RwLock<ContextManager>,
+    context_manager: Arc<RwLock<ContextManager>>,
     /// The fill rate the context manager was built with — needed to rebuild a
     /// `ContextManager` when the provider (and thus its max context) changes.
     fill_rate: f64,
@@ -313,18 +314,18 @@ pub struct AgentLoopFactory {
     /// `spawn_agent` tool). `None` until the IPC layer wires it in via
     /// `set_spawner` — the tool is then omitted from the registry. Behind an
     /// `RwLock` so it can be set once at startup through the shared `Arc`.
-    spawner: RwLock<Option<Arc<dyn AgentSpawner>>>,
+    spawner: Arc<RwLock<Option<Arc<dyn AgentSpawner>>>>,
     /// An optional descendant tracker — the brain-side seam that lets the
     /// dispatch layer gate workflow-state transitions on "no spawned
     /// subagents running". `None` until the IPC layer wires it in via
     /// [`set_descendant_tracker`](Self::set_descendant_tracker). Behind an
     /// `RwLock` so it can be set once at startup through the shared `Arc`.
-    descendant_tracker: RwLock<Option<Arc<dyn crate::runtime::DescendantTracker>>>,
+    descendant_tracker: Arc<RwLock<Option<Arc<dyn crate::runtime::DescendantTracker>>>>,
     /// The app-side policy factory (2b.2; master-spec :266-269). `None`
     /// (the default) builds kernel `NoPolicy`-equivalent policies via
     /// NoPolicyFactory — production and the kernel test helpers wire the
     /// app implementation via set_policy_factory before the first build.
-    policy_factory: RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>,
+    policy_factory: Arc<RwLock<Option<Arc<dyn crate::agent::policy::AgentPolicyFactory>>>>,
 
     /// An optional per-context model resolver. When present, every built agent
     /// gets it wired in so the turn driver can pick a model per workflow state
@@ -449,9 +450,9 @@ impl AgentLoopFactory {
         // the cliff guard (same preservation contract as preflight).
         let proxy_cache_ceiling = context_manager.proxy_cache_ceiling();
         Self {
-            provider: RwLock::new(provider.clone()),
-            default_display_effort: RwLock::new(None),
-            context_manager: RwLock::new(context_manager),
+            provider: Arc::new(RwLock::new(provider.clone())),
+            default_display_effort: Arc::new(RwLock::new(None)),
+            context_manager: Arc::new(RwLock::new(context_manager)),
             fill_rate,
             proxy_cache_ceiling,
             preflight_compact,
@@ -480,12 +481,12 @@ impl AgentLoopFactory {
             // No spawner at construction — the IPC layer wires it in via
             // `set_spawner` once the `AgentManager` exists. Until then the
             // `spawn_agent` tool is omitted from every registry.
-            spawner: RwLock::new(None),
+            spawner: Arc::new(RwLock::new(None)),
             // No descendant tracker at construction — the IPC layer wires it
             // in via `set_descendant_tracker` alongside the spawner. Until
             // then the state-transition gate is not enforced.
-            descendant_tracker: RwLock::new(None),
-            policy_factory: RwLock::new(None),
+            descendant_tracker: Arc::new(RwLock::new(None)),
+            policy_factory: Arc::new(RwLock::new(None)),
             // No skill registry at construction — the IPC layer wires it in
 
             // No model resolver at construction — the IPC layer wires it in

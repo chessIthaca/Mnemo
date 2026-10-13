@@ -567,6 +567,8 @@ fn main() {
                             None,  // no worktree binding — the main agent works the main tree
                             // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
                             None,
+                            // 3a.6 (G5): the main agent never resumes
+                            None,
                         )
                         .await
                         .expect("main agent spawn must succeed");

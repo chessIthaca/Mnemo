@@ -229,11 +229,48 @@ pub struct SessionLimits {
     pub idle_ms: Option<u64>,
 }
 
-/// A serialized conversation transcript (§5.9.5, G5) — the 3a.6 land
-/// fills the layout-preserving export; the type exists now so
-/// `SpawnOptions::resume` and the wire contract are pinned first.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// A serialized conversation transcript (§5.9.5, G5): the full message
+/// history — roles, tool calls/results, reasoning, and the compaction
+/// summaries all live IN the messages, so a resumed session reproduces
+/// the original request byte prefix (§5.9.5 :693-695: same transcript +
+/// same spec + same model ⇒ identical request body).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Transcript {
-    /// The exported messages (the G5 layout lands in 3a.6).
-    pub messages: Vec<serde_json::Value>,
+    /// The conversation messages, oldest first.
+    pub messages: Vec<crate::provider::Message>,
+}
+
+/// A session's snapshot (§5.9.5): the transcript + the model + the
+/// context usage + the pending interaction. The turn stats land with
+/// 3b's spend accounting.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    /// The conversation at snapshot time (the pre-request view when
+    /// taken mid-turn).
+    pub transcript: Transcript,
+    /// The session's model (None until the loop exposes one).
+    pub model: Option<String>,
+    /// The approximate prompt-token usage.
+    pub used_tokens: u32,
+    /// The context window.
+    pub max_tokens: u32,
+    /// The pending approval/question awaiting a SessionCommand answer.
+    pub pending: Option<PendingInteraction>,
+}
+
+/// The pending interaction a snapshot reports (§5.9.5): an approval or
+/// a question the session is blocked on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PendingInteraction {
+    /// An approval awaiting SessionCommand::Approve.
+    Approval {
+        /// The id from the ApprovalRequest event.
+        request_id: String,
+    },
+    /// A question awaiting SessionCommand::Answer.
+    Question {
+        /// The id from the UserQuestion event.
+        question_id: String,
+    },
 }

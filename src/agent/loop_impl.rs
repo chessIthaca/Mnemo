@@ -637,6 +637,9 @@ impl StopReason {
     pub fn fold(current: &mut Option<StopReason>, cmd: crate::runtime::AgentCommand) {
         use crate::runtime::AgentCommand as C;
         match cmd {
+            // G5 (3a.6): the export is a pure side-channel read — never a
+            // steer; the fold leaves any current stop reason untouched.
+            C::ExportHistory { .. } => {}
             // Both steer-carrying commands normalize to their payload — a
             // Prompt folded mid-stream rides the same steer pipeline, so its
             // images must ride along too (previously the fold discarded them

@@ -165,6 +165,14 @@ impl AgentTask {
         }
     }
 
+    /// 3a.6 (G5): seed the conversation from a transcript — the resume
+    /// path. [`spawn_agent_shared`] applies it BEFORE the task runs, so
+    /// the seeded history is the first request's prefix (§5.9.5
+    /// :693-695: the provider prefix-cache byte-for-byte contract).
+    pub(crate) fn seed_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
+    }
+
     /// Build the user-message content for a text + images payload —
     /// delegates to [`crate::agent::AgentLoop::build_user_content`], the ONE
     /// image-handling path shared by the normal prompt arm, every steer
@@ -799,6 +807,24 @@ impl AgentTask {
     ) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
+                AgentCommand::ExportHistory { reply } => {
+                    // G5 (3a.6): the layout-preserving export — a pure
+                    // read, safe between turns AND mid-turn (the clone is
+                    // momentary; the reply is best-effort — a dropped
+                    // requester is not an error).
+                    let used =
+                        crate::agent::context::ContextManager::count_tokens(&self.messages)
+                            as u32;
+                    let max = self.agent_loop.context_manager().max_tokens() as u32;
+                    let _ = reply
+                        .send(crate::runtime::channels::ConversationExport {
+                            messages: self.messages.clone(),
+                            model: None,
+                            used_tokens: used,
+                            max_tokens: max,
+                        })
+                        .await;
+                }
                 AgentCommand::Prompt { text, images } => {
                     // Real user input — reset the auto-continue streak so the
                     // next 12 auto-continues are available (the user is engaged

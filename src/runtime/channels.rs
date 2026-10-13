@@ -122,6 +122,33 @@ pub enum AgentCommand {
     /// [`crate::agent::StopReason::Clear`]). Backed by the `/new` slash
     /// command.
     Clear,
+    /// Export the conversation (G5, 3a.6): reply over the channel with
+    /// the message history + the model + the context usage — the headless
+    /// `history()`/`snapshot()` source. A pure read: never mutates, never
+    /// folds into a running turn. Mid-request arrivals are answered by
+    /// the turn loop from the pre-request snapshot (the in-flight
+    /// assistant turn is not yet part of the history).
+    ExportHistory {
+        /// The reply channel (capacity ≥ 1) for the exported conversation.
+        reply: tokio::sync::mpsc::Sender<ConversationExport>,
+    },
+}
+
+/// The exported conversation state (G5, 3a.6): the full message history
+/// — roles, tool calls/results, reasoning, and the compaction summaries
+/// all live IN the messages, so a seeded resume reproduces the original
+/// request byte prefix (§5.9.5 :693-695) — plus the model + usage for the
+/// session snapshot.
+#[derive(Debug, Clone)]
+pub struct ConversationExport {
+    /// The conversation messages, oldest first.
+    pub messages: Vec<crate::provider::Message>,
+    /// The session's current model (None until the loop exposes one).
+    pub model: Option<String>,
+    /// The approximate prompt-token usage.
+    pub used_tokens: u32,
+    /// The context window.
+    pub max_tokens: u32,
 }
 
 /// The marker prefix of an unattended (run-all) dispatched prompt.

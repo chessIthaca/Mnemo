@@ -4130,13 +4130,18 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             crate::provider::estimate_prompt_tokens(messages, tool_schemas) as u32;
         let stream_result = {
             let complete_fut = self.complete_with_retry(
-                &provider,
+                provider,
                 messages,
-                &tool_schemas,
+                tool_schemas,
                 fanin_tx,
                 agent_id,
                 session_id,
             );
+            // G5 (3a.6): the pre-request history snapshot — a mid-request
+            // ExportHistory answers from this (the pinned future holds the
+            // live borrow; the snapshot is the conversation as of the
+            // request start, missing only the in-flight assistant turn).
+            let history_at_request = messages.clone();
             tokio::pin!(complete_fut);
             loop {
                 tokio::select! {
@@ -4156,6 +4161,23 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                             break Err(crate::error::Error::Provider(
                                 "interrupted during provider request".into(),
                             ));
+                        }
+                        Some(AgentCommand::ExportHistory { reply }) => {
+                            // G5 (3a.6): the pure read answers from the
+                            // pre-request snapshot — the live borrow is
+                            // pinned into the provider future above.
+                            let used = crate::agent::context::ContextManager::count_tokens(
+                                &history_at_request,
+                            )
+                            as u32;
+                            let _ = reply
+                                .send(crate::runtime::channels::ConversationExport {
+                                    messages: history_at_request.clone(),
+                                    model: None,
+                                    used_tokens: used,
+                                    max_tokens: self.context_manager().max_tokens() as u32,
+                                })
+                                .await;
                         }
                         Some(AgentCommand::Cancel) => {
                             state.stop_reason = Some(StopReason::Cancel);

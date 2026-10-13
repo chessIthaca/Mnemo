@@ -19,6 +19,7 @@ pub use engine::{Engine, EngineBuilder};
 pub use error::EngineError;
 pub use session::AgentSession;
 pub use types::{
-    EngineOptions, EventReceiver, HostEvent, MemoryBackend, RecvError, SessionCommand,
-    SessionEvent, SessionId, SessionLimits, SpawnOptions, Transcript, TurnOutcome,
+    EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
+    SessionCommand, SessionEvent, SessionId, SessionLimits, SessionSnapshot, SpawnOptions,
+    Transcript, TurnOutcome,
 };

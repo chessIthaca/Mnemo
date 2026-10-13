@@ -52,6 +52,8 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
         None, // no worktree binding — a main-tree agent
         // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
         None,
+        // 3a.6 (G5): the IPC path never resumes from a transcript
+        None,
     )
     .await?;
 
@@ -182,6 +184,8 @@ pub(crate) async fn spawn_run_all_agent(
         }),
         // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
         None,
+        // 3a.6 (G5): the IPC path never resumes from a transcript
+        None,
     )
     .await
 }
@@ -276,6 +280,8 @@ impl ParentAwareSpawner for IpcSpawner {
             false, // own_plans_dir — subagents share the main dir (can't mutate)
             None, // no worktree binding — subagents inherit the parent's root
             // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+            None,
+            // 3a.6 (G5): subagents never resume from a transcript
             None,
         )
         .await?;

@@ -422,3 +422,43 @@ Amendment (2027-01-15, step 3a.5 — the landed D5+D9 picks):
   the worktree option + HostToolResult/PolicyAnswer arms = 3c; the
   policy registry + the builder's full surface = job 4; the free
   ADVERTISE surface + memory/index/embedder consumption = 3b.
+
+### 3a.6 (D6) — G5: the transcript export/import + resume — landed 2026-01-13
+
+- The ExportHistory reply rides a 1-cap mpsc (NOT oneshot — the Sender
+  isn't Clone and the mid-request arm in turn.rs answers from a
+  pre-request snapshot cloned before the pin, needing a second send
+  site); `spawn_agent_shared` grew its 12th param
+  `resume: Option<Vec<Message>>` (every app caller passes None —
+  ipc/spawn.rs ×3 + main.rs ×1).
+- Mid-block semantics (the hang fix): during a pending approval the
+  turn blocks mid-dispatch and NOBODY drains the command channel, so a
+  live export there would wait forever. `export_conversation` now
+  bounds the wait at 2s — history() errors `session_busy`, snapshot()
+  degrades its transcript to empty (pending stays engine-local and
+  ALWAYS accurate). Verified: snapshot_reports_pending_approval asserts
+  pending Some mid-block + None + a FULL transcript after the answer.
+- The byte-prefix test's contract is shifted-position, not
+  index-aligned: the volatile tail + context footer ride AFTER the
+  history by design (build_volatile_tail — the stable head stays
+  cache-immune), so the resumed layout is [head, history(+reply, +new
+  prompt), tail, footer] and the original messages sit byte-identical
+  at i<=1→i, i>1→i+2. Spec §5.9.5 :693-695's "identical bytes" = every
+  carried message serializes identically (verified) + the shared cache
+  prefix [stable head, user turn] hits.
+- Clippy: turn.rs :4133/:4135 needless_borrow (complete_with_retry's
+  &provider/&tool_schemas) were this step's and are FIXED; runtime.rs
+  :73 too_many_arguments is pre-existing (11 params at 73d5322,
+  git-shown — the count moved 11/7→12/7 with the resume param;
+  struct-ification is sweep material); channels.rs :169 (RecallHit doc
+  list) + agent.rs :379 + loop_impl :279/:371 are pre-existing storm,
+  outside this step's hunks.
+- In-flight repairs: the naive positional assert first failed at
+  message 2 (ENGINE1 tail vs ENGINE2 carried reply — the position
+  shift); the Option juggling in snapshot() needed a single destructure
+  (partial-move E0382 ×3 rounds).
+- The battery at the final tree: the module 17/17 (15 headless + 2 new
+  G5) + test -p mnemo (kernel_exit=0, 3005+41) + --features
+  browser,embeddings (feat_exit=0, 3032+41) + --workspace (ws_exit=0)
+  + build --workspace (build_exit=0); clippy zero NEW sites in own
+  hunks.

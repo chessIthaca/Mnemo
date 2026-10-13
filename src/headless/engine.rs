@@ -140,6 +140,9 @@ impl Engine {
             true, // own plans dir (a parentless session agent)
             None, // no worktree binding (the option wires with 3c)
             Some(permission),
+            // 3a.6 (G5): the resume seed — the transcript's messages
+            // become the initial conversation (§5.9.5 :693-695).
+            opts.resume.map(|transcript| transcript.messages),
         )
         .await
         .map_err(EngineError::spawn_failed)?;

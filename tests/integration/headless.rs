@@ -63,7 +63,7 @@ fn public_types_serde_roundtrip() {
         permissions: Some(PermissionPolicy::OverridePermissions),
         policy: Some("mnemo.workflow".into()),
         resume: Some(Transcript {
-            messages: vec![json!({"role": "user", "content": "hi"})],
+            messages: vec![Message::user_text("hi")],
         }),
     });
 

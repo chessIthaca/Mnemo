@@ -67,6 +67,16 @@ impl EngineError {
             message: message.into(),
         }
     }
+
+    /// The history export is mid-flight — the turn holds the conversation
+    /// while a tool blocks (a pending approval/question); retry between
+    /// turns (3a.6, G5).
+    pub(crate) fn session_busy(message: impl Into<String>) -> Self {
+        Self {
+            code: "session_busy".to_string(),
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for EngineError {

@@ -86,6 +86,9 @@ pub async fn spawn_agent_shared(
     // is applied post-build via [`AgentLoop::set_permission`] (the
     // Engine resolves the engine default vs. the SpawnOptions override).
     permission: Option<crate::agent::policy::PermissionPolicy>,
+    // 3a.6 (G5, §5.9.5): the resume seed — the transcript's messages
+    // become the initial conversation (None = a fresh session).
+    initial_messages: Option<Vec<crate::provider::Message>>,
 ) -> Result<(AgentId, String), String> {
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
@@ -209,7 +212,12 @@ pub async fn spawn_agent_shared(
         let mut mgr = manager.lock().await;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
         fanin_tx = mgr.fanin_sender();
-        let task = AgentTask::new(agent_id, name.clone(), agent_loop.clone());
+        let mut task = AgentTask::new(agent_id, name.clone(), agent_loop.clone());
+    // 3a.6 (G5): the resume seed — applied before the task runs, so the
+    // seeded history is the first request's byte prefix.
+    if let Some(messages) = initial_messages {
+        task.seed_messages(messages);
+    }
         tokio::spawn(task.run(cmd_rx, fanin_tx.clone()));
         let mut handle = AgentHandle::new(agent_id, name.clone(), cmd_tx);
         if let Some(pid) = parent_id {
@@ -611,6 +619,8 @@ impl ParentAwareSpawner for HostSpawner {
             false, // own_plans_dir — subagents share the main dir (can't mutate)
             None,  // no worktree binding — subagents inherit the parent's root
             Some(permission),
+            // subagents never resume from a transcript (3a.6)
+            None,
         )
         .await?;
         Ok(id)
@@ -701,6 +711,8 @@ impl HostRuntime {
             false,
             None,
             // the main agent keeps the factory build's default policy
+            None,
+            // the main agent never resumes from a transcript
             None,
         )
         .await

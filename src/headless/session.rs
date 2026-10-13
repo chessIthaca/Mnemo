@@ -15,7 +15,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
 
 use crate::headless::error::EngineError;
-use crate::headless::types::{EventReceiver, SessionCommand, SessionEvent, SessionId, TurnOutcome};
+use crate::headless::types::{
+    EventReceiver, PendingInteraction, SessionCommand, SessionEvent, SessionId, SessionSnapshot,
+    Transcript, TurnOutcome,
+};
+use crate::runtime::channels::ConversationExport;
 use crate::host::runtime::HostRuntime;
 use crate::runtime::channels::{
     AgentEvent, AgentId, Approval, SerializableAgentEvent, SteerPayload, UserAnswer,
@@ -180,6 +184,101 @@ impl AgentSession {
                 }
             }
         }
+    }
+
+    /// The conversation transcript (§5.3 :323 / §5.9.5, G5) — the full
+    /// message history, layout-preserving (roles, tool calls/results,
+    /// reasoning, and the compaction summaries all live in the
+    /// messages).
+    pub async fn history(&self) -> Result<Transcript, EngineError> {
+        let export = self.export_conversation().await?;
+        Ok(Transcript {
+            messages: export.messages,
+        })
+    }
+
+    /// A snapshot (§5.3 :324 / §5.9.5): the transcript + the model + the
+    /// context usage + the pending approval/question (if any). The turn
+    /// stats land with 3b's spend accounting.
+    pub async fn snapshot(&self) -> Result<SessionSnapshot, EngineError> {
+        // G5: the transcript part is best-effort — mid-block (a pending
+        // approval) the live export times out and the snapshot degrades
+        // to an empty transcript rather than hanging; `pending` is
+        // engine-local and ALWAYS accurate.
+        let export = self.export_conversation().await.ok();
+        let (transcript, model, used_tokens, max_tokens) = match export {
+            Some(e) => (
+                Transcript { messages: e.messages },
+                e.model,
+                e.used_tokens,
+                e.max_tokens,
+            ),
+            None => (Transcript::default(), None, 0, 0),
+        };
+        let pending = {
+            let approvals = self.inner.pending_approvals.lock().await;
+            if let Some(id) = approvals.keys().next() {
+                Some(PendingInteraction::Approval {
+                    request_id: id.clone(),
+                })
+            } else {
+                let questions = self.inner.pending_questions.lock().await;
+                questions
+                    .keys()
+                    .next()
+                    .map(|id| PendingInteraction::Question {
+                        question_id: id.clone(),
+                    })
+            }
+        };
+        Ok(SessionSnapshot {
+            transcript,
+            model,
+            used_tokens,
+            max_tokens,
+            pending,
+        })
+    }
+
+    /// The export plumbing: send ExportHistory through the command
+    /// channel and await the reply (the task answers between turns from
+    /// its live state; mid-request from the pre-request snapshot).
+    async fn export_conversation(&self) -> Result<ConversationExport, EngineError> {
+        if !self.inner.sessions.lock().await.contains_key(&self.id) {
+            return Err(EngineError::session_closed(format!(
+                "session {:?} is closed",
+                self.id
+            )));
+        }
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel(1);
+        let mgr = self.inner.host.manager.lock().await;
+        mgr.send(
+            self.agent,
+            AgentCommand::ExportHistory { reply: reply_tx },
+        )
+        .map_err(|_| EngineError::session_closed("the agent task ended"))?;
+        drop(mgr);
+        let export = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reply_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(export)) => export,
+            Ok(None) => {
+                return Err(EngineError::session_closed("the agent task ended"))
+            }
+            // G5: mid-block (a pending approval/question) the turn holds
+            // the conversation and does not drain the command channel —
+            // the export is genuinely unavailable, never a hang.
+            Err(_) => {
+                return Err(EngineError::session_busy(
+                    "the history is mid-flight — the turn holds it while a tool blocks; \
+                     retry between turns",
+                ))
+            }
+        };
+        Ok(export)
     }
 
     /// Send a prompt and pump the session's own event stream until the

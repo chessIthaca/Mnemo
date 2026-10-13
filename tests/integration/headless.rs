@@ -5,12 +5,14 @@
 use serde_json::json;
 use std::path::PathBuf;
 
-use mnemo::agent::policy::{GateVerdict, PermissionPolicy};
+use mnemo::agent::policy::{Continuation, GateVerdict, PermissionPolicy};
 use mnemo::config::SafetyMode;
+use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::headless::{
     Engine, EngineError, EngineOptions, EventReceiver, ExternalPolicySpec, GateRule,
-    Guardrails, HookKind, MemoryBackend, RecvError, SessionCommand, SessionEvent, SessionId,
-    SessionLimits, SpawnOptions, TimeoutAction, Transcript,
+    Guardrails, HookKind, HostToolSpec, MemoryBackend, PolicyAnswer, QuestionPolicy,
+    RecvError, SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions,
+    TimeoutAction, Transcript,
 };
 use mnemo::runtime::channels::{Approval, SerializableAgentEvent, UserAnswer};
 use mnemo::workspace::Workspace;
@@ -71,7 +73,17 @@ fn public_types_serde_roundtrip() {
             wall_clock_ms: Some(600_000),
             ..SessionLimits::default()
         }),
-        host_tools: Vec::new(),
+        host_tools: vec![HostToolSpec {
+            name: "get_weather".into(),
+            description: "Get the current weather for a city".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }),
+            safety: SafetyLevel::AutoRun,
+            timeout_ms: Some(150),
+        }],
         // 3c/G6 tier 3: a representative external-policy spec — the
         // hooks array, the timeout, and the timeout action all ride
         // the wire (the field's None form round-trips via the default
@@ -93,9 +105,31 @@ fn public_types_serde_roundtrip() {
                     message: "no destructive shell".into(),
                 },
             }],
+            question_policy: QuestionPolicy::AnswerConstant("decide yourself".into()),
             ..Guardrails::default()
         }),
     });
+
+    // 3c/G6 tier 3 (D5): the answer wire — the Gate/Deny form, the
+    // Continuation/Continue note, and the Stop verb.
+    roundtrip(&PolicyAnswer::Gate {
+        verdict: GateVerdict::Deny {
+            message: "no destructive shell".into(),
+        },
+    });
+    roundtrip(&PolicyAnswer::Continuation {
+        continuation: Continuation::Continue {
+            note: Some("continue and finish".into()),
+        },
+    });
+    roundtrip(&PolicyAnswer::Continuation {
+        continuation: Continuation::Stop,
+    });
+    // 3c/G6 tier 2 (D5): the guardrails' default (today's free
+    // session) + the question-policy arms (wire-only until job 5).
+    roundtrip(&Guardrails::default());
+    roundtrip(&QuestionPolicy::AnswerConstant("decide yourself".into()));
+    roundtrip(&QuestionPolicy::Deny);
 
     // SessionCommand — every 3a variant.
     let commands = vec![
@@ -115,6 +149,21 @@ fn public_types_serde_roundtrip() {
         SessionCommand::Answer {
             question_id: "q1".into(),
             answer: UserAnswer::Choice { index: 1 },
+        },
+        // 3c (D5): the G2/G6 wire shapes — the host-tool answer and
+        // the policy-hook answer.
+        SessionCommand::HostToolResult {
+            call_id: "c1".into(),
+            result: Some(ToolResult::success("sunny, 21°C".to_string())),
+            error: None,
+        },
+        SessionCommand::PolicyAnswer {
+            hook_id: "h1".into(),
+            answer: PolicyAnswer::Gate {
+                verdict: GateVerdict::Deny {
+                    message: "no destructive shell".into(),
+                },
+            },
         },
     ];
     for command in &commands {

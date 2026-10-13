@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use mnemo::agent::policy::PermissionPolicy;
-use mnemo::headless::{Engine, EngineOptions, MemoryBackend, Setup, SetupStep};
+use mnemo::headless::{
+    EndpointDto, Engine, EngineOptions, KeySource, MemoryBackend, Secret, Setup, SetupStep,
+};
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
 use mnemo::workspace::Workspace;
@@ -211,4 +213,177 @@ async fn engine_start_fails_fast_when_not_configured() {
         .await
         .expect("a ready config starts");
     engine.shutdown().await.expect("shutdown ok");
+}
+// --- D2: Secret + KeySource + the endpoints group ---
+
+/// §5.8 :535: `set_api_key` is WRITE-ONLY — there is no getter; a fresh
+/// handle reads the persisted key; `keys.toml` lands with the entry.
+#[test]
+fn set_and_has_api_key_round_trip() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    assert!(!setup.has_api_key("test"));
+    setup.set_api_key("test", Secret::new("sk-witness")).unwrap();
+    assert!(setup.has_api_key("test"));
+    let keys = std::fs::read_to_string(cfg.path().join("keys.toml")).unwrap();
+    assert!(keys.contains("sk-witness"), "the file stores the key: {keys}");
+    // A FRESH handle over the same dir sees the persisted key.
+    let fresh = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    assert!(fresh.has_api_key("test"));
+}
+
+/// §5.8 :578-580: `Env`/`InMemory` sources serve READS without any
+/// plaintext (or file) on disk — and refuse the write paths.
+#[test]
+fn non_file_key_sources_refuse_writes_and_serve_reads() {
+    let cfg = tempfile::tempdir().unwrap();
+    let env_source = Setup::open(Some(cfg.path().to_path_buf()))
+        .unwrap()
+        .with_key_source(KeySource::Env("MNEMO_TEST_KEY_DEFINITELY_UNSET_9431".into()));
+    assert!(!env_source.has_api_key("any"));
+    env_source
+        .set_api_key("any", Secret::new("sk-x"))
+        .expect_err("Env sources refuse writes");
+    let mut map = std::collections::HashMap::new();
+    map.insert("injected".to_string(), "sk-mem".to_string());
+    let mem_source = Setup::open(Some(cfg.path().to_path_buf()))
+        .unwrap()
+        .with_key_source(KeySource::InMemory(map));
+    assert!(mem_source.has_api_key("injected"));
+    assert!(!mem_source.has_api_key("missing"));
+    mem_source
+        .set_api_key("any", Secret::new("sk-x"))
+        .expect_err("InMemory sources refuse writes");
+    // Neither read created a keys.toml — the sources never touch disk.
+    assert!(!cfg.path().join("keys.toml").exists());
+}
+
+/// §5.8 :534: upsert validates (the same lib rules the GUI's save
+/// uses), persists, and PRESERVES an untouched key; a refused upsert
+/// leaves the config unchanged.
+#[test]
+fn upsert_endpoint_validates_persists_and_preserves_keys() {
+    let cfg = tempfile::tempdir().unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    let dto = EndpointDto {
+        name: "test".into(),
+        kind: "openai".into(),
+        base_url: "http://127.0.0.1:9/v1".into(),
+        models: vec!["test-model".into()],
+        max_context: Some(8192),
+        max_output_tokens: None,
+        multimodal: false,
+        supports_reasoning_effort: false,
+        reasoning_effort: None,
+        workspace_id: None,
+        has_api_key: false,
+    };
+    setup
+        .upsert_endpoint(dto.clone(), Some(Secret::new("sk-first")))
+        .unwrap();
+    let listed = setup.endpoints().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "test");
+    assert_eq!(listed[0].kind, "openai");
+    assert!(
+        listed[0].base_url.ends_with('/'),
+        "the trailing slash is appended"
+    );
+    assert_eq!(listed[0].models, vec!["test-model".to_string()]);
+    assert!(listed[0].has_api_key);
+
+    // Upsert again with key: None — the EXISTING key is preserved.
+    let mut dto2 = dto.clone();
+    dto2.max_output_tokens = Some(4096);
+    setup.upsert_endpoint(dto2, None).unwrap();
+    assert!(setup.has_api_key("test"));
+    assert_eq!(
+        setup.endpoints().unwrap()[0].max_output_tokens,
+        Some(4096)
+    );
+
+    // A refused upsert (empty base_url) changes nothing.
+    let mut bad = dto;
+    bad.name = "bad".into();
+    bad.base_url = " ".into();
+    setup
+        .upsert_endpoint(bad, Some(Secret::new("sk-leak")))
+        .expect_err("an empty base_url is refused");
+    assert_eq!(setup.endpoints().unwrap().len(), 1);
+    assert!(!setup.has_api_key("bad"), "the refused key never landed");
+}
+
+/// §5.8 :534: remove drops the endpoint AND its key; the set
+/// re-validation refuses to remove the default provider's endpoint.
+#[test]
+fn remove_endpoint_drops_key_and_guards_the_default() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    // write_ready_config's endpoint "test" IS the default provider.
+    setup
+        .remove_endpoint("test")
+        .expect_err("the default provider's endpoint is guarded");
+    // A second endpoint with its own key, then remove it.
+    let dto = EndpointDto {
+        name: "extra".into(),
+        kind: "local".into(),
+        base_url: "http://127.0.0.1:9/v1/".into(),
+        models: vec![],
+        max_context: None,
+        max_output_tokens: None,
+        multimodal: false,
+        supports_reasoning_effort: false,
+        reasoning_effort: None,
+        workspace_id: None,
+        has_api_key: false,
+    };
+    setup
+        .upsert_endpoint(dto, Some(Secret::new("sk-extra")))
+        .unwrap();
+    assert!(setup.has_api_key("extra"));
+    setup.remove_endpoint("extra").unwrap();
+    assert!(!setup.has_api_key("extra"), "the key dropped with it");
+    let listed = setup.endpoints().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "test");
+    assert!(setup.has_api_key("test"), "the survivor's key is preserved");
+}
+
+/// The shared credential chain (moved from ipc/models.rs — one
+/// implementation): override args win; the saved endpoint fills
+/// base_url/kind + the stored key; an unknown endpoint without a
+/// base_url errors.
+#[test]
+fn resolve_endpoint_credentials_shared_chain() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    let config = mnemo::config::Config::load(cfg.path()).unwrap();
+    // The saved endpoint fills base_url + kind + the stored key.
+    let (base_url, api_key, kind) =
+        mnemo::provider::models::resolve_endpoint_credentials(&config, "test", None, None, None)
+            .unwrap();
+    assert!(base_url.starts_with("http://127.0.0.1:9"));
+    assert_eq!(api_key, "sk-test");
+    assert_eq!(kind, "openai");
+    // Override args win.
+    let (base_url, _api_key, kind) = mnemo::provider::models::resolve_endpoint_credentials(
+        &config,
+        "test",
+        Some("http://localhost:4/v1/".into()),
+        Some("sk-override".into()),
+        Some("anthropic".into()),
+    )
+    .unwrap();
+    assert_eq!(base_url, "http://localhost:4/v1/");
+    assert_eq!(kind, "anthropic");
+    // An unknown endpoint with no base_url errors.
+    assert!(mnemo::provider::models::resolve_endpoint_credentials(
+        &config,
+        "nope",
+        None,
+        None,
+        None
+    )
+    .is_err());
 }

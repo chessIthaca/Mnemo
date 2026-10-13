@@ -54,6 +54,8 @@ directories = "6"
 glob = "0.3"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
+# Secret zeroize-on-drop (job 4 D2, §5.8 :577-580)
+zeroize = "1"
 
 # OS file watching (codegraph auto-index — keeps the graph fresh on every edit)
 notify = "8"

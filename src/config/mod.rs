@@ -22,7 +22,7 @@ pub mod patch;
 pub mod projects;
 pub mod settings_dto;
 
-pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry};
+pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, kind_wire};
 pub use general::{
     BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,

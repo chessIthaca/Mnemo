@@ -28,6 +28,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::error::Result;
 
@@ -129,6 +130,72 @@ impl KeyStore {
             );
         }
         Ok(())
+    }
+}
+
+/// A write-only API-key wrapper (§5.8 :577-580, job 4 D2): the value is
+/// zeroized on drop and never rendered by `Debug` — it moves only into
+/// the key store's write paths ([`KeyStore::insert`]) through the
+/// crate-internal accessor. No `Serialize`/`Deserialize` by design: a
+/// binding receives the plain string on its wire and wraps it here.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a raw key value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The raw value — crate-internal (the store's write paths).
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret([REDACTED])")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Where keys come from (§5.8 :578-580, job 4 D2): `keys.toml` under
+/// the config dir (the default — the only persistent source), one
+/// environment variable, or an in-memory map — a binding or daemon
+/// can serve keys WITHOUT plaintext landing on disk. `Env` and
+/// `InMemory` are host-managed: the read paths consult them, the
+/// write paths refuse (inject keys at construction).
+#[derive(Debug, Clone, Default)]
+pub enum KeySource {
+    /// `keys.toml` under the config dir (the default).
+    #[default]
+    File,
+    /// One environment variable holding THE key (any endpoint name
+    /// resolves to it) — host-managed, read-only here.
+    Env(String),
+    /// An in-memory name → key map, never written to disk.
+    InMemory(HashMap<String, String>),
+}
+
+impl KeySource {
+    /// Whether `endpoint`'s key is available through this source.
+    /// `File` loads `keys.toml` from `keys_path` (a missing file = no
+    /// keys); `Env` checks the variable; `InMemory` checks the map. No
+    /// source ever CREATES or writes the file.
+    pub fn has_key(&self, keys_path: &Path, endpoint: &str) -> bool {
+        match self {
+            KeySource::File => KeyStore::load_or_default(keys_path)
+                .map(|store| store.get(endpoint).is_some())
+                .unwrap_or(false),
+            KeySource::Env(var) => std::env::var(var).is_ok(),
+            KeySource::InMemory(map) => map.contains_key(endpoint),
+        }
     }
 }
 

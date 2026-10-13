@@ -355,4 +355,45 @@ time absent) ✓ (D3), the GUI still reads `[ui]` unchanged ✓ (D3).
   legs gate earlier (the workspace gate) and stay untouched; the
   provider-injecting engine tests (rows 17-32) bypass by design.
 - Battery: workspace green, exit 0 (60 integration tests incl. the six
-  new headless_setup fixtures).
+  new headless_setup fixtures).### D2 — landed (feat(4.2)): Secret + KeySource + the endpoints group
+
+- `src/config/keys.rs`: `Secret` — the write-only zeroize-on-drop wrapper
+  (manual `Debug` printing `[REDACTED]`, NO serde by design — a binding
+  receives the plain string on its wire and wraps it here); `KeySource::
+  {File, Env, InMemory}` — `File` (the default) is the only persistent
+  source; `Env`/`InMemory` are host-managed READ sources (`has_key`
+  consults file/env/map and never creates a file; the WRITE paths refuse
+  them — inject at construction). New plain dep `zeroize = "1"`.
+- `src/provider/models.rs`: `resolve_endpoint_credentials` +
+  `fetch_by_kind` MOVED from ipc/models.rs — the GUI pickers and the
+  Setup surface share ONE implementation; the kind-aware env fallback
+  chain (ANTHROPIC_API_KEY / OPENAI_API_KEY / ANTHROPIC_AUTH_TOKEN →
+  `"dummy"`) rides along.
+- `src/config/endpoints.rs` (+ the mod.rs re-export): `kind_wire` — the
+  `EndpointKind` ↔ wire mapping, one implementation (the app's
+  `endpoint_kind_wire` delegates).
+- `src/headless/setup.rs` (the D2 group): `endpoints()` — the lean
+  `EndpointDto` wire (essential fields + `has_api_key` OUTPUT-only; the
+  GUI's card DTO keeps its extra fields and validates through the same
+  lib `validate_endpoint`); `upsert_endpoint` — validate →
+  replace-or-append by name → the SET re-validation (the default
+  provider/model must still resolve) → `apply_endpoints` → `save_all`,
+  with `key: None` PRESERVING the endpoint's existing key;
+  `remove_endpoint` — the key drops with it (the rebuilt store keeps
+  keys for surviving endpoints only), the default provider's endpoint is
+  guarded; `set_api_key` — write-only (no getter exists), `File` source
+  only; `has_api_key` — never a value; `list_models` / `test_endpoint` —
+  the shared resolution + the kind-selected fetcher (`test_endpoint`
+  reports bool; `list_models` surfaces the detail). Plus
+  `with_key_source` and the `load_config` dedup.
+- IPC: ipc/models.rs's two helpers are thin delegates (the `IpcError`
+  mapping stays app-side); settings.rs's `endpoint_kind_wire` delegates
+  to the lib. The endpoint COMMANDS keep their persist+resync glue —
+  D4 lands the moved rewire and the commands thin then.
+- Fixtures (headless_setup.rs, +5): the set→has round trip + the
+  persisted file; Env/InMemory reads refuse writes and never create
+  `keys.toml`; upsert validates/persists/preserves keys and a refused
+  upsert changes nothing; remove drops the key + the default-provider
+  guard; the credential chain (overrides win, saved-endpoint fallback,
+  unknown endpoint errors).
+- Battery: workspace green, exit 0 (65 integration tests).

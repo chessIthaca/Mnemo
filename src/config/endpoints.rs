@@ -708,6 +708,18 @@ pub enum EndpointKind {
     Anthropic,
 }
 
+/// The kind's serde wire form (job 4 D2, moved from the app's
+/// ipc/settings.rs so one mapping serves the GUI DTOs, the standalone
+/// `Setup` surface, and the credential resolution): `"openai"`,
+/// `"local"`, `"anthropic"`.
+pub fn kind_wire(kind: EndpointKind) -> &'static str {
+    match kind {
+        EndpointKind::OpenAI => "openai",
+        EndpointKind::Local => "local",
+        EndpointKind::Anthropic => "anthropic",
+    }
+}
+
 /// Load endpoints + pricing from `endpoints.toml`, or return empty lists if
 /// missing.
 ///

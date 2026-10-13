@@ -22,11 +22,13 @@
 //! [`crate::config::resolve_config_dir`], which owns the `$MNEMO_HOME`
 //! default) and every derivation helper lives in `config/`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::keys::{KeySource, Secret};
 use crate::config::{Config, EndpointKind};
 use crate::headless::error::EngineError;
 use crate::memory::classifier::ClassifierStatus;
@@ -112,6 +114,59 @@ pub struct EndpointReadiness {
     pub reachable: Option<bool>,
 }
 
+/// One endpoint's config wire (§5.8 :533-534, job 4 D2) — the standalone
+/// surface's lean shape. The app's GUI DTO carries extra card fields
+/// (per-model configs, pricing) and validates through the same lib
+/// `validate_endpoint`; `has_api_key` is OUTPUT ONLY
+/// ([`Setup::endpoints`] fills it; the upsert path ignores it).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EndpointDto {
+    /// The endpoint's config name (unique, non-empty).
+    pub name: String,
+    /// The kind wire form: `"openai"`, `"local"`, or `"anthropic"`.
+    pub kind: String,
+    /// The base URL (non-empty; a missing trailing `/` is appended).
+    pub base_url: String,
+    /// The served model ids (empty entries dropped).
+    pub models: Vec<String>,
+    /// The endpoint-level context-window cap, if known.
+    pub max_context: Option<usize>,
+    /// The endpoint-level output-token cap, if known.
+    pub max_output_tokens: Option<usize>,
+    /// Whether the endpoint serves a multimodal default model.
+    pub multimodal: bool,
+    /// Whether the endpoint accepts reasoning-effort overrides.
+    pub supports_reasoning_effort: bool,
+    /// The endpoint-level default reasoning effort.
+    pub reasoning_effort: Option<String>,
+    /// The Anthropic workspace id (cleared for other kinds).
+    pub workspace_id: Option<String>,
+    /// OUTPUT ONLY: whether a key is available for this endpoint.
+    pub has_api_key: bool,
+}
+
+impl EndpointDto {
+    /// Validate + convert into the lib [`crate::config::Endpoint`] —
+    /// the same `validate_endpoint` the GUI's save path uses (one
+    /// implementation). The lean surface carries no per-model
+    /// configs: model ids become bare specs.
+    fn into_endpoint(self) -> Result<crate::config::Endpoint, String> {
+        crate::config::patch::validate_endpoint(
+            &self.name,
+            &self.kind,
+            &self.base_url,
+            self.models,
+            Vec::new(),
+            self.max_context,
+            self.max_output_tokens,
+            self.multimodal,
+            self.supports_reasoning_effort,
+            self.reasoning_effort,
+            self.workspace_id,
+        )
+    }
+}
+
 /// The semantic-search leg (§5.8 :567): which bundled model is
 /// configured, whether it is installed in the cache, the embedder's
 /// status, and whether semantic (vs. hash-fallback) vectors are live.
@@ -184,6 +239,10 @@ pub struct SetupStatus {
 pub struct Setup {
     /// The resolved config dir (explicit / `$MNEMO_HOME` / `~/.mnemo`).
     config_dir: PathBuf,
+    /// Where keys come from (D2, §5.8 :578-580) — `File` (`keys.toml`)
+    /// is the default; `Env`/`InMemory` are host-managed READ sources
+    /// (the write paths refuse them).
+    key_source: KeySource,
 }
 
 impl Setup {
@@ -200,7 +259,10 @@ impl Setup {
                 config_dir.display()
             ))
         })?;
-        Ok(Self { config_dir })
+        Ok(Self {
+            config_dir,
+            key_source: KeySource::default(),
+        })
     }
 
     /// The resolved config dir this Setup targets.
@@ -208,17 +270,240 @@ impl Setup {
         &self.config_dir
     }
 
+    /// Point this Setup at a different [`KeySource`] (§5.8 :578-580):
+    /// `Env`/`InMemory` serve `has_api_key` reads without plaintext on
+    /// disk — they are host-managed, so the write paths
+    /// ([`Setup::set_api_key`], [`Setup::upsert_endpoint`]'s key)
+    /// refuse; inject the keys at construction instead.
+    pub fn with_key_source(mut self, source: KeySource) -> Self {
+        self.key_source = source;
+        self
+    }
+
+    /// Load the config for the endpoints group — one error mapping for
+    /// every read.
+    fn load_config(&self) -> Result<Config, EngineError> {
+        Config::load(&self.config_dir).map_err(|e| {
+            EngineError::start_failed(format!(
+                "config load from '{}' failed: {e}",
+                self.config_dir.display()
+            ))
+        })
+    }
+
+    /// The configured endpoints (§5.8 :533) with per-endpoint key
+    /// availability — the lean [`EndpointDto`] wire.
+    pub fn endpoints(&self) -> Result<Vec<EndpointDto>, EngineError> {
+        let config = self.load_config()?;
+        let keys_path = self.config_dir.join("keys.toml");
+        Ok(config
+            .endpoints
+            .iter()
+            .map(|e| EndpointDto {
+                name: e.name.clone(),
+                kind: crate::config::kind_wire(e.kind).to_string(),
+                base_url: e.base_url.clone(),
+                models: e.models.iter().map(|m| m.id.clone()).collect(),
+                max_context: e.max_context,
+                max_output_tokens: e.max_output_tokens,
+                multimodal: e.multimodal,
+                supports_reasoning_effort: e.supports_reasoning_effort,
+                reasoning_effort: e.reasoning_effort.clone(),
+                workspace_id: e.workspace_id.clone(),
+                has_api_key: self.key_source.has_key(&keys_path, &e.name),
+            })
+            .collect())
+    }
+
+    /// Upsert one endpoint (§5.8 :534): the same lib validation the
+    /// GUI's save path enforces (`validate_endpoint` + the SET
+    /// re-validation — the default provider/model must still resolve),
+    /// replace-or-append by name, then persist. `key`: `Some` stores
+    /// the key alongside (the `File` source only); `None` PRESERVES
+    /// the endpoint's existing key.
+    pub fn upsert_endpoint(
+        &self,
+        dto: EndpointDto,
+        key: Option<Secret>,
+    ) -> Result<(), EngineError> {
+        let endpoint = dto.into_endpoint().map_err(EngineError::start_failed)?;
+        let current = self.load_config()?;
+
+        // Preserve the set's order: replace-or-append by name.
+        let mut built = current.endpoints.clone();
+        match built.iter().position(|e| e.name == endpoint.name) {
+            Some(i) => built[i] = endpoint.clone(),
+            None => built.push(endpoint.clone()),
+        }
+
+        // The surviving endpoints' keys merged with the provided one
+        // (apply_endpoints rebuilds the store keeping keys for
+        // existing endpoints only).
+        let mut api_keys: HashMap<String, String> = HashMap::new();
+        for ep in &built {
+            if let Some(k) = current.keys.get(&ep.name) {
+                api_keys.insert(ep.name.clone(), k.to_string());
+            }
+        }
+        if let Some(secret) = &key {
+            match &self.key_source {
+                KeySource::File => {
+                    api_keys.insert(endpoint.name.clone(), secret.expose().to_string());
+                }
+                _ => {
+                    return Err(EngineError::start_failed(
+                        "storing a key requires the File key source — Env and InMemory \
+                         sources are host-managed (inject keys at construction)",
+                    ));
+                }
+            }
+        }
+
+        let default_provider = current.general.general.default_provider.clone();
+        let default_model = current.general.general.default_model.clone();
+        crate::config::patch::validate_endpoint_set(
+            &built,
+            default_provider.as_deref(),
+            default_model.as_deref(),
+            default_model.as_deref(),
+        )
+        .map_err(EngineError::start_failed)?;
+        let new_config = crate::config::patch::apply_endpoints(
+            &current,
+            built,
+            default_provider,
+            default_model,
+            &api_keys,
+        );
+        new_config
+            .save_all(&self.config_dir)
+            .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove one endpoint by name (§5.8 :534): its key drops with it
+    /// (the rebuilt store keeps keys for surviving endpoints only).
+    /// Refused when the default provider still references it (the SET
+    /// re-validation).
+    pub fn remove_endpoint(&self, name: &str) -> Result<(), EngineError> {
+        let current = self.load_config()?;
+        let built: Vec<crate::config::Endpoint> = current
+            .endpoints
+            .iter()
+            .filter(|e| e.name != name)
+            .cloned()
+            .collect();
+        if built.len() == current.endpoints.len() {
+            return Err(EngineError::start_failed(format!(
+                "endpoint '{name}' does not exist"
+            )));
+        }
+        let mut api_keys: HashMap<String, String> = HashMap::new();
+        for ep in &built {
+            if let Some(k) = current.keys.get(&ep.name) {
+                api_keys.insert(ep.name.clone(), k.to_string());
+            }
+        }
+        let default_provider = current.general.general.default_provider.clone();
+        let default_model = current.general.general.default_model.clone();
+        crate::config::patch::validate_endpoint_set(
+            &built,
+            default_provider.as_deref(),
+            default_model.as_deref(),
+            default_model.as_deref(),
+        )
+        .map_err(EngineError::start_failed)?;
+        let new_config = crate::config::patch::apply_endpoints(
+            &current,
+            built,
+            default_provider,
+            default_model,
+            &api_keys,
+        );
+        new_config
+            .save_all(&self.config_dir)
+            .map_err(|e| EngineError::start_failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Store an API key for an endpoint (§5.8 :535) — WRITE-ONLY: there
+    /// is no getter (only [`Setup::has_api_key`]). The `File` source
+    /// persists to `keys.toml` (atomic write + user-only permissions);
+    /// `Env`/`InMemory` refuse (host-managed).
+    pub fn set_api_key(&self, endpoint_name: &str, secret: Secret) -> Result<(), EngineError> {
+        match &self.key_source {
+            KeySource::File => {
+                let keys_path = self.config_dir.join("keys.toml");
+                let mut store = crate::config::keys::KeyStore::load_or_default(&keys_path)
+                    .map_err(|e| EngineError::start_failed(e.to_string()))?;
+                store.insert(endpoint_name.to_string(), secret.expose().to_string());
+                store
+                    .save(&keys_path)
+                    .map_err(|e| EngineError::start_failed(e.to_string()))?;
+                Ok(())
+            }
+            _ => Err(EngineError::start_failed(
+                "set_api_key requires the File key source — Env and InMemory sources are \
+                 host-managed (inject keys at construction)",
+            )),
+        }
+    }
+
+    /// Whether a key is AVAILABLE for an endpoint (§5.8 :535) — never
+    /// the value. Consults the [`KeySource`] (file/env/map).
+    pub fn has_api_key(&self, endpoint_name: &str) -> bool {
+        self.key_source
+            .has_key(&self.config_dir.join("keys.toml"), endpoint_name)
+    }
+
+    /// Fetch the live model list for an endpoint (§5.8 :536) — the
+    /// shared credential resolution (override args first, then the
+    /// saved endpoint + `keys.toml` key, then the kind-aware env
+    /// fallback, then `"dummy"`), then the kind-selected fetcher.
+    /// Never writes config.
+    pub async fn list_models(
+        &self,
+        endpoint_name: &str,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        kind: Option<String>,
+    ) -> Result<Vec<crate::provider::models::ModelWithVision>, EngineError> {
+        let config = self.load_config()?;
+        let (base_url, api_key, kind) =
+            crate::provider::models::resolve_endpoint_credentials(
+                &config,
+                endpoint_name,
+                base_url,
+                api_key,
+                kind,
+            )
+            .map_err(EngineError::start_failed)?;
+        crate::provider::models::fetch_by_kind(&kind, &base_url, &api_key)
+            .await
+            .map_err(|e| EngineError::start_failed(e.to_string()))
+    }
+
+    /// Probe an endpoint's `/models` (§5.8 :536): `true` when the probe
+    /// returns a list — `false` on ANY error (the detail rides
+    /// [`Setup::list_models`] when a diagnosis is needed).
+    pub async fn test_endpoint(
+        &self,
+        endpoint_name: &str,
+        base_url: Option<String>,
+        api_key: Option<String>,
+        kind: Option<String>,
+    ) -> bool {
+        self.list_models(endpoint_name, base_url, api_key, kind)
+            .await
+            .is_ok()
+    }
+
     /// The readiness snapshot (§5.8 :562-571) for this config — and,
     /// when given, a workspace root's project facts. Pure fs + config
     /// reads; NO network calls (endpoints report `reachable: None`
     /// until `test_endpoint` (D2) probes one).
     pub fn status(&self, project: Option<&Path>) -> Result<SetupStatus, EngineError> {
-        let config = Config::load(&self.config_dir).map_err(|e| {
-            EngineError::start_failed(format!(
-                "config load from '{}' failed: {e}",
-                self.config_dir.display()
-            ))
-        })?;
+        let config = self.load_config()?;
         Ok(Self::status_from_config(&self.config_dir, &config, project))
     }
 

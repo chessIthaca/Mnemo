@@ -840,11 +840,9 @@ pub struct SaveSettingsResponse {
 /// Map [`EndpointKind`] to the serde wire form (`"openai"` / `"local"` /
 /// `"anthropic"`).
 pub(crate) fn endpoint_kind_wire(kind: EndpointKind) -> &'static str {
-    match kind {
-        EndpointKind::OpenAI => "openai",
-        EndpointKind::Local => "local",
-        EndpointKind::Anthropic => "anthropic",
-    }
+    // Job 4 D2: the mapping moved into the lib (`config::kind_wire`) —
+    // one implementation shared with the standalone Setup surface.
+    mnemo::config::kind_wire(kind)
 }
 
 /// Convert a [`ModelRef`](mnemo::config::ModelRef) to its wire form.

@@ -37,9 +37,13 @@ pub use memory_api::{
     ScoredMemoryDebugWire,
 };
 pub use session::AgentSession;
+/// 4/D2 (§5.8 :577-580): the key-source wire — `Secret` never
+/// serializes; a binding wraps its plain string and hands it to
+/// `Setup::set_api_key`.
+pub use crate::config::keys::{KeySource, Secret};
 pub use setup::{
-    EmbedderReadiness, EndpointReadiness, ProjectReadiness, Setup, SetupEvent, SetupStatus,
-    SetupStep,
+    EmbedderReadiness, EndpointDto, EndpointReadiness, ProjectReadiness, Setup, SetupEvent,
+    SetupStatus, SetupStep,
 };
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{

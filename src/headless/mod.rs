@@ -41,6 +41,7 @@ pub use session::AgentSession;
 /// serializes; a binding wraps its plain string and hands it to
 /// `Setup::set_api_key`.
 pub use crate::config::keys::{KeySource, Secret};
+pub use crate::host::brain::SharedResources;
 pub use setup::{
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,
     ProjectReadiness, Setup, SetupEvent, SetupStatus, SetupStep,

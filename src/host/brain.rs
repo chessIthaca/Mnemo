@@ -43,10 +43,19 @@ use crate::provider::openai::{OpenAiClient, OpenAiClientConfig};
 /// host-notifier + a runtime handle, never a Tauri app.
 pub struct Brain {
     pub factory: Arc<AgentLoopFactory>,
-    /// Concrete memory store for runtime embedder rewire (Settings → Memory).
-    /// `pub(crate)` so console mode can start the deferred background embedder
-    /// load (the GUI's setup hook does the same; console mode has no Tauri).
-    pub memory_store: Option<Arc<MemoryStore>>,
+    /// The agent-facing memory funnel (G8): the dyn handle the factory,
+    /// the memory tools, and the loop instrumentation talk to — the
+    /// engine's OWN store when built from the backend enum, the INJECTED
+    /// store ([`crate::headless::EngineBuilder::memory_store`]) when one
+    /// was supplied.
+    pub memory_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+    /// The engine's OWN concrete store (backend-enum builds only; `None`
+    /// for an injected G8 store): the embedder machinery (the startup
+    /// load, the rewire swaps), the debug API (`MemoryApi`), the kNN
+    /// overlay, and `Setup::for_engine`'s live handles read THIS slot —
+    /// an injected store owns its embedding + its debug surface.
+    /// `pub(crate)` for the same reasons the old single field was.
+    pub(crate) own_memory_store: Option<Arc<MemoryStore>>,
     /// The resolved kernel workspace (2c.3 G3): the root + the state dir.
     /// The brain no longer holds the app's Project (the kernel facade must
     /// not import it) — the consumers build their own app-side Project.
@@ -244,6 +253,11 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             memory_enabled: true,
             memory_path: None,
             index_codegraph: want_codegraph,
+            // G8: the app path never injects — the backend enum is its
+            // only source (and no shared resources: one process, one
+            // engine).
+            injected_store: None,
+            shared: None,
         },
     )
     .map(BrainOutcome::Ready)
@@ -270,6 +284,47 @@ pub(crate) struct BrainMemoryOptions {
     /// config's `codegraph`; the headless Engine passes
     /// EngineOptions.index_codegraph).
     pub index_codegraph: bool,
+    /// G8 (§5.9.8 :726-728): the Rust-only INJECTED store — overrides the
+    /// backend wiring entirely (the serde `MemoryBackend` enum stays the
+    /// wire). `None` = build from `memory_enabled`/`memory_path` as today.
+    pub injected_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+    /// G8 (§5.9.8 :729-731): process-shared resources (the embedder) —
+    /// N engines over one handle hold ONE instance.
+    pub shared: Option<Arc<SharedResources>>,
+}
+
+/// Process-shared resources (G8, §5.9.8 :729-731) — Rust-only, injected
+/// via [`crate::headless::EngineBuilder::shared_resources`]: state that N
+/// engines in ONE process should hold exactly once, so N tenants don't
+/// load N copies of the (large) embedder model. Today that is the
+/// embedder; the HTTP client pool + model-catalog cache slots ride the
+/// provider rework (no per-engine state exists to share yet — documented
+/// in the job-4 landing notes).
+///
+/// When the shared embedder's model matches the one an engine resolved,
+/// the SHARED instance becomes that engine's store embedder and the
+/// per-engine background load/download is dropped (the copy is already in
+/// process — the N-copies guarantee). A mismatched shared embedder is
+/// ignored (the engine's config stays faithful).
+pub struct SharedResources {
+    embedder: Option<Arc<dyn crate::memory::embedder::Embedder>>,
+}
+
+impl SharedResources {
+    /// An empty handle (no shared embedder).
+    pub fn new() -> Self {
+        Self { embedder: None }
+    }
+
+    /// Set the shared embedder (builder-style).
+    pub fn with_embedder(mut self, embedder: Arc<dyn crate::memory::embedder::Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    fn embedder(&self) -> Option<Arc<dyn crate::memory::embedder::Embedder>> {
+        self.embedder.clone()
+    }
 }
 
 pub(crate) fn wire_brain(
@@ -285,6 +340,8 @@ pub(crate) fn wire_brain(
         memory_enabled,
         memory_path,
         index_codegraph,
+        injected_store,
+        shared,
     } = memory;
     // The shared request/response trace log — created first so every provider
     // built below (default, dummy fallback, resolver) records into the same
@@ -452,6 +509,24 @@ pub(crate) fn wire_brain(
             None,
         ),
     };
+    // G8 (§5.9.8 :729-731): the process-shared embedder. When its model
+    // matches the one this engine just resolved, the SHARED instance is
+    // the store's embedder and any background plan is dropped — the
+    // model is already loaded in process, so N engines built over one
+    // [`SharedResources`] hold exactly ONE instance (the N-copies
+    // guarantee). A mismatched shared embedder is ignored: the engine's
+    // own config stays faithful.
+    let (embedder, pending_download, pending_load) =
+        match shared.as_ref().and_then(|s| s.embedder()) {
+            Some(se) if se.model_id() == embedder.model_id() => {
+                *embedder_status
+                    .write()
+                    .expect("embedder status lock poisoned") =
+                    crate::memory::embedder::EmbedderStatus::Ready;
+                (se, None, None)
+            }
+            _ => (embedder, pending_download, pending_load),
+        };
 
     // The optional Laya classifier (opt-in; disabled by default). Built only
     // when [general.laya] enables it — otherwise `None` with
@@ -481,25 +556,42 @@ pub(crate) fn wire_brain(
     let tool_choice_flag = Arc::new(std::sync::atomic::AtomicBool::new(
         config.general.general.laya.steer_tool_choice,
     ));
-    let store: Option<Arc<MemoryStore>> = if memory_enabled {
-        let db_path = memory_path.unwrap_or_else(|| workspace.state_dir.join("memory.db"));
-        match MemoryStore::open(&db_path, embedder) {
-            Ok(s) => Some(Arc::new(s)),
-            Err(e) => {
-                eprintln!("warning: failed to open memory store: {e}; using in-memory");
-                Some(Arc::new(
-                    MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap(),
-                ))
-            }
+    // G8 (§5.9.8 :726-728): the Rust-only INJECTED store — overrides the
+    // backend wiring entirely (the serde enum stays the wire). No own
+    // concrete store is opened: the agent funnel (the tools, recall +
+    // consolidation + capture) talks to the injected instance, while the
+    // engine-side embedder machinery, the kNN overlay, the indexer
+    // bootstrap, and `MemoryApi` — all own-store machinery — are inert
+    // (an injected store owns its embedding + its debug surface).
+    let (store, store_trait): (
+        Option<Arc<MemoryStore>>,
+        Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+    ) = match injected_store {
+        Some(injected) => (None, Some(injected)),
+        None => {
+            let store: Option<Arc<MemoryStore>> = if memory_enabled {
+                let db_path = memory_path.unwrap_or_else(|| workspace.state_dir.join("memory.db"));
+                match MemoryStore::open(&db_path, Arc::clone(&embedder)) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        eprintln!("warning: failed to open memory store: {e}; using in-memory");
+                        // G8: the fallback keeps the RESOLVED embedder — a
+                        // fresh hash here would silently drop a shared
+                        // instance (or a configured one).
+                        Some(Arc::new(MemoryStore::open_in_memory(embedder).unwrap()))
+                    }
+                }
+            } else {
+                // 3b.1 (D1): MemoryBackend::Disabled — NO store at all: no
+                // recall, no consolidation, no capture, no memory.db on disk.
+                None
+            };
+            let store_trait = store
+                .as_ref()
+                .map(|store| store.clone() as Arc<dyn crate::memory::MemoryStoreTrait>);
+            (store, store_trait)
         }
-    } else {
-        // 3b.1 (D1): MemoryBackend::Disabled — NO store at all: no
-        // recall, no consolidation, no capture, no memory.db on disk.
-        None
     };
-    let store_trait: Option<Arc<dyn crate::memory::MemoryStoreTrait>> = store
-        .as_ref()
-        .map(|store| store.clone() as Arc<dyn crate::memory::MemoryStoreTrait>);
 
     // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
     // slot plus the `[general.laya] failure_triage` flag mirror. The factory
@@ -1038,7 +1130,7 @@ pub(crate) fn wire_brain(
     let factory = AgentLoopFactory::new(
         provider,
         constitution_source,
-        store_trait,
+        store_trait.clone(),
         sandbox.clone(),
         workspace.root.clone(),
         Some(safety_rules.clone()),
@@ -1155,7 +1247,8 @@ pub(crate) fn wire_brain(
 
     Ok(Brain {
         factory,
-        memory_store: store,
+        memory_store: store_trait,
+        own_memory_store: store,
         workspace,
         config: Arc::new(tokio::sync::Mutex::new(config)),
         sandbox,
@@ -1207,7 +1300,7 @@ impl Brain {
         let Some(model) = self.pending_model_load.clone() else {
             return;
         };
-        let Some(store) = self.memory_store.clone() else {
+        let Some(store) = self.own_memory_store.clone() else {
             return;
         };
         let status = self.embedder_status.clone();

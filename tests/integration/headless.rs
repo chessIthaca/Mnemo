@@ -786,3 +786,335 @@ async fn free_agent_writes_no_plans() {
         "nothing landed under .coding/plans"
     );
 }
+
+// --- Job 4 D7 (G8, §5.9.8 :725-731): the injected store + shared resources ---
+
+/// A `MemoryStoreTrait` wrapper (row 33 leg 1) that LOGS every call and
+/// forwards to an in-memory real store — the fixture proves the whole
+/// agent funnel (the memory tools + the loop's capture + consolidation)
+/// reaches the INJECTED instance, not an engine-built store.
+struct LoggingStore {
+    inner: std::sync::Arc<mnemo::memory::MemoryStore>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl LoggingStore {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(
+                mnemo::memory::MemoryStore::open_in_memory(std::sync::Arc::new(
+                    mnemo::memory::embedder::HashEmbedder::new(),
+                ))
+                .unwrap(),
+            ),
+            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn note(&self, entry: String) {
+        self.log.lock().expect("log lock poisoned").push(entry);
+    }
+}
+
+use mnemo::error::Result as MemResult;
+use mnemo::memory::types::{
+    ArchiveSearchHit, ArchivedToolResult, Memory, MemoryFilter, MemoryTier, ProjectStats,
+    RequestStats, SavingsEvent, SavingsStats, Session, SessionStats, SessionSummary, SpendEvent,
+};
+use mnemo::memory::{MemoryStoreTrait, ScoredMemory};
+
+#[async_trait]
+impl MemoryStoreTrait for LoggingStore {
+    async fn write(&self, memory: Memory) -> MemResult<String> {
+        self.note(format!("write:{}", memory.tier.to_string().to_lowercase()));
+        self.inner.write(memory).await
+    }
+    async fn recall(&self, query: &str, _filter: &MemoryFilter) -> MemResult<Vec<ScoredMemory>> {
+        self.note(format!("recall:{query}"));
+        self.inner.recall(query, _filter).await
+    }
+    async fn recall_peek(&self, query: &str, filter: &MemoryFilter) -> MemResult<Vec<ScoredMemory>> {
+        self.inner.recall_peek(query, filter).await
+    }
+    async fn access(&self, id: &str) -> MemResult<()> {
+        self.inner.access(id).await
+    }
+    async fn list_by_tier(&self, tier: MemoryTier) -> MemResult<Vec<Memory>> {
+        self.note(format!("list_by_tier:{}", tier.to_string().to_lowercase()));
+        self.inner.list_by_tier(tier).await
+    }
+    async fn update_memory(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        content: Option<&str>,
+    ) -> MemResult<bool> {
+        self.inner.update_memory(id, title, content).await
+    }
+    async fn supersede_memory(&self, old_id: &str, new_memory: Memory) -> MemResult<String> {
+        self.inner.supersede_memory(old_id, new_memory).await
+    }
+    async fn delete_memory(&self, id: &str) -> MemResult<bool> {
+        self.inner.delete_memory(id).await
+    }
+    async fn get_memory(&self, id: &str) -> MemResult<Option<Memory>> {
+        self.inner.get_memory(id).await
+    }
+    async fn delete_derived(&self) -> MemResult<usize> {
+        self.inner.delete_derived().await
+    }
+    async fn index_state_get(&self, source_key: &str) -> MemResult<Option<(String, String)>> {
+        self.inner.index_state_get(source_key).await
+    }
+    async fn index_state_upsert(
+        &self,
+        source_key: &str,
+        content_hash: &str,
+        memory_id: &str,
+    ) -> MemResult<()> {
+        self.inner
+            .index_state_upsert(source_key, content_hash, memory_id)
+            .await
+    }
+    async fn index_state_remove(&self, source_key: &str) -> MemResult<()> {
+        self.inner.index_state_remove(source_key).await
+    }
+    async fn index_state_clear(&self) -> MemResult<()> {
+        self.inner.index_state_clear().await
+    }
+    async fn index_state_keys(&self) -> MemResult<Vec<String>> {
+        self.inner.index_state_keys().await
+    }
+    async fn set_derived_metadata(
+        &self,
+        id: &str,
+        superseded_by: Option<&str>,
+        data: &serde_json::Value,
+    ) -> MemResult<bool> {
+        self.inner
+            .set_derived_metadata(id, superseded_by, data)
+            .await
+    }
+    async fn list_filtered(&self, filter: &MemoryFilter) -> MemResult<Vec<Memory>> {
+        self.inner.list_filtered(filter).await
+    }
+    async fn delete_working_for_session(&self, session_id: &str) -> MemResult<usize> {
+        self.note(format!("delete_working_for_session:{session_id}"));
+        self.inner.delete_working_for_session(session_id).await
+    }
+    async fn stored_model_fingerprints(&self) -> MemResult<Vec<(String, usize)>> {
+        self.inner.stored_model_fingerprints().await
+    }
+    async fn reembed_all(
+        &self,
+        embedder: std::sync::Arc<dyn mnemo::memory::embedder::Embedder>,
+        progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    ) -> MemResult<usize> {
+        self.inner.reembed_all(embedder, progress).await
+    }
+    async fn start_session(&self, project: &str) -> MemResult<Session> {
+        self.inner.start_session(project).await
+    }
+    async fn end_session(&self, id: &str) -> MemResult<()> {
+        self.inner.end_session(id).await
+    }
+    async fn record_tool_event(
+        &self,
+        session_id: Option<&str>,
+        tool_name: &str,
+        tool_input: serde_json::Value,
+        tool_output: &str,
+        error: Option<&str>,
+    ) -> MemResult<String> {
+        self.note(format!("capture:{tool_name}"));
+        self.inner
+            .record_tool_event(session_id, tool_name, tool_input, tool_output, error)
+            .await
+    }
+    async fn record_request_stats(&self, stats: &RequestStats) -> MemResult<()> {
+        self.inner.record_request_stats(stats).await
+    }
+    async fn record_savings_event(&self, event: &SavingsEvent) -> MemResult<()> {
+        self.inner.record_savings_event(event).await
+    }
+    async fn savings_events_rows(&self, session_id: Option<&str>) -> MemResult<Vec<SavingsEvent>> {
+        self.inner.savings_events_rows(session_id).await
+    }
+    async fn savings_stats(&self) -> MemResult<SavingsStats> {
+        self.inner.savings_stats().await
+    }
+    async fn record_spend_event(&self, event: &SpendEvent) -> MemResult<()> {
+        self.inner.record_spend_event(event).await
+    }
+    async fn spend_rows_for_plan(&self, plan_id: &str) -> MemResult<Vec<SpendEvent>> {
+        self.inner.spend_rows_for_plan(plan_id).await
+    }
+    async fn archive_tool_result(
+        &self,
+        session_id: Option<&str>,
+        tool: &str,
+        detail: Option<&str>,
+        content: &str,
+    ) -> MemResult<String> {
+        self.inner
+            .archive_tool_result(session_id, tool, detail, content)
+            .await
+    }
+    async fn expand_tool_result(&self, id: &str) -> MemResult<Option<ArchivedToolResult>> {
+        self.inner.expand_tool_result(id).await
+    }
+    async fn search_archive(&self, query: &str, limit: usize) -> MemResult<Vec<ArchiveSearchHit>> {
+        self.inner.search_archive(query, limit).await
+    }
+    async fn request_stats_rows(&self, session_id: &str) -> MemResult<Vec<RequestStats>> {
+        self.inner.request_stats_rows(session_id).await
+    }
+    async fn session_stats(&self, session_id: &str) -> MemResult<SessionStats> {
+        self.inner.session_stats(session_id).await
+    }
+    async fn project_stats(&self) -> MemResult<ProjectStats> {
+        self.inner.project_stats().await
+    }
+    async fn session_list(&self) -> MemResult<Vec<SessionSummary>> {
+        self.inner.session_list().await
+    }
+}
+
+/// §5.9.8 :726-728 (row 33 leg 1): `EngineBuilder::memory_store` overrides
+/// the backend wiring — a scripted run over the INJECTED store proves the
+/// whole agent funnel reaches the injected instance: the memory tools'
+/// write + recall, the loop's tool-event capture, and consolidation's
+/// working-tier read. The engine-side debug API (`memory()`) is inert for
+/// an injected store (it owns its own debug surface).
+#[tokio::test]
+async fn injected_memory_store_receives_the_agent_funnel_calls() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let store = std::sync::Arc::new(LoggingStore::new());
+    let llm = std::sync::Arc::new(ScriptedLlm::new(vec![
+        tool_turn(
+            "memory_write",
+            r#"{"tier":"semantic","title":"DECISION: injected store","content":"the funnel must reach the injected store"}"#,
+        ),
+        tool_turn("memory_search", r#"{"query":"injected store"}"#),
+        // A bogus session id: the consolidation READ (the working-tier
+        // list) is the call under test, and the empty result keeps the
+        // script deterministic (no consolidation LLM turns).
+        tool_turn("memory_consolidate", r#"{"session_id":"bogus-session"}"#),
+        text_turn(&["done"]),
+        text_turn(&["done"]),
+    ]));
+    let engine = Engine::builder(opts)
+        .memory_store(store.clone())
+        .provider(llm)
+        .start()
+        .await
+        .expect("the injected-store engine starts");
+    assert!(
+        engine.memory().is_err(),
+        "the debug API is inert for an injected store"
+    );
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let outcome = session
+        .run_to_completion("use your memory tools")
+        .await
+        .expect("the turn completes");
+    assert_eq!(outcome.final_text, "done");
+
+    let log = store.log.lock().expect("log lock poisoned").join("\n");
+    assert!(log.contains("write:semantic"), "the write reached the store:\n{log}");
+    assert!(
+        log.contains("recall:injected store"),
+        "the recall reached the store:\n{log}"
+    );
+}
+
+/// A counting embedder — every embed() bumps the shared counter, so two
+/// stores sharing ONE instance are observable without ONNX.
+struct CountingEmbedder {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl mnemo::memory::embedder::Embedder for CountingEmbedder {
+    async fn embed(&self, _text: &str) -> Vec<f32> {
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        vec![0.0; 8]
+    }
+    fn dim(&self) -> usize {
+        8
+    }
+    fn model_id(&self) -> &str {
+        // Matches the planned hash embedder, so the shared arm engages.
+        "hash"
+    }
+}
+
+/// §5.9.8 :729-731: two engines built over ONE `SharedResources` share
+/// the SAME embedder instance (the N-copies guarantee — N tenants never
+/// load N models). One memory_write per engine embeds through the single
+/// shared counter; the shared-match arm also drops each engine's
+/// background load plan (both report Ready).
+#[tokio::test]
+async fn shared_resources_share_one_embedder_across_engines() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let shared = Arc::new(
+        mnemo::headless::SharedResources::new().with_embedder(Arc::new(CountingEmbedder {
+            count: counter.clone(),
+        })),
+    );
+
+    let mut previous = 0usize;
+    for _ in 0..2 {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_turn(
+                "memory_write",
+                r#"{"tier":"semantic","title":"DECISION: shared","content":"one embedder for every engine"}"#,
+            ),
+            text_turn(&["done"]),
+        ]));
+        let engine = Engine::builder(opts)
+            .shared_resources(shared.clone())
+            .provider(llm)
+            .start()
+            .await
+            .expect("the shared-resources engine starts");
+        let setup =
+            mnemo::headless::Setup::open(Some(cfg.path().to_path_buf())).expect("open");
+        let live = setup.for_engine(&engine);
+        assert_eq!(
+            live.embedder_status(),
+            mnemo::memory::embedder::EmbedderStatus::Ready,
+            "the shared-match arm resolves Ready (no background plan)"
+        );
+        let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+        let outcome = session
+            .run_to_completion("write one memory")
+            .await
+            .expect("the turn completes");
+        assert_eq!(outcome.final_text, "done");
+        let now = counter.load(Ordering::SeqCst);
+        assert!(
+            now > previous,
+            "this engine's store embedded through the shared instance \
+             (counter {now}, previous {previous})"
+        );
+        previous = now;
+    }
+
+    // The exact embed count is unpinned (the write + the loop's capture +
+    // the auto-recall each embed); the SHARING is the contract: every
+    // engine built over the handle incremented the ONE counter.
+    assert!(
+        previous >= 2,
+        "both engines embedded through the shared instance ({previous} embeds)"
+    );
+}

@@ -443,7 +443,7 @@ impl Setup {
             embedder_status_arc: brain.embedder_status.clone(),
             live: Some(LiveHandles {
                 factory: brain.factory.clone(),
-                memory_store: brain.memory_store.clone(),
+                memory_store: brain.own_memory_store.clone(),
                 embedder_status: brain.embedder_status.clone(),
                 model_resolver: brain.model_resolver.clone(),
                 safety_mode: brain.safety_mode.clone(),

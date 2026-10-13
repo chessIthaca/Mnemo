@@ -604,3 +604,54 @@ catalog, the hash-sentinel paths).
   `match`, the no-feature `let _ = &cache_dir`, the gated mapper, and
   the fixtures (`write_ready_config(dir)` takes the dir and returns
   `()`; one `EmbedderStatus` import was already present from D1).
+### 4.7 — D7 landed (2026-10-13): G8 — memory_store + SharedResources
+
+The Rust-only injection seams (§5.9.8 :725-731) — the backend enum
+stays the serde wire; the builder carries what serde cannot. Battery:
+workspace green, exit 0 — integration 75 → 77.
+
+- `EngineBuilder` (engine.rs) gains `.memory_store(Arc<dyn
+  MemoryStoreTrait>)` (G8 :726-728 — overrides the backend wiring
+  entirely; the agent funnel — the memory tools, recall +
+  consolidation + the loop's tool-event capture — talks to the
+  injected instance) and `.shared_resources(Arc<SharedResources>)`
+  (:729-731). `Engine::start(opts)` stays the thin no-injection path.
+- NEW `SharedResources` (brain.rs, re-exported from `headless`):
+  process-shared state N engines hold ONCE. Lands with the embedder
+  slot — the REAL N-copies seam; the HTTP pool + model-catalog cache
+  slots ride the provider rework (no per-engine state exists to share
+  today — documented deviation). When the shared embedder's
+  `model_id()` matches the engine's just-resolved one, the SHARED
+  instance becomes the store's embedder AND the background
+  load/download plan is DROPPED (the copy is already in process) —
+  status flips Ready. A mismatched shared embedder is ignored (the
+  engine's config stays faithful).
+- The Brain field split: `memory_store: Option<Arc<dyn
+  MemoryStoreTrait>>` (the agent funnel — the factory, the tools, the
+  capture) + `own_memory_store: Option<Arc<MemoryStore>>` (the
+  engine's own concrete store: the embedder machinery, MemoryApi, the
+  kNN overlay, `Setup::for_engine`'s live handles — `None` for an
+  injected store, which owns its embedding + debug surface).
+  `BrainMemoryOptions` carries `injected_store` + `shared` (the app
+  path passes None/None — byte-identical). The sqlite-open FALLBACK
+  now keeps the RESOLVED embedder (a fresh hash silently dropped a
+  shared/configured instance — found by the fixture).
+- Consumers rewired: `Engine::memory()` errors `memory_disabled` for
+  injected stores (documented); `Setup::for_engine`'s LiveHandles +
+  main.rs's IpcState wiring + the two startup hooks read
+  `own_memory_store`.
+- Fixtures (2, in headless.rs — the scripted-provider home): a 36-
+  method `LoggingStore` wrapper (row 33 leg 1) proves the injected
+  store receives write/recall (the `memory_search` tool — the
+  registered name, NOT "memory_recall")/the loop's capture/and the
+  consolidation working-tier read, + `memory()` inert;
+  `CountingEmbedder` (dim 8, model "hash") proves two engines over
+  ONE handle embed through the SAME instance (each engine increments;
+  the exact count is unpinned — the write + the capture + the
+  auto-recall each embed) + the shared-match arm reports Ready.
+- En-route fixes: `store_trait.clone()` at the factory (moved twice),
+  `ScoredMemory` lives at the memory root (not `types`), `for_engine`
+  is a method on an opened Setup, the multi_edit ambiguity (main.rs's
+  two identical `if let` lines — count: 2), and the fixture tool
+  name. The bare-tempdir sqlite fallback (`no .coding/ dir`) is the
+  codebase norm — the fallback-embedder fix makes it honest.

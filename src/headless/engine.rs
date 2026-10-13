@@ -80,6 +80,8 @@ pub struct Engine {
 pub struct EngineBuilder {
     opts: EngineOptions,
     provider: Option<Arc<dyn LlmClient>>,
+    memory_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+    shared: Option<Arc<crate::host::brain::SharedResources>>,
 }
 
 impl EngineBuilder {
@@ -88,6 +90,8 @@ impl EngineBuilder {
         Self {
             opts,
             provider: None,
+            memory_store: None,
+            shared: None,
         }
     }
 
@@ -99,9 +103,31 @@ impl EngineBuilder {
         self
     }
 
+    /// G8 (§5.9.8 :726-728): inject the memory store — Rust-only (the
+    /// serde `MemoryBackend` enum stays the wire). Overrides the backend
+    /// wiring entirely: the agent funnel (the memory tools, recall +
+    /// consolidation + capture, the loop's tool-event capture) talks to
+    /// the injected instance. The engine's own embedder machinery /
+    /// debug API / kNN overlay are inert for it (an injected store owns
+    /// its embedding + its debug surface).
+    pub fn memory_store(mut self, store: Arc<dyn crate::memory::MemoryStoreTrait>) -> Self {
+        self.memory_store = Some(store);
+        self
+    }
+
+    /// G8 (§5.9.8 :729-731): process-shared resources — when the shared
+    /// embedder's model matches the engine's resolved one, the SHARED
+    /// instance is the store's embedder and the background load/download
+    /// is dropped, so N engines over one handle hold ONE model instance
+    /// (N tenants never load N copies).
+    pub fn shared_resources(mut self, shared: Arc<crate::host::brain::SharedResources>) -> Self {
+        self.shared = Some(shared);
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
-        start_inner(self.opts, self.provider).await
+        start_inner(self.opts, self.provider, self.memory_store, self.shared).await
     }
 }
 
@@ -389,11 +415,13 @@ impl Engine {
     /// §5.6's memory data API — the debug/read + maintenance surface,
     /// ONE implementation shared with the app's IPC commands. Errors
     /// code `memory_disabled` when `EngineOptions.memory` was
-    /// `Disabled` (no store: no recall, no consolidation, no capture).
+    /// `Disabled` (no store: no recall, no consolidation, no capture) —
+    /// and for a G8-injected store: an injected store owns its debug
+    /// surface, so no engine-side `MemoryApi` is built over it.
     pub fn memory(&self) -> Result<MemoryApi, EngineError> {
         let store = self
             .brain
-            .memory_store
+            .own_memory_store
             .clone()
             .ok_or_else(EngineError::memory_disabled)?;
         Ok(MemoryApi::from_parts(
@@ -462,6 +490,8 @@ impl Engine {
 async fn start_inner(
     opts: EngineOptions,
     provider: Option<Arc<dyn LlmClient>>,
+    injected_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
+    shared: Option<Arc<crate::host::brain::SharedResources>>,
 ) -> Result<Engine, EngineError> {
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
@@ -549,6 +579,8 @@ async fn start_inner(
             memory_enabled,
             memory_path,
             index_codegraph: opts.index_codegraph,
+            injected_store,
+            shared,
         },
     )
     .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;

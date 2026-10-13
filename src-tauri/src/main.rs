@@ -624,7 +624,7 @@ fn main() {
                                 std::collections::HashMap::new(),
                             )),
                             factory: Some(brain.factory.clone()),
-                            memory_store: brain.memory_store.clone(),
+                            memory_store: brain.own_memory_store.clone(),
                             safety_mode: brain.safety_mode.clone(),
                             safety_rules: Some(brain.safety_rules.clone()),
                             model_resolver: Some(brain.model_resolver.clone()),
@@ -707,7 +707,7 @@ fn main() {
                     // real embedder into the live store + re-embeds rows, so
                     // semantic recall goes live without a restart.
                     if let Some(model) = &brain.pending_model_download {
-                        if let Some(store) = &brain.memory_store {
+                        if let Some(store) = &brain.own_memory_store {
                             ipc::embeddings::spawn_startup_download(
                                 app.handle().clone(),
                                 store.clone(),
@@ -723,7 +723,7 @@ fn main() {
                     // store + re-embed rows (the same install path as the
                     // download, minus the network).
                     if let Some(model) = &brain.pending_model_load {
-                        if let Some(store) = &brain.memory_store {
+                        if let Some(store) = &brain.own_memory_store {
                             ipc::embeddings::spawn_startup_load(
                                 app.handle().clone(),
                                 store.clone(),

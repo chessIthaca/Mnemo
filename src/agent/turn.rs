@@ -3764,6 +3764,31 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
     }
 
+    /// Fan one live `AgentEvent` on the injected route (§5.7, job 3b.4) —
+    /// the sync-method bridge for the loop's persistence sites: the live
+    /// `Savings` / `Spend` events ride the same bounded fan-in the turn's
+    /// async paths already announce on, emitted at exactly the points where
+    /// their ledger rows persist. Fire-and-forget: a missing route
+    /// (directly-built test loops), no `agent_id`, or a bounded-full
+    /// fan-in drops the event — live telemetry is best-effort and the turn
+    /// never blocks on it (the store rows are the durable truth). The
+    /// routing tuple mirrors every other fan-in send in the runtime (the
+    /// loop's own `agent_id`, the event).
+    fn emit_live_event(&self, event: AgentEvent) {
+        let Some(tx) = &*self.event_fanin.lock().expect("event_fanin lock poisoned")
+        else {
+            return;
+        };
+        let Some(agent_id) = *self.agent_id.lock().expect("agent_id lock poisoned")
+        else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send((agent_id, event)).await;
+        });
+    }
+
     /// Record one per-decision spend row (backlog a25a5323) — the budget
     /// layer's ledger. Fire-and-forget through the shared store (mirrors
     /// [`record_stats_row`](Self::record_stats_row)); the per-plan counters
@@ -3785,6 +3810,18 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         self.with_plan_spend(|spend| {
             spend.note_plan(&attr.plan_id);
             spend.note_tokens(prompt_tokens as u64, completion_tokens as u64);
+        });
+        // Live event (§5.7, job 3b.4): fan the `Spend` at the point the row
+        // persists — attribution-gated like the ledger (the early return
+        // above), but not store-gated: the inline counters above update the
+        // same way, and a memory-Disabled session's live budget totals still
+        // count (the durable row is the store's half alone).
+        self.emit_live_event(AgentEvent::Spend {
+            model: provider.model().to_string(),
+            lane: attr.lane.clone(),
+            tokens_in: prompt_tokens as i64,
+            tokens_out: completion_tokens as i64,
+            cached_tokens: cached_tokens.map(|c| c as i64),
         });
         let Some(store) = &self.memory else {
             return;
@@ -3858,6 +3895,17 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             measured,
             created_at: now_epoch,
         };
+        // Live event (§5.7, job 3b.4): fan the `Savings` at the point the
+        // ledger row persists — un-gated by the store, mirroring the
+        // in-memory counters above (the durable row is the store's half
+        // alone).
+        self.emit_live_event(AgentEvent::Savings {
+            kind: kind.to_string(),
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before - tokens_after,
+            measured,
+        });
         if let Some(store) = &self.memory {
             let store = Arc::clone(store);
             tokio::spawn(async move {

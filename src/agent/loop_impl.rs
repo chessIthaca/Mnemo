@@ -269,6 +269,21 @@ pub struct AgentLoop {
     /// `None` until the factory assigns it at build time (and for tests that
     /// construct a loop directly without an id).
     pub(crate) agent_id: std::sync::Mutex<Option<crate::runtime::AgentId>>,
+    /// The live event fan-in route (§5.7, job 3b.4): a clone of the agent
+    /// task's own fan-in sender, injected by `AgentTask::run` on entry — the
+    /// ONE task body every spawn path (GUI, console, headless host, tests)
+    /// funnels through. Lets the loop's SYNC persistence methods
+    /// (`record_spend_row` / `record_savings_event` in turn.rs) fan the live
+    /// `Spend` / `Savings` events from exactly the points where their ledger
+    /// rows persist, without threading a sender parameter through every
+    /// helper (the async turn paths carry `fanin_tx` as a parameter
+    /// instead). `None` for directly-built test loops that no runtime task
+    /// drives — the live events then simply don't fan (the store writes are
+    /// unaffected). The routing id comes from
+    /// [`agent_id`](Self::agent_id), so the emission always carries the
+    /// loop's own id.
+    pub(crate) event_fanin:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>>>,
     /// Whether plan-mutation tools are allowed on this agent's workflow.
     /// False for sub-agents spawned via the tool (Phase 4 policy). Used both
     /// to filter schemas (so the model is not offered the tools) and as a
@@ -966,6 +981,20 @@ impl AgentLoop {
             .apply(limits);
     }
 
+    /// Inject the live fan-in route (§5.7, job 3b.4) — called by the agent
+    /// task on entry (`AgentTask::run`, runtime/agent.rs), the ONE task body
+    /// every spawn path funnels through, so the sync persistence methods'
+    /// live `Savings`/`Spend` emissions ride this same task's fan-in
+    /// sender. Mirrors the other post-build setters (`set_limits`,
+    /// `set_permission`): the sender is minted per spawn, so it cannot
+    /// flow through the constructor.
+    pub(crate) fn set_event_fanin(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>,
+    ) {
+        *self.event_fanin.lock().expect("event_fanin lock poisoned") = Some(tx);
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -1008,6 +1037,7 @@ impl AgentLoop {
             vision,
             session: SessionState::new(),
             agent_id: std::sync::Mutex::new(None),
+            event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
             model_resolver: None,
             is_subagent: std::sync::Mutex::new(false),

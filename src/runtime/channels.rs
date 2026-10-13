@@ -25,6 +25,10 @@ use crate::tool::ToolResult;
 /// A unique agent identifier.
 pub type AgentId = u64;
 
+/// The fan-in channel's item type: the emitting agent's id paired with the
+/// event it fans in — the pair every fan-in send/receive carries.
+pub type FaninItem = (AgentId, AgentEvent);
+
 /// One clickable option in an `ask_user` question.
 ///
 /// `label` is the short text on the button; `description` is an optional
@@ -290,6 +294,53 @@ pub enum AgentEvent {
         /// app-side spawn seed — the frontend reads an absent grade as
         /// "unchanged", so the popup keeps the last one instead of blanking.
         quality: Option<crate::agent::optimizer::QualityReport>,
+    },
+    /// A token-savings ledger event fanned LIVE (§5.7, job 3b.4): one
+    /// context-optimization lever's outcome, emitted by
+    /// `record_savings_event` at exactly the point its ledger row
+    /// persists — before, what was about to enter the context; after,
+    /// what actually entered. Display-only telemetry, no turn effect:
+    /// the GUI forwarder drops it (R8 — never on the transcript); the
+    /// headless side tallies live totals from it; the durable ledger
+    /// row is the memory store's half alone.
+    Savings {
+        /// The lever that produced the event: `truncation`, `compaction`,
+        /// `delta_read`, `skeleton`, `compression`, `archive`,
+        /// `archive_expand`, or `compaction_checkpoint`.
+        kind: String,
+        /// Token count of the original form (what would have entered the
+        /// context). Non-negative.
+        tokens_before: i64,
+        /// Token count of the served form (what actually entered the
+        /// context). Non-negative.
+        tokens_after: i64,
+        /// `tokens_before - tokens_after`. Negative for a re-expansion
+        /// (an `archive_expand` re-adds archived content).
+        tokens_saved: i64,
+        /// Whether the counts come from a metered source
+        /// (provider-reported usage) or an estimate (the chars-per-token
+        /// heuristics).
+        measured: bool,
+    },
+    /// A per-decision spend ledger event fanned LIVE (§5.7, job 3b.4):
+    /// the budget layer's bill for ONE request, emitted by
+    /// `record_spend_row` at exactly the point its ledger row persists.
+    /// Attribution-gated like the ledger (no plan, no event);
+    /// display-only telemetry, no turn effect — the GUI forwarder drops
+    /// it (R8); the headless side tallies live budget totals from it.
+    Spend {
+        /// The model that served the request (the effective model id).
+        model: String,
+        /// The lane the request ran on (`cheap` / `medium` / `high` /
+        /// `escalate`), when a lane decision applied.
+        lane: Option<String>,
+        /// Input tokens (prompt side).
+        tokens_in: i64,
+        /// Output tokens (completion side).
+        tokens_out: i64,
+        /// Prompt tokens served from the provider's cache (a subset of
+        /// `tokens_in`). `None` when the provider never reported usage.
+        cached_tokens: Option<i64>,
     },
     /// The workflow state changed. `state` is the state TOKEN (the
     /// neutral handle's opaque representation since 2b.3 — the same Debug
@@ -650,6 +701,30 @@ pub enum SerializableAgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<crate::agent::optimizer::QualityReport>,
     },
+    /// A live token-savings ledger event. See
+    /// [`AgentEvent::Savings`].
+    Savings {
+        /// The lever that produced the event — the ledger row's `kind`
+        /// column (truncation, compaction, archive, `archive_expand`, …).
+        /// Not named `kind` here: that's the enum's tag key, and serde
+        /// rejects a variant field named like the tag.
+        lever: String,
+        tokens_before: i64,
+        tokens_after: i64,
+        tokens_saved: i64,
+        measured: bool,
+    },
+    /// A live per-decision spend ledger event. See
+    /// [`AgentEvent::Spend`].
+    Spend {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lane: Option<String>,
+        tokens_in: i64,
+        tokens_out: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_tokens: Option<i64>,
+    },
     WorkflowStateChanged {
         /// The state token (the neutral handle's opaque representation since
         /// 2b.3 — mirrors [`AgentEvent::WorkflowStateChanged`]).
@@ -904,6 +979,40 @@ impl AgentEvent {
                     max,
                     breakdown,
                     quality,
+                },
+                approval_sender: None,
+                question_sender: None,
+            },
+            AgentEvent::Savings {
+                kind,
+                tokens_before,
+                tokens_after,
+                tokens_saved,
+                measured,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::Savings {
+                    lever: kind,
+                    tokens_before,
+                    tokens_after,
+                    tokens_saved,
+                    measured,
+                },
+                approval_sender: None,
+                question_sender: None,
+            },
+            AgentEvent::Spend {
+                model,
+                lane,
+                tokens_in,
+                tokens_out,
+                cached_tokens,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::Spend {
+                    model,
+                    lane,
+                    tokens_in,
+                    tokens_out,
+                    cached_tokens,
                 },
                 approval_sender: None,
                 question_sender: None,

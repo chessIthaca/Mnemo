@@ -805,6 +805,14 @@ impl AgentTask {
         mut cmd_rx: mpsc::Receiver<AgentCommand>,
         fanin_tx: mpsc::Sender<(AgentId, AgentEvent)>,
     ) {
+        // Job 3b.4 (§5.7): inject the live fan-in route — a clone of this
+        // task's own sender — so the loop's sync persistence methods
+        // (`record_spend_row` / `record_savings_event`) can fan the live
+        // `Spend`/`Savings` events from their durability points. run() is
+        // the ONE task body every spawn path funnels through (GUI spawn,
+        // console, headless host, tests), so this one line covers them all;
+        // every explicit send below keeps carrying `self.id` as before.
+        self.agent_loop.set_event_fanin(fanin_tx.clone());
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 AgentCommand::ExportHistory { reply } => {

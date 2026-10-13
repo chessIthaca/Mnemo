@@ -433,6 +433,19 @@ pub fn spawn(
                 break;
             };
 
+            // R8 (§9, job 3b.4): the live `Savings`/`Spend` ledger events
+            // are display-only telemetry fanned from the loop's persistence
+            // sites — their consumers are the durable ledger + the headless
+            // stats surfaces, never the transcript. Drop them BEFORE the
+            // serialization/diag path: no wire emit, no watchdog ring
+            // entry, no delta-batcher disturbance.
+            if matches!(
+                event,
+                AgentEvent::Savings { .. } | AgentEvent::Spend { .. }
+            ) {
+                continue;
+            }
+
             let SerializedEvent {
                 event: serial,
                 approval_sender,

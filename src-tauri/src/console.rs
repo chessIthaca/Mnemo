@@ -395,6 +395,11 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
                 truncate(description, 160)
             )])
         }
+        // R8 (§9, job 3b.4): the live `Savings`/`Spend` ledger events are
+        // display-only telemetry — the console (like the GUI forwarder)
+        // never prints them; the durable ledger + the stats pulls are
+        // their consumers.
+        AgentEvent::Savings { .. } | AgentEvent::Spend { .. } => Rendered::Silent,
     }
 }
 

@@ -3070,6 +3070,185 @@ async fn run_turn_records_request_stats_on_usage() {
 }
 
 #[tokio::test]
+async fn savings_and_spend_emitted_where_persisted() {
+    // Job 3b.4 (§5.7): the two persistence methods fan the live
+    // `Savings`/`Spend` events at exactly the points their ledger rows
+    // persist — same store, same numbers, attribution-gated like the
+    // ledger. The live feed itself is NOT gated by the store: with none
+    // attached the events still fan (the durable rows are the store's
+    // half alone).
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let provider = Arc::new(MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta { text: "hi".into() },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]]));
+    let expected_model = provider.model().to_string();
+
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider: provider.clone(),
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    // The route the agent task injects in production (`AgentTask::run`),
+    // plus the id `build_with_id` assigns — the test mirrors both, then
+    // drives the persistence methods directly (they ARE the §5.7 emission
+    // contract).
+    *agent.agent_id.lock().expect("agent_id lock poisoned") = Some(7);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
+    agent.set_event_fanin(fanin_tx);
+
+    // — Spend: stamp the attribution the way run_turn does per
+    // plan-scoped iteration, then the usage site's persistence call. The
+    // row + the live event co-land.
+    agent.set_spend_attribution(crate::agent::budget::SpendAttribution {
+        plan_id: "plan-1".into(),
+        turn_id: "turn-1".into(),
+        step_index: Some(0),
+        lane: Some("medium".into()),
+        reason: crate::agent::budget::BudgetReason::Route,
+    });
+    agent.record_spend_row(None, provider.as_ref(), 1000, 200, Some(800));
+
+    // — Savings: the lever's ledger row + the live event co-land.
+    agent.record_savings_event(None, "archive", Some("detail-1".into()), 500, 200, false);
+
+    // The live events, in launch order (current-thread runtime: the
+    // first-spawned send completes first), carrying the loop's own id.
+    let (spend_id, spend_event) = fanin_rx.recv().await.expect("the live Spend event");
+    assert_eq!(spend_id, 7, "the live events carry the loop's own agent id");
+    let AgentEvent::Spend {
+        model,
+        lane,
+        tokens_in,
+        tokens_out,
+        cached_tokens,
+    } = spend_event
+    else {
+        panic!("expected the live Spend first, got {spend_event:?}");
+    };
+    assert_eq!(model, expected_model);
+    assert_eq!(lane, Some("medium".into()));
+    assert_eq!(tokens_in, 1000);
+    assert_eq!(tokens_out, 200);
+    assert_eq!(cached_tokens, Some(800));
+
+    let (savings_id, savings_event) = fanin_rx.recv().await.expect("the live Savings event");
+    assert_eq!(savings_id, 7);
+    let AgentEvent::Savings {
+        kind,
+        tokens_before,
+        tokens_after,
+        tokens_saved,
+        measured,
+    } = savings_event
+    else {
+        panic!("expected the live Savings second, got {savings_event:?}");
+    };
+    assert_eq!(kind, "archive");
+    assert_eq!(tokens_before, 500);
+    assert_eq!(tokens_after, 200);
+    assert_eq!(tokens_saved, 300);
+    assert!(!measured);
+
+    // The durable rows co-landed at the same emission points (the writes
+    // are spawned; the awaited receives yield them — the precedent tests
+    // sleep 100ms for the same reason).
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rows = store.spend_rows_for_plan("plan-1").await.unwrap();
+    assert_eq!(rows.len(), 1, "the durable spend row co-lands");
+    assert_eq!(rows[0].tokens_in, 1000);
+    assert_eq!(rows[0].tokens_out, 200);
+    assert_eq!(rows[0].cached_tokens, Some(800));
+    assert_eq!(rows[0].lane.as_deref(), Some("medium"));
+    assert_eq!(
+        rows[0].reason,
+        crate::agent::budget::BudgetReason::Route.wire_label(),
+    );
+    let savings_rows = store.savings_events_rows(None).await.unwrap();
+    assert_eq!(savings_rows.len(), 1, "the durable savings row co-lands");
+    assert_eq!(savings_rows[0].kind, "archive");
+    assert_eq!(savings_rows[0].tokens_before, 500);
+    assert_eq!(savings_rows[0].tokens_after, 200);
+    assert_eq!(savings_rows[0].tokens_saved, 300);
+    assert!(!savings_rows[0].measured);
+
+    // — The no-store leg: the live feed is un-gated (the durable half
+    // gates itself; the live events and the in-memory counters don't).
+    let dir2 = tempdir().unwrap();
+    let workflow2 = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir2.path().join("plans"),
+    )));
+    let sandbox2 = Arc::new(Sandbox::new(dir2.path()).unwrap());
+    let registry2 = make_registry((*sandbox2).clone(), workflow2.clone());
+    let agent2 = AgentLoop::new(
+        AgentLoopConfig {
+            provider: Arc::new(MockProvider::sequence(vec![vec![
+                LlmEvent::TextDelta { text: "hi".into() },
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]])),
+            tools: registry2,
+            workflow: crate::app::workflow::as_handle(workflow2.clone()),
+            sandbox: sandbox2,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: None,
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+    *agent2.agent_id.lock().expect("agent_id lock poisoned") = Some(7);
+    let (fanin_tx2, mut fanin_rx2) = mpsc::channel(64);
+    agent2.set_event_fanin(fanin_tx2);
+    agent2.set_spend_attribution(crate::agent::budget::SpendAttribution {
+        plan_id: "plan-2".into(),
+        turn_id: "turn-2".into(),
+        step_index: None,
+        lane: None,
+        reason: crate::agent::budget::BudgetReason::Default,
+    });
+    agent2.record_spend_row(None, provider.as_ref(), 10, 5, None);
+    agent2.record_savings_event(None, "truncation", None, 300, 100, true);
+    let (_, no_store_spend) = fanin_rx2.recv().await.expect("the no-store Spend");
+    assert!(matches!(no_store_spend, AgentEvent::Spend { .. }));
+    let (_, no_store_savings) = fanin_rx2.recv().await.expect("the no-store Savings");
+    let AgentEvent::Savings {
+        kind,
+        tokens_before,
+        tokens_after,
+        tokens_saved,
+        measured,
+    } = no_store_savings
+    else {
+        panic!("expected the live Savings on the no-store leg, got {no_store_savings:?}");
+    };
+    assert_eq!(kind, "truncation");
+    assert_eq!(tokens_before, 300);
+    assert_eq!(tokens_after, 100);
+    assert_eq!(tokens_saved, 200);
+    assert!(measured);
+}
+
+#[tokio::test]
 async fn cache_heuristic_skipped_after_summarization() {
     // Regression for the over-reporting finding: after a context
     // summarization the conversation prefix is rewritten, so the

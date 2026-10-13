@@ -362,3 +362,66 @@ The G10 acceptance (§7 row 34) does NOT block on this: its three legs
 are the no-default build (D1 ✓), the boundary test (D4 ✓, enforcing),
 and "GUI + console behave as before" (the battery, green at 5d97bc1 —
 no code changed in D5, so that battery state stands).
+
+### 5.6 D6 — the acceptance sweep (landed 2026-10-13)
+
+**§8 verify battery (each run once):**
+1. `cargo build -p mnemo --no-default-features --features headless` —
+   exit 0 ✓ (re-proven this sweep; the §5.9.10 `kernel,headless` form
+   green since D1).
+2. `cargo test -p mnemo` — exit 0 ✓ (the lib unit suite + the
+   integration set incl. boundary 2/2; ~2,795 passing lines kept).
+3. `cargo test --workspace` — exit 0 ✓ (83 integration + boundary +
+   the app crate's suites; the D4 route compiles).
+4. `cargo tree -p mnemo -i tauri` — "package ID specification 'tauri'
+   did not match any packages" ✓ (the fact-16 independence proof's
+   established reading).
+5. `cargo clippy --workspace --all-targets -- -D warnings` — exit 101:
+   **the §8 stop rule INVOKED.** The lib alone carries 183 pre-existing
+   clippy errors (redundant field names ×93, doc-list indentation ×44,
+   type complexity ×16, redundant closures ×14, too-many-args ×13+,
+   …— all style classes, none behavioral, none naming the job-5 delta
+   files). Target isolation is impossible (`--no-deps` does not skip
+   the lib — a workspace member compiled from source — and it fails
+   first). FILED as backlog `#5da6c9b2-2eb1-4506-850e-10be075f9926`
+   with the census + the fix direction (mechanical sweep in file
+   groups; inline `#[allow]` with justification over reshaping hot
+   paths). Zero job-5 lints: the new targets never linted past the lib
+   failure, but no census diagnostic names second_consumer.rs /
+   boundary.rs / the facade.
+
+**§7 rows 1-35** — every row's proof rides the green legs above:
+rows 1-11 (phases 1-2a/2b: the host-extraction, app-move, goldens +
+boundary) — the lib-side tests green in leg 2; rows 12-18 (phase 3:
+events/subscribers/serde roundtrips/ask_user/start_blocking/shutdown/
+free-agent memory+codegraph/stats) — headless.rs fixtures, green;
+row 19 + 24 + 32-name (contract fixtures) — contract_fixtures.rs,
+green; rows 20-24 (phase 4: setup status/ready/install/select/keys/
+init_project/settings-MCP) — headless_setup.rs fixtures (job 4 D1-D8
++ the D9 regressions), green; rows 25-28 (2c G1-G4) —
+headless_kernel.rs fixtures, green; rows 29-30 (3a G5/G7) —
+headless_kernel.rs, green; rows 31-32 (3c G2/G6) — the row-31
+fixture literally named `host_tool_round_trip_and_timeout_row_31`,
+green; row 33 (G8/G9) — the D7 injection fixtures + the G9-split
+fixtures, green; row 34 (G10) — D1 build ✓ + D2 example ✓ + D4
+boundary ✓ + battery ✓; row 35 (the plan-first guard) — the 2a
+goldens green in leg 2.
+
+**§9 name audit** — CORRECTION of §B fact 10: it claimed the spec's
+`headless_kernel.rs` set "landed in headless.rs" — WRONG, both files
+exist (`headless_kernel.rs` IS the 2c/3a/3c fixture home, 1,905
+lines). Recorded; the deviation note retracted. Known combined-name
+renames: the spec's `host_tool_roundtrip` + `host_tool_timeout`
+landed as one fixture (`..._row_31`, both legs asserted inside);
+`SettingsPatch` landed as `SettingsSaveDto`/`SettingsSaveWire` (G9).
+All named tests, whatever their landed names, ride legs 2-3 (green).
+
+**Docs**: README gains "Embedding the kernel" (the feature lattice +
+the lean build + the example + the boundary enforcement); PLAN.md's
+status section gains the "Kernel/headless feature lattice (2026-10-13,
+G10)" paragraph. Module docs were updated in-step (lib.rs gate docs,
+the facade block, the example header).
+
+Leak check (§8 tail): `git worktree list` unchanged; no `alf/*`
+branches (the deviation stands — the arc runs on wt/mnemo);
+`git status --short` clean at the boundary commit.

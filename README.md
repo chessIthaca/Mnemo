@@ -47,6 +47,27 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
 
+## Embedding the kernel
+
+The engine under the app is a library first. Cargo features slice it:
+`kernel` (the core — always compiled), `headless` (the public engine
+surface: `Engine`, `AgentSession`, `Setup`, the `*Api`s; implies
+`kernel`), `app` (the plan-first workflow module graph), plus the
+optional `embeddings` / `browser` heavies. Defaults give library
+consumers the full set; a second consumer builds the lean surface:
+
+```sh
+cargo build -p mnemo --no-default-features --features kernel,headless
+```
+
+`examples/second_consumer.rs` is the ~140-line proof — a NoPolicy
+agent with a non-coding identity, tools narrowed to `[Read, Host]`,
+one host tool the host answers itself, turn limits, every session
+event printed as JSON. The app crate is held to the same public
+surface: `tests/boundary.rs` fails the build if `src-tauri` reaches
+into `mnemo::agent::` / `mnemo::runtime::` / `mnemo::host::`
+internals.
+
 ---
 
 ## The enforced workflow

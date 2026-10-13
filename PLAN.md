@@ -31,6 +31,20 @@ approval-gated coding harness — not a UI swap.
 6 suites) + 21 integration + 92 vitest files / 1319 frontend tests;
 `cargo check` and `tsc --noEmit` clean.
 
+**Kernel/headless feature lattice (2026-10-13, G10).** The library
+now slices into Cargo features — `kernel` (the core, always
+compiled), `headless` (the public engine surface:
+Engine/AgentSession/Setup/*Api; implies `kernel`), `app` (the
+plan-first workflow graph) — with `default = [kernel, app, headless]`
+so the app and the integration tests see zero change. A second
+consumer builds `--no-default-features --features kernel,headless`
+(no app machinery, no embeddings/browser;
+`examples/second_consumer.rs` is the proof). The app crate reaches
+the kernel ONLY through the public surface — `mnemo::headless::*`,
+`mnemo::app::*`, and the curated crate-root re-export facade in
+`src/lib.rs` — enforced by
+`tests/boundary.rs::tauri_uses_only_public_api`.
+
 **Dependency & security posture (2026-09-29).** The dependabot + CodeQL sweep
 (PRs #16–#60) modernized the dependency set and hardened CI: React 19,
 TypeScript 7, Tailwind v4 (`@tailwindcss/postcss`; `autoprefixer` dropped),

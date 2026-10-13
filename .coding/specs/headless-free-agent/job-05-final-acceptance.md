@@ -176,3 +176,33 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
 - Battery `cargo test --workspace` exit 0 (83 integration; defaults =
   today's code set, zero behavior change). src-tauri needed no dep-line
   change (defaults unify automatically).
+
+### 5.2 D2 — examples/second_consumer.rs (landed 2026-10-13)
+
+- NEW `examples/second_consumer.rs` (~140 lines incl. the doc header):
+  the §5.9.10 :744-746 sketch — a NoPolicy free agent (`policy: None`)
+  with a non-coding `PromptSpec` (identity only, `blocks: []`,
+  `ConstitutionMode::None`), tools narrowed to `[Read, Host]` via the
+  guardrails' `ToolSelection`, `SessionLimits { max_turns: 4,
+  wall_clock_ms: 120 s }`, one host tool (`acme_ticket_lookup`) the
+  example answers itself from the event loop, every event printed as
+  JSON (`serde_json::to_string(&ev)` — the same wire the frontend
+  sees), `run_to_completion` + the answer loop joined.
+- Uses ONLY the public surface: `mnemo::headless::*` (Engine/
+  EngineOptions/SpawnOptions/Guardrails/HostToolSpec/SessionLimits/
+  SessionCommand/ToolGroup/ToolSelection), `mnemo::agent::policy::
+  PermissionPolicy`, `mnemo::agent::prompt::{PromptSpec,
+  ConstitutionMode}`, `mnemo::tool::{SafetyLevel, ToolResult}`,
+  `mnemo::runtime::channels::SerializableAgentEvent`,
+  `mnemo::workspace::Workspace` — no `mnemo::app::*`, proving the
+  second-consumer contract by construction.
+- Compile proof: `cargo build --examples --no-default-features
+  --features kernel,headless` exit 0 (one fix en route: `.into()` on a
+  `&str` against `impl Into<String>` is inference-ambiguous with the
+  other `From<&str>` impls in scope — `.to_string()`).
+- Smoke run: with `MNEMO_HOME` set to a bare temp dir the engine gate
+  surfaces CLEANLY — `not_configured` naming exactly what's missing.
+  The configured/mock run rides CI (§9 :924; documented in the example
+  header).
+- Battery `cargo test --workspace` exit 0 (83 integration; the example
+  is a default-features target too — it compiles against the full set).

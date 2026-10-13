@@ -42,8 +42,8 @@ pub use session::AgentSession;
 /// `Setup::set_api_key`.
 pub use crate::config::keys::{KeySource, Secret};
 pub use setup::{
-    EmbedderReadiness, EndpointDto, EndpointReadiness, ProjectReadiness, Setup, SetupEvent,
-    SetupStatus, SetupStep,
+    EmbedderReadiness, EndpointDto, EndpointReadiness, EngineConfig, ProjectReadiness, Setup,
+    SetupEvent, SetupStatus, SetupStep,
 };
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{

@@ -396,4 +396,29 @@ time absent) ✓ (D3), the GUI still reads `[ui]` unchanged ✓ (D3).
   upsert changes nothing; remove drops the key + the default-provider
   guard; the credential chain (overrides win, saved-endpoint fallback,
   unknown endpoint errors).
-- Battery: workspace green, exit 0 (65 integration tests).
+- Battery: workspace green, exit 0 (65 integration tests).### D3 — landed (feat(4.3)): G9 — the EngineConfig/UiConfig split
+
+- The lib patch (`SettingsSaveDto`, settings_dto.rs) LOSES all 14 `[ui]`
+  fields (theme, the show_*/chat_*/sound_* toggles, steering_notes) +
+  the theme validation + the ~75-line `[ui]` application block —
+  compile-time absent (row 33 leg 2: "SettingsPatch cannot set `[ui]`
+  fields"). A wire still carrying them deserializes (serde drops
+  unknown keys) and the apply leaves `[ui]` untouched — pinned by
+  `ui_fields_are_absent_from_the_engine_patch` +
+  `ui_table_survives_an_engine_patch` (the G9 on-disk invariant: a
+  standalone consumer's engine-side save never nukes the GUI's theme).
+- The app owns `[ui]` (ipc/settings.rs): `SettingsSaveWire` = the
+  flattened engine patch + `SettingsUiPatch` (the 14 UI fields) — the
+  FRONTEND PAYLOAD SHAPE IS UNCHANGED (the split is at the type level
+  only); `apply_ui_patch` (moved from the lib) applies the `[ui]` half
+  app-side after the engine patch, with the theme validation BEFORE any
+  application (no partial writes). The moved per-kind steering-notes
+  logic is covered by the app-side test
+  `ui_patch_applies_per_kind_and_validates_theme`.
+- `Setup::settings()` (§5.8 :539) exposes ONLY `EngineConfig` — the
+  `[general]`/`[models]`/`[context]`/`[trace]`/`[memory]`/`[shell_filter]`
+  sections + the endpoints DTO; the `[ui]` table has no field to name.
+  Fixture: `settings_exposes_engine_config_and_preserves_ui`
+  (headless_setup.rs). `endpoint_dto` dedupes the DTO mapping
+  (`endpoints()` + `settings()` share it).
+- Battery: workspace green, exit 0 (66 integration tests).

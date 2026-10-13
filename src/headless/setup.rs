@@ -167,6 +167,31 @@ impl EndpointDto {
     }
 }
 
+/// The engine-relevant config view (G9, §5.9.9 :733-738, job 4 D3) —
+/// what [`Setup::settings`] exposes: every section EXCEPT the
+/// app-owned `[ui]` table (row 33: `[ui]` is read only by src-tauri; a
+/// standalone consumer has no GUI). On disk nothing moves — the same
+/// `config.toml` tables; this view drops the `[ui]` half.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineConfig {
+    /// The `[general]` section — `GeneralSection` holds no `[ui]`
+    /// fields (the `[ui]` table lives beside it in `GeneralConfig`).
+    pub general: crate::config::general::GeneralSection,
+    /// The `[models]` section (the routing/executing/free lanes).
+    pub models: crate::config::general::ModelsConfig,
+    /// The `[context]` section.
+    pub context: crate::config::general::ContextConfig,
+    /// The `[trace]` section.
+    pub trace: crate::config::general::TraceConfig,
+    /// The memory search config (`[memory]`).
+    pub memory: crate::memory::MemorySearchConfig,
+    /// The `[shell_filter]` section.
+    pub shell_filter: crate::config::general::ShellFilterConfig,
+    /// The endpoints (`endpoints.toml`) — the lean [`EndpointDto`]
+    /// wire with key availability.
+    pub endpoints: Vec<EndpointDto>,
+}
+
 /// The semantic-search leg (§5.8 :567): which bundled model is
 /// configured, whether it is installed in the cache, the embedder's
 /// status, and whether semantic (vs. hash-fallback) vectors are live.
@@ -280,6 +305,45 @@ impl Setup {
         self
     }
 
+    /// One endpoint's lean DTO — shared by [`Setup::endpoints`] and
+    /// [`Setup::settings`].
+    fn endpoint_dto(e: &crate::config::Endpoint, has_key: bool) -> EndpointDto {
+        EndpointDto {
+            name: e.name.clone(),
+            kind: crate::config::kind_wire(e.kind).to_string(),
+            base_url: e.base_url.clone(),
+            models: e.models.iter().map(|m| m.id.clone()).collect(),
+            max_context: e.max_context,
+            max_output_tokens: e.max_output_tokens,
+            multimodal: e.multimodal,
+            supports_reasoning_effort: e.supports_reasoning_effort,
+            reasoning_effort: e.reasoning_effort.clone(),
+            workspace_id: e.workspace_id.clone(),
+            has_api_key: has_key,
+        }
+    }
+
+    /// The engine-relevant config (§5.8 :539, G9 §5.9.9) — every
+    /// section EXCEPT the app-owned `[ui]` table (row 33: `Setup`
+    /// exposes only `EngineConfig`).
+    pub fn settings(&self) -> Result<EngineConfig, EngineError> {
+        let config = self.load_config()?;
+        let keys_path = self.config_dir.join("keys.toml");
+        Ok(EngineConfig {
+            general: config.general.general.clone(),
+            models: config.general.models.clone(),
+            context: config.general.context.clone(),
+            trace: config.general.trace.clone(),
+            memory: config.general.memory.clone(),
+            shell_filter: config.general.shell_filter.clone(),
+            endpoints: config
+                .endpoints
+                .iter()
+                .map(|e| Self::endpoint_dto(e, self.key_source.has_key(&keys_path, &e.name)))
+                .collect(),
+        })
+    }
+
     /// Load the config for the endpoints group — one error mapping for
     /// every read.
     fn load_config(&self) -> Result<Config, EngineError> {
@@ -299,19 +363,7 @@ impl Setup {
         Ok(config
             .endpoints
             .iter()
-            .map(|e| EndpointDto {
-                name: e.name.clone(),
-                kind: crate::config::kind_wire(e.kind).to_string(),
-                base_url: e.base_url.clone(),
-                models: e.models.iter().map(|m| m.id.clone()).collect(),
-                max_context: e.max_context,
-                max_output_tokens: e.max_output_tokens,
-                multimodal: e.multimodal,
-                supports_reasoning_effort: e.supports_reasoning_effort,
-                reasoning_effort: e.reasoning_effort.clone(),
-                workspace_id: e.workspace_id.clone(),
-                has_api_key: self.key_source.has_key(&keys_path, &e.name),
-            })
+            .map(|e| Self::endpoint_dto(e, self.key_source.has_key(&keys_path, &e.name)))
             .collect())
     }
 

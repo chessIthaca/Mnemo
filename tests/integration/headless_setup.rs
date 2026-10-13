@@ -387,3 +387,48 @@ fn resolve_endpoint_credentials_shared_chain() {
     )
     .is_err());
 }
+/// G9 (§5.9.9, row 33 leg 2): `Setup::settings()` exposes ONLY
+/// EngineConfig — the app-owned `[ui]` table is absent from the type
+/// (compile-time), and it SURVIVES a standalone engine-side save
+/// ("on disk nothing moves": the GUI's theme rides through an
+/// engine-half upsert untouched).
+#[test]
+fn settings_exposes_engine_config_and_preserves_ui() {
+    let cfg = tempfile::tempdir().unwrap();
+    write_ready_config(cfg.path());
+    // A GUI user's [ui] half in the same file.
+    std::fs::write(
+        cfg.path().join("config.toml"),
+        "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\nbundled_embedding_model = \"hash\"\n\n[ui]\ntheme = \"dark\"\nchat_thread_line = false\n",
+    )
+    .unwrap();
+    let setup = Setup::open(Some(cfg.path().to_path_buf())).unwrap();
+    let settings = setup.settings().expect("settings");
+    // The engine sections are exposed…
+    assert_eq!(settings.general.default_model.as_deref(), Some("test-model"));
+    assert_eq!(settings.endpoints.len(), 1);
+    assert!(settings.endpoints[0].has_api_key);
+    // …and the [ui] table survives a standalone engine-side save (the
+    // type carries no field to touch it — there is nothing to name).
+    setup
+        .upsert_endpoint(
+            EndpointDto {
+                name: "second".into(),
+                kind: "local".into(),
+                base_url: "http://127.0.0.1:9/v1/".into(),
+                models: vec![],
+                max_context: None,
+                max_output_tokens: None,
+                multimodal: false,
+                supports_reasoning_effort: false,
+                reasoning_effort: None,
+                workspace_id: None,
+                has_api_key: false,
+            },
+            None,
+        )
+        .unwrap();
+    let reloaded = mnemo::config::Config::load(cfg.path()).unwrap();
+    assert_eq!(reloaded.general.ui.theme, "dark", "the [ui] table rides through");
+    assert!(!reloaded.general.ui.chat_thread_line);
+}

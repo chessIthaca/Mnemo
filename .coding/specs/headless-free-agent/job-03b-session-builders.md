@@ -126,3 +126,51 @@ Job 3a closed the engine + session surface (review PASS at c38e7b2; master 7/11)
   match); stats()/refresh() Result-threaded like the IPC.
 - Battery: kernel 3006+48, features 3033+48, workspace (3033+48+331+app
   tests), build green; clippy ZERO findings in all seven 3b.2 hunks.
+### 3b.3 (D3) — the startup host events — landed 2027-01-18
+
+- HostEvent gains EmbedderStatus (notifier.rs) — §5.1's sketch also
+  named CodegraphProgress/CodegraphReady, but the sketch is job-1's
+  PRE-landing design ("one variant per existing emit site"); job 1
+  landed that stream as HostEvent::IndexProgress (the 1:1
+  codegraph://index-progress mapping) and wire_brain's startup pass
+  already emits it on the engine's bus. The doc note records the
+  naming resolution; my initially-added duplicate variants were
+  REMOVED (a second stream shape = drift risk).
+- The engine does NOT spawn its own graph pass: wire_brain ALREADY
+  spawns the startup index (brain.rs :882-1022, with the shared
+  notifier). A tail-spawned second pass would double-index AND go
+  tick-silent (the mtime fast path runs 0 waves on an already-indexed
+  tree) while racing the real pass on the SQLite lock — discovered
+  live; the tail carries the explanatory note instead.
+- The startup events ride QUEUED tasks (the initial EmbedderStatus
+  snapshot) so a subscriber connecting during/after `start` still sees
+  them — the bus is lossy by design (BusNotifier: "no subscribers yet
+  → the event drops"), and wire_brain's pass polls at start_inner's
+  internal awaits, BEFORE a caller could subscribe; its IndexProgress
+  Done therefore reaches mid-pass subscribers only (the GUI's
+  forwarder — connected from construction — sees everything).
+- Brain::spawn_startup_embedder_load (brain.rs, the FIRST impl Brain
+  block): the kernel twin of the app's ipc::embeddings startup load —
+  pending_model_load + memory_store checks moved into the one
+  implementation; BundledEmbedder::new on the blocking pool →
+  Ready/Failed transitions (emit callback) → reembed_if_needed +
+  set_embedder (rewire.rs's order); the model cache derives from
+  global_config_dir().join("models") in the HOST layer (the headless
+  G4 rule stays intact — the engine just passes the forwarding emit).
+  cfg(embeddings) + a no-op twin (the 3a.1 every-combination rule).
+- The app's TauriNotifier (main.rs) gains the EmbedderStatus arm →
+  emits on embedder://status, payload-identical to the IPC paths
+  (E0004 non-exhaustive match — the app compiled green after).
+- Test: engine_start_emits_index_host_events (headless_kernel.rs) —
+  the shared opts() helper keeps index_codegraph FALSE (hermetic engine
+  tests); this fixture opts IN explicitly. Asserts (a) EmbedderStatus
+  on host_events() (the queued re-emission) and (b) the pass's RESULT:
+  Engine::codegraph().status() reports available + last_indexed_at set
+  (poll-bounded 5s) — row 17's "ready" observable for a post-start
+  subscriber (the Done event drops on a zero-receiver bus for a
+  tiny-tree instant pass). Debug trail: the temp diagnostic (listing +
+  status) exposed the helper's false default — the root cause behind
+  all three failing runs.
+- Battery: module 25/25, kernel 3006+49, features 3033+49, workspace
+  3033+49+331+app suites, build green; clippy ZERO new sites in the
+  3b.3 hunks (brain.rs:116 stays the documented pre-existing).

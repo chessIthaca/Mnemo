@@ -296,6 +296,9 @@ async fn start_inner(
     let notifier: SharedNotifier = Arc::new(BusNotifier {
         tx: host_events_tx.clone(),
     });
+    // 3b.3 (D3): the startup host events forward through this clone —
+    // wire_brain below consumes the original.
+    let notifier_events = notifier.clone();
 
     // The brain — the SAME wiring tail the app uses, with the engine's
     // explicit inputs. A headless start is never "switched open".
@@ -356,6 +359,38 @@ async fn start_inner(
         parked: Mutex::new(HashSet::new()),
     });
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
+
+    // 3b.3 (D3, §5.6 :422-425, row 17): the startup host events — the
+    // engine does what the GUI setup hook + console do. The events ride
+    // QUEUED tasks so a subscriber connecting during `start` still sees
+    // them (the bus is lossy; a synchronous notify here would be gone
+    // before the caller's first `host_events()` — current-thread
+    // runtimes poll the queue at the caller's first await).
+    let status_arc = brain.embedder_status.clone();
+    let notify_status = notifier_events.clone();
+    tokio::spawn(async move {
+        let snapshot = status_arc
+            .read()
+            .expect("embedder status lock poisoned")
+            .clone();
+        notify_status.notify(HostEvent::EmbedderStatus(snapshot));
+    });
+    // The deferred bundled-model load: the brain's kernel twin of the
+    // app's startup path (§5.6); each status transition forwards onto
+    // the bus. No pending model / no store → the method no-ops.
+    let notify_load = notifier_events.clone();
+    brain.spawn_startup_embedder_load(move |s| {
+        notify_load.notify(HostEvent::EmbedderStatus(s));
+    });
+    // (3b.3 note) The graph's startup index pass already runs inside
+    // wire_brain (the graph construction spawns it with the shared
+    // notifier), streaming HostEvent::IndexProgress onto this bus —
+    // the engine must NOT spawn a second pass: it would double-index
+    // and its mtime fast path emits no ticks (0 waves) while racing the
+    // real pass on the SQLite lock. Row 17's progress/ready contract is
+    // served by that existing stream (the §5.1 sketch's
+    // CodegraphProgress/Ready names predate job 1's IndexProgress
+    // landing — see notifier.rs's doc note).
 
     Ok(Engine {
         brain,

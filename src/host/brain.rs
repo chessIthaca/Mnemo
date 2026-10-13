@@ -1174,3 +1174,89 @@ pub(crate) fn wire_brain(
         _graph_watcher: graph_watcher,
     })
 }
+
+// 3b.3 (D3, §5.6 :422-425): the startup embedder load — the kernel twin
+// of the GUI setup hook / console path (`ipc::embeddings::
+// spawn_startup_load_console`): when a bundled model is installed but
+// not yet loaded (`pending_model_load`), build the `BundledEmbedder` on
+// the blocking pool, flip the shared status, and install into the live
+// store (re-embed with the new handle, then swap — rewire.rs's order).
+// `emit` receives each status transition; the headless Engine forwards
+// them onto `host_events()` as `HostEvent::EmbedderStatus` (row 17).
+//
+// Fire-and-forget: the store keeps its standing (hash) embedder on any
+// failure — the graceful degradation of the app's twin (review finding
+// 1, 2026-08-20, lives there).
+impl Brain {
+    /// Start the deferred bundled-model load (§5.6's "starts the
+    /// deferred embedder load" — the engine's startup step). No-op when
+    /// no model is pending or no store is wired (the checks the console
+    /// performed at its call site, moved into the one implementation).
+    /// Must be called inside a tokio runtime context (the engine's
+    /// `start` / the console's startup).
+    #[cfg(feature = "embeddings")]
+    pub fn spawn_startup_embedder_load(
+        &self,
+        emit: impl Fn(crate::memory::embedder::EmbedderStatus) + Send + Sync + 'static,
+    ) {
+        use crate::memory::embedder::{BundledEmbedder, EmbedderStatus};
+        let Some(model) = self.pending_model_load.clone() else {
+            return;
+        };
+        let Some(store) = self.memory_store.clone() else {
+            return;
+        };
+        let status = self.embedder_status.clone();
+        tokio::spawn(async move {
+            // ONNX init is blocking → the blocking pool (the app's twin
+            // does the same). The model cache is machine-global
+            // (~/.mnemo/models or MNEMO_HOME/models) — the same dir the
+            // app's embedder_cache_dir() derives; host layer, so the
+            // headless G4 rule (no global_config_dir inside headless/)
+            // stays intact.
+            let load_status = status.clone();
+            let load_model = model.clone();
+            let load_dir = crate::config::global_config_dir().join("models");
+            let result =
+                tokio::task::spawn_blocking(move || {
+                    BundledEmbedder::new(&load_model, &load_dir, load_status)
+                })
+                .await;
+            match result {
+                Ok(Ok(embedder)) => {
+                    let s = EmbedderStatus::Ready;
+                    *status.write().expect("embedder status lock poisoned") = s.clone();
+                    emit(s);
+                    let embedder: std::sync::Arc<dyn crate::memory::embedder::Embedder> =
+                        std::sync::Arc::new(embedder);
+                    let for_reembed = embedder.clone();
+                    crate::memory::reembed_if_needed(&store, &for_reembed).await;
+                    store.set_embedder(embedder);
+                }
+                Ok(Err(e)) => {
+                    eprintln!("error: bundled model local load failed: {e}");
+                    let s = EmbedderStatus::Failed;
+                    *status.write().expect("embedder status lock poisoned") = s.clone();
+                    emit(s);
+                }
+                Err(e) => {
+                    eprintln!("error: bundled model load task panicked: {e}");
+                    let s = EmbedderStatus::Failed;
+                    *status.write().expect("embedder status lock poisoned") = s.clone();
+                    emit(s);
+                }
+            }
+        });
+    }
+
+    /// Without the `embeddings` feature there is no bundled model to
+    /// load — the store runs its standing (hash) embedder, and the
+    /// status transition is reported by `build_embedder` itself (the
+    /// 3a.1 un-gate kept every feature combination compiling).
+    #[cfg(not(feature = "embeddings"))]
+    pub fn spawn_startup_embedder_load(
+        &self,
+        _emit: impl Fn(crate::memory::embedder::EmbedderStatus) + Send + Sync + 'static,
+    ) {
+    }
+}

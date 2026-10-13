@@ -73,7 +73,8 @@ use futures::stream::BoxStream;
 
 use mnemo::config::SafetyMode;
 use mnemo::headless::{
-    PendingInteraction, SessionCommand, SessionEvent, SessionLimits, SpawnOptions, Transcript,
+    HostEvent, PendingInteraction, SessionCommand, SessionEvent, SessionLimits, SpawnOptions,
+    Transcript,
 };
 use mnemo::provider::{
     Capabilities, FinishReason, LimitKind, LlmClient, LlmEvent, Message, ProviderKind,
@@ -670,6 +671,71 @@ async fn free_agent_uses_memory_and_codegraph_tools() {
     assert!(
         json.contains("graph_search"),
         "the free agent dispatched graph_search"
+    );
+    engine.shutdown().await.expect("engine shuts down");
+}
+/// §5.6 row 17 (canonical): `Engine::start` emits `EmbedderStatus`
+/// (the new variant — the initial snapshot; each deferred-load
+/// transition forwards too) and the graph's startup-pass stream on
+/// `host_events()`: wire_brain's spawned pass forwards IndexProgress,
+/// whose terminal `Done` is the "ready" signal (§5.1's sketch named it
+/// CodegraphReady — job 1 landed the stream as IndexProgress; see
+/// notifier.rs's doc note). The startup events ride QUEUED tasks, so a
+/// subscriber connecting right after `start` (current-thread runtime —
+/// the queue polls at this test's first await) still sees them.
+#[tokio::test]
+async fn engine_start_emits_index_host_events() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".coding")).unwrap();
+    // Some source so the pass has something to index.
+    std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(root.path().join("b.rs"), "struct B;\n").unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["ok"])]);
+    // The shared opts() helper keeps the graph OFF (hermetic engine
+    // tests — no watcher, no pass noise); THIS fixture opts in: the
+    // startup pass + its events are the contract under test.
+    let mut options = opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    options.index_codegraph = true;
+    let engine = Engine::builder(options)
+        .provider(llm)
+        .start()
+        .await
+        .expect("engine starts");
+    let mut events = engine.host_events();
+    let mut saw_status = false;
+    for _ in 0..16 {
+        if saw_status {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await {
+            Ok(Ok(HostEvent::EmbedderStatus(_))) => saw_status = true,
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert!(saw_status, "EmbedderStatus rides host_events()");
+    // The graph's startup pass is wire_brain's spawn — its IndexProgress
+    // stream flows to whoever subscribes DURING the pass; on a tiny tree
+    // the pass completes inside `start()` before this test could
+    // subscribe (the bus is lossy by design — no subscribers yet → the
+    // event drops, BusNotifier's documented contract). The pass's
+    // RESULT is deterministically observable: the graph's DB carries the
+    // run (row 17's "ready" for a subscriber that connected after
+    // start).
+    let mut indexed = None;
+    for _ in 0..100 {
+        let status = engine.codegraph().status().await.expect("status reads");
+        assert!(status.available, "the graph opened (index_codegraph default)");
+        if status.last_indexed_at.is_some() {
+            indexed = status.last_indexed_at;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        indexed.is_some(),
+        "the startup pass indexed the tree before ready"
     );
     engine.shutdown().await.expect("engine shuts down");
 }

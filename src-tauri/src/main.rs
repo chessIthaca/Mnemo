@@ -59,6 +59,14 @@ impl HostNotifier for TauriNotifier {
             HostEvent::IndexProgress(ev) => {
                 ipc::codegraph_cmds::emit_index_progress(&self.0, &ev);
             }
+            HostEvent::EmbedderStatus(status) => {
+                // 3b.3 (§5.1): the embedder://status channel —
+                // payload-identical to the app's own emissions from the
+                // IPC load paths (the settings UI's listener). Today
+                // only the headless Engine's startup path notifies this
+                // variant; the app's load paths emit directly.
+                let _ = self.0.emit("embedder://status", &status);
+            }
         }
     }
 }

@@ -24,6 +24,15 @@ pub enum HostEvent {
     Reconcile(ReconcileEvent),
     /// The startup code-graph index pass.
     IndexProgress(IndexProgressEvent),
+    /// The embedder status transitions (`embedder://status`): the
+    /// current status at engine start + each deferred-load change
+    /// (3b.3, §5.1/§5.6 row 17). §5.1's sketch also named
+    /// `CodegraphProgress`/`CodegraphReady` — job 1 landed that stream
+    /// as [`HostEvent::IndexProgress`] (the 1:1 `codegraph://index-progress`
+    /// mapping) and the startup pass (wire_brain's spawn) already emits
+    /// it on this bus; the sketch's names predate the landing and are
+    /// served by it.
+    EmbedderStatus(crate::memory::embedder::EmbedderStatus),
 }
 
 /// Receives [`HostEvent`]s from the brain. Implemented by each frontend.
@@ -58,6 +67,7 @@ mod tests {
             HostEvent::IndexProgress(IndexProgressEvent::Failed {
                 error: "boom".to_string(),
             }),
+            HostEvent::EmbedderStatus(crate::memory::embedder::EmbedderStatus::Ready),
         ];
         for ev in events {
             let json = serde_json::to_string(&ev).expect("serialize");

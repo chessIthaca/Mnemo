@@ -231,3 +231,57 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
 - Proofs: `cargo test --test boundary` — 1 passed, 1 ignored (the
   designed state); battery `cargo test --workspace` exit 0 (83
   integration + 84th boundary file; zero warnings).
+
+### 5.4-prep — the D4 worklist, classified (probed 2026-10-13, tree d7ff39e)
+
+The `mnemo::(agent|runtime|host)::` scan over src-tauri (100 matches /
+20 files; the scan output truncated — re-run for the tail beyond
+ipc/state.rs). Three classes:
+
+1. **TEST-CODE (stripped by the scanner — no work):** console.rs
+   :1497-1501, :2087, :2164, :2203-2429 (the AgentHandle/manager
+   fixtures); events.rs :1593, :1700, :1939-1940, :2085, :2192,
+   :2224-2225. Verify each sits inside a `#[cfg(test)]` item when
+   routing (the stripper handles whole-file test mods only via the
+   lib-side WHOLE_FILE_TEST_MODULES list — src-tauri has none known).
+2. **DOC/COMMENT (exempt — the scan splits on `//`, which covers `//!`
+   and `///`):** config_io.rs :253, embeddings.rs :8, laya.rs :8/:141,
+   rewire.rs :15, finetune.rs :12, state.rs :12.
+3. **PRODUCTION (the rewrite set):** console.rs :33-41 (the import
+   block: channels types + ParentAwareSpawner + HostRuntime) and :1216
+   (`Arc<dyn AgentPolicyFactory>`); ipc/agent.rs :17/:29/:315/:416/:432;
+   approval.rs :27/:29; backlog_cmds.rs :18; codegraph_cmds.rs :46/:50;
+   config_io.rs :17-18/:24/:25; contract_fixtures.rs :27; error.rs
+   :59-60; events.rs :43-44/:48/:51/:74/:1490; files.rs :19;
+   finetune.rs :45; laya.rs :26/:35/:63/:77/:91; memory_maintenance.rs
+   :37; questions.rs :23; rewire.rs :21/:152; run_all.rs :232 (verify
+   prod vs test)/:576/:601/:750/:763/:801/:3782/:4699/:4732/:4746/:4794/
+   :5304/:5471/:6743/:6894; spawn.rs :16-18/:23/:243/:277/:311/:318;
+   startup.rs :19; state.rs :22/:26/:91; + the truncated tail.
+
+**Type inventory (the facade's curated list):** runtime::channels —
+AgentEvent, Approval, QuestionOption, UserAnswer, AgentCommand, AgentId,
+SerializableAgentEvent, ParkReason, PhaseKind, SessionLimits;
+runtime — AgentManager, SerializedEvent, SteerPayload, AgentHandle,
+AgentSpawner, ParentAwareSpawner, DescendantTracker (+ the
+turn_resolve:: module block events.rs:44 imports); agent::context —
+ContextManager; agent::factory — AgentLoopFactory; agent::policy —
+PermissionPolicy, RouteKey, AgentPolicyFactory; agent::approval —
+needs_approval; agent::workflow_handle — AgentWorkflowHandle,
+capitalize_token; agent::failure_triage — read_rows, training_log_path,
+FailureLogRow; host::runtime — HostRuntime, AgentLoopMap, HostSpawner,
+LifecycleBookkeeping, spawn_agent_shared, WorktreeBinding,
+cleanup_inactive_subagents; host::index_progress (module block);
+host::maintenance — MaintenanceBusy (+ the :37 block);
+host::laya — StatusSink + the :35 pub-use block (deep consumption);
+host::embed_download (the :23 block); host::rewire — rewire_vision_
+embedder, RewireTargets, sync_model_resolver.
+
+**Facade design note:** follow the established headless/mod.rs pattern
+— extend `mnemo::headless`'s re-export list with the TYPE re-exports,
+and add ROOT MODULE re-exports in src/lib.rs for the deeply-consumed
+host modules (`pub use crate::host::{laya, embed_download, rewire, ...}`
+→ `mnemo::laya::…` etc. — bare `mnemo::` paths pass the scan and read
+as the public API). Type list first, then file-by-file rewrites
+(console.rs last — biggest); drop the `#[ignore]` on
+`tauri_uses_only_public_api` in the FINAL D4 commit; battery per chunk.

@@ -1481,7 +1481,7 @@ mod tests {
 
     #[test]
     fn stringified_null_dropped_through_union_branches() {
-        // create_plan's `steps` shape: oneOf [string, {header, body}] — the
+        // create_plan's `steps` shape: anyOf [string, {header, body}] — the
         // object branch's optional `body` is unset-able via "null" too.
         let schema = serde_json::json!({
             "type": "object",
@@ -1489,7 +1489,7 @@ mod tests {
                 "steps": {
                     "type": "array",
                     "items": {
-                        "oneOf": [
+                        "anyOf": [
                             {"type": "string"},
                             {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                         ]

@@ -700,7 +700,11 @@ impl Tool for CreatePlanTool {
                     "steps": {
                         "type": "array",
                         "items": {
-                            "oneOf": [
+                            // anyOf, deliberately: Muse (Meta) 400s on the
+                            // exclusive exactly-one union keyword in tool
+                            // parameters (2027-01-18, backlog eba239b8);
+                            // the union is permissive (string OR object).
+                            "anyOf": [
                                 {"type": "string"},
                                 {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                             ]
@@ -1113,7 +1117,11 @@ impl Tool for UpdatePlanTool {
                     "steps": {
                         "type": "array",
                         "items": {
-                            "oneOf": [
+                            // anyOf, deliberately: Muse (Meta) 400s on the
+                            // exclusive exactly-one union keyword in tool
+                            // parameters (2027-01-18, backlog eba239b8);
+                            // the union is permissive (string OR object).
+                            "anyOf": [
                                 {"type": "string"},
                                 {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                             ]
@@ -2660,6 +2668,41 @@ mod tests {
         assert!(!upd.append);
         assert!(upd.title.is_none());
         assert!(upd.steps.is_none());
+    }
+
+    #[test]
+    fn plan_tool_schemas_emit_anyof_not_oneof() {
+        // Muse (Meta) 400s on 'oneOf' inside tool parameters (2027-01-18,
+        // backlog eba239b8): its OpenAI-compat layer rejects the key
+        // outright, and the steps unions are permissive (string OR object)
+        // anyway — anyOf is the correct shape. Non-strict endpoints receive
+        // these parameters bytes verbatim (pass_through), so this serialized
+        // form is exactly what crosses the wire.
+        let dir = tempdir().expect("temp dir for workflow state");
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        let params = serde_json::to_string(&create.schema().parameters)
+            .expect("create_plan parameters serialize");
+        assert!(
+            params.contains("\"anyOf\""),
+            "create_plan parameters must carry anyOf: {params}"
+        );
+        assert!(
+            !params.contains("\"oneOf\""),
+            "create_plan parameters must not carry oneOf — muse (Meta) 400s on it: {params}"
+        );
+
+        let update = UpdatePlanTool::new(wf);
+        let params = serde_json::to_string(&update.schema().parameters)
+            .expect("update_plan parameters serialize");
+        assert!(
+            params.contains("\"anyOf\""),
+            "update_plan parameters must carry anyOf: {params}"
+        );
+        assert!(
+            !params.contains("\"oneOf\""),
+            "update_plan parameters must not carry oneOf — muse (Meta) 400s on it: {params}"
+        );
     }
 
     fn make_store() -> Arc<MemoryStore> {

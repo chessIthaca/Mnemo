@@ -1875,7 +1875,7 @@ impl Tool for AbandonPlanTool {
                 .unwrap_or(0);
             let n = crate::memory::finish_capture::supersede_plan_markers(
                 store.as_ref(),
-                &plan_id,
+                plan_id,
                 "ABANDONED",
                 now,
             )

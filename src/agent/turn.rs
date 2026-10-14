@@ -3140,7 +3140,7 @@ impl AgentLoop {
                         ))
                         .await;
                     if images.is_empty() {
-                        Self::push_suggestion_message(messages, &provider, &text);
+                        Self::push_suggestion_message(messages, provider, &text);
                     } else {
                         let content = self
                             .build_user_content(agent_id, fanin_tx, text, &images)
@@ -3536,7 +3536,7 @@ impl AgentLoop {
             let mut volatile_tail = prompt::build_volatile_tail(
                 provider.capabilities(),
                 &app_tail,
-                memory_context.as_deref(),
+                memory_context,
             );
             // Eager Complete → Planning nudge: when the agent is resting
             // in Complete state and the user's latest message looks like a

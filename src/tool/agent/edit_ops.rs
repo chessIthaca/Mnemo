@@ -1294,7 +1294,7 @@ pub(crate) fn apply_ops(
                 }
             }
             EditOp::Line(line_op) => {
-                current = apply_line_op(&current, &le, line_op, idx)?;
+                current = apply_line_op(&current, le, line_op, idx)?;
             }
         }
         if track {

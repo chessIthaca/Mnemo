@@ -749,7 +749,7 @@ mod tests {
         let img = RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255]));
         let mut buf = Cursor::new(Vec::new());
         img.write_to(&mut buf, ImageFormat::Png).unwrap();
-        std::fs::write(dir.path().join("pic.png"), &buf.into_inner()).unwrap();
+        std::fs::write(dir.path().join("pic.png"), buf.into_inner()).unwrap();
         (dir, sandbox)
     }
 

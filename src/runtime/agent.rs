@@ -378,7 +378,7 @@ impl AgentTask {
                         // forget (spawns a task holding Arc clones); doesn't block
                         // the turn. Only fires during auto-continue chains, which
                         // is exactly when context pressure builds up.
-                        if self.auto_continue_streak % CONSOLIDATE_EVERY_N_TURNS == 0 {
+                        if self.auto_continue_streak.is_multiple_of(CONSOLIDATE_EVERY_N_TURNS) {
                             self.spawn_consolidation();
                         }
                         // Unattended variant: the model may have ended its
@@ -6830,7 +6830,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             while let Ok((_id, _event)) = fanin_rx.try_recv() {}
-            if calls.load(std::sync::atomic::Ordering::SeqCst) >= cap + 1 {
+            if calls.load(std::sync::atomic::Ordering::SeqCst) > cap {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -7301,7 +7301,7 @@ mod tests {
                     ));
                 }
             }
-            if calls.load(std::sync::atomic::Ordering::SeqCst) >= cap + 1
+            if calls.load(std::sync::atomic::Ordering::SeqCst) > cap
                 && matches!(parked, Some((ParkReason::NoWorkExpected, _, _, _)))
             {
                 break;

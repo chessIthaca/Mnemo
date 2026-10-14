@@ -144,11 +144,11 @@ pub(crate) async fn consolidate_session_with_events(
 
     // 2. Generate the episodic summary (synthetic or LLM-assisted).
     let (narrative, key_decisions, files_modified, concepts) = if let Some(llm) = provider {
-        synthesize_with_llm(&session_events, llm)
+        synthesize_with_llm(session_events, llm)
             .await
-            .unwrap_or_else(|_| synthesize_synthetic(&session_events))
+            .unwrap_or_else(|_| synthesize_synthetic(session_events))
     } else {
-        synthesize_synthetic(&session_events)
+        synthesize_synthetic(session_events)
     };
 
     // 3. Store the episodic memory.
@@ -1246,7 +1246,7 @@ mod tests {
         // scoped to the owning fn bodies so this test's own needles never
         // self-match.
         let src = include_str!("consolidation.rs");
-        let core = fn_body(&src, "consolidate_session_with_events");
+        let core = fn_body(src, "consolidate_session_with_events");
         for needle in [
             "mnemo: semantic fact extraction failed",
             "mnemo: procedural workflow extraction failed",
@@ -1264,7 +1264,7 @@ mod tests {
                 "a swallow crept back into consolidate_session_with_events: {banned}"
             );
         }
-        let semantic = fn_body(&src, "extract_semantic_facts");
+        let semantic = fn_body(src, "extract_semantic_facts");
         assert!(
             semantic.contains("mnemo: failed to write semantic fact"),
             "the semantic-fact write must log its failure"
@@ -1273,7 +1273,7 @@ mod tests {
             !semantic.contains("let _ = store.write"),
             "a store.write swallow crept back into extract_semantic_facts"
         );
-        let procedural = fn_body(&src, "extract_procedural_workflows");
+        let procedural = fn_body(src, "extract_procedural_workflows");
         assert!(
             procedural.contains("mnemo: failed to write procedural workflow"),
             "the procedural-workflow write must log its failure"

@@ -1114,7 +1114,7 @@ impl AgentPolicy for DeclarativePolicy {
         for (rule, pattern) in self.guardrails.gate_rules.iter().zip(&self.arg_patterns) {
             let args_match = pattern
                 .as_ref()
-                .map_or(true, |re| re.is_match(&args.to_string()));
+                .is_none_or(|re| re.is_match(&args.to_string()));
             if rule.tool == name && args_match {
                 return rule.verdict.clone();
             }

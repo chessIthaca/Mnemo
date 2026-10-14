@@ -109,5 +109,5 @@ pub const PROGRESS_EVERY: usize = 50;
 /// phases (`done == total == 0`) forward unconditionally. `pub(crate)` so the
 /// codegraph reindex command shares the same throttle policy.
 pub fn should_forward_progress(done: usize, total: usize, every: usize) -> bool {
-    done == 1 || done == total || done % every == 0
+    done == 1 || done == total || done.is_multiple_of(every)
 }

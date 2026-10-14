@@ -6478,7 +6478,7 @@ async fn dispatch_allows_subplan_final_step_while_descendants_running() {
         "popping to the parent plan stays Executing"
     );
     assert_eq!(
-        wf.plan_id().as_deref(),
+        wf.plan_id(),
         Some(root_id.as_str()),
         "the sub-plan must have popped; the root plan is active again"
     );
@@ -12949,7 +12949,7 @@ impl crate::tool::Tool for FlakyTool {
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let fail = match self.mode {
-            FlakyMode::FailOnOddCalls => n % 2 == 0,
+            FlakyMode::FailOnOddCalls => n.is_multiple_of(2),
             FlakyMode::AlwaysFail => true,
         };
         if fail {
@@ -15169,7 +15169,7 @@ async fn budget_cap_pauses_the_plan_and_a_bypass_continues_the_turn() {
     assert!(agent.with_plan_spend(|spend| spend.bypassed));
     // ...and the plan was never killed: still live, still Executing.
     let wf = workflow.lock().await;
-    assert_eq!(wf.plan_id().as_deref(), Some(plan_id.as_str()));
+    assert_eq!(wf.plan_id(), Some(plan_id.as_str()));
     assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Executing);
 }
 

@@ -366,7 +366,7 @@ fn looks_like_work_intent(text: &str) -> bool {
                     return true;
                 }
                 stem.strip_prefix(v)
-                    .map_or(false, |rest| SUFFIXES.contains(&rest))
+                    .is_some_and(|rest| SUFFIXES.contains(&rest))
             })
     })
 }

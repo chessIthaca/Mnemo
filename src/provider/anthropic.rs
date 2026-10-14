@@ -1562,7 +1562,7 @@ impl LlmClient for AnthropicClient {
                             // The authoritative set_usage (the Usage event
                             // arm below) overwrites it at stream end.
                             if !final_usage_seen
-                                && last_usage_push.map_or(true, |t| {
+                                && last_usage_push.is_none_or(|t| {
                                     now.duration_since(t) >= std::time::Duration::from_millis(500)
                                 })
                             {

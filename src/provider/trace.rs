@@ -1045,7 +1045,7 @@ impl LlmRequestLog {
     /// thread and I/O errors are tolerated there (the request path must never
     /// break because logging failed).
     fn maybe_log_error(&self, record: &LlmRequestRecord) {
-        let is_error = record.http_status.map_or(false, |s| s >= 400) || record.error.is_some();
+        let is_error = record.http_status.is_some_and(|s| s >= 400) || record.error.is_some();
         if !is_error {
             return;
         }

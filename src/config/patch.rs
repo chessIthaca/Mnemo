@@ -711,7 +711,7 @@ mod tests {
         );
         assert_eq!(new.general.general.default_provider, Some("openai".into()));
         assert_eq!(new.pricing.len(), 1);
-        assert_eq!(new.keys.get("openai").as_deref(), Some("sk-key"));
+        assert_eq!(new.keys.get("openai"), Some("sk-key"));
         // Projects preserved.
         assert_eq!(new.projects.len(), 1);
     }
@@ -736,7 +736,7 @@ mod tests {
         keys.insert("openai".to_string(), "sk-key".to_string());
         keys.insert("deleted".to_string(), "sk-old".to_string()); // not in built → dropped
         let new = apply_endpoints(&current, built, None, None, &keys);
-        assert_eq!(new.keys.get("openai").as_deref(), Some("sk-key"));
+        assert_eq!(new.keys.get("openai"), Some("sk-key"));
         assert!(new.keys.get("deleted").is_none());
     }
 

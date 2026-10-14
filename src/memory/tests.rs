@@ -1476,7 +1476,7 @@ async fn load_recent_locked_caps_and_orders_by_recency() {
     for i in 0..5u32 {
         let mut m = Memory::new(
             MemoryTier::Semantic,
-            &format!("mem-{i}"),
+            format!("mem-{i}"),
             "shared keyword",
             1000,
         );

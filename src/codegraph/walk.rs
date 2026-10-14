@@ -237,6 +237,16 @@ mod tests {
             "export const d = 1;",
         )
         .unwrap();
+        // Session logs + red-check scratch under .coding/ (backlog
+        // c439dda0): JSONL event streams and gitignored scratch are noise,
+        // not searchable artifacts — while .coding/knowledge proves the
+        // prune is path-scoped, not a blanket .coding exclusion.
+        std::fs::create_dir_all(dir.join(".coding/logs")).unwrap();
+        std::fs::write(dir.join(".coding/logs/events.jsonl"), "{\"e\":1}").unwrap();
+        std::fs::create_dir_all(dir.join(".coding/tmp")).unwrap();
+        std::fs::write(dir.join(".coding/tmp/copy.rs"), "fn copy() {}").unwrap();
+        std::fs::create_dir_all(dir.join(".coding/knowledge")).unwrap();
+        std::fs::write(dir.join(".coding/knowledge/f.md"), "# fact").unwrap();
         std::fs::write(dir.join("notes.md"), "# notes").unwrap();
         std::fs::write(dir.join("main.py"), "def main(): pass").unwrap();
         std::fs::write(
@@ -263,7 +273,7 @@ mod tests {
         assert_eq!(
             rel,
             vec!["a.rs", "main.py", "page.html", "sub/deep/b.ts", "sub/nested.tsx"],
-            "must find exactly the source files, sorted, ignoring target/node_modules/.git"
+            "must find exactly the source files, sorted, ignoring target/node_modules/.git and the .coding/logs + .coding/tmp scratch dirs"
         );
     }
 
@@ -287,6 +297,7 @@ mod tests {
         assert_eq!(
             rel,
             vec![
+                ".coding/knowledge/f.md",
                 "a.rs",
                 "main.py",
                 "notes.md",
@@ -295,7 +306,9 @@ mod tests {
                 "sub/nested.tsx"
             ],
             "every searchable file regardless of extension, sorted; \
-             target/node_modules/.git still skipped"
+             target/node_modules/.git still skipped; .coding/logs and \
+             .coding/tmp pruned (backlog c439dda0) while .coding/knowledge \
+             stays searchable"
         );
     }
 

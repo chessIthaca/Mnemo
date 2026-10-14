@@ -2301,6 +2301,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alternation_of_literal_branches_uses_index_engine() {
+        // Backlog c439dda0: a regex alternation whose every branch is an
+        // escape-only literal (`memory\.db`, `codegraph\.db`) carries exact
+        // literal semantics — the FTS index must serve it per branch,
+        // merged, instead of demoting the whole query to the walk (the
+        // 2027-01-14 session pain: `memory\.db|codegraph\.db` walked the
+        // entire tree).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/store.rs"), "open memory.db\n").unwrap();
+        std::fs::write(dir.path().join("src/graph.rs"), "read codegraph.db\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "pattern": "memory\\.db|codegraph\\.db",
+                "glob": "src/**"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("engine: index"),
+            "an alternation of literal branches must be index-served: {}",
+            result.output
+        );
+        assert!(result.output.contains("store.rs:1"), "{}", result.output);
+        assert!(result.output.contains("graph.rs:1"), "{}", result.output);
+    }
+
+    #[tokio::test]
     async fn index_matches_walk_on_large_tree() {
         // Synthetic large tree (the feature's target environment): the index
         // engine must report the same totals as the walk engine.
@@ -2430,6 +2459,69 @@ mod tests {
         assert!(
             !result.output.contains("codegraph.db") && !result.output.contains("memory.db"),
             "app data stores must never appear in results: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_logs_and_tmp_are_never_searched() {
+        // Backlog c439dda0: `.coding/logs` (session JSONL event streams) and
+        // `.coding/tmp` (gitignored red-check scratch) are noise, not
+        // searchable artifacts — unlike the other `.coding/` members
+        // (knowledge, plans, reviews), which stay searchable. The prune is
+        // path-scoped, so a project's own `logs/` dir still searches.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/logs")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/logs/events.jsonl"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/tmp/redcheck")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/tmp/redcheck/copy.rs"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+        // Plain `logs/` — not the ignored path; must stay searchable.
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/app.rs"), "uniqueneedle42").unwrap();
+        // `.coding/knowledge` — the prune is path-scoped, not a blanket
+        // `.coding/` exclusion; must stay searchable.
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/knowledge/fact.md"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+
+        let (files, _) = walk_searchable(dir.path(), None).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|p| !p.contains(".coding/logs") && !p.contains(".coding/tmp")),
+            "walk_searchable must exclude .coding/logs and .coding/tmp: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.contains("logs/app.rs")),
+            "a plain logs/ dir is not the ignored path: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.contains(".coding/knowledge")),
+            "the .coding prune must stay path-scoped: {names:?}"
+        );
+
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({"pattern": "uniqueneedle42"})).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("logs/app.rs"), "{}", result.output);
+        assert!(
+            !result.output.contains("events.jsonl") && !result.output.contains("redcheck"),
+            ".coding/logs and .coding/tmp must never appear in results: {}",
             result.output
         );
     }
@@ -2649,6 +2741,44 @@ mod tests {
             "{}",
             r.output
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_symbol_answer_carries_the_file_matches() {
+        // Backlog c439dda0: the delegated block and the plain file matches
+        // ride in ONE response — the walk is never skipped, so no identical
+        // re-issue is needed. The escape hatch stays: the repeat drops the
+        // block and returns the plain search alone.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn helper() {}\nlet helper = 2;\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let r = tool.execute(json!({"pattern": "helper"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.output.contains("AUTO-DELEGATED to the code graph"),
+            "the delegated block still rides inline: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("engine:"),
+            "the plain file search must run in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1") && r.output.contains("a.rs:2"),
+            "the file matches must be present alongside the graph answer: {}",
+            r.output
+        );
+        // The escape hatch still works: a repeat is the plain search, with
+        // the advisory nudge but WITHOUT a second delegated block.
+        let r = tool.execute(json!({"pattern": "helper"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            !r.output.contains("AUTO-DELEGATED"),
+            "the repeat escapes the block: {}",
+            r.output
+        );
+        assert!(r.output.contains("a.rs:1"), "{}", r.output);
     }
 
     #[tokio::test]

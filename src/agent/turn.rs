@@ -3598,9 +3598,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
         match self.session_primer() {
             Some(Some(primer)) => {
-                head_content.push_str("\n");
+                head_content.push('\n');
                 head_content.push_str(&primer);
-                head_content.push_str("\n");
+                head_content.push('\n');
             }
             Some(None) => {
                 // Fetched already, no primer — append nothing, do not refetch.
@@ -3614,9 +3614,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     Ok(memories) if !memories.is_empty() => {
                         let primer = prompt::format_primer(&memories);
                         if !primer.trim().is_empty() {
-                            head_content.push_str("\n");
+                            head_content.push('\n');
                             head_content.push_str(&primer);
-                            head_content.push_str("\n");
+                            head_content.push('\n');
                         }
                         self.set_session_primer(Some(Some(primer)));
                     }
@@ -4007,8 +4007,8 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     session_id,
                     "archive",
                     Some(tool.to_string()),
-                    crate::tool::agent::optimizer::estimate_tokens(output) as i64,
-                    crate::tool::agent::optimizer::estimate_tokens(&preview) as i64,
+                    crate::tool::agent::optimizer::estimate_tokens(output),
+                    crate::tool::agent::optimizer::estimate_tokens(&preview),
                     false,
                 );
                 preview
@@ -4039,7 +4039,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         if region.is_empty() {
             return None;
         }
-        let region_tokens = crate::tool::agent::optimizer::estimate_tokens(&region) as i64;
+        let region_tokens = crate::tool::agent::optimizer::estimate_tokens(&region);
         match store
             .archive_tool_result(
                 session_id,
@@ -4524,7 +4524,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                                     .send((agent_id, AgentEvent::ContextUsage {
                                         used: prompt_tokens,
                                         max: context_manager.max_tokens() as u32,
-                                        breakdown: breakdown.clone(),
+                                        breakdown: *breakdown,
                                         // Lever 6 grades only the top-of-loop and
                                         // post-compaction emissions; this mid-stream
                                         // re-anchor keeps the previous grade (the

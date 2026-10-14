@@ -12380,10 +12380,8 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
     while let Ok((_id, event)) = fanin_rx.try_recv() {
         match event {
             AgentEvent::MemoryRecalled { .. } => recalled += 1,
-            AgentEvent::ToolResult { result, .. } => {
-                if result.output.len() > 4096 {
-                    large_result_seen = true;
-                }
+            AgentEvent::ToolResult { result, .. } if result.output.len() > 4096 => {
+                large_result_seen = true;
             }
             _ => {}
         }

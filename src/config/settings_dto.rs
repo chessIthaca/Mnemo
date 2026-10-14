@@ -827,31 +827,30 @@ pub fn validate_and_apply_settings_patch(
     };
     if let Some(models) = &patch.models {
         if let Some(p) = &models.planning {
-            general.models.planning = p.as_ref().map(|m| to_ref(m));
+            general.models.planning = p.as_ref().map(to_ref);
         }
         if let Some(e) = &models.executing {
-            general.models.executing = e.as_ref().map(|m| to_ref(m));
+            general.models.executing = e.as_ref().map(to_ref);
         }
         if let Some(b) = &models.bug_fixing {
-            general.models.bug_fixing = b.as_ref().map(|m| to_ref(m));
+            general.models.bug_fixing = b.as_ref().map(to_ref);
         }
         if let Some(r) = &models.reviewing {
-            general.models.reviewing = r.as_ref().map(|m| to_ref(m));
+            general.models.reviewing = r.as_ref().map(to_ref);
         }
         if let Some(c) = &models.complete {
-            general.models.complete = c.as_ref().map(|m| to_ref(m));
+            general.models.complete = c.as_ref().map(to_ref);
         }
         if let Some(f) = &models.free {
             // Lint-clean form (clippy redundant_closure): pass the mapper
-            // directly — the seven sibling arms still fire the lint and
-            // ride the a439d8c2 sweep.
+            // directly — every arm has since the efd1f4c3 clippy sweep.
             general.models.free = f.as_ref().map(to_ref);
         }
         if let Some(s) = &models.subagent {
-            general.models.subagent = s.as_ref().map(|m| to_ref(m));
+            general.models.subagent = s.as_ref().map(to_ref);
         }
         if let Some(s) = &models.summarize {
-            general.models.summarize = s.as_ref().map(|m| to_ref(m));
+            general.models.summarize = s.as_ref().map(to_ref);
         }
         if let Some(skill_map) = &models.skill {
             general.models.skill = skill_map
@@ -863,19 +862,19 @@ pub fn validate_and_apply_settings_patch(
 
     if let Some(routing) = &patch.routing {
         if let Some(cheap) = &routing.cheap {
-            general.general.routing.cheap = cheap.as_ref().map(|m| to_ref(m));
+            general.general.routing.cheap = cheap.as_ref().map(to_ref);
         }
         if let Some(capable) = &routing.capable {
-            general.general.routing.capable = capable.as_ref().map(|m| to_ref(m));
+            general.general.routing.capable = capable.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.lane_medium {
-            general.general.routing.lane_medium = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.lane_medium = lane.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.lane_high {
-            general.general.routing.lane_high = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.lane_high = lane.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.escalate {
-            general.general.routing.escalate = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.escalate = lane.as_ref().map(to_ref);
         }
         if let Some(threshold) = routing.threshold {
             general.general.routing.threshold = threshold;

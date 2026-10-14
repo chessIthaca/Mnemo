@@ -183,13 +183,13 @@ pub fn render_review_preamble(scope: &ReviewScope) -> String {
         }
     }
 
-    out.push_str(&format!(
+    out.push_str(
         "- **Uncommitted carry-over.** If the delta re-shows hunks that a round ending in PASS \
          already verified (that material was never committed), note it in ONE line as a process \
          remark — do not re-line-review it. Hunks a round ending in FINDINGS reported are NOT in \
          that class: if your task names findings awaiting a fix, verify each fix is present in \
          the delta before you report PASS.\n",
-    ));
+    );
     out
 }
 

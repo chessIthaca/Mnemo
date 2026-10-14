@@ -1597,10 +1597,10 @@ impl LlmClient for AnthropicClient {
                                             }
                                         }
                                         LlmEvent::ToolCallStart { .. }
-                                        | LlmEvent::ToolCallArgumentDelta { .. } => {
-                                            if first_content_chunk.is_none() {
-                                                first_content_chunk = Some(now);
-                                            }
+                                        | LlmEvent::ToolCallArgumentDelta { .. }
+                                            if first_content_chunk.is_none() =>
+                                        {
+                                            first_content_chunk = Some(now);
                                         }
                                         _ => {}
                                     }

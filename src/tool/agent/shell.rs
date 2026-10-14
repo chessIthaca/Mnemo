@@ -217,17 +217,13 @@ fn translate_powershell_chaining(command: &str) -> Option<String> {
         match bytes[i] {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
-            b'&' if !in_single && !in_double => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
-                    splits.push((i, true));
-                    i += 1; // consume the second '&'
-                }
+            b'&' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                splits.push((i, true));
+                i += 1; // consume the second '&'
             }
-            b'|' if !in_single && !in_double => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
-                    splits.push((i, false));
-                    i += 1; // consume the second '|'
-                }
+            b'|' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                splits.push((i, false));
+                i += 1; // consume the second '|'
             }
             _ => {}
         }

@@ -1322,11 +1322,9 @@ fn longest_string_leaf_mut(value: &mut serde_json::Value) -> Option<&mut String>
         best_len: &mut usize,
     ) {
         match v {
-            serde_json::Value::String(s) => {
-                if s.len() > *best_len {
-                    *best_len = s.len();
-                    *best = Some(s);
-                }
+            serde_json::Value::String(s) if s.len() > *best_len => {
+                *best_len = s.len();
+                *best = Some(s);
             }
             serde_json::Value::Array(items) => {
                 for item in items {

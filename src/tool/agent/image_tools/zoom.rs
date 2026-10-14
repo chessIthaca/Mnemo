@@ -268,13 +268,13 @@ async fn zoom_loop(
     let vote = parse_vote(&overview_answer);
     match vote {
         Some(v) if v.action == "done" => {
-            return Ok(ZoomResult {
+            Ok(ZoomResult {
                 markdown: v.answer.unwrap_or(overview_answer),
                 confidence: v.confidence,
                 rounds,
                 regions,
                 warnings,
-            });
+            })
         }
         Some(v) => {
             // action == "zoom": crop the voted region and re-read.
@@ -379,7 +379,7 @@ async fn zoom_loop(
                     }
                     // Max rounds exhausted.
                     warnings.push("max zoom rounds reached".into());
-                    return Ok(ZoomResult {
+                    Ok(ZoomResult {
                         markdown: crop_vote_result
                             .as_ref()
                             .and_then(|v| v.answer.clone())
@@ -388,20 +388,20 @@ async fn zoom_loop(
                         rounds,
                         regions,
                         warnings,
-                    });
+                    })
                 }
                 None => {
                     // Couldn't crop the voted region — fall back to the overview answer.
                     warnings.push(
                         "model voted a region that could not be cropped; used overview".into(),
                     );
-                    return Ok(ZoomResult {
+                    Ok(ZoomResult {
                         markdown: v.answer.unwrap_or(overview_answer),
                         confidence: v.confidence,
                         rounds,
                         regions,
                         warnings,
-                    });
+                    })
                 }
             }
         }

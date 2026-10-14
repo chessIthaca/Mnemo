@@ -572,13 +572,14 @@ impl Tool for GitTool {
                          checkout, stash, branch, push, restore (branch/stash actions like \
                          delete or pop are also accepted here)"
                     )),
-                    None => ToolResult::error(format!(
+                    None => ToolResult::error(
                         "git requires a 'subcommand' field (status, diff, log, commit, merge, \
                          checkout, stash, branch, push, restore) — or an 'action' naming one \
                          of them. Per-subcommand required fields: commit→message, \
                          merge/checkout→branch, restore→paths, branch \
                          delete/create→branch"
-                    )),
+                            .to_string(),
+                    ),
                 };
             }
         };

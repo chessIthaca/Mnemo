@@ -1223,7 +1223,7 @@ impl MemoryStore {
             params_vec.push(Box::new(t.as_str().to_string()));
             stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?
         } else {
-            stmt.query(rusqlite::params_from_iter(rowids.iter().map(|r| *r as i64)))?
+            stmt.query(rusqlite::params_from_iter(rowids.iter().map(|r| *r)))?
         };
         while let Some(row) = rows.next()? {
             out.push(Self::parse_memory_row(row)?);

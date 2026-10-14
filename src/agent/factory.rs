@@ -1210,7 +1210,7 @@ impl AgentLoopFactory {
             match factory_slot.as_ref() {
                 Some(pf) => {
                     let ctx = crate::agent::policy::PolicyFactoryCtx {
-                        agent_id: agent_id.clone(),
+                        agent_id,
                         project_root: self.project_root.clone(),
                         plans_dir,
                         // The handle passes straight through — the ctx field

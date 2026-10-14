@@ -153,7 +153,7 @@ pub fn is_code_extension(ext: &str) -> bool {
 /// living in docs/config/other file types).
 pub fn walk_searchable(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    visit(root, root, &mut out, |p, r| should_search(p, r));
+    visit(root, root, &mut out, should_search);
     out.sort();
     out
 }

@@ -1113,7 +1113,7 @@ impl BacklogStore {
         let lines = self
             .items
             .iter()
-            .map(|i| serde_json::to_string(i))
+            .map(serde_json::to_string)
             .collect::<Result<Vec<String>, _>>();
         let content = match lines {
             Ok(l) => l.join("\n") + "\n",
@@ -1439,11 +1439,10 @@ mod tests {
     #[test]
     fn normalize_accepts_no_code_research_marker() {
         // The explicit escape hatch: research items carry no paths.
-        let body = format!(
-            "Research the best approach for the export pipeline (2027-01-07): compare \
+        let body = "Research the best approach for the export pipeline (2027-01-07): compare \
              streaming vs buffered writes, note the trade-offs, recommend one. \
              no-code research — findings only, no code changes."
-        );
+            .to_string();
         assert!(body.chars().count() >= MIN_BODY_CHARS);
         assert!(normalize_item_text(&format!("Research export options\n\n{body}")).is_ok());
     }

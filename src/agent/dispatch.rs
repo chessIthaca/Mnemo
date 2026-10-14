@@ -1458,17 +1458,13 @@ fn observe_mutation_vehicle(
     result: &ToolResult,
 ) {
     match tool_name {
-        "file_edit" | "file_write" | "file_append" | "multi_edit" => {
-            if result.success {
-                steering.note_file_tool_mutation();
-            }
+        "file_edit" | "file_write" | "file_append" | "multi_edit" if result.success => {
+            steering.note_file_tool_mutation();
         }
-        "shell" => {
-            if result.success {
-                if let Some(command) = args.get("command").and_then(|c| c.as_str()) {
-                    if shell_command_mutates_files(command) {
-                        steering.note_shell_mutation();
-                    }
+        "shell" if result.success => {
+            if let Some(command) = args.get("command").and_then(|c| c.as_str()) {
+                if shell_command_mutates_files(command) {
+                    steering.note_shell_mutation();
                 }
             }
         }
@@ -1499,11 +1495,9 @@ fn observe_edit_freshness(
         // knowledge of P is fresh by construction — the ecosystem steers
         // drift-failure recovery to file_write full-file replacement, so the
         // gate lifts for P without a read (review L3).
-        "file_write" | "file_append" => {
-            if result.success {
-                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    steering.clear_edit_drift_for(agent_id, path);
-                }
+        "file_write" | "file_append" if result.success => {
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                steering.clear_edit_drift_for(agent_id, path);
             }
         }
         "file_edit" => {

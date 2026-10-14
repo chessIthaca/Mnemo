@@ -269,10 +269,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                         }
                                     }
                                     LlmEvent::ToolCallStart { .. }
-                                    | LlmEvent::ToolCallArgumentDelta { .. } => {
-                                        if first_content_chunk.is_none() {
-                                            first_content_chunk = Some(now);
-                                        }
+                                    | LlmEvent::ToolCallArgumentDelta { .. }
+                                        if first_content_chunk.is_none() =>
+                                    {
+                                        first_content_chunk = Some(now);
                                     }
                                     _ => {}
                                 }

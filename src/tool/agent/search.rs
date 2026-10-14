@@ -4,12 +4,16 @@
 
 //! `search` — grep + glob tools for finding files and content.
 //!
-//! Literal queries are served by the CodeGraph FTS content index when it is
-//! populated (`engine: index` in the output); everything else — regex
+//! Literal queries — and regex alternations whose every branch is an
+//! escape-only literal (backlog c439dda0: per-branch lookups, merged,
+//! regex-verified) — are served by the CodeGraph FTS content index when it
+//! is populated (`engine: index` in the output); everything else — regex
 //! patterns, multi-line or punctuation-only literals (no FTS tokens), and
 //! broken-regex fallbacks (the walk engine keeps "matched literally"
 //! semantics exact) — walks the project tree (skipping build artifacts +
-//! deps) and matches line-by-line (`engine: walk`). Auto-run (read-only).
+//! deps; the path-scoped `.coding/logs`/`.coding/tmp` are pruned too,
+//! backlog c439dda0) and matches line-by-line (`engine: walk`). Auto-run
+//! (read-only).
 //!
 //! AUTO-DELEGATION (backlog b804012f): when the pattern names an indexed
 //! symbol — a bare identifier, a definition-prefixed form (`fn X`), or a
@@ -69,6 +73,8 @@ use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 /// would add duplicate rows, and its own continuously-written
 /// `.coding/codegraph.db` would otherwise trigger debounced passes on the
 /// MAIN tree's watcher.
+///
+/// Multi-component (path-scoped) exclusions live in [`IGNORED_DIR_PATHS`].
 const IGNORED_DIRS: &[&str] = &[
     "target",       // Rust build output
     "node_modules", // JS dependencies
@@ -92,12 +98,42 @@ pub(crate) fn is_ignored_component(name: &str) -> bool {
     IGNORED_DIRS.contains(&name)
 }
 
+/// Root-relative directory paths that are never searched — the
+/// multi-component siblings of [`IGNORED_DIRS`] (backlog c439dda0).
+/// `.coding/logs` holds the session's JSONL event streams and
+/// `.coding/tmp` the gitignored red-check scratch: both churn constantly
+/// and are never what a content search wants — while the OTHER `.coding/`
+/// members (knowledge, plans, reviews, backlog) stay searchable. Entries
+/// are `/`-separated root-relative paths;
+/// [`is_under_ignored_dir_path`] matches the path itself (a directory
+/// prune) or anything below it (a file filter).
+///
+/// Like [`is_coding_data_file`], this list is consulted by BOTH
+/// [`should_search`] (index coverage + walk coverage) and the file
+/// watcher's trigger set, so the trigger set and the content index's
+/// coverage cannot drift apart: log writes and scratch files neither
+/// appear in search results nor fire re-index passes.
+const IGNORED_DIR_PATHS: &[&str] = &[".coding/logs", ".coding/tmp"];
+
+/// Whether a ROOT-RELATIVE path is one of [`IGNORED_DIR_PATHS`] itself or
+/// anything under one of them. Normalizes the platform separator to `/`
+/// first. Shared by `should_search`, the search tool's `descend`, the
+/// codegraph walkers' `visit`, and the watcher's `is_indexable_path` —
+/// one rule, every consumer.
+pub(crate) fn is_under_ignored_dir_path(rel: &Path) -> bool {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    IGNORED_DIR_PATHS
+        .iter()
+        .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+}
+
 /// Whether a ROOT-RELATIVE path is one of the app's own SQLite stores under
 /// `.coding/` (the codegraph + memory DBs and their journal/WAL sidecars).
 ///
 /// These are binary caches whose contents are meaningless as search results,
 /// and the graph DB is written DURING every index pass — indexing it into
-/// itself would re-index forever. This is the ONE predicate that keeps the
+/// itself would re-index forever. This predicate — together with the
+/// path-scoped [`IGNORED_DIR_PATHS`] (backlog c439dda0) — keeps the
 /// content index's coverage and the file watcher's trigger set in agreement:
 /// the index skips these files and the watcher must not fire on them, so
 /// every OTHER `.coding/` file is both indexed and watched.
@@ -126,7 +162,8 @@ pub(crate) fn is_coding_data_file(rel: &Path) -> bool {
 }
 
 /// Whether a file should be searched: skip ignored dirs, the app's own data
-/// stores under `.coding/`, and files that are likely huge.
+/// stores under `.coding/`, the path-scoped `.coding/logs` + `.coding/tmp`
+/// (backlog c439dda0), and files that are likely huge.
 ///
 /// Fails CLOSED: if `path` does not lie under `root` (strip_prefix fails), the
 /// file is NOT searched. This is defense-in-depth against a glob that escapes
@@ -146,6 +183,13 @@ pub(crate) fn should_search(path: &Path, root: &Path) -> bool {
                 return false;
             }
         }
+    }
+    // Backlog c439dda0: the session-log and scratch dirs under `.coding/`
+    // are path-scoped ignores — never searched, never indexed, never
+    // watched. Consulted by the watcher too, so the trigger set stays
+    // equal to this coverage.
+    if is_under_ignored_dir_path(rel) {
+        return false;
     }
     // Never scan the app's own SQLite stores under `.coding/` — see
     // `is_coding_data_file`, the predicate the file watcher SHARES so the
@@ -349,6 +393,15 @@ fn descend(
             if is_ignored_component(&entry.file_name().to_string_lossy()) {
                 *pruned += 1;
                 continue; // never stat inside ignored dirs — the whole point
+            }
+            // Path-scoped ignores (backlog c439dda0): `.coding/logs` /
+            // `.coding/tmp` are pruned by root-relative PATH, not by bare
+            // component name — a project's own `logs/` dir stays searched.
+            if let Ok(rel) = path.strip_prefix(root) {
+                if is_under_ignored_dir_path(rel) {
+                    *pruned += 1;
+                    continue;
+                }
             }
             descend(&path, root, patterns, files, pruned);
         } else if path.is_file() {
@@ -2765,9 +2818,17 @@ mod tests {
         .unwrap();
 
         let (files, _) = walk_searchable(dir.path(), None).unwrap();
+        // Normalize separators: PathBuf strings are backslash-joined on
+        // Windows, and the asserts below compare forward-slash fragments
+        // (same normalization as the walk.rs tests).
         let names: Vec<String> = files
             .iter()
-            .map(|p| p.to_string_lossy().to_string())
+            .map(|p| {
+                p.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
             .collect();
         assert!(
             names

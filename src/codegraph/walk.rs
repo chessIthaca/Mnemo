@@ -192,6 +192,14 @@ fn visit(dir: &Path, root: &Path, out: &mut Vec<PathBuf>, accept: fn(&Path, &Pat
             if crate::tool::agent::search::is_ignored_component(&name) {
                 continue;
             }
+            // Path-scoped ignores (backlog c439dda0): `.coding/logs` and
+            // `.coding/tmp` are pruned by root-relative PATH, not bare
+            // component name — a project's own `logs/` dir stays searched.
+            if let Ok(rel) = path.strip_prefix(root) {
+                if crate::tool::agent::search::is_under_ignored_dir_path(rel) {
+                    continue;
+                }
+            }
             visit(&path, root, out, accept);
         } else if file_type.is_file() && accept(&path, root) {
             out.push(path);

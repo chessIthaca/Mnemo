@@ -34,8 +34,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::codegraph::CodeGraph;
 
 /// Whether `path` should trigger a re-index: any file the content index
-/// covers — i.e. one that does not pass through an ignored directory or the
-/// app's own SQLite store family under `.coding/`.
+/// covers — i.e. one that does not pass through an ignored directory, the
+/// path-scoped `.coding/logs` / `.coding/tmp` dirs (backlog c439dda0), or
+/// the app's own SQLite store family under `.coding/`.
 ///
 /// Mirrors `walk_searchable`'s coverage (the content index holds every
 /// searchable file, not just parseable source — review C1), so a docs/config
@@ -64,14 +65,21 @@ fn is_indexable_path(path: &Path, root: &Path) -> bool {
                 }
             }
         }
-        // Beyond the search ignore rules the ONLY exclusion is the app's own
-        // SQLite store family under `.coding/` (codegraph + memory DBs and
-        // their -wal/-shm/-journal sidecars): an index pass writes the graph
-        // DB itself, so watching it would self-trigger a reindex loop
-        // forever. Every other `.coding/` file (knowledge, plans, reviews,
-        // skills, backlog.jsonl) IS watched — the trigger set equals the
-        // content index's coverage, so a write there refreshes its own rows
-        // instead of waiting for an unrelated source edit to trigger a pass.
+        // Beyond the search ignore rules the ONLY exclusions are the app's
+        // own SQLite store family under `.coding/` (codegraph + memory DBs
+        // and their -wal/-shm/-journal sidecars) and the path-scoped
+        // `.coding/logs` + `.coding/tmp` dirs (backlog c439dda0 — the
+        // session JSONL streams and red-check scratch are unsearchable
+        // noise, so writes there must not fire re-index passes either):
+        // an index pass writes the graph DB itself, so watching it would
+        // self-trigger a reindex loop forever. Every other `.coding/`
+        // file (knowledge, plans, reviews, skills, backlog.jsonl) IS
+        // watched — the trigger set equals the content index's coverage,
+        // so a write there refreshes its own rows instead of waiting for
+        // an unrelated source edit to trigger a pass.
+        if crate::tool::agent::search::is_under_ignored_dir_path(rel) {
+            return false;
+        }
         !crate::tool::agent::search::is_coding_data_file(rel)
     }
     if under_base(path, root) {

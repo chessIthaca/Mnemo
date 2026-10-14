@@ -1599,7 +1599,7 @@ fn redacted_record_line(record: &LlmRequestRecord) -> Option<String> {
 /// than the original synchronous implementation; the caps are unchanged):
 /// - **The file is capped** at [`MAX_TRACE_FILE_BYTES`], with residual
 ///   behavior to be aware of: below the cap each writer wakeup still re-reads
-///   + rewrites the whole file (up to ~`MAX_TRACE_FILE_BYTES` of I/O per
+///   and rewrites the whole file (up to ~`MAX_TRACE_FILE_BYTES` of I/O per
 ///   batch). When the file exceeds the cap the merge is skipped and every row
 ///   not in the current batch is dropped — so the file is effectively
 ///   "recent history past 8 MiB", not a complete log. With a hot ring

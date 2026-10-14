@@ -1568,10 +1568,10 @@ impl BrowserManager {
     }
 
     /// Navigate the Browser tab's child webview to `url`. Normalizes the URL
-    /// through the same [`normalize_url`] choke point (so the scheme allow-list
-    /// + omnibox autodetection apply), then drives the child webview's page
-    /// directly via CDP `Page.navigate` — no iframe `src` eval (the child is a
-    /// separate top-level webview, not an iframe in the app's DOM).
+    /// through the same [`normalize_url`] choke point (so the scheme
+    /// allow-list + omnibox autodetection apply), then drives the child
+    /// webview's page directly via CDP `Page.navigate` — no iframe `src` eval
+    /// (the child is a separate top-level webview, not an iframe in the app's DOM).
     ///
     /// BOOTSTRAP: when no child webview exists yet (the Browser tab was
     /// toggled on but never navigated), the app-layer

@@ -2077,8 +2077,8 @@ pub struct TokenAccounting {
     head_count: u32,
     /// Per-role bucket totals.
     breakdown: crate::runtime::ContextBreakdown,
-    /// Token overhead of the request's tool-schema array (name + description
-    /// + parameters JSON per tool). The provider bills it in
+    /// Token overhead of the request's tool-schema array (name + description +
+    /// parameters JSON per tool). The provider bills it in
     /// `usage.prompt_tokens` but it belongs to no message, so it is kept out
     /// of the per-role buckets and added to the total. Set by the turn loop
     /// at the TOP of each iteration, from the schemas actually sent

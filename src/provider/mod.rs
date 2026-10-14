@@ -769,8 +769,8 @@ pub(crate) fn message_estimate_chars(m: &Message) -> usize {
     chars
 }
 
-/// The serialized char length of the tools-schema array: name + description
-/// + parameters JSON per tool (the parameters schema is serialized into the
+/// The serialized char length of the tools-schema array: name + description +
+/// parameters JSON per tool (the parameters schema is serialized into the
 /// request body). Shared by [`estimate_prompt_tokens`],
 /// [`estimate_tools_tokens`], and the request builder's split estimate
 /// (perf review L3) so the bases cannot drift.

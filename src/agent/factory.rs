@@ -742,13 +742,12 @@ impl AgentLoopFactory {
     }
 
 
-    pub fn knowledge_handle(&self) -> Option<Arc<KnowledgeStore>> {
-        self.knowledge.clone()
-    }
-
     /// The knowledge-store handle (2b.3): the bin arms construct the app
     /// policy factory from this accessor — the plan/skill registrations it
     /// owns carry the same wiring the kernel registrations had.
+    pub fn knowledge_handle(&self) -> Option<Arc<KnowledgeStore>> {
+        self.knowledge.clone()
+    }
 
     /// Wire in a per-context [`ModelResolver`]. Called once by the IPC layer
     /// at startup. Affects agents built **after** this call (the resolver is

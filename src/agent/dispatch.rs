@@ -762,6 +762,7 @@ impl AgentLoop {
     /// - On a `Suggestion`/`Prompt` (steer), the command is buffered and the
     ///   loop continues re-polling the pinned future (the steer is re-injected
     ///   by the caller after the tool completes).
+    ///
     /// G2 (§5.9.2): the kernel↔host round-trip for one host-tool call —
     /// emit [`AgentEvent::HostToolCall`], then await the host's answer with
     /// the same interrupt semantics as [`Self::dispatch_with_interrupt`]:

@@ -170,7 +170,7 @@ pub struct ConversationExport {
 pub const UNATTENDED_PROMPT_PREFIX: &str = "[backlog run-all — unattended mode]";
 
 /// One recalled memory in a [`AgentEvent::MemoryRecalled`] payload: its tier
-/// + title, so the transcript entry can expand to the full hit list (user
+/// and title, so the transcript entry can expand to the full hit list (user
 /// request 2026-08-20). The recall limit already caps the vec.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecallHit {

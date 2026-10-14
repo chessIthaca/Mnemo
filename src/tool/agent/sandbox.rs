@@ -29,7 +29,7 @@
 //! design, with the trade-off noted:
 //! - [`crate::agent::approval::is_project_scoped`] — one `validate` per
 //!   tool-call approval decision; async-ifying it would make `needs_approval`
-//!   + its callers async (a larger cross-cutting seam). Low-leverage (one
+//!   and its callers async (a larger cross-cutting seam). Low-leverage (one
 //!   syscall, infrequent).
 //! - `shell::resolve_cwd` — one `validate` + `is_dir` per shell command; the
 //!   command itself already runs via `tokio::process::Command` (async). Low
@@ -275,8 +275,8 @@ impl Sandbox {
     ///   `git status` (2027-01-09 security review HIGH-1). Component
     ///   equality only: `.gitignore`/`.gitattributes` stay writable.
     ///
-    /// A `.coding/**` path is ALSO protected when it is a hardlink (link count
-    /// > 1, plan b4812291): canonicalize cannot see a hardlink — there is no
+    /// A `.coding/**` path is ALSO protected when it is a hardlink (link
+    /// count > 1, plan b4812291): canonicalize cannot see a hardlink — there is no
     /// link to follow, the path IS the file — so `.coding/x.toml` hardlinked to
     /// `.coding/safety.toml` would otherwise truncate the protected file's
     /// shared inode through an innocent-looking name. The guard is fail-closed
@@ -482,7 +482,7 @@ impl Sandbox {
     ///    ONLY when [`lexical_path_is_link_free`](Self::lexical_path_is_link_free)
     ///    agrees: the OS follows a link at write time, so a grant inferred from
     ///    the spelling must not survive one (2027-01-15, plan b4812291).
-    /// 2b. Re-run the protection check on the CANONICAL form of the deepest
+    ///    2b. Re-run the protection check on the CANONICAL form of the deepest
     ///    existing ancestor, so a spelling the lexical walk cannot see — a Win32
     ///    8.3 alias like `.coding/KNOWLE~1/…` is not a symlink — cannot get a
     ///    subtree planted inside a protected tree.

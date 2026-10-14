@@ -56,9 +56,9 @@ struct SkillStartArgs {
 /// The `skill_start` workflow tool — enter a skill.
 ///
 /// Validates the skill exists + is available in the current workflow state,
-/// then transitions to [`WorkflowState::Skill`] with the skill's tool allow-list
-/// + prompt as the active overlay. `AutoRun` — the entry is not approval-gated;
-/// the operations inside the skill are.
+/// then transitions to [`WorkflowState::Skill`] with the skill's tool
+/// allow-list + prompt as the active overlay. `AutoRun` — the entry is not
+/// approval-gated; the operations inside the skill are.
 pub struct SkillStartTool {
     workflow: Arc<Mutex<Workflow>>,
     library: Arc<SkillLibrary>,

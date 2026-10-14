@@ -963,8 +963,8 @@ mod tests {
     // (contract_fixtures.rs).
 
     /// Build an `AgentLoop` in a given workflow state, register a realistic
-    /// tool set (file_read + file_write + git + git_read + write_review_report
-    /// + create_plan + complete_step + web_fetch +
+    /// tool set (file_read + file_write + git + git_read +
+    /// write_review_report + create_plan + complete_step + web_fetch +
     /// memory_recall), and insert it into an `agent_loops` map under
     /// `parent_id`. Returns the map + the loop's workflow handle so the test
     /// can drive state transitions.

@@ -3499,8 +3499,8 @@ impl AgentLoop {
     /// Build and install the system prompt for this iteration: the stable head
     /// (preamble + constitution + session primer + hidden tool-group index) into
     /// messages[0], and the volatile tail (workflow state + recalled memories)
-    /// + the byte-stable CONTEXT_FOOTER as the last two messages, popped right
-    /// after the request returns. Their ROLE follows
+    /// plus the byte-stable CONTEXT_FOOTER as the last two messages, popped
+    /// right after the request returns. Their ROLE follows
     /// [`Self::tail_is_user_role`]: user for DeepSeek-vendor/Local, system
     /// otherwise — the same two messages either way.
     ///

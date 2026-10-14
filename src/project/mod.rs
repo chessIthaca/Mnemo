@@ -5,8 +5,8 @@
 //! The kernel's project pieces (2c.3/G3): the constitution loader
 //! ([`agent_md`]) and the git-ops helpers ([`git_ops`], consumed by the
 //! kernel's review scope, the git tool, and the memory finish-capture). The
-//! APP's project model (the `Project` type + the discovery + the registry
-//! + the init + the scaffold) moved to [`crate::app::project`], with the
+//! APP's project model (the `Project` type + the discovery + the registry +
+//! the init + the scaffold) moved to [`crate::app::project`], with the
 //! run-all worktree helpers app-side next to it; the
 //! kernel's state-dir primitive is [`crate::workspace::Workspace`] (§5.9.3).
 //! The shipped-skill catalog stays kernel-owned (job 2b decision 5): the

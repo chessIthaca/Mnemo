@@ -53,8 +53,8 @@ pub struct ScoredMemory {
 /// when the fingerprint set already matches.
 ///
 /// Extracted from the duplicated startup (main.rs) + post-config-save
-/// (rewire.rs) re-embed paths. The caller is responsible for the Ready-status
-/// + hash-opt-out + pending-download guards (they differ between the two call
+/// (rewire.rs) re-embed paths. The caller is responsible for the Ready-status +
+/// hash-opt-out + pending-download guards (they differ between the two call
 /// sites) and for spawning this on a background task (it awaits DB I/O).
 pub async fn reembed_if_needed(store: &Arc<MemoryStore>, embedder: &Arc<dyn Embedder>) {
     let expected_model = embedder.model_id().to_string();

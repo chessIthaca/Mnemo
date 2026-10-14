@@ -1719,6 +1719,7 @@ impl Tool for CompleteStepTool {
 /// 1. the plan stack — a truncated or hedged transcription of a PARENT (or
 ///    other stacked) plan id, the classic stacked-plan slip;
 /// 2. the plans directory — an id belonging to an OLDER, finished plan.
+///
 /// Returns `None` when nothing resembles the provided id (the caller then
 /// falls back to the generic "call current_plan" advice).
 fn plan_id_hint(

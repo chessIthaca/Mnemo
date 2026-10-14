@@ -761,7 +761,7 @@ fn visit_php(node: tree_sitter::Node, ctx: &mut Ctx) {
                 let mut leaf = String::new();
                 walk_for_kind(child, &["name", "qualified_name"], &mut |n| {
                     if leaf.is_empty() {
-                        if let Some(last) = ctx.text(n).split('\\').filter(|s| !s.is_empty()).next_back() {
+                        if let Some(last) = ctx.text(n).split('\\').rfind(|s| !s.is_empty()) {
                             leaf = last.to_string();
                         }
                     }
@@ -1369,7 +1369,7 @@ fn php_use_names(node: tree_sitter::Node, ctx: &Ctx, out: &mut Vec<String>) {
     match node.kind() {
         "name" | "qualified_name" => {
             let text = ctx.text(node);
-            if let Some(last) = text.split('\\').filter(|s| !s.is_empty()).next_back() {
+            if let Some(last) = text.split('\\').rfind(|s| !s.is_empty()) {
                 out.push(last.to_string());
             }
         }

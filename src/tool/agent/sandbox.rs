@@ -351,7 +351,7 @@ impl Sandbox {
         // Only the `.coding/` side-car tree is protected by name, and
         // everything BELOW one of these entries stays protected too (a nested
         // write into them is the same refusal).
-        if !comps.first().is_some_and(|c| c == ".coding") {
+        if comps.first().is_none_or(|c| c != ".coding") {
             return false;
         }
         // HARDLINK GUARD (2027-01-15, plan b4812291): a hardlink inside
@@ -1588,7 +1588,7 @@ mod tests {
         let outside = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
         let sandbox = Sandbox::new(dir.path()).unwrap();
-        if !link_fixture::plant_dir_link(&outside.path(), &dir.path().join(".coding/link")) {
+        if !link_fixture::plant_dir_link(outside.path(), &dir.path().join(".coding/link")) {
             eprintln!("SKIP: could not create a directory link out of the root");
             return;
         }

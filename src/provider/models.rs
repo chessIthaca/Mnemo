@@ -74,7 +74,7 @@ pub fn resolve_endpoint_credentials(
     let api_key = api_key
         .filter(|k| !k.trim().is_empty())
         .or_else(|| saved.and_then(|e| config.key_for(&e.name).map(|s| s.to_string())))
-        .or_else(|| env_key)
+        .or(env_key)
         .unwrap_or_else(|| "dummy".to_string());
     Ok((base_url, api_key, kind))
 }

@@ -891,8 +891,7 @@ impl LifecycleBookkeeping {
             .lock()
             .await
             .get(&id)
-            .map(|l| l.last_review_report())
-            .flatten();
+            .and_then(|l| l.last_review_report());
         // Backlog 5b46674d: no !success gate — a reviewer that FINISHES
         // report-less is just as report-less as a failed one (the review did
         // not happen either way).

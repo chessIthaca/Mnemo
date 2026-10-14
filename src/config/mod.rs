@@ -1225,7 +1225,7 @@ api_key = "sk-x"
         fs::write(staging_path(&endpoints), "staged\n").unwrap();
 
         let restore = |p: &Path| {
-            if p == &config {
+            if p == config {
                 Err(crate::error::Error::Config("disk full".into()))
             } else {
                 Ok(())

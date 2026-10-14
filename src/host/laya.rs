@@ -1215,7 +1215,7 @@ mod tests {
         link.set_path(symlink.0).unwrap();
         link.set_link_name(symlink.1).unwrap();
         link.set_cksum();
-        tar.append(&mut link, std::io::empty()).unwrap();
+        tar.append(&link, std::io::empty()).unwrap();
         for (name, data) in regular {
             let mut header = tar::Header::new_gnu();
             header.set_size(data.len() as u64);

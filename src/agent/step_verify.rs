@@ -262,8 +262,7 @@ fn pass_summary(stdout: &str, stderr: &str) -> String {
         .lines()
         .chain(stderr.lines())
         .map(|line| line.trim_end_matches('\r').trim())
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .unwrap_or("");
     let line = output_compactor::redact_secrets(line);
     if line.chars().count() > MAX_SUMMARY_CHARS {

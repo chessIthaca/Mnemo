@@ -4216,7 +4216,7 @@ data: [DONE]\n\n";
             LlmEvent::TextDelta { text } => {
                 received_text.push_str(&text);
             }
-            LlmEvent::Finish { reason } if reason == crate::provider::FinishReason::Stop => {
+            LlmEvent::Finish { reason: crate::provider::FinishReason::Stop } => {
                 got_finish_stop = true;
             }
             _ => {}
@@ -4276,7 +4276,7 @@ data: [DONE]\n\n";
             LlmEvent::TextDelta { text } => {
                 received_text.push_str(&text);
             }
-            LlmEvent::Finish { reason } if reason == crate::provider::FinishReason::Stop => {
+            LlmEvent::Finish { reason: crate::provider::FinishReason::Stop } => {
                 got_finish_stop = true;
             }
             _ => {}

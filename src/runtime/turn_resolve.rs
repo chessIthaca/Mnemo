@@ -459,7 +459,7 @@ mod turn_resolve_latch_tests {
     #[test]
     fn workflow_transition_counts_requires_a_real_state_change() {
         assert!(
-            workflow_transition_counts(Some("Complete"), "Complete") == false,
+            !workflow_transition_counts(Some("Complete"), "Complete"),
             "a no-op event (same state) is NOT evidence"
         );
         assert!(

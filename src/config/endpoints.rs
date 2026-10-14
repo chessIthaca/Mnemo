@@ -542,7 +542,7 @@ impl Endpoint {
                 }
             });
         let mut list: Vec<String> = match model_list {
-            Some(specs) => specs.iter().cloned().collect(),
+            Some(specs) => specs.to_vec(),
             None => DEFAULT_REASONING_EFFORTS
                 .iter()
                 .map(|s| s.to_string())

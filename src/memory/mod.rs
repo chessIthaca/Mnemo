@@ -1004,7 +1004,7 @@ impl MemoryStore {
         // Slide a window the length of the needle; compare ASCII-case-insensitively.
         'outer: for i in 0..=(h.len() - n.len()) {
             for j in 0..n.len() {
-                if h[i + j].to_ascii_lowercase() != n[j].to_ascii_lowercase() {
+                if !h[i + j].eq_ignore_ascii_case(&n[j]) {
                     continue 'outer;
                 }
             }
@@ -1182,7 +1182,7 @@ impl MemoryStore {
         sql.push_str(" ORDER BY last_accessed_at DESC LIMIT ?");
         params_vec.push(Box::new(limit as i64));
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(Self::parse_memory_row(row)?);
@@ -1221,9 +1221,9 @@ impl MemoryStore {
                 .map(|r| Box::new(*r) as Box<dyn rusqlite::ToSql>)
                 .collect();
             params_vec.push(Box::new(t.as_str().to_string()));
-            stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?
+            stmt.query(rusqlite::params_from_iter(params_vec))?
         } else {
-            stmt.query(rusqlite::params_from_iter(rowids.iter().map(|r| *r)))?
+            stmt.query(rusqlite::params_from_iter(rowids.iter().copied()))?
         };
         while let Some(row) = rows.next()? {
             out.push(Self::parse_memory_row(row)?);
@@ -1294,7 +1294,7 @@ impl MemoryStore {
             Ok(s) => s,
             Err(_) => return FtsResult::Unavailable,
         };
-        let mut rows = match stmt.query(rusqlite::params_from_iter(params_vec.into_iter())) {
+        let mut rows = match stmt.query(rusqlite::params_from_iter(params_vec)) {
             Ok(r) => r,
             Err(_) => return FtsResult::Unavailable,
         };
@@ -1545,7 +1545,7 @@ impl MemoryStoreTrait for MemoryStore {
         self.log_access(
             "read",
             filter.tier.map(|t| t.as_str().to_string()),
-            query.to_string(),
+            query,
             Some(scored.len()),
         );
         Ok(scored)
@@ -1593,7 +1593,7 @@ impl MemoryStoreTrait for MemoryStore {
             for id in &ids {
                 params_vec.push(Box::new(id.clone()));
             }
-            conn.execute(&sql, rusqlite::params_from_iter(params_vec.into_iter()))?;
+            conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
             Ok(())
         })
         .await
@@ -1861,7 +1861,7 @@ impl MemoryStoreTrait for MemoryStore {
                 params_vec.push(Box::new(limit as i64));
             }
             let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
                 out.push(Self::parse_memory_row(row)?);
@@ -1910,7 +1910,7 @@ impl MemoryStoreTrait for MemoryStore {
             let mut stmt = conn.prepare(&sql)?;
             let params_vec: Vec<Box<dyn rusqlite::ToSql>> =
                 wanted.iter().map(|t| Box::new(t.as_str().to_string()) as Box<dyn rusqlite::ToSql>).collect();
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
             let mut memories = Vec::new();
             while let Some(row) = rows.next()? {
                 memories.push(Self::parse_memory_row(row)?);

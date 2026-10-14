@@ -287,7 +287,7 @@ mod tests {
         });
         assert!(text.contains("(round 3 of this plan)"), "{text}");
         assert!(text.contains("round 2 verified"), "{text}");
-        assert!(text.contains("`git diff def5678`") == false, "{text}");
+        assert!(!text.contains("`git diff def5678`"), "{text}");
         assert!(text.contains("the delta since `def5678`"), "{text}");
     }
 

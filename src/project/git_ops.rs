@@ -987,7 +987,7 @@ pub(crate) mod mock_git {
         fn run(&self, _root: &Path, args: &[&str]) -> Result<String, String> {
             let mut s = self.state.lock().unwrap();
             s.calls.push(args.iter().map(|a| a.to_string()).collect());
-            let args: Vec<&str> = args.iter().copied().collect();
+            let args: Vec<&str> = args.to_vec();
 
             // status --porcelain
             if args == ["status", "--porcelain"] {
@@ -1291,9 +1291,8 @@ mod tests {
 
         // The session died BEFORE committing anything: no commits after
         // the checkpoint → not landed.
-        assert_eq!(
-            commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
-            false,
+        assert!(
+            !commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
             "no commits after the checkpoint — work did not land"
         );
 
@@ -1301,18 +1300,16 @@ mod tests {
         // commits after the checkpoint → landed.
         git.set_dirty(true);
         commit_success_impl(&git, root, "item-9", "landed work").unwrap();
-        assert_eq!(
+        assert!(
             commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
-            true,
             "a commit after the checkpoint — the work landed"
         );
 
         // The checkpoint sha itself is excluded (it IS the anchor): the
         // range from the new HEAD sees nothing after it.
         let head = git.head_sha();
-        assert_eq!(
-            commits_after_checkpoint_impl(&git, root, &head).unwrap(),
-            false,
+        assert!(
+            !commits_after_checkpoint_impl(&git, root, &head).unwrap(),
             "the anchor commit itself must not count as landed work"
         );
 

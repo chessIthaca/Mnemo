@@ -73,7 +73,7 @@ pub fn corpus_digest(plans_dir: &Path, reviews_dir: &Path) -> String {
                 Some((mtime, e.path()))
             })
             .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (_, path) in files.into_iter().take(CORPUS_MAX_FILES_PER_DIR) {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
@@ -356,7 +356,7 @@ async fn extract_semantic_facts(
     // List the newest existing facts so the LLM can refine them in place
     // (via the optional 'id' field) instead of duplicating near-misses.
     let mut existing = store.list_by_tier(MemoryTier::Semantic).await?;
-    existing.sort_by(|a, b| b.last_accessed_at.cmp(&a.last_accessed_at));
+        existing.sort_by_key(|a| std::cmp::Reverse(a.last_accessed_at));
     existing.truncate(EXISTING_FACTS_LIMIT);
     let existing_section = if existing.is_empty() {
         String::new()

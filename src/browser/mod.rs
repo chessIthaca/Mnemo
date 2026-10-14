@@ -419,7 +419,7 @@ impl BrowserManager {
         // so it need not complete before launch — and running it inline held
         // the state lock across blocking `read_dir` + `remove_dir_all` calls
         // (Review M1-perf).
-        let _ = tokio::task::spawn_blocking(Self::sweep_orphan_profiles);
+        let _handle = tokio::task::spawn_blocking(Self::sweep_orphan_profiles);
 
         let profile = tempfile::Builder::new()
             .prefix("mnemo-browser-")
@@ -433,7 +433,7 @@ impl BrowserManager {
                 // outside the crate. The builder's `new_headless_mode()` sets
                 // exactly HeadlessMode::New — the mode this app wants.
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 // No plugins in this app: forbid extension loading explicitly
                 // (the throwaway profile already blocks extensions; this makes
                 // the policy explicit in case a profile dir is ever reused).
@@ -2603,7 +2603,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -2726,7 +2726,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -2905,7 +2905,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3136,7 +3136,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3248,7 +3248,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3345,7 +3345,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3512,7 +3512,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3573,7 +3573,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()

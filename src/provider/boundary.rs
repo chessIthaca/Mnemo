@@ -317,7 +317,7 @@ mod tests {
         // parse must handle them (a fixed 4-width parse would corrupt).
         let token = "\u{1f600}\u{3c}".to_string();
         let content = format!("emoji {} token", token);
-        let escaped = escape_boundary_tokens(&content, &[token.clone()]);
+        let escaped = escape_boundary_tokens(&content, std::slice::from_ref(&token));
         assert!(!escaped.contains(&token));
         assert_eq!(restore_boundary_tokens(&escaped), content);
     }
@@ -353,7 +353,7 @@ mod tests {
         for token in ["a", "raw:", "\u{27e7}", "\\u003c", "0f"] {
             let token = token.to_string();
             let content = format!("x{token}y and z {token} tail");
-            let escaped = escape_boundary_tokens(&content, &[token.clone()]);
+            let escaped = escape_boundary_tokens(&content, std::slice::from_ref(&token));
             assert_eq!(
                 restore_boundary_tokens(&escaped),
                 content,
@@ -389,7 +389,7 @@ mod tests {
         // a regex-QUOTED form — the raw token's `|` alternation must not
         // change match semantics.
         let token = endoftext();
-        let escaped = escape_boundary_tokens(&token, &[token.clone()]);
+        let escaped = escape_boundary_tokens(&token, std::slice::from_ref(&token));
         let quoted = restore_boundary_tokens_regex_quoted(&escaped);
         assert_eq!(quoted, regex::escape(&token));
         // The plain restore still lands the raw token.

@@ -3678,11 +3678,10 @@ mod tests {
         let factory =
             make_free_factory(dir.path()).with_tool_selection(ToolSelection::free_default());
         factory.set_spawner(Arc::new(MockSpawner));
-        assert!(registry_contains(
-            &factory,
-            &dir,
-            "write_review_report"
-        ) == false, "no review tool in the free surface");
+        assert!(
+            !registry_contains(&factory, &dir, "write_review_report"),
+            "no review tool in the free surface"
+        );
         for name in [
             "read_files",
             "file_edit",

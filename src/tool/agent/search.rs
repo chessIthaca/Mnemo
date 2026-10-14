@@ -886,6 +886,83 @@ fn is_index_eligible_regex(pattern: &str) -> bool {
         && is_tokenizable(pattern)
 }
 
+/// The branch cap for [`split_alternation_literals`]: past it the merged
+/// run costs more index queries than a walk of the tree — the pattern
+/// stays on the regex engine.
+const MAX_ALTERNATION_BRANCHES: usize = 8;
+
+/// Split a REGEX-mode alternation into the exact literal string each
+/// top-level branch matches (backlog c439dda0):
+/// `memory\.db|codegraph\.db` → [`memory.db`, `codegraph.db`]. `Some` only
+/// when EVERY branch is literal-safe:
+///
+/// - split on UNESCAPED `|` — a `\|` is a literal pipe inside a branch,
+///   never a split point;
+/// - 2..=[`MAX_ALTERNATION_BRANCHES`] non-empty branches;
+/// - every `\` quotes a NON-alphanumeric char (`\.` is a literal dot;
+///   `\d`/`\w`/`\s`/`\n` are class or control shorthands, not literals);
+/// - no UNESCAPED metacharacter remains (groups, classes, anchors, and
+///   unescaped dots disqualify — the index cannot serve those exactly, and
+///   the walk must stay authoritative).
+///
+/// The un-escaped branch strings are what the FTS index looks up per
+/// branch; the compiled regex stays the truth filter for the merged page
+/// (see [`try_index_alternation`]). Shared with `search_read`.
+pub(crate) fn split_alternation_literals(pattern: &str) -> Option<Vec<String>> {
+    let mut branches: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut escaped = false;
+    for (i, c) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '|' => {
+                branches.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    branches.push(&pattern[start..]);
+    if branches.len() < 2 || branches.len() > MAX_ALTERNATION_BRANCHES {
+        return None;
+    }
+    let mut literals = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if branch.is_empty() {
+            return None;
+        }
+        let mut literal = String::with_capacity(branch.len());
+        let mut chars = branch.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    // Only a punctuation escape un-escapes to a literal;
+                    // \d/\w/\s/\n are class or control shorthands.
+                    let Some(next) = chars.next() else {
+                        return None; // trailing lone backslash
+                    };
+                    if next.is_alphanumeric() {
+                        return None;
+                    }
+                    literal.push(next);
+                }
+                // An UNescaped metacharacter is real regex structure the
+                // index cannot serve exactly.
+                '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                    return None;
+                }
+                _ => literal.push(c),
+            }
+        }
+        literals.push(literal);
+    }
+    Some(literals)
+}
+
 /// The literal-engine TIP for a regex-mode walk that the content index
 /// could have served exactly: `Some(note)` when the call is in regex mode,
 /// the pattern is [`is_index_eligible_regex`], a graph is present with a
@@ -1109,6 +1186,103 @@ pub(crate) fn try_index(
         });
     }
     None
+}
+
+/// Run the FTS index once per alternation branch and merge the pages
+/// (backlog c439dda0). Returns [`FtsOutcome::Hits`] only when EVERY branch
+/// served a fresh page: hits deduped by (path, line) in branch order and
+/// each kept line VERIFIED against `re` — the FTS phrase drops non-token
+/// characters, so a raw row can match where the regex does not (review
+/// B1); a phantom row is dropped here rather than shown. `total` is the
+/// SUM of the branch totals (each branch's raw post-glob count — the same
+/// hedge as the single path's "... and more" line), `files` the distinct
+/// verified paths, `reindexed`/`stale` the accumulated inline-repair
+/// records. Any branch returning `None` (index unpopulated, a
+/// non-tokenizable branch, zero post-glob hits) walks the whole query
+/// transparently; a branch returning `Stale` short-circuits to the walk
+/// carrying that branch's still-stale records plus every earlier branch's
+/// inline repairs, so no F10 evidence is lost. Shared with `search_read`.
+pub(crate) fn try_index_alternation(
+    graph: &crate::codegraph::CodeGraph,
+    root: &Path,
+    branches: &[String],
+    glob: Option<&str>,
+    re: &regex::Regex,
+) -> Option<FtsOutcome> {
+    let mut hits: Vec<crate::codegraph::store::ContentHit> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut verified_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    let mut reindexed = 0usize;
+    let mut stale_records: Vec<StaleFile> = Vec::new();
+    for branch in branches {
+        match try_index(graph, root, branch, glob) {
+            Some(FtsOutcome::Hits(ix)) => {
+                reindexed += ix.reindexed;
+                stale_records.extend(ix.stale);
+                total += ix.total;
+                for h in ix.hits {
+                    // Dedup across branches first: the same (file, line)
+                    // verifies identically wherever it came from.
+                    if !seen.insert((h.path.clone(), h.line)) {
+                        continue;
+                    }
+                    if !re.is_match(&h.text) {
+                        continue; // FTS phantom row — the regex says no.
+                    }
+                    verified_files.insert(h.path.clone());
+                    if hits.len() < MAX_MATCHES {
+                        hits.push(h);
+                    }
+                }
+            }
+            Some(FtsOutcome::Stale { stale, repaired }) => {
+                // The walk is authoritative; earlier branches' inline
+                // repairs keep their log records.
+                let mut all_repaired = stale_records;
+                all_repaired.extend(repaired);
+                return Some(FtsOutcome::Stale {
+                    stale,
+                    repaired: all_repaired,
+                });
+            }
+            None => return None,
+        }
+    }
+    if hits.is_empty() {
+        // Every fetched row failed regex verification — the index cannot
+        // answer this query; the walk is authoritative.
+        return None;
+    }
+    Some(FtsOutcome::Hits(IndexHits {
+        hits,
+        total,
+        files: verified_files.len(),
+        reindexed,
+        stale: stale_records,
+    }))
+}
+
+/// Render a fresh index page as the `search` success body (shared by the
+/// single-literal and alternation-branch paths): one `path:line: text`
+/// row per hit, the `N matches in M files (engine: index)` summary, and
+/// the "... and more" hedge when the page is capped.
+fn index_success_body(ix: &IndexHits) -> String {
+    let lines: Vec<String> = ix
+        .hits
+        .iter()
+        .map(|h| format!("{}:{}: {}", h.path, h.line, h.text.trim()))
+        .collect();
+    let mut body = format!(
+        "{} matches in {} files (engine: index)\n\n{}",
+        ix.total,
+        ix.files,
+        lines.join("\n")
+    );
+    if ix.total > ix.hits.len() {
+        body.push_str("\n... and more matches (narrow your pattern or use a glob filter)");
+    }
+    body
 }
 
 /// Probe one stale file's disk evidence for the staleness log: mtime, size,
@@ -1437,7 +1611,10 @@ impl Tool for SearchTool {
             "Searches a pattern (regex by default, or literal) in files matching an optional \
              glob. Literal queries use the full-text content index when populated \
              (engine: index), walking otherwise; metachar-free regex walks carry a TIP \
-             pointing at literal:true. A broken regex is matched literally with a note. \
+             pointing at literal:true. A regex alternation whose every branch is an \
+             escape-only literal (e.g. memory\\.db|codegraph\\.db) is served by per-branch \
+             index lookups, merged — any branch the index cannot serve falls back to the \
+             walk. A broken regex is matched literally with a note. \
              Returns matching lines with paths and line numbers. Build output and \
              dependencies (target/, node_modules/, .git/, dist/) are pruned from the walk. \
               ESCAPE-HATCH: for text with regex metacharacters or backslashes \
@@ -1569,6 +1746,11 @@ impl Tool for SearchTool {
             };
             let re = compiled.regex;
             let fallback_note = compiled.fallback_note;
+            // Backlog c439dda0: captured here, before merged_note moves
+            // `fallback_note` — the alternation split gate below must know
+            // whether the regex compiled clean (a fallback-fired pattern
+            // matches verbatim, review B1 — never split).
+            let fallback_fired = fallback_note.is_some();
 
             // Auto-delegation (backlog b804012f): a symbol hunt the graph
             // can answer gets the answer inline instead of the advisory
@@ -1664,22 +1846,7 @@ impl Tool for SearchTool {
                             // (an empty fetch walks — 2026-01-03), so the
                             // hits are never empty here; the C2 metachar
                             // retry hint lives on the walk path.
-                            let lines: Vec<String> = ix
-                                .hits
-                                .iter()
-                                .map(|h| format!("{}:{}: {}", h.path, h.line, h.text.trim()))
-                                .collect();
-                            let mut body = format!(
-                                "{} matches in {} files (engine: index)\n\n{}",
-                                ix.total,
-                                ix.files,
-                                lines.join("\n")
-                            );
-                            if ix.total > ix.hits.len() {
-                                body.push_str(
-                                    "\n... and more matches (narrow your pattern or use a glob filter)",
-                                );
-                            }
+                            let body = index_success_body(&ix);
                             // Disclose the inline re-index (F10): a read
                             // tool mutated the index DB — the note rides
                             // ABOVE the results (truncation-safe).
@@ -1730,6 +1897,79 @@ impl Tool for SearchTool {
                             ));
                         }
                         None => {}
+                    }
+                }
+            }
+            // Backlog c439dda0: a REGEX-mode alternation whose branches
+            // are all escape-only literals (`memory\.db|codegraph\.db`)
+            // is exact literal semantics per branch — the index serves
+            // each branch and the merged page is deduped by (path, line)
+            // and verified against the compiled regex, so the response is
+            // never wider than the regex itself. A fallback-fired pattern
+            // never splits (the fallback promises verbatim-literal
+            // matching, review B1); literal:true keeps a `|` as one
+            // verbatim literal; any branch the index cannot serve —
+            // unpopulated, non-tokenizable, zero post-glob hits, or
+            // staleness beyond inline repair — falls the WHOLE query back
+            // to the walk, which stays authoritative.
+            if !args.literal && !fallback_fired && !args.pattern.contains('\n') {
+                if let Some(branches) = split_alternation_literals(&args.pattern) {
+                    if let Some(g) = &graph {
+                        match try_index_alternation(
+                            g,
+                            &root,
+                            &branches,
+                            args.glob.as_deref(),
+                            &re,
+                        ) {
+                            Some(FtsOutcome::Hits(ix)) => {
+                                let body = index_success_body(&ix);
+                                // Disclose the inline re-index (F10), same
+                                // disclosure as the single-literal path.
+                                let note = if ix.reindexed > 0 {
+                                    let sample = log_stale(
+                                        staleness_log.as_ref(),
+                                        "search",
+                                        &root,
+                                        &ix.stale,
+                                        crate::index_staleness::Action::InlineReindex,
+                                    );
+                                    push_note(
+                                        note,
+                                        format!(
+                                            "reindexed {} stale file(s){} — serving fresh index results",
+                                            ix.reindexed,
+                                            stale_detail(&sample, ix.stale.len(), staleness_log.is_some())
+                                        ),
+                                    )
+                                } else {
+                                    note
+                                };
+                                return ToolResult::success(with_note(body, &note));
+                            }
+                            Some(FtsOutcome::Stale { stale, repaired }) => {
+                                log_stale(
+                                    staleness_log.as_ref(),
+                                    "search",
+                                    &root,
+                                    &repaired,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
+                                let sample = log_stale(
+                                    staleness_log.as_ref(),
+                                    "search",
+                                    &root,
+                                    &stale,
+                                    crate::index_staleness::Action::SurfacedOnly,
+                                );
+                                stale_note = Some(format!(
+                                    "content index stale for {} file(s){} — serving tree-walk results",
+                                    stale.len(),
+                                    stale_detail(&sample, stale.len(), staleness_log.is_some())
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -2298,6 +2538,35 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("a.rs:1"));
+    }
+
+    #[test]
+    fn split_alternation_literals_exactness() {
+        use super::split_alternation_literals as split;
+        // Escape-only branches un-escape to the exact literal per branch.
+        assert_eq!(
+            split("memory\\.db|codegraph\\.db"),
+            Some(vec!["memory.db".to_string(), "codegraph.db".to_string()])
+        );
+        // An escaped pipe is a literal inside a branch — not a split point.
+        assert_eq!(
+            split("x\\|y|z"),
+            Some(vec!["x|y".to_string(), "z".to_string()])
+        );
+        assert_eq!(split("a\\|b"), None, "no top-level split");
+        // Disqualified shapes keep the walk authoritative.
+        assert_eq!(split("a.b|c"), None, "unescaped dot");
+        assert_eq!(split("a\\d|c"), None, "class shorthand");
+        assert_eq!(split("(a|b)"), None, "group parens stay regex");
+        assert_eq!(split("^a$|^b$"), None, "anchors");
+        assert_eq!(split("a|"), None, "empty branch");
+        assert_eq!(split("a||b"), None, "empty middle branch");
+        assert_eq!(split("a"), None, "single pattern, nothing to split");
+        assert_eq!(
+            split("a|b|c|d|e|f|g|h|i"),
+            None,
+            "over the branch cap"
+        );
     }
 
     #[tokio::test]

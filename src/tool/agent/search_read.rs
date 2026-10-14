@@ -146,7 +146,9 @@ impl Tool for SearchReadTool {
             "Search + auto-read in one call: the same content search as `search`, then reads \
              the top matched files' full numbered content — collapsing the search→read \
              round-trip. Literal queries use the content index when populated (engine: \
-             index), walking otherwise. Build output and dependencies are always skipped. \
+             index), walking otherwise. A regex alternation whose every branch is an \
+             escape-only literal is served by per-branch index lookups, merged. \
+             Build output and dependencies are always skipped. \
               ESCAPE-HATCH: for text with regex metacharacters or backslashes \
               prefer literal:true (it avoids escaping); if a call is rejected as \
               malformed, do NOT resend it — reformulate. \
@@ -267,6 +269,11 @@ impl Tool for SearchReadTool {
             };
             let re = compiled.regex;
             let fallback_note = compiled.fallback_note;
+            // Backlog c439dda0: captured here, before merged_note moves
+            // `fallback_note` — the alternation split gate below must know
+            // whether the regex compiled clean (a fallback-fired pattern
+            // matches verbatim, review B1 — never split).
+            let fallback_fired = fallback_note.is_some();
 
             // Auto-delegation (backlog b804012f): same contract as `search`
             // — a symbol hunt the graph can answer (or a memory-targeted
@@ -406,6 +413,72 @@ impl Tool for SearchReadTool {
                             ));
                         }
                         None => {}
+                    }
+                }
+            }
+            // Backlog c439dda0: same alternation contract as `search` —
+            // every branch an escape-only literal → per-branch index run,
+            // merged, deduped, regex-verified; any branch miss or
+            // staleness falls the whole query back to the walk+read below.
+            if !args.literal && !fallback_fired && !args.pattern.contains('\n') {
+                if let Some(branches) = search::split_alternation_literals(&args.pattern) {
+                    if let Some(g) = &graph {
+                        match search::try_index_alternation(
+                            g,
+                            &root,
+                            &branches,
+                            args.glob.as_deref(),
+                            &re,
+                        ) {
+                            Some(search::FtsOutcome::Hits(ix)) => {
+                                let note = if ix.reindexed > 0 {
+                                    let sample = search::log_stale(
+                                        staleness_log.as_ref(),
+                                        "search_read",
+                                        &root,
+                                        &ix.stale,
+                                        crate::index_staleness::Action::InlineReindex,
+                                    );
+                                    search::push_note(
+                                        note,
+                                        format!(
+                                            "reindexed {} stale file(s){} — serving fresh index results",
+                                            ix.reindexed,
+                                            search::stale_detail(
+                                                &sample,
+                                                ix.stale.len(),
+                                                staleness_log.is_some()
+                                            )
+                                        ),
+                                    )
+                                } else {
+                                    note
+                                };
+                                return build_index_output(ix, max_files, &sandbox, &note);
+                            }
+                            Some(search::FtsOutcome::Stale { stale, repaired }) => {
+                                search::log_stale(
+                                    staleness_log.as_ref(),
+                                    "search_read",
+                                    &root,
+                                    &repaired,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
+                                let sample = search::log_stale(
+                                    staleness_log.as_ref(),
+                                    "search_read",
+                                    &root,
+                                    &stale,
+                                    crate::index_staleness::Action::SurfacedOnly,
+                                );
+                                stale_note = Some(format!(
+                                    "content index stale for {} file(s){} — serving tree-walk results",
+                                    stale.len(),
+                                    search::stale_detail(&sample, stale.len(), staleness_log.is_some())
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -813,6 +886,28 @@ mod tests {
         );
         assert!(result.output.contains("=== a.rs"));
         assert!(!result.output.contains("=== b.rs"));
+    }
+
+    #[tokio::test]
+    async fn alternation_of_literal_branches_uses_index_engine() {
+        // Backlog c439dda0 (mirror of search.rs): a regex alternation of
+        // escape-only literal branches rides the per-branch index run —
+        // merged hits, relevance-ranked reads — instead of walking.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("store.rs"), "open memory.db\n").unwrap();
+        std::fs::write(dir.path().join("graph.rs"), "read codegraph.db\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let result = tool
+            .execute(json!({"pattern": "memory\\.db|codegraph\\.db"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("engine: index"),
+            "alternation of literal branches is index-served: {}",
+            result.output
+        );
+        assert!(result.output.contains("=== store.rs"), "{}", result.output);
+        assert!(result.output.contains("=== graph.rs"), "{}", result.output);
     }
 
     #[tokio::test]

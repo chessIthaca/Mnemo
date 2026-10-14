@@ -277,16 +277,21 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   workflow state. The two read tools cross-hint each other's argument shape
   in their invalid-args error when a model mixes up a call. `search`/
   `search_read` serve literal single-line queries from the FTS5 content
-  index (`engine: index`, bm25-ranked, glob-filtered) and walk the tree
-  otherwise; the walk PRUNES ignored directories (their children are never
-  enumerated). When the pattern names an indexed symbol
+  index (`engine: index`, bm25-ranked, glob-filtered) — and, since backlog
+  c439dda0, regex-mode alternations whose every branch is an escape-only
+  literal too (per-branch index lookups, merged, regex-verified) — and walk
+  the tree otherwise; the walk PRUNES ignored directories (their children
+  are never enumerated) and the path-scoped `.coding/logs`/`.coding/tmp`
+  scratch dirs. When the pattern names an indexed symbol
   (`CodeGraph::symbol_id`, exact, best-effort) through a recognized shape —
   a bare identifier, a definition-prefixed name (`fn X`, `pub struct X` —
   `strip_definition_prefix`), or a symbol-INTENT pattern (`X(`, `a::b`,
   "who calls X" — `strip_symbol_intent`, backlog 8b8f40d2) — the search
   AUTO-DELEGATES to the code graph (backlog b804012f): a compact block
   (definition, top callers/callees, the `graph_context(id="file::name::line")`
-  pointer) rides above the output and the file walk is skipped entirely; a
+  pointer) rides above the output with the plain file matches following in
+  the SAME response — the walk is never skipped, so no identical re-issue
+  (backlog c439dda0); a
   query targeting semantic memory (a glob under `.coding/knowledge`/
   `.coding/reviews` or a typed `SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/
   `REVIEW:` prefix) delegates to `memory_search` the same way. With the

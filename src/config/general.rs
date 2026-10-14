@@ -1106,7 +1106,9 @@ pub struct UiConfig {
     pub show_knowledge_activity: bool,
     /// Show the AUTO-DELEGATED steering line that `search` / `search_read`
     /// emit when a symbol-shaped query is auto-delegated to the code graph
-    /// or memory (raw fast-path block or `note: `-prefixed prepend).
+    /// or memory (a `note: `-prefixed prepend above the plain results —
+    /// backlog c439dda0: the file matches always follow in the same
+    /// response).
     /// GUI-only display filter: the tool result
     /// text (the model's context, including the re-issue escape-hatch hint)
     /// is unaffected — only the chat ToolCard's rendering hides the line;

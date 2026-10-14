@@ -19,16 +19,18 @@
 //! symbol — a bare identifier, a definition-prefixed form (`fn X`), or a
 //! symbol-INTENT shape (`X(`, `a::b`, "who calls X") — the graph answers
 //! INLINE: a compact block (definition, top callers/callees, the
-//! graph_context pointer) rides above the output and the file walk is
-//! skipped entirely. A query targeting semantic memory — a glob under
-//! `.coding/knowledge`/`.coding/reviews` or a typed prefix (SPEC:/DECISION:/
+//! graph_context pointer) rides above the output, and the plain file
+//! matches follow in the SAME response — the walk is never skipped, so no
+//! identical re-issue is needed (backlog c439dda0). A query targeting
+//! semantic memory — a glob under `.coding/knowledge`/`.coding/reviews` or
+//! a typed prefix (SPEC:/DECISION:/
 //! BUG:/PLAN:/HOW:/REVIEW:) — gets the memory_search recall answer inline
 //! the same way. The block opens with "AUTO-DELEGATED to …" and carries the
 //! escape line: re-issuing the SAME query (pattern+glob+literal) skips
-//! delegation and runs the plain file search (sticky per exact query — a
-//! bounded set of bypassed keys; interleaved delegating queries never
-//! break an earlier escape). Best-effort: an unindexed symbol, an empty
-//! recall, or any store hiccup falls through to the normal search.
+//! delegation and returns the plain file search alone (sticky per exact
+//! query — a bounded set of bypassed keys; interleaved delegating queries
+//! never break an earlier escape). Best-effort: an unindexed symbol, an
+//! empty recall, or any store hiccup falls through to the normal search.
 //!
 //! OPTIONAL CLASSIFIER STEERING (backlog e2c47d5f): with the opt-in
 //! `[general.laya] steer_tool_choice` flag on and a confident answer, the
@@ -1613,9 +1615,11 @@ pub(crate) fn memory_hunt(pattern: &str, glob: Option<&str>) -> bool {
 
 /// The delegated memory answer for a memory-targeted query (backlog
 /// b804012f): run the semantic recall the model would otherwise reach for
-/// with `memory_search` and prepend the top hits inline, skipping the file
-/// walk. Best-effort — a missed detection, an empty recall, or any store
-/// error returns `None` and the caller falls through to the normal search.
+/// with `memory_search` and build the block the caller PREPENDS above the
+/// normal results (backlog c439dda0 — the file search runs in the same
+/// response; no identical re-issue). Best-effort — a missed detection, an
+/// empty recall, or any store error returns `None` and the caller falls
+/// through to the normal search.
 pub(crate) async fn memory_delegation_block(
     store: &Arc<dyn crate::memory::MemoryStoreTrait>,
     pattern: &str,
@@ -1631,7 +1635,8 @@ pub(crate) async fn memory_delegation_block(
     }
     let mut out = String::from(
         "AUTO-DELEGATED to memory — this query targets the memory store \
-         (re-issue this exact search to get the plain file search instead):",
+         (the plain file search follows below; re-issue this exact search \
+         to drop the block):",
     );
     for (i, sm) in hits.iter().enumerate() {
         let gist: String = sm.memory.content.chars().take(160).collect();
@@ -1679,8 +1684,9 @@ impl Tool for SearchTool {
                text occurrences (comments, string literals, config keys, log text). \
                Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
                an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
-               SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-               and the walk is skipped; re-issue the same search to get the plain file search. \
+                SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
+                above the plain file matches in the same response — nothing is skipped; \
+                re-issue the same search to drop the block. \
                 With the optional Laya tool-choice classifier on and confident, it picks that route itself (symbol / text / memory); otherwise the heuristics above stand.",
             json!({
                 "type": "object",
@@ -1807,14 +1813,14 @@ impl Tool for SearchTool {
 
             // Auto-delegation (backlog b804012f): a symbol hunt the graph
             // can answer gets the answer inline instead of the advisory
-            // nudge + a wasted walk; a memory-targeted query gets the recall
-            // answer (memory wins when both fire — a knowledge/reviews glob
-            // is a memory hunt by definition). When the delegated answer
-            // fully serves the query (memory, or a symbol hunt with no
-            // glob) the file walk is skipped entirely and the key is
-            // recorded so an immediate repeat gets the plain search (the
-            // escape hatch); a symbol hunt narrowed by a glob PREPENDS the
-            // block above the normal results instead.
+            // nudge; a memory-targeted query gets the recall answer (memory
+            // wins when both fire — a knowledge/reviews glob is a memory
+            // hunt by definition). The block PREPENDS above the normal
+            // results in the SAME response (backlog c439dda0 — the file
+            // search is never skipped, so no identical re-issue is
+            // needed), and the key is recorded so an immediate repeat
+            // drops the block and returns the plain search alone (the
+            // escape hatch).
             let symbol_block = if escape || !allow_symbol {
                 None
             } else {
@@ -1824,7 +1830,6 @@ impl Tool for SearchTool {
                     })
                 })
             };
-            let memory_delegated = memory_block.is_some();
             let delegated = memory_block.or(symbol_block);
             if log_live {
                 crate::tool::agent::tool_choice::log_decision(
@@ -1839,9 +1844,8 @@ impl Tool for SearchTool {
             }
             let mut prepended: Option<String> = None;
             if let Some(block) = delegated {
-                // Record the key on BOTH arms: the fast-path return AND the
-                // glob-narrowed prepend — the block promises the escape
-                // ("re-issue this exact search…") either way, so the repeat
+                // Record the key on the delegated arm — the block promises
+                // the escape ("re-issue this exact search…"), so the repeat
                 // must run the plain search (review 2026-12-28 H1). Set
                 // semantics: the key joins the bypass set (dedup, bounded —
                 // oldest evicted) without replacing other queries' escapes.
@@ -1852,9 +1856,12 @@ impl Tool for SearchTool {
                     let overflow = set.len().saturating_sub(DELEGATION_SET_CAP);
                     set.drain(..overflow);
                 }
-                if memory_delegated || args.glob.is_none() {
-                    return ToolResult::success(block);
-                }
+                // Backlog c439dda0: the file search is NEVER skipped — the
+                // block rides ABOVE the normal results in the SAME response
+                // (merged_note renders it first), so no identical re-issue
+                // is needed. The recorded key keeps the escape hatch: the
+                // repeat drops the block and returns the plain search
+                // alone.
                 prepended = Some(block);
             }
 
@@ -2986,18 +2993,19 @@ mod tests {
 
     #[tokio::test]
     async fn bare_identifier_symbol_searches_earn_the_graph_nudge() {
-        // Backlog b804012f: grepping a symbol name DELEGATES — the graph
-        // answers inline (definition + callers) and the walk is skipped.
-        // The immediate repeat is the escape hatch: plain search results
-        // with the advisory nudge riding above them (byte-pinned sentence).
+        // Backlog b804012f + c439dda0: grepping a symbol name DELEGATES —
+        // the graph answer (definition + callers) rides inline ABOVE the
+        // plain file matches in the same response; the immediate repeat is
+        // the escape hatch: plain search results alone, with the advisory
+        // nudge riding above them (byte-pinned sentence).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
         let tool = make_indexed_tool(dir.path());
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(r.output.contains("def: a.rs::hello::1"), "{}", r.output);
@@ -3012,8 +3020,13 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("engine:"),
+            "the plain file search runs in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1"),
+            "the file matches ride below the block: {}",
             r.output
         );
 
@@ -3053,7 +3066,7 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -3160,7 +3173,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with("AUTO-DELEGATED to the code graph"),
+                r.output.contains("AUTO-DELEGATED to the code graph"),
                 "pattern {pattern:?} must delegate: {}",
                 r.output
             );
@@ -3335,7 +3348,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with(
+                r.output.contains(
                     "AUTO-DELEGATED to the code graph — 'search_content' is an indexed symbol"
                 ),
                 "pattern {pattern:?} delegates: {}",
@@ -3362,7 +3375,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with("AUTO-DELEGATED to the code graph"),
+                r.output.contains("AUTO-DELEGATED to the code graph"),
                 "{pattern:?} delegates: {}",
                 r.output
             );
@@ -3402,7 +3415,7 @@ mod tests {
         let r = tool.execute(json!({"pattern": "fn hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -3680,8 +3693,9 @@ mod tests {
     #[tokio::test]
     async fn memory_targeted_query_delegates_and_skips_the_walk() {
         // Backlog b804012f, execute level: a knowledge-dir glob gets the
-        // recall answer inline — the walk is skipped — and the immediate
-        // repeat escapes to the plain search.
+        // recall answer inline ABOVE the plain search results (backlog
+        // c439dda0 �� same response, no re-issue), and the immediate
+        // repeat escapes to the plain search alone.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
         let store: std::sync::Arc<dyn crate::memory::MemoryStoreTrait> = {
@@ -3705,8 +3719,8 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to memory"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to memory"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -3720,8 +3734,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("no matches found"),
+            "the plain file search runs in the same response: {}",
             r.output
         );
 
@@ -3786,10 +3800,10 @@ mod tests {
         let r = tool.execute(json!({"pattern": "hello|world"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with(
+            r.output.contains(
                 "AUTO-DELEGATED to the code graph — each hit below is an indexed symbol"
             ),
-            "prepended: {}",
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -3808,8 +3822,13 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("engine:"),
+            "the plain file search runs in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1"),
+            "the file matches ride below the block: {}",
             r.output
         );
 
@@ -3867,10 +3886,10 @@ mod tests {
         let tool = make_indexed_tool(dir.path());
         // A delegates.
         let r = tool.execute(json!({"pattern": "hello"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
         // B (a different delegating query) delegates.
         let r = tool.execute(json!({"pattern": "world"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
         // A's re-issue must ESCAPE (currently: delegates again — the key was
         // replaced by B).
         let r = tool.execute(json!({"pattern": "hello"})).await;
@@ -3934,7 +3953,7 @@ mod tests {
         let tool =
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("SYMBOL", 0.9, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
     }
 
     #[tokio::test]
@@ -3947,7 +3966,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.5, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED"),
+            r.output.contains("AUTO-DELEGATED"),
             "below threshold keeps the heuristics: {}",
             r.output
         );
@@ -3963,7 +3982,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.99, false));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED"),
+            r.output.contains("AUTO-DELEGATED"),
             "disabled keeps the heuristics: {}",
             r.output
         );

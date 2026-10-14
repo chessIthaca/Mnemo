@@ -35,9 +35,9 @@ import messageSource from "../components/chat/Message.tsx?raw";
  */
 const LINES: Record<SteeringNoteKey, string> = {
   auto_delegated:
-    "note: AUTO-DELEGATED to the code graph — 'ChatDraft' is an indexed symbol (re-issue this exact search to get the plain file search instead):",
+    "note: AUTO-DELEGATED to the code graph — 'ChatDraft' is an indexed symbol (the plain file matches follow below; re-issue this exact search to drop the block):",
   search_nudge:
-    "AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol (re-issue this exact search to get the plain file search instead):",
+    "AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol (the plain file matches follow below; re-issue this exact search to drop the block):",
   shell_tip:
     "TIP: for file-content search use the `search` tool (sandboxed, content-indexed)",
   graph_miss:
@@ -258,7 +258,7 @@ describe("stripSteeringNotes", () => {
       "an AUTO-DELEGATED mention mid-line survives too",
     ].join("\n");
     const out = stripSteeringNotes(text, ["auto_delegated"]);
-    expect(out).not.toContain("(re-issue this exact search");
+    expect(out).not.toContain("re-issue this exact search to drop the block");
     expect(out).toContain("the note: AUTO-DELEGATED mention mid-line survives");
     expect(out).toContain("an AUTO-DELEGATED mention mid-line survives too");
   });

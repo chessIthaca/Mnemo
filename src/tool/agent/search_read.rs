@@ -11,10 +11,11 @@
 //!
 //! AUTO-DELEGATION (backlog b804012f): same contract as `search` — a symbol
 //! hunt the graph can answer (or a memory-targeted query: knowledge/reviews
-//! globs, typed SPEC:/DECISION:/… prefixes) gets the answer inline and the
-//! search+read is skipped entirely; re-issuing the SAME query runs the
-//! plain search+read (the escape hatch). See search.rs for the full
-//! contract.
+//! globs, typed SPEC:/DECISION:/… prefixes) gets the answer inline above
+//! the normal search+read results in the SAME response — never skipped, no
+//! identical re-issue (backlog c439dda0); re-issuing the SAME query drops
+//! the block and runs the plain search+read alone (the escape hatch). See
+//! search.rs for the full contract.
 //!
 //! OPTIONAL CLASSIFIER STEERING (backlog e2c47d5f): identical contract to
 //! `search` — with the opt-in `[general.laya] steer_tool_choice` flag on and
@@ -153,12 +154,13 @@ impl Tool for SearchReadTool {
               prefer literal:true (it avoids escaping); if a call is rejected as \
               malformed, do NOT resend it — reformulate. \
                Returns a summary line, then the matched files (capped per-file and total). \
-              For symbol questions — where is X defined, who calls X — call graph_search \
-              (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
-              symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
-              prefixes), auto-delegate: the answer rides inline and the search+read is skipped; \
-              re-issue the same search to get the plain search. With the optional Laya \
-              tool-choice classifier on and confident, it picks that route itself; otherwise the heuristics stand.",
+               For symbol questions — where is X defined, who calls X — call graph_search \
+               (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
+               symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
+               prefixes), auto-delegate: the answer rides inline above the matched files' \
+               reads in the same response — nothing is skipped; re-issue the same search \
+               to drop the block. With the optional Laya \
+               tool-choice classifier on and confident, it picks that route itself; otherwise the heuristics stand.",
             json!({
                 "type": "object",
                 "properties": {
@@ -277,10 +279,10 @@ impl Tool for SearchReadTool {
 
             // Auto-delegation (backlog b804012f): same contract as `search`
             // — a symbol hunt the graph can answer (or a memory-targeted
-            // query) gets the answer inline; when it fully serves the query
-            // the search+read is skipped entirely and the key is recorded
-            // for the escape hatch; a symbol hunt narrowed by a glob
-            // prepends the block above the normal results instead.
+            // query) gets the answer inline; the block PREPENDS above the
+            // normal search+read results in the SAME response (backlog
+            // c439dda0 — never skipped, no identical re-issue), and the
+            // key is recorded so the repeat drops the block (escape hatch).
             let symbol_block = if escape || !allow_symbol {
                 None
             } else {
@@ -290,7 +292,6 @@ impl Tool for SearchReadTool {
                     })
                 })
             };
-            let memory_delegated = memory_block.is_some();
             let delegated = memory_block.or(symbol_block);
             if log_live {
                 crate::tool::agent::tool_choice::log_decision(
@@ -305,12 +306,12 @@ impl Tool for SearchReadTool {
             }
             let mut prepended: Option<String> = None;
             if let Some(block) = delegated {
-                // Record the key on BOTH arms: the fast-path return AND the
-                // glob-narrowed prepend — the block promises the escape
-                // ("re-issue this exact search…") either way, so the repeat
-                // must run the plain search+read (review 2026-12-28 H1). Set
-                // semantics: the key joins the bypass set (dedup, bounded —
-                // oldest evicted) without replacing other queries' escapes.
+                // Record the key on the delegated arm — the block promises
+                // the escape ("re-issue this exact search…"), so the repeat
+                // must run the plain search+read (review 2026-12-28 H1).
+                // Set semantics: the key joins the bypass set (dedup,
+                // bounded — oldest evicted) without replacing other
+                // queries' escapes.
                 {
                     let mut set = delegation_state.lock().unwrap();
                     set.retain(|k| *k != key);
@@ -318,9 +319,11 @@ impl Tool for SearchReadTool {
                     let overflow = set.len().saturating_sub(search::DELEGATION_SET_CAP);
                     set.drain(..overflow);
                 }
-                if memory_delegated || args.glob.is_none() {
-                    return ToolResult::success(block);
-                }
+                // Backlog c439dda0: the search+read is NEVER skipped — the
+                // block rides ABOVE the normal results in the SAME
+                // response, so no identical re-issue is needed; the
+                // recorded key keeps the escape hatch (repeat = plain
+                // search+read without the block).
                 prepended = Some(block);
             }
 
@@ -1223,7 +1226,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("SYMBOL", 0.9, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -1239,7 +1242,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.5, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "below threshold keeps the heuristics: {}",
             r.output
         );
@@ -1254,7 +1257,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.99, false));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "disabled keeps the heuristics: {}",
             r.output
         );
@@ -1263,18 +1266,18 @@ mod tests {
     #[tokio::test]
     async fn bare_identifier_symbol_search_earns_the_graph_nudge() {
         // Mirrors search.rs: grepping a symbol name DELEGATES — the graph
-        // answers inline and the search+read is skipped; the escape repeat
-        // runs the plain search+read with the advisory nudge above the
-        // summary + read sections. A spaced pattern (a text search) never
-        // delegates nor nudges.
+        // answer rides inline ABOVE the summary + read sections (backlog
+        // c439dda0 — same response, no re-issue); the escape repeat runs
+        // the plain search+read with the advisory nudge above them. A
+        // spaced pattern (a text search) never delegates nor nudges.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
         let tool = make_indexed_tool(dir.path());
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(r.output.contains("def: a.rs::hello::1"), "{}", r.output);
@@ -1284,8 +1287,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("=== a.rs"),
-            "the search+read is skipped entirely: {}",
+            r.output.contains("=== a.rs"),
+            "the search+read runs in the same response: {}",
             r.output
         );
 
@@ -1317,7 +1320,8 @@ mod tests {
     #[tokio::test]
     async fn memory_targeted_query_delegates_and_skips_the_read() {
         // Backlog b804012f, search_read twin: a knowledge-dir glob gets the
-        // recall answer inline — the search+read is skipped entirely.
+        // recall answer inline above the plain search+read results (backlog
+        // c439dda0 — same response, no re-issue).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
         let store: std::sync::Arc<dyn crate::memory::MemoryStoreTrait> = {
@@ -1341,8 +1345,8 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to memory"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to memory"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -1351,8 +1355,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("=== "),
-            "the search+read is skipped entirely: {}",
+            r.output.contains("no matches"),
+            "the plain search runs in the same response (the glob matches nothing here): {}",
             r.output
         );
 

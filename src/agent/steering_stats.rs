@@ -905,7 +905,8 @@ mod tests {
         // answer arrived in-place, so it registers as a switch. Two
         // delegations must never arm the C5 intercept gate.
         let delegated_out = "AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol \
-                             (re-issue this exact search to get the plain file search instead):";
+                             (the plain file matches follow below; re-issue this exact search \
+                             to drop the block):";
         let stats = SteeringStats::new();
         stats.observe_result(1, "search", delegated_out);
         stats.observe_result(1, "search", delegated_out);

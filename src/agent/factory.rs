@@ -1213,7 +1213,7 @@ impl AgentLoopFactory {
                     let ctx = crate::agent::policy::PolicyFactoryCtx {
                         agent_id: agent_id.clone(),
                         project_root: self.project_root.clone(),
-                        plans_dir: plans_dir,
+                        plans_dir,
                         // The handle passes straight through — the ctx field
                         // IS the neutral trait type since 2b.3 (no cast).
                         workflow: agent.workflow_handle(),

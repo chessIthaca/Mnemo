@@ -2481,7 +2481,7 @@ async fn override_permissions_bypasses_safety_mode_gated_call() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -2571,7 +2571,7 @@ async fn git_merge_prompts_even_in_autonomous_mode() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -2681,7 +2681,7 @@ async fn run_turn_records_session_id_on_tool_events() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -2749,10 +2749,10 @@ async fn run_turn_records_error_request_stats() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -2844,10 +2844,10 @@ async fn run_turn_records_summarize_request_stats() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -2956,10 +2956,10 @@ async fn run_turn_records_request_stats_on_usage() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -3317,10 +3317,10 @@ async fn cache_heuristic_skipped_after_summarization() {
     // messages each carry >6 tokens, so the threshold trips on the 2nd turn.
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(100, 0.5),
             memory: Some(store.clone()),
@@ -3640,7 +3640,7 @@ async fn volatile_tail_then_stable_footer_appended_and_popped() {
             provider: Arc::new(provider),
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -3734,7 +3734,7 @@ async fn deepseek_vendor_tail_rides_as_user_messages_no_trailing_system_block() 
             provider: Arc::new(provider),
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -3847,7 +3847,7 @@ async fn deepseek_head_stays_byte_stable_across_plan_progress_bumps() {
             provider: Arc::new(provider),
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -3935,7 +3935,7 @@ async fn plan_frozen_tools_head_and_footer_byte_stable_across_executing_reviewin
             provider: Arc::new(provider),
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -4036,7 +4036,7 @@ async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
             provider: Arc::new(provider),
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -4125,7 +4125,7 @@ async fn local_provider_tail_rides_as_user_messages_no_trailing_system_block() {
             provider: Arc::new(provider),
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -4361,7 +4361,7 @@ async fn complete_with_retry_records_error_stats_per_attempt() {
             provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -5139,7 +5139,7 @@ async fn safety_rule_auto_approves_in_approve_each_mode() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -5238,7 +5238,7 @@ async fn safety_rule_non_match_still_prompts_in_approve_each_mode() {
 
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -5740,10 +5740,10 @@ async fn dispatch_clears_failure_pending_on_ask_user() {
     });
     let agent = Arc::new(AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: Arc::new(registry),
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -6502,10 +6502,10 @@ async fn dispatch_allows_state_transition_when_no_descendants_running() {
     });
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -7024,10 +7024,10 @@ async fn dispatch_approval_request_includes_file_write_preview() {
     });
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -7119,10 +7119,10 @@ async fn deny_all_latches_and_skips_remaining_tool_calls() {
     });
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::ApproveEachAction,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -8017,7 +8017,7 @@ async fn run_turn_records_cancelled_request_stats() {
             provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -8135,7 +8135,7 @@ async fn run_turn_usage_then_interrupt_records_no_cancelled_row() {
             provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: Some(store.clone()),
@@ -8627,10 +8627,10 @@ async fn ask_user_two_questions_round_trip() {
     });
     let agent = Arc::new(AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: Arc::new(registry),
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -8754,10 +8754,10 @@ async fn ask_user_interrupt_returns_error() {
     });
     let agent = Arc::new(AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: Arc::new(registry),
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9002,7 +9002,7 @@ async fn resolve_turn_provider_forced_model_beats_state_override() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9135,7 +9135,7 @@ async fn summarize_provider_routes_through_the_summarize_slot() {
                 provider: turn_provider.clone(),
                 tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow),
-                sandbox: sandbox,
+                sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: context::ContextManager::new(128_000, 0.5),
                 memory: None,
@@ -9267,7 +9267,7 @@ async fn explicit_picker_provider_beats_the_config_override_chain() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9436,7 +9436,7 @@ async fn picker_pin_yields_to_configured_model_on_state_change() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9562,7 +9562,7 @@ async fn picker_pin_yields_to_bug_fixing_slot_in_a_bug_plan() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9708,7 +9708,7 @@ async fn picker_pin_survives_state_change_when_no_model_configured() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9797,7 +9797,7 @@ async fn fresh_picker_pick_restamps_in_the_current_state() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -9990,10 +9990,10 @@ async fn set_explicit_provider_deferred_when_context_smaller() {
     });
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
             memory: None,
@@ -10070,10 +10070,10 @@ async fn set_explicit_provider_clears_stale_deferred_swap_on_immediate() {
     });
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
             memory: None,
@@ -10198,7 +10198,7 @@ async fn run_turn_completes_deferred_swap_after_summarization() {
             provider: old_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
             memory: None,
@@ -10357,7 +10357,7 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
             provider: old_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(200_000, 0.5),
             memory: None,
@@ -11265,7 +11265,7 @@ async fn skill_override_beats_explicit_picker_pin() {
             provider: default_provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -11590,7 +11590,7 @@ async fn run_turn_switches_to_skill_model_after_midturn_skill_start() {
             provider: default_provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -11787,7 +11787,7 @@ async fn mid_turn_skill_model_switch_emits_model_changed_events() {
             provider: default_provider,
             tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-            sandbox: sandbox,
+            sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: context::ContextManager::new(128_000, 0.5),
             memory: None,
@@ -11943,10 +11943,10 @@ async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
         let probe = provider.clone();
         let agent = AgentLoop::new(
             AgentLoopConfig {
-                provider: provider,
+                provider,
                 tools: registry,
                 workflow: crate::app::workflow::as_handle(workflow.clone()),
-                sandbox: sandbox,
+                sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: context::ContextManager::new(128_000, 0.5),
                 memory: Some(store.clone()),
@@ -12149,7 +12149,7 @@ async fn auto_recall_emits_memory_recalled_event() {
     ]));
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -12252,7 +12252,7 @@ async fn same_turn_memory_write_invalidates_auto_recall_cache() {
     ]));
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -12354,7 +12354,7 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
     ]));
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),
@@ -14754,7 +14754,7 @@ async fn failed_tool_result_is_serialized_for_the_provider_as_an_error() {
     let probe = provider.clone();
     let agent = AgentLoop::new(
         AgentLoopConfig {
-            provider: provider,
+            provider,
             tools: registry,
             workflow: crate::app::workflow::as_handle(workflow.clone()),
             sandbox: sandbox.clone(),

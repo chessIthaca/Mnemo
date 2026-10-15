@@ -45,6 +45,18 @@ fn status_sink(app: &AppHandle) -> EmbedderStatusSink {
     })
 }
 
+/// Run a core spawner inside Tauri's global async runtime context. The
+/// core's `spawn_download` / `spawn_startup_load_task` use a bare
+/// `tokio::spawn`, which panics ("there is no reactor running") on the
+/// main thread — and the startup twins below are called from the
+/// `.setup()` closure, where no Tokio runtime is entered. Before D6 moved
+/// the core, these twins spawned via `tauri::async_runtime::spawn`.
+fn on_tauri_runtime(f: impl FnOnce()) {
+    let rt = tauri::async_runtime::handle();
+    let _guard = rt.inner().enter();
+    f();
+}
+
 /// A catalog entry as sent to the frontend — the model info + whether
 /// it's already downloaded on this machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,14 +134,16 @@ pub fn spawn_startup_download(
         .find(|m| m.id == model)
         .map(|m| m.size_mb)
         .unwrap_or(0);
-    spawn_download(
-        Some(status_sink(&app)),
-        status,
-        model,
-        size_mb,
-        embedder_cache_dir(),
-        DownloadOutcome::SwapIntoStore(store),
-    );
+    on_tauri_runtime(|| {
+        spawn_download(
+            Some(status_sink(&app)),
+            status,
+            model,
+            size_mb,
+            embedder_cache_dir(),
+            DownloadOutcome::SwapIntoStore(store),
+        )
+    });
 }
 
 /// Installed-model startup path: the configured bundled model is
@@ -145,13 +159,15 @@ pub fn spawn_startup_load(
     status: Arc<RwLock<EmbedderStatus>>,
     model: String,
 ) {
-    spawn_startup_load_task(
-        Some(status_sink(&app)),
-        store,
-        status,
-        model,
-        embedder_cache_dir(),
-    );
+    on_tauri_runtime(|| {
+        spawn_startup_load_task(
+            Some(status_sink(&app)),
+            store,
+            status,
+            model,
+            embedder_cache_dir(),
+        )
+    });
 }
 
 /// Console-mode twin of [`spawn_startup_load`]: the same background
@@ -166,4 +182,26 @@ pub fn spawn_startup_load_console(
     model: String,
 ) {
     spawn_startup_load_task(None, store, status, model, embedder_cache_dir());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (the startup crash): a plain `#[test]` thread has no
+    /// Tokio runtime entered — the same situation as the `.setup()`
+    /// closure on the main thread. A bare `tokio::spawn` panics there;
+    /// inside `on_tauri_runtime` it must land on Tauri's runtime and run.
+    #[test]
+    fn on_tauri_runtime_lets_core_spawners_run_outside_a_runtime() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (tx, rx) = std::sync::mpsc::channel();
+        on_tauri_runtime(|| {
+            tokio::spawn(async move {
+                let _ = tx.send(());
+            });
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the spawned task must run on Tauri's runtime");
+    }
 }

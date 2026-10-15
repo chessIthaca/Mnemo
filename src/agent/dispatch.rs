@@ -160,6 +160,27 @@ fn denial_message(name: &str, state_token: String, verdict: ResearchWrite) -> St
     }
 }
 
+/// The interrupt plumbing threaded through the dispatch helpers
+/// (`dispatch_with_interrupt`, `dispatch_host_tool`): the agent identity +
+/// event fan-in, the command channel borrow, and the two mutable
+/// interrupt slots — the stop signal latched during approval waits /
+/// tool execution, and the command buffer drained mid-call and returned
+/// for re-injection. Grouped so the dispatch entry points stay under
+/// the argument budget; each helper destructures it at its head into
+/// plain locals.
+pub(crate) struct DispatchCtx<'a> {
+    /// The agent's identity — stamped on every emitted event.
+    pub(crate) agent_id: AgentId,
+    /// The event fan-in (host tool calls, live output deltas).
+    pub(crate) fanin_tx: &'a mpsc::Sender<(AgentId, AgentEvent)>,
+    /// The command channel borrow (interrupts, approvals, steers).
+    pub(crate) cmd_rx: &'a mut mpsc::Receiver<AgentCommand>,
+    /// The stop signal latched during approval waits / tool execution.
+    pub(crate) stop_signal: &'a mut Option<crate::agent::StopReason>,
+    /// Commands drained mid-call, returned to the caller for re-injection.
+    pub(crate) buffered: &'a mut Vec<AgentCommand>,
+}
+
 impl AgentLoop {
     /// Execute a single tool call, handling approval + retries.
     ///
@@ -584,13 +605,15 @@ impl AgentLoop {
                 let mut buffered = Vec::new();
                 let result = self
                     .dispatch_with_interrupt(
+                        DispatchCtx {
+                            agent_id,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            stop_signal: &mut *stop_signal,
+                            buffered: &mut buffered,
+                        },
                         &parsed_call,
-                        agent_id,
-                        cmd_rx,
-                        stop_signal,
-                        &mut buffered,
                         output_sink.clone(),
-                        fanin_tx,
                     )
                     .await;
                 return (result, buffered);
@@ -667,13 +690,15 @@ impl AgentLoop {
             // Approved — execute the tool, returning any buffered commands.
             let result = self
                 .dispatch_with_interrupt(
+                    DispatchCtx {
+                        agent_id,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        stop_signal: &mut *stop_signal,
+                        buffered: &mut buffered,
+                    },
                     &parsed_call,
-                    agent_id,
-                    cmd_rx,
-                    stop_signal,
-                    &mut buffered,
                     output_sink.clone(),
-                    fanin_tx,
                 )
                 .await;
             return (result, buffered);
@@ -690,13 +715,15 @@ impl AgentLoop {
         let mut buffered = Vec::new();
         let result = self
             .dispatch_with_interrupt(
+                DispatchCtx {
+                    agent_id,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    stop_signal: &mut *stop_signal,
+                    buffered: &mut buffered,
+                },
                 &parsed_call,
-                agent_id,
-                cmd_rx,
-                stop_signal,
-                &mut buffered,
                 output_sink.clone(),
-                fanin_tx,
             )
             .await;
         (result, buffered)
@@ -777,14 +804,17 @@ impl AgentLoop {
     /// like any tool result.
     async fn dispatch_host_tool(
         &self,
+        ctx: DispatchCtx<'_>,
         parsed_call: &ParsedToolCall,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        stop_signal: &mut Option<crate::agent::StopReason>,
-        buffered: &mut Vec<AgentCommand>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
         timeout_ms: u64,
     ) -> ToolResult {
+        let DispatchCtx {
+            agent_id,
+            fanin_tx,
+            cmd_rx,
+            stop_signal,
+            buffered,
+        } = ctx;
         let (responder_tx, mut responder_rx) =
             oneshot::channel::<crate::runtime::channels::HostToolOutcome>();
         let send_failed = fanin_tx
@@ -877,14 +907,17 @@ impl AgentLoop {
     /// same way — see [`attach_escalations`].
     async fn dispatch_with_interrupt(
         &self,
+        ctx: DispatchCtx<'_>,
         parsed_call: &ParsedToolCall,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        stop_signal: &mut Option<crate::agent::StopReason>,
-        buffered: &mut Vec<AgentCommand>,
         sink: OutputSink,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
     ) -> ToolResult {
+        let DispatchCtx {
+            agent_id,
+            fanin_tx,
+            cmd_rx,
+            stop_signal,
+            buffered,
+        } = ctx;
         // G2 (§5.9.2): a host tool's execution is a round-trip, not an
         // in-process call — the shim's `execute` never runs; dispatch
         // emits the HostToolCall event and awaits the host's answer (or
@@ -898,12 +931,14 @@ impl AgentLoop {
         {
             return self
                 .dispatch_host_tool(
+                    DispatchCtx {
+                        agent_id,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        stop_signal: &mut *stop_signal,
+                        buffered: &mut *buffered,
+                    },
                     parsed_call,
-                    agent_id,
-                    cmd_rx,
-                    stop_signal,
-                    buffered,
-                    fanin_tx,
                     timeout_ms,
                 )
                 .await;

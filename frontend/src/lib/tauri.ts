@@ -572,7 +572,6 @@ export interface AppSettings {
   };
   context: {
     summarize_at_fill_rate: number;
-    proxy_cache_ceiling_tokens: number | null;
   };
   ui: {
     theme: string;
@@ -722,7 +721,6 @@ export interface SettingsSavePatch {
    *  it. Entries are trimmed and blanks dropped by the backend. */
   optimizer_compress_extra_commands?: string[];
   summarize_at_fill_rate?: number;
-  proxy_cache_ceiling_tokens?: number | null;
   theme?: string;
   show_token_usage?: boolean;
   show_tool_images?: boolean;

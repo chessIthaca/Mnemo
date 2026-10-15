@@ -47,10 +47,6 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
   const setPricingStore = useAgentStore((s) => s.setPricing);
   const [fillRate, setFillRate] = useState(0.5);
   const [fillSnap, setFillSnap] = useState(0.5);
-  // Proxy cache ceiling in tokens — `null` is the cleared input (guard
-  // disabled) and saves as 0, which the backend maps to None.
-  const [cacheCeiling, setCacheCeiling] = useState<number | null>(340_000);
-  const [cacheCeilingSnap, setCacheCeilingSnap] = useState<number | null>(340_000);
   const [traceBudget, setTraceBudget] = useState(16);
   const [traceBudgetSnap, setTraceBudgetSnap] = useState(16);
   const [reqCap, setReqCap] = useState(256);
@@ -80,9 +76,6 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       const rate = s.context.summarize_at_fill_rate;
       setFillRate(rate);
       setFillSnap(rate);
-      const ceiling = s.context.proxy_cache_ceiling_tokens ?? null;
-      setCacheCeiling(ceiling);
-      setCacheCeilingSnap(ceiling);
       const budget = s.trace?.memory_budget_mb ?? 16;
       setTraceBudget(budget);
       setTraceBudgetSnap(budget);
@@ -117,20 +110,11 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
   // same gate for uniformity.
   const budgetValid = Number.isFinite(traceBudget) && traceBudget >= 1;
   const capValid = Number.isFinite(reqCap) && reqCap >= 1;
-  // The ceiling accepts a sane cliff value (>= 65_536, matching the backend
-  // validator) or a cleared field (guard disabled, saved as 0). Anything
-  // else — stray text, sub-floor values — must not latch dirty (reviews
-  // I4 + F3 pattern).
-  const cacheCeilingValid =
-    cacheCeiling === null ||
-    (Number.isFinite(cacheCeiling) && (cacheCeiling === 0 || cacheCeiling >= 65_536));
-  const cacheCeilingDirty = cacheCeilingValid && cacheCeiling !== cacheCeilingSnap;
 
   const dirty =
     numericKnobDirty(fillRate, fillSnap, 0.05, 1e-9) ||
     numericKnobDirty(traceBudget, traceBudgetSnap, 1) ||
     numericKnobDirty(reqCap, reqCapSnap, 1) ||
-    cacheCeilingDirty ||
     skipDirs !== skipDirsSnap ||
     inspectEnabled !== inspectSnap ||
     autoCompact !== autoCompactSnap;
@@ -147,11 +131,6 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       const patch: Parameters<typeof saveSettings>[0] = {};
       if (numericKnobDirty(fillRate, fillSnap, 0.05, 1e-9)) {
         patch.summarize_at_fill_rate = fillRate;
-      }
-      if (cacheCeilingDirty) {
-        // Backend maps 0 to None (guard disabled); the cleared input (null)
-        // also saves as 0.
-        patch.proxy_cache_ceiling_tokens = cacheCeiling ?? 0;
       }
       if (numericKnobDirty(traceBudget, traceBudgetSnap, 1)) {
         patch.trace_memory_budget_mb = Math.round(traceBudget);
@@ -173,8 +152,6 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
       }
       await saveSettings(patch);
       setFillSnap(fillRate);
-      setCacheCeilingSnap(cacheCeilingValid ? cacheCeiling : cacheCeilingSnap);
-      if (!cacheCeilingValid) setCacheCeiling(cacheCeilingSnap);
       // Revert an invalid (cleared/NaN) entry to the saved value instead of
       // latching it into the snapshot — an invalid value can never be saved,
       // so the UI must not pretend it was (review I4, 2026-08-18).
@@ -266,15 +243,9 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           patch.clear_vision_model = true;
         }
       }
-      const context = o.context as
-        | { summarize_at_fill_rate?: number; proxy_cache_ceiling_tokens?: number | null }
-        | undefined;
+      const context = o.context as { summarize_at_fill_rate?: number } | undefined;
       if (context && typeof context.summarize_at_fill_rate === "number") {
         patch.summarize_at_fill_rate = context.summarize_at_fill_rate;
-      }
-      if (context && context.proxy_cache_ceiling_tokens !== undefined) {
-        // Preserve "disabled" bundles: null imports as 0 (backend None).
-        patch.proxy_cache_ceiling_tokens = context.proxy_cache_ceiling_tokens ?? 0;
       }
       const ui = o.ui as { theme?: string; show_token_usage?: boolean } | undefined;
       if (ui) {
@@ -391,38 +362,6 @@ export const AdvancedSection = forwardRef<SettingsSectionHandle, {
           <span>50% default</span>
           <span>95% (late)</span>
         </div>
-      </div>
-
-      <div className="space-y-2">
-        <label
-          className="text-sm text-(--text-primary)"
-          htmlFor="cache-ceiling"
-        >
-          Proxy cache ceiling{" "}
-          <span className="text-(--text-muted)">
-            {cacheCeiling === null
-              ? "(disabled)"
-              : `(${cacheCeiling.toLocaleString()} tok)`}
-          </span>
-        </label>
-        <input
-          id="cache-ceiling"
-          type="number"
-          min={0}
-          step={1000}
-          value={cacheCeiling ?? ""}
-          placeholder="disabled"
-          onChange={(e) => {
-            const t = e.target.value.trim();
-            setCacheCeiling(t === "" ? null : Number(t));
-          }}
-          className="w-full rounded-lg border border-border bg-bg-primary px-3 py-2 text-xs text-(--text-primary) focus:border-(--accent-color) focus:outline-hidden"
-        />
-        <p className="text-xs text-(--text-muted)">
-          Summarize before the ~340K-token cliff where LiteLLM-class proxies
-          drop whole-conversation prefix caching. Empty disables the guard;
-          minimum 65,536 when set.
-        </p>
       </div>
 
       <div className="space-y-2">

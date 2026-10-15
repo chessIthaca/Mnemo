@@ -250,7 +250,7 @@ fn public_types_serde_roundtrip() {
     );
     // The permission policy rides along in kebab-case (the 2c.5 lesson:
     // SafetyMode is kebab-case on the wire; the tag is "mode").
-    let opts_json = serde_json::to_value(&sample_options()).unwrap();
+    let opts_json = serde_json::to_value(sample_options()).unwrap();
     assert_eq!(
         opts_json["permissions"],
         json!({"mode": "ApproveViaApi", "safety_mode": "autonomous"})

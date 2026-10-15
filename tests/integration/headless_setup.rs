@@ -834,8 +834,10 @@ async fn patch_settings_rejects_the_classifier_flag_with_a_stable_code() {
     let cfg = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(cfg.path()).unwrap();
     let setup = Setup::open(Some(cfg.path().to_path_buf())).expect("open");
-    let mut patch = SettingsSaveDto::default();
-    patch.laya_enabled = Some(true);
+    let patch = SettingsSaveDto {
+        laya_enabled: Some(true),
+        ..Default::default()
+    };
     let err = setup.patch_settings(patch).await.expect_err("rejected");
     assert_eq!(err.code(), "unsupported_patch");
     assert!(err.message().contains("classifier_setup"));

@@ -322,14 +322,16 @@ impl Watchdog {
             .name("hang-watchdog".to_string())
             .spawn(move || {
                 detector_loop(
-                    app,
-                    heartbeat_ms,
-                    stop,
-                    ring,
-                    start,
-                    stall_threshold,
-                    report_dir,
-                    main_thread_rust_id,
+                    DetectorInputs {
+                        app,
+                        heartbeat_ms,
+                        stop,
+                        ring,
+                        start,
+                        stall_threshold,
+                        report_dir,
+                        main_thread_rust_id,
+                    },
                     #[cfg(windows)]
                     main_thread_os_id,
                 );
@@ -352,8 +354,13 @@ impl Watchdog {
     }
 }
 
-/// The detector thread: ping → observe → (once per episode) report.
-fn detector_loop(
+/// The detector thread's inputs, grouped to keep the signature under the
+/// argument budget: the app handle (heartbeat scheduling + report
+/// emission), the shared activity/stop plumbing, the timing threshold,
+/// the report destination, and the main-thread Rust id for the report
+/// header. The Windows OS thread id stays a separate cfg-gated parameter
+/// (struct-literal fields cannot carry cfg attributes).
+struct DetectorInputs {
     app: AppHandle,
     heartbeat_ms: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
@@ -362,8 +369,23 @@ fn detector_loop(
     stall_threshold: Duration,
     report_dir: PathBuf,
     main_thread_rust_id: String,
+}
+
+/// The detector thread: ping → observe → (once per episode) report.
+fn detector_loop(
+    det: DetectorInputs,
     #[cfg(windows)] main_thread_os_id: u32,
 ) {
+    let DetectorInputs {
+        app,
+        heartbeat_ms,
+        stop,
+        ring,
+        start,
+        stall_threshold,
+        report_dir,
+        main_thread_rust_id,
+    } = det;
     let mut tracker = StallTracker::new(stall_threshold);
     // Episode counter — owned by this thread only (the report carries it per
     // fire; nothing else reads it).

@@ -387,7 +387,7 @@ async fn per_agent_workflows_are_independent_via_factory() {
     std::fs::write(&gpath, "").unwrap();
     std::fs::write(&ppath, "").unwrap();
     let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
-    let safety_rules = Arc::new(SafetyRules::new(&dir.path().join("safety.toml")).unwrap());
+    let safety_rules = Arc::new(SafetyRules::new(dir.path().join("safety.toml")).unwrap());
 
     let factory = AgentLoopFactory::new(mnemo::agent::factory::FactoryDeps {
         provider: Arc::new(SingleResponseProvider {

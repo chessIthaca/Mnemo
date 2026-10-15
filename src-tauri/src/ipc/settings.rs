@@ -258,7 +258,7 @@ pub async fn save_endpoints(
 /// fallback-ordering helper), so the re-sync picks the same endpoint + model
 /// the next app start would.
 async fn resync_runtime_state(app: &tauri::AppHandle, state: &State<'_, IpcState>) -> bool {
-    let provider_swapped = if state.runtime.factory.is_some() {
+    let provider_swapped = if let Some(factory) = &state.runtime.factory {
         let (provider, context_manager, kind_label, swapped_model, swapped_display_effort) = {
             let cfg = state.project.config.lock().await;
             let (endpoint, model) = crate::startup::resolve_startup_provider(&cfg);
@@ -280,12 +280,7 @@ async fn resync_runtime_state(app: &tauri::AppHandle, state: &State<'_, IpcState
                         ep.effective_reasoning_effort_for(Some(&model)),
                         Some(state.trace.clone()),
                     );
-                    let context_manager = state
-                        .runtime
-                        .factory
-                        .as_ref()
-                        .unwrap()
-                        .context_manager_for(provider.as_ref());
+                    let context_manager = factory.context_manager_for(provider.as_ref());
                     // The DISPLAY-space effort of the rebuilt default (the
                     // same chain the request builder uses, "off" kept
                     // verbatim) — carried on the ModelChanged event + recorded

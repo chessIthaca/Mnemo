@@ -168,15 +168,16 @@ mod tests {
     /// A saved-endpoint fixture: name "ep" with the given kind + base_url,
     /// no stored key unless the test inserts one.
     fn config_with_endpoint(kind: EndpointKind, base_url: &str) -> Config {
-        let mut config = Config::default();
-        config.endpoints = vec![Endpoint {
-            name: "ep".into(),
-            kind,
-            base_url: base_url.into(),
-            models: vec![],
-            ..Endpoint::test_default()
-        }];
-        config
+        Config {
+            endpoints: vec![Endpoint {
+                name: "ep".into(),
+                kind,
+                base_url: base_url.into(),
+                models: vec![],
+                ..Endpoint::test_default()
+            }],
+            ..Default::default()
+        }
     }
 
     #[test]

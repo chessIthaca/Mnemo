@@ -17,14 +17,13 @@
 //! sink below.
 
 use std::sync::Arc;
-use std::sync::RwLock;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use mnemo::config::Config;
 use mnemo::laya::StatusSink;
-use mnemo::memory::classifier::{Classifier, ClassifierStatus};
+use mnemo::memory::classifier::{ClassifierSlot, ClassifierStatus};
 
 use crate::ipc::state::IpcState;
 
@@ -85,7 +84,7 @@ pub fn spawn_setup_task(
     manager: Arc<LayaManager>,
     checkpoint: &'static LayaCheckpoint,
     config: Arc<tokio::sync::Mutex<Config>>,
-    classifier_slot: Option<Arc<RwLock<Option<Arc<dyn Classifier>>>>>,
+    classifier_slot: Option<ClassifierSlot>,
 ) {
     let sink = status_sink(&app);
     mnemo::laya::spawn_setup_task(sink, manager, checkpoint, config, classifier_slot);

@@ -1630,7 +1630,7 @@ mod tests {
             }))
             .await;
         assert!(result.success, "{}", result.output);
-        let calls = spawner.calls.lock().unwrap();
+        let calls = spawner.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         // The TASK the spawner received carries the rider; the caller's
         // success message (built from the args) is unchanged.
@@ -1649,6 +1649,7 @@ mod tests {
             "the matched hit is surfaced in the task: {}",
             calls[0].1
         );
+
         // Passive by construction: recall_peek must NOT bump access counts.
         let rows = store
             .list_by_tier(crate::memory::MemoryTier::Semantic)

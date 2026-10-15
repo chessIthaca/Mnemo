@@ -90,6 +90,54 @@ impl Workspace {
     }
 }
 
+/// The kernel-minimal project bootstrap the engine may perform when a
+/// `--project` flag points at a directory that is not yet a project (the
+/// CLI's initialize workflow): scaffold `.coding/` + `plans/`, seed the
+/// shipped skills (the kernel-owned catalog), and write the root `agent.md`
+/// template. THE APP-OWNED `.gitignore`/`.gitattributes` merge stays the
+/// app's `Project::init` (row 27's letter: the kernel never writes
+/// `.gitignore`) — the app seeds those on its own init pass.
+///
+/// Idempotent (mkdir-all + write-if-missing, like the app's init).
+pub fn ensure_minimal_project(root: &Path) -> crate::error::Result<()> {
+    let state_dir = root.join(CODING_DIR_NAME);
+    std::fs::create_dir_all(state_dir.join("plans")).map_err(|e| {
+        crate::error::Error::Project(format!(
+            "mkdir {}: {e}",
+            state_dir.join("plans").display()
+        ))
+    })?;
+    crate::project::skills_seed::seed_skills(&state_dir.join("skills")).map_err(|e| {
+        crate::error::Error::Project(format!(
+            "failed to seed skills into {}: {e}",
+            state_dir.join("skills").display()
+        ))
+    })?;
+    let agent_md_path = root.join("agent.md");
+    if !agent_md_path.exists() {
+        std::fs::write(&agent_md_path, crate::project::agent_md::DEFAULT_PROJECT_TEMPLATE)
+            .map_err(|e| {
+                crate::error::Error::Project(format!("write {}: {e}", agent_md_path.display()))
+            })?;
+    }
+    Ok(())
+}
+
+///<span> Walk</span> up from `start` looking for a directory containing `.coding/`.
+/// Returns the project root (the parent of `.coding/`) if found. The
+/// kernel's project-detection primitive (the app's `Project` delegates to
+/// this; G3 keeps the `.coding` knowledge kernel-side).
+pub fn find_coding_dir_ancestor(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join(CODING_DIR_NAME).is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,51 +201,4 @@ mod tests {
             .join("merge_to_main.toml")
             .is_file());
     }
-}
-///<span> Walk</span> up from `start` looking for a directory containing `.coding/`.
-/// Returns the project root (the parent of `.coding/`) if found. The
-/// kernel's project-detection primitive (the app's `Project` delegates to
-/// this; G3 keeps the `.coding` knowledge kernel-side).
-pub fn find_coding_dir_ancestor(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        if dir.join(CODING_DIR_NAME).is_dir() {
-            return Some(dir.to_path_buf());
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-/// The kernel-minimal project bootstrap the engine may perform when a
-/// `--project` flag points at a directory that is not yet a project (the
-/// CLI's initialize workflow): scaffold `.coding/` + `plans/`, seed the
-/// shipped skills (the kernel-owned catalog), and write the root `agent.md`
-/// template. THE APP-OWNED `.gitignore`/`.gitattributes` merge stays the
-/// app's `Project::init` (row 27's letter: the kernel never writes
-/// `.gitignore`) — the app seeds those on its own init pass.
-///
-/// Idempotent (mkdir-all + write-if-missing, like the app's init).
-pub fn ensure_minimal_project(root: &Path) -> crate::error::Result<()> {
-    let state_dir = root.join(CODING_DIR_NAME);
-    std::fs::create_dir_all(state_dir.join("plans")).map_err(|e| {
-        crate::error::Error::Project(format!(
-            "mkdir {}: {e}",
-            state_dir.join("plans").display()
-        ))
-    })?;
-    crate::project::skills_seed::seed_skills(&state_dir.join("skills")).map_err(|e| {
-        crate::error::Error::Project(format!(
-            "failed to seed skills into {}: {e}",
-            state_dir.join("skills").display()
-        ))
-    })?;
-    let agent_md_path = root.join("agent.md");
-    if !agent_md_path.exists() {
-        std::fs::write(&agent_md_path, crate::project::agent_md::DEFAULT_PROJECT_TEMPLATE)
-            .map_err(|e| {
-                crate::error::Error::Project(format!("write {}: {e}", agent_md_path.display()))
-            })?;
-    }
-    Ok(())
 }

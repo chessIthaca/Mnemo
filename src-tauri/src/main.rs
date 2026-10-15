@@ -832,9 +832,10 @@ fn main() {
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
                             // `brain_result` is matched by reference (the Ready
-                            // arm borrows `brain`), so `config` is a `&Config`
-                            // here and must be cloned — it cannot be moved out.
-                            config: Arc::new(tokio::sync::Mutex::new(config.clone())),
+                            // arm borrows `brain`), so `config` is a
+                            // `&Box<Config>` here and must be cloned through
+                            // the box — it cannot be moved out.
+                            config: Arc::new(tokio::sync::Mutex::new((**config).clone())),
                             sandbox: Arc::new(fallback_sandbox),
                         },
                         approvals: pending_approvals.clone(),

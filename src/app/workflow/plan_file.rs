@@ -874,7 +874,7 @@ G
     fn bold_header_tolerates_double_wrapped_runs() {
         // Regression (backlog 2026-08-20, "****Verify builds/tests**** should
         // be rendered bold"): legacy plans written by the double-wrapping
-        // StepInput::to_text stored `****Header****` (and the asymmetric
+        // StepInput::into_text stored `****Header****` (and the asymmetric
         // `****Header**`). The old extractor stripped exactly 2 leading `*`
         // then found the closer immediately → EMPTY header → None → the plan
         // view fell back to the raw text with literal asterisks. Runs of 2+

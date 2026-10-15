@@ -1178,7 +1178,7 @@ async fn begin_shutdown(state: &mut ReplState, runtime: &ConsoleRuntime) {
 /// non-interactive loop over the same runtime.
 pub(crate) async fn run_console() -> i32 {
     let brain = match crate::build_brain(None, tokio::runtime::Handle::current()) {
-        Ok(crate::BrainOutcome::Ready(brain)) => brain,
+        Ok(crate::BrainOutcome::Ready(brain)) => *brain,
         Ok(crate::BrainOutcome::NeedsProject(_)) => {
             eprintln!(
                 "mnemo console: no project resolved — run from a project directory, \

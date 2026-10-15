@@ -294,14 +294,14 @@ where
     #[serde(untagged)]
     enum ModelEntry {
         Id(String),
-        Spec(ModelSpec),
+        Spec(Box<ModelSpec>),
     }
     let entries = Vec::<ModelEntry>::deserialize(d)?;
     Ok(entries
         .into_iter()
         .map(|e| match e {
             ModelEntry::Id(id) => ModelSpec::from(id),
-            ModelEntry::Spec(spec) => spec,
+            ModelEntry::Spec(spec) => *spec,
         })
         .collect())
 }

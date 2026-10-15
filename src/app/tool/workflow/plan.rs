@@ -118,7 +118,7 @@ struct CreatePlanArgs {
 ///
 /// Without this, the structured form failed deserialization with
 /// `invalid type: map, expected a string` (backlog #38). The untagged enum
-/// accepts either; [`StepInput::to_text`] normalizes a map step into the
+/// accepts either; [`StepInput::into_text`] normalizes a map step into the
 /// documented string form so the workflow layer (which stores `Vec<String>`)
 /// is unchanged. The untagged order matters: `Text` (string) is tried before
 /// `Map` (object), so a plain string never accidentally parses as a map.
@@ -152,7 +152,7 @@ impl StepInput {
     /// failed to parse, so the plan view showed raw asterisks instead of a
     /// bold header (backlog 2026-08-20, "****Verify builds/tests**** should
     /// be rendered bold").
-    fn to_text(self) -> String {
+    fn into_text(self) -> String {
         match self {
             StepInput::Text(s) => s,
             StepInput::Map { header, body } => {
@@ -170,7 +170,7 @@ impl StepInput {
 
 /// Strip ALL layers of `**` markers from a header that already carries them
 /// (`"**Add X**"` → `"Add X"`, and the double-wrapped `"****Add X****"` →
-/// `"Add X"`), so the wrap in [`StepInput::to_text`] is always exactly one
+/// `"Add X"`), so the wrap in [`StepInput::into_text`] is always exactly one
 /// layer (review L1, 2026-08-20).
 ///
 /// Anything else passes through unchanged — single `*italics*` markers,
@@ -181,7 +181,7 @@ impl StepInput {
 fn unwrap_bold(header: &str) -> &str {
     let mut current = header.trim();
     // Unwrap to a fixpoint: a single pass left `"****X****"` → `"**X**"`,
-    // and the re-wrap in to_text restored the broken `****X****`.
+    // and the re-wrap in into_text restored the broken `****X****`.
     while let Some(inner) = current
         .strip_prefix("**")
         .and_then(|rest| rest.strip_suffix("**"))
@@ -197,7 +197,7 @@ fn unwrap_bold(header: &str) -> &str {
 
 /// Normalize a list of [`StepInput`] steps into stored step text.
 fn steps_to_text(steps: Vec<StepInput>) -> Vec<String> {
-    steps.into_iter().map(StepInput::to_text).collect()
+    steps.into_iter().map(StepInput::into_text).collect()
 }
 
 /// Collapse a value to a single line for the plan file's one-line sections
@@ -4411,14 +4411,14 @@ mod tests {
     #[test]
     fn step_input_to_text_passes_strings_through() {
         let step: StepInput = serde_json::from_value(json!("**Add X** — do it")).unwrap();
-        assert_eq!(step.to_text(), "**Add X** — do it");
+        assert_eq!(step.into_text(), "**Add X** — do it");
     }
 
     #[test]
     fn step_input_to_text_joins_header_and_body() {
         let step: StepInput =
             serde_json::from_value(json!({"header": "Add X", "body": "do it"})).unwrap();
-        assert_eq!(step.to_text(), "**Add X** — do it");
+        assert_eq!(step.into_text(), "**Add X** — do it");
     }
 
     #[test]
@@ -4426,9 +4426,9 @@ mod tests {
         // A map step with an empty (or omitted) body becomes just the bold header.
         let step: StepInput =
             serde_json::from_value(json!({"header": "Add X", "body": ""})).unwrap();
-        assert_eq!(step.to_text(), "**Add X**");
+        assert_eq!(step.into_text(), "**Add X**");
         let step: StepInput = serde_json::from_value(json!({"header": "Add X"})).unwrap();
-        assert_eq!(step.to_text(), "**Add X**");
+        assert_eq!(step.into_text(), "**Add X**");
     }
 
     #[test]
@@ -4443,23 +4443,23 @@ mod tests {
             json!({"header": "**Verify builds/tests**", "body": "run tests"}),
         )
         .unwrap();
-        assert_eq!(step.to_text(), "**Verify builds/tests** — run tests");
+        assert_eq!(step.into_text(), "**Verify builds/tests** — run tests");
         // Header-only form too.
         let step: StepInput = serde_json::from_value(json!({"header": "**Verify**"})).unwrap();
-        assert_eq!(step.to_text(), "**Verify**");
+        assert_eq!(step.into_text(), "**Verify**");
         // Already-DOUBLE-wrapped headers lose BOTH layers (fixpoint unwrap —
         // review L1: a single pass left `****X****` re-wrapped to the exact
         // broken form the backlog reported).
         let step: StepInput =
             serde_json::from_value(json!({"header": "****Add X****", "body": "do it"})).unwrap();
-        assert_eq!(step.to_text(), "**Add X** — do it");
+        assert_eq!(step.into_text(), "**Add X** — do it");
         // Single `*italics*` markers are NOT unwrapped (only `**…**` is).
         let step: StepInput = serde_json::from_value(json!({"header": "*Add X*"})).unwrap();
-        assert_eq!(step.to_text(), "***Add X***");
+        assert_eq!(step.into_text(), "***Add X***");
         // `**` only mid-text stays as-is.
         let step: StepInput =
             serde_json::from_value(json!({"header": "Use **bold** here"})).unwrap();
-        let text = step.to_text();
+        let text = step.into_text();
         assert!(text.starts_with("**Use **bold** here**"), "{text}");
     }
 

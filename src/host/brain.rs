@@ -125,13 +125,16 @@ pub struct Brain {
 /// `NeedsProject` carries the loaded global `Config` (so the picker can list
 /// the registered projects from `projects.toml`) without building any of the
 /// project-scoped subsystems (provider, sandbox, memory, constitution…).
+/// Both payloads ride boxed — `Config` is ~1.7 KB and `Brain` ~216 B; the
+/// boxes keep `BrainOutcome` cheap to hold and pass (boxing only `Config`
+/// left `Brain` itself over the 200 B large_enum_variant threshold).
 pub enum BrainOutcome {
     /// The brain built successfully — the app runs normally.
-    Ready(Brain),
+    Ready(Box<Brain>),
     /// No project resolved at startup — the frontend shows the project
     /// picker. The window is open but the agent can't run until a project is
     /// chosen (which restarts the app into the selected project).
-    NeedsProject(Config),
+    NeedsProject(Box<Config>),
 }
 
 /// Build the brain: load config, resolve project, wire provider + factory —
@@ -216,7 +219,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
                 "mnemo: pending-project marker pointed at '{}' which has no .coding/ — showing the picker",
                 pending.display()
             );
-            return Ok(BrainOutcome::NeedsProject(config));
+            return Ok(BrainOutcome::NeedsProject(Box::new(config)));
         }
     } else if let Some(flagged) = project_flag_from_args(std::env::args()) {
         if flagged.join(CODING_DIR_NAME).exists() {
@@ -237,7 +240,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
         if let Some(found) = find_coding_dir_ancestor(&cwd) {
             Arc::new(Workspace::new(&found))
         } else {
-            return Ok(BrainOutcome::NeedsProject(config));
+            return Ok(BrainOutcome::NeedsProject(Box::new(config)));
         }
     };
 
@@ -263,7 +266,7 @@ fn build_brain_inner(notifier: Option<SharedNotifier>, rt: tokio::runtime::Handl
             shared: None,
         },
     )
-    .map(BrainOutcome::Ready)
+    .map(|brain| BrainOutcome::Ready(Box::new(brain)))
 }
 
 /// The shared wiring tail (3a.4): everything from an EXPLICIT config dir +

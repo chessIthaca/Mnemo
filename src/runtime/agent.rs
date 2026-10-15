@@ -4521,7 +4521,7 @@ mod tests {
         // The follow-up turn's request must carry the injected steer as a
         // user message with an image block (multimodal path) — not bare
         // text with the image silently dropped.
-        let calls = calls.lock().unwrap();
+        let calls = calls.lock().unwrap().clone();
         assert!(
             calls.len() >= 2,
             "the follow-up turn must have issued a request: {calls:?}"
@@ -5436,7 +5436,7 @@ mod tests {
         }
 
         // The captured user message must be multipart (Parts), not plain text.
-        let messages = captured.lock().unwrap();
+        let messages = captured.lock().unwrap().clone();
         assert_eq!(
             messages.len(),
             1,
@@ -6194,7 +6194,7 @@ mod tests {
             }
         }
 
-        let snaps = captured.lock().unwrap();
+        let snaps = captured.lock().unwrap().clone();
         assert!(
             snaps.len() >= 2,
             "expected multiple provider calls, got {}",

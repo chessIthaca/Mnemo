@@ -534,8 +534,10 @@ enum Msg {
     /// The record is cloned at its terminal transition (under the records
     /// lock, while it is guaranteed still in the ring) and the writer thread
     /// does the redaction/serialization/append — heavy work stays off the
-    /// request path, per the module's writer-thread invariant.
-    ArchiveRecord(LlmRequestRecord),
+    /// request path, per the module's writer-thread invariant. The record
+    /// rides boxed — `LlmRequestRecord` is ~384 B against the other
+    /// variants' 16-24 B, so every channel send stays cheap.
+    ArchiveRecord(Box<LlmRequestRecord>),
     /// Acknowledge once every write queued before this message is on disk.
     Flush(std::sync::mpsc::Sender<()>),
 }
@@ -991,7 +993,7 @@ impl LlmRequestLog {
                 && self.shared.log_enabled.load(Ordering::Relaxed)
             {
                 let snapshot = r.clone();
-                let _ = self.ensure_writer().send(Msg::ArchiveRecord(snapshot));
+                let _ = self.ensure_writer().send(Msg::ArchiveRecord(Box::new(snapshot)));
             }
         }
         // Re-enforce the global raw budget — `append_response` may have grown
@@ -1392,7 +1394,7 @@ fn writer_main(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Msg>) {
                 }
                 Msg::ErrorLine(line) => error_lines.push(line),
                 Msg::CancelLine(line) => cancel_lines.push(line),
-                Msg::ArchiveRecord(rec) => archive_records.push(rec),
+                Msg::ArchiveRecord(rec) => archive_records.push(*rec),
                 Msg::Flush(ack) => flush_acks.push(ack),
             }
         }

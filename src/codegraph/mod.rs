@@ -1057,6 +1057,18 @@ fn extract_job(
     })
 }
 
+/// The content hash the index stores for a file: std `DefaultHasher` over the
+/// raw bytes, hex-formatted — the same hasher the indexer has always used,
+/// and what [`Store::stored_file_meta`]'s `content_hash` carries. Kept as ONE
+/// function so the indexer and the staleness log's disk probe can never drift
+/// apart (backlog fc1d57fe): the probe's classification compares like for
+/// like.
+pub fn content_hash(bytes: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    format!("{:x}", hasher.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1870,16 +1882,4 @@ mod tests {
             stats.elapsed_ms
         );
     }
-}
-
-/// The content hash the index stores for a file: std `DefaultHasher` over the
-/// raw bytes, hex-formatted — the same hasher the indexer has always used,
-/// and what [`Store::stored_file_meta`]'s `content_hash` carries. Kept as ONE
-/// function so the indexer and the staleness log's disk probe can never drift
-/// apart (backlog fc1d57fe): the probe's classification compares like for
-/// like.
-pub fn content_hash(bytes: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(bytes);
-    format!("{:x}", hasher.finish())
 }

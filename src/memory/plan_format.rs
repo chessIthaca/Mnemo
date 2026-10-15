@@ -454,7 +454,7 @@ pub(crate) fn parse_step_header(header: &str) -> Option<String> {
 /// unchanged so the PlanProgress view can show the header + body expanded.
 ///
 /// Tolerant of longer marker runs: `****Header****` and the asymmetric
-/// `****Header**` (the legacy double-wrapped form `StepInput::to_text` used
+/// `****Header**` (the legacy double-wrapped form `StepInput::into_text` used
 /// to produce when a model passed an already-bold header — backlog
 /// 2026-08-20) parse as a single header, not an empty one.
 ///

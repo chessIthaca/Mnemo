@@ -10977,14 +10977,16 @@ async fn legitimate_long_turn_compactions_reset_budget() {
                     context::ContextManager::count_tokens_by_role(&messages);
                 agent
                     .maybe_compact(
-                        &mut state,
-                        &mut messages,
-                        &dyn_provider,
+                        super::turn::TurnCtx {
+                            agent_id: 1,
+                            session_id: None,
+                            provider: &dyn_provider,
+                            fanin_tx: &fanin_tx,
+                            cmd_rx: &mut cmd_rx,
+                            state: &mut state,
+                            messages: &mut messages,
+                        },
                         &context_manager,
-                        &fanin_tx,
-                        1,
-                        None,
-                        &mut cmd_rx,
                         count,
                         &mut breakdown,
                     )
@@ -11119,14 +11121,16 @@ async fn compaction_invalidates_the_recall_delta_cache() {
         let mut breakdown = context::ContextManager::count_tokens_by_role(&messages);
         let outcome = agent
             .maybe_compact(
-                &mut state,
-                &mut messages,
-                &dyn_provider,
+                super::turn::TurnCtx {
+                    agent_id: 1,
+                    session_id: None,
+                    provider: &dyn_provider,
+                    fanin_tx: &fanin_tx,
+                    cmd_rx: &mut cmd_rx,
+                    state: &mut state,
+                    messages: &mut messages,
+                },
                 &context_manager,
-                &fanin_tx,
-                1,
-                None,
-                &mut cmd_rx,
                 count,
                 &mut breakdown,
             )

@@ -273,6 +273,50 @@ pub(crate) struct TurnState {
     spend_turn_id: Option<String>,
 }
 
+/// The per-turn plumbing threaded from `run_turn` through the turn helpers
+/// (`maybe_compact`, `request_stream`, `consume_stream`,
+/// `record_interrupted_output`, `execute_tool_batch`, `handle_bad_json`):
+/// the agent's identity + session id, the provider and event fan-in, and
+/// the mutable command channel, turn state, and message list. Grouped so
+/// the helper signatures stay readable; each helper destructures it at
+/// its head and the body reads plain locals. Two lifetimes because
+/// `request_stream` returns a stream that borrows only the shared half
+/// (`'a`): the `&mut` half (`'b`) ends with the call, so the caller can
+/// keep mutating state/messages between helper calls.
+pub(crate) struct TurnCtx<'a, 'b> {
+    /// The agent's identity — stamped on every emitted event.
+    pub(crate) agent_id: AgentId,
+    /// The persisted session's id, if any.
+    pub(crate) session_id: Option<&'a str>,
+    /// The turn's provider handle.
+    pub(crate) provider: &'a Arc<dyn LlmClient>,
+    /// The event fan-in every helper emits through.
+    pub(crate) fanin_tx: &'a mpsc::Sender<(AgentId, AgentEvent)>,
+    /// The command channel borrow (interrupts, approvals, steers — in
+    /// `handle_bad_json`, the batch-isolation borrow that lets the
+    /// well-formed subset run through `execute_tool_batch`, plan d3aedfee).
+    pub(crate) cmd_rx: &'b mut mpsc::Receiver<AgentCommand>,
+    /// The per-turn counters/flags record.
+    pub(crate) state: &'b mut TurnState,
+    /// The turn's message list.
+    pub(crate) messages: &'b mut Vec<Message>,
+}
+
+/// The assistant response's echo-back metadata — the text, reasoning,
+/// message meta, and response id recorded with the assistant turn and
+/// echoed on the next request. Grouped with `TurnCtx` for the same
+/// signature-budget reason; destructured at the helper's head.
+pub(crate) struct AssistantEcho<'a> {
+    /// The assistant's text content.
+    pub(crate) text: &'a str,
+    /// The model's reasoning/thinking text, if any.
+    pub(crate) reasoning: &'a Option<String>,
+    /// Provider-reported message metadata, if any.
+    pub(crate) msg_meta: &'a Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provider's response id — taken into the recorded message.
+    pub(crate) response_id: &'a mut Option<String>,
+}
+
 impl TurnState {
     /// A fresh per-turn state: all counters zeroed, no stop signal, no
     /// compaction announced, empty caches. The single construction site
@@ -670,14 +714,16 @@ impl AgentLoop {
             if token_count >= context_manager.effective_limit() {
                 if let Some(outcome) = self
                     .maybe_compact(
-                        &mut state,
-                        messages,
-                        &provider,
+                        TurnCtx {
+                            agent_id,
+                            session_id,
+                            provider: &provider,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            state: &mut state,
+                            messages: &mut *messages,
+                        },
                         &context_manager,
-                        fanin_tx,
-                        agent_id,
-                        session_id,
-                        cmd_rx,
                         token_count,
                         &mut breakdown,
                     )
@@ -734,14 +780,16 @@ impl AgentLoop {
             let mut buffered_steers: Vec<crate::runtime::SteerPayload> = Vec::new();
             let stream_result = self
                 .request_stream(
-                    messages,
-                    &provider,
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     &tool_schemas,
-                    fanin_tx,
-                    agent_id,
-                    session_id,
-                    cmd_rx,
-                    &mut state,
                     &mut buffered_steers,
                     prep_started,
                 )
@@ -813,14 +861,17 @@ impl AgentLoop {
                 mut stream_error,
             } = self
                 .consume_stream(
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     stream,
-                    &provider,
                     &context_manager,
-                    &mut state,
-                    fanin_tx,
-                    agent_id,
-                    cmd_rx,
-                    session_id,
                     estimated_prompt_tokens,
                     &breakdown,
                 )
@@ -840,14 +891,18 @@ impl AgentLoop {
             // partial output — see record_interrupted_output.
             if let Some(outcome) = self
                 .record_interrupted_output(
-                    &mut state,
-                    messages,
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     &mut acc,
                     &text,
                     &assistant_reasoning,
-                    &provider,
-                    fanin_tx,
-                    agent_id,
                 )
                 .await
             {
@@ -931,19 +986,23 @@ impl AgentLoop {
             if has_bad_json {
                 if let Some(outcome) = self
                     .handle_bad_json(
-                        &mut state,
+                        TurnCtx {
+                            agent_id,
+                            session_id,
+                            provider: &provider,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            state: &mut state,
+                            messages: &mut *messages,
+                        },
+                        AssistantEcho {
+                            text: &text,
+                            reasoning: &assistant_reasoning,
+                            msg_meta: &msg_meta,
+                            response_id: &mut response_id,
+                        },
                         &tool_calls,
-                        messages,
                         &finish_reason,
-                        &text,
-                        &assistant_reasoning,
-                        &msg_meta,
-                        &mut response_id,
-                        &provider,
-                        fanin_tx,
-                        agent_id,
-                        cmd_rx,
-                        session_id,
                         &tool_schemas,
                     )
                     .await
@@ -1022,20 +1081,24 @@ impl AgentLoop {
             // then record the tools-phase duration and compact old tool
             // results — see execute_tool_batch.
             self.execute_tool_batch(
+                TurnCtx {
+                    agent_id,
+                    session_id,
+                    provider: &provider,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    state: &mut state,
+                    messages: &mut *messages,
+                },
+                AssistantEcho {
+                    text: &text,
+                    reasoning: &assistant_reasoning,
+                    msg_meta: &msg_meta,
+                    response_id: &mut response_id,
+                },
                 &tool_calls,
                 &tool_calls,
-                &text,
-                &assistant_reasoning,
-                msg_meta,
                 &mut raw,
-                &mut response_id,
-                messages,
-                fanin_tx,
-                agent_id,
-                cmd_rx,
-                session_id,
-                &provider,
-                &mut state,
             )
             .await;
 
@@ -1989,21 +2052,27 @@ impl AgentLoop {
     /// (quality review HIGH 1); behavior unchanged.
     async fn execute_tool_batch(
         &self,
+        ctx: TurnCtx<'_, '_>,
+        echo: AssistantEcho<'_>,
         tool_calls: &[ToolCall],
         recorded_calls: &[ToolCall],
-        text: &str,
-        assistant_reasoning: &Option<String>,
-        msg_meta: Option<serde_json::Map<String, serde_json::Value>>,
         raw: &mut Option<serde_json::Value>,
-        response_id: &mut Option<String>,
-        messages: &mut Vec<Message>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
-        provider: &Arc<dyn LlmClient>,
-        state: &mut TurnState,
     ) {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
+        let AssistantEcho {
+            text,
+            reasoning: assistant_reasoning,
+            msg_meta,
+            response_id,
+        } = echo;
         // A stop signal set by a tool call (Interrupt/Cancel during approval or
         // ask_user, or — once step 4 lands — during tool execution). When set,
         // the turn ends at the next break point (after the current tool call
@@ -2041,7 +2110,7 @@ impl AgentLoop {
         // passes the same slice for both.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
-            provider_meta: msg_meta,
+            provider_meta: msg_meta.clone(),
             raw: raw.take(),
             response_id: response_id.take(),
             origin_provider: Some(provider.kind().as_str().to_string()),
@@ -2770,17 +2839,20 @@ impl AgentLoop {
     /// from run_turn (quality review HIGH 1); behavior unchanged.
     pub(crate) async fn maybe_compact(
         &self,
-        state: &mut TurnState,
-        messages: &mut Vec<Message>,
-        provider: &Arc<dyn LlmClient>,
+        ctx: TurnCtx<'_, '_>,
         context_manager: &context::ContextManager,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        session_id: Option<&str>,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         token_count: usize,
         breakdown: &mut crate::runtime::ContextBreakdown,
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
         // Auto-compaction runs a whole extra LLM call inside the
         // "sending" window — surface it as its own live phase so the
         // inflight bar doesn't sit on "sending…" for the duration.
@@ -4137,20 +4209,23 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// run_turn (quality review HIGH 1); behavior unchanged.
     async fn request_stream<'a>(
         &self,
-        messages: &mut [Message],
-        provider: &'a Arc<dyn LlmClient>,
+        ctx: TurnCtx<'a, '_>,
         tool_schemas: &[crate::provider::ToolSchema],
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        session_id: Option<&str>,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        state: &mut TurnState,
         buffered_steers: &mut Vec<crate::runtime::SteerPayload>,
         prep_started: std::time::Instant,
     ) -> Result<
         (futures::stream::BoxStream<'a, LlmEvent>, u32),
         crate::error::Error,
     > {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
         // The provider request (connection establishment + first byte) is
         // interruptible: an Interrupt/Cancel arriving during this window is
         // caught by a select! that polls cmd_rx. reqwest is drop-safe (the
@@ -4321,17 +4396,21 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// HIGH 1); behavior unchanged.
     async fn consume_stream(
         &self,
+        ctx: TurnCtx<'_, '_>,
         stream: futures::stream::BoxStream<'_, LlmEvent>,
-        provider: &Arc<dyn LlmClient>,
         context_manager: &context::ContextManager,
-        state: &mut TurnState,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
         estimated_prompt_tokens: u32,
         breakdown: &crate::runtime::ContextBreakdown,
     ) -> StreamOutcome {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            ..
+        } = ctx;
         let mut acc = DeltaAccumulator::new();
         let mut text = String::new();
         // The model's reasoning/thinking text this turn (DeepSeek
@@ -4663,15 +4742,19 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// behavior unchanged.
     async fn record_interrupted_output(
         &self,
-        state: &mut TurnState,
-        messages: &mut Vec<Message>,
+        ctx: TurnCtx<'_, '_>,
         acc: &mut DeltaAccumulator,
         text: &str,
         assistant_reasoning: &Option<String>,
-        provider: &Arc<dyn LlmClient>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            provider,
+            fanin_tx,
+            state,
+            messages,
+            ..
+        } = ctx;
         // A HARD stop signal arrived during streaming (Interrupt, Cancel,
         // Compact, Clear — with or without carried steers). End the turn
         // at this break point (the current stream chunk completed — we're
@@ -4815,25 +4898,29 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// the batch from history and nothing runs.
     async fn handle_bad_json(
         &self,
-        state: &mut TurnState,
+        ctx: TurnCtx<'_, '_>,
+        echo: AssistantEcho<'_>,
         tool_calls: &[ToolCall],
-        messages: &mut Vec<Message>,
         finish_reason: &FinishReason,
-        text: &str,
-        assistant_reasoning: &Option<String>,
-        msg_meta: &Option<serde_json::Map<String, serde_json::Value>>,
-        response_id: &mut Option<String>,
-        provider: &Arc<dyn LlmClient>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        // Batch isolation (plan d3aedfee): needed to execute the well-formed
-        // subset through the normal tool path (execute_tool_batch).
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
         // The request's advertised tool schemas — the one-liner's required
         // list comes from the matching tool's `parameters.required`.
         tool_schemas: &[crate::provider::ToolSchema],
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
+        let AssistantEcho {
+            text,
+            reasoning: assistant_reasoning,
+            msg_meta,
+            response_id,
+        } = echo;
         // Bad JSON is an LLM output issue the model can recover from by
         // emitting valid JSON — it does NOT count toward MAX_RETRIES
         // (tool-execution failures). It uses the higher
@@ -5039,20 +5126,24 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // malformed calls are not dispatched; the guidance loop below
             // errors them, so history still holds N results for N calls.
             self.execute_tool_batch(
+                TurnCtx {
+                    agent_id,
+                    session_id,
+                    provider,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    state: &mut *state,
+                    messages: &mut *messages,
+                },
+                AssistantEcho {
+                    text,
+                    reasoning: assistant_reasoning,
+                    msg_meta,
+                    response_id: &mut *response_id,
+                },
                 &valid_subset,
                 &sanitized_calls,
-                text,
-                assistant_reasoning,
-                msg_meta.clone(),
                 &mut None,
-                response_id,
-                messages,
-                fanin_tx,
-                agent_id,
-                cmd_rx,
-                session_id,
-                provider,
-                state,
             )
             .await;
         }

@@ -16876,4 +16876,167 @@ async fn guardrails_is_default_and_gate_rules() {
         ..Guardrails::default()
     }))
     .is_err());
+}#[tokio::test]
+async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
+    // (d) Set-level sentinel (backlog c68a8c3b): when EVERY recalled row
+    // was already injected (the set is unchanged since its last
+    // sighting), the block collapses into ONE sentinel line — an N-row
+    // repeat costs one line, not N per-row references. Pre-fix, turn 2
+    // below rendered the per-row references (red).
+    const M1: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path so the history stays linear";
+    const M2: &str = "steps to merge a release branch into main";
+    const M3: &str = "merge checklist: run the workspace suite before landing the release branch merge";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions",
+            M1,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "merge checklist",
+            M2,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![
+        vec![
+            LlmEvent::TextDelta {
+                text: "one".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta {
+                text: "two".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta {
+                text: "three".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_optimizer(Arc::new(std::sync::RwLock::new(
+        crate::config::OptimizerConfig::default(),
+    )));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // Turn 2 — same query, same corpus: every row is already injected.
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // A new equally-matching memory lands between turns 2 and 3: turn 3
+    // is a MIXED set and must still render the delta block (the new row
+    // full, the repeats as references) — the sentinel only fires when
+    // the WHOLE set is unchanged.
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "release checklist",
+            M3,
+            1_700_000_200,
+        ))
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tails = probe.request_tails();
+    let turn1 = &tails[0];
+    let turn2 = &tails[1];
+    let turn3 = &tails[2];
+
+    // Turn 1: both rows arrive in full.
+    assert!(
+        turn1.contains("how to merge feature branches into main safely") && turn1.contains(M2),
+        "turn 1 injects both rows in full: {turn1}"
+    );
+
+    // Turn 2: the UNCHANGED set costs ONE line — the sentinel names the
+    // count and the first injection turn, and no per-row references
+    // render (RED pre-fix: turn 2 rendered the references).
+    assert!(
+        turn2.contains(
+            "2 recalled memories unchanged since injection (first at turn 1); re-read with memory_search if needed."
+        ),
+        "the all-elided set renders the one-line sentinel: {turn2}"
+    );
+    assert!(
+        !turn2.contains("unchanged since injection (turn 1);"),
+        "no per-row references when the whole set is elided: {turn2}"
+    );
+
+    // Turn 3: the MIXED set still renders the delta block — the new row
+    // in full, the repeats as per-row references.
+    assert!(
+        turn3.contains("unchanged since injection (turn 1);"),
+        "a mixed set keeps per-row references: {turn3}"
+    );
+    assert!(
+        turn3.contains(M3),
+        "the newly recalled row arrives in full: {turn3}"
+    );
+
+    // The savings ledger records the sentinel's saved chars.
+    let rows = store.savings_events_rows(None).await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == "recall_delta"
+                && r
+                    .detail
+                    .as_deref()
+                    .map_or(false, |d| d.contains("sentinel"))),
+        "a savings row names the sentinel: {rows:?}"
+    );
 }

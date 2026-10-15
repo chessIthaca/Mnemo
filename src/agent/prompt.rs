@@ -769,6 +769,19 @@ pub fn format_recall_context_delta(
     out
 }
 
+/// Format the all-elided recall block as ONE sentinel line (backlog
+/// c68a8c3b): when every recalled row was already injected this session —
+/// the set is unchanged since its last sighting — N per-row references
+/// collapse into a single line naming the count and the first injection
+/// turn. A 5-row repeat costs ~1 line instead of ~5. Like a per-row
+/// reference, the sentinel is a pointer, not a replacement: it tells the
+/// model to `memory_search` when it needs the text (or an id to dismiss
+/// via `recall_feedback`). The caller (recall_block) owns the decision;
+/// this function stays pure.
+pub fn format_recall_sentinel(count: usize, first_turn: u64) -> String {
+    format!("{count} recalled memories unchanged since injection (first at turn {first_turn}); re-read with memory_search if needed.\n\n")
+}
+
 /// Format the standing project-memory primer (the top strongest
 /// semantic+procedural memories) into a compact section for the stable head.
 ///
@@ -2030,6 +2043,19 @@ mod tests {
             mixed.contains("other body"),
             "the newly recalled entry still arrives full: {mixed}"
         );
+    }
+
+    #[test]
+    fn format_recall_sentinel_is_one_line_with_the_re_read_hint() {
+        // (d) Set-level sentinel (backlog c68a8c3b): the all-elided set
+        // renders ONE line — the count, the first injection turn, and
+        // the memory_search re-read hint. No per-row bytes.
+        let s = format_recall_sentinel(5, 4);
+        assert_eq!(
+            s,
+            "5 recalled memories unchanged since injection (first at turn 4); re-read with memory_search if needed.\n\n"
+        );
+        assert!(!s.contains("(id:"), "no per-row ids/titles in the sentinel");
     }
 
     #[test]

@@ -3536,6 +3536,36 @@ impl AgentLoop {
             // Nothing to elide: keep today's bytes and record no savings.
             return full;
         }
+        // (d) Set-level sentinel (backlog c68a8c3b): EVERY row in the
+        // set is already injected — the set is unchanged since its last
+        // sighting. N per-row references collapse into ONE line (a
+        // 5-row repeat costs ~1 line instead of ~5). The decisions stay
+        // recorded (the cache is already updated above), and the
+        // not-smaller guard keeps the delta path's semantics: only a
+        // strictly smaller block ships; a pathological set where the
+        // sentinel is not smaller falls through to the per-row
+        // references, which carry more information for the same cost.
+        if elided == decisions.len() {
+            let first_turn = decisions.iter().flatten().min().copied().unwrap_or(0);
+            let sentinel = prompt::format_recall_sentinel(results.len(), first_turn);
+            let before = crate::tool::agent::optimizer::estimate_tokens(&full);
+            let after = crate::tool::agent::optimizer::estimate_tokens(&sentinel);
+            if after < before {
+                self.record_savings_event(
+                    session_id,
+                    "recall_delta",
+                    Some(format!(
+                        "{} memories ({} elided → sentinel)",
+                        results.len(),
+                        elided
+                    )),
+                    before,
+                    after,
+                    false,
+                );
+                return sentinel;
+            }
+        }
         let delta = prompt::format_recall_context_delta(results, &|i, _| decisions[i]);
         let before = crate::tool::agent::optimizer::estimate_tokens(&full);
         let after = crate::tool::agent::optimizer::estimate_tokens(&delta);

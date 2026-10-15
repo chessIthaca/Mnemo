@@ -22,6 +22,10 @@
 //! instance that launched meanwhile owns the file, and its marker must
 //! survive our exit). Without the removal a stale marker survives shutdown
 //! and can re-warn on the next launch via pid recycling (backlog ea9576d7).
+//! The read→remove guard is check-then-act, so a launch landing inside
+//! that tiny window can lose its fresh marker to the older instance's exit
+//! — an accepted benign residual (the marker warns, it never locks), the
+//! same class as pid recycling.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,7 +96,12 @@ pub fn conflict_for(dir: &Path, own_pid: u32, alive: impl Fn(u32) -> bool) -> Op
 /// not read a stale claim. The pid guard is the point: only a marker that
 /// still names THIS process is deleted — last-writer-wins means a newer
 /// instance that launched since owns the file, and its marker must survive
-/// our exit.
+/// our exit. That guard is check-then-act (read → remove): a newer
+/// instance whose write lands inside that microseconds-wide window can
+/// lose its fresh marker to this exit — an accepted benign residual (the
+/// marker warns, it never locks), the same class as pid recycling; an
+/// atomic conditional delete is not expressible with `std::fs`, and a
+/// lock file is not warranted for a single-slot advisory marker.
 ///
 /// Returns whether the marker was removed. A missing marker and a
 /// malformed one (ownership unverifiable — preserved) both return

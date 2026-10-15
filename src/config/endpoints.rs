@@ -188,7 +188,7 @@ impl Default for Endpoint {
 /// per-model default effort (unset = the endpoint's value applies), and
 /// `multimodal` overrides the endpoint's vision flag so one endpoint can mix
 /// text-only (e.g. GLM) and vision-capable (e.g. GLM flash) models.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelSpec {
     /// The model id (matches a `ModelRef.model` / `default_model` value).
     pub id: String,
@@ -251,26 +251,6 @@ pub struct ModelSpec {
     /// Merged last: keys here can override any request field including model/messages/stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<toml::Table>,
-}
-
-impl Default for ModelSpec {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            max_context: None,
-            max_output_tokens: None,
-            reasoning_efforts: Vec::new(),
-            reasoning_effort: None,
-            reasoning_effort_off_wire: None,
-            multimodal: None,
-            temperature: None,
-            top_p: None,
-            stop: Vec::new(),
-            stop_token_ids: Vec::new(),
-            stop_boundary_strings: Vec::new(),
-            extra_body: None,
-        }
-    }
 }
 
 impl From<&str> for ModelSpec {

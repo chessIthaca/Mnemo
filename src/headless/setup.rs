@@ -857,8 +857,10 @@ impl Setup {
                 "unknown embedding model '{id}'"
             )));
         }
-        let mut patch = SettingsSaveDto::default();
-        patch.bundled_embedding_model = Some(id.to_string());
+        let patch = SettingsSaveDto {
+            bundled_embedding_model: Some(id.to_string()),
+            ..SettingsSaveDto::default()
+        };
         self.patch_settings(patch).await
     }
 

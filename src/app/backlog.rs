@@ -634,21 +634,21 @@ impl BacklogStore {
         let Some(item) = self.items.iter_mut().find(|i| i.id == id && is_live(i)) else {
             return false;
         };
-        let legal = match (item.status, to) {
-            (BacklogStatus::Pending, BacklogStatus::InFlight) => true,
-            (BacklogStatus::Pending, BacklogStatus::Done)
-            | (BacklogStatus::Pending, BacklogStatus::Failed)
-            | (BacklogStatus::Pending, BacklogStatus::CantResolve) => true,
-            (BacklogStatus::InFlight, BacklogStatus::Done)
-            | (BacklogStatus::InFlight, BacklogStatus::Failed)
-            | (BacklogStatus::InFlight, BacklogStatus::CantResolve)
-            | (BacklogStatus::InFlight, BacklogStatus::Pending) => true,
-            (
-                BacklogStatus::Done | BacklogStatus::Failed | BacklogStatus::CantResolve,
-                BacklogStatus::Pending,
-            ) => true,
-            _ => false,
-        };
+        let legal = matches!(
+            (item.status, to),
+            (BacklogStatus::Pending, BacklogStatus::InFlight)
+                | (BacklogStatus::Pending, BacklogStatus::Done)
+                | (BacklogStatus::Pending, BacklogStatus::Failed)
+                | (BacklogStatus::Pending, BacklogStatus::CantResolve)
+                | (BacklogStatus::InFlight, BacklogStatus::Done)
+                | (BacklogStatus::InFlight, BacklogStatus::Failed)
+                | (BacklogStatus::InFlight, BacklogStatus::CantResolve)
+                | (BacklogStatus::InFlight, BacklogStatus::Pending)
+                | (
+                    BacklogStatus::Done | BacklogStatus::Failed | BacklogStatus::CantResolve,
+                    BacklogStatus::Pending,
+                )
+        );
         if !legal {
             return false;
         }

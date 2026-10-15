@@ -4608,7 +4608,7 @@ async fn auto_compaction_announces_only_once_per_turn() {
         match event {
             AgentEvent::CompactStarted => started += 1,
             AgentEvent::Compacted { .. } => compacted += 1,
-            AgentEvent::Phase { phase } if phase == PhaseKind::Compacting => {
+            AgentEvent::Phase { phase: PhaseKind::Compacting } => {
                 compacting_phases += 1;
             }
             _ => {}

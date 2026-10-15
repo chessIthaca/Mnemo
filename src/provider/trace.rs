@@ -1285,25 +1285,21 @@ fn cap_request_json(value: &mut serde_json::Value, cap_bytes: usize) -> bool {
         return false; // already fits (or not serializable — leave verbatim)
     }
     let mut truncated_any = false;
-    loop {
-        if let Some(leaf) = longest_string_leaf_mut(value) {
-            let total_chars = leaf.chars().count();
-            // Aim for roughly a quarter of the cap per pass so a few big
-            // leaves converge quickly without overshooting on tiny bodies.
-            let keep_chars = (cap_bytes / 4).min(total_chars);
-            // Progress guarantee: only cut when the savings exceed the
-            // marker's own length. A body of many short strings (nothing
-            // sensible to cut) falls through and is accepted over-cap.
-            if total_chars - keep_chars < MIN_CUT_CHARS {
-                break;
-            }
-            let mut kept: String = leaf.chars().take(keep_chars).collect();
-            kept.push_str(&format!("…(+{} chars truncated)", total_chars - keep_chars));
-            *leaf = kept;
-            truncated_any = true;
-        } else {
-            break; // no string leaves left to cut
+    while let Some(leaf) = longest_string_leaf_mut(value) {
+        let total_chars = leaf.chars().count();
+        // Aim for roughly a quarter of the cap per pass so a few big
+        // leaves converge quickly without overshooting on tiny bodies.
+        let keep_chars = (cap_bytes / 4).min(total_chars);
+        // Progress guarantee: only cut when the savings exceed the
+        // marker's own length. A body of many short strings (nothing
+        // sensible to cut) falls through and is accepted over-cap.
+        if total_chars - keep_chars < MIN_CUT_CHARS {
+            break;
         }
+        let mut kept: String = leaf.chars().take(keep_chars).collect();
+        kept.push_str(&format!("…(+{} chars truncated)", total_chars - keep_chars));
+        *leaf = kept;
+        truncated_any = true;
         if serde_json::to_string(value).map_or(true, |s| s.len() <= cap_bytes) {
             break; // fits now
         }

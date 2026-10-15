@@ -70,17 +70,12 @@ const FILE_HEADER: &str = "\
 /// Serialized as `kind = "literal"` / `kind = "command_class"`. A missing
 /// `kind` field (old `safety.toml` files) deserializes as `Literal`, so
 /// existing rules keep working unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleKind {
+    #[default]
     Literal,
     CommandClass,
-}
-
-impl Default for RuleKind {
-    fn default() -> Self {
-        Self::Literal
-    }
 }
 
 impl RuleKind {

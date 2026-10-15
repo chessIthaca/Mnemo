@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// General preferences from `config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// The `[general]` section.
@@ -48,22 +48,6 @@ pub struct GeneralConfig {
     /// output before it reaches the LLM transcript (errors and summaries are
     /// always kept; raw output stays in the tool result's `data` field).
     pub shell_filter: ShellFilterConfig,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralSection::default(),
-            context: ContextConfig::default(),
-            ui: UiConfig::default(),
-            models: ModelsConfig::default(),
-            markdown: MarkdownConfig::default(),
-            git: GitConfig::default(),
-            trace: TraceConfig::default(),
-            memory: crate::memory::MemorySearchConfig::default(),
-            shell_filter: ShellFilterConfig::default(),
-        }
-    }
 }
 
 /// The `[general]` section of `config.toml`.

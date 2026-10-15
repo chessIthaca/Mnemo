@@ -275,7 +275,7 @@ impl Engine {
             .lock()
             .expect("host tools lock poisoned")
             .clone();
-        host_tools.extend(opts.host_tools.into_iter().map(HostTool::new));
+        host_tools.extend(opts.host_tools.into_iter().map(HostTool::wrap));
         // 3c/G6 tier 2: a tool selection excluding the Host group drops
         // the session's host tools too (the factory's registration
         // table covers the kernel names; the Host group's members live

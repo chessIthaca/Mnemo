@@ -691,13 +691,15 @@ mod tests {
 
     #[test]
     fn apply_endpoints_preserves_pricing_and_projects() {
-        let mut current = Config::default();
-        current.pricing = vec![PricingEntry {
-            model: "gpt-4o".into(),
-            input_per_1m: 2.5,
-            output_per_1m: 10.0,
-            cached_per_1m: 1.25,
-        }];
+        let mut current = Config {
+            pricing: vec![PricingEntry {
+                model: "gpt-4o".into(),
+                input_per_1m: 2.5,
+                output_per_1m: 10.0,
+                cached_per_1m: 1.25,
+            }],
+            ..Config::default()
+        };
         current.projects.add("demo", "/demo");
         let built = vec![ep("openai", "openai", "https://x/v1/", vec!["gpt-4o"])];
         let mut keys = HashMap::new();

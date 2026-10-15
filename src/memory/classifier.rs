@@ -129,11 +129,12 @@ impl Answer {
 /// `Downloading` serializes as `{"downloading": {"label": …, "progress": …}}`
 /// exactly like [`EmbedderStatus::Downloading`], and `FineTuning` as
 /// `{"finetuning": {"label": …}}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ClassifierStatus {
     /// Laya is off (the default) or enabled without an endpoint; no
     /// classifier call is ever attempted and no backend object exists.
+    #[default]
     Disabled,
     /// Enabled with an endpoint; calls are attempted.
     Ready,
@@ -167,12 +168,6 @@ pub enum ClassifierStatus {
         /// Human-facing description (the checkpoint id being fine-tuned).
         label: String,
     },
-}
-
-impl Default for ClassifierStatus {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// A classifier answers typed [`Question`]s about a state text with

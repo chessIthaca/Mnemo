@@ -1301,7 +1301,6 @@ impl Tool for MemorySupersedeTool {
         };
         let old_id = args.id;
         let title = args.title;
-        let tier = tier;
         // Knowledge-backed supersede: the record's FILE is the truth. The
         // successor's tier must be a distilled tier (knowledge records are
         // semantic rows — an episodic/working successor has no file home).

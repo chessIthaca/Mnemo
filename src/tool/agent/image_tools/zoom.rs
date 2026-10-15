@@ -31,18 +31,13 @@ use super::prompts::{build_prompt, zoom_control_prompt, ImageTool, PromptArgs};
 /// How much detail to apply. `Overview` = single fast pass; `Normal`/`Fine`/
 /// `Auto` drive the zoom loop (`Auto` zooms only when needed, early-exits when
 /// clear).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DetailLevel {
     Overview,
     Normal,
     Fine,
+    #[default]
     Auto,
-}
-
-impl Default for DetailLevel {
-    fn default() -> Self {
-        DetailLevel::Auto
-    }
 }
 
 /// Parse a detail-level string (case-insensitive); unknown values default to

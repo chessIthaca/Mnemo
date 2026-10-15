@@ -528,9 +528,8 @@ fn extract_bold_header_impl(text: &str) -> Option<String> {
 
 /// Strip a leading "N. " step number if present.
 fn strip_leading_number(s: &str) -> String {
-    let mut chars = s.char_indices();
     let mut found_digit = false;
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in s.char_indices() {
         if c.is_ascii_digit() {
             found_digit = true;
         } else if c == '.' && found_digit {

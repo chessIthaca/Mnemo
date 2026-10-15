@@ -96,9 +96,10 @@ impl Embedder for HashEmbedder {
 /// as bare lowercase strings (`"ready"`, `"checking"`, …) so the existing
 /// frontend string comparisons keep working; `Downloading` serializes as
 /// `{"downloading": {"model": "…", "progress": 0.5}}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbedderStatus {
+    #[default]
     Ready,
     Checking,
     Fallback,
@@ -109,12 +110,6 @@ pub enum EmbedderStatus {
         progress: f64,
     },
     Failed,
-}
-
-impl Default for EmbedderStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 /// Info about a bundled embedding model the user can pick in Settings.

@@ -1439,9 +1439,7 @@ impl AgentLoop {
             return None;
         }
         // No live plan (chat turns, subagents): nothing to cap.
-        let Some((plan_id, step_index)) = plan_scope else {
-            return None;
-        };
+        let (plan_id, step_index) = plan_scope?;
         // Counters: point them at this plan (a new plan resets everything),
         // then apply the pending failed-cycle retry to the step that runs
         // next.
@@ -4139,7 +4137,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// run_turn (quality review HIGH 1); behavior unchanged.
     async fn request_stream<'a>(
         &self,
-        messages: &mut Vec<Message>,
+        messages: &mut [Message],
         provider: &'a Arc<dyn LlmClient>,
         tool_schemas: &[crate::provider::ToolSchema],
         fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
@@ -4218,7 +4216,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // ExportHistory answers from this (the pinned future holds the
             // live borrow; the snapshot is the conversation as of the
             // request start, missing only the in-flight assistant turn).
-            let history_at_request = messages.clone();
+            let history_at_request = messages.to_vec();
             tokio::pin!(complete_fut);
             loop {
                 tokio::select! {

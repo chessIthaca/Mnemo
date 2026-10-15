@@ -190,6 +190,12 @@ pub struct ParserCache {
     by_lang: HashMap<Lang, tree_sitter::Parser>,
 }
 
+impl Default for ParserCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ParserCache {
     /// An empty cache — parsers materialize lazily per language on first
     /// use.

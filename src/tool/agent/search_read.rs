@@ -196,8 +196,7 @@ impl Tool for SearchReadTool {
         let max_files = args
             .max_files
             .unwrap_or(MAX_FILES_TO_READ)
-            .min(MAX_FILES_TO_READ)
-            .max(1);
+            .clamp(1, MAX_FILES_TO_READ);
 
         let sandbox = self.sandbox.clone();
         let root = sandbox.root().to_path_buf();

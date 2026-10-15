@@ -2061,9 +2061,10 @@ mod tests {
             if have_all {
                 break;
             }
-            match tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await {
-                Ok(Ok(ev)) => got.push(ev),
-                _ => {}
+            if let Ok(Ok(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await
+            {
+                got.push(ev)
             }
         }
         let texts: Vec<&str> = got.iter().map(|e| e.text.as_str()).collect();
@@ -2366,6 +2367,7 @@ mod tests {
         std::fs::File::options()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(skewed.path().join(LIVE_MARKER))
             .expect("marker")
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))

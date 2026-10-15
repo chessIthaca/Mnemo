@@ -411,8 +411,7 @@ impl AnthropicClient {
             .max_output_tokens
             .max(4096)
             .min(quantized_context_budget)
-            .min(SANE_MAX_OUTPUT_TOKENS)
-            .max(1024);
+            .clamp(1024, SANE_MAX_OUTPUT_TOKENS);
 
         let mut body = serde_json::json!({
             "model": self.config.model,

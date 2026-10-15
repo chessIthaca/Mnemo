@@ -68,7 +68,7 @@ pub struct HostTool {
 
 impl HostTool {
     /// Wrap a spec as the shared registry shim.
-    pub fn new(spec: HostToolSpec) -> std::sync::Arc<dyn Tool> {
+    pub fn wrap(spec: HostToolSpec) -> std::sync::Arc<dyn Tool> {
         std::sync::Arc::new(Self { spec })
     }
 }
@@ -145,7 +145,7 @@ mod tests {
             safety: SafetyLevel::NeedsApproval,
             timeout_ms: Some(500),
         };
-        let tool = HostTool::new(spec);
+        let tool = HostTool::wrap(spec);
         assert_eq!(tool.name(), "get_weather");
         assert_eq!(tool.safety(), SafetyLevel::NeedsApproval);
         assert_eq!(tool.host_tool_timeout_ms(), Some(500));

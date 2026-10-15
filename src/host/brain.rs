@@ -313,6 +313,12 @@ pub struct SharedResources {
     embedder: Option<Arc<dyn crate::memory::embedder::Embedder>>,
 }
 
+impl Default for SharedResources {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedResources {
     /// An empty handle (no shared embedder).
     pub fn new() -> Self {

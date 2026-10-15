@@ -2630,11 +2630,13 @@ impl MemoryStoreTrait for MemoryStore {
         let read_conn = self.read_conn().clone();
         tokio::task::spawn_blocking(move || -> Result<ProjectStats> {
             let conn = read_conn.lock().expect("read conn lock poisoned");
-            let mut stats = ProjectStats::default();
             // Session count.
-            stats.session_count = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0).map(|n| n as u64)
-            })?;
+            let mut stats = ProjectStats {
+                session_count: conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0).map(|n| n as u64)
+                })?,
+                ..ProjectStats::default()
+            };
             // Per-model × endpoint breakdown (accumulates totals). NULL
             // endpoints group together — the pre-dimension per-model view.
             let mut stmt = conn.prepare(

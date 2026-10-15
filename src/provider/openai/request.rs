@@ -329,9 +329,9 @@ impl OpenAiClient {
         tool_choice: Option<ToolChoice>,
     ) -> Result<serde_json::Value> {
         let body = self.build_request_body(messages, tools, tool_choice, false)?;
-        Ok(serde_json::from_str(&body).map_err(|e| {
+        serde_json::from_str(&body).map_err(|e| {
             Error::Provider(format!("built request body failed to re-parse: {e}"))
-        })?)
+        })
     }
 
     /// Build the chat-completions request body as its wire JSON string (for
@@ -764,8 +764,7 @@ impl OpenAiClient {
             .max_output_tokens
             .max(4096)
             .min(quantized_context_budget)
-            .min(SANE_MAX_OUTPUT_TOKENS)
-            .max(1024);
+            .clamp(1024, SANE_MAX_OUTPUT_TOKENS);
 
         // Pre-serialized body (perf review L3, 2027-01-09): each message's
         // JSON is produced exactly once — a borrowed raw serializes straight

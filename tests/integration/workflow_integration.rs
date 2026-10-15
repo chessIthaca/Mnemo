@@ -389,21 +389,21 @@ async fn per_agent_workflows_are_independent_via_factory() {
     let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
     let safety_rules = Arc::new(SafetyRules::new(&dir.path().join("safety.toml")).unwrap());
 
-    let factory = AgentLoopFactory::new(
-        Arc::new(SingleResponseProvider {
+    let factory = AgentLoopFactory::new(mnemo::agent::factory::FactoryDeps {
+        provider: Arc::new(SingleResponseProvider {
             events: vec![],
             caps: Capabilities::openai(),
         }),
-        source,
-        Some(store),
+        constitution_source: source,
+        memory: Some(store),
         sandbox,
-        dir.path().to_path_buf(),
-        Some(safety_rules),
-        Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
-        ContextManager::new(128_000, 0.5),
-        dir.path().join("plans"),
-        None,
-    );
+        project_root: dir.path().to_path_buf(),
+        safety_rules: Some(safety_rules),
+        safety_mode: Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+        context_manager: ContextManager::new(128_000, 0.5),
+        plans_dir: dir.path().join("plans"),
+        vision: None,
+    });
     // 2b.3: the production shape wires the app policy factory — without it
     // the builds' loops get the UnwiredWorkflow handle and the concrete
     // reads fail.

@@ -1139,18 +1139,18 @@ pub(crate) fn wire_brain(
         None
     };
 
-    let factory = AgentLoopFactory::new(
+    let factory = AgentLoopFactory::new(crate::agent::factory::FactoryDeps {
         provider,
         constitution_source,
-        store_trait.clone(),
-        sandbox.clone(),
-        workspace.root.clone(),
-        Some(safety_rules.clone()),
-        safety_mode.clone(),
+        memory: store_trait.clone(),
+        sandbox: sandbox.clone(),
+        project_root: workspace.root.clone(),
+        safety_rules: Some(safety_rules.clone()),
+        safety_mode: safety_mode.clone(),
         context_manager,
-        workspace.state_dir.join("plans"),
+        plans_dir: workspace.state_dir.join("plans"),
         vision,
-    )
+    })
     // Wire the per-context model resolver so `[models]` overrides take effect
     // at turn time (skill > subagent > state > default).
     .with_model_resolver(model_resolver.clone())

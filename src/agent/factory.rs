@@ -457,6 +457,22 @@ pub struct AgentLoopFactory {
     staleness_log: crate::index_staleness::StalenessLog,
 }
 
+/// The shared, stateless deps every built agent clones — the argument to
+/// [`AgentLoopFactory::new`], grouped so the constructor stays under
+/// clippy's argument budget.
+pub struct FactoryDeps {
+    pub provider: Arc<dyn LlmClient>,
+    pub constitution_source: ConstitutionSource,
+    pub memory: Option<Arc<dyn MemoryStoreTrait>>,
+    pub sandbox: Arc<Sandbox>,
+    pub project_root: PathBuf,
+    pub safety_rules: Option<Arc<SafetyRules>>,
+    pub safety_mode: Arc<RwLock<SafetyMode>>,
+    pub context_manager: ContextManager,
+    pub plans_dir: PathBuf,
+    pub vision: Option<Arc<dyn ImageDescriber>>,
+}
+
 impl AgentLoopFactory {
     /// The factory's steering counters (2c.4/G4) — the instance-scoped
     /// replacement for the deleted process-wide singleton. The IPC
@@ -470,18 +486,19 @@ impl AgentLoopFactory {
     ///
     /// Every subsequent [`build`](Self::build) clones the shared deps and
     /// creates a fresh per-agent `Workflow` + `ToolRegistry`.
-    pub fn new(
-        provider: Arc<dyn LlmClient>,
-        constitution_source: ConstitutionSource,
-        memory: Option<Arc<dyn MemoryStoreTrait>>,
-        sandbox: Arc<Sandbox>,
-        project_root: PathBuf,
-        safety_rules: Option<Arc<SafetyRules>>,
-        safety_mode: Arc<RwLock<SafetyMode>>,
-        context_manager: ContextManager,
-        plans_dir: PathBuf,
-        vision: Option<Arc<dyn ImageDescriber>>,
-    ) -> Self {
+    pub fn new(deps: FactoryDeps) -> Self {
+        let FactoryDeps {
+            provider,
+            constitution_source,
+            memory,
+            sandbox,
+            project_root,
+            safety_rules,
+            safety_mode,
+            context_manager,
+            plans_dir,
+            vision,
+        } = deps;
         // Derive the fill rate from the context manager so it can be rebuilt
         // when the provider is swapped (its max context changes). The default
         // of 0.5 is a safety net for a degenerate zero max_tokens.
@@ -2098,18 +2115,18 @@ mod tests {
         let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
         // Test hygiene (backlog fc1d57fe): the staleness log lives in the
         // temp dir — no test may write the real ~/.mnemo.
-        let factory = AgentLoopFactory::new(
+        let factory = AgentLoopFactory::new(FactoryDeps {
             provider,
-            source,
-            Some(store),
+            constitution_source: source,
+            memory: Some(store),
             sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
+            project_root: dir.to_path_buf(),
+            safety_rules: None,
+            safety_mode: Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+            context_manager: ContextManager::new(128_000, 0.5),
+            plans_dir: dir.join("plans"),
             vision,
-        )
+        })
         .with_staleness_log(crate::index_staleness::StalenessLog::at(
             dir.join(".mnemo-staleness"),
         ));
@@ -2143,18 +2160,18 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
-        AgentLoopFactory::new(
+        AgentLoopFactory::new(FactoryDeps {
             provider,
-            source,
-            Some(store),
+            constitution_source: source,
+            memory: Some(store),
             sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
-            None,
-        )
+            project_root: dir.to_path_buf(),
+            safety_rules: None,
+            safety_mode: Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+            context_manager: ContextManager::new(128_000, 0.5),
+            plans_dir: dir.join("plans"),
+            vision: None,
+        })
         .with_staleness_log(crate::index_staleness::StalenessLog::at(
             dir.join(".mnemo-staleness"),
         ))

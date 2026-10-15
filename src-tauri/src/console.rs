@@ -2124,18 +2124,20 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         Arc::new(AgentLoopFactory::new(
-            provider,
-            ConstitutionSource::new(&gpath, &ppath).unwrap(),
-            None,
-            sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(
-                mnemo::config::SafetyMode::Autonomous,
-            )),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
-            None,
+            mnemo::agent::factory::FactoryDeps {
+                provider,
+                constitution_source: ConstitutionSource::new(&gpath, &ppath).unwrap(),
+                memory: None,
+                sandbox,
+                project_root: dir.to_path_buf(),
+                safety_rules: None,
+                safety_mode: Arc::new(std::sync::RwLock::new(
+                    mnemo::config::SafetyMode::Autonomous,
+                )),
+                context_manager: ContextManager::new(128_000, 0.5),
+                plans_dir: dir.join("plans"),
+                vision: None,
+            },
         ))
     }
 

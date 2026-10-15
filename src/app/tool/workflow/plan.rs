@@ -36,7 +36,7 @@ use crate::project::git_ops::{
 };
 use crate::provider::ToolSchema;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-use crate::app::workflow::{PlanKind, Workflow, WorkflowState};
+use crate::app::workflow::{PlanDraft, PlanKind, PlanUpdate, Workflow, WorkflowState};
 
 /// The locked 4-step skeleton for `kind = bug_fixing` plans — the bug
 /// protocol: reproduce with a failing regression test → document the root
@@ -958,10 +958,12 @@ impl Tool for CreatePlanTool {
             },
         };
         let mut result = match wf.create_plan_with_kind_and_detail(
-            &args.title,
-            &args.goal,
-            &args.context,
-            steps.clone(),
+            PlanDraft {
+                title: &args.title,
+                goal: &args.goal,
+                context: &args.context,
+                steps: steps.clone(),
+            },
             args.kind,
             bug_symptom.as_deref(),
             detailed_steps.as_deref(),
@@ -1226,15 +1228,15 @@ impl Tool for UpdatePlanTool {
         // the Ok arm cannot borrow it (the changes enumeration needs the
         // count).
         let steps_len = steps.as_ref().map(|s| s.len());
-        match wf.update_plan(
-            args.title.as_deref(),
-            args.goal.as_deref(),
-            args.context.as_deref(),
+        match wf.update_plan(PlanUpdate {
+            title: args.title.as_deref(),
+            goal: args.goal.as_deref(),
+            context: args.context.as_deref(),
             steps,
-            args.append,
-            args.regression_test.as_deref(),
-            args.landed_design,
-        ) {
+            append: args.append,
+            regression_test: args.regression_test.as_deref(),
+            landed_design: args.landed_design,
+        }) {
             Ok(()) => {
                 let plan = wf.plan().unwrap();
                 let completed = plan.completed_count();
@@ -2104,9 +2106,10 @@ impl Tool for FinishTool {
                     // (the in-memory frame still gets the test, but the plan
                     // file isn't persisted) shouldn't be fully silent —
                     // mirrors the capture-failure logging below (plan.rs:1375).
-                    if let Err(e) =
-                        wf.update_plan(None, None, None, None, false, Some(rt), None)
-                    {
+                    if let Err(e) = wf.update_plan(PlanUpdate {
+                        regression_test: Some(rt),
+                        ..Default::default()
+                    }) {
                         eprintln!("finish: regression_test update_plan failed: {e}");
                     }
                 }

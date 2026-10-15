@@ -222,6 +222,30 @@ impl ToolFilter {
     }
 }
 
+/// The plan body fields [`Workflow::create_plan_with_kind_and_detail`] and
+/// its wrappers need — the four `create_plan` schema strings, grouped so the
+/// method stays under clippy's argument budget.
+pub struct PlanDraft<'a> {
+    pub title: &'a str,
+    pub goal: &'a str,
+    pub context: &'a str,
+    pub steps: Vec<String>,
+}
+
+/// The optional updates [`Workflow::update_plan`] applies — `None`/`false`
+/// = leave unchanged. Grouped so the method stays under clippy's argument
+/// budget.
+#[derive(Default)]
+pub struct PlanUpdate<'a> {
+    pub title: Option<&'a str>,
+    pub goal: Option<&'a str>,
+    pub context: Option<&'a str>,
+    pub steps: Option<Vec<String>>,
+    pub append: bool,
+    pub regression_test: Option<&'a str>,
+    pub landed_design: Option<bool>,
+}
+
 impl Workflow {
     /// Create a new workflow with no plan (Planning state).
     pub fn new(plans_dir: impl Into<PathBuf>) -> Self {
@@ -637,7 +661,12 @@ impl Workflow {
         kind: PlanKind,
         bug_symptom: Option<&str>,
     ) -> Result<String> {
-        self.create_plan_with_kind_and_detail(title, goal, context, steps, kind, bug_symptom, None)
+        self.create_plan_with_kind_and_detail(
+            PlanDraft { title, goal, context, steps },
+            kind,
+            bug_symptom,
+            None,
+        )
     }
 
     /// The full creation path — [`create_plan_with_kind`](Self::create_plan_with_kind)
@@ -651,14 +680,12 @@ impl Workflow {
     /// steps.
     pub fn create_plan_with_kind_and_detail(
         &mut self,
-        title: &str,
-        goal: &str,
-        context: &str,
-        steps: Vec<String>,
+        draft: PlanDraft<'_>,
         kind: PlanKind,
         bug_symptom: Option<&str>,
         detailed_steps: Option<&str>,
     ) -> Result<String> {
+        let PlanDraft { title, goal, context, steps } = draft;
         // A plan with no steps is not a plan — it cannot enter Executing (the
         // workflow gate would expose write tools with nothing to execute).
         if steps.is_empty() {
@@ -736,16 +763,9 @@ impl Workflow {
     /// resumes with it as the active step);
     /// title/goal/context/regression_test/landed_design updates are always
     /// allowed.
-    pub fn update_plan(
-        &mut self,
-        title: Option<&str>,
-        goal: Option<&str>,
-        context: Option<&str>,
-        steps: Option<Vec<String>>,
-        append: bool,
-        regression_test: Option<&str>,
-        landed_design: Option<bool>,
-    ) -> Result<()> {
+    pub fn update_plan(&mut self, update: PlanUpdate<'_>) -> Result<()> {
+        let PlanUpdate { title, goal, context, steps, append, regression_test, landed_design } =
+            update;
         // update_plan only adjusts an in-flight plan. In Planning there's no
         // plan; in Complete the plan is done (start a fresh one). In Reviewing
         // the plan is finished but the closing sequence is still running —
@@ -1742,11 +1762,17 @@ mod tests {
             Some("slow"),
         )
         .unwrap();
-        wf.update_plan(None, None, None, None, false, None, Some(true))
+        wf.update_plan(PlanUpdate {
+            landed_design: Some(true),
+            ..Default::default()
+        })
             .unwrap();
         assert!(wf.plan().unwrap().landed_design);
         // Un-set.
-        wf.update_plan(None, None, None, None, false, None, Some(false))
+        wf.update_plan(PlanUpdate {
+            landed_design: Some(false),
+            ..Default::default()
+        })
             .unwrap();
         assert!(!wf.plan().unwrap().landed_design);
     }
@@ -1766,15 +1792,10 @@ mod tests {
             Some("crash"),
         )
         .unwrap();
-        wf.update_plan(
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some("crash_on_open_regression"),
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            regression_test: Some("crash_on_open_regression"),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(
             wf.plan().unwrap().regression_test.as_deref(),
@@ -1806,15 +1827,10 @@ mod tests {
         )
         .unwrap();
         let err = wf
-            .update_plan(
-                None,
-                None,
-                None,
-                Some(vec!["replacement".into()]),
-                false,
-                None,
-                None,
-            )
+            .update_plan(PlanUpdate {
+                steps: Some(vec!["replacement".into()]),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(err.to_string().contains("locked 4-step skeleton"), "{err}");
         // The steps are untouched.
@@ -1822,7 +1838,10 @@ mod tests {
         // A non-bug plan still allows steps replacement.
         let mut wf2 = Workflow::new(dir.path().join("plans2"));
         wf2.create_plan("T", "G", "C", vec!["a".into()]).unwrap();
-        wf2.update_plan(None, None, None, Some(vec!["b".into()]), false, None, None)
+        wf2.update_plan(PlanUpdate {
+            steps: Some(vec!["b".into()]),
+            ..Default::default()
+        })
             .unwrap();
         assert_eq!(wf2.plan().unwrap().steps.len(), 1);
         assert_eq!(wf2.plan().unwrap().steps[0].text, "b");
@@ -2740,15 +2759,10 @@ mod tests {
         let id = wf.plan_id().unwrap().to_string();
         // Replace the remaining ("c") with ["c","d","e"]: the two completed
         // steps must stay; remaining is replaced by the new list.
-        wf.update_plan(
-            None,
-            None,
-            None,
-            Some(vec!["c".into(), "d".into(), "e".into()]),
-            false,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            steps: Some(vec!["c".into(), "d".into(), "e".into()]),
+            ..Default::default()
+        })
         .unwrap();
         let plan = wf.plan().unwrap();
         assert_eq!(plan.steps.len(), 5);
@@ -2771,7 +2785,11 @@ mod tests {
         let mut wf = Workflow::new(dir.path().join("plans"));
         wf.create_plan("Old", "Old goal", "C", vec!["a".into()])
             .unwrap();
-        wf.update_plan(Some("New title"), Some("New goal"), None, None, false, None, None)
+        wf.update_plan(PlanUpdate {
+            title: Some("New title"),
+            goal: Some("New goal"),
+            ..Default::default()
+        })
             .unwrap();
         let plan = wf.plan().unwrap();
         assert_eq!(plan.title, "New title");
@@ -2789,15 +2807,12 @@ mod tests {
         wf.create_plan("P", "G", "base ctx", vec!["a".into(), "b".into()])
             .unwrap();
         let id = wf.plan_id().unwrap().to_string();
-        wf.update_plan(
-            None,
-            None,
-            Some("more ctx"),
-            Some(vec!["c".into(), "d".into()]),
-            true,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            context: Some("more ctx"),
+            steps: Some(vec!["c".into(), "d".into()]),
+            append: true,
+            ..Default::default()
+        })
         .unwrap();
         let plan = wf.plan().unwrap();
         assert_eq!(plan.steps.len(), 4);
@@ -2822,7 +2837,11 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["a".into(), "b".into(), "c".into()])
             .unwrap();
         wf.complete_step(0).unwrap(); // "a" done
-        wf.update_plan(None, None, None, Some(vec!["d".into()]), true, None, None)
+        wf.update_plan(PlanUpdate {
+            steps: Some(vec!["d".into()]),
+            append: true,
+            ..Default::default()
+        })
             .unwrap();
         let plan = wf.plan().unwrap();
         assert_eq!(plan.steps.len(), 4);
@@ -2854,7 +2873,11 @@ mod tests {
         )
         .unwrap();
         let err = wf
-            .update_plan(None, None, None, Some(vec!["extra".into()]), true, None, None)
+            .update_plan(PlanUpdate {
+                steps: Some(vec!["extra".into()]),
+                append: true,
+                ..Default::default()
+            })
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("locked 4-step skeleton"), "{msg}");
@@ -2866,7 +2889,11 @@ mod tests {
         assert_eq!(wf.plan().unwrap().steps.len(), 1);
         // Context-only append still works on a bug plan (title/goal/context
         // updates remain allowed).
-        wf.update_plan(None, None, Some("found root cause: x"), None, true, None, None)
+        wf.update_plan(PlanUpdate {
+            context: Some("found root cause: x"),
+            append: true,
+            ..Default::default()
+        })
             .unwrap();
         assert_eq!(wf.plan().unwrap().context, "C\n\nfound root cause: x");
     }
@@ -2883,7 +2910,10 @@ mod tests {
         let mut wf = Workflow::new(dir.path().join("plans"));
         // Planning — no plan yet.
         let err = wf
-            .update_plan(Some("T"), None, None, None, false, None, None)
+            .update_plan(PlanUpdate {
+                title: Some("T"),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2897,7 +2927,10 @@ mod tests {
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Complete);
         let err = wf
-            .update_plan(Some("T"), None, None, None, false, None, None)
+            .update_plan(PlanUpdate {
+                title: Some("T"),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(
             err,
@@ -2922,7 +2955,10 @@ mod tests {
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
         // regression_test-only update MUST succeed in Reviewing.
-        wf.update_plan(None, None, None, None, false, Some("my_regression_test"), None)
+        wf.update_plan(PlanUpdate {
+            regression_test: Some("my_regression_test"),
+            ..Default::default()
+        })
             .expect("regression_test-only update_plan must be allowed in Reviewing");
         assert_eq!(
             wf.plan().unwrap().regression_test.as_deref(),
@@ -2930,7 +2966,10 @@ mod tests {
         );
         // landed_design-only updates are equally allowed in Reviewing (the
         // feature-scale marker may only become clear during review fixes).
-        wf.update_plan(None, None, None, None, false, None, Some(true))
+        wf.update_plan(PlanUpdate {
+            landed_design: Some(true),
+            ..Default::default()
+        })
             .expect("landed_design-only update_plan must be allowed in Reviewing");
         assert!(wf.plan().unwrap().landed_design);
     }
@@ -2948,15 +2987,12 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["a".into()]).unwrap();
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
-        wf.update_plan(
-            Some("P2"),
-            Some("G2"),
-            Some("review finding 1 fixed; re-run tests"),
-            None,
-            false,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            title: Some("P2"),
+            goal: Some("G2"),
+            context: Some("review finding 1 fixed; re-run tests"),
+            ..Default::default()
+        })
         .expect("full-field update_plan must be allowed in Reviewing");
         let plan = wf.plan().unwrap();
         assert_eq!(plan.title, "P2");
@@ -2978,15 +3014,11 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["a".into()]).unwrap();
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
-        wf.update_plan(
-            None,
-            None,
-            None,
-            Some(vec!["fix finding 2".into()]),
-            true,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            steps: Some(vec!["fix finding 2".into()]),
+            append: true,
+            ..Default::default()
+        })
         .expect("steps append must be allowed in Reviewing for implementation plans");
         assert_eq!(wf.plan().unwrap().steps.len(), 2);
         // The follow-on window (backlog 37f8631a): append in Reviewing now
@@ -3003,14 +3035,21 @@ mod tests {
         .unwrap();
         bug.complete_step(0).unwrap();
         assert_eq!(bug.state(), WorkflowState::Reviewing);
-        bug.update_plan(None, None, None, Some(vec!["extra".into()]), true, None, None)
+        bug.update_plan(PlanUpdate {
+            steps: Some(vec!["extra".into()]),
+            append: true,
+            ..Default::default()
+        })
             .expect("append must be allowed in Reviewing for bug plans (the follow-on window)");
         let bug_plan = bug.plan().unwrap();
         assert_eq!(bug_plan.steps.len(), 2);
         assert!(bug_plan.steps[0].done);
         assert!(!bug_plan.steps[1].done);
         let err = bug
-            .update_plan(None, None, None, Some(vec!["replacement".into()]), false, None, None)
+            .update_plan(PlanUpdate {
+                steps: Some(vec!["replacement".into()]),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(err.to_string().contains("locked 4-step skeleton"), "{err}");
     }
@@ -3037,15 +3076,11 @@ mod tests {
         .unwrap();
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
-        wf.update_plan(
-            None,
-            None,
-            None,
-            Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
-            true,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            steps: Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
+            append: true,
+            ..Default::default()
+        })
         .expect("append must be allowed in Reviewing for bug plans");
         let plan = wf.plan().unwrap();
         assert_eq!(plan.steps.len(), 2);
@@ -3056,20 +3091,19 @@ mod tests {
         // The appended step does not reopen Executing in-session.
         assert_eq!(wf.state(), WorkflowState::Reviewing);
         // A second append stacks after the first.
-        wf.update_plan(
-            None,
-            None,
-            None,
-            Some(vec!["re-run cargo test".into()]),
-            true,
-            None,
-            None,
-        )
+        wf.update_plan(PlanUpdate {
+            steps: Some(vec!["re-run cargo test".into()]),
+            append: true,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(wf.plan().unwrap().steps.len(), 3);
         // Replacement is refused with the sanctioned alternatives named.
         let err = wf
-            .update_plan(None, None, None, Some(vec!["replacement".into()]), false, None, None)
+            .update_plan(PlanUpdate {
+                steps: Some(vec!["replacement".into()]),
+                ..Default::default()
+            })
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("locked 4-step skeleton"), "{msg}");
@@ -3100,15 +3134,11 @@ mod tests {
             .unwrap();
             wf.complete_step(0).unwrap();
             assert_eq!(wf.state(), WorkflowState::Reviewing);
-            wf.update_plan(
-                None,
-                None,
-                None,
-                Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
-                true,
-                None,
-                None,
-            )
+            wf.update_plan(PlanUpdate {
+                steps: Some(vec!["fix the reviewer finding in src/widget.rs".into()]),
+                append: true,
+                ..Default::default()
+            })
             .unwrap();
         }
         // "Crash": a fresh workflow reloads the plan from disk.
@@ -3135,17 +3165,23 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["a".into()]).unwrap();
         // Empty step list.
         let err = wf
-            .update_plan(None, None, None, Some(vec![]), false, None, None)
+            .update_plan(PlanUpdate {
+                steps: Some(vec![]),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidInput(_)));
         // Nothing provided at all.
         let err = wf
-            .update_plan(None, None, None, None, false, None, None)
+            .update_plan(PlanUpdate::default())
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidInput(_)));
         // Blank string is treated as "leave unchanged" (a no-op) — error.
         let err = wf
-            .update_plan(Some("   "), None, None, None, false, None, None)
+            .update_plan(PlanUpdate {
+                title: Some("   "),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::InvalidInput(_)));
     }
@@ -3162,7 +3198,10 @@ mod tests {
         // Complete step 2 ("c") while step 0 ("a") and 1 ("b") are open.
         wf.complete_step(2).unwrap();
         let err = wf
-            .update_plan(None, None, None, Some(vec!["b2".into()]), false, None, None)
+            .update_plan(PlanUpdate {
+                steps: Some(vec!["b2".into()]),
+                ..Default::default()
+            })
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Workflow(_)));
     }

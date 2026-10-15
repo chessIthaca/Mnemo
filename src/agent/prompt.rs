@@ -1825,10 +1825,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path().join("plans"));
         wf.create_plan_with_kind_and_detail(
-            "P",
-            "G",
-            "the root cause lives in src/app.rs:42",
-            vec!["s1".into()],
+            crate::app::workflow::PlanDraft {
+                title: "P",
+                goal: "G",
+                context: "the root cause lives in src/app.rs:42",
+                steps: vec!["s1".into()],
+            },
             crate::app::workflow::PlanKind::BugFixing,
             Some("the app crashes on open"),
             Some("- Reproduce — run cargo test crashy"),

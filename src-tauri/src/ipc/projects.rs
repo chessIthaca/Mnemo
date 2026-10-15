@@ -201,13 +201,29 @@ pub async fn create_project(
 /// an existing project, the app restarted, and the switch dialog came back
 /// with no explanation).
 #[tauri::command]
-pub async fn switch_project(app: AppHandle, path: String) -> Result<(), IpcError> {
+pub async fn switch_project(
+    app: AppHandle,
+    state: State<'_, IpcState>,
+    path: String,
+) -> Result<(), IpcError> {
     let path = path.trim();
     if path.is_empty() {
         return Err("project path must not be empty".into());
     }
     let dir = Path::new(path);
     validate_switch_target(dir)?;
+    // Remove THIS instance's `.coding/instance.json` marker from the
+    // project it is leaving — pid-guarded (a newer instance that launched
+    // meanwhile owns the file) and best-effort, never blocking the switch.
+    // The restart below calls `std::process::exit(0)` directly, so the
+    // app's RunEvent::Exit handler never fires on this path — this is the
+    // only cleanup the vacated project gets (backlog ea9576d7).
+    if let Some(root) = state.runtime.instance_marker_root.clone() {
+        if let Err(e) = crate::instance_marker::remove_marker_if_self(&root, std::process::id())
+        {
+            eprintln!("warning: failed to remove instance marker on switch: {e}");
+        }
+    }
     write_pending_project(dir).map_err(|e| format!("failed to stage project switch: {e}"))?;
     // Restart the current process. The marker carries the selection across
     // the restart (argv is reused, so it can't be passed as a flag). This call

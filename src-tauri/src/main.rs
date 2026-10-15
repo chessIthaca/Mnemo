@@ -644,6 +644,9 @@ fn main() {
                             classifier: brain.classifier_slot.clone(),
                             laya: laya.clone(),
                             instance_conflict,
+                            // The marker written above names this process —
+                            // the exit/switch paths remove exactly it.
+                            instance_marker_root: Some(backlog_root.clone()),
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(
@@ -830,6 +833,7 @@ fn main() {
                             startup_error: None,
                             needs_project: true,
                             instance_conflict: None,
+                            instance_marker_root: None,
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
@@ -927,6 +931,7 @@ fn main() {
                             startup_error: Some(msg),
                             needs_project: false,
                             instance_conflict: None,
+                            instance_marker_root: None,
                             embedder_status: Arc::new(RwLock::new(
                                 mnemo::memory::embedder::EmbedderStatus::Ready,
                             )),
@@ -991,6 +996,7 @@ fn main() {
             ipc::agent::ui_diag,
             ipc::agent::context_caps,
             ipc::startup::startup_snapshot,
+            ipc::startup::incumbent_pid_alive,
             ipc::spawn::spawn_agent,
             ipc::agent::set_model,
             ipc::agent::get_workflow_state,
@@ -1107,6 +1113,28 @@ fn main() {
                 // log lines could be lost. Kept OUTSIDE the timed teardown
                 // below: it does not touch WebView2 and must always run.
                 app_handle.state::<IpcState>().trace.flush_file_writes();
+
+                // Remove this instance's `.coding/instance.json` marker from
+                // the project it had open — pid-guarded (a newer instance
+                // that launched meanwhile owns the file), best-effort, and
+                // BEFORE the timed WebView2 teardown below: a small local
+                // file op that must always run and must never block exit.
+                // Without it a stale marker survives shutdown and can
+                // re-warn on the next launch via pid recycling (backlog
+                // ea9576d7).
+                if let Some(root) = &app_handle
+                    .state::<IpcState>()
+                    .runtime
+                    .instance_marker_root
+                {
+                    if let Err(e) =
+                        instance_marker::remove_marker_if_self(root, std::process::id())
+                    {
+                        eprintln!(
+                            "warning: failed to remove instance marker on exit: {e}"
+                        );
+                    }
+                }
 
                 // The remaining teardown touches the headless browser /
                 // WebView2, whose calls can block on a wedged compositor

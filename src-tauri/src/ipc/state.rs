@@ -168,6 +168,13 @@ pub struct AgentRuntimeContext {
     /// the frontend warns before opening it (2027-01-13). Computed once, so
     /// the startup snapshot is stable for the whole session.
     pub instance_conflict: Option<crate::ipc::startup::InstanceConflict>,
+    /// The project root whose `.coding/instance.json` this process wrote at
+    /// launch — `Some` only on the Ready path, where a marker was actually
+    /// written (main.rs). The clean-exit (RunEvent::Exit) and
+    /// project-switch paths remove exactly this marker via
+    /// `instance_marker::remove_marker_if_self`, pid-guarded so a newer
+    /// incumbent's marker survives (last-writer-wins).
+    pub instance_marker_root: Option<std::path::PathBuf>,
 }
 
 /// The project slice of [`IpcState`].

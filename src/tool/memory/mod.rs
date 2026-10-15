@@ -4,8 +4,10 @@
 
 //! Memory tools — `memory_write`, `memory_recall`, `memory_consolidate`, plus the
 //! hygiene tools `memory_update`, `memory_amend`, `memory_supersede`, `memory_delete`,
-//! `memory_list`, and the Phase-3 retrieval tools `plans_search`, `reviews_search`,
-//! `past_fixes`, `context_pack` (in [`retrieval`]).
+//! `memory_list`, the session-dismissal tool `recall_feedback` (backlog c68a8c3b —
+//! a per-loop Arc shared with the auto-recall injector), and the Phase-3 retrieval
+//! tools `memory_search`, `plans_search`, `reviews_search`, `past_fixes`,
+//! `context_pack` (in [`retrieval`]).
 //!
 //! Always available regardless of workflow state. All are auto-run — they
 //! only touch the project's own memory store (sandboxed bookkeeping), so they

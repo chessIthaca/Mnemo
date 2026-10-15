@@ -239,11 +239,15 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   tail-owning assistant turn must carry a `reasoning_content` key (any value),
   and the builder injects it into the age-0 raw echo when missing so foreign
   429-fallback turns cannot poison the tail; all others keep the
-  Rule-1 verbatim echo); (7) a proxy-cache-cliff compaction ceiling
-  (`proxy_cache_ceiling_tokens`, default 340 000, `0` disables — Settings →
-  Advanced) so long sessions summarize before crossing the ~340K-token mark
-  where LiteLLM-class proxies drop whole-conversation prefix caching (hit rate
-  collapse ~99% → ~4%); (8) vendor-specific packaging exception:
+  Rule-1 verbatim echo); (7) REMOVED 2027-01-25 — the proxy-cache-cliff
+  compaction ceiling (`proxy_cache_ceiling_tokens`, its config default and
+  Settings → Advanced dial) was deleted: with the default fill rate 0.3 the
+  cap only bound on windows > ~1.02M tokens — a rarely-binding, hard-coded
+  override of the user's actual dial — so the trigger now respects ONLY
+  `summarize_at_fill_rate` (a LiteLLM user wanting the old behavior sets a
+  lower fill rate, e.g. 0.3 on a 1M window = 300K, under the cliff); the
+  wire-side reasoning-retention pressure check in (6) keeps using the fixed
+  provider consts; (8) vendor-specific packaging exception:
   DeepSeek-vendor models echo trailing system blocks instead of answering
   the user (sentinel-mirror 5cf5469c + the 2027-01-11 exit-note loop — the
   model echoed the injected RECALLED MEMORIES block, fabricated sections,

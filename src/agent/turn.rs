@@ -705,12 +705,12 @@ impl AgentLoop {
             // abandons the summary and returns the original messages. Any
             // non-interrupt commands buffered during the call are re-injected
             // as system messages below.
-            // The effective trigger respects the proxy cache ceiling (when
-            // set) so compaction fires before the request crosses the ~340K
-            // cliff where proxies drop whole-conversation prefix caching. It
-            // also carries the session's temporary raise (backlog 11513ee5),
-            // so a session that compaction could not bring under the fill-rate
-            // dial is not re-triggered on every iteration.
+            // The effective trigger is exactly the fill-rate dial
+            // (`summarize_at_fill_rate` × window; the proxy-cache ceiling
+            // cap was removed 2027-01-25). It also carries the session's
+            // temporary raise (backlog 11513ee5), so a session that
+            // compaction could not bring under the fill-rate dial is not
+            // re-triggered on every iteration.
             if token_count >= context_manager.effective_limit() {
                 if let Some(outcome) = self
                     .maybe_compact(

@@ -298,16 +298,47 @@ fn sanitize_stringified_nulls(schema: &Value, args: &mut Value) {
 /// one stringified JSON value — the same transport degradation class that
 /// produces the "null" artifact [`drop_stringified_nulls`] cleans. On
 /// success returns the parsed elements; on failure returns the 0-based
-/// byte position of serde's error (0 when the payload parses to another
-/// JSON kind) plus the reason, so callers can point the model at the
-/// exact spot instead of getting a re-emitted identical payload.
+/// ABSOLUTE byte position of serde's error in the delivered string (0
+/// when the payload parses to another JSON kind) plus the reason, so
+/// callers can point the model at the exact spot instead of getting a
+/// re-emitted identical payload.
+///
+/// Review L1 (plan 7446b6dc round 1): the UN-trimmed string is parsed —
+/// serde skips leading whitespace itself, so positions stay absolute
+/// (trimming shifted them) — and serde's line-relative column is
+/// converted to the absolute offset, so multi-line payloads point at
+/// the real defect, not a byte of the wrong line.
 pub(crate) fn parse_stringified_sequence(s: &str) -> Result<Vec<Value>, (usize, String)> {
-    let trimmed = s.trim();
-    match serde_json::from_str::<Value>(trimmed) {
+    match serde_json::from_str::<Value>(s) {
         Ok(Value::Array(elements)) => Ok(elements),
         Ok(other) => Err((0, format!("parses to {}, not an array", json_kind(&other)))),
-        Err(e) => Err((e.column().saturating_sub(1), e.to_string())),
+        Err(e) => Err((
+            absolute_byte_position(s, e.line(), e.column()),
+            e.to_string(),
+        )),
     }
+}
+
+/// Convert serde's 1-based, line-relative `line`/`column` (review L1,
+/// plan 7446b6dc round 1: a multi-line stringified payload would
+/// otherwise point at a byte within the wrong line) into the 0-based
+/// absolute byte offset of the reported spot.
+fn absolute_byte_position(s: &str, line: usize, column: usize) -> usize {
+    if line <= 1 {
+        return column.saturating_sub(1);
+    }
+    let mut line_start = 0;
+    let mut remaining = line;
+    for (idx, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            remaining -= 1;
+            if remaining == 1 {
+                line_start = idx + 1;
+                break;
+            }
+        }
+    }
+    line_start + column.saturating_sub(1)
 }
 
 /// The JSON kind name for a parse-repair error message.
@@ -1580,6 +1611,15 @@ mod tests {
         // A stray quote lands the position at the offending byte.
         let (pos, reason) = parse_stringified_sequence("[1, 2\"").unwrap_err();
         assert_eq!(pos, 5, "reason: {reason}");
+        // Review L1: a MULTI-LINE payload points at the ABSOLUTE byte of
+        // the defect — serde's line-2 column 2 converted past the newline
+        // (the stray quote is byte 5, not 1).
+        let (pos, reason) = parse_stringified_sequence("[1,\n2\"").unwrap_err();
+        assert_eq!(pos, 5, "reason: {reason}");
+        // Review L1: leading whitespace no longer shifts the pointer —
+        // the UN-trimmed string is parsed, so the position is absolute.
+        let (pos, reason) = parse_stringified_sequence("  [1, 2\"").unwrap_err();
+        assert_eq!(pos, 7, "reason: {reason}");
         // A clean object parse reports kind, position 0 (nothing to point at).
         let (pos, reason) = parse_stringified_sequence("{\"a\": 1}").unwrap_err();
         assert_eq!(pos, 0);

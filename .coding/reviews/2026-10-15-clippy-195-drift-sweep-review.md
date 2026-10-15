@@ -1,0 +1,48 @@
+## Verdict: FINDINGS (0 high, 1 low)
+
+Review of plan efd1f4c3 — clippy 1.95 drift sweep, branch wt/mnemo, commits 55bfa9c..a895921 (20 commits, all sweep work). One cosmetic low finding; every behavior-preservation claim verified. Gate/tests/build greenness is taken on the dispatcher's unpiped verification (this reviewer is read-only with no shell — basis stated below).
+
+### Scope and method
+
+- Walked all 20 commits: full diffs read for a895921 (batch 10b), bfb146f (10a), 043d65d (batch 9), 1b2103c (DispatchCtx), 55bfa9c (batch 1/arithmetic); 972b5c5 (TurnCtx/AssistantEcho, 307-line diff) verified via current-tree reads of all struct definitions, all 7 TurnCtx construction sites, and both `msg_meta.clone()` push sites; 09bfcfd (SpawnHost/SessionOptions) verified via graph caller enumeration (exactly 7 callers, matching the claim) + current-tree reads of every call site and both re-exports. Remaining 13 batches reviewed via commit message + stat + targeted spot-checks (their commit trails show per-batch gate-down counts and `cargo test --workspace` green at each step).
+- `git status` clean of sweep files; the uncommitted churn (.coding/*, src-tauri/src/ipc/embeddings.rs) is confirmed out-of-scope other-plan work and contains no `#[allow]`.
+
+### Risk-focus verification (all PASS)
+
+1. **events.rs guard fall-through (bfb146f)** — the four `collapsible_match` moves are semantics-identical. Each guard (`compact_in_flight.remove(&agent_id)`, `notified_children.insert(agent_id)`) is a side-effecting call evaluated exactly once per pattern-matching event, on the same condition as the original body `if`. On guard-false the event now falls through to `_ => {}`, which produces the same nothing as the old skipped-if. The `!retrying && insert(...)` compound preserves the original short-circuit order (`!retrying` first). Verified no arm after these does work for Compacted/Finished/Error in either match block.
+2. **rewire.rs truth table (a895921)** — `(true, Some(port))`/`(true, None)`/`(false, _)` maps 1:1 onto the original `if enabled && port.is_some() … else if enabled … else …` arms; arm bodies identical; `port` bound by pattern equals the old `.expect()` after `is_some()` (the expect could never fire). No post-match use of `port` (compiles).
+3. **watchdog cfg separation (a895921)** — `DetectorInputs` groups 8 fields; the OS-thread-id stays a `#[cfg(windows)]` fn param, consistently removed on both sides (call site keeps its pre-existing `#[cfg(windows)] main_thread_os_id` argument, signature keeps its cfg'd parameter). Struct-literal fields cannot carry cfg — the separation is correct and adds no new cfg(windows) surface.
+4. **TurnCtx lifetime split (972b5c5)** — `TurnCtx<'a,'b>` is constructed as a per-call temporary at all 7 sites with `&mut *cmd_rx` / `&mut state` / `&mut *messages` reborrows; the `'b` borrows end at each call. Run_turn still mutates between calls (e.g. `messages.pop()` immediately after `request_stream` returns at turn.rs:797). `request_stream` returns `BoxStream<'a>` with the ctx's `'b` half anonymous — the compiler guarantees the stream captures only the provider/fan-in `'a` borrows, which is exactly the claimed design. Nothing locks state/messages longer than the old explicit `&mut` args.
+5. **AssistantEcho owned→borrowed msg_meta** — `msg_meta: &'a Option<Map>` + `msg_meta.clone()` at both assistant-message pushes (turn.rs:2113 and the handle_bad_json path at 5111) inserts a value-identical copy where the old code moved the owned param; one extra clone, identical observable behavior. `response_id: &'a mut Option<String>` with `.take()` semantics unchanged at both branches.
+6. **SpawnHost/SessionOptions mapping (09bfcfd)** — graph confirms exactly 7 callers, all read in the current tree: HostSpawner::spawn_with_parent (forwards model/role/Some(permission)), HostRuntime::start (all defaults), spawn.rs spawn_agent (own_plans_dir: true, rest default), spawn_run_all_agent (worktree binding, default policy — 3a.5 semantics preserved), IpcSpawner (permission: None with the pre-3a.5 comment — matches the original positional None; the already-ignored `_permission` param is unchanged behavior), Engine::spawn (initial_messages: opts.resume.map, effective_limits forwarded), main.rs main-agent spawn (all defaults). Every field maps 1:1 to the old positional args. Re-exports verified: headless/mod.rs:50-53 and ipc/spawn.rs:23.
+7. **run_all.rs test pins (bfb146f)** — the two source-contract tests now pin the two-line guard form (`Compacted { .. }\n if compact_in_flight.remove(&agent_id) =>`); the contract intent still asserted: the Compacted arm exists, is guarded by the pairing removal, and the insert precedes it. CRLF-safe via the read-boundary normalization (commit fcea115 precedent). The removed `return;` at run_all.rs:6619 (batch 9) was verified in the current tree: only comments follow the if/else in its enclosing block before the fn ends — zero statements skipped.
+
+### Mechanical families (spot-checked, all identity-preserving)
+
+- `is_multiple_of` ≡ `% == 0`; `> cap` ≡ `>= cap + 1` (integer identity, overflow-safe); `is_none_or` ≡ `map_or(true,..)`; `is_some_and` ≡ `map_or(false,..)`; needless-borrow/deref/cast removals are compile-proven identical; the openai test `format!` change replaced a `\n` escape with a literal newline — identical string bytes.
+- Batch 7: `to_text`→`into_text` and `from_str`→`from_str_opt` renames are lint-mandated (wrong_self_convention, should_implement_trait) with all in-workspace callers updated (from_str_opt: 6 defs + 26 sites; sanctioned by repo review precedent per the plan). `large_enum_variant` boxings (ModelEntry::Spec, Msg::ArchiveRecord, BrainOutcome both variants) adjust match arms to derefs — value semantics preserved. `items_after_test_module` = pure item moves. `await_holding_lock` ×4 are test-only snapshot clones (guard held across await → clone-out), consistent with the recorded knowledge note.
+- Param-struct batches (record/zoom, workflow pair, validate_endpoint, AgentLoopFactory::new) all follow the destructuring-at-head pattern with bodies unchanged and every in-workspace call site rewritten; tests green at each batch.
+
+### Acceptance criteria
+
+- **No `#[allow` added**: tree-wide search of src/, src-tauri/, tests/ finds only (a) two PRE-EXISTING `#[allow(clippy::too_many_arguments)]` in src/agent/failure_triage.rs:326,661 — git log confirms no sweep commit touched that file (last touch 4d30133, pre-sweep), so they were not added by this work; (b) doc-comment mentions only. The acceptance criterion "no #[allow] added" is met.
+- **vendor/ untouched**: last vendor/ commit is 5523247, far before the sweep range. Confirmed.
+- **Public API**: changed exactly in lint-mandated ways beyond the new pub structs — renames (from_str_opt ×6, into_text, HostTool::new→wrap) and pub-signature regroupings (spawn_agent_shared, AgentLoopFactory::new, validate_endpoint, Workflow::create_plan_with_kind_and_detail/update_plan). All are plan-step-5-sanctioned, graph-impact-first, in-workspace-complete. Observation, not a violation: the task's phrasing "beyond the new pub structs" is terser than the plan's own progress notes, which document these renames as sanctioned API-family work.
+
+### Constitution checks
+
+- **Documentation sync**: no feature/behavior change — nothing for README/PLAN to say. All new pub structs carry doc comments (verified for SpawnHost, SessionOptions, TurnCtx, DispatchCtx, AssistantEcho, FactoryDeps, PlanDraft/PlanUpdate, EndpointDraft). No doc now lies. PASS.
+- **Multi-platform neutrality**: no new cfg(windows)-only surface anywhere in the diff; the watchdog cfg param was pre-existing structure preserved consistently on both call and definition sides. PASS.
+- **File-tools-first**: no shell-mutation signatures in any commit; the recorded knowledge notes document file_edit-based techniques (literal backslash escapes through file_edit, identical-text-trap handling). PASS.
+- **Warning-free**: no `#[allow]` additions anywhere (see above). PASS.
+- **Bookkeeping accuracy** (one line, per the exclusion): the plan file's progress notes match the shipped commits batch-for-batch (gate counts, file lists, 3066-test trail), and the three untracked knowledge/how notes accurately describe techniques this sweep actually used; the remaining churn belongs to other plans (muse-anyOf/3354cbc5). Accurate.
+
+### Finding (low)
+
+**L1 — `src/host/maintenance.rs` lost its trailing newline (commit 55bfa9c).** The diff hunk carries `\ No newline at end of file` after the `+` side only (old side had the newline), and no later commit touched the file. Zero behavior impact (rustc/clippy do not warn on this), but it is a file-state regression introduced by the sweep. Fix: `file_edit` to restore the final newline, or fold into the next commit on this branch.
+
+### Verification basis (transparency)
+
+This reviewer has no shell: the "gate exits 0 unpiped / tests 3066 / build exit 0" claims are the dispatcher's stated verification plus the per-commit gate-count trail (166→127→…→13→11→10→9���GATE GREEN) and per-batch `cargo test --workspace` green recorded in every commit message; I independently verified the source-level acceptance claims (no #[allow], vendor untouched, call-site completeness, behavior preservation at every risk-focus site) from the diffs and the current tree. If the pre-commit closing-sequence re-run of the gate/tests is still pending at fix time, it should re-confirm L1's fix stays green (it will — comment-only change is not needed; the newline fix is text-only).
+
+Reviewed-state: a89592176ab9b193da39015bebd00ef53f157d95

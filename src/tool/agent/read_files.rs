@@ -207,7 +207,7 @@ impl Tool for ReadFilesTool {
                     "files": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "Read specs (max 10): {path, start_line?, max_lines?} per file.",
+                        "description": "Read specs (max 10): {path, start_line?, max_lines?} per file. A stringified JSON array (the whole array delivered as a string) is auto-repaired when it parses cleanly; a malformed string recovers well-formed {\"path\": ...} specs with a NOTE, or fails with the byte position of the parse error.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -253,6 +253,56 @@ impl Tool for ReadFilesTool {
                 serde_json::json!({ "files": [serde_json::Value::Object(spec)] })
             }
             _ => args,
+        };
+        // Backlog c19ec2ff (c): the files argument sometimes arrives as one
+        // stringified JSON array (the transport degradation class — hit 3x
+        // in one turn, 2027-01-25; the generic "an argument must be a
+        // sequence, not a string" taught nothing, so the model re-emitted
+        // the identical payload). The dispatch seam repairs a clean parse;
+        // this layer catches direct execute calls and goes further: a
+        // MALFORMED string (observed: a stray quote after a numeric field)
+        // still recovers its well-formed {"path": ...} specs, with the byte
+        // position of the parse failure in the NOTE/error.
+        let (args, repair_note) = match args.get("files") {
+            Some(serde_json::Value::String(s)) => {
+                let (specs, skipped, parse_err) = recover_files_from_string(s);
+                if specs.is_empty() {
+                    if let Some((pos, reason)) = parse_err {
+                        let fragments = if skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (malformed fragments: {})", skipped.join(" | "))
+                        };
+                        return ToolResult::error(format!(
+                            "the files argument arrived as a STRING, not an array — its \
+                             JSON parse failed at byte {pos}: {reason}. Well-formed \
+                             {{\"path\": ...}} specs inside the string are auto-recovered, \
+                             but none were{fragments}. Emit files as a native JSON \
+                             array: [{{\"path\":\"src/main.rs\",\"start_line\":10,\"max_lines\":40}}]"
+                        ));
+                    }
+                    // A clean "[]": splice the empty array through so the
+                    // canonical empty-array error fires below.
+                    (json!({"files": []}), None)
+                } else if let Some((pos, reason)) = parse_err {
+                    let note = format!(
+                        "NOTE (repaired files argument): the files argument arrived \
+                         as a STRING; {} well-formed spec(s) recovered and read, {} \
+                         malformed fragment(s) skipped (JSON parse failed at byte \
+                         {pos}: {reason}). Re-read the skipped file(s) with a \
+                         corrected array form. Fragments: {}",
+                        specs.len(),
+                        skipped.len(),
+                        skipped.join(" | ")
+                    );
+                    (json!({"files": specs}), Some(note))
+                } else {
+                    // A clean stringified array — repaired silently (the
+                    // dispatch seam normally catches this before the tool).
+                    (json!({"files": specs}), None)
+                }
+            }
+            _ => (args, None),
         };
         let args: ReadFilesArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
@@ -341,6 +391,12 @@ impl Tool for ReadFilesTool {
                 // prefix per file read as multiple notes).
                 output = format!("SYMBOL NUDGE: {}\n\n{output}", nudge.join("; "));
             }
+            if let Some(note) = repair_note {
+                // Backlog c19ec2ff (c): the repair NOTE leads the output —
+                // it is about the call itself, not the results, and a
+                // LEADING note survives the END-truncation below.
+                output = format!("{note}\n\n{output}");
+            }
 
             // Total byte cap across all files. Back up to a char boundary so a
             // multi-byte char at the cut point doesn't panic (String::truncate
@@ -361,6 +417,94 @@ impl Tool for ReadFilesTool {
         .await
         .unwrap_or_else(|e| ToolResult::error(format!("read_files task failed: {e}")))
     }
+}
+
+/// Backlog c19ec2ff (c): recover file specs from a stringified `files`
+/// argument. Layer 1: a clean JSON-array parse (the dispatch seam
+/// normally repairs this shape before the call reaches the tool; this
+/// layer keeps direct execute calls working). Layer 2: when the payload
+/// does not parse (observed, 2027-01-25: a stray quote after a numeric
+/// field inside one spec), an escape-aware brace scan extracts each
+/// `{...}` candidate and keeps the ones that parse as objects carrying a
+/// string `path`; failures become short excerpts for the NOTE/error. The
+/// clean-parse failure (0-based byte position + serde's reason) rides
+/// along for the caller's positional message.
+fn recover_files_from_string(
+    s: &str,
+) -> (Vec<serde_json::Value>, Vec<String>, Option<(usize, String)>) {
+    match crate::tool::parse_stringified_sequence(s) {
+        Ok(specs) => (specs, Vec::new(), None),
+        Err((pos, reason)) => {
+            let (specs, skipped) = extract_path_objects(s);
+            (specs, skipped, Some((pos, reason)))
+        }
+    }
+}
+
+/// The lenient layer of [`recover_files_from_string`]: scan `s` for
+/// brace-balanced `{...}` candidates (string/escape-aware) and keep those
+/// that parse as objects with a string `path`. Candidates are cut on ASCII
+/// delimiters only, so byte slicing never splits a multi-byte char. A
+/// candidate that fails to parse may have swallowed later well-formed
+/// specs (a stray quote derails the string state) — the scan resumes
+/// INSIDE its span so they are still recovered.
+fn extract_path_objects(s: &str) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut specs: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // String/escape-aware balance walk for the candidate's close.
+        let mut depth: usize = 0;
+        let mut in_string = false;
+        let mut j = i;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'\\' if in_string => j += 1,
+                b'"' => in_string = !in_string,
+                b'{' if !in_string => depth += 1,
+                b'}' if !in_string => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let end = j.min(s.len());
+        let candidate = &s[start..end];
+        match serde_json::from_str::<serde_json::Value>(candidate) {
+            Ok(obj) => {
+                if obj.get("path").is_some_and(|p| p.is_string()) {
+                    specs.push(obj);
+                } else {
+                    skipped.push(excerpt_of(candidate));
+                }
+                // Parsed cleanly — nothing recoverable inside; advance past.
+                i = end;
+            }
+            Err(_) => {
+                skipped.push(excerpt_of(candidate));
+                // Rescan inside the failed candidate's span (see doc).
+                i = start + 1;
+            }
+        }
+    }
+    (specs, skipped)
+}
+
+/// A compact one-line excerpt of a skipped fragment for the NOTE/error.
+fn excerpt_of(s: &str) -> String {
+    let short: String = s.chars().take(48).collect();
+    short.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Maximum number of entries a directory listing renders before capping —
@@ -680,6 +824,94 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, src).unwrap();
+    }
+
+    /// Backlog c19ec2ff (c): a stringified JSON array for `files` is
+    /// accepted — a clean parse is spliced through and the files read
+    /// (the 2027-01-25 session hit this 3x in one turn and got the
+    /// generic "an argument must be a sequence, not a string" every
+    /// time, causing identical re-emissions).
+    #[tokio::test]
+    async fn stringified_files_array_reads_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha content").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta content").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "files": "[{\"path\": \"a.txt\"}, {\"path\": \"b.txt\"}]"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("alpha content") && result.output.contains("beta content"),
+            "both files read from the repaired array: {}",
+            result.output
+        );
+        // A clean repair is silent — no NOTE clutter.
+        assert!(
+            !result.output.contains("NOTE"),
+            "clean parse needs no note: {}",
+            result.output
+        );
+    }
+
+    /// Backlog c19ec2ff (c): a MALFORMED stringified array (observed
+    /// shape, 2027-01-25: a stray quote after a numeric field) still
+    /// reads the well-formed specs, with a NOTE naming the skipped
+    /// fragment and the byte position of the parse failure.
+    #[tokio::test]
+    async fn malformed_stringified_files_recovers_well_formed_specs_with_note() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha content").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "beta content").unwrap();
+        let tool = make_tool(dir.path());
+        // a.txt's spec carries the stray-quote defect (max_lines: 5");
+        // b.txt's spec is well-formed.
+        let result = tool
+            .execute(json!({
+                "files": "[{\"path\": \"a.txt\", \"max_lines\": 5\"}, {\"path\": \"b.txt\"}]"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("beta content"),
+            "the well-formed spec is read: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("alpha content"),
+            "the malformed spec must NOT be read: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("repaired files argument"),
+            "the NOTE names the repair: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("byte") && result.output.contains("a.txt"),
+            "the NOTE names the skipped fragment and the parse byte position: {}",
+            result.output
+        );
+    }
+
+    /// Backlog c19ec2ff (c): an unrecoverable string fails with the byte
+    /// position of the parse error and the expected native-array shape —
+    /// not the generic sequence error that taught nothing.
+    #[tokio::test]
+    async fn unrecoverable_stringified_files_error_names_position() {
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({"files": "not json at all"})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("arrived as a STRING")
+                && result.output.contains("byte")
+                && result.output.contains("\"path\""),
+            "the error names files, the parse byte position, and the expected shape: {}",
+            result.output
+        );
     }
 
     #[test]

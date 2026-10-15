@@ -1097,7 +1097,7 @@ impl MemoryStore {
         let rtype_str: String = row.get(12)?;
         Ok(Memory {
             id: row.get(0)?,
-            tier: MemoryTier::from_str(&tier_str).unwrap_or(MemoryTier::Working),
+            tier: MemoryTier::from_str_opt(&tier_str).unwrap_or(MemoryTier::Working),
             title: row.get(2)?,
             content: row.get(3)?,
             data: serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null),
@@ -1108,8 +1108,8 @@ impl MemoryStore {
             source_session_ids: serde_json::from_str(&source_json).unwrap_or_default(),
             // Unknown/legacy strings degrade to the defaults (Authored/None)
             // rather than failing the whole load.
-            record_class: MemoryClass::from_str(&class_str).unwrap_or_default(),
-            record_type: MemoryRecordType::from_str(&rtype_str).unwrap_or_default(),
+            record_class: MemoryClass::from_str_opt(&class_str).unwrap_or_default(),
+            record_type: MemoryRecordType::from_str_opt(&rtype_str).unwrap_or_default(),
             superseded_by: row.get(13)?,
             embedding,
         })

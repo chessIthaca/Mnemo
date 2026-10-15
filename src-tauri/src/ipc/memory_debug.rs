@@ -79,7 +79,7 @@ pub async fn memory_debug_list(
     let tier = tier
         .as_deref()
         .map(|s| {
-            MemoryTier::from_str(s).ok_or_else(|| IpcError::msg(format!("unknown tier '{s}'")))
+            MemoryTier::from_str_opt(s).ok_or_else(|| IpcError::msg(format!("unknown tier '{s}'")))
         })
         .transpose()?;
     Ok(memory_api(&state, None).list(tier, limit).await?)

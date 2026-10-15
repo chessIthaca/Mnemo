@@ -71,7 +71,9 @@ impl SymbolKind {
     }
 
     /// Parse back from [`SymbolKind::as_str`] output; `None` on unknown.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// (`_opt`: an Option-returning parse — deliberately NOT
+    /// `std::str::FromStr`, which would force a `Result` + error type.)
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         Some(match s {
             "function" => Self::Function,
             "method" => Self::Method,
@@ -113,7 +115,9 @@ impl EdgeKind {
     }
 
     /// Parse back from [`EdgeKind::as_str`] output; `None` on unknown.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// (`_opt`: an Option-returning parse — deliberately NOT
+    /// `std::str::FromStr`, which would force a `Result` + error type.)
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         Some(match s {
             "calls" => Self::Calls,
             "imports" => Self::Imports,
@@ -2428,13 +2432,13 @@ namespace App {
             SymbolKind::TsEnum,
             SymbolKind::Module,
         ] {
-            assert_eq!(SymbolKind::from_str(k.as_str()), Some(k));
+            assert_eq!(SymbolKind::from_str_opt(k.as_str()), Some(k));
         }
-        assert_eq!(SymbolKind::from_str("nope"), None);
+        assert_eq!(SymbolKind::from_str_opt("nope"), None);
         for k in [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::Contains] {
-            assert_eq!(EdgeKind::from_str(k.as_str()), Some(k));
+            assert_eq!(EdgeKind::from_str_opt(k.as_str()), Some(k));
         }
-        assert_eq!(EdgeKind::from_str("nope"), None);
+        assert_eq!(EdgeKind::from_str_opt("nope"), None);
     }
 
     #[test]

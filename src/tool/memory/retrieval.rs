@@ -148,13 +148,13 @@ impl Tool for MemorySearchTool {
 
         let mut filter = MemoryFilter::new();
         if let Some(tier_str) = &args.tier {
-            match crate::memory::MemoryTier::from_str(tier_str) {
+            match crate::memory::MemoryTier::from_str_opt(tier_str) {
                 Some(t) => filter = filter.tier(t),
                 None => return ToolResult::error(format!("unknown tier '{tier_str}'")),
             }
         }
         if let Some(rt_str) = &args.record_type {
-            match MemoryRecordType::from_str(rt_str) {
+            match MemoryRecordType::from_str_opt(rt_str) {
                 Some(rt) => filter = filter.record_type(rt),
                 None => {
                     return ToolResult::error(format!(

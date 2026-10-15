@@ -134,8 +134,10 @@ impl ProviderKind {
     }
 
     /// Parse a lowercase wire name back to a [`ProviderKind`] (inverse of
-    /// [`as_str`]); used to reconstruct the origin policy for Rule 5.
-    pub fn from_str(s: &str) -> Option<ProviderKind> {
+    /// [`as_str`]); used to reconstruct the origin policy for Rule 5. (`_opt`:
+    /// Option-returning parse — deliberately NOT `std::str::FromStr`, which
+    /// would force a `Result` + error type.)
+    pub fn from_str_opt(s: &str) -> Option<ProviderKind> {
         match s {
             "openai" => Some(ProviderKind::OpenAI),
             "local" => Some(ProviderKind::Local),
@@ -544,7 +546,7 @@ pub fn strip_cross_vendor_reasoning(
         let Some(origin_kind) = msg
             .origin_provider
             .as_deref()
-            .and_then(ProviderKind::from_str)
+            .and_then(ProviderKind::from_str_opt)
         else {
             continue;
         };

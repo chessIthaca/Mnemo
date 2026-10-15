@@ -213,7 +213,7 @@ impl Tool for MemoryWriteTool {
                 ))
             }
         };
-        let tier = match MemoryTier::from_str(&args.tier) {
+        let tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
@@ -603,7 +603,7 @@ impl Tool for MemoryRecallTool {
         };
         let mut filter = MemoryFilter::new();
         if let Some(tier_str) = &args.tier {
-            match MemoryTier::from_str(tier_str) {
+            match MemoryTier::from_str_opt(tier_str) {
                 Some(t) => filter = filter.tier(t),
                 None => return ToolResult::error(format!("unknown tier '{tier_str}'")),
             }
@@ -1295,7 +1295,7 @@ impl Tool for MemorySupersedeTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
-        let tier = match MemoryTier::from_str(&args.tier) {
+        let tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };

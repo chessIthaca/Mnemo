@@ -210,7 +210,7 @@ pub fn title_prefix(record_type: MemoryRecordType) -> Option<&'static str> {
 /// knowledge types map (`spec`/`decision`/`bug`/`how`); `plan`, `review`,
 /// and anything else return `None` — those records have their own file homes.
 pub fn record_type_for_dir(dir: &str) -> Option<MemoryRecordType> {
-    match MemoryRecordType::from_str(dir) {
+    match MemoryRecordType::from_str_opt(dir) {
         Some(t) if dir_for_record_type(t).is_some() => Some(t),
         _ => None,
     }

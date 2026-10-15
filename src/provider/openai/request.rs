@@ -1187,7 +1187,7 @@ fn raw_is_usable(raw: &serde_json::Value) -> bool {
 fn raw_origin_allows_echo(origin_provider: Option<&str>, kind: ProviderKind) -> bool {
     match origin_provider {
         None => true,
-        Some(origin) => ProviderKind::from_str(origin) == Some(kind),
+        Some(origin) => ProviderKind::from_str_opt(origin) == Some(kind),
     }
 }
 

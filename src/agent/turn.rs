@@ -3373,7 +3373,16 @@ impl AgentLoop {
         // MemoryRecalled lines after every >4 KiB tool output (defect
         // fixed 2026-08-20).
         if let Some(store) = &self.memory {
-            let query = last_user_query(messages);
+            // Task scoping (backlog c68a8c3b): with a plan active, the
+            // recall query embeds the plan's goal+context alongside the
+            // last user message, so the plan's own records outrank rows
+            // that merely match the message's generic tokens. The
+            // per-turn cache keys on the COMBINED query — a plan-frame
+            // change (step tick, context amendment) re-embeds once:
+            // correctness over cache.
+            let plan_text = self.workflow.plan_recall_text().await;
+            let query =
+                last_user_query(messages).map(|q| recall_query_text(&q, plan_text.as_deref()));
             if let Some(q_text) = query {
                 let q: &str = &q_text;
                 let filter = crate::memory::MemoryFilter::new().limit(5);
@@ -5335,6 +5344,41 @@ fn repeated_tool_failure(messages: &[Message], tool_name: &str, failed_content: 
                     MessageContent::Parts(_) => false,
                 }
         })
+}
+
+/// Build the auto-recall query (backlog c68a8c3b): the last user message
+/// alone (today's behavior) when no plan is active, or the message plus a
+/// capped `[ACTIVE PLAN — goal+context]` block when one is — the ranking
+/// (query similarity + the keyword boost) then scores the plan's own
+/// records above rows that merely match the message's generic tokens.
+/// The plan text is capped at ~1 000 bytes, cut at a whitespace boundary
+/// (never mid-word), so the embed stays cheap and the plan's lexical mass
+/// stays balanced against the user's own message.
+pub(crate) fn recall_query_text(last: &str, plan_goal_context: Option<&str>) -> String {
+    match plan_goal_context.map(str::trim).filter(|p| !p.is_empty()) {
+        None => last.to_string(),
+        Some(p) => format!(
+            "{last}\n\n[ACTIVE PLAN — goal+context]\n{}",
+            cap_at_whitespace(p, 1_000)
+        ),
+    }
+}
+
+/// Cut `text` to at most `cap` bytes on a whitespace boundary — never a
+/// mid-word cut, never a mid-UTF-8-sequence cut (the boundary is walked
+/// back to a char boundary first); a single long token is hard-cut.
+fn cap_at_whitespace(text: &str, cap: usize) -> &str {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    match text[..end].rfind(char::is_whitespace) {
+        Some(i) => &text[..i],
+        None => &text[..end],
+    }
 }
 
 /// The auto-recall query: the latest User-role message text, skipping

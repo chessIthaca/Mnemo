@@ -12237,6 +12237,135 @@ async fn recall_feedback_dismissed_row_never_reinjects_this_session() {
 }
 
 #[tokio::test]
+async fn plan_active_recall_ranks_the_plans_own_records_above_generic_rows() {
+    // Task-scoped ranking (backlog c68a8c3b), end-to-end: with a plan
+    // active whose goal+context is all quokka-gallery vocabulary and a
+    // user message ("merge it") that generically matches the merge-topic
+    // record, the recall block must rank the PLAN's own record above the
+    // generic one. Pre-fix (the query = the last message ALONE) the
+    // generic row outranks the plan's row (or the plan's row never
+    // makes the cut) — red.
+    const PLAN_GOAL: &str = "Ship the quokka gallery: rotate the quokka image viewer so the quokka photos render upright in the gallery grid";
+    const PLAN_CONTEXT: &str = "The quokka viewer currently renders rotated quokka photos; the gallery grid needs upright quokka image thumbnails. The quokka photo test fails on the rotated fixture.";
+    const P: &str = "quokka gallery fix: rotate the quokka image viewer so quokka photos render upright in the gallery grid, per the quokka photo test";
+    const G: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Quokka gallery upright photos",
+            PLAN_GOAL,
+            PLAN_CONTEXT,
+            vec!["Fix the quokka viewer".into()],
+        )
+        .unwrap();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "rotate quokka thumbnails", // P — the plan's own record
+            P,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions", // G — generic, matches the message alone
+            G,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta { text: "ok".into() },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tail = &probe.request_tails()[0];
+    let p_pos = tail
+        .find("rotate quokka thumbnails")
+        .expect("the plan's own record injects");
+    let g_pos = tail
+        .find("merge instructions")
+        .expect("the generic row injects");
+    assert!(
+        p_pos < g_pos,
+        "with a plan active, the plan's own record outranks the generic match: {tail}"
+    );
+}
+
+#[test]
+fn recall_query_text_caps_plan_text_and_falls_back_to_the_message() {
+    use crate::agent::turn::recall_query_text;
+    // No plan — exactly today's single-message query.
+    assert_eq!(recall_query_text("merge it", None), "merge it");
+    // Blank plan text is treated as absent.
+    assert_eq!(recall_query_text("merge it", Some("   ")), "merge it");
+    // A plan rides along under its marked header.
+    assert_eq!(
+        recall_query_text("merge it", Some("quokka gallery")),
+        "merge it\n\n[ACTIVE PLAN — goal+context]\nquokka gallery"
+    );
+    const HEADER: &str = "\n\n[ACTIVE PLAN — goal+context]\n";
+    // Oversized plan text is cut at a whitespace boundary (never
+    // mid-word): 2 002 bytes of "quokka " repetitions.
+    let long = "quokka ".repeat(286);
+    let capped = recall_query_text("merge it", Some(&long));
+    let plan = &capped["merge it".len() + HEADER.len()..];
+    assert!(plan.len() <= 1_000, "the cap holds: {}", plan.len());
+    assert!(
+        plan.ends_with("quokka"),
+        "the cut lands at a whitespace boundary (never mid-word): {plan:?}"
+    );
+    // Multibyte safety: a CJK-only plan (no whitespace) is hard-cut at
+    // the cap, always on a char boundary — never mid-UTF-8-sequence.
+    let cjk = "照片旋转".repeat(400); // 4 800 bytes, 3 bytes per char
+    let capped_cjk = recall_query_text("merge it", Some(&cjk));
+    let plan_cjk = &capped_cjk["merge it".len() + HEADER.len()..];
+    assert!(plan_cjk.len() <= 1_000);
+    assert_eq!(
+        plan_cjk.len() % 3,
+        0,
+        "the hard cut lands on a char boundary"
+    );
+}
+
+#[tokio::test]
 async fn auto_recall_emits_memory_recalled_event() {
     // Regression (2026-04-20, user request + review finding 1): the per-turn
     // AUTO-recall injected memories into the prompt invisibly — there must be

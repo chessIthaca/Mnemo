@@ -3419,6 +3419,17 @@ impl crate::agent::workflow_handle::AgentWorkflowHandle
         )
     }
 
+    async fn plan_recall_text(&self) -> Option<String> {
+        // Backlog c68a8c3b: the goal+context block the auto-recall query
+        // embeds alongside the last user message (task-scoped ranking).
+        // The same plan fields the volatile tail's workflow section
+        // renders (workflow_policy.rs); the kernel caps and shapes the
+        // query (recall_query_text).
+        let wf = self.lock().await;
+        let plan = wf.plan()?;
+        Some(format!("{}\n{}", plan.goal, plan.context))
+    }
+
     async fn active_skill_name(&self) -> Option<String> {
         self.lock().await.active_skill().map(|s| s.name.clone())
     }

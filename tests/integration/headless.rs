@@ -854,6 +854,9 @@ impl MemoryStoreTrait for LoggingStore {
     async fn supersede_memory(&self, old_id: &str, new_memory: Memory) -> MemResult<String> {
         self.inner.supersede_memory(old_id, new_memory).await
     }
+    async fn quarantine_memory(&self, id: &str, reason: &str) -> MemResult<()> {
+        self.inner.quarantine_memory(id, reason).await
+    }
     async fn delete_memory(&self, id: &str) -> MemResult<bool> {
         self.inner.delete_memory(id).await
     }

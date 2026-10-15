@@ -14,6 +14,7 @@ pub mod classifier;
 pub mod consolidation;
 pub mod embedder;
 pub mod finish_capture;
+pub mod integrity;
 pub mod indexer;
 pub mod knowledge;
 pub mod maintenance;
@@ -226,6 +227,10 @@ pub trait MemoryStoreTrait: Send + Sync {
     /// is already superseded — the error names the existing superseder so
     /// the caller can point at it. Returns the new memory's id.
     async fn supersede_memory(&self, old_id: &str, new_memory: Memory) -> Result<String>;
+    /// Quarantine a record: set the integrity reason (backlog c68a8c3b —
+    /// the startup digest-integrity sweep). NEVER deletes — the row
+    /// stays retrievable via a filter with `include_quarantined`.
+    async fn quarantine_memory(&self, id: &str, reason: &str) -> Result<()>;
 
     /// Hard-delete a memory (the FTS delete trigger keeps the index in
     /// sync). For junk/duplicate rows only — stale-but-once-true knowledge
@@ -703,7 +708,7 @@ impl MemoryStore {
             let mut stmt = conn.prepare(
                 "SELECT id, tier, title, content, data, strength, access_count, created_at, \
                  last_accessed_at, source_session_ids, embedding, record_class, record_type, \
-                 superseded_by FROM memories WHERE id = ?1",
+                 superseded_by, quarantined FROM memories WHERE id = ?1",
             )?;
             let mut rows = stmt.query(params![id])?;
             match rows.next()? {
@@ -1042,7 +1047,8 @@ impl MemoryStore {
     /// write connection, or a transaction on it). Shared by `write` and
     /// `supersede_memory` so both persist the full column set — including
     /// the semantic-record columns (`record_class` / `record_type` /
-    /// `superseded_by`) — faithfully from the struct. The FTS sync triggers
+    /// `superseded_by` / `quarantined`) — faithfully from the struct. The
+    /// FTS sync triggers
     /// keep the index in step.
     fn insert_memory_locked(
         conn: &Connection,
@@ -1055,7 +1061,7 @@ impl MemoryStore {
         let source_json =
             serde_json::to_string(&memory.source_session_ids).unwrap_or_else(|_| "[]".into());
         conn.execute(
-            "INSERT OR REPLACE INTO memories (id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, embed_model, embed_dim, record_class, record_type, superseded_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT OR REPLACE INTO memories (id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, embed_model, embed_dim, record_class, record_type, superseded_by, quarantined) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 memory.id,
                 memory.tier.as_str(),
@@ -1073,6 +1079,7 @@ impl MemoryStore {
                 memory.record_class.as_str(),
                 memory.record_type.as_str(),
                 memory.superseded_by,
+                memory.quarantined,
             ],
         )?;
         Ok(())
@@ -1084,7 +1091,7 @@ impl MemoryStore {
     /// `load_by_rowids_locked`:
     /// `id, tier, title, content, data, strength, access_count, created_at,
     ///  last_accessed_at, source_session_ids, embedding, record_class,
-    ///  record_type, superseded_by`.
+    ///  record_type, superseded_by, quarantined`.
     fn parse_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         let embedding_blob: Option<Vec<u8>> = row.get(10)?;
         let embedding = embedding_blob
@@ -1111,6 +1118,7 @@ impl MemoryStore {
             record_class: MemoryClass::from_str_opt(&class_str).unwrap_or_default(),
             record_type: MemoryRecordType::from_str_opt(&rtype_str).unwrap_or_default(),
             superseded_by: row.get(13)?,
+            quarantined: row.get(14)?,
             embedding,
         })
     }
@@ -1129,9 +1137,9 @@ impl MemoryStore {
     /// Locked-connection variant of `load_all` (no async lock acquisition).
     fn load_all_locked(conn: &Connection, tier: Option<MemoryTier>) -> Result<Vec<Memory>> {
         let sql = if tier.is_some() {
-            "SELECT id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by FROM memories WHERE tier = ?1"
+            "SELECT id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories WHERE tier = ?1"
         } else {
-            "SELECT id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by FROM memories"
+            "SELECT id, tier, title, content, data, strength, access_count, created_at, last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories"
         };
         let mut stmt = conn.prepare(sql)?;
         let mut out = Vec::new();
@@ -1163,7 +1171,7 @@ impl MemoryStore {
         let mut sql = String::from(
             "SELECT id, tier, title, content, data, strength, access_count, created_at, \
              last_accessed_at, source_session_ids, embedding, record_class, record_type, \
-             superseded_by FROM memories WHERE 1=1",
+             superseded_by, quarantined FROM memories WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(t) = filter.tier {
@@ -1174,6 +1182,12 @@ impl MemoryStore {
         }
         if filter.exclude_superseded {
             sql.push_str(" AND superseded_by IS NULL");
+        }
+        // Quarantined rows (backlog c68a8c3b — the startup digest-integrity
+        // sweep's finds) are excluded by default, exactly like supersession:
+        // a malformed or self-contradicted record is not live knowledge.
+        if filter.exclude_quarantined {
+            sql.push_str(" AND quarantined IS NULL");
         }
         if let Some(rt) = filter.record_type {
             sql.push_str(" AND record_type = ?");
@@ -1204,7 +1218,7 @@ impl MemoryStore {
         let placeholders: Vec<String> = (0..rowids.len()).map(|i| format!("?{}", i + 1)).collect();
         let mut sql = String::from(
             "SELECT id, tier, title, content, data, strength, access_count, created_at, \
-             last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by FROM memories \
+             last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories \
              WHERE rowid IN (",
         );
         sql.push_str(&placeholders.join(", "));
@@ -1283,6 +1297,11 @@ impl MemoryStore {
         }
         if filter.exclude_superseded {
             sql.push_str(" AND m.superseded_by IS NULL");
+        }
+        // Quarantined rows (backlog c68a8c3b): same default exclusion as
+        // superseded — the sweep's finds never inject.
+        if filter.exclude_quarantined {
+            sql.push_str(" AND m.quarantined IS NULL");
         }
         if let Some(rt) = filter.record_type {
             sql.push_str(" AND m.record_type = ?");
@@ -1809,6 +1828,27 @@ impl MemoryStoreTrait for MemoryStore {
         Ok(updated)
     }
 
+    /// Quarantine one record (backlog c68a8c3b): set the `quarantined`
+    /// reason — NEVER delete (the row stays retrievable via a filter with
+    /// `include_quarantined`). Called by the startup digest-integrity
+    /// sweep (src/memory/integrity.rs). A missing row is a concurrent
+    /// delete — a no-op, not an error.
+    async fn quarantine_memory(&self, id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            conn.execute(
+                "UPDATE memories SET quarantined = ?1 WHERE id = ?2",
+                params![&reason, &id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("quarantine_memory task failed: {e}")))?
+    }
+
     async fn supersede_memory(&self, old_id: &str, mut new_memory: Memory) -> Result<String> {
         let (embedding_blob, embed_model, embed_dim) =
             self.embedding_for_insert(&mut new_memory).await;
@@ -1950,7 +1990,7 @@ impl MemoryStoreTrait for MemoryStore {
             let mut sql = String::from(
                 "SELECT id, tier, title, content, data, strength, access_count, created_at, \
                  last_accessed_at, source_session_ids, embedding, record_class, record_type, \
-                 superseded_by FROM memories WHERE 1=1",
+                 superseded_by, quarantined FROM memories WHERE 1=1",
             );
             let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
             if let Some(t) = filter.tier {
@@ -1961,6 +2001,11 @@ impl MemoryStoreTrait for MemoryStore {
             }
             if filter.exclude_superseded {
                 sql.push_str(" AND superseded_by IS NULL");
+            }
+            // Quarantined rows (backlog c68a8c3b): same default exclusion
+            // as superseded — the sweep's finds never list.
+            if filter.exclude_quarantined {
+                sql.push_str(" AND quarantined IS NULL");
             }
             if let Some(rt) = filter.record_type {
                 sql.push_str(" AND record_type = ?");
@@ -2021,8 +2066,8 @@ impl MemoryStoreTrait for MemoryStore {
             let placeholders: Vec<&str> = (0..wanted.len()).map(|_| "?").collect();
             let sql = format!(
                 "SELECT id, tier, title, content, data, strength, access_count, created_at, \
-                 last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by FROM memories \
-                 WHERE tier IN ({}) AND superseded_by IS NULL",
+                 last_accessed_at, source_session_ids, embedding, record_class, record_type, superseded_by, quarantined FROM memories \
+                 WHERE tier IN ({}) AND superseded_by IS NULL AND quarantined IS NULL",
                 placeholders.join(", ")
             );
             let mut stmt = conn.prepare(&sql)?;

@@ -49,7 +49,7 @@ pub use crate::host::brain::SharedResources;
 /// paths on the app side.
 pub use crate::host::runtime::{
     cleanup_inactive_subagents, spawn_agent_shared, AgentLoopMap, HostRuntime,
-    WorktreeBinding,
+    SessionOptions, SpawnHost, WorktreeBinding,
 };
 pub use setup::{
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,

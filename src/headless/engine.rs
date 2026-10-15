@@ -29,7 +29,7 @@ use crate::headless::codegraph_api::CodegraphApi;
 use crate::headless::memory_api::MemoryApi;
 use crate::host::brain::{wire_brain, Brain, BrainMemoryOptions};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
-use crate::host::runtime::{spawn_agent_shared, HostRuntime};
+use crate::host::runtime::{spawn_agent_shared, HostRuntime, SessionOptions, SpawnHost};
 use crate::provider::LlmClient;
 
 /// The fan-out notifier: every host event lands on the engine's broadcast
@@ -299,25 +299,31 @@ impl Engine {
             }
         }
         let (agent, _) = spawn_agent_shared(
-            factory,
-            self.inner.host.manager.clone(),
-            self.inner.host.agent_loops.clone(),
+            SpawnHost {
+                factory,
+                manager: self.inner.host.manager.clone(),
+                agent_loops: self.inner.host.agent_loops.clone(),
+            },
             name,
             None, // no initial prompt — sessions drive via send
             None, // parentless — a session is its own main
-            model,
-            None, // no role
-            true, // own plans dir (a parentless session agent)
-            None, // no worktree binding (the option wires with 3c)
-            Some(permission),
-            // 3a.6 (G5): the resume seed — the transcript's messages
-            // become the initial conversation (§5.9.5 :693-695).
-            opts.resume.map(|transcript| transcript.messages),
-            // 3a.7 (G7, §5.9.7) + 3c/G6 tier 2: the per-session limits —
-            // the guardrails' limits override the option's.
-            effective_limits,
-            // 3c/G2 (§5.9.2): the session's host tools.
-            host_tools,
+            SessionOptions {
+                model,
+                role: None, // no role
+                // own plans dir (a parentless session agent)
+                own_plans_dir: true,
+                // no worktree binding (the option wires with 3c)
+                worktree: None,
+                permission: Some(permission),
+                // 3a.6 (G5): the resume seed — the transcript's messages
+                // become the initial conversation (§5.9.5 :693-695).
+                initial_messages: opts.resume.map(|transcript| transcript.messages),
+                // 3a.7 (G7, §5.9.7) + 3c/G6 tier 2: the per-session limits —
+                // the guardrails' limits override the option's.
+                limits: effective_limits,
+                // 3c/G2 (§5.9.2): the session's host tools.
+                host_tools,
+            },
         )
         .await
         .map_err(EngineError::spawn_failed)?;

@@ -563,24 +563,32 @@ fn main() {
                     // (the locks are uncontended at startup).
                     tauri::async_runtime::block_on(async {
                         ipc::spawn::spawn_agent_shared(
-                            brain.factory.clone(),
-                            manager.clone(),
-                            agent_loops.clone(),
+                            ipc::spawn::SpawnHost {
+                                factory: brain.factory.clone(),
+                                manager: manager.clone(),
+                                agent_loops: agent_loops.clone(),
+                            },
                             "main".to_string(),
                             None,
                             None,
-                            None,  // no forced model — the main agent uses the default
-                            None,  // no role — the main agent is unrestricted
-                            false, // own_plans_dir — main keeps .coding/plans/
-                            None,  // no worktree binding — the main agent works the main tree
-                            // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
-                            None,
-                            // 3a.6 (G5): the main agent never resumes
-                            None,
-                            // 3a.7 (G7): the main agent sets no session limits
-                            None,
-                            // 3c (G2): the main agent registers no host tools
-                            vec![],
+                            ipc::spawn::SessionOptions {
+                                // no forced model — the main agent uses the default
+                                model: None,
+                                // no role — the main agent is unrestricted
+                                role: None,
+                                // own_plans_dir — main keeps .coding/plans/
+                                own_plans_dir: false,
+                                // no worktree binding — the main agent works the main tree
+                                worktree: None,
+                                // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+                                permission: None,
+                                // 3a.6 (G5): the main agent never resumes
+                                initial_messages: None,
+                                // 3a.7 (G7): the main agent sets no session limits
+                                limits: None,
+                                // 3c (G2): the main agent registers no host tools
+                                host_tools: vec![],
+                            },
                         )
                         .await
                         .expect("main agent spawn must succeed");

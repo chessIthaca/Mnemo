@@ -60,6 +60,55 @@ async fn parent_root_binding(
     })
 }
 
+/// The host dependencies a spawn needs: the loop factory (builds the
+/// agent's loop), the manager (registers it), and the per-agent loop map
+/// (tracks it for `get_workflow_state`). The three always travel
+/// together from every spawn path — grouped so [`spawn_agent_shared`]
+/// stays under the argument budget.
+pub struct SpawnHost {
+    /// Builds the agent's loop (tools, provider routing, brain wiring).
+    pub factory: Arc<AgentLoopFactory>,
+    /// Registers the agent + owns the task bookkeeping.
+    pub manager: Arc<tokio::sync::Mutex<AgentManager>>,
+    /// The live per-agent loop map.
+    pub agent_loops: AgentLoopMap,
+}
+
+/// The per-session spawn options — everything except the spawn's identity
+/// (name, initial prompt, parent). `None`/`false`/`vec![]` defaults keep
+/// the pre-3a.5 behavior; each field is applied post-build exactly as the
+/// corresponding positional argument was.
+pub struct SessionOptions {
+    /// A forced model — `None` = the default routing.
+    pub model: Option<crate::config::ModelRef>,
+    /// The workflow role (restricts the tool surface) — `None` = unrestricted.
+    pub role: Option<String>,
+    /// Whether the agent owns its `.coding/plans/agents/<id>/` dir.
+    pub own_plans_dir: bool,
+    /// The worktree binding (root override) — `None` = the main tree.
+    pub worktree: Option<WorktreeBinding>,
+    /// 3a.5 (§5.4 :303-314): the per-session permission policy — `None`
+    /// keeps the factory build's default (every pre-3a.5 caller); `Some`
+    /// is applied post-build via [`AgentLoop::set_permission`] (the
+    /// Engine resolves the engine default vs. the SpawnOptions override).
+    pub permission: Option<crate::agent::policy::PermissionPolicy>,
+    /// 3a.6 (G5, §5.9.5): the resume seed — the transcript's messages
+    /// become the initial conversation (`None` = a fresh session).
+    pub initial_messages: Option<Vec<crate::provider::Message>>,
+    /// 3a.7 (G7, §5.9.7): the session limits — `None` keeps the loop's
+    /// default (unlimited); `Some` is applied post-build via
+    /// [`AgentLoop::set_limits`].
+    pub limits: Option<crate::runtime::channels::SessionLimits>,
+    /// 3c/G2 (§5.9.2): the session's host tools — spec shims plus any
+    /// engine-registered custom tools. Registered post-build via the
+    /// registry's shared dynamic slot (interior-mutable — the registry
+    /// sits behind an Arc, so there is no `&mut` to be had); each is
+    /// advertised from the first request and dispatch intercepts its
+    /// calls via the `host_tool_timeout_ms` marker. `vec![]` for every
+    /// pre-3c caller.
+    pub host_tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
+}
+
 /// Spawn a background agent: build its loop via the factory, spawn its task,
 /// register it with the manager, and track its loop for `get_workflow_state`.
 ///
@@ -71,37 +120,27 @@ async fn parent_root_binding(
 /// UI-button spawns and the main agent) — used to notify the parent when this
 /// agent finishes. Returns `(agent_id, name)`.
 pub async fn spawn_agent_shared(
-    factory: Arc<AgentLoopFactory>,
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
+    host: SpawnHost,
     name: String,
     initial_prompt: Option<String>,
     parent_id: Option<AgentId>,
-    model: Option<crate::config::ModelRef>,
-    role: Option<String>,
-    own_plans_dir: bool,
-    worktree: Option<WorktreeBinding>,
-    // 3a.5 (§5.4 :303-314): the per-session permission policy — `None`
-    // keeps the factory build's default (every pre-3a.5 caller); `Some`
-    // is applied post-build via [`AgentLoop::set_permission`] (the
-    // Engine resolves the engine default vs. the SpawnOptions override).
-    permission: Option<crate::agent::policy::PermissionPolicy>,
-    // 3a.6 (G5, §5.9.5): the resume seed — the transcript's messages
-    // become the initial conversation (None = a fresh session).
-    initial_messages: Option<Vec<crate::provider::Message>>,
-    // 3a.7 (G7, §5.9.7): the session limits — None keeps the loop's
-    // default (unlimited); Some is applied post-build via
-    // [`AgentLoop::set_limits`].
-    limits: Option<crate::runtime::channels::SessionLimits>,
-    // 3c/G2 (§5.9.2): the session's host tools — spec shims plus any
-    // engine-registered custom tools. Registered post-build via the
-    // registry's shared dynamic slot (interior-mutable — the registry
-    // sits behind an Arc, so there is no `&mut` to be had); each is
-    // advertised from the first request and dispatch intercepts its
-    // calls via the `host_tool_timeout_ms` marker. `vec![]` for every
-    // pre-3c caller.
-    host_tools: Vec<std::sync::Arc<dyn crate::tool::Tool>>,
+    session: SessionOptions,
 ) -> Result<(AgentId, String), String> {
+    let SpawnHost {
+        factory,
+        manager,
+        agent_loops,
+    } = host;
+    let SessionOptions {
+        model,
+        role,
+        own_plans_dir,
+        worktree,
+        permission,
+        initial_messages,
+        limits,
+        host_tools,
+    } = session;
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
     // of any background agents it spawns (the completion-notification loop).
@@ -643,23 +682,29 @@ impl ParentAwareSpawner for HostSpawner {
         permission: crate::agent::policy::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
-            self.factory.clone(),
-            self.manager.clone(),
-            self.agent_loops.clone(),
+            SpawnHost {
+                factory: self.factory.clone(),
+                manager: self.manager.clone(),
+                agent_loops: self.agent_loops.clone(),
+            },
             name.to_string(),
             Some(task.to_string()),
             parent_id,
-            model,
-            role,
-            false, // own_plans_dir — subagents share the main dir (can't mutate)
-            None,  // no worktree binding — subagents inherit the parent's root
-            Some(permission),
-            // subagents never resume from a transcript (3a.6)
-            None,
-            // subagents set no session limits (3a.7)
-            None,
-            // subagents register no host tools (3c/G2)
-            vec![],
+            SessionOptions {
+                model,
+                role,
+                // own_plans_dir — subagents share the main dir (can't mutate)
+                own_plans_dir: false,
+                // no worktree binding — subagents inherit the parent's root
+                worktree: None,
+                permission: Some(permission),
+                // subagents never resume from a transcript (3a.6)
+                initial_messages: None,
+                // subagents set no session limits (3a.7)
+                limits: None,
+                // subagents register no host tools (3c/G2)
+                host_tools: vec![],
+            },
         )
         .await?;
         Ok(id)
@@ -739,24 +784,29 @@ impl HostRuntime {
         // no initial prompt, no parent, no forced model, no role, and no
         // worktree binding (the main agent works the main tree).
         let (main_id, _) = spawn_agent_shared(
-            factory.clone(),
-            manager.clone(),
-            agent_loops.clone(),
+            SpawnHost {
+                factory: factory.clone(),
+                manager: manager.clone(),
+                agent_loops: agent_loops.clone(),
+            },
             "main".to_string(),
             None,
             None,
-            None,
-            None,
-            false,
-            None,
-            // the main agent keeps the factory build's default policy
-            None,
-            // the main agent never resumes from a transcript
-            None,
-            // the main agent sets no session limits (3a.7)
-            None,
-            // the main agent registers no host tools (3c/G2)
-            vec![],
+            SessionOptions {
+                model: None,
+                role: None,
+                own_plans_dir: false,
+                // no worktree binding — the main agent works the main tree
+                worktree: None,
+                // the main agent keeps the factory build's default policy
+                permission: None,
+                // the main agent never resumes from a transcript
+                initial_messages: None,
+                // the main agent sets no session limits (3a.7)
+                limits: None,
+                // the main agent registers no host tools (3c/G2)
+                host_tools: vec![],
+            },
         )
         .await
         .map_err(|e| format!("main agent spawn failed: {e}"))?;

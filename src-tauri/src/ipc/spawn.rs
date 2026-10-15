@@ -20,7 +20,7 @@ use mnemo::{AgentManager, AgentSpawner, ParentAwareSpawner};
 use crate::ipc::agent::AgentInfo;
 use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_prompt_dispatched;
-pub(crate) use mnemo::headless::{spawn_agent_shared, WorktreeBinding};
+pub(crate) use mnemo::headless::{spawn_agent_shared, SessionOptions, SpawnHost, WorktreeBinding};
 use crate::ipc::state::IpcState;
 
 /// Spawn a new agent with the given name.
@@ -40,24 +40,32 @@ pub async fn spawn_agent(state: State<'_, IpcState>, name: String) -> Result<Age
         .ok_or_else(|| IpcError::msg("agent factory unavailable (brain failed to start)"))?;
 
     let (agent_id, name) = spawn_agent_shared(
-        factory,
-        state.runtime.manager.clone(),
-        state.runtime.agent_loops.clone(),
+        SpawnHost {
+            factory,
+            manager: state.runtime.manager.clone(),
+            agent_loops: state.runtime.agent_loops.clone(),
+        },
         name,
         None,
         None, // no parent — a UI-button spawn has no owning agent
-        None, // no forced model — UI spawns use the default
-        None, // no role — UI spawns are unrestricted
-        true, // own_plans_dir — UI spawns get .coding/plans/agents/<id>/
-        None, // no worktree binding — a main-tree agent
-        // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
-        None,
-        // 3a.6 (G5): the IPC path never resumes from a transcript
-        None,
-        // 3a.7 (G7): the IPC path sets no session limits
-        None,
-        // 3c (G2): the IPC path registers no host tools
-        vec![],
+        SessionOptions {
+            // no forced model — UI spawns use the default
+            model: None,
+            // no role — UI spawns are unrestricted
+            role: None,
+            // own_plans_dir — UI spawns get .coding/plans/agents/<id>/
+            own_plans_dir: true,
+            // no worktree binding — a main-tree agent
+            worktree: None,
+            // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+            permission: None,
+            // 3a.6 (G5): the IPC path never resumes from a transcript
+            initial_messages: None,
+            // 3a.7 (G7): the IPC path sets no session limits
+            limits: None,
+            // 3c (G2): the IPC path registers no host tools
+            host_tools: vec![],
+        },
     )
     .await?;
 
@@ -173,27 +181,34 @@ pub(crate) async fn spawn_run_all_agent(
         .map_err(|e| format!("worktree graph task failed: {e}"))?
     };
     spawn_agent_shared(
-        factory,
-        manager,
-        agent_loops,
+        SpawnHost {
+            factory,
+            manager,
+            agent_loops,
+        },
         name,
         initial_prompt,
         None,  // parentless — a main agent of its own
-        None,  // no forced model — the default provider chain
-        None,  // no role — an unrestricted main agent
-        false, // own_plans_dir — the worktree binding drives the plans dir
-        Some(WorktreeBinding {
-            worktree,
-            codegraph,
-        }),
-        // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
-        None,
-        // 3a.6 (G5): the IPC path never resumes from a transcript
-        None,
-        // 3a.7 (G7): the IPC path sets no session limits
-        None,
-        // 3c (G2): the IPC path registers no host tools
-        vec![],
+        SessionOptions {
+            // no forced model — the default provider chain
+            model: None,
+            // no role — an unrestricted main agent
+            role: None,
+            // own_plans_dir — the worktree binding drives the plans dir
+            own_plans_dir: false,
+            worktree: Some(WorktreeBinding {
+                worktree,
+                codegraph,
+            }),
+            // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+            permission: None,
+            // 3a.6 (G5): the IPC path never resumes from a transcript
+            initial_messages: None,
+            // 3a.7 (G7): the IPC path sets no session limits
+            limits: None,
+            // 3c (G2): the IPC path registers no host tools
+            host_tools: vec![],
+        },
     )
     .await
 }
@@ -277,25 +292,31 @@ impl ParentAwareSpawner for IpcSpawner {
         _permission: mnemo::PermissionPolicy,
     ) -> Result<AgentId, String> {
         let (id, _) = spawn_agent_shared(
-            self.factory.clone(),
-            self.manager.clone(),
-            self.agent_loops.clone(),
+            SpawnHost {
+                factory: self.factory.clone(),
+                manager: self.manager.clone(),
+                agent_loops: self.agent_loops.clone(),
+            },
             name.to_string(),
             Some(task.to_string()),
             parent_id,
-            model,
-            role,
-            false, // own_plans_dir — subagents share the main dir (can't mutate)
-            None, // no worktree binding — subagents inherit the parent's root
-        // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
-        None,
-        // 3a.6 (G5): subagents never resume from a transcript
-        None,
-        // 3a.7 (G7): subagents set no session limits
-        None,
-        // 3c (G2): subagents register no host tools
-        vec![],
-    )
+            SessionOptions {
+                model,
+                role,
+                // own_plans_dir — subagents share the main dir (can't mutate)
+                own_plans_dir: false,
+                // no worktree binding — subagents inherit the parent's root
+                worktree: None,
+                // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+                permission: None,
+                // 3a.6 (G5): subagents never resume from a transcript
+                initial_messages: None,
+                // 3a.7 (G7): subagents set no session limits
+                limits: None,
+                // 3c (G2): subagents register no host tools
+                host_tools: vec![],
+            },
+        )
     .await?;
         // Emit a PromptDispatched event for the spawned agent so its task
         // shows as the first user message in its window — as if typed by the

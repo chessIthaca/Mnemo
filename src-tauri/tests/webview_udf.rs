@@ -12,10 +12,10 @@
 //! (vendor/wry/src/webview2/mod.rs:348 `&data_directory.unwrap_or_default()`).
 //! Both instances therefore resolve the SAME Win32 default UDF — the exe path
 //! + `.WebView2` (MS Learn "Manage user data folders"). A UDF holds at most
-//! one WebView2 session, and a differently-configured second environment for
-//! an in-use UDF fails to create WebView2 objects (MS Learn "Process model");
-//! the window is created before the webview, so the second instance shows a
-//! live-but-blank window.
+//!   one WebView2 session, and a differently-configured second environment for
+//!   an in-use UDF fails to create WebView2 objects (MS Learn "Process model");
+//!   the window is created before the webview, so the second instance shows a
+//!   live-but-blank window.
 //!
 //! The fix: the first instance keeps the default (persistent) profile; every
 //! additional instance gets its own per-pid WebView2 user data folder (see

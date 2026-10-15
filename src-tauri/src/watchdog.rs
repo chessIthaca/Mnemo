@@ -23,8 +23,8 @@
 //! mutex. Fixed upstream by PR #1215 (tao 0.36.0+; the interim vendored 0.35.4
 //! backport was dropped when tauri 2.12 moved the app to registry tao 0.37.x)
 //! + Rust-side delta coalescing in the event
-//! forwarder (`DeltaBatcher`, `ipc/events.rs`). The watchdog stays armed: any
-//! recurrence yields a named stack again.
+//!   forwarder (`DeltaBatcher`, `ipc/events.rs`). The watchdog stays armed: any
+//!   recurrence yields a named stack again.
 //!
 //! # How it works
 //!

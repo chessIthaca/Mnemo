@@ -575,34 +575,34 @@ pub fn spawn(
                 SerializableAgentEvent::CompactStarted => {
                     compact_in_flight.insert(agent_id);
                 }
-                SerializableAgentEvent::Compacted { .. } => {
-                    if compact_in_flight.remove(&agent_id) {
-                        let is_main =
-                            manager_arc.lock().await.main_agent_id() == Some(agent_id);
-                        if is_main {
-                            app.state::<IpcState>()
-                                .backlog
-                                .compact_signal
-                                .send_if_modified(|c| {
+                SerializableAgentEvent::Compacted { .. }
+                    if compact_in_flight.remove(&agent_id) =>
+                {
+                    let is_main =
+                        manager_arc.lock().await.main_agent_id() == Some(agent_id);
+                    if is_main {
+                        app.state::<IpcState>()
+                            .backlog
+                            .compact_signal
+                            .send_if_modified(|c| {
                             *c += 1;
                             true
                         });
-                        }
                     }
                 }
-                SerializableAgentEvent::Error { .. } => {
-                    if compact_in_flight.remove(&agent_id) {
-                        let is_main =
-                            manager_arc.lock().await.main_agent_id() == Some(agent_id);
-                        if is_main {
-                            app.state::<IpcState>()
-                                .backlog
-                                .compact_signal
-                                .send_if_modified(|c| {
+                SerializableAgentEvent::Error { .. }
+                    if compact_in_flight.remove(&agent_id) =>
+                {
+                    let is_main =
+                        manager_arc.lock().await.main_agent_id() == Some(agent_id);
+                    if is_main {
+                        app.state::<IpcState>()
+                            .backlog
+                            .compact_signal
+                            .send_if_modified(|c| {
                             *c += 1;
                             true
                         });
-                        }
                     }
                 }
                 _ => {}
@@ -615,26 +615,26 @@ pub fn spawn(
             // the completion-notification feedback loop that lets an
             // orchestrating agent know when its spawned agents are done.
             match &serial {
-                SerializableAgentEvent::Finished { .. } => {
+                SerializableAgentEvent::Finished { .. }
+                    if notified_children.insert(agent_id) =>
+                {
                     // Only notify once per background agent (on its first
                     // finish) — a multi-turn child shouldn't spam its parent.
-                    if notified_children.insert(agent_id) {
-                        if let Some(ev) =
-                            notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, true)
-                                .await
-                        {
-                            emit_child_finished(&app, ev);
-                        }
+                    if let Some(ev) =
+                        notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, true)
+                            .await
+                    {
+                        emit_child_finished(&app, ev);
                     }
                 }
-                SerializableAgentEvent::Error { retrying, .. } if !retrying => {
-                    if notified_children.insert(agent_id) {
-                        if let Some(ev) =
-                            notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, false)
-                                .await
-                        {
-                            emit_child_finished(&app, ev);
-                        }
+                SerializableAgentEvent::Error { retrying, .. } if !retrying
+                    && notified_children.insert(agent_id) =>
+                {
+                    if let Some(ev) =
+                        notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, false)
+                            .await
+                    {
+                        emit_child_finished(&app, ev);
                     }
                 }
                 _ => {}
@@ -1437,7 +1437,7 @@ async fn try_flush_deferred_main_resolution(
             let state = app.state::<IpcState>();
             let wf_complete = crate::ipc::run_all::main_agent_workflow_state(&state)
                 .await
-                .map_or(false, |s| s == "Complete");
+                .is_some_and(|s| s == "Complete");
             if wf_complete {
                 // Off the forwarder's critical path (review L2): evidence
                 // is read BEFORE the spawn (the next Started clears it);
@@ -1535,7 +1535,7 @@ async fn try_flush_deferred_spawned_resolutions(
                 let wf_complete =
                     crate::ipc::run_all::agent_workflow_state(&state, lane_id)
                         .await
-                        .map_or(false, |s| s == "complete");
+                        .is_some_and(|s| s == "complete");
                 if wf_complete {
                     // Off the forwarder's critical path (review L2):
                     // evidence is read BEFORE the spawn (the next Started

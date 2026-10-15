@@ -2603,8 +2603,8 @@ mod tests {
     ///    state: no console, NULL std handles after nulling) and waits.
     /// 3. Grandchild runs `attach_console()` and exits PASS only when its
     ///    console HWND is non-null **and distinct from the intermediate's**.
-    /// Fails against AttachConsole (child HWND == parent HWND); passes once
-    /// AllocConsole-only is in.
+    ///    Fails against AttachConsole (child HWND == parent HWND); passes once
+    ///    AllocConsole-only is in.
     #[test]
     #[cfg(windows)]
     fn attach_console_allocates_own_console_not_parent() {

@@ -3501,7 +3501,9 @@ mod tests {
             "the forwarder must track compaction starts"
         );
         assert!(
-            forwarder.contains("SerializableAgentEvent::Compacted { .. } => {"),
+            forwarder.contains(
+                "SerializableAgentEvent::Compacted { .. }\n                    if compact_in_flight.remove(&agent_id) =>"
+            ),
             "the forwarder must resolve the wait on Compacted"
         );
         assert!(
@@ -3515,7 +3517,7 @@ mod tests {
             .find("compact_in_flight.insert(agent_id)")
             .expect("CompactStarted must insert into the pairing set");
         let compacted = forwarder
-            .find("SerializableAgentEvent::Compacted { .. } => {")
+            .find("SerializableAgentEvent::Compacted { .. }")
             .expect("the Compacted arm must exist");
         assert!(
             insert < compacted,
@@ -4450,7 +4452,7 @@ async fn record_in_flight_item(
 /// SPAWNED worktree agent — item 1 stays on the main agent (the path
 /// above); items 2..N each get their own parentless agent + git worktree
 /// + `wt/runall-*` branch. Sequential runs (concurrency 1) never enter
-/// here — zero behavior change.
+///   here — zero behavior change.
 ///
 /// The window counts SPAWNED lanes only (`spawned.len() < concurrency -
 /// 1`): the main agent's lane is accounted by its own dispatch path
@@ -4708,7 +4710,7 @@ async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::AgentId) {
 /// fill/resolution paths).
 pub(crate) async fn any_lane_in_flight(state: &IpcState) -> bool {
     let guard = state.backlog.run_all.lock().await;
-    guard.as_ref().map_or(false, lanes_in_flight)
+    guard.as_ref().is_some_and(lanes_in_flight)
 }
 
 /// Whether any lane of a run is still in flight (the per-run core of
@@ -4745,7 +4747,7 @@ pub(crate) async fn owns_spawned_run(
 ) -> bool {
     let state = app.state::<IpcState>();
     let guard = state.backlog.run_all.lock().await;
-    guard.as_ref().map_or(false, |r| {
+    guard.as_ref().is_some_and(|r| {
         r.spawned
             .lock()
             .expect("spawned lock poisoned")
@@ -5150,7 +5152,7 @@ pub async fn on_spawned_turn_resolved(
                         .iter()
                         .find(|i| i.id == item.id)
                         .and_then(|i| i.note.as_deref())
-                        .map_or(false, |n| n.contains(note.as_str()))
+                        .is_some_and(|n| n.contains(note.as_str()))
                 };
                 if !already_waiting {
                     state.backlog.store.lock().await.annotate(&item.id, &note);
@@ -5214,7 +5216,7 @@ pub async fn on_spawned_turn_resolved(
                 .iter()
                 .find(|i| i.id == item.id)
                 .and_then(|i| i.note.as_deref())
-                .map_or(false, |n| n.contains(note.as_str()))
+                .is_some_and(|n| n.contains(note.as_str()))
         };
         if !already_waiting {
             state.backlog.store.lock().await.annotate(&item.id, &note);
@@ -5264,12 +5266,12 @@ pub async fn on_spawned_turn_resolved(
         let guard = state.backlog.run_all.lock().await;
         guard
             .as_ref()
-            .map_or(false, |r| r.stop.load(Ordering::Relaxed))
+            .is_some_and(|r| r.stop.load(Ordering::Relaxed))
     };
     if stopped {
         let any_in_flight = {
             let guard = state.backlog.run_all.lock().await;
-            guard.as_ref().map_or(false, |r| {
+            guard.as_ref().is_some_and(|r| {
                 r.current_item
                     .lock()
                     .expect("current_item lock poisoned")
@@ -5444,7 +5446,7 @@ pub(crate) async fn drain_spawned_on_exit(
         let guard = state.backlog.run_all.lock().await;
         guard
             .as_ref()
-            .map_or(false, |r| r.stop.load(Ordering::Relaxed))
+            .is_some_and(|r| r.stop.load(Ordering::Relaxed))
     };
     if stopped {
         if !any_lane_in_flight(&state).await {
@@ -5805,7 +5807,7 @@ async fn resolve_single_dispatch_turn(
                             .iter()
                             .find(|i| i.id == in_flight_id)
                             .and_then(|i| i.note.as_deref())
-                            .map_or(false, |n| n.contains(note.as_str()))
+                            .is_some_and(|n| n.contains(note.as_str()))
                     };
                     if !already_waiting {
                         state
@@ -6202,7 +6204,7 @@ async fn annotate_run_all_waiting(
             .iter()
             .find(|i| i.id == item.id)
             .and_then(|i| i.note.as_deref())
-            .map_or(false, |n| n.contains(note.as_str()))
+            .is_some_and(|n| n.contains(note.as_str()))
     };
     if !already_waiting {
         state
@@ -6242,7 +6244,7 @@ async fn annotate_run_all_error(
             .iter()
             .find(|i| i.id == item.id)
             .and_then(|i| i.note.as_deref())
-            .map_or(false, |n| n.contains(note.as_str()))
+            .is_some_and(|n| n.contains(note.as_str()))
     };
     if !already_waiting {
         state
@@ -6580,7 +6582,7 @@ pub async fn halt_run_all(app: &tauri::AppHandle, reason: &str, stamp_failed: bo
         };
         let already_halted = current_note
             .as_deref()
-            .map_or(false, |n| n.contains("halted"));
+            .is_some_and(|n| n.contains("halted"));
         drop(guard);
         let Some(item_id) = &item_id else {
             // No in-flight item to mark, but still clear the run state

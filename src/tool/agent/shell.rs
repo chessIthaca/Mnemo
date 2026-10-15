@@ -128,7 +128,7 @@ fn command_is_core_git_op(command: &str, core_operations: &[String]) -> bool {
     let cr = char::from(13u8);
     let lowered = command.to_ascii_lowercase();
     lowered
-        .split(|c: char| c == ';' || c == '|' || c == '&' || c == lf || c == cr)
+        .split([';', '|', '&', lf, cr])
         .any(|segment| {
             let mut tokens = segment.split_whitespace();
             let Some(exe) = tokens.next() else {
@@ -217,17 +217,13 @@ fn translate_powershell_chaining(command: &str) -> Option<String> {
         match bytes[i] {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
-            b'&' if !in_single && !in_double => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
-                    splits.push((i, true));
-                    i += 1; // consume the second '&'
-                }
+            b'&' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
+                splits.push((i, true));
+                i += 1; // consume the second '&'
             }
-            b'|' if !in_single && !in_double => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
-                    splits.push((i, false));
-                    i += 1; // consume the second '|'
-                }
+            b'|' if !in_single && !in_double && i + 1 < bytes.len() && bytes[i + 1] == b'|' => {
+                splits.push((i, false));
+                i += 1; // consume the second '|'
             }
             _ => {}
         }
@@ -1240,11 +1236,7 @@ mod tests {
     async fn captures_exit_code() {
         let dir = tempdir().unwrap();
         let tool = tool_in(dir.path());
-        let cmd = if cfg!(target_os = "windows") {
-            "exit 42"
-        } else {
-            "exit 42"
-        };
+        let cmd = "exit 42";
         let result = tool.execute(json!({"command": cmd, "purpose": "exit code capture"})).await;
         // Shell always reports success when the command ran — the exit code
         // is data for the LLM, not a tool failure.

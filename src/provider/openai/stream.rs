@@ -204,7 +204,7 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                     // The authoritative set_usage (the Usage event
                     // arm below) overwrites it at stream end.
                     if !final_usage_seen
-                        && last_usage_push.map_or(true, |t| {
+                        && last_usage_push.is_none_or(|t| {
                             now.duration_since(t) >= std::time::Duration::from_millis(500)
                         })
                     {
@@ -269,10 +269,10 @@ pub(super) async fn pump_sse_stream(response: reqwest::Response, task: StreamTas
                                         }
                                     }
                                     LlmEvent::ToolCallStart { .. }
-                                    | LlmEvent::ToolCallArgumentDelta { .. } => {
-                                        if first_content_chunk.is_none() {
-                                            first_content_chunk = Some(now);
-                                        }
+                                    | LlmEvent::ToolCallArgumentDelta { .. }
+                                        if first_content_chunk.is_none() =>
+                                    {
+                                        first_content_chunk = Some(now);
                                     }
                                     _ => {}
                                 }

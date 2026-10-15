@@ -122,7 +122,19 @@ export type FinishReason =
   | "tool_calls"
   | "length"
   | "content_filter"
-  | { other: string };
+  | { other: string }
+  | {
+      limit_reached: {
+        which:
+          | "max_turns"
+          | "max_requests"
+          | "max_prompt_tokens"
+          | "max_completion_tokens"
+          | "max_cost_micros"
+          | "wall_clock"
+          | "idle";
+      };
+    };
 
 /**
  * The phases of the agent's request loop, mirroring the backend `PhaseKind`
@@ -372,6 +384,31 @@ export type SerializableAgentEvent =
       descendants_running: boolean;
       /** The auto-continue streak at the park. */
       auto_continue_streak: number;
+    }
+  /** The model called a host tool — a session-owner-registered tool whose
+   *  execution lives outside the kernel (3c/G2). The app's own agents never
+   *  spawn with host tools; this member keeps the wire union complete. */
+  | {
+      kind: "host_tool_call";
+      /** Matches the model's tool-call id. */
+      call_id: string;
+      /** The host tool's name. */
+      name: string;
+      /** The model's call arguments. */
+      args: unknown;
+    }
+  /** A selected external-policy hook fired (3c/G6 tier 3) — the same
+   *  request/response shape as approvals and questions; the app's own agents
+   *  never spawn with an external policy. The hook-kind field is
+   *  `hook_kind` on the wire because the union's discriminator is `kind`. */
+  | {
+      kind: "policy_hook";
+      /** The hook id the host echoes in its answer. */
+      hook_id: string;
+      /** Which hook fired. */
+      hook_kind: "tool_gate" | "prompt_intake" | "turn_end" | "after_tool" | "session_end";
+      /** The hook's JSON payload (per-kind shape). */
+      payload: unknown;
     };
 
 export interface AgentInfo {

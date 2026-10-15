@@ -353,8 +353,8 @@ fn classify_primary(stage: &str) -> Option<String> {
     }
     // Per-command subcommand retention.
     let class = match cmd.as_str() {
-        "cargo" | "rustc" => with_subcommand(&cmd, &tokens, CARGO_SUBS)?,
-        "git" => with_subcommand(&cmd, &tokens, GIT_SUBS)?,
+        "cargo" | "rustc" => with_subcommand(cmd, &tokens, CARGO_SUBS)?,
+        "git" => with_subcommand(cmd, &tokens, GIT_SUBS)?,
         "npm" => npm_class(&tokens)?,
         "npx" => npx_class(&tokens)?,
         // Get-ChildItem, Get-Location, Get-Item, ls, dir, echo, Write-Output,

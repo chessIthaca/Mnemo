@@ -29,9 +29,9 @@ use mnemo::runtime::AgentManager;
 use mnemo::tool::agent::sandbox::Sandbox;
 use mnemo::tool::agent::{file_read::FileReadTool, file_write::FileWriteTool};
 use mnemo::tool::memory::{MemoryRecallTool, MemoryWriteTool};
-use mnemo::tool::workflow::plan::{CompleteStepTool, CreatePlanTool, UpdatePlanTool};
+use mnemo::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool, UpdatePlanTool};
 use mnemo::tool::{Tool, ToolRegistry};
-use mnemo::workflow::{Workflow, WorkflowState};
+use mnemo::app::workflow::{Workflow, WorkflowState};
 use tempfile::tempdir;
 use tokio::sync::Mutex;
 
@@ -187,7 +187,7 @@ async fn full_workflow_create_plan_execute_complete() {
         mnemo::agent::AgentLoopConfig {
             provider,
             tools: registry,
-            workflow: workflow.clone(),
+                workflow: mnemo::app::workflow::as_handle(workflow.clone()),
             sandbox,
             safety_mode: SafetyMode::Autonomous,
             context_manager: ContextManager::new(128_000, 0.5),
@@ -265,7 +265,7 @@ async fn resume_on_restart() {
             mnemo::agent::AgentLoopConfig {
                 provider,
                 tools: registry,
-                workflow,
+                workflow: mnemo::app::workflow::as_handle(workflow),
                 sandbox,
                 safety_mode: SafetyMode::Autonomous,
                 context_manager: ContextManager::new(128_000, 0.5),
@@ -387,23 +387,35 @@ async fn per_agent_workflows_are_independent_via_factory() {
     std::fs::write(&gpath, "").unwrap();
     std::fs::write(&ppath, "").unwrap();
     let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
-    let safety_rules = Arc::new(SafetyRules::new(&dir.path().join("safety.toml")).unwrap());
+    let safety_rules = Arc::new(SafetyRules::new(dir.path().join("safety.toml")).unwrap());
 
-    let factory = AgentLoopFactory::new(
-        Arc::new(SingleResponseProvider {
+    let factory = AgentLoopFactory::new(mnemo::agent::factory::FactoryDeps {
+        provider: Arc::new(SingleResponseProvider {
             events: vec![],
             caps: Capabilities::openai(),
         }),
-        source,
-        Some(store),
+        constitution_source: source,
+        memory: Some(store),
         sandbox,
-        dir.path().to_path_buf(),
-        Some(safety_rules),
-        Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
-        ContextManager::new(128_000, 0.5),
-        dir.path().join("plans"),
-        None,
-    );
+        project_root: dir.path().to_path_buf(),
+        safety_rules: Some(safety_rules),
+        safety_mode: Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+        context_manager: ContextManager::new(128_000, 0.5),
+        plans_dir: dir.path().join("plans"),
+        vision: None,
+    });
+    // 2b.3: the production shape wires the app policy factory — without it
+    // the builds' loops get the UnwiredWorkflow handle and the concrete
+    // reads fail.
+    factory.set_policy_factory(Arc::new(
+        mnemo::app::policy_factory::WorkflowPolicyFactory::new(
+            None,
+            None,
+            None,
+            std::path::PathBuf::new(),
+            None,
+        ),
+    ));
 
     // Build two agents from the same factory.
     let agent_a = factory.build();
@@ -411,15 +423,15 @@ async fn per_agent_workflows_are_independent_via_factory() {
 
     // Both start in Planning.
     {
-        let wf_a = agent_a.workflow_handle();
-        let wf_b = agent_b.workflow_handle();
+        let wf_a = concrete(&agent_a.workflow_handle());
+        let wf_b = concrete(&agent_b.workflow_handle());
         assert_eq!(wf_a.lock().await.state(), WorkflowState::Planning);
         assert_eq!(wf_b.lock().await.state(), WorkflowState::Planning);
     }
 
     // Agent A creates a plan directly via its workflow.
     {
-        let wf_a = agent_a.workflow_handle();
+        let wf_a = concrete(&agent_a.workflow_handle());
         let mut wf_a = wf_a.lock().await;
         wf_a.create_plan("A's plan", "goal", "ctx", vec!["step1".into()])
             .unwrap();
@@ -427,8 +439,8 @@ async fn per_agent_workflows_are_independent_via_factory() {
 
     // Agent A is now Executing; agent B must still be Planning with no plan.
     {
-        let wf_a = agent_a.workflow_handle();
-        let wf_b = agent_b.workflow_handle();
+        let wf_a = concrete(&agent_a.workflow_handle());
+        let wf_b = concrete(&agent_b.workflow_handle());
         let wf_a = wf_a.lock().await;
         let wf_b = wf_b.lock().await;
         assert_eq!(wf_a.state(), WorkflowState::Executing);
@@ -513,7 +525,7 @@ async fn bug_fixing_plan_end_to_end_with_finish_capture() {
     {
         let wf = workflow.lock().await;
         let plan = wf.plan().unwrap();
-        assert_eq!(plan.kind, mnemo::workflow::PlanKind::BugFixing);
+        assert_eq!(plan.kind, mnemo::app::workflow::PlanKind::BugFixing);
         assert_eq!(plan.steps.len(), 4, "the skeleton is forced");
         assert!(
             plan.steps[0]
@@ -570,7 +582,7 @@ async fn bug_fixing_plan_end_to_end_with_finish_capture() {
     let reviews_dir_for_finish = root.join(".coding/reviews");
     let report_path = reviews_dir_for_finish.join("review.md");
     std::fs::write(&report_path, "## Verdict: PASS\nno findings").unwrap();
-    let finish = mnemo::tool::workflow::plan::FinishTool::new(
+    let finish = mnemo::app::tool::workflow::plan::FinishTool::new(
         workflow.clone(),
         reviews_dir_for_finish.clone(),
     )
@@ -713,4 +725,16 @@ async fn bug_fixing_plan_end_to_end_with_finish_capture() {
         store.get_memory(&plan_digest.id).await.unwrap().is_some(),
         "the PLAN: digest survives a derived rebuild"
     );
+}
+/// The concrete app workflow behind a loop's neutral handle (2b.3): the
+/// integration tests read the rich surface through the same app→app
+/// downcast the IPC uses.
+fn concrete(
+    handle: &std::sync::Arc<dyn mnemo::agent::workflow_handle::AgentWorkflowHandle>,
+) -> std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>> {
+    handle
+        .as_any_arc()
+        .downcast_ref::<std::sync::Arc<tokio::sync::Mutex<mnemo::app::workflow::Workflow>>>()
+        .expect("the loop's workflow handle wraps the concrete app workflow")
+        .clone()
 }

@@ -19,7 +19,6 @@ pub mod browser;
 pub mod error_message;
 pub mod memory;
 pub mod steering;
-pub mod workflow;
 
 use std::collections::HashMap;
 
@@ -28,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::provider::{ApprovalPreview, Capabilities, ToolSchema};
-use crate::workflow::WorkflowState;
 
 /// A tool's category — determines how it's gated by the workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +42,11 @@ pub enum ToolCategory {
 }
 
 /// Whether a tool runs automatically or needs human approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serde since 3c — a [`HostToolSpec`](crate::headless::HostToolSpec)
+/// carries it on the wire (snake_case: `auto_run` / `needs_approval`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SafetyLevel {
     /// Runs without prompting (read-only tools).
     AutoRun,
@@ -117,6 +119,11 @@ pub enum ToolOutputStream {
     Stderr,
 }
 
+/// The callback a live [`OutputSink`] wraps: one partial chunk on one
+/// stream, shared by reference across a call's reader tasks (hence
+/// `Arc<dyn Fn>` + `Clone` rather than an `FnMut` trait object).
+pub type OutputSinkFn = std::sync::Arc<dyn Fn(ToolOutputStream, &str) + Send + Sync>;
+
 /// Per-call sink for PARTIAL tool output — the live view of a call that is
 /// still running (user request 2027-01-16: a long `shell` command showed
 /// nothing until it exited).
@@ -131,7 +138,7 @@ pub enum ToolOutputStream {
 /// Shared by reference across a call's reader tasks, hence `Arc<dyn Fn>` +
 /// `Clone` rather than an `FnMut` trait object.
 #[derive(Clone)]
-pub struct OutputSink(Option<std::sync::Arc<dyn Fn(ToolOutputStream, &str) + Send + Sync>>);
+pub struct OutputSink(Option<OutputSinkFn>);
 
 impl OutputSink {
     /// A sink that discards everything — for a call nobody is watching
@@ -365,6 +372,19 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// The host-tool marker (G2, §5.9.2): `None` (the default) — a normal
+    /// kernel tool, executed in-process via [`Tool::execute`]. `Some(ms)` —
+    /// a **host tool** whose execution lives outside the kernel: dispatch
+    /// never calls `execute`, it emits [`AgentEvent::HostToolCall`] and
+    /// awaits the host's answer for `ms` milliseconds (the shim's
+    /// effective timeout — the 120 s default when the spec carries none),
+    /// then resolves to an error result so the turn continues. One method
+    /// answers both questions (is it a host tool + how long to wait) to
+    /// keep the dispatch branch a single lookup.
+    fn host_tool_timeout_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Execute the tool with parsed arguments.
     async fn execute(&self, args: Value) -> ToolResult;
 
@@ -407,14 +427,12 @@ pub enum ToolFilter {
     /// Executing a `kind: "research"` plan — [`Executing`](Self::Executing)
     /// minus the source-mutating file tools.
     ///
-    /// DISPATCH-ONLY since 2027-01-11: [`Workflow::schema_filter`] no longer
+    /// DISPATCH-ONLY since 2027-01-11: the workflow's `schema_filter` no longer
     /// advertises this surface for research plans — a per-kind advertised
     /// array rewrote the head on every plan-KIND change and collapsed the
     /// provider's prefix cache to 6,016 tokens with 15.7–17.9s TTFT
     /// (`.coding/analysis/cache-hit-6-report.md`, cause 2). The restriction
     /// itself is unchanged and still enforced here, at the gate.
-    ///
-    /// [`Workflow::schema_filter`]: crate::workflow::Workflow::schema_filter
     ///
     /// A research plan is *defined* as work that produces no source-code
     /// changes (it is the kind that skips review on completion). Denying
@@ -466,6 +484,14 @@ pub enum ToolFilter {
     PlanFrozen,
     /// Complete: read agent tools + `create_plan` + all memory tools.
     Complete,
+    /// The FREE agent's dispatch gate (3a.5, row 11's engine form):
+    /// everything the registration offered — no workflow state ever
+    /// gates a free agent.
+    /// [`NoPolicy`](crate::agent::policy::NoPolicy) answers with this
+    /// gate; the free default registration offers all groups but Host,
+    /// so the pair is the free surface. The hard rules above the arm
+    /// (`write_review_report` reviewer-only) still apply.
+    Free,
     /// A skill is active — only the named tools in the allow-list are visible
     /// (plus all memory tools, which are always available). Seeded from the
     /// active skill's `tools` field at `start_skill` time. The always-available
@@ -500,30 +526,6 @@ pub enum ToolFilter {
 }
 
 impl ToolFilter {
-    /// Derive the filter from the workflow state.
-    ///
-    /// Returns `None` for [`WorkflowState::Skill`] — the skill filter is NOT
-    /// derived from the state alone (it depends on the active skill's stored
-    /// tool list) and is constructed directly by
-    /// [`Workflow::allowed_tools`](crate::workflow::Workflow::allowed_tools).
-    /// Returning `None` here makes a caller that forgets to handle the Skill
-    /// case fail loudly at the call site rather than silently degrading to a
-    /// wrong-but-plausible `Planning` filter.
-    ///
-    /// Returns `None` for [`WorkflowState::Subagent`] for the same reason: a
-    /// sub-agent's tool surface comes from its spawn-time allow-list
-    /// (`compute_subagent_allowlist` → `set_tool_allowlist` /
-    /// `set_reviewer_allowlist`), never from a lifecycle state it doesn't
-    /// own.
-    pub fn from_state(state: WorkflowState) -> Option<Self> {
-        match state {
-            WorkflowState::Planning => Some(ToolFilter::Planning),
-            WorkflowState::Executing => Some(ToolFilter::Executing),
-            WorkflowState::Reviewing => Some(ToolFilter::Reviewing),
-            WorkflowState::Complete => Some(ToolFilter::Complete),
-            WorkflowState::Skill | WorkflowState::Subagent => None,
-        }
-    }
 
     /// Whether this filter is an explicit allow-list that NAMES `name`.
     ///
@@ -552,6 +554,12 @@ impl ToolFilter {
         if name == "write_review_report" && !matches!(self, ToolFilter::Reviewer(_)) {
             return false;
         }
+        // 3a.5 (row 11's engine form): the FREE gate — everything the
+        // registration offered, regardless of workflow state. Placed
+        // after the hard rules above so they still bind.
+        if matches!(self, ToolFilter::Free) {
+            return true;
+        }
         // `skill_create` (authoring a skill file) is EXECUTING-ONLY in the base
         // states: the arms below allow it in Executing / ExecutingResearch /
         // PlanFrozen, and Planning/Reviewing/Complete deny it. Under a SKILL it
@@ -568,6 +576,10 @@ impl ToolFilter {
             return false;
         }
         match self {
+            // 3a.5: the free gate — everything the registration offered
+            // (normally unreachable: the early return above handles Free;
+            // this arm keeps the match exhaustive).
+            ToolFilter::Free => true,
             ToolFilter::Planning => match category {
                 // HARD RULE: no changes without a plan. Only read (AutoRun)
                 // tools are visible — every mutation (file_edit/write/append,
@@ -1193,6 +1205,15 @@ impl ToolRegistry {
             .insert(tool.name().to_string(), std::sync::Arc::from(tool));
     }
 
+    /// Remove a registered tool by name (2c.2/G2: the `ToolSelection`
+    /// exclude = a per-name carve-out — the tool array never advertises
+    /// tools the caller excluded). Not for dynamically revealed MCP tools
+    /// (they ride the shared slot, not this map). Returns whether it was
+    /// present.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Look up a tool by name (registered or dynamically revealed).
     /// Returns an owned `Arc` clone so callers can hold the tool across
     /// awaits without borrowing the registry.
@@ -1465,7 +1486,7 @@ mod tests {
 
     #[test]
     fn stringified_null_dropped_through_union_branches() {
-        // create_plan's `steps` shape: oneOf [string, {header, body}] — the
+        // create_plan's `steps` shape: anyOf [string, {header, body}] — the
         // object branch's optional `body` is unset-able via "null" too.
         let schema = serde_json::json!({
             "type": "object",
@@ -1473,7 +1494,7 @@ mod tests {
                 "steps": {
                     "type": "array",
                     "items": {
-                        "oneOf": [
+                        "anyOf": [
                             {"type": "string"},
                             {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                         ]
@@ -1817,8 +1838,8 @@ mod tests {
         // points at a never-written path; schema listing never executes, so
         // the store stays an empty in-memory instance.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogAddTool::new(
-                std::sync::Arc::new(tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogAddTool::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 ))),
                 None,
@@ -1827,8 +1848,8 @@ mod tests {
         // The real BacklogStatusTool — same rationale as above: the
         // all-state visibility regression must exercise the shipped tool.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogStatusTool::new(
-                std::sync::Arc::new(tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogStatusTool::new(
+                std::sync::Arc::new(tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 ))),
                 None,
@@ -1837,8 +1858,8 @@ mod tests {
         // The real BacklogListTool — same rationale: the read-only-query
         // visibility regression must exercise the shipped tool.
         r.register(Box::new(
-            crate::tool::workflow::backlog::BacklogListTool::new(std::sync::Arc::new(
-                tokio::sync::Mutex::new(crate::backlog::BacklogStore::open(
+            crate::app::tool::workflow::backlog::BacklogListTool::new(std::sync::Arc::new(
+                tokio::sync::Mutex::new(crate::app::backlog::BacklogStore::open(
                     std::path::PathBuf::from("test-backlog-never-written.json"),
                 )),
             )),

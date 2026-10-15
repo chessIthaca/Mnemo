@@ -1,0 +1,601 @@
+# Job 2c — the free agent (NoPolicy's real semantics; the G1–G4 kernel mechanics)
+
+Master-spec anchors: §5.2 :270-271 ("2c: `NoPolicy` (the free agent). Kernel head/tail, the constant
+surface, `["free"]` routing, the `[models.free]` slot."), the G-gap table :602-607 (G1/G2/G3/G4),
+§5.9.1 (:615-632, PromptSpec), §5.9.2 (:634-652, ToolSelection), §5.9.3 (:654-669, Workspace),
+§5.9.4 (:671-682, no process globals), §5.4 (:356-378, permissions), the §6 2c file row :762, §7
+rows 5/6/7/8/11 and 25/26/27/28, §8 (the verify list), §14.4 ("the coordinator writes the step files
+for jobs 1 and 2c–3b directly").
+
+Status: NOT STARTED at authoring (2027-01-14, wt/mnemo, tree HEAD 5fe33b8 = post-2b.3 PASS).
+This file is the 2c step file; every anchor below is verified fresh this session. SCOPE READING
+(the G-row mapping, recorded here as the coordinator's final pick): §6's 2c file row carries
+"— G1-G4", so job 2c lands the KERNEL MECHANISMS of G1–G4 — the kernel-side types, the behavior
+flips, and kernel-level tests. The G acceptance rows (§7 :859-872) name the ENGINE-flavored
+harness (`Engine`/`EngineOptions`/`Engine::start`); that harness re-verifies on the real Engine
+in job 3a and again at job 5's final proof. Job 2c's contract = the mechanics + the kernel-side
+tests; any drift from this reading is a documented deviation.
+
+## A. The verified census (read fresh 2027-01-14 on wt/mnemo)
+
+### A1. src/agent/policy.rs (372 total lines)
+
+- :19-37 `ToolSurface { advertise: Option<ToolFilter>, gate: Option<ToolFilter> }` +
+  `ToolSurface::constant()` (both `None`) — already the free agent's surface (2a).
+- :43-49 `GateVerdict { Allow, Block { reason } }`; :55-63 `PromptHook { unattended:
+  Option<bool>, tail_rewrite: Option<String> }`; :69-74 `Continuation { Stop, Continue { note } }`;
+  :79-93 `TurnSummary { success, stop_reason, unattended }`; :97-100 `SpendTags`; :104-106
+  `RoleSpec { role }`; :113-116 `RouteKey { slots: Vec<String> }`.
+- :118-138 `PolicyBuildCtx { agent_id, project_root, plans_dir, root, sandbox, step_verify,
+  workflow }`; :140-153 `PolicyFactoryCtx { agent_id, project_root, plans_dir, workflow }`.
+- :155-165 `PolicyBuildResult { policy: Arc<dyn AgentPolicy>, attach_loop }` — `build_policy` is
+  INFALLIBLE today (:191: `fn build_policy(&self, ctx: &PolicyFactoryCtx) -> PolicyBuildResult`).
+- :175-198 `AgentPolicyFactory { create_workflow(plans_dir, is_subagent) :181-185, build_policy
+  :191, register_tools :197 }`.
+- :200-223 `NoPolicyFactory`: `create_workflow → UnwiredWorkflow` (:207-213); `build_policy → {
+  Arc::new(NoPolicy), no-op attach }` (:215-220); `register_tools {}` (:222). Doc :200-203:
+  "Used when no app factory is wired (tests that never needed one)"
+- :225-248 `KernelPromptBlocks { preamble, lifecycle, rules, discipline, strategy,
+  memory_records }` + `::workflow() → prompt::kernel_prompt_blocks()`.
+- :250-295 the `AgentPolicy` trait: register_tools :254, stable_head :259, volatile_tail :263,
+  tool_surface :266, gate_call :270, route :274, on_prompt :278, after_tool :281, on_turn_end
+  :284, spend_tags :287, spawn_roles :290, on_session_end :294.
+- :297-335 `NoPolicy` (the 2a stub): register_tools {}; stable_head → `assemble_stable_head(k, c)`
+  (:304-306) — FLIPS to the PromptSpec composition in 2c.1; volatile_tail → "" (:307-309);
+  tool_surface → constant (:310-312); gate_call → Allow; route → `RouteKey { slots: ["free"] }`
+  (:316-320); on_prompt → default; after_tool → no-op; on_turn_end → Stop; spend_tags → default;
+  spawn_roles → []; on_session_end → no-op.
+- :337+ `assemble_stable_head` — the byte-faithful assembler (the 2a.0 golden's body). STAYS for
+  the workflow path (the byte-identical contract).
+
+### A2. src/agent/prompt.rs (1931 total lines)
+
+- The consts: CODING_SYSTEM_PREAMBLE :26-55; WORKFLOW_LIFECYCLE :67; APP_RULES :113;
+  TOOL_CALL_DISCIPLINE :161; TOOL_STRATEGY :223; MEMORY_RECORDS :271; PLAN_NUDGE_TEXT :305;
+  CONTEXT_FOOTER :418 (pub).
+- :26-28 the IDENTITY — compiled bytes: "You are a coding agent operating under a plan-first
+  workflow. You help the user build software by reading files, writing code, running commands, and
+  managing a plan." (the :27-28 `\`-line continuation collapses to one space).
+- :435-437 `build_stable_head(constitution)` = `assemble_stable_head(&KernelPromptBlocks::workflow(),
+  constitution)` (the workflow back-compat wrapper).
+- :444-453 `kernel_prompt_blocks()` → the six-const set.
+- :476-510 `build_volatile_tail(caps, app_tail, memories)`: the recall block :483-490; the app
+  tail :493; CAPABILITIES :497-507 (kernel-owned).
+
+### A3. src/agent/dispatch.rs (2398 total lines)
+
+- :441-457 the symbol-search redirect gate (reads `SteeringStats::shared()` :451).
+- :469-491 the file_edit / multi_edit stale-read gates (shared() :472/:486).
+- :494-564 THE APPROVAL BRANCH (the spec's §5.4 anchor ":483-520" drifted to :494-564):
+  :494 the live mode read (`*self.safety_mode.read()`); :503 `let force_prompt =
+  tool.never_auto_for(&parsed_call.arguments)`; :510-517 `if force_prompt ||
+  approval::needs_approval(...)`; :523-541 the safety-rules auto-approve shortcut; :547 the
+  approval preview; :551-563 the `AgentEvent::ApprovalRequest` emission (with the oneshot
+  responder).
+- :731 `let steering = SteeringStats::shared()` (the dispatch path's observer site).
+- Tests :1603-2198 build `SteeringStats::new()` directly (the unit fixtures).
+
+### A4. src/runtime/channels.rs
+
+- `AgentEvent` enum :181; `ApprovalRequest` :218; `WorkflowStateChanged` :263.
+- `SerializableAgentEvent` :561 (ApprovalRequest) / :593-601 (WorkflowStateChanged + the 2b.3
+  mirrors); the forward arms :783 (ApprovalRequest) / :846 (WorkflowStateChanged); tests :1144
+  and :1158 (the ApprovalRequest serialization pattern).
+- IPC note :11-14: ApprovalRequest's oneshot → the serializable twin forwarded to the frontend.
+
+### A5. src/agent/factory.rs (3447+ lines; the registration + build map)
+
+- :107 the brain/loop builder; :339/:346/:357 the spawner/skills/graph omit switches.
+- :946-966 the loop build: `build_registry(&workflow, agent_id, root, &plans_dir)` :948; the
+  loop assembly ending `tools: Arc::new(registry)` :966.
+- :1133 `build_registry(...)`; the REGISTRATION ORDER :1157-1194 (MUST stay byte-identical):
+  :1157 the registry; :1159 `register_agent_tools`; :1166 `register_policy_factory_tools` (the
+  policy's OWN registrations — the app's D5 channel); :1167 vision; :1168 memory; :1169
+  codegraph; :1178 spawn; :1180 browser; :1186 the McpReveal wiring; :1191-1194 the deferred
+  snapshot + register.
+- :1218 `register_agent_tools` (the census at 2c.2): the search family :1278; web :1280;
+  GitTool :1281; GitReadTool :1291; write_review_report :1296 (always registered,
+  dispatch-gated via review_scope — NOT a group member in 2c); list_models :1302.
+- :1326-1349 register_policy_factory_tools (routes to `pf.register_tools(registry, &ctx)`);
+  :1362-1397 the browser tools (10 offscreen + 6 on-screen); :1418-1444 the image tools;
+  :1449-1522 the memory tools; the Laya tool-choice steering comment :1270 (verify the
+  load_tools tool's registration + group pick at 2c.2).
+- The live setters :159/:191/:221/:427/:447/:565/:576/:659/:671/:684/:696/:707/:763 (the
+  tool-selection setter lands as a sibling of these).
+
+### A6. src/agent/steering_stats.rs (1334+ lines)
+
+- `SteeringStats` :422-424; impl :426-746 (incl. `snapshot` :692-712); `Default` :748-752.
+- :450 `static SHARED: OnceLock<Arc<SteeringStats>>` + the shared()/setter right after (read
+  :450-470 exactly at 2c.4 before deleting).
+- ALL ::shared() consumers: src/agent/dispatch.rs :451/:472/:486/:731;
+  src-tauri/src/ipc/trace.rs :130 (get_steering_stats → snapshot()). Tests use ::new()
+  (steering_stats.rs :825+; dispatch.rs :1603+).
+- The GUI mirror: frontend/src/lib/tauri.ts :2238 getSteeringStats + types.ts :625
+  SteeringStatsSnapshot (the IPC shape must NOT change — the reroute is lib-internal).
+
+### A7. project/ + instance_marker + the kernel's .coding joins
+
+- src/project/agent_md.rs: `Constitution` :17, `ConstitutionSource` :41, `ConstitutionHolder`
+  :81+ (the per-turn load — the G1 constitution-mode filter point).
+- src/project/mod.rs (the 2c.3 split's subject): the §5.9.3 app list (`.coding` discovery, the
+  projects registry, `pending_project`, `Project::init` + scaffold, the instance marker) —
+  full census at 2c.3 execution before splitting.
+- src/instance_marker.rs :1-147 (kernel-side; imports crate::project::Project :24; uses
+  Project::CODING_DIR_NAME :50/:61; the app caller: the startup aliveness predicate — probe
+  src-tauri/src/startup.rs at 2c.3).
+- The kernel's `.coding` joins (→ `state_dir` at 2c.3): src/agent/factory.rs
+  :103/:143/:319/:826/:864/:867/:885/:898/:1203-1212/:1615; src/agent/loop_impl.rs
+  :179-181 (safety.toml) / :391 (the plans-dir doc); the kernel test fixtures (factory.rs
+  :3055/:3213/:3447 keep tempdir roots — state_dir = root/.coding by default, unchanged).
+
+### A8. [models.free] — the 2a.6 remainder
+
+- LANDED: src/config/general.rs :855-861 (`pub free: Option<ModelRef>` + the default arms)
+  + src/model_resolver.rs :346 (the walk's `"free" => models.free`) + :791-851
+  `free_slot_resolves_configured_or_falls_back_to_default` (set/unset/dangling pinned; the
+  unset ride = the default, blessed by the 2a.6 review round-1 LOW — the :792 comment cites it).
+- REMAINING: src/config/settings_dto.rs gains the `free` slot (today's routing DTO: :64
+  planning / :66 executing / :73 reviewing — NO free) + the apply arms (:638-641 reads /
+  :927-937 the patch write) + the fixture mirrors (:1315-1358 pattern).
+- Row 7's wording ("unset → [models.executing]") vs the landed "unset → the default ride":
+  2c.6 verifies the row's CURRENT §7 text against the walked chain and DOCUMENTS the deviation
+  (no behavior change — the review blessed it).
+
+### A9. NOT 2c (recorded to keep the scope honest)
+
+- Engine/EngineOptions/SpawnOptions/Guardrails/SessionLimits/history/resume/snapshot — jobs
+  3a/3b (§5.3, §5.9.5-.7).
+- HostToolSpec / Engine::register_tool / the host surface — 3c (§5.9.2's host bits; the Host
+  group remains enum-only in 2c).
+- EngineConfig vs UiConfig split (G9) — job 4.
+- Rows 27/28's engine-form harness — 3a; job 2c lands the kernel mechanics + kernel tests.## B. Design decisions (the final picks; deviations from the spec's letter documented)
+
+- **D1 (G1 composition — byte-isolation).** The workflow path stays BYTE-IDENTICAL: KernelPromptBlocks::workflow() + CODING_SYSTEM_PREAMBLE + WORKFLOW_LIFECYCLE + APP_RULES are TOUCHED
+  NOWHERE; WorkflowPolicy::stable_head keeps delegating to assemble_stable_head
+  (src/app/workflow_policy.rs :125-126). The G1 library serves ONLY the NoPolicy composition:
+  prompt.rs gains `pub const CODING_IDENTITY` (the :26-28 sentence verbatim), the block enum
+  { CoreCodingPrinciples, ToolCallDiscipline, ToolStrategy, MemoryRecords, FileToolRules }
+  (§5.9.1 :624's exact names, serde rename_all = "snake_case"), and the block-text map:
+  CoreCodingPrinciples → a NEW kernel-safe const (tool-agnostic principles — NO plan-first /
+  create_plan / complete_step / WORKFLOW-LIFECYCLE text; row 6's grep is the gate: [verify at
+  execution] whether TOOL_CALL_DISCIPLINE/TOOL_STRATEGY/MEMORY_RECORDS contain no plan/workflow
+  text — if any does, the free selection drops it or a kernel-safe copy is carved; the pick is
+  recorded in the commit), ToolCallDiscipline → TOOL_CALL_DISCIPLINE, ToolStrategy →
+  TOOL_STRATEGY, MemoryRecords → MEMORY_RECORDS, FileToolRules → a NEW small const (the
+  read-before-write + exact-match + multi_edit + line-endings + file-tools-first discipline,
+  kernel-worded, no workflow text).
+- **D2 (NoPolicy's spec + the missing-spec error).** PromptSpec { identity: String, blocks:
+  Vec<PromptBlock>, extra_stable: Option<String>, constitution: ConstitutionMode } +
+  ConstitutionMode { None, Global, Project, Both } + PromptSpec::coding_default() (§5.9.1
+  :617-632 verbatim shapes). PolicyFactoryCtx gains `pub prompt: Option<PromptSpec>`.
+  `AgentPolicyFactory::build_policy` becomes `-> Result<PolicyBuildResult, KernelError>` with
+  KernelError::PromptRequired + `code() -> "prompt_required"` (the spec's :630 code). NoPolicy
+  gains `pub spec: Arc<PromptSpec>`; NoPolicy::stable_head composes { identity + selected blocks
+  in the FIXED enum order + extra_stable + the constitution per its mode } via the assembler's
+  push_section semantics (empty-skip + raw bytes + "\n\n"); NoPolicyFactory: None →
+  Err(PromptRequired), Some(s) → the spec-carrying NoPolicy. The constitution-mode filter rides
+  a new default trait method `constitution_mode(&self) -> ConstitutionMode` (default Both —
+  the workflow path unchanged); the kernel's per-turn constitution load site (the
+  ConstitutionHolder caller) drops the excluded source [verify the exact load site + the
+  Constitution/ConstitutionSource mechanics at execution]. The kernel test helpers that build
+  NoPolicy agents pass PromptSpec::coding_default() (the compile errors enumerate the fixtures).
+- **D3 (ToolSelection, §5.9.2).** The verbatim type lives in src/agent/factory.rs —
+  ToolGroup { Read, Write, Shell, Git, Web, Browser, Codegraph, Memory, Images, Spawn, AskUser,
+  Mcp, Host } (serde rename_all = "snake_case") + ToolSelection { include: Vec<ToolGroup>,
+  exclude: Vec<String> } + ::all(). The factory's params gain `tool_selection:
+  Option<ToolSelection>` (None = full, today's exact behavior) + a live setter beside the
+  existing ones. THE ARRAY GOLDEN FIRST: pin the full set's tool-name array (registration
+  order) BEFORE gating — [verify at execution] whether a test already pins it (extend, not
+  duplicate). Then build_registry gates per group: Read = the search family + read_files +
+  expand_result; Write = file_edit/multi_edit/file_write/convert_line_endings (+file_append
+  [verify: separate tool or the file_write mode]); Shell = shell; Git = GitTool + GitReadTool
+  AND ONLY when the root is a repo (D4's require_git flip); Web = web_fetch; Browser = the
+  browser set (:1362-1397); Codegraph = the graph_* tools; Memory = the memory tools
+  (:1449-1522); Images = the image tools (:1418-1444); Spawn = spawn_agent + list_models;
+  Mcp = the McpReveal wiring (:1182-1186). AskUser/Host: kernel-side none today (ask_user is
+  app-registered post-2b) — the app's own registrations stay UNGATED in 2c (the policy factory
+  path is today-identical); the app group-honoring lands with the host surface in 3c. The
+  kernel-side AskUser/Host groups stay enum-only (documented).
+- **D4 (Workspace + the project split + the marker move, §5.9.3).** NEW kernel module
+  src/workspace.rs: `pub struct Workspace { pub root: PathBuf, pub state_dir: PathBuf,
+  pub require_git: bool }` + Workspace::new(root) (state_dir = root/.coding) + the git
+  detection (.git exists, file or dir — worktree .git files count). [DEVIATION, documented: the
+  spec's §6 row bundles Workspace in factory.rs; a dedicated module keeps the 3400-line factory
+  from carrying the state-dir policy — the consumption still lands exactly where the row
+  points.] The project split: the app-halves of src/project/mod.rs (discovery/registry/
+  pending/init+scaffold per §5.9.3 :664-666) → src/app/project.rs; the kernel keeps
+  src/project/agent_md.rs (Constitution). The kernel's `.coding` joins (A7's list) derive from
+  the state_dir the factory/brain now carries (state_dir defaults to root/.coding — behavior
+  identical for the app); [verify at execution] each derivation's exact wiring (factory.rs's
+  plans-dir derivations, loop_impl.rs :179-181 safety.toml, the brain's memory/codegraph db
+  paths, the trace dir, the read cache). require_git default false: with no repo at root the
+  GIT GROUP IS NOT REGISTERED (row 27's kernel form) and the kernel never writes .gitignore
+  (the scaffold is app-side [verify]). instance_marker.rs → src-tauri/src/instance_marker.rs
+  in the SAME step (it imports crate::project::Project; after the split Project is app-side —
+  the kernel module must not dangle; its app callers keep the same API).
+- **D5 (steering de-globalization, §5.9.4).** The brain/factory gains `pub steering:
+  Arc<SteeringStats>` (built at construction); the loop build threads it; the dispatch funnel's
+  struct gains the field (probe the funnel struct + its construction at execution); the FOUR
+  ::shared() reads (dispatch.rs :451/:472/:486/:731) flip to the injected handle (the free fns
+  already take &SteeringStats); SHARED :450 + shared()/the setter DELETED — any surviving
+  ::shared() reference is a compile error (the intended tripwire). src-tauri/src/ipc/trace.rs
+  :130 flips to the factory's steering (the IpcState's factory handle — probe the field; the
+  IPC shape + the frontend mirror unchanged). The two-factories disjoint-stats test (row 28's
+  kernel form). The 3a Engine reroute noted (the spec :672-674's engine-level wiring).
+- **D6 (the permission model's mechanism, §5.4).** [Re-read §5.4 :356-378 verbatim at 2c.5
+  execution — the variant/serde names below are this census's capture and must match the spec
+  byte-for-byte before coding.] The kernel type (policy.rs): PermissionPolicy { #[default]
+  OverridePermissions, ApproveViaApi(SafetyMode) } — serde tag = "mode", the default
+  OverridePermissions. The dispatcher's struct gains `pub permission: PermissionPolicy`;
+  the factory sets ApproveViaApi at build (the GUI/console path stays byte-identical: the
+  live safety-mode RwLock read :494 REMAINS the ApproveViaApi behavior). Under
+  OverridePermissions the ENTIRE approval branch is skipped (needs_approval, force_prompt
+  prompting, the safety-rules shortcut), each call that WOULD have been gated emits
+  AgentEvent::ApprovalBypassed { tool, reason } first — reason "core_op" when force_prompt
+  (the predicate is still evaluated, silently), else "safety_mode" — and the call dispatches
+  directly. Subagents inherit the parent's policy (the spawn param assembly copies it — probe
+  the spawn path at execution).
+- **D7 (ApprovalBypassed, channels.rs).** AgentEvent::ApprovalBypassed { tool: String, reason:
+  String } beside ApprovalRequest (:218); the SerializableAgentEvent twin + the forward arms
+  (the :783/:846 patterns) + the test mirror (:1144 pattern). Additive variant — the app-event
+  contract fixtures stay green (the existing names unchanged).
+- **D8 (settings_dto free).** The `free` slot mirrors planning/executing/reviewing (:64-120)
+  + the apply arms + the fixtures. NO walk change (A8's row-7 verdict).
+- **D9 (the split rule).** Each 2c.x step ≤ ~400 changed lines; if a step's landed diff
+  crosses it, that G-item splits into its own sub-plan BEFORE the close's review — the step
+  file records the pick, the review runs delta-scoped.
+
+## C. Steps (in order; each = a boundary commit --no-verify; the goldens + the battery gate each step's complete)
+
+- **2c.1 (G1)** — the prompt library + NoPolicy's real head: prompt.rs + policy.rs per D1/D2;
+  the kernel test helpers updated; tests no_policy_requires_identity,
+  prompt_spec_blocks_compose_in_fixed_order, kernel_head_has_no_workflow_text + the
+  composition-drift guard (CODING_IDENTITY is CODING_SYSTEM_PREAMBLE's prefix); the workflow
+  byte-golden green. Probe first: TOOL_CALL_DISCIPLINE/TOOL_STRATEGY/MEMORY_RECORDS's content
+  (the row-6 grep), the build_policy call sites, the constitution load site.
+- **2c.2 (G2)** — ToolSelection + the factory gating per D3: the array-bytes golden FIRST;
+  the group map + the gating; the McpReveal/list_models/spawn gating; tests
+  tool_selection_registers_only_groups (row 26's kernel form: include [Read]) +
+  register_spawn_group_gates_list_models_and_spawn + the array stays byte-identical.
+- **2c.3 (G3)** — src/workspace.rs + the project split + the state_dir rewiring + the
+  Git-group skip + instance_marker.rs → src-tauri per D4; tests: a non-git temp-dir build
+  (starts; no git tools; no .gitignore written by the kernel) + state_dir-elsewhere (the
+  derived files land under state_dir).
+- **2c.4 (G4)** — the steering de-globalization + the trace reroute per D5; tests: the
+  two-factories disjoint-stats test + the src-tauri IPC shape unchanged.
+- **2c.5 (the permissions)** — PermissionPolicy + the dispatch gate + ApprovalBypassed + the
+  serialization + the subagent inheritance per D6/D7 (after re-reading §5.4 :356-378 verbatim);
+  tests: the override branch + the two reasons + the serialization + the inheritance.
+- **2c.6 ([models.free])** — the settings_dto free slot + the row-7 wording verification per
+  D8; tests: the settings round-trip fixture.
+- **2c.7 (the close)** — the acceptance checklist (rows 5/6/8/11 + the kernel-side 25/26),
+  the FULL verify battery (the master's :14 list + clippy -D warnings), the boundary commit,
+  the review rounds to PASS, finish, then complete_step on the master.
+
+## D. Acceptance (the row coverage)
+
+- Row 5 (phase 2c): a NoPolicy (free) agent advertises no plan/backlog/skill/review tool; a
+  hallucinated call to create_plan/complete_step/finish/start_skill is rejected at dispatch
+  (the unknown-tool path; [probe] the exact rejection error at execution).
+- Row 6: the free agent's head contains no "plan-first"/"create_plan"/"WORKFLOW LIFECYCLE"
+  text; the tool array is byte-identical across turns.
+- Row 7: [models.free] set → used; unset → the default ride (LANDED 2a.6 — verify-only).
+- Row 8: the free agent writes nothing under .coding/plans/** (the file tools' protected-set
+  refusal [verify the coverage at 2c.7; if the row demands a broader block, NoPolicy::gate_call
+  denies .coding/plans/** file-write paths — the kernel-side pick]); recall IS injected;
+  consolidation happens at session end (kernel-owned U2 — [verify] the loop's session-end).
+- Row 11 (the mechanism half): the dispatch gate + ApprovalBypassed land (2c.5); the Engine
+  exposure follows in 3c.
+- Row 25 (kernel form): the no-spec build errors with the prompt_required code (2c.1).
+- Row 26 (kernel form): ToolSelection { include: [Read] } advertises only the read tools (2c.2).
+- Rows 27/28: the kernel mechanics land (2c.3/2c.4 + the Git-group skip, the state_dir
+  independence, the disjoint stats); the engine-form rows re-verify in 3a.
+- The goldens trio (workflow_stable_head_bytes_unchanged + workflow_policy_routing_table_unchanged
+  + volatile_tail_section_order_pinned) green at EVERY step (the 2a.0 contract).
+- Compile-enforced greps: `SteeringStats::shared()` absent from the tree (the deletion
+  tripwire); no kernel `.gitignore` write; `src/instance_marker.rs` absent from the kernel.
+
+## E. Stop rule
+
+Per §14: any verification attempt failing 3 times → STOP, report, re-plan. Quote drift →
+resolve for the tree + document in the commit message. NO silent deviations. The battery is
+unpiped on PowerShell ($LASTEXITCODE read from the command, not a pipe — the constitution's
+pipe trap). Both crates are #![deny(warnings)]: a green cargo test proves zero warnings; never
+#[allow].
+
+## F. Report format (the close)
+
+The 2b close-out shape: Landed (the per-step commits) / the test results / the acceptance
+check-offs (the row → the test name → the result) / the deviations (each + why) / the
+remaining risk.## G. Landed amendments (the executor's dated picks)
+
+Amendment (2027-01-14, step 2c.1 — the landed D1/D2 picks, supersede §B
+D1/D2's provisional wording where they differ):
+- NO identity extraction from CODING_SYSTEM_PREAMBLE — the workflow const
+  stays byte-verbatim (the 2a.0 golden guards it; byte-isolation made the
+  extraction unnecessary). The free library carries its own identity:
+  `KERNEL_CODING_DEFAULT_IDENTITY` (pub(crate), prompt.rs) — the coding line
+  WITHOUT the plan-first-workflow phrasing (row 6's grep passes on the
+  composed head).
+- The block texts (probed): TOOL_STRATEGY + MEMORY_RECORDS enter the library
+  VERBATIM (tool-agnostic); CoreCodingPrinciples → KERNEL_CODING_PRINCIPLES
+  (the tool-agnostic core: no plan-first/complete_step text; the file-tool
+  bullets excluded); ToolCallDiscipline → KERNEL_TOOL_CALL_DISCIPLINE (the
+  discipline without the plan-tool examples); FileToolRules → FILE_TOOL_RULES
+  (new kernel-worded file-mutation discipline, no .coding literals —
+  state-dir-neutral for G3).
+- The constitution mode applies INSIDE `assemble_spec_head` (the spec field
+  governs its own head — §5.9.1's letter). The trait's constitution_mode()
+  was DROPPED (not in §5.2's trait sketch); the ConstitutionHolder is
+  untouched (the workflow bytes unchanged). `Constitution::restricted`
+  (agent_md.rs) is the filter helper.
+- NoPolicy carries `spec: Arc<PromptSpec>` (REQUIRED — no spec-free
+  constructor); `with_coding_default()` = the kernel's explicit fallback
+  (the loop's bare default, the factory's unwired arm, and the
+  wired-factory-Err fallback at factory.rs :1005-1022 with a documented
+  deviation comment). `build_inner` stays infallible — the Engine (3a) owns
+  propagating `prompt_required` at spawn (EngineError); the trait's
+  build_policy → Result<_, KernelError> and the app impl wraps in Ok.
+- Tests: prompt_spec_blocks_compose_in_fixed_order (the listed-order
+  contract, push-built expected), kernel_head_has_no_workflow_text (row 6's
+  grep), prompt_spec_constitution_modes_filter_head (all four modes
+  byte-checked), no_policy_requires_identity (row 25's kernel form: the
+  prompt_required code), no_policy_with_spec_builds_spec_head; the bare-loop
+  default flip is pinned by
+  agent::tests::volatile_tail_then_stable_footer_appended_and_popped (now
+  asserting the free identity prefix); the holder tests ride
+  with_coding_default().
+- The battery green: cargo test -p mnemo; -p mnemo --features
+  browser,embeddings; --workspace; build --workspace; the goldens trio 3/3.Amendment (2027-01-14, step 2c.2 — the landed D3 picks, supersede §B D3 where
+they differ):
+- ToolGroup/ToolSelection/group_allowed live at factory.rs MODULE scope
+  (nested impl-block items are illegal Rust — the first placement attempt was
+  caught by cargo and re-landed module-level).
+- The group map (the landed letter, §5.9.2 :634-642): Read = read_files,
+  expand_result, search, search_read (expand_result unlisted in the spec's
+  Read shorthand — the read family picked); Write = file_edit, multi_edit,
+  file_write, convert_line_endings (the spec's file_append = the file_write
+  append mode — no separate kernel tool); Shell/Git/Web/Browser/Codegraph/
+  Memory = whole-body gated (the fn-top group_allowed); Spawn = spawn_agent +
+  list_models; Mcp = load_tools + the McpReveal wiring; AskUser = kernel-side
+  none (app-owned post-2b; enum-only); Host = write_review_report (row 5's
+  letter — a free agent advertises no review tool).
+- The EXCLUDE = a post-registration PRUNE on the WHOLE array
+  (ToolRegistry::unregister + the build_registry prune, before the deferred
+  snapshot) — the spec's "the tool array never advertises tools the caller
+  excluded" reads whole-array, not just the kernel's per-name sites; the
+  prune also covers the app-owned tools when the caller names them.
+- The factory field: tool_selection: Option<ToolSelection> — None = full =
+  today's exact registration order (the byte-golden
+  expected_tool_names_registered_when_fully_wired untouched and green);
+  with_tool_selection = the builder. The Engine's per-agent SpawnOptions
+  supply remains a 3a-forward.
+- ToolSelection::free_default() = every group except Host (the free agent's
+  constant surface).
+- The kernel-only test factory (make_free_factory — the make_factory shape
+  minus the app policy-factory wire; the wire = production's 2b.3 shape and
+  the app surface is UNGATED in 2c, so the G2 gating tests must run
+  kernel-only to isolate the selection).
+- Tests: tool_selection_registers_only_read_group (row 26's kernel form;
+  the names diagnostic then converted to the count message),
+  free_default_excludes_the_reviewer_channel (row 5),
+  list_models_and_spawn_require_the_spawn_group (the Spawn gating + the
+  resolver-conditional shape), tool_selection_exclude_carves_named_tools
+  (the exclude leg), + StubResolver (the minimal ModelResolver mock) +
+  registry_for_factory/registry_contains/registry_len helpers. The free
+  surface counts are FEATURE-AWARE (the browser family = 16 feature-gated
+  tools: 44 with, 28 without; the carved = 43/27 — cfg!(feature =
+  "browser") branches).
+- The battery green: cargo test -p mnemo; the feature build
+  (--features browser,embeddings); --workspace; build --workspace; the
+  goldens trio 3/3.
+Amendment (2027-01-14, step 2c.3 — the landed D4/G3 picks, supersede §B
+D4 where they differ):
+- src/workspace.rs (the kernel workspace): `Workspace { root, state_dir,
+  require_git }` (+ `with_state_dir`, `requiring_git`, `root_is_git_repo` —
+  accepts `.git` as dir OR file, linked worktrees included) + the re-homed
+  `CODING_DIR_NAME` + `find_coding_dir_ancestor` (the kernel's project-
+  detection primitive; the app's Project delegates to it) +
+  `ensure_minimal_project` — the kernel-minimal bootstrap for the CLI's
+  `--project` init: `.coding/plans` + the shipped skills + the agent.md
+  template, idempotent, and NEVER `.gitignore`/`.gitattributes` (row 27's
+  letter — those stay the app's `Project::init`).
+- The project split: kernel src/project/mod.rs keeps ONLY agent_md
+  (Constitution) + git_ops + skills_seed; Project/scaffold/worktrees move to
+  src/app/{project,scaffold,worktrees}.rs; instance_marker.rs → src-tauri
+  (its one consumer main.rs; it now reads `workspace::CODING_DIR_NAME` — the
+  kernel constant stays the single source of truth).
+- The brain rewire: `Brain.project: Arc<Mutex<Project>>` →
+  `Brain.workspace: Arc<Workspace>` (never mutated post-resolve — no Mutex).
+  The resolution flow uses the kernel primitives (take_pending_project → the
+  `.coding` check; project_flag_from_args → ensure_minimal_project on a
+  non-project dir; the find_coding_dir_ancestor walk-up; NeedsProject
+  preserved on both dead ends). Every derived path is
+  `workspace.state_dir.join(...)` (memory.db, codegraph.db, mcp.toml,
+  safety.toml, plans, backlog.jsonl, the four logs/* sinks). The app
+  consumers (main.rs :399/:505/:629, console.rs :658/:1228) build their own
+  `app::project::Project::from_root(&brain.workspace.root)`; skills dirs read
+  `workspace.state_dir.join("skills")` directly.
+- require_git: `git` + `git_read` register only when `<root>/.git` exists
+  (the existence probe); the repo-gate ripple (4 tests assuming git tools)
+  fixed by `.git` markers in their tempdirs — gate behavior, not logic bugs.
+  The factory's CWD-relative `.coding` reviews fallback is rewired
+  plans_dir-derived — no in-code `.coding` join remains in the kernel.
+- Tests: workspace unit tests (default_state_dir_is_coding_dir_under_root,
+  state_dir_may_sit_anywhere, git_repo_detection_accepts_dir_and_file,
+  ancestor_walk_finds_coding_dir, minimal_bootstrap_is_idempotent_and_
+  never_writes_gitignore — row 27's kernel form) + the positive repo-gate
+  test in factory.rs. In-flight fix: the first workspace.rs append glued a
+  doc comment onto the closing brace and duplicated three test names (E0428)
+  — caught and repaired before any commit.
+- The battery green: cargo test -p mnemo; -p mnemo --features
+  browser,embeddings (the brain's gate — E0432 surfaced only there);
+  --workspace; build --workspace; clippy --workspace --all-targets
+  -- -D warnings; cargo tree -p mnemo -i tauri = "did not match any
+  packages" (the kernel has NO tauri edge — the error IS the pass); the
+  goldens trio 3/3. Headless build N/A at 2c.3 (the `headless` feature
+  arrives with the headless API in a later job; the step file carries no
+  no-default-features command).
+Amendment (2027-01-14, step 2c.4 — the landed D5/G4 picks):
+- The deletion: `SteeringStats::shared()` + its SHARED `OnceLock` are GONE
+  (steering_stats.rs) — the tripwire holds: any survivor fails to compile
+  (the battery compiled with the deletion; the grep `SteeringStats::shared`
+  returns only history/docs). The struct doc re-worded: factory-scoped, not
+  process-wide. The orphaned `OnceLock` import was caught pre-build by a
+  literal probe; the orphaned `Arc` was caught by the battery (one burned
+  cycle) — both trims landed with the deletion (the double-cycle lesson is
+  queued as backlog 1ead68c3, a deletion-hygiene rule for agent.md).
+- The factory (D5's letter): `AgentLoopFactory` gains private
+  `steering: Arc<SteeringStats>` built once in `new()` + the pub accessor
+  `steering()`; the build chain threads it into every loop via the new
+  `AgentLoop::with_steering` builder (chained after `with_plans_dir`) —
+  one counter set per factory instance, shared by all its loops.
+- The loop: `AgentLoop.steering` (pub(crate)), default a fresh isolated
+  set in `from_config` (direct test constructions stay unwired by design);
+  the four dispatch reads flipped off the singleton to `&self.steering`
+  (the three redirect gates :451/:472/:486 + the :731 rebind — the local
+  `steering` binding survives, rebound to the field).
+- The trace reroute: `get_steering_stats` now takes
+  `State<'_, IpcState>` and reads `state.runtime.factory` — the app
+  instance's factory (the 3a Engine reroute noted in D5 lands with the
+  Engine). No factory (the brain failed to build) → a zeroed fresh
+  snapshot, same shape; the IPC surface + the frontend mirror are
+  unchanged (state injection is server-side).
+- The test (row 28's kernel form):
+  `two_factories_have_disjoint_steering_stats` in factory.rs — two
+  `make_factory` builds never share a counter set (`!Arc::ptr_eq`) and a
+  fresh factory's snapshot equals a virgin one (the Snapshot derives
+  PartialEq/Debug, the zeroed-equality assert compiles).
+- The battery green: default + browser,embeddings + the goldens trio 3/3
+  + workspace test/build + clippy --workspace --all-targets -- -D
+  warnings.
+
+
+Amendment (2027-01-15, step 2c.5 — the landed D6/D7 picks):
+- The type (policy.rs): `PermissionPolicy` — `#[serde(tag = "mode")]`,
+  `#[default] OverridePermissions`, `ApproveViaApi { safety_mode }`. ONE
+  spec-letter deviation, documented per the stop rule: §5.4 :358 sketches
+  `ApproveViaApi(SafetyMode)` (tuple); the landed form is the named-field
+  struct variant — an internally-tagged enum cannot carry a newtype variant
+  whose payload serializes to a bare string (`SafetyMode` is a plain enum;
+  serde has no map to hold the tag). Wire shapes: `{"mode":"OverridePermissions"}`
+  / `{"mode":"ApproveViaApi","safety_mode":"autonomous"}`. DISCOVERY:
+  SafetyMode serializes KEBAB-CASE (`approve-each-action`/`auto-read-approve-writes`/
+  `auto-approve-project`/`autonomous`) — the first serde-test draft asserted
+  PascalCase and failed; the literal was fixed, the enum was right.
+- The loop: `AgentLoop.permission` (pub) + `with_permission`; `from_config`
+  defaults to `ApproveViaApi { safety_mode }` — directly-built loops keep
+  today's semantics (§5.4 :378), so pre-existing kernel tests are unwired by
+  default; only the two new tests opt into Override.
+- The gate (dispatch.rs): `gated = force_prompt || approval::needs_approval(...)`
+  hoisted; `if gated && Override` emits `AgentEvent::ApprovalBypassed { tool,
+  reason }` (reason `core_op` when force_prompt — the predicate still evaluated
+  silently, per D6; else `safety_mode`) and falls through to direct dispatch;
+  `else if gated` keeps today's branch byte-identical (SafetyRules auto-approve
+  + prompt). SafetyRules is NOT consulted under Override (§5.4 :374-376).
+- The factory: the loop build chains `.with_permission(ApproveViaApi {
+  safety_mode: *self.safety_mode.read() })` — GUI/console behavior unchanged,
+  the live RwLock read in dispatch untouched; the SpawnAgentTool gets the same
+  policy at construction (§5.4 :377 — subagents inherit the parent's policy).
+- The event (D7, channels.rs): `AgentEvent::ApprovalBypassed { tool, reason }`
+  beside ApprovalRequest + the SerializableAgentEvent twin + the
+  senders-None-tolerant forward arm + the test mirror
+  `approval_bypassed_forwards_without_senders`. Additive — the app-event
+  contract fixtures stayed green.
+- The seam: `AgentSpawner::spawn` + `spawn_with_parent` gain a `permission`
+  param; HostSpawner, IpcSpawner (accepts it for the 3a Engine's SpawnOptions —
+  today's children are factory-built → ApproveViaApi) and the test mocks
+  updated.
+- App fallout (caught by the workspace leg, fixed in-step): console.rs
+  `render_event` gained the audit arm `· approval bypassed: {tool} ({reason})`
+  (E0004) + the console reviewer test's `spawn_with_parent` call the 6th arg
+  (E0061).
+- Tests: `override_permissions_bypasses_core_op_with_audit_event` +
+  `override_permissions_bypasses_safety_mode_gated_call` (tests.rs),
+  `permission_policy_serde_shape_and_default` (policy.rs),
+  `approval_bypassed_forwards_without_senders` (channels.rs),
+  `spawn_passes_the_parent_permission_policy` (spawn_agent.rs).
+- The clippy habit-leg: BLOCKED pre-existing — `cargo clippy --workspace
+  --all-targets -- -D warnings` exits 101 on ~250 sites / ~40 files under the
+  active rustc 1.95.0 (2026-04-14 build; lint promotions). NOT 2c.5's: every
+  error site was intersected with the step's hunks — exactly 3 fell inside
+  (2× redundant field names in the new tests; 1× clippy::await_holding_lock in
+  the new spawn test, whose explicit `drop(calls)` was not honored —
+  restructured to statement-local guards) and all 3 were fixed in-step; the
+  remaining hits in touched files (spawn_agent.rs:560/:1632, channels.rs:142,
+  dispatch.rs:1312+, factory.rs:424/:702/:1174/:3645, loop_impl.rs:279/:371,
+  host/runtime.rs:73/…) sit outside the hunks. The sweep is queued as backlog
+  a439d8c2. The §D battery green at the final tree: default (test_exit=0) +
+  browser,embeddings (feat_exit=0) + workspace (ws_exit=0) + build --workspace
+  (pre-dates only the cfg(test)-only lint fixes — non-test code identical) +
+  the goldens trio 3/3 (in-suite) + the three compile-enforced greps.
+
+
+Amendment (2027-01-15, step 2c.6 — the landed D8 picks):
+- The slot (settings_dto.rs ModelsConfigDto): `free: Option<Option<ModelRefDto>>`
+  after `complete`, the same double-Option + `deserialize_optional_nullable`
+  shape as the lifecycle slots; the validation field-list entry + the apply
+  arm (`general.models.free`) mirror planning/executing/reviewing. ONE in-hunk
+  deviation from the byte-mirror: the new arm uses `.map(to_ref)` — clippy
+  redundant_closure fires on the seven siblings' `|m| to_ref(m)` (all
+  pre-existing, riding the a439d8c2 sweep), and the new arm itself adds ZERO
+  storm sites (the settings_dto.rs count is unchanged at 12).
+- Additive wire field — the IPC parses the patch generically via serde (no
+  src-tauri change; the ipc/settings.rs ModelsConfigDto hits are tests only),
+  and the config-side consumption landed in 2a.6 (general.rs :855-861
+  `free: Option<ModelRef>`).
+- NO walk change (A8's row-7 verdict, held): the resolver walk is untouched —
+  model_resolver.rs :346 `"free" => models.free.as_ref()` + the default-ride
+  on None, pinned by `free_slot_resolves_configured_or_falls_back_to_default`
+  (:791-829, 2a.6). Row 7's wording — "[models.free] set → used; unset → the
+  default ride" — VERIFIED against that test; verify-only as specified.
+- The fixture: `free_patch_set_clear_keep` (the bug_fixing_patch_set_clear_keep
+  precedent — set replaces with the effort, Some(None) clears, outer None
+  keeps), asserting the arm end-to-end through validate_and_apply_settings_patch.
+- The battery green at the final tree: default (test_exit=0) + workspace
+  (ws_exit=0) + browser,embeddings (feat_exit=0) + the goldens trio 3/3
+  (in-suite); the three compile-enforced greps unchanged since the 2c.5
+  verification (this step touched only src/config/settings_dto.rs + this
+  file). The clippy habit-leg: unchanged storm state (backlog a439d8c2),
+  zero new sites.
+
+
+Amendment (2027-01-15, step 2c.7 — the close, §F report):
+- LANDED (boundary commits on wt/mnemo): f348992 (2c.1 G1), 1993e39 (2c.2
+  G2), 9723ae2 + cbdc50c (2c.3 G3), 6fe6768 (2c.4 G4), 4e4462b (2c.5 §5.4),
+  fec4314 (2c.6), + this close.
+- TESTS at the final tree: -p mnemo (test_exit=0, 2714 passing) + --workspace
+  (ws_exit=0) + --features browser,embeddings (feat_exit=0) + build
+  --workspace (build_exit=0); goldens trio 3/3 in-suite; the three greps green.
+- CHECK-OFFS (row → test → result): Row 5 →
+  free_default_excludes_the_reviewer_channel +
+  list_models_and_spawn_require_the_spawn_group → green (hallucinated calls
+  ride the unknown-tool path — the free registry never contains them). Row 6
+  → kernel_head_has_no_workflow_text +
+  expected_tool_names_registered_when_fully_wired → green. Row 7 →
+  free_slot_resolves_configured_or_falls_back_to_default (2a.6, verified) +
+  free_patch_set_clear_keep → green. Row 8 → the sandbox-layer protected set
+  refuses .coding/plans/** policy-independently (sandbox.rs +
+  file_write.rs:463-505 + agent::tests:6702-6730) — NO gate_call deny needed
+  (the broader-block pick was conditional); recall injection = the volatile
+  tail's kernel half (auto_recall_emits_memory_recalled_event); session-end
+  consolidation = the loop's shutdown path (loop_impl.rs:407-409) → green.
+  Row 11 (mechanism) → the five 2c.5 tests → green (Engine exposure = 3c).
+  Row 25 → no_policy_requires_identity → green. Row 26 →
+  tool_selection_registers_only_read_group → green. Rows 27/28 (kernel) →
+  the workspace suite + minimal_bootstrap_never_writes_gitignore + the
+  disjoint-stats test + the IPC shape unchanged → green (engine re-verify =
+  3a).
+- DEVIATIONS: (1) ApproveViaApi's named-field variant vs §5.4's tuple sketch
+  (internally-tagged serde cannot carry a newtype variant of a plain enum).
+  (2) SafetyMode serializes kebab-case — the first serde draft asserted
+  PascalCase; the literal was fixed. (3) console.rs render arm + the
+  reviewer test's 6th arg — app fallout, fixed in-step. (4) The 2c.6 apply
+  arm's `.map(to_ref)` — the lint-clean form; the 7 sibling sites ride the
+  sweep. (5) The clippy habit-leg BLOCKED by the pre-existing rustc-1.95
+  storm (~250 sites / ~40 files; every site intersected with 2c's hunks —
+  the 3 in-hunk sites found were fixed; zero new); sweep queued (a439d8c2).
+- REMAINING RISK: clippy stays red tree-wide until the a439d8c2 sweep; the
+  engine-form rows re-verify in 3a/3c; the GUI cannot express the free slot
+  yet (phase-3 exposure by design).

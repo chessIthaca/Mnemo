@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use mnemo::config::general::{OptimizerConfig, UiConfig};
-use mnemo::config::settings_dto::{validate_and_apply_settings_patch, SettingsSaveDto};
+use mnemo::config::settings_dto::{
+    validate_and_apply_settings_patch, SettingsSaveDto, SteeringNotesDto,
+};
 use mnemo::config::{Endpoint, EndpointKind, SafetyMode};
 use mnemo::memory::classifier::ClassifierStatus;
 use mnemo::memory::embedder::EmbedderStatus;
@@ -43,18 +45,6 @@ pub async fn get_classifier_status(
 ) -> Result<ClassifierStatus, IpcError> {
     state.classifier_status()
 }
-
-/// Get the global config for the Settings UI, minus secrets.
-///
-/// Returns a JSON object `{ general, endpoints, pricing }`: `general` holds
-/// the default provider/model + safety mode; `endpoints` lists each configured
-/// endpoint (name, kind, base_url, models, context/output caps, multimodal,
-/// supports_reasoning_effort, reasoning_effort); `pricing` lists per-model
-/// pricing entries. API keys are never included (the `keys.toml` store is not
-/// serialized).
-///
-/// (E5: the legacy `get_config` command was deleted — `get_settings` is a
-/// strict superset and all callers migrated to it.)
 
 /// The editable shape of an endpoint as sent by the Settings → Endpoints tab.
 ///
@@ -146,19 +136,19 @@ impl EndpointDto {
                 ..Default::default()
             })
             .collect();
-        mnemo::config::patch::validate_endpoint(
-            &self.name,
-            &self.kind,
-            &self.base_url,
-            self.models,
-            specs,
-            self.max_context,
-            self.max_output_tokens,
-            self.multimodal,
-            self.supports_reasoning_effort,
-            self.reasoning_effort,
-            self.workspace_id,
-        )
+        mnemo::config::patch::validate_endpoint(mnemo::config::patch::EndpointDraft {
+            name: self.name,
+            kind: self.kind,
+            base_url: self.base_url,
+            models: self.models,
+            model_configs: specs,
+            max_context: self.max_context,
+            max_output_tokens: self.max_output_tokens,
+            multimodal: self.multimodal,
+            supports_reasoning_effort: self.supports_reasoning_effort,
+            reasoning_effort: self.reasoning_effort,
+            workspace_id: self.workspace_id,
+        })
     }
 }
 
@@ -268,7 +258,7 @@ pub async fn save_endpoints(
 /// fallback-ordering helper), so the re-sync picks the same endpoint + model
 /// the next app start would.
 async fn resync_runtime_state(app: &tauri::AppHandle, state: &State<'_, IpcState>) -> bool {
-    let provider_swapped = if state.runtime.factory.is_some() {
+    let provider_swapped = if let Some(factory) = &state.runtime.factory {
         let (provider, context_manager, kind_label, swapped_model, swapped_display_effort) = {
             let cfg = state.project.config.lock().await;
             let (endpoint, model) = crate::startup::resolve_startup_provider(&cfg);
@@ -290,12 +280,7 @@ async fn resync_runtime_state(app: &tauri::AppHandle, state: &State<'_, IpcState
                         ep.effective_reasoning_effort_for(Some(&model)),
                         Some(state.trace.clone()),
                     );
-                    let context_manager = state
-                        .runtime
-                        .factory
-                        .as_ref()
-                        .unwrap()
-                        .context_manager_for(provider.as_ref());
+                    let context_manager = factory.context_manager_for(provider.as_ref());
                     // The DISPLAY-space effort of the rebuilt default (the
                     // same chain the request builder uses, "off" kept
                     // verbatim) — carried on the ModelChanged event + recorded
@@ -840,11 +825,9 @@ pub struct SaveSettingsResponse {
 /// Map [`EndpointKind`] to the serde wire form (`"openai"` / `"local"` /
 /// `"anthropic"`).
 pub(crate) fn endpoint_kind_wire(kind: EndpointKind) -> &'static str {
-    match kind {
-        EndpointKind::OpenAI => "openai",
-        EndpointKind::Local => "local",
-        EndpointKind::Anthropic => "anthropic",
-    }
+    // Job 4 D2: the mapping moved into the lib (`config::kind_wire`) —
+    // one implementation shared with the standalone Setup surface.
+    mnemo::config::kind_wire(kind)
 }
 
 /// Convert a [`ModelRef`](mnemo::config::ModelRef) to its wire form.
@@ -1052,25 +1035,173 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
     })
 }
 
+/// The app-owned `[ui]` half of the save wire (G9, §5.9.9 :733-738, job
+/// 4 D3): the lib's `SettingsSaveDto` carries NO `[ui]` fields —
+/// compile-time absent (row 33) — so the GUI's wire splits here.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SettingsUiPatch {
+    #[serde(default)]
+    pub theme: Option<String>,
+    #[serde(default)]
+    pub show_token_usage: Option<bool>,
+    #[serde(default)]
+    pub show_tool_images: Option<bool>,
+    #[serde(default)]
+    pub show_tool_activity: Option<bool>,
+    #[serde(default)]
+    pub show_knowledge_activity: Option<bool>,
+    #[serde(default)]
+    pub show_delegation_notes: Option<bool>,
+    /// Per-kind steering-note display overrides (`[ui.steering_notes]`).
+    #[serde(default)]
+    pub steering_notes: Option<SteeringNotesDto>,
+    #[serde(default)]
+    pub chat_thread_line: Option<bool>,
+    #[serde(default)]
+    pub chat_prose_cap: Option<bool>,
+    #[serde(default)]
+    pub chat_turn_tint: Option<bool>,
+    #[serde(default)]
+    pub chat_hover_timestamps: Option<bool>,
+    #[serde(default)]
+    pub sound_complete: Option<bool>,
+    #[serde(default)]
+    pub sound_input_needed: Option<bool>,
+    #[serde(default)]
+    pub sound_stopped_errors: Option<bool>,
+}
+
+/// The GUI's save wire (job 4 D3): the flattened engine patch + the
+/// app-owned `[ui]` half. The FRONTEND PAYLOAD SHAPE IS UNCHANGED —
+/// the split is at the type level only.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SettingsSaveWire {
+    /// The engine-relevant patch — the lib type (NO `[ui]` fields).
+    #[serde(flatten)]
+    pub engine: SettingsSaveDto,
+    /// The app-owned `[ui]` half.
+    #[serde(flatten)]
+    pub ui: SettingsUiPatch,
+}
+
+/// Apply the app-owned `[ui]` half onto the config (moved from the lib
+/// patch, job 4 D3 — one implementation, now at its owner). The caller
+/// persists; on error the original config is unchanged (the theme is
+/// validated BEFORE any application).
+fn apply_ui_patch(
+    general: &mut mnemo::config::general::GeneralConfig,
+    ui: &SettingsUiPatch,
+) -> Result<(), IpcError> {
+    if let Some(theme) = &ui.theme {
+        let t = theme.to_ascii_lowercase();
+        if t != "dark" && t != "light" && t != "system" {
+            return Err(format!(
+                "theme must be 'dark', 'light', or 'system' (got '{theme}')"
+            )
+            .into());
+        }
+        general.ui.theme = t;
+    }
+    if let Some(show) = ui.show_token_usage {
+        general.ui.show_token_usage = show;
+    }
+    if let Some(show) = ui.show_tool_images {
+        general.ui.show_tool_images = show;
+    }
+    if let Some(show) = ui.show_tool_activity {
+        general.ui.show_tool_activity = show;
+    }
+    if let Some(show) = ui.show_knowledge_activity {
+        general.ui.show_knowledge_activity = show;
+    }
+    if let Some(show) = ui.show_delegation_notes {
+        general.ui.show_delegation_notes = show;
+    }
+    if let Some(notes) = &ui.steering_notes {
+        let cur = &mut general.ui.steering_notes;
+        if let Some(v) = notes.auto_delegated {
+            cur.auto_delegated = Some(v);
+        }
+        if let Some(v) = notes.search_nudge {
+            cur.search_nudge = Some(v);
+        }
+        if let Some(v) = notes.shell_tip {
+            cur.shell_tip = Some(v);
+        }
+        if let Some(v) = notes.graph_miss {
+            cur.graph_miss = Some(v);
+        }
+        if let Some(v) = notes.recall_rider {
+            cur.recall_rider = Some(v);
+        }
+        if let Some(v) = notes.read_nudge {
+            cur.read_nudge = Some(v);
+        }
+        if let Some(v) = notes.literal_tip {
+            cur.literal_tip = Some(v);
+        }
+        if let Some(v) = notes.known_memory_hit {
+            cur.known_memory_hit = Some(v);
+        }
+        if let Some(v) = notes.consolidation_due {
+            cur.consolidation_due = Some(v);
+        }
+        if let Some(v) = notes.shell_redirect {
+            cur.shell_redirect = Some(v);
+        }
+        if let Some(v) = notes.edit_stale_read {
+            cur.edit_stale_read = Some(v);
+        }
+    }
+    if let Some(on) = ui.chat_thread_line {
+        general.ui.chat_thread_line = on;
+    }
+    if let Some(on) = ui.chat_prose_cap {
+        general.ui.chat_prose_cap = on;
+    }
+    if let Some(on) = ui.chat_turn_tint {
+        general.ui.chat_turn_tint = on;
+    }
+    if let Some(on) = ui.chat_hover_timestamps {
+        general.ui.chat_hover_timestamps = on;
+    }
+    if let Some(on) = ui.sound_complete {
+        general.ui.sound_complete = on;
+    }
+    if let Some(on) = ui.sound_input_needed {
+        general.ui.sound_input_needed = on;
+    }
+    if let Some(on) = ui.sound_stopped_errors {
+        general.ui.sound_stopped_errors = on;
+    }
+    Ok(())
+}
+
 /// Persist general / context / memory / ui / vision / pricing Settings.
 #[tauri::command]
 pub async fn save_settings(
     app: tauri::AppHandle,
     state: State<'_, IpcState>,
-    patch: SettingsSaveDto,
+    patch: SettingsSaveWire,
 ) -> Result<SaveSettingsResponse, IpcError> {
     // Validate + apply the patch in the brain (review M1b): pure domain logic,
     // no I/O, no Tauri state. Returns the new Config; on any error the original
     // is unchanged (no partial application).
-    let new_config = {
+    //
+    // G9 (§5.9.9, job 4 D3): the wire SPLITS here — the ENGINE half
+    // flows through the lib patch (whose type carries NO `[ui]` fields —
+    // compile-time absent, row 33), the app-owned `[ui]` half applies
+    // right after (on disk nothing moves: same file, same tables).
+    let mut new_config = {
         let current = state.project.config.lock().await;
-        validate_and_apply_settings_patch(&current, &patch).map_err(IpcError::from)?
+        validate_and_apply_settings_patch(&current, &patch.engine).map_err(IpcError::from)?
     };
+    apply_ui_patch(&mut new_config.general, &patch.ui)?;
 
     // The brain function already parsed + applied the safety mode to
     // new_config.general.general.safety. Read it back directly instead of
     // re-parsing patch.safety (review finding 7 — avoids a redundant parse).
-    let parsed_safety = if patch.safety.is_some() {
+    let parsed_safety = if patch.engine.safety.is_some() {
         Some(new_config.general.general.safety)
     } else {
         None
@@ -1114,7 +1245,9 @@ pub async fn save_settings(
     // they take effect without a restart. The budget applies retroactively
     // (oldest over-budget payloads evicted immediately); the request cap
     // applies to records started after this point.
-    if patch.trace_memory_budget_mb.is_some() || patch.trace_request_body_cap_kb.is_some() {
+    if patch.engine.trace_memory_budget_mb.is_some()
+        || patch.engine.trace_request_body_cap_kb.is_some()
+    {
         state
             .trace
             .set_memory_budget(reloaded.general.trace.memory_budget_mb * 1024 * 1024);
@@ -1437,7 +1570,7 @@ mod settings_dto_tests {
     }
 
     #[test]
-    fn settings_save_dto_parses_vision_and_pricing() {
+    fn settings_save_wire_parses_vision_pricing_and_ui() {
         let raw = r#"{
             "safety": "auto-approve-project",
             "vision_model": { "endpoint": "qwen", "model": "qwen-vl" },
@@ -1449,17 +1582,19 @@ mod settings_dto_tests {
             "sound_stopped_errors": false,
             "pricing": [{ "model": "gpt-4o", "input_per_1m": 2.5, "output_per_1m": 10.0, "cached_per_1m": 1.25 }]
         }"#;
-        let p: SettingsSaveDto = serde_json::from_str(raw).unwrap();
-        assert_eq!(p.safety.as_deref(), Some("auto-approve-project"));
-        assert_eq!(p.vision_model.as_ref().unwrap().endpoint, "qwen");
-        assert!((p.summarize_at_fill_rate.unwrap() - 0.4).abs() < 1e-9);
-        assert_eq!(p.theme.as_deref(), Some("system"));
-        assert_eq!(p.show_token_usage, Some(false));
+        let p: SettingsSaveWire = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.engine.safety.as_deref(), Some("auto-approve-project"));
+        assert_eq!(p.engine.vision_model.as_ref().unwrap().endpoint, "qwen");
+        assert!((p.engine.summarize_at_fill_rate.unwrap() - 0.4).abs() < 1e-9);
+        // The UI half rides the same flattened wire (G9: engine + ui
+        // both `#[serde(flatten)]` — one payload, two DTOs).
+        assert_eq!(p.ui.theme.as_deref(), Some("system"));
+        assert_eq!(p.ui.show_token_usage, Some(false));
         // Each notification sound patches independently (absent = keep).
-        assert_eq!(p.sound_complete, Some(false));
-        assert_eq!(p.sound_input_needed, Some(true));
-        assert_eq!(p.sound_stopped_errors, Some(false));
-        assert_eq!(p.pricing.as_ref().unwrap().len(), 1);
+        assert_eq!(p.ui.sound_complete, Some(false));
+        assert_eq!(p.ui.sound_input_needed, Some(true));
+        assert_eq!(p.ui.sound_stopped_errors, Some(false));
+        assert_eq!(p.engine.pricing.as_ref().unwrap().len(), 1);
     }
 
     #[test]
@@ -1467,6 +1602,40 @@ mod settings_dto_tests {
         assert_eq!(endpoint_kind_wire(EndpointKind::OpenAI), "openai");
         assert_eq!(endpoint_kind_wire(EndpointKind::Local), "local");
         assert_eq!(endpoint_kind_wire(EndpointKind::Anthropic), "anthropic");
+    }
+
+    #[test]
+    fn ui_patch_applies_per_kind_and_validates_theme() {
+        // G9 (job 4 D3): the [ui] apply moved here from the lib patch —
+        // the per-kind steering overrides + the toggles ride the app
+        // half; the theme validation rejects bad values before any
+        // application (no partial writes).
+        let mut general = mnemo::config::general::GeneralConfig::default();
+        let ui = SettingsUiPatch {
+            theme: Some("DARK".into()),
+            chat_thread_line: Some(false),
+            show_token_usage: Some(true),
+            steering_notes: Some(SteeringNotesDto {
+                auto_delegated: Some(false),
+                literal_tip: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        apply_ui_patch(&mut general, &ui).unwrap();
+        assert_eq!(general.ui.theme, "dark");
+        assert!(!general.ui.chat_thread_line);
+        assert!(general.ui.show_token_usage);
+        assert_eq!(general.ui.steering_notes.auto_delegated, Some(false));
+        assert_eq!(general.ui.steering_notes.literal_tip, Some(false));
+        // A bad theme refuses without partial application.
+        let bad = SettingsUiPatch {
+            theme: Some("neon".into()),
+            chat_thread_line: Some(true),
+            ..Default::default()
+        };
+        assert!(apply_ui_patch(&mut general, &bad).is_err());
+        assert!(!general.ui.chat_thread_line, "the refused patch applied nothing");
     }
 
     // ── Typed response structs render byte-identically to the old json! bodies ─

@@ -210,7 +210,7 @@ pub fn title_prefix(record_type: MemoryRecordType) -> Option<&'static str> {
 /// knowledge types map (`spec`/`decision`/`bug`/`how`); `plan`, `review`,
 /// and anything else return `None` — those records have their own file homes.
 pub fn record_type_for_dir(dir: &str) -> Option<MemoryRecordType> {
-    match MemoryRecordType::from_str(dir) {
+    match MemoryRecordType::from_str_opt(dir) {
         Some(t) if dir_for_record_type(t).is_some() => Some(t),
         _ => None,
     }
@@ -434,7 +434,7 @@ fn scan_dir_max_date(dir: &std::path::Path, ceiling: &str, best: &mut Option<Str
             .map(str::to_string)
     }) {
         if let Some(date) = date_from_slug(&stem) {
-            if valid_floor_date(date, ceiling) && best.as_deref().map_or(true, |b| date > b) {
+            if valid_floor_date(date, ceiling) && best.as_deref().is_none_or(|b| date > b) {
                 *best = Some(date.to_string());
             }
         }
@@ -449,7 +449,7 @@ fn valid_floor_date(date: &str, ceiling: &str) -> bool {
     let year: u32 = date.get(0..4).and_then(|y| y.parse().ok()).unwrap_or(0);
     let month: u32 = date.get(5..7).and_then(|m| m.parse().ok()).unwrap_or(0);
     let day: u32 = date.get(8..10).and_then(|d| d.parse().ok()).unwrap_or(0);
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let max_day = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

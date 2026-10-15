@@ -752,6 +752,188 @@ async fn recall_peek_does_not_bump_access() {
 }
 
 #[tokio::test]
+async fn stale_record_ranks_below_fresh_of_equal_relevance() {
+    // Backlog 4100f5e3 pillar B: closed-session digests dominated the
+    // injected recall block because they ride surface similarity + keyword
+    // + tier long after their strength term decayed to ~0 (the peek paths
+    // never bump last_accessed_at, so it stays frozen at write time). The
+    // staleness penalty sinks a record not accessed within the grace
+    // window, so a fresh record of equal relevance outranks it.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    // The stale record: fully query-aligned (sim 1.0 under the anchor
+    // embedder), 60 days unaccessed — the surface-similarity dominator
+    // the old ranking rewarded. Strength is pinned on both records so the
+    // arithmetic is exact.
+    let mut stale = Memory::new(
+        MemoryTier::Semantic,
+        "stale review digest",
+        "pipeline pipeline",
+        1000,
+    );
+    stale.strength = 0.5;
+    store.write(stale).await.unwrap();
+
+    // 60 days later: a fresh record, lower similarity (axis-mixed content,
+    // sim ~0.447) but equal keyword/tier/class and a live strength term.
+    now_val.store(1000 + 60 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "fresh pipeline note",
+        "pipeline unrelated unrelated",
+        1000 + 60 * DAY,
+    );
+    fresh.strength = 0.5;
+    store.write(fresh).await.unwrap();
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "fresh pipeline note",
+        "the fresh record must outrank the stale one of equal relevance"
+    );
+}
+
+#[tokio::test]
+async fn staleness_grace_follows_the_configured_decay_tau() {
+    // Review 084978b3 LOW-2: the staleness grace was hardcoded at 7 days
+    // while the adjacent strength-decay tau is live-configurable — a 30-day
+    // half-life still saw penalties begin at 7 days. The grace must track
+    // the configured tau. Identical text on both records isolates the
+    // strength + penalty terms: the 20-day-old record (strength 1.0,
+    // decayed term 0.154 under tau=30) beats the fresh pinned 0.35
+    // (term 0.105) — but only while its grace window exempts it; under the
+    // pre-fix constant grace the 0.141 penalty sinks it.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    let mut old = Memory::new(
+        MemoryTier::Semantic,
+        "old pipeline digest",
+        "pipeline pipeline",
+        1000,
+    );
+    old.strength = 1.0;
+    store.write(old).await.unwrap();
+
+    now_val.store(1000 + 20 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "fresh pipeline note",
+        "pipeline pipeline",
+        1000 + 20 * DAY,
+    );
+    fresh.strength = 0.35;
+    store.write(fresh).await.unwrap();
+
+    // Configured tau = 30 days: the 20-day-old record is inside its grace
+    // window — no penalty — and keeps the top slot.
+    store.set_memory_search_config(MemorySearchConfig {
+        decay_half_life_days: 30.0,
+        ..MemorySearchConfig::default()
+    });
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "old pipeline digest",
+        "a record within the configured tau's grace must not be de-ranked"
+    );
+
+    // Default 7-day tau: the same record is deep in the ramp and sinks.
+    store.set_memory_search_config(MemorySearchConfig::default());
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].memory.title, "fresh pipeline note",
+        "under the default tau the aged record sinks again"
+    );
+}
+
+#[tokio::test]
+async fn turn_boundary_auto_consolidates_previous_turns_working_rows() {
+    // Backlog 4100f5e3 pillar C: a gap between a session's tool events
+    // marks a turn boundary — the previous turn's working rows are
+    // compressed into one episodic summary and deleted automatically,
+    // without the manual consolidate tool or the stale-session cleanup.
+    // The live turn's row stays.
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new());
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+
+    // Turn one: two tool events a second apart.
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_read",
+            serde_json::json!({"path": "a.rs"}),
+            "a",
+            None,
+        )
+        .await
+        .unwrap();
+    now_val.store(1001, Ordering::SeqCst);
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_write",
+            serde_json::json!({"path": "b.rs"}),
+            "b",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 400 seconds later: the new tool event crosses the 300s turn gap.
+    now_val.store(1401, Ordering::SeqCst);
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_read",
+            serde_json::json!({"path": "c.rs"}),
+            "c",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The two pre-gap rows are gone from working; the live row remains.
+    let working = store.list_by_tier(MemoryTier::Working).await.unwrap();
+    assert_eq!(working.len(), 1, "only the live turn's row remains in working");
+    assert_eq!(working[0].source_session_ids, vec!["sess-t".to_string()]);
+
+    // The previous turn was compressed into one episodic summary.
+    let episodic = store.list_by_tier(MemoryTier::Episodic).await.unwrap();
+    assert_eq!(episodic.len(), 1, "the previous turn left an episodic summary");
+    assert_eq!(episodic[0].title, "session sess-t summary");
+    assert_eq!(episodic[0].source_session_ids, vec!["sess-t".to_string()]);
+}
+
+#[tokio::test]
 async fn recall_bumps_access_via_batch() {
     // End-to-end: recall should still bump access counts (now via the
     // batched path). After recalling 3 memories, each should have
@@ -1476,7 +1658,7 @@ async fn load_recent_locked_caps_and_orders_by_recency() {
     for i in 0..5u32 {
         let mut m = Memory::new(
             MemoryTier::Semantic,
-            &format!("mem-{i}"),
+            format!("mem-{i}"),
             "shared keyword",
             1000,
         );
@@ -1979,12 +2161,10 @@ async fn superseded_strongest_match_stays_hidden_by_default() {
 
 // ── request_stats + aggregation ────────────────────────────────────────
 
-/// A helper that records a stats row with sensible defaults.
-async fn record(
-    store: &MemoryStore,
-    session_id: Option<&str>,
-    model: &str,
-    endpoint: Option<&str>,
+/// The token/timing numbers of one stats row [`record`] files — grouped so
+/// the helper stays under clippy's argument budget: prompt/completion/
+/// reasoning/cached tokens, TTFT ms, generation ms, epoch seconds.
+struct StatsRow {
     p: u32,
     c: u32,
     r: u32,
@@ -1992,7 +2172,17 @@ async fn record(
     ttft: Option<u32>,
     gen: Option<u32>,
     at: i64,
+}
+
+/// A helper that records a stats row with sensible defaults.
+async fn record(
+    store: &MemoryStore,
+    session_id: Option<&str>,
+    model: &str,
+    endpoint: Option<&str>,
+    row: StatsRow,
 ) {
+    let StatsRow { p, c, r, cached, ttft, gen, at } = row;
     let stats = RequestStats {
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.map(|s| s.to_string()),
@@ -2358,13 +2548,15 @@ async fn request_stats_rows_separates_outcome_and_purpose_tags() {
         Some("s1"),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        800,
-        Some(420),
-        Some(2000),
-        now,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 800,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: now,
+        },
     )
     .await;
     // An error row: our estimated prompt, cached NULL, outcome='error'.
@@ -2443,13 +2635,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o",
         None,
-        1000,
-        200,
-        50,
-        800,
-        Some(420),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 50,
+            cached: 800,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2457,13 +2651,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o",
         None,
-        2000,
-        400,
-        100,
-        0,
-        Some(500),
-        Some(4000),
-        6000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 100,
+            cached: 0,
+            ttft: Some(500),
+            gen: Some(4000),
+            at: 6000,
+        },
     )
     .await;
     record(
@@ -2471,13 +2667,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o-mini",
         None,
-        500,
-        100,
-        0,
-        0,
-        None,
-        None,
-        7000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 7000,
+        },
     )
     .await;
 
@@ -2525,13 +2723,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        0,
-        Some(400),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 0,
+            ttft: Some(400),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2539,13 +2739,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         Some("b200"),
-        2000,
-        400,
-        0,
-        0,
-        Some(600),
-        Some(4000),
-        6000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(600),
+            gen: Some(4000),
+            at: 6000,
+        },
     )
     .await;
     record(
@@ -2553,13 +2755,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         None,
-        500,
-        100,
-        0,
-        0,
-        None,
-        None,
-        7000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 7000,
+        },
     )
     .await;
 
@@ -2606,13 +2810,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        1000,
-        200,
-        0,
-        100,
-        Some(420),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 100,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2620,13 +2826,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        2000,
-        400,
-        0,
-        0,
-        Some(500),
-        Some(4000),
-        5000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(500),
+            gen: Some(4000),
+            at: 5000,
+        },
     )
     .await;
     // Day 2 (86400 + 5000s) — one request in s2.
@@ -2635,13 +2843,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s2.id),
         "gpt-4o-mini",
         None,
-        500,
-        100,
-        0,
-        0,
-        Some(300),
-        Some(1000),
-        86400 + 5000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: Some(300),
+            gen: Some(1000),
+            at: 86400 + 5000,
+        },
     )
     .await;
 
@@ -2677,13 +2887,15 @@ async fn project_stats_splits_same_model_across_endpoints() {
         Some(&s1.id),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        0,
-        Some(400),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 0,
+            ttft: Some(400),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2691,13 +2903,15 @@ async fn project_stats_splits_same_model_across_endpoints() {
         Some(&s2.id),
         "glm-5.3",
         Some("b200"),
-        2000,
-        400,
-        0,
-        0,
-        Some(600),
-        Some(4000),
-        86400 + 5000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(600),
+            gen: Some(4000),
+            at: 86400 + 5000,
+        },
     )
     .await;
 
@@ -2730,13 +2944,15 @@ async fn session_list_orders_newest_first_with_token_totals() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        100,
-        20,
-        0,
-        0,
-        None,
-        None,
-        100,
+        StatsRow {
+            p: 100,
+            c: 20,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 100,
+        },
     )
     .await;
     let s2 = store.start_session("proj").await.unwrap();
@@ -2745,13 +2961,15 @@ async fn session_list_orders_newest_first_with_token_totals() {
         Some(&s2.id),
         "gpt-4o",
         None,
-        500,
-        80,
-        10,
-        0,
-        None,
-        None,
-        200,
+        StatsRow {
+            p: 500,
+            c: 80,
+            r: 10,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 200,
+        },
     )
     .await;
 

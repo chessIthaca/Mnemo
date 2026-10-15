@@ -40,15 +40,15 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
-use mnemo::runtime::channels::SerializableAgentEvent;
-use mnemo::runtime::turn_resolve::{
+use mnemo::SerializableAgentEvent;
+use mnemo::turn_resolve::{
     completion_suggestion_text, reviewer_failure_suggestion_text, workflow_transition_counts,
     ResolveAction, TurnResolveLatch,
 };
-use mnemo::runtime::{AgentCommand, AgentEvent, AgentId, AgentManager, SerializedEvent};
-use mnemo::workflow::WorkflowState;
+use mnemo::{AgentCommand, AgentEvent, AgentId, AgentManager, SerializedEvent};
 
 use crate::ipc::approval::PendingApprovals;
+pub(crate) use mnemo::headless::cleanup_inactive_subagents;
 use crate::ipc::state::IpcState;
 
 /// The Tauri event channel name for agent events.
@@ -67,7 +67,12 @@ fn watchdog_note(agent_id: AgentId, event: &SerializableAgentEvent) -> Option<St
         }
         SerializableAgentEvent::Error { .. } => format!("agent{agent_id} Error(final)"),
         SerializableAgentEvent::WorkflowStateChanged { state, .. } => {
-            format!("agent{agent_id} workflow → {state}")
+            // The watchdog note keeps the pre-2b.3 Debug shape (first letter
+            // capitalized) — the event FIELD itself is the serde shape.
+            format!(
+                "agent{agent_id} workflow → {}",
+                mnemo::capitalize_token(state)
+            )
         }
         SerializableAgentEvent::ApprovalRequest { tool_name, .. } => {
             format!("agent{agent_id} approval: {tool_name}")
@@ -217,7 +222,7 @@ impl DeltaBatcher {
         let bucket = self
             .buckets
             .entry((agent_id, kind, index))
-            .or_insert_with(DeltaBucket::default);
+            .or_default();
         bucket.bytes += fragment.len();
         bucket.text.push_str(&fragment);
         if bucket.bytes >= DELTA_BUCKET_CAP {
@@ -350,7 +355,7 @@ pub fn spawn(
     // Each agent's workflow state the last time we saw a WorkflowStateChanged
     // event. Used to detect a fresh plan started from Complete (Complete →
     // Executing), which triggers cleanup of inactive subagents.
-    let mut prev_workflow_state: std::collections::HashMap<AgentId, WorkflowState> =
+    let mut prev_workflow_state: std::collections::HashMap<AgentId, String> =
         std::collections::HashMap::new();
     // Each agent's top plan id the last time we saw a WorkflowStateChanged
     // event (backlog bba2c82d). At a root-plan abandonment the event's own
@@ -428,10 +433,30 @@ pub fn spawn(
                 break;
             };
 
+            // R8 (§9, job 3b.4): the live `Savings`/`Spend` ledger events
+            // are display-only telemetry fanned from the loop's persistence
+            // sites — their consumers are the durable ledger + the headless
+            // stats surfaces, never the transcript. Drop them BEFORE the
+            // serialization/diag path: no wire emit, no watchdog ring
+            // entry, no delta-batcher disturbance.
+            if matches!(
+                event,
+                AgentEvent::Savings { .. } | AgentEvent::Spend { .. }
+            ) {
+                continue;
+            }
+
+            // 3c (§5.9.2/§5.9.6): the host-tool + policy-hook senders ride
+            // the same struct; this forwarder's app-spawned agents never
+            // produce those events (WorkflowPolicy registers no host tools
+            // and no external policy), so the `..` drops any stray
+            // responder — the kernel's dispatch-side timeout then resolves
+            // it instead of hanging.
             let SerializedEvent {
                 event: serial,
                 approval_sender,
                 question_sender,
+                ..
             } = event.into_serializable();
 
             // Chain marker: events reaching the forwarder at all (see
@@ -462,22 +487,25 @@ pub fn spawn(
             // it exits and its tab disappears. RUNNING subagents are never
             // touched (they finish on their own and are removed via Exited).
             if let SerializableAgentEvent::WorkflowStateChanged { state, top_plan_id } = &serial {
-                let new_state = *state;
-                let prev_state = prev_workflow_state.get(&agent_id).copied();
-                let was_complete = prev_state == Some(WorkflowState::Complete);
+                let new_state = state.clone();
+                // The owned snapshot (2b.3): the map insert below mutably
+                // borrows, so the prev state must not still be borrowed —
+                // clone it out, compare via as_deref.
+                let prev_state = prev_workflow_state.get(&agent_id).cloned();
+                let was_complete = prev_state.as_deref() == Some("complete");
                 // (backlog bba2c82d) The abandoned plan's id comes from
                 // the PREVIOUS top — read BEFORE the map update: after
                 // the abandonment pop the event's own top_plan_id is the
                 // post-pop top, and the live main_agent_top_plan_id no
                 // longer names the abandoned plan either.
                 let prev_top = prev_top_plan_id.get(&agent_id).cloned().flatten();
-                prev_workflow_state.insert(agent_id, new_state);
+                prev_workflow_state.insert(agent_id, new_state.clone());
                 prev_top_plan_id.insert(agent_id, top_plan_id.clone());
                 // Plan-loop gate evidence: only a REAL state transition
                 // counts (a failed workflow tool can emit its unchanged
                 // state — belt-and-braces behind the emission-side
                 // result.success gating; see workflow_transition_counts).
-                if workflow_transition_counts(prev_state, new_state) {
+                if workflow_transition_counts(prev_state.as_deref(), new_state.as_str()) {
                     turn_resolve.note_workflow_changed(agent_id);
                 }
                 // Root-plan abandonment (backlog 45dcf577): latched
@@ -485,7 +513,7 @@ pub fn spawn(
                 // dispatched item's `Failed` (failure means exactly "the
                 // plan was abandoned"). The captured plan id (bba2c82d)
                 // is the linkage evidence for the Failed guard.
-                if crate::ipc::run_all::is_root_plan_abandonment(prev_state, new_state) {
+                if crate::ipc::run_all::is_root_plan_abandonment(prev_state.as_deref(), new_state.as_str()) {
                     turn_resolve.note_plan_abandoned(agent_id, prev_top);
                 }
                 // Stamp the in-flight backlog item `InFlight` when the MAIN
@@ -496,7 +524,7 @@ pub fn spawn(
                 // are main-agent bookkeeping, and a child entering
                 // `Executing` must not stamp the main's item while it is
                 // still pre-planning.
-                if crate::ipc::run_all::should_stamp_in_flight(prev_state, new_state) {
+                if crate::ipc::run_all::should_stamp_in_flight(prev_state.as_deref(), new_state.as_str()) {
                     // Parallel run-all (plan ffd7a86f, review R1): route by
                     // OWNERSHIP, not by a live main_agent_id() — a spawned
                     // run-all agent is parentless, and after the main
@@ -532,7 +560,7 @@ pub fn spawn(
                         }
                     }
                 }
-                if was_complete && new_state == WorkflowState::Executing {
+                if was_complete && new_state == "executing" {
                     cleanup_inactive_subagents(&manager_arc, agent_id).await;
                 }
             }
@@ -547,34 +575,34 @@ pub fn spawn(
                 SerializableAgentEvent::CompactStarted => {
                     compact_in_flight.insert(agent_id);
                 }
-                SerializableAgentEvent::Compacted { .. } => {
-                    if compact_in_flight.remove(&agent_id) {
-                        let is_main =
-                            manager_arc.lock().await.main_agent_id() == Some(agent_id);
-                        if is_main {
-                            app.state::<IpcState>()
-                                .backlog
-                                .compact_signal
-                                .send_if_modified(|c| {
+                SerializableAgentEvent::Compacted { .. }
+                    if compact_in_flight.remove(&agent_id) =>
+                {
+                    let is_main =
+                        manager_arc.lock().await.main_agent_id() == Some(agent_id);
+                    if is_main {
+                        app.state::<IpcState>()
+                            .backlog
+                            .compact_signal
+                            .send_if_modified(|c| {
                             *c += 1;
                             true
                         });
-                        }
                     }
                 }
-                SerializableAgentEvent::Error { .. } => {
-                    if compact_in_flight.remove(&agent_id) {
-                        let is_main =
-                            manager_arc.lock().await.main_agent_id() == Some(agent_id);
-                        if is_main {
-                            app.state::<IpcState>()
-                                .backlog
-                                .compact_signal
-                                .send_if_modified(|c| {
+                SerializableAgentEvent::Error { .. }
+                    if compact_in_flight.remove(&agent_id) =>
+                {
+                    let is_main =
+                        manager_arc.lock().await.main_agent_id() == Some(agent_id);
+                    if is_main {
+                        app.state::<IpcState>()
+                            .backlog
+                            .compact_signal
+                            .send_if_modified(|c| {
                             *c += 1;
                             true
                         });
-                        }
                     }
                 }
                 _ => {}
@@ -587,26 +615,26 @@ pub fn spawn(
             // the completion-notification feedback loop that lets an
             // orchestrating agent know when its spawned agents are done.
             match &serial {
-                SerializableAgentEvent::Finished { .. } => {
+                SerializableAgentEvent::Finished { .. }
+                    if notified_children.insert(agent_id) =>
+                {
                     // Only notify once per background agent (on its first
                     // finish) — a multi-turn child shouldn't spam its parent.
-                    if notified_children.insert(agent_id) {
-                        if let Some(ev) =
-                            notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, true)
-                                .await
-                        {
-                            emit_child_finished(&app, ev);
-                        }
+                    if let Some(ev) =
+                        notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, true)
+                            .await
+                    {
+                        emit_child_finished(&app, ev);
                     }
                 }
-                SerializableAgentEvent::Error { retrying, .. } if !retrying => {
-                    if notified_children.insert(agent_id) {
-                        if let Some(ev) =
-                            notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, false)
-                                .await
-                        {
-                            emit_child_finished(&app, ev);
-                        }
+                SerializableAgentEvent::Error { retrying, .. } if !retrying
+                    && notified_children.insert(agent_id) =>
+                {
+                    if let Some(ev) =
+                        notify_parent_on_completion(&manager_arc, &agent_loops, agent_id, false)
+                            .await
+                    {
+                        emit_child_finished(&app, ev);
                     }
                 }
                 _ => {}
@@ -1313,77 +1341,6 @@ fn emit_child_finished(app: &AppHandle, event: SerializableAgentEvent) {
     }
 }
 
-/// Cancel every INACTIVE subagent registered with the manager, leaving the
-/// given `trigger_agent` and any RUNNING subagent untouched.
-///
-/// Called when an agent starts a fresh plan from Complete (Complete →
-/// Executing): stale background agents from the previous plan should be
-/// cleaned up so their tabs disappear. A subagent is "inactive" when it has
-/// started at least one turn and is not currently running — cancelling a
-/// running subagent would kill a task still in flight, so those are left alone
-/// (they exit on their own and are removed by the existing `Exited` forwarder
-/// path), and a subagent that has never started is *pending*, not completed,
-/// so it is left alone too.
-///
-/// Also called from `spawn_agent_shared` right before a new agent is spawned:
-/// per the user's rule, completed (inactive) subagents are cleaned up only when
-/// a new agent is spawned (or the user closes a tab) — never proactively. This
-/// keeps finished subagent tabs around for review until the user moves on.
-///
-/// Each cancelled subagent emits `Finished` then `Exited`; the `Exited`
-/// handler in the forwarder removes it from the manager + the per-agent loop
-/// map and emits the event so the frontend drops its tab.
-///
-/// The snapshot + all the `Cancel` sends happen under a **single** manager
-/// lock acquisition. `mgr.send` uses `try_send` (non-blocking), so this never
-/// awaits while holding the lock. Holding the lock across the whole loop
-/// prevents a concurrent `send_prompt` IPC command from enqueuing a `Prompt`
-/// *between* the snapshot and the `Cancel` — the `Prompt` send needs the same
-/// lock, so it blocks until every `Cancel` is already in the channel, landing
-/// the `Cancel` ahead of any later `Prompt` in the FIFO. The agent task then
-/// reads the `Cancel` first and exits without running an extra turn.
-pub(crate) async fn cleanup_inactive_subagents(
-    manager_arc: &Arc<Mutex<AgentManager>>,
-    trigger_agent: AgentId,
-) {
-    let mgr = manager_arc.lock().await;
-    let to_cancel: Vec<AgentId> = mgr
-        .list()
-        .iter()
-        .filter(|h| {
-            h.id != trigger_agent
-                && h.parent_id.is_some()
-                // "Inactive" means ran-and-went-idle, NOT never-started. A
-                // subagent registered by an earlier `spawn_agent` in the SAME
-                // assistant message has `running == false` until its first
-                // `Started` event reaches the forwarder — without the
-                // `has_ever_started` half of this test, each spawn's cleanup
-                // cancelled its not-yet-started siblings, so only the
-                // last-spawned agent of a batch survived (live-observed
-                // 2026-09-08, plan ccff0138: four reviewers spawned, one ran).
-                // Latch first (Acquire load): observing `has_ever_started`
-                // guarantees the `running = true` store that preceded the
-                // latch store in `set_running` is visible to the
-                // `is_running()` load below — on the first latch transition
-                // (a freshly spawned agent) the two can never present
-                // "started + idle" mid-`set_running(true)` (quality review
-                // Q1, 2026-09-08). On re-starts (turn 2+) a
-                // nanosecond-scale residual remains, equivalent to the
-                // cleanup winning the race during the agent's designed
-                // idle gap between turns.
-                && h.has_ever_started()
-                && !h.is_running()
-        })
-        .map(|h| h.id)
-        .collect();
-    // Send each Cancel while still holding the lock (try_send is non-blocking,
-    // so this is brief and never awaits). Keeping the lock until all Cancels
-    // are enqueued guarantees correct FIFO ordering vs. a concurrent Prompt.
-    for id in to_cancel {
-        let _ = mgr.send(id, AgentCommand::Cancel);
-    }
-}
-
 /// The payload emitted to the frontend: the agent id + the serializable event.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentEventPayload {
@@ -1480,7 +1437,7 @@ async fn try_flush_deferred_main_resolution(
             let state = app.state::<IpcState>();
             let wf_complete = crate::ipc::run_all::main_agent_workflow_state(&state)
                 .await
-                .map_or(false, |s| s == WorkflowState::Complete);
+                .is_some_and(|s| s == "Complete");
             if wf_complete {
                 // Off the forwarder's critical path (review L2): evidence
                 // is read BEFORE the spawn (the next Started clears it);
@@ -1530,7 +1487,7 @@ async fn try_flush_deferred_spawned_resolutions(
     turn_resolve: &mut TurnResolveLatch,
 ) {
     let state = app.state::<IpcState>();
-    let lanes: Vec<mnemo::runtime::AgentId> = {
+        let lanes: Vec<mnemo::AgentId> = {
         let guard = state.backlog.run_all.lock().await;
         guard.as_ref().map_or(Vec::new(), |r| {
             r.spawned
@@ -1578,7 +1535,7 @@ async fn try_flush_deferred_spawned_resolutions(
                 let wf_complete =
                     crate::ipc::run_all::agent_workflow_state(&state, lane_id)
                         .await
-                        .map_or(false, |s| s == WorkflowState::Complete);
+                        .is_some_and(|s| s == "complete");
                 if wf_complete {
                     // Off the forwarder's critical path (review L2):
                     // evidence is read BEFORE the spawn (the next Started
@@ -1981,7 +1938,7 @@ mod watchdog_note_tests {
     use mnemo::provider::FinishReason;
     use mnemo::runtime::channels::{ParkReason, SerializableAgentEvent};
     use mnemo::runtime::AgentId;
-    use mnemo::workflow::WorkflowState;
+    use mnemo::app::workflow::WorkflowState;
 
     /// Review finding 4 (2026-08-20): every state-changing event arm must
     /// produce its note; streaming/display-only events must be skipped.
@@ -2015,7 +1972,7 @@ mod watchdog_note_tests {
             (
                 7,
                 SerializableAgentEvent::WorkflowStateChanged {
-                    state: WorkflowState::Reviewing,
+                    state: format!("{:?}", WorkflowState::Reviewing).to_lowercase(),
                     top_plan_id: None,
                 },
                 "agent7 workflow → Reviewing",
@@ -2310,18 +2267,20 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         Arc::new(AgentLoopFactory::new(
-            provider,
-            ConstitutionSource::new(&gpath, &ppath).unwrap(),
-            None,
-            sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(
-                mnemo::config::SafetyMode::Autonomous,
-            )),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
-            None,
+            mnemo::agent::factory::FactoryDeps {
+                provider,
+                constitution_source: ConstitutionSource::new(&gpath, &ppath).unwrap(),
+                memory: None,
+                sandbox,
+                project_root: dir.to_path_buf(),
+                safety_rules: None,
+                safety_mode: Arc::new(std::sync::RwLock::new(
+                    mnemo::config::SafetyMode::Autonomous,
+                )),
+                context_manager: ContextManager::new(128_000, 0.5),
+                plans_dir: dir.join("plans"),
+                vision: None,
+            },
         ))
     }
 

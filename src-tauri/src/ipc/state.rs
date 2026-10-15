@@ -19,18 +19,17 @@ use std::sync::{Arc, RwLock};
 
 use tokio::sync::Mutex;
 
-use mnemo::agent::factory::AgentLoopFactory;
-use mnemo::agent::AgentLoop;
+use mnemo::AgentLoopFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::memory::MemoryStore;
-use mnemo::project::Project;
-use mnemo::runtime::{AgentId, AgentManager};
+use mnemo::app::project::Project;
+use mnemo::{AgentId, AgentManager};
 use mnemo::safety_rules::SafetyRules;
 use mnemo::tool::agent::sandbox::Sandbox;
 
 use crate::ipc::approval::PendingApprovals;
 use crate::ipc::questions::PendingQuestions;
-use mnemo::backlog::BacklogStore;
+use mnemo::app::backlog::BacklogStore;
 
 /// The shared state accessible to all Tauri commands.
 ///
@@ -46,6 +45,11 @@ use mnemo::backlog::BacklogStore;
 /// anywhere today and would risk a deadlock if a future command did so while
 /// another task held `manager` then waited on `agent_loops`.
 pub struct IpcState {
+    /// The app policy factory (2b.3): the IPC's `enter_skill` reads its
+    /// skill-library handle app→app — the kernel factory's skills surface
+    /// retired with the registration move. `None` on the arms that build
+    /// no agent (no skill path to serve).
+    pub app_policy_factory: Option<Arc<mnemo::app::policy_factory::WorkflowPolicyFactory>>,
     /// The agent runtime: manager, per-agent loops, factory, safety.
     pub runtime: AgentRuntimeContext,
     /// The project: project handle, config, sandbox.
@@ -84,12 +88,8 @@ pub struct IpcState {
     /// `None` only in tests that construct `IpcState` directly.
     pub watchdog: Option<Arc<crate::watchdog::Watchdog>>,
 }
+pub(crate) use mnemo::headless::AgentLoopMap;
 
-/// The per-agent loop map: `Arc<tokio::Mutex<HashMap<AgentId, Arc<AgentLoop>>>>`.
-/// Shared across the IPC layer (state, spawn, events). A type alias so the
-/// 8+ spellings of this type don't drift.
-pub(crate) type AgentLoopMap =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<AgentId, Arc<AgentLoop>>>>;
 
 /// The agent-runtime slice of [`IpcState`].
 pub struct AgentRuntimeContext {

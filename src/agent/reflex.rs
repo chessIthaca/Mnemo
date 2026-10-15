@@ -946,7 +946,7 @@ mod tests {
             questions.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
             vec!["complexity", "action", "risk_flag"]
         );
-        let mut expected = vec![
+        let mut expected = [
             vec!["escalate", "high", "medium", "small"],
             vec!["complete", "continue", "escalate", "retry", "verify"],
             vec!["data_loss", "none", "security"],

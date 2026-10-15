@@ -133,7 +133,7 @@ async fn tool_result_serializes() {
 #[tokio::test]
 async fn workflow_state_changed_serializes() {
     let event = AgentEvent::WorkflowStateChanged {
-        state: mnemo::workflow::WorkflowState::Executing,
+        state: format!("{:?}", mnemo::app::workflow::WorkflowState::Executing).to_lowercase(),
         top_plan_id: Some("abc123".into()),
     };
     let SerializedEvent { event: serial, .. } = event.into_serializable();

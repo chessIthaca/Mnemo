@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 
@@ -416,9 +416,11 @@ pub struct SteeringStatsSnapshot {
     pub shell_mutations: u64,
 }
 
-/// The shared steering counters (Arc-shared, interior-mutable). One process
-/// wide instance — the metric exists to answer "is steering working"
-/// globally, and per-agent breakdowns are not surfaced.
+/// The steering counters (2c.4/G4: factory-scoped, not process-wide —
+/// the `shared()` singleton is deleted). One instance per
+/// `AgentLoopFactory`, shared by every loop the factory builds via
+/// `AgentLoop::with_steering`; the IPC layer reads the factory's
+/// instance. Loops built without wiring get their own isolated set.
 pub struct SteeringStats {
     inner: Mutex<Inner>,
 }
@@ -440,15 +442,6 @@ impl SteeringStats {
                 shell_mutations: 0,
             }),
         }
-    }
-
-    /// The process-wide shared instance, created on first use. Deliberately a
-    /// static rather than an `IpcState`/factory field: the observers live
-    /// inside the per-agent dispatch path, and the metric is process-scoped
-    /// by design (agents are cheap to co-count).
-    pub fn shared() -> &'static Arc<Self> {
-        static SHARED: OnceLock<Arc<SteeringStats>> = OnceLock::new();
-        SHARED.get_or_init(|| Arc::new(Self::new()))
     }
 
     /// Lock, recovering from poisoning — a poisoned metrics lock must never
@@ -912,7 +905,8 @@ mod tests {
         // answer arrived in-place, so it registers as a switch. Two
         // delegations must never arm the C5 intercept gate.
         let delegated_out = "AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol \
-                             (re-issue this exact search to get the plain file search instead):";
+                             (the plain file matches follow below; re-issue this exact search \
+                             to drop the block):";
         let stats = SteeringStats::new();
         stats.observe_result(1, "search", delegated_out);
         stats.observe_result(1, "search", delegated_out);

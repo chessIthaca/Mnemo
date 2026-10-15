@@ -15,6 +15,7 @@
  */
 
 import type { ReactNode } from "react";
+import { noteLinkPress, takeLinkPress } from "../../lib/linkGesture";
 import { normalizeLocalFileHref } from "../../lib/markdownLink";
 import { openChatLink } from "../../lib/openChatLink";
 import { openFileInViewer } from "../../lib/openFile";
@@ -81,18 +82,36 @@ export function MarkdownLink({
             : "Opens in the Browser tab — ctrl-click for your browser"
         }
         className="cursor-pointer underline underline-offset-2"
+        onMouseDown={(e) => {
+          // Sample the escape hatch at PRESS time (lib/linkGesture.ts): the
+          // engine decides a ctrl/middle-click gesture itself and can dispatch
+          // the click without the modifier (user report 2026-10-01), so the
+          // click's own flags are only the fallback. Suppressing the press
+          // also stops the engine's native gesture.
+          if (noteLinkPress(e)) e.preventDefault();
+        }}
         onClick={(e) => {
           e.preventDefault();
-          // The click modifiers keep the pre-2027-01-16 behavior: the OS
-          // default browser, instead of the app's own Browser tab.
-          openMarkdownTarget(trimmed, { osBrowser: e.ctrlKey || e.metaKey });
+          // The press is the reliable signal; the click modifiers keep the
+          // pre-2027-01-16 behavior — the OS default browser instead of the
+          // app's own Browser tab — as the fallback.
+          openMarkdownTarget(trimmed, {
+            osBrowser: takeLinkPress() || e.ctrlKey || e.metaKey,
+          });
         }}
         onAuxClick={(e) => {
-          // Middle-click is the same escape hatch (it never fires `click`).
+          // Middle-click is the same escape hatch (it never fires `click`),
+          // so drain the press its mousedown recorded.
           if (e.button === 1) {
             e.preventDefault();
+            takeLinkPress();
             openMarkdownTarget(trimmed, { osBrowser: true });
           }
+        }}
+        onKeyDown={(e) => {
+          // Keyboard activation fires no press — drain any record an aborted
+          // press left behind, so Enter cannot inherit a stale hatch.
+          if (e.key === "Enter" || e.key === " ") takeLinkPress();
         }}
       >
         {children}

@@ -47,7 +47,6 @@ use crate::provider::{
 use crate::runtime::{AgentCommand, AgentEvent, AgentId, PhaseKind};
 use crate::tool::agent::git::resolve_git_subcommand;
 use crate::tool::ToolResult;
-use crate::workflow::WorkflowState;
 
 /// The per-row payload for [`AgentLoop::record_stats_row`] (R21): the token,
 /// timing, and tag fields of a request_stats row. The identity fields (id,
@@ -274,6 +273,50 @@ pub(crate) struct TurnState {
     spend_turn_id: Option<String>,
 }
 
+/// The per-turn plumbing threaded from `run_turn` through the turn helpers
+/// (`maybe_compact`, `request_stream`, `consume_stream`,
+/// `record_interrupted_output`, `execute_tool_batch`, `handle_bad_json`):
+/// the agent's identity + session id, the provider and event fan-in, and
+/// the mutable command channel, turn state, and message list. Grouped so
+/// the helper signatures stay readable; each helper destructures it at
+/// its head and the body reads plain locals. Two lifetimes because
+/// `request_stream` returns a stream that borrows only the shared half
+/// (`'a`): the `&mut` half (`'b`) ends with the call, so the caller can
+/// keep mutating state/messages between helper calls.
+pub(crate) struct TurnCtx<'a, 'b> {
+    /// The agent's identity — stamped on every emitted event.
+    pub(crate) agent_id: AgentId,
+    /// The persisted session's id, if any.
+    pub(crate) session_id: Option<&'a str>,
+    /// The turn's provider handle.
+    pub(crate) provider: &'a Arc<dyn LlmClient>,
+    /// The event fan-in every helper emits through.
+    pub(crate) fanin_tx: &'a mpsc::Sender<(AgentId, AgentEvent)>,
+    /// The command channel borrow (interrupts, approvals, steers — in
+    /// `handle_bad_json`, the batch-isolation borrow that lets the
+    /// well-formed subset run through `execute_tool_batch`, plan d3aedfee).
+    pub(crate) cmd_rx: &'b mut mpsc::Receiver<AgentCommand>,
+    /// The per-turn counters/flags record.
+    pub(crate) state: &'b mut TurnState,
+    /// The turn's message list.
+    pub(crate) messages: &'b mut Vec<Message>,
+}
+
+/// The assistant response's echo-back metadata — the text, reasoning,
+/// message meta, and response id recorded with the assistant turn and
+/// echoed on the next request. Grouped with `TurnCtx` for the same
+/// signature-budget reason; destructured at the helper's head.
+pub(crate) struct AssistantEcho<'a> {
+    /// The assistant's text content.
+    pub(crate) text: &'a str,
+    /// The model's reasoning/thinking text, if any.
+    pub(crate) reasoning: &'a Option<String>,
+    /// Provider-reported message metadata, if any.
+    pub(crate) msg_meta: &'a Option<serde_json::Map<String, serde_json::Value>>,
+    /// The provider's response id — taken into the recorded message.
+    pub(crate) response_id: &'a mut Option<String>,
+}
+
 impl TurnState {
     /// A fresh per-turn state: all counters zeroed, no stop signal, no
     /// compaction announced, empty caches. The single construction site
@@ -437,6 +480,35 @@ impl AgentLoop {
                 return Ok(outcome);
             }
 
+            // G7 (§5.9.7): session limits — checked before every provider
+            // request (after the deferred-swap early exit, mirroring the
+            // routing iteration count below). A hit ends the turn with
+            // Finished{LimitReached{which}} and parks the session. The
+            // guard is bound + dropped BEFORE the await (an if-let
+            // scrutinee temporary would live through the block and pin
+            // the future to the thread).
+            let limit_hit = self
+                .limiter
+                .lock()
+                .expect("limiter lock poisoned")
+                .begin_request();
+            if let Some(which) = limit_hit {
+                let _ = fanin_tx
+                    .send((
+                        agent_id,
+                        AgentEvent::Finished {
+                            reason: FinishReason::LimitReached { which },
+                        },
+                    ))
+                    .await;
+                return Ok(TurnOutcome {
+                    finish_reason: FinishReason::LimitReached { which },
+                    text: String::new(),
+                    tool_calls_made: 0,
+                    stop_reason: None,
+                });
+            }
+
             // Routing log (backlog 091e694d): count this provider iteration —
             // placed after the deferred-swap early exit above, so a swap that
             // ends the turn before any request is built never counts as one
@@ -484,7 +556,19 @@ impl AgentLoop {
             // are written regardless of the budget flag — it gates only the
             // caps), and the failed-cycle marker says this iteration's
             // request IS the retry.
-            let plan_scope = self.read_plan_scope().await;
+            // 2a.8: the live plan scope consults the agent's policy —
+            // WorkflowPolicy::spend_tags reads the SAME two workflow fields
+            // read_plan_scope assembled (the row's plan_id/step_index are
+            // unchanged); NoPolicy returns the default (empty) tags,
+            // indistinguishable from no-plan-live, so the kernel falls back
+            // to its own read — byte-identical rows for policy and
+            // no-policy loops.
+            let plan_scope = match self.policy().spend_tags().await {
+                tags if tags.plan_id.is_some() => {
+                    Some((tags.plan_id.expect("checked above"), tags.step_index))
+                }
+                _ => self.workflow.plan_scope().await,
+            };
             let retry_pending = self.take_pending_lane_retry();
             // The deterministic budget gate: when a cap is reached, PAUSE the
             // plan through a pending question — never a hard kill (the plan
@@ -563,8 +647,14 @@ impl AgentLoop {
             // finish during Executing) are still rejected — advertisement is
             // frozen, enforcement is not.
             let tool_filter = {
-                let wf = self.workflow.lock().await;
-                wf.schema_filter()
+                // 2a.3: the advertisement consult — the policy owns the
+                // plan-frozen schema filter (byte-stable advertisement);
+                // NoPolicy falls back to the raw read.
+                let surface = self.policy().tool_surface().await;
+                match surface.advertise {
+                    Some(f) => f,
+                    None => self.workflow.schema_filter().await,
+                }
             };
             // Build the tool schemas (filtered by workflow state).
             let mut tool_schemas = self.tools.schemas(provider.capabilities(), &tool_filter);
@@ -624,14 +714,16 @@ impl AgentLoop {
             if token_count >= context_manager.effective_limit() {
                 if let Some(outcome) = self
                     .maybe_compact(
-                        &mut state,
-                        messages,
-                        &provider,
+                        TurnCtx {
+                            agent_id,
+                            session_id,
+                            provider: &provider,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            state: &mut state,
+                            messages: &mut *messages,
+                        },
                         &context_manager,
-                        fanin_tx,
-                        agent_id,
-                        session_id,
-                        cmd_rx,
                         token_count,
                         &mut breakdown,
                     )
@@ -688,14 +780,16 @@ impl AgentLoop {
             let mut buffered_steers: Vec<crate::runtime::SteerPayload> = Vec::new();
             let stream_result = self
                 .request_stream(
-                    messages,
-                    &provider,
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     &tool_schemas,
-                    fanin_tx,
-                    agent_id,
-                    session_id,
-                    cmd_rx,
-                    &mut state,
                     &mut buffered_steers,
                     prep_started,
                 )
@@ -767,14 +861,17 @@ impl AgentLoop {
                 mut stream_error,
             } = self
                 .consume_stream(
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     stream,
-                    &provider,
                     &context_manager,
-                    &mut state,
-                    fanin_tx,
-                    agent_id,
-                    cmd_rx,
-                    session_id,
                     estimated_prompt_tokens,
                     &breakdown,
                 )
@@ -794,14 +891,18 @@ impl AgentLoop {
             // partial output — see record_interrupted_output.
             if let Some(outcome) = self
                 .record_interrupted_output(
-                    &mut state,
-                    messages,
+                    TurnCtx {
+                        agent_id,
+                        session_id,
+                        provider: &provider,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        state: &mut state,
+                        messages: &mut *messages,
+                    },
                     &mut acc,
                     &text,
                     &assistant_reasoning,
-                    &provider,
-                    fanin_tx,
-                    agent_id,
                 )
                 .await
             {
@@ -885,19 +986,23 @@ impl AgentLoop {
             if has_bad_json {
                 if let Some(outcome) = self
                     .handle_bad_json(
-                        &mut state,
+                        TurnCtx {
+                            agent_id,
+                            session_id,
+                            provider: &provider,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            state: &mut state,
+                            messages: &mut *messages,
+                        },
+                        AssistantEcho {
+                            text: &text,
+                            reasoning: &assistant_reasoning,
+                            msg_meta: &msg_meta,
+                            response_id: &mut response_id,
+                        },
                         &tool_calls,
-                        messages,
                         &finish_reason,
-                        &text,
-                        &assistant_reasoning,
-                        &msg_meta,
-                        &mut response_id,
-                        &provider,
-                        fanin_tx,
-                        agent_id,
-                        cmd_rx,
-                        session_id,
                         &tool_schemas,
                     )
                     .await
@@ -976,20 +1081,24 @@ impl AgentLoop {
             // then record the tools-phase duration and compact old tool
             // results — see execute_tool_batch.
             self.execute_tool_batch(
+                TurnCtx {
+                    agent_id,
+                    session_id,
+                    provider: &provider,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    state: &mut state,
+                    messages: &mut *messages,
+                },
+                AssistantEcho {
+                    text: &text,
+                    reasoning: &assistant_reasoning,
+                    msg_meta: &msg_meta,
+                    response_id: &mut response_id,
+                },
                 &tool_calls,
                 &tool_calls,
-                &text,
-                &assistant_reasoning,
-                msg_meta,
                 &mut raw,
-                &mut response_id,
-                messages,
-                fanin_tx,
-                agent_id,
-                cmd_rx,
-                session_id,
-                &provider,
-                &mut state,
             )
             .await;
 
@@ -1196,13 +1305,12 @@ impl AgentLoop {
         target: model_routing::RouteTarget,
     ) -> Option<crate::config::ModelRef> {
         let resolver = self.model_resolver.as_ref()?;
-        let wf = self.workflow.lock().await;
-        let ctx = crate::model_resolver::ModelContext::new(
-            wf.state(),
-            wf.active_skill().map(|s| s.name.as_str()),
-            self.is_subagent(),
-            wf.active_plan_kind(),
-        );
+        // 2b.3: the context rides the policy's live route consult (the
+        // state/skill/kind derivation lives app-side).
+        let ctx = crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
+            is_subagent: self.is_subagent(),
+        };
         resolver.resolve_routed(target, ctx)
     }
 
@@ -1228,17 +1336,12 @@ impl AgentLoop {
             return None;
         }
         let policy = self.model_resolver.as_ref()?.routing_policy()?;
-        // The live step, under the workflow lock; the guard is dropped before
-        // the first await (decide + resolve both await). The plan's IDENTITY
+        // The live step, via the neutral handle (2b.3 — the guard lives
+        // app-side); the plan's IDENTITY
         // is its id, never its title -- agent-generated titles repeat, and the
         // memo must never serve a new plan a decision made for its
         // predecessor (ad56c7bd review finding L1).
-        let (plan_id, step_index, step_text) = {
-            let wf = self.workflow.lock().await;
-            let step = wf.current_step()?;
-            let plan_id = wf.plan_id()?.to_string();
-            (plan_id, step.index, step.text.clone())
-        };
+        let (plan_id, step_index, step_text) = self.workflow.lane_step_snapshot().await?;
         let epoch = self
             .escalation_epoch
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1369,17 +1472,6 @@ impl AgentLoop {
         }
     }
 
-    /// The live plan's `(id, current step)` under ONE workflow lock —
-    /// `None` when no plan is active (chat turns and subagents run
-    /// planless). Shared by the budget gate and the spend attribution
-    /// (backlog a25a5323), so a single read serves both and the ledger rows
-    /// are written regardless of the budget flag.
-    async fn read_plan_scope(&self) -> Option<(String, Option<usize>)> {
-        let wf = self.workflow.lock().await;
-        let plan_id = wf.plan_id()?.to_string();
-        Some((plan_id, wf.current_step().map(|s| s.index)))
-    }
-
     /// The deterministic budget gate (backlog a25a5323, the cost-saving
     /// chain's budget item): called at every plan-step boundary, after the
     /// lane decision and before the request resolves. Counts the pending
@@ -1410,9 +1502,7 @@ impl AgentLoop {
             return None;
         }
         // No live plan (chat turns, subagents): nothing to cap.
-        let Some((plan_id, step_index)) = plan_scope else {
-            return None;
-        };
+        let (plan_id, step_index) = plan_scope?;
         // Counters: point them at this plan (a new plan resets everything),
         // then apply the pending failed-cycle retry to the step that runs
         // next.
@@ -1840,14 +1930,13 @@ impl AgentLoop {
                 || tc.name == "skill_end"
                 || tc.name == "abandon_skill")
         {
-            let (wf_state, step_index, top_plan_id, plan_title, plan_goal) = {
-                let wf = self.workflow.lock().await;
-                let state = wf.state();
-                let top_plan_id = wf.top_plan_id().map(|s| s.to_string());
-                let plan = wf.plan();
-                let plan_title = plan.map(|p| p.title.clone());
-                let plan_goal = plan.map(|p| p.goal.clone());
-                let step_index = if tc.name == "complete_step" {
+            // 2b.3: the gate's workflow-sourced fields ride the neutral
+            // handle's snapshot (the state token, the plan identity); the
+            // completing step number stays kernel-side — it is parsed from
+            // the tool's own arguments.
+            let (wf_state, top_plan_id, plan_title, plan_goal) =
+                self.workflow.plan_gate_snapshot().await;
+            let step_index = if tc.name == "complete_step" {
                     serde_json::from_str::<serde_json::Value>(&tc.arguments)
                         .ok()
                         .and_then(|v| match v.get("step_index") {
@@ -1863,16 +1952,14 @@ impl AgentLoop {
                             _ => None,
                         })
                         .map(|i| i as u32)
-                } else {
-                    None
-                };
-                (state, step_index, top_plan_id, plan_title, plan_goal)
+            } else {
+                None
             };
             let _ = fanin_tx
                 .send((
                     agent_id,
                     AgentEvent::WorkflowStateChanged {
-                        state: wf_state,
+                        state: wf_state.clone(),
                         top_plan_id: top_plan_id.clone(),
                     },
                 ))
@@ -1899,7 +1986,7 @@ impl AgentLoop {
             // (e.g. merge_to_main) re-enters Complete for the same
             // plan. Guard on the root plan id so each plan is captured
             // at most once per session.
-            if wf_state == WorkflowState::Complete && result.success {
+            if wf_state == "complete" && result.success {
                 let already_captured = top_plan_id
                     .as_deref()
                     .map(|id| self.captured_complete_plan_id().as_deref() == Some(id))
@@ -1965,21 +2052,27 @@ impl AgentLoop {
     /// (quality review HIGH 1); behavior unchanged.
     async fn execute_tool_batch(
         &self,
+        ctx: TurnCtx<'_, '_>,
+        echo: AssistantEcho<'_>,
         tool_calls: &[ToolCall],
         recorded_calls: &[ToolCall],
-        text: &str,
-        assistant_reasoning: &Option<String>,
-        msg_meta: Option<serde_json::Map<String, serde_json::Value>>,
         raw: &mut Option<serde_json::Value>,
-        response_id: &mut Option<String>,
-        messages: &mut Vec<Message>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
-        provider: &Arc<dyn LlmClient>,
-        state: &mut TurnState,
     ) {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
+        let AssistantEcho {
+            text,
+            reasoning: assistant_reasoning,
+            msg_meta,
+            response_id,
+        } = echo;
         // A stop signal set by a tool call (Interrupt/Cancel during approval or
         // ask_user, or — once step 4 lands — during tool execution). When set,
         // the turn ends at the next break point (after the current tool call
@@ -2017,7 +2110,7 @@ impl AgentLoop {
         // passes the same slice for both.
         messages.push(Message {
             reasoning_content: assistant_reasoning.clone(),
-            provider_meta: msg_meta,
+            provider_meta: msg_meta.clone(),
             raw: raw.take(),
             response_id: response_id.take(),
             origin_provider: Some(provider.kind().as_str().to_string()),
@@ -2201,6 +2294,14 @@ impl AgentLoop {
                     }
                 }
             }
+
+            // 2a.8: the policy's per-tool hook — one consult per executed
+            // tool call, the attempt-final result (an auto-retry replaces
+            // the failed first attempt in `result` right above, so the
+            // hook sees exactly what the model sees). NoPolicy's hook is a
+            // no-op; WorkflowPolicy's is a documented no-op until the
+            // 2b/2c engine seam — the advisory seam, master-spec :223.
+            self.policy().after_tool(&tc.name, &result).await;
 
             // Merge the per-tool-call stop signal (Interrupt/Cancel from
             // approval or ask_user) into the turn-level stop_reason.
@@ -2655,18 +2756,20 @@ impl AgentLoop {
         // returns a model, build the throwaway provider + context
         // manager for it; otherwise fall back to the live default pair.
         let (provider, context_manager) = {
-            let wf = self.workflow.lock().await;
-            let skill_name = wf.active_skill().map(|s| s.name.as_str());
-            let plan_kind = wf.active_plan_kind();
+            // 2b.3: the skill name rides the neutral handle; the state and
+            // plan-kind locals retired with the route consult inside the
+            // resolve chain (the derivation lives app-side).
+            let skill_name = self.workflow.active_skill_name().await;
             // `route` is the turn's pre-prompt routing decision (backlog
             // 091e694d): the routed variant applies it above the
             // state/subagent chain and below the explicit-pin arms; with no
             // route the plain chain runs unchanged.
             let resolved = match route {
                 Some(target) => {
-                    self.resolve_turn_provider_routed(wf.state(), skill_name, plan_kind, Some(target))
+                    self.resolve_turn_provider_routed(skill_name.as_deref(), Some(target))
+                        .await
                 }
-                None => self.resolve_turn_provider(wf.state(), skill_name, plan_kind),
+                None => self.resolve_turn_provider(skill_name.as_deref()).await,
             };
             match resolved {
                 Some((p, cm)) => (p, cm),
@@ -2736,17 +2839,20 @@ impl AgentLoop {
     /// from run_turn (quality review HIGH 1); behavior unchanged.
     pub(crate) async fn maybe_compact(
         &self,
-        state: &mut TurnState,
-        messages: &mut Vec<Message>,
-        provider: &Arc<dyn LlmClient>,
+        ctx: TurnCtx<'_, '_>,
         context_manager: &context::ContextManager,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        session_id: Option<&str>,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
         token_count: usize,
         breakdown: &mut crate::runtime::ContextBreakdown,
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
         // Auto-compaction runs a whole extra LLM call inside the
         // "sending" window — surface it as its own live phase so the
         // inflight bar doesn't sit on "sending…" for the duration.
@@ -3104,7 +3210,7 @@ impl AgentLoop {
                         ))
                         .await;
                     if images.is_empty() {
-                        Self::push_suggestion_message(messages, &provider, &text);
+                        Self::push_suggestion_message(messages, provider, &text);
                     } else {
                         let content = self
                             .build_user_content(agent_id, fanin_tx, text, &images)
@@ -3463,8 +3569,8 @@ impl AgentLoop {
     /// Build and install the system prompt for this iteration: the stable head
     /// (preamble + constitution + session primer + hidden tool-group index) into
     /// messages[0], and the volatile tail (workflow state + recalled memories)
-    /// + the byte-stable CONTEXT_FOOTER as the last two messages, popped right
-    /// after the request returns. Their ROLE follows
+    /// plus the byte-stable CONTEXT_FOOTER as the last two messages, popped
+    /// right after the request returns. Their ROLE follows
     /// [`Self::tail_is_user_role`]: user for DeepSeek-vendor/Local, system
     /// otherwise — the same two messages either way.
     ///
@@ -3489,12 +3595,18 @@ impl AgentLoop {
         // The stable head is cached and rebuilt only when the constitution
         // changes (L4) — re-reads agent.md on mtime change internally.
         let (stable_head, mut volatile_tail) = {
-            let wf = self.workflow.lock().await;
-            let stable_head = self.constitution.stable_head();
+            let stable_head = self.constitution.stable_head(&*self.policy());
+            // 2a.4: the tail consults the policy — the workflow section is
+            // the app's volatile_tail (the policy locks the workflow
+            // internally); NoPolicy falls back to an empty app tail.
+            let app_tail = self
+                .policy()
+                .volatile_tail(provider.capabilities())
+                .await;
             let mut volatile_tail = prompt::build_volatile_tail(
                 provider.capabilities(),
-                &wf,
-                memory_context.as_deref(),
+                &app_tail,
+                memory_context,
             );
             // Eager Complete → Planning nudge: when the agent is resting
             // in Complete state and the user's latest message looks like a
@@ -3509,11 +3621,11 @@ impl AgentLoop {
                 .rev()
                 .find(|m| m.role == Role::User)
                 .map(|m| m.content.as_text());
-            prompt::append_plan_nudge(
-                &mut volatile_tail,
-                wf.state(),
-                latest_user_msg.as_deref(),
-            );
+        prompt::append_plan_nudge(
+            &mut volatile_tail,
+            self.workflow.is_complete().await,
+            latest_user_msg.as_deref(),
+        );
             (stable_head, volatile_tail)
         };
 
@@ -3556,9 +3668,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
         match self.session_primer() {
             Some(Some(primer)) => {
-                head_content.push_str("\n");
+                head_content.push('\n');
                 head_content.push_str(&primer);
-                head_content.push_str("\n");
+                head_content.push('\n');
             }
             Some(None) => {
                 // Fetched already, no primer — append nothing, do not refetch.
@@ -3572,9 +3684,9 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     Ok(memories) if !memories.is_empty() => {
                         let primer = prompt::format_primer(&memories);
                         if !primer.trim().is_empty() {
-                            head_content.push_str("\n");
+                            head_content.push('\n');
                             head_content.push_str(&primer);
-                            head_content.push_str("\n");
+                            head_content.push('\n');
                         }
                         self.set_session_primer(Some(Some(primer)));
                     }
@@ -3722,6 +3834,31 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         }
     }
 
+    /// Fan one live `AgentEvent` on the injected route (§5.7, job 3b.4) —
+    /// the sync-method bridge for the loop's persistence sites: the live
+    /// `Savings` / `Spend` events ride the same bounded fan-in the turn's
+    /// async paths already announce on, emitted at exactly the points where
+    /// their ledger rows persist. Fire-and-forget: a missing route
+    /// (directly-built test loops), no `agent_id`, or a bounded-full
+    /// fan-in drops the event — live telemetry is best-effort and the turn
+    /// never blocks on it (the store rows are the durable truth). The
+    /// routing tuple mirrors every other fan-in send in the runtime (the
+    /// loop's own `agent_id`, the event).
+    fn emit_live_event(&self, event: AgentEvent) {
+        let Some(tx) = &*self.event_fanin.lock().expect("event_fanin lock poisoned")
+        else {
+            return;
+        };
+        let Some(agent_id) = *self.agent_id.lock().expect("agent_id lock poisoned")
+        else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send((agent_id, event)).await;
+        });
+    }
+
     /// Record one per-decision spend row (backlog a25a5323) — the budget
     /// layer's ledger. Fire-and-forget through the shared store (mirrors
     /// [`record_stats_row`](Self::record_stats_row)); the per-plan counters
@@ -3743,6 +3880,18 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         self.with_plan_spend(|spend| {
             spend.note_plan(&attr.plan_id);
             spend.note_tokens(prompt_tokens as u64, completion_tokens as u64);
+        });
+        // Live event (§5.7, job 3b.4): fan the `Spend` at the point the row
+        // persists — attribution-gated like the ledger (the early return
+        // above), but not store-gated: the inline counters above update the
+        // same way, and a memory-Disabled session's live budget totals still
+        // count (the durable row is the store's half alone).
+        self.emit_live_event(AgentEvent::Spend {
+            model: provider.model().to_string(),
+            lane: attr.lane.clone(),
+            tokens_in: prompt_tokens as i64,
+            tokens_out: completion_tokens as i64,
+            cached_tokens: cached_tokens.map(|c| c as i64),
         });
         let Some(store) = &self.memory else {
             return;
@@ -3816,6 +3965,17 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             measured,
             created_at: now_epoch,
         };
+        // Live event (§5.7, job 3b.4): fan the `Savings` at the point the
+        // ledger row persists — un-gated by the store, mirroring the
+        // in-memory counters above (the durable row is the store's half
+        // alone).
+        self.emit_live_event(AgentEvent::Savings {
+            kind: kind.to_string(),
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before - tokens_after,
+            measured,
+        });
         if let Some(store) = &self.memory {
             let store = Arc::clone(store);
             tokio::spawn(async move {
@@ -3917,8 +4077,8 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                     session_id,
                     "archive",
                     Some(tool.to_string()),
-                    crate::tool::agent::optimizer::estimate_tokens(output) as i64,
-                    crate::tool::agent::optimizer::estimate_tokens(&preview) as i64,
+                    crate::tool::agent::optimizer::estimate_tokens(output),
+                    crate::tool::agent::optimizer::estimate_tokens(&preview),
                     false,
                 );
                 preview
@@ -3949,7 +4109,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
         if region.is_empty() {
             return None;
         }
-        let region_tokens = crate::tool::agent::optimizer::estimate_tokens(&region) as i64;
+        let region_tokens = crate::tool::agent::optimizer::estimate_tokens(&region);
         match store
             .archive_tool_result(
                 session_id,
@@ -4049,20 +4209,23 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// run_turn (quality review HIGH 1); behavior unchanged.
     async fn request_stream<'a>(
         &self,
-        messages: &mut Vec<Message>,
-        provider: &'a Arc<dyn LlmClient>,
+        ctx: TurnCtx<'a, '_>,
         tool_schemas: &[crate::provider::ToolSchema],
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        session_id: Option<&str>,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        state: &mut TurnState,
         buffered_steers: &mut Vec<crate::runtime::SteerPayload>,
         prep_started: std::time::Instant,
     ) -> Result<
         (futures::stream::BoxStream<'a, LlmEvent>, u32),
         crate::error::Error,
     > {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
         // The provider request (connection establishment + first byte) is
         // interruptible: an Interrupt/Cancel arriving during this window is
         // caught by a select! that polls cmd_rx. reqwest is drop-safe (the
@@ -4117,13 +4280,18 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             crate::provider::estimate_prompt_tokens(messages, tool_schemas) as u32;
         let stream_result = {
             let complete_fut = self.complete_with_retry(
-                &provider,
+                provider,
                 messages,
-                &tool_schemas,
+                tool_schemas,
                 fanin_tx,
                 agent_id,
                 session_id,
             );
+            // G5 (3a.6): the pre-request history snapshot — a mid-request
+            // ExportHistory answers from this (the pinned future holds the
+            // live borrow; the snapshot is the conversation as of the
+            // request start, missing only the in-flight assistant turn).
+            let history_at_request = messages.to_vec();
             tokio::pin!(complete_fut);
             loop {
                 tokio::select! {
@@ -4143,6 +4311,23 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                             break Err(crate::error::Error::Provider(
                                 "interrupted during provider request".into(),
                             ));
+                        }
+                        Some(AgentCommand::ExportHistory { reply }) => {
+                            // G5 (3a.6): the pure read answers from the
+                            // pre-request snapshot — the live borrow is
+                            // pinned into the provider future above.
+                            let used = crate::agent::context::ContextManager::count_tokens(
+                                &history_at_request,
+                            )
+                            as u32;
+                            let _ = reply
+                                .send(crate::runtime::channels::ConversationExport {
+                                    messages: history_at_request.clone(),
+                                    model: None,
+                                    used_tokens: used,
+                                    max_tokens: self.context_manager().max_tokens() as u32,
+                                })
+                                .await;
                         }
                         Some(AgentCommand::Cancel) => {
                             state.stop_reason = Some(StopReason::Cancel);
@@ -4211,17 +4396,21 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// HIGH 1); behavior unchanged.
     async fn consume_stream(
         &self,
+        ctx: TurnCtx<'_, '_>,
         stream: futures::stream::BoxStream<'_, LlmEvent>,
-        provider: &Arc<dyn LlmClient>,
         context_manager: &context::ContextManager,
-        state: &mut TurnState,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
         estimated_prompt_tokens: u32,
         breakdown: &crate::runtime::ContextBreakdown,
     ) -> StreamOutcome {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            ..
+        } = ctx;
         let mut acc = DeltaAccumulator::new();
         let mut text = String::new();
         // The model's reasoning/thinking text this turn (DeepSeek
@@ -4412,7 +4601,7 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
                                     .send((agent_id, AgentEvent::ContextUsage {
                                         used: prompt_tokens,
                                         max: context_manager.max_tokens() as u32,
-                                        breakdown: breakdown.clone(),
+                                        breakdown: *breakdown,
                                         // Lever 6 grades only the top-of-loop and
                                         // post-compaction emissions; this mid-stream
                                         // re-anchor keeps the previous grade (the
@@ -4553,15 +4742,19 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// behavior unchanged.
     async fn record_interrupted_output(
         &self,
-        state: &mut TurnState,
-        messages: &mut Vec<Message>,
+        ctx: TurnCtx<'_, '_>,
         acc: &mut DeltaAccumulator,
         text: &str,
         assistant_reasoning: &Option<String>,
-        provider: &Arc<dyn LlmClient>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            provider,
+            fanin_tx,
+            state,
+            messages,
+            ..
+        } = ctx;
         // A HARD stop signal arrived during streaming (Interrupt, Cancel,
         // Compact, Clear — with or without carried steers). End the turn
         // at this break point (the current stream chunk completed — we're
@@ -4705,25 +4898,29 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
     /// the batch from history and nothing runs.
     async fn handle_bad_json(
         &self,
-        state: &mut TurnState,
+        ctx: TurnCtx<'_, '_>,
+        echo: AssistantEcho<'_>,
         tool_calls: &[ToolCall],
-        messages: &mut Vec<Message>,
         finish_reason: &FinishReason,
-        text: &str,
-        assistant_reasoning: &Option<String>,
-        msg_meta: &Option<serde_json::Map<String, serde_json::Value>>,
-        response_id: &mut Option<String>,
-        provider: &Arc<dyn LlmClient>,
-        fanin_tx: &mpsc::Sender<(AgentId, AgentEvent)>,
-        agent_id: AgentId,
-        // Batch isolation (plan d3aedfee): needed to execute the well-formed
-        // subset through the normal tool path (execute_tool_batch).
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        session_id: Option<&str>,
         // The request's advertised tool schemas — the one-liner's required
         // list comes from the matching tool's `parameters.required`.
         tool_schemas: &[crate::provider::ToolSchema],
     ) -> Option<TurnOutcome> {
+        let TurnCtx {
+            agent_id,
+            session_id,
+            provider,
+            fanin_tx,
+            cmd_rx,
+            state,
+            messages,
+        } = ctx;
+        let AssistantEcho {
+            text,
+            reasoning: assistant_reasoning,
+            msg_meta,
+            response_id,
+        } = echo;
         // Bad JSON is an LLM output issue the model can recover from by
         // emitting valid JSON — it does NOT count toward MAX_RETRIES
         // (tool-execution failures). It uses the higher
@@ -4929,20 +5126,24 @@ AVAILABLE TOOL GROUPS — not in your tool list yet. Call                      l
             // malformed calls are not dispatched; the guidance loop below
             // errors them, so history still holds N results for N calls.
             self.execute_tool_batch(
+                TurnCtx {
+                    agent_id,
+                    session_id,
+                    provider,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    state: &mut *state,
+                    messages: &mut *messages,
+                },
+                AssistantEcho {
+                    text,
+                    reasoning: assistant_reasoning,
+                    msg_meta,
+                    response_id: &mut *response_id,
+                },
                 &valid_subset,
                 &sanitized_calls,
-                text,
-                assistant_reasoning,
-                msg_meta.clone(),
                 &mut None,
-                response_id,
-                messages,
-                fanin_tx,
-                agent_id,
-                cmd_rx,
-                session_id,
-                provider,
-                state,
             )
             .await;
         }

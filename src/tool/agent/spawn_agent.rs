@@ -27,7 +27,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Mutex;
 
 use crate::agent::review_scope::{render_review_preamble, ReviewScope, ReviewScoper};
 use crate::memory::MemoryStoreTrait;
@@ -35,7 +34,6 @@ use crate::model_resolver::ModelResolver;
 use crate::provider::ToolSchema;
 use crate::runtime::AgentSpawner;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
-use crate::workflow::Workflow;
 
 /// Arguments for `spawn_agent`.
 #[derive(Debug, Deserialize)]
@@ -121,6 +119,10 @@ pub struct SpawnAgentTool {
     /// their round on the plan frame after a successful spawn. `None` in
     /// tests — the spawn then behaves exactly as before.
     review_scope: Option<ReviewScopeWiring>,
+    /// The PARENT's approval policy (2c.5, §5.4 :377): passed to every
+    /// spawn call so subagents inherit it. Defaults to the kernel's
+    /// `OverridePermissions`; the factory wires its loops' policy here.
+    permission: crate::agent::policy::PermissionPolicy,
 }
 
 /// The wiring that lets a REVIEWER spawn render the harness preamble and stamp
@@ -130,8 +132,9 @@ pub struct SpawnAgentTool {
 /// spawn forwards the task verbatim exactly as it did before.
 pub struct ReviewScopeWiring {
     /// The agent's workflow — its active plan frame carries the round stamps
-    /// ([`Workflow::review_rounds`]) and receives the new one.
-    workflow: Arc<Mutex<Workflow>>,
+    /// ([`Workflow::review_rounds`]) and receives the new one. Held as the
+    /// neutral handle since 2b.3 (the round facts ride its opaque surface).
+    workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The repository the git reads run in (the agent's project root).
     root: PathBuf,
     /// The git-facing scope reader — [`GitReviewScoper`] in production, a
@@ -150,6 +153,7 @@ impl SpawnAgentTool {
             model_resolver: None,
             memory: None,
             review_scope: None,
+            permission: crate::agent::policy::PermissionPolicy::default(),
         }
     }
 
@@ -195,7 +199,7 @@ impl SpawnAgentTool {
     /// chaining — the factory calls this right after construction.
     pub fn with_review_scope(
         mut self,
-        workflow: Arc<Mutex<Workflow>>,
+        workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
         root: PathBuf,
         scoper: Arc<dyn ReviewScoper>,
     ) -> Self {
@@ -204,6 +208,17 @@ impl SpawnAgentTool {
             root,
             scoper,
         });
+        self
+    }
+
+    /// Wire the PARENT's approval policy (2c.5, §5.4 :377) so subagents
+    /// inherit it — the factory calls this right after construction with
+    /// the same policy it sets on the loop being built.
+    pub fn with_permission(
+        mut self,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Self {
+        self.permission = permission;
         self
     }
 }
@@ -423,20 +438,9 @@ impl Tool for SpawnAgentTool {
         let mut stamped_base: Option<String> = None;
         let task = match (role.as_deref(), self.review_scope.as_ref()) {
             (Some("reviewer"), Some(wiring)) => {
-                let (round, previous_base) = {
-                    // Snapshot-and-drop: the workflow lock is shared with every
-                    // workflow tool, so it is released before any git
-                    // round-trip (never held across I/O).
-                    let wf = wiring.workflow.lock().await;
-                    let rounds = wf.review_rounds();
-                    let round = rounds.len() as u32 + 1;
-                    let previous_base = if round >= 2 {
-                        rounds.last().map(|s| s.base.clone())
-                    } else {
-                        None
-                    };
-                    (round, previous_base)
-                };
+                // 2b.3: the round facts ride the neutral handle (the lock
+                // lives app-side — never held across I/O).
+                let (round, previous_base) = wiring.workflow.next_review_round().await;
                 // HEAD is this round's base: the dispatcher suspends while the
                 // reviewer works, so the tree it starts looking at is the tree
                 // this sha names.
@@ -485,10 +489,17 @@ impl Tool for SpawnAgentTool {
                         // unchanged).
                         forced_model.or(reviewer_pin),
                         role.clone(),
+                        // §5.4 :377 — the child inherits the parent's
+                        // policy.
+                        self.permission.clone(),
                     )
                     .await
             }
-            _ => self.spawner.spawn(&args.name, &task, role.clone()).await,
+            _ => {
+                self.spawner
+                    .spawn(&args.name, &task, role.clone(), self.permission.clone())
+                    .await
+            }
         };
 
         match spawned {
@@ -502,8 +513,8 @@ impl Tool for SpawnAgentTool {
                 if let (Some(base), Some(wiring)) =
                     (stamped_base.as_deref(), self.review_scope.as_ref())
                 {
-                    let mut wf = wiring.workflow.lock().await;
-                    if let Err(e) = wf.record_review_round(base) {
+                    // 2b.3: the stamp write rides the neutral handle.
+                    if let Err(e) = wiring.workflow.record_review_round(base).await {
                         stamp_note = Some(e.to_string());
                     }
                 }
@@ -539,13 +550,22 @@ impl Tool for SpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::app::workflow::Workflow;
     use super::*;
     use std::path::Path;
     use std::sync::Mutex;
 
+    /// One recorded spawn call: (agent name, task, model override, policy).
+    type RecordedSpawn = (
+        String,
+        String,
+        Option<String>,
+        crate::agent::policy::PermissionPolicy,
+    );
+
     /// A mock spawner that records calls and returns a canned id.
     struct MockSpawner {
-        calls: Mutex<Vec<(String, String, Option<String>)>>,
+        calls: Mutex<Vec<RecordedSpawn>>,
         result: Result<u64, String>,
     }
 
@@ -560,11 +580,17 @@ mod tests {
 
     #[async_trait]
     impl AgentSpawner for MockSpawner {
-        async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<u64, String> {
+        async fn spawn(
+            &self,
+            name: &str,
+            task: &str,
+            role: Option<String>,
+            permission: crate::agent::policy::PermissionPolicy,
+        ) -> Result<u64, String> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((name.to_string(), task.to_string(), role));
+                .push((name.to_string(), task.to_string(), role, permission));
             self.result.clone()
         }
     }
@@ -658,7 +684,7 @@ mod tests {
         let (_dir, workflow) = workflow_with_plan();
         let spawner = Arc::new(MockSpawner::ok(1));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -699,7 +725,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(2));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -737,7 +763,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(3));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper {
                 head: Err("not a git repository".to_string()),
@@ -771,7 +797,7 @@ mod tests {
             .unwrap();
         let spawner = Arc::new(MockSpawner::ok(4));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper {
                 head: Ok("head9999".to_string()),
@@ -796,7 +822,7 @@ mod tests {
         let (_dir, workflow) = workflow_with_plan();
         let spawner = Arc::new(MockSpawner::ok(5));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -836,7 +862,7 @@ mod tests {
             result: Err("boom".to_string()),
         });
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -861,7 +887,7 @@ mod tests {
         let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(dir.path().join("plans"))));
         let spawner = Arc::new(MockSpawner::ok(9));
         let tool = SpawnAgentTool::new(spawner.clone()).with_review_scope(
-            Arc::clone(&workflow),
+            crate::app::workflow::as_handle(Arc::clone(&workflow)),
             PathBuf::from("."),
             Arc::new(FakeScoper::ok()),
         );
@@ -947,6 +973,7 @@ mod tests {
             _name: &str,
             _task: &str,
             role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             *self.plain_calls.lock().unwrap() += 1;
             *self.role_seen.lock().unwrap() = role;
@@ -966,11 +993,54 @@ mod tests {
             parent_id: Option<u64>,
             _model: Option<crate::config::ModelRef>,
             role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             self.parent_calls.lock().unwrap().push(parent_id);
             *self.role_seen.lock().unwrap() = role;
             Ok(9)
         }
+    }
+
+    /// 2c.5 (§5.4 :377): the spawn param assembly carries the parent's
+    /// policy — subagents inherit it. The default (no wiring) is the
+    /// kernel's `OverridePermissions`.
+    #[tokio::test]
+    async fn spawn_passes_the_parent_permission_policy() {
+        use crate::agent::policy::PermissionPolicy;
+        let spawner = Arc::new(MockSpawner::ok(7));
+        let tool = SpawnAgentTool::new(spawner.clone());
+        let result = tool
+            .execute(json!({"name": "worker", "task": "do the thing"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert_eq!(spawner.calls.lock().unwrap().len(), 1);
+        // Statement-local guards only (clippy::await_holding_lock): each
+        // lock is a temporary dropped by the end of its statement.
+        let inherited = spawner.calls.lock().unwrap()[0].3.clone();
+        assert_eq!(
+            inherited,
+            PermissionPolicy::OverridePermissions,
+            "the child inherits the parent's (default) policy"
+        );
+
+        let spawner = Arc::new(MockSpawner::ok(8));
+        let tool = SpawnAgentTool::new(spawner.clone()).with_permission(
+            PermissionPolicy::ApproveViaApi {
+                safety_mode: crate::config::SafetyMode::Autonomous,
+            },
+        );
+        let result = tool
+            .execute(json!({"name": "worker", "task": "again"}))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        let passed = spawner.calls.lock().unwrap()[0].3.clone();
+        assert_eq!(
+            passed,
+            PermissionPolicy::ApproveViaApi {
+                safety_mode: crate::config::SafetyMode::Autonomous
+            },
+            "a wired parent passes its own policy through"
+        );
     }
 
     #[tokio::test]
@@ -1097,7 +1167,7 @@ mod tests {
     impl crate::model_resolver::ModelResolver for CannedResolver {
         fn resolve(
             &self,
-            _context: crate::model_resolver::ModelContext<'_>,
+            _context: crate::model_resolver::ModelContext,
         ) -> Option<crate::config::ModelRef> {
             None
         }
@@ -1140,6 +1210,7 @@ mod tests {
             _name: &str,
             _task: &str,
             _role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             Ok(1)
         }
@@ -1157,6 +1228,7 @@ mod tests {
             _parent_id: Option<u64>,
             model: Option<crate::config::ModelRef>,
             _role: Option<String>,
+            _permission: crate::agent::policy::PermissionPolicy,
         ) -> Result<u64, String> {
             *self.model_seen.lock().unwrap() = model;
             Ok(11)
@@ -1260,7 +1332,7 @@ mod tests {
     /// depends on (model_resolver.rs): `resolve(Reviewing, is_subagent=false)`
     /// → the reviewing slot falling back to executing; `resolve(Reviewing,
     /// is_subagent=true)` → the subagent slot. Records every context it was
-    /// asked with as `(state == Reviewing, is_subagent)` — the pin must NOT
+    /// asked with as `(deliberate-slot, is_subagent)` — the pin must NOT
     /// consult the per-turn state chain anymore ([models.reviewing] is
     /// reviewer-spawn-only), so every pin test asserts `asked` stays EMPTY:
     /// `resolve` always returns None here, and a regressed pin would visibly
@@ -1314,12 +1386,17 @@ mod tests {
     impl crate::model_resolver::ModelResolver for StateResolver {
         fn resolve(
             &self,
-            context: crate::model_resolver::ModelContext<'_>,
+            context: crate::model_resolver::ModelContext,
         ) -> Option<crate::config::ModelRef> {
-            self.asked.lock().unwrap().push((
-                context.workflow_state == crate::workflow::WorkflowState::Reviewing,
-                context.is_subagent,
-            ));
+            // 2a.6: the workflow state is no longer on the ctx (the routing
+            // key carries Reviewing as the "executing" slot); the pin tests
+            // only assert `asked` stays EMPTY, never the flag values, so the
+            // first component records whether the ctx carried any deliberate
+            // (skill/subagent/bug_fixing) slot.
+            let deliberate = context.route.slots.iter().any(|s| {
+                s.starts_with("skill:") || s == "subagent" || s == "bug_fixing"
+            });
+            self.asked.lock().unwrap().push((deliberate, context.is_subagent));
             // The reviewer pin must NOT ride the per-turn state chain anymore
             // (decision 2026-12-06): [models.reviewing] is resolved solely by
             // resolve_reviewer_model below. Always return None here so a
@@ -1553,7 +1630,7 @@ mod tests {
             }))
             .await;
         assert!(result.success, "{}", result.output);
-        let calls = spawner.calls.lock().unwrap();
+        let calls = spawner.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         // The TASK the spawner received carries the rider; the caller's
         // success message (built from the args) is unchanged.
@@ -1572,6 +1649,7 @@ mod tests {
             "the matched hit is surfaced in the task: {}",
             calls[0].1
         );
+
         // Passive by construction: recall_peek must NOT bump access counts.
         let rows = store
             .list_by_tier(crate::memory::MemoryTier::Semantic)

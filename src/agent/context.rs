@@ -2077,8 +2077,8 @@ pub struct TokenAccounting {
     head_count: u32,
     /// Per-role bucket totals.
     breakdown: crate::runtime::ContextBreakdown,
-    /// Token overhead of the request's tool-schema array (name + description
-    /// + parameters JSON per tool). The provider bills it in
+    /// Token overhead of the request's tool-schema array (name + description +
+    /// parameters JSON per tool). The provider bills it in
     /// `usage.prompt_tokens` but it belongs to no message, so it is kept out
     /// of the per-role buckets and added to the total. Set by the turn loop
     /// at the TOP of each iteration, from the schemas actually sent
@@ -2923,16 +2923,16 @@ mod tests {
 
         // Tool results indices in `messages` are 2..23 (21 results).
         // First 11 (indices 2..13) are truncated.
-        for i in 2..13 {
+        for (i, msg) in messages.iter().enumerate().skip(2).take(11) {
             assert!(
-                messages[i].content.as_text().contains(COMPACTED_MARKER),
+                msg.content.as_text().contains(COMPACTED_MARKER),
                 "message {i} should be truncated"
             );
         }
         // Last 10 (indices 13..23) are intact.
-        for i in 13..23 {
+        for (i, msg) in messages.iter().enumerate().skip(13).take(10) {
             assert!(
-                !messages[i].content.as_text().contains(COMPACTED_MARKER),
+                !msg.content.as_text().contains(COMPACTED_MARKER),
                 "message {i} should be intact"
             );
         }

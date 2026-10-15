@@ -15,8 +15,8 @@ use tauri::AppHandle;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
-use mnemo::project::Project;
-use mnemo::runtime::channels::AgentId;
+use mnemo::app::project::Project;
+use mnemo::AgentId;
 use mnemo::tool::agent::image_tools::{magic_matches, mime_from_ext};
 use mnemo::tool::agent::sandbox::Sandbox;
 
@@ -1191,7 +1191,7 @@ fn git_history_at(root: &std::path::Path) -> Result<GitHistory, String> {
             "log",
             "--branches",
             "--topo-order",
-            &format!("--pretty=format:%H\u{1f}%h\u{1f}%P\u{1f}%s\u{1f}%an\u{1f}%at\u{1f}%D"),
+            "--pretty=format:%H\u{1f}%h\u{1f}%P\u{1f}%s\u{1f}%an\u{1f}%at\u{1f}%D",
             "-n",
             &GIT_HISTORY_COMMIT_CAP.to_string(),
         ],

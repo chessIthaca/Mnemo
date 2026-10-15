@@ -96,15 +96,17 @@ fn resolve_id(view: &GraphView, name_or_id: &str) -> Option<String> {
 /// Render the compact inline answer for a delegated symbol hunt — the
 /// `search`/`search_read` auto-delegation (backlog b804012f): instead of the
 /// advisory symbol-hunt note, the search tool resolves the hunt against the
-/// graph and prepends the answer itself, skipping the file walk.
+/// graph and prepends the answer itself above the normal results (backlog
+/// c439dda0 — the file search runs in the same response; no re-issue).
 ///
 /// One `def:` line per resolved name (definition, kind, line range); a
 /// single-symbol hunt additionally lists its top callers/callees and the
 /// `graph_context` pointer for the full 360° view. The FIRST LINE carries
 /// the `SEARCH_NUDGE_MARK` substring ("is an indexed symbol") so the
 /// steering metric keeps counting delegated answers, and the escape line
-/// tells the model that re-issuing the same query gets the plain file
-/// search. Best-effort: any store/view failure or a total resolution miss
+/// tells the model that the plain file matches follow in the same response
+/// and that re-issuing the same query drops the block. Best-effort: any
+/// store/view failure or a total resolution miss
 /// returns `None` and the caller falls through to the normal search. This is
 /// a pure EMITTER: the delegation DECISION (whether a pattern is a symbol
 /// hunt at all) lives in the caller and may be classifier-steered (backlog
@@ -138,7 +140,7 @@ pub(crate) fn symbol_delegation_block(graph: &CodeGraph, names: &[String]) -> Op
     if resolved.is_empty() {
         return None;
     }
-    const ESCAPE: &str = " (re-issue this exact search to get the plain file search instead):";
+    const ESCAPE: &str = " (the plain file matches follow below; re-issue this exact search to drop the block):";
     let mut out = if resolved.len() == 1 {
         let (name, _) = resolved[0];
         format!("AUTO-DELEGATED to the code graph — '{name}' is an indexed symbol{ESCAPE}")

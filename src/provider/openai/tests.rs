@@ -29,7 +29,7 @@ fn detect_repetition_false_for_normal_prose() {
     let text = "The quick brown fox jumps over the lazy dog. \
                 Pack my box with five dozen liquor jugs. \
                 How vexingly quick daft zebras jump!";
-    assert!(!detect_repetition(&text, 200, 3));
+    assert!(!detect_repetition(text, 200, 3));
 }
 
 #[test]
@@ -1246,7 +1246,8 @@ fn build_request_json_escapes_boundary_tokens_in_tool_results() {
     let tool_result = Message::tool_result(
         "c1",
         "read_files",
-        &format!("stop = [\"{endoftext}\"]\n"),
+        format!("stop = [\"{endoftext}\"]
+"),
     );
     let user = Message::user_text("Reply ok");
     let body = client
@@ -1292,7 +1293,8 @@ fn build_responses_request_json_escapes_boundary_tokens_in_tool_results() {
     let tool_result = Message::tool_result(
         "c1",
         "read_files",
-        &format!("stop = [\"{endoftext}\"]\n"),
+        format!("stop = [\"{endoftext}\"]
+"),
     );
     let body = client
         .build_responses_request_json(&[assistant, tool_result], &[], None)
@@ -4214,10 +4216,8 @@ data: [DONE]\n\n";
             LlmEvent::TextDelta { text } => {
                 received_text.push_str(&text);
             }
-            LlmEvent::Finish { reason } => {
-                if reason == crate::provider::FinishReason::Stop {
-                    got_finish_stop = true;
-                }
+            LlmEvent::Finish { reason: crate::provider::FinishReason::Stop } => {
+                got_finish_stop = true;
             }
             _ => {}
         }
@@ -4276,10 +4276,8 @@ data: [DONE]\n\n";
             LlmEvent::TextDelta { text } => {
                 received_text.push_str(&text);
             }
-            LlmEvent::Finish { reason } => {
-                if reason == crate::provider::FinishReason::Stop {
-                    got_finish_stop = true;
-                }
+            LlmEvent::Finish { reason: crate::provider::FinishReason::Stop } => {
+                got_finish_stop = true;
             }
             _ => {}
         }

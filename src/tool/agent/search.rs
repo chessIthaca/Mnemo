@@ -4,27 +4,33 @@
 
 //! `search` — grep + glob tools for finding files and content.
 //!
-//! Literal queries are served by the CodeGraph FTS content index when it is
-//! populated (`engine: index` in the output); everything else — regex
+//! Literal queries — and regex alternations whose every branch is an
+//! escape-only literal (backlog c439dda0: per-branch lookups, merged,
+//! regex-verified) — are served by the CodeGraph FTS content index when it
+//! is populated (`engine: index` in the output); everything else — regex
 //! patterns, multi-line or punctuation-only literals (no FTS tokens), and
 //! broken-regex fallbacks (the walk engine keeps "matched literally"
 //! semantics exact) — walks the project tree (skipping build artifacts +
-//! deps) and matches line-by-line (`engine: walk`). Auto-run (read-only).
+//! deps; the path-scoped `.coding/logs`/`.coding/tmp` are pruned too,
+//! backlog c439dda0) and matches line-by-line (`engine: walk`). Auto-run
+//! (read-only).
 //!
 //! AUTO-DELEGATION (backlog b804012f): when the pattern names an indexed
 //! symbol — a bare identifier, a definition-prefixed form (`fn X`), or a
 //! symbol-INTENT shape (`X(`, `a::b`, "who calls X") — the graph answers
 //! INLINE: a compact block (definition, top callers/callees, the
-//! graph_context pointer) rides above the output and the file walk is
-//! skipped entirely. A query targeting semantic memory — a glob under
-//! `.coding/knowledge`/`.coding/reviews` or a typed prefix (SPEC:/DECISION:/
+//! graph_context pointer) rides above the output, and the plain file
+//! matches follow in the SAME response — the walk is never skipped, so no
+//! identical re-issue is needed (backlog c439dda0). A query targeting
+//! semantic memory — a glob under `.coding/knowledge`/`.coding/reviews` or
+//! a typed prefix (SPEC:/DECISION:/
 //! BUG:/PLAN:/HOW:/REVIEW:) — gets the memory_search recall answer inline
 //! the same way. The block opens with "AUTO-DELEGATED to …" and carries the
 //! escape line: re-issuing the SAME query (pattern+glob+literal) skips
-//! delegation and runs the plain file search (sticky per exact query — a
-//! bounded set of bypassed keys; interleaved delegating queries never
-//! break an earlier escape). Best-effort: an unindexed symbol, an empty
-//! recall, or any store hiccup falls through to the normal search.
+//! delegation and returns the plain file search alone (sticky per exact
+//! query — a bounded set of bypassed keys; interleaved delegating queries
+//! never break an earlier escape). Best-effort: an unindexed symbol, an
+//! empty recall, or any store hiccup falls through to the normal search.
 //!
 //! OPTIONAL CLASSIFIER STEERING (backlog e2c47d5f): with the opt-in
 //! `[general.laya] steer_tool_choice` flag on and a confident answer, the
@@ -69,6 +75,8 @@ use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 /// would add duplicate rows, and its own continuously-written
 /// `.coding/codegraph.db` would otherwise trigger debounced passes on the
 /// MAIN tree's watcher.
+///
+/// Multi-component (path-scoped) exclusions live in [`IGNORED_DIR_PATHS`].
 const IGNORED_DIRS: &[&str] = &[
     "target",       // Rust build output
     "node_modules", // JS dependencies
@@ -92,12 +100,42 @@ pub(crate) fn is_ignored_component(name: &str) -> bool {
     IGNORED_DIRS.contains(&name)
 }
 
+/// Root-relative directory paths that are never searched — the
+/// multi-component siblings of [`IGNORED_DIRS`] (backlog c439dda0).
+/// `.coding/logs` holds the session's JSONL event streams and
+/// `.coding/tmp` the gitignored red-check scratch: both churn constantly
+/// and are never what a content search wants — while the OTHER `.coding/`
+/// members (knowledge, plans, reviews, backlog) stay searchable. Entries
+/// are `/`-separated root-relative paths;
+/// [`is_under_ignored_dir_path`] matches the path itself (a directory
+/// prune) or anything below it (a file filter).
+///
+/// Like [`is_coding_data_file`], this list is consulted by BOTH
+/// [`should_search`] (index coverage + walk coverage) and the file
+/// watcher's trigger set, so the trigger set and the content index's
+/// coverage cannot drift apart: log writes and scratch files neither
+/// appear in search results nor fire re-index passes.
+const IGNORED_DIR_PATHS: &[&str] = &[".coding/logs", ".coding/tmp"];
+
+/// Whether a ROOT-RELATIVE path is one of [`IGNORED_DIR_PATHS`] itself or
+/// anything under one of them. Normalizes the platform separator to `/`
+/// first. Shared by `should_search`, the search tool's `descend`, the
+/// codegraph walkers' `visit`, and the watcher's `is_indexable_path` —
+/// one rule, every consumer.
+pub(crate) fn is_under_ignored_dir_path(rel: &Path) -> bool {
+    let s = rel.to_string_lossy().replace('\\', "/");
+    IGNORED_DIR_PATHS
+        .iter()
+        .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+}
+
 /// Whether a ROOT-RELATIVE path is one of the app's own SQLite stores under
 /// `.coding/` (the codegraph + memory DBs and their journal/WAL sidecars).
 ///
 /// These are binary caches whose contents are meaningless as search results,
 /// and the graph DB is written DURING every index pass — indexing it into
-/// itself would re-index forever. This is the ONE predicate that keeps the
+/// itself would re-index forever. This predicate — together with the
+/// path-scoped [`IGNORED_DIR_PATHS`] (backlog c439dda0) — keeps the
 /// content index's coverage and the file watcher's trigger set in agreement:
 /// the index skips these files and the watcher must not fire on them, so
 /// every OTHER `.coding/` file is both indexed and watched.
@@ -126,7 +164,8 @@ pub(crate) fn is_coding_data_file(rel: &Path) -> bool {
 }
 
 /// Whether a file should be searched: skip ignored dirs, the app's own data
-/// stores under `.coding/`, and files that are likely huge.
+/// stores under `.coding/`, the path-scoped `.coding/logs` + `.coding/tmp`
+/// (backlog c439dda0), and files that are likely huge.
 ///
 /// Fails CLOSED: if `path` does not lie under `root` (strip_prefix fails), the
 /// file is NOT searched. This is defense-in-depth against a glob that escapes
@@ -146,6 +185,13 @@ pub(crate) fn should_search(path: &Path, root: &Path) -> bool {
                 return false;
             }
         }
+    }
+    // Backlog c439dda0: the session-log and scratch dirs under `.coding/`
+    // are path-scoped ignores — never searched, never indexed, never
+    // watched. Consulted by the watcher too, so the trigger set stays
+    // equal to this coverage.
+    if is_under_ignored_dir_path(rel) {
+        return false;
     }
     // Never scan the app's own SQLite stores under `.coding/` — see
     // `is_coding_data_file`, the predicate the file watcher SHARES so the
@@ -349,6 +395,15 @@ fn descend(
             if is_ignored_component(&entry.file_name().to_string_lossy()) {
                 *pruned += 1;
                 continue; // never stat inside ignored dirs — the whole point
+            }
+            // Path-scoped ignores (backlog c439dda0): `.coding/logs` /
+            // `.coding/tmp` are pruned by root-relative PATH, not by bare
+            // component name — a project's own `logs/` dir stays searched.
+            if let Ok(rel) = path.strip_prefix(root) {
+                if is_under_ignored_dir_path(rel) {
+                    *pruned += 1;
+                    continue;
+                }
             }
             descend(&path, root, patterns, files, pruned);
         } else if path.is_file() {
@@ -886,6 +941,83 @@ fn is_index_eligible_regex(pattern: &str) -> bool {
         && is_tokenizable(pattern)
 }
 
+/// The branch cap for [`split_alternation_literals`]: past it the merged
+/// run costs more index queries than a walk of the tree — the pattern
+/// stays on the regex engine.
+const MAX_ALTERNATION_BRANCHES: usize = 8;
+
+/// Split a REGEX-mode alternation into the exact literal string each
+/// top-level branch matches (backlog c439dda0):
+/// `memory\.db|codegraph\.db` → [`memory.db`, `codegraph.db`]. `Some` only
+/// when EVERY branch is literal-safe:
+///
+/// - split on UNESCAPED `|` — a `\|` is a literal pipe inside a branch,
+///   never a split point;
+/// - 2..=[`MAX_ALTERNATION_BRANCHES`] non-empty branches;
+/// - every `\` quotes a NON-alphanumeric char (`\.` is a literal dot;
+///   `\d`/`\w`/`\s`/`\n` are class or control shorthands, not literals);
+/// - no UNESCAPED metacharacter remains (groups, classes, anchors, and
+///   unescaped dots disqualify — the index cannot serve those exactly, and
+///   the walk must stay authoritative).
+///
+/// The un-escaped branch strings are what the FTS index looks up per
+/// branch; the compiled regex stays the truth filter for the merged page
+/// (see [`try_index_alternation`]). Shared with `search_read`.
+pub(crate) fn split_alternation_literals(pattern: &str) -> Option<Vec<String>> {
+    let mut branches: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut escaped = false;
+    for (i, c) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '|' => {
+                branches.push(&pattern[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    branches.push(&pattern[start..]);
+    if branches.len() < 2 || branches.len() > MAX_ALTERNATION_BRANCHES {
+        return None;
+    }
+    let mut literals = Vec::with_capacity(branches.len());
+    for branch in branches {
+        if branch.is_empty() {
+            return None;
+        }
+        let mut literal = String::with_capacity(branch.len());
+        let mut chars = branch.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    // Only a punctuation escape un-escapes to a literal;
+                    // \d/\w/\s/\n are class or control shorthands.
+                    let Some(next) = chars.next() else {
+                        return None; // trailing lone backslash
+                    };
+                    if next.is_alphanumeric() {
+                        return None;
+                    }
+                    literal.push(next);
+                }
+                // An UNescaped metacharacter is real regex structure the
+                // index cannot serve exactly.
+                '^' | '$' | '.' | '|' | '?' | '*' | '+' | '(' | ')' | '[' | ']' | '{' | '}' => {
+                    return None;
+                }
+                _ => literal.push(c),
+            }
+        }
+        literals.push(literal);
+    }
+    Some(literals)
+}
+
 /// The literal-engine TIP for a regex-mode walk that the content index
 /// could have served exactly: `Some(note)` when the call is in regex mode,
 /// the pattern is [`is_index_eligible_regex`], a graph is present with a
@@ -1109,6 +1241,103 @@ pub(crate) fn try_index(
         });
     }
     None
+}
+
+/// Run the FTS index once per alternation branch and merge the pages
+/// (backlog c439dda0). Returns [`FtsOutcome::Hits`] only when EVERY branch
+/// served a fresh page: hits deduped by (path, line) in branch order and
+/// each kept line VERIFIED against `re` — the FTS phrase drops non-token
+/// characters, so a raw row can match where the regex does not (review
+/// B1); a phantom row is dropped here rather than shown. `total` is the
+/// SUM of the branch totals (each branch's raw post-glob count — the same
+/// hedge as the single path's "... and more" line), `files` the distinct
+/// verified paths, `reindexed`/`stale` the accumulated inline-repair
+/// records. Any branch returning `None` (index unpopulated, a
+/// non-tokenizable branch, zero post-glob hits) walks the whole query
+/// transparently; a branch returning `Stale` short-circuits to the walk
+/// carrying that branch's still-stale records plus every earlier branch's
+/// inline repairs, so no F10 evidence is lost. Shared with `search_read`.
+pub(crate) fn try_index_alternation(
+    graph: &crate::codegraph::CodeGraph,
+    root: &Path,
+    branches: &[String],
+    glob: Option<&str>,
+    re: &regex::Regex,
+) -> Option<FtsOutcome> {
+    let mut hits: Vec<crate::codegraph::store::ContentHit> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut verified_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    let mut reindexed = 0usize;
+    let mut stale_records: Vec<StaleFile> = Vec::new();
+    for branch in branches {
+        match try_index(graph, root, branch, glob) {
+            Some(FtsOutcome::Hits(ix)) => {
+                reindexed += ix.reindexed;
+                stale_records.extend(ix.stale);
+                total += ix.total;
+                for h in ix.hits {
+                    // Dedup across branches first: the same (file, line)
+                    // verifies identically wherever it came from.
+                    if !seen.insert((h.path.clone(), h.line)) {
+                        continue;
+                    }
+                    if !re.is_match(&h.text) {
+                        continue; // FTS phantom row — the regex says no.
+                    }
+                    verified_files.insert(h.path.clone());
+                    if hits.len() < MAX_MATCHES {
+                        hits.push(h);
+                    }
+                }
+            }
+            Some(FtsOutcome::Stale { stale, repaired }) => {
+                // The walk is authoritative; earlier branches' inline
+                // repairs keep their log records.
+                let mut all_repaired = stale_records;
+                all_repaired.extend(repaired);
+                return Some(FtsOutcome::Stale {
+                    stale,
+                    repaired: all_repaired,
+                });
+            }
+            None => return None,
+        }
+    }
+    if hits.is_empty() {
+        // Every fetched row failed regex verification — the index cannot
+        // answer this query; the walk is authoritative.
+        return None;
+    }
+    Some(FtsOutcome::Hits(IndexHits {
+        hits,
+        total,
+        files: verified_files.len(),
+        reindexed,
+        stale: stale_records,
+    }))
+}
+
+/// Render a fresh index page as the `search` success body (shared by the
+/// single-literal and alternation-branch paths): one `path:line: text`
+/// row per hit, the `N matches in M files (engine: index)` summary, and
+/// the "... and more" hedge when the page is capped.
+fn index_success_body(ix: &IndexHits) -> String {
+    let lines: Vec<String> = ix
+        .hits
+        .iter()
+        .map(|h| format!("{}:{}: {}", h.path, h.line, h.text.trim()))
+        .collect();
+    let mut body = format!(
+        "{} matches in {} files (engine: index)\n\n{}",
+        ix.total,
+        ix.files,
+        lines.join("\n")
+    );
+    if ix.total > ix.hits.len() {
+        body.push_str("\n... and more matches (narrow your pattern or use a glob filter)");
+    }
+    body
 }
 
 /// Probe one stale file's disk evidence for the staleness log: mtime, size,
@@ -1386,9 +1615,11 @@ pub(crate) fn memory_hunt(pattern: &str, glob: Option<&str>) -> bool {
 
 /// The delegated memory answer for a memory-targeted query (backlog
 /// b804012f): run the semantic recall the model would otherwise reach for
-/// with `memory_search` and prepend the top hits inline, skipping the file
-/// walk. Best-effort — a missed detection, an empty recall, or any store
-/// error returns `None` and the caller falls through to the normal search.
+/// with `memory_search` and build the block the caller PREPENDS above the
+/// normal results (backlog c439dda0 — the file search runs in the same
+/// response; no identical re-issue). Best-effort — a missed detection, an
+/// empty recall, or any store error returns `None` and the caller falls
+/// through to the normal search.
 pub(crate) async fn memory_delegation_block(
     store: &Arc<dyn crate::memory::MemoryStoreTrait>,
     pattern: &str,
@@ -1404,7 +1635,8 @@ pub(crate) async fn memory_delegation_block(
     }
     let mut out = String::from(
         "AUTO-DELEGATED to memory — this query targets the memory store \
-         (re-issue this exact search to get the plain file search instead):",
+         (the plain file search follows below; re-issue this exact search \
+         to drop the block):",
     );
     for (i, sm) in hits.iter().enumerate() {
         let gist: String = sm.memory.content.chars().take(160).collect();
@@ -1437,7 +1669,10 @@ impl Tool for SearchTool {
             "Searches a pattern (regex by default, or literal) in files matching an optional \
              glob. Literal queries use the full-text content index when populated \
              (engine: index), walking otherwise; metachar-free regex walks carry a TIP \
-             pointing at literal:true. A broken regex is matched literally with a note. \
+             pointing at literal:true. A regex alternation whose every branch is an \
+             escape-only literal (e.g. memory\\.db|codegraph\\.db) is served by per-branch \
+             index lookups, merged — any branch the index cannot serve falls back to the \
+             walk. A broken regex is matched literally with a note. \
              Returns matching lines with paths and line numbers. Build output and \
              dependencies (target/, node_modules/, .git/, dist/) are pruned from the walk. \
               ESCAPE-HATCH: for text with regex metacharacters or backslashes \
@@ -1449,8 +1684,9 @@ impl Tool for SearchTool {
                text occurrences (comments, string literals, config keys, log text). \
                Symbol-shaped patterns (bare name, 'fn X', 'X(', 'a::b', 'who calls X') naming \
                an indexed symbol, and memory hunts (.coding/knowledge|reviews globs, typed \
-               SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
-               and the walk is skipped; re-issue the same search to get the plain file search. \
+                SPEC:/DECISION:/ prefixes), auto-delegate: the graph/memory answer rides inline \
+                above the plain file matches in the same response — nothing is skipped; \
+                re-issue the same search to drop the block. \
                 With the optional Laya tool-choice classifier on and confident, it picks that route itself (symbol / text / memory); otherwise the heuristics above stand.",
             json!({
                 "type": "object",
@@ -1569,17 +1805,22 @@ impl Tool for SearchTool {
             };
             let re = compiled.regex;
             let fallback_note = compiled.fallback_note;
+            // Backlog c439dda0: captured here, before merged_note moves
+            // `fallback_note` — the alternation split gate below must know
+            // whether the regex compiled clean (a fallback-fired pattern
+            // matches verbatim, review B1 — never split).
+            let fallback_fired = fallback_note.is_some();
 
             // Auto-delegation (backlog b804012f): a symbol hunt the graph
             // can answer gets the answer inline instead of the advisory
-            // nudge + a wasted walk; a memory-targeted query gets the recall
-            // answer (memory wins when both fire — a knowledge/reviews glob
-            // is a memory hunt by definition). When the delegated answer
-            // fully serves the query (memory, or a symbol hunt with no
-            // glob) the file walk is skipped entirely and the key is
-            // recorded so an immediate repeat gets the plain search (the
-            // escape hatch); a symbol hunt narrowed by a glob PREPENDS the
-            // block above the normal results instead.
+            // nudge; a memory-targeted query gets the recall answer (memory
+            // wins when both fire — a knowledge/reviews glob is a memory
+            // hunt by definition). The block PREPENDS above the normal
+            // results in the SAME response (backlog c439dda0 — the file
+            // search is never skipped, so no identical re-issue is
+            // needed), and the key is recorded so an immediate repeat
+            // drops the block and returns the plain search alone (the
+            // escape hatch).
             let symbol_block = if escape || !allow_symbol {
                 None
             } else {
@@ -1589,7 +1830,6 @@ impl Tool for SearchTool {
                     })
                 })
             };
-            let memory_delegated = memory_block.is_some();
             let delegated = memory_block.or(symbol_block);
             if log_live {
                 crate::tool::agent::tool_choice::log_decision(
@@ -1604,9 +1844,8 @@ impl Tool for SearchTool {
             }
             let mut prepended: Option<String> = None;
             if let Some(block) = delegated {
-                // Record the key on BOTH arms: the fast-path return AND the
-                // glob-narrowed prepend — the block promises the escape
-                // ("re-issue this exact search…") either way, so the repeat
+                // Record the key on the delegated arm — the block promises
+                // the escape ("re-issue this exact search…"), so the repeat
                 // must run the plain search (review 2026-12-28 H1). Set
                 // semantics: the key joins the bypass set (dedup, bounded —
                 // oldest evicted) without replacing other queries' escapes.
@@ -1617,9 +1856,12 @@ impl Tool for SearchTool {
                     let overflow = set.len().saturating_sub(DELEGATION_SET_CAP);
                     set.drain(..overflow);
                 }
-                if memory_delegated || args.glob.is_none() {
-                    return ToolResult::success(block);
-                }
+                // Backlog c439dda0: the file search is NEVER skipped — the
+                // block rides ABOVE the normal results in the SAME response
+                // (merged_note renders it first), so no identical re-issue
+                // is needed. The recorded key keeps the escape hatch: the
+                // repeat drops the block and returns the plain search
+                // alone.
                 prepended = Some(block);
             }
 
@@ -1664,22 +1906,7 @@ impl Tool for SearchTool {
                             // (an empty fetch walks — 2026-01-03), so the
                             // hits are never empty here; the C2 metachar
                             // retry hint lives on the walk path.
-                            let lines: Vec<String> = ix
-                                .hits
-                                .iter()
-                                .map(|h| format!("{}:{}: {}", h.path, h.line, h.text.trim()))
-                                .collect();
-                            let mut body = format!(
-                                "{} matches in {} files (engine: index)\n\n{}",
-                                ix.total,
-                                ix.files,
-                                lines.join("\n")
-                            );
-                            if ix.total > ix.hits.len() {
-                                body.push_str(
-                                    "\n... and more matches (narrow your pattern or use a glob filter)",
-                                );
-                            }
+                            let body = index_success_body(&ix);
                             // Disclose the inline re-index (F10): a read
                             // tool mutated the index DB — the note rides
                             // ABOVE the results (truncation-safe).
@@ -1730,6 +1957,79 @@ impl Tool for SearchTool {
                             ));
                         }
                         None => {}
+                    }
+                }
+            }
+            // Backlog c439dda0: a REGEX-mode alternation whose branches
+            // are all escape-only literals (`memory\.db|codegraph\.db`)
+            // is exact literal semantics per branch — the index serves
+            // each branch and the merged page is deduped by (path, line)
+            // and verified against the compiled regex, so the response is
+            // never wider than the regex itself. A fallback-fired pattern
+            // never splits (the fallback promises verbatim-literal
+            // matching, review B1); literal:true keeps a `|` as one
+            // verbatim literal; any branch the index cannot serve —
+            // unpopulated, non-tokenizable, zero post-glob hits, or
+            // staleness beyond inline repair — falls the WHOLE query back
+            // to the walk, which stays authoritative.
+            if !args.literal && !fallback_fired && !args.pattern.contains('\n') {
+                if let Some(branches) = split_alternation_literals(&args.pattern) {
+                    if let Some(g) = &graph {
+                        match try_index_alternation(
+                            g,
+                            &root,
+                            &branches,
+                            args.glob.as_deref(),
+                            &re,
+                        ) {
+                            Some(FtsOutcome::Hits(ix)) => {
+                                let body = index_success_body(&ix);
+                                // Disclose the inline re-index (F10), same
+                                // disclosure as the single-literal path.
+                                let note = if ix.reindexed > 0 {
+                                    let sample = log_stale(
+                                        staleness_log.as_ref(),
+                                        "search",
+                                        &root,
+                                        &ix.stale,
+                                        crate::index_staleness::Action::InlineReindex,
+                                    );
+                                    push_note(
+                                        note,
+                                        format!(
+                                            "reindexed {} stale file(s){} — serving fresh index results",
+                                            ix.reindexed,
+                                            stale_detail(&sample, ix.stale.len(), staleness_log.is_some())
+                                        ),
+                                    )
+                                } else {
+                                    note
+                                };
+                                return ToolResult::success(with_note(body, &note));
+                            }
+                            Some(FtsOutcome::Stale { stale, repaired }) => {
+                                log_stale(
+                                    staleness_log.as_ref(),
+                                    "search",
+                                    &root,
+                                    &repaired,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
+                                let sample = log_stale(
+                                    staleness_log.as_ref(),
+                                    "search",
+                                    &root,
+                                    &stale,
+                                    crate::index_staleness::Action::SurfacedOnly,
+                                );
+                                stale_note = Some(format!(
+                                    "content index stale for {} file(s){} — serving tree-walk results",
+                                    stale.len(),
+                                    stale_detail(&sample, stale.len(), staleness_log.is_some())
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -2300,6 +2600,64 @@ mod tests {
         assert!(result.output.contains("a.rs:1"));
     }
 
+    #[test]
+    fn split_alternation_literals_exactness() {
+        use super::split_alternation_literals as split;
+        // Escape-only branches un-escape to the exact literal per branch.
+        assert_eq!(
+            split("memory\\.db|codegraph\\.db"),
+            Some(vec!["memory.db".to_string(), "codegraph.db".to_string()])
+        );
+        // An escaped pipe is a literal inside a branch — not a split point.
+        assert_eq!(
+            split("x\\|y|z"),
+            Some(vec!["x|y".to_string(), "z".to_string()])
+        );
+        assert_eq!(split("a\\|b"), None, "no top-level split");
+        // Disqualified shapes keep the walk authoritative.
+        assert_eq!(split("a.b|c"), None, "unescaped dot");
+        assert_eq!(split("a\\d|c"), None, "class shorthand");
+        assert_eq!(split("(a|b)"), None, "group parens stay regex");
+        assert_eq!(split("^a$|^b$"), None, "anchors");
+        assert_eq!(split("a|"), None, "empty branch");
+        assert_eq!(split("a||b"), None, "empty middle branch");
+        assert_eq!(split("a"), None, "single pattern, nothing to split");
+        assert_eq!(
+            split("a|b|c|d|e|f|g|h|i"),
+            None,
+            "over the branch cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn alternation_of_literal_branches_uses_index_engine() {
+        // Backlog c439dda0: a regex alternation whose every branch is an
+        // escape-only literal (`memory\.db`, `codegraph\.db`) carries exact
+        // literal semantics — the FTS index must serve it per branch,
+        // merged, instead of demoting the whole query to the walk (the
+        // 2027-01-14 session pain: `memory\.db|codegraph\.db` walked the
+        // entire tree).
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/store.rs"), "open memory.db\n").unwrap();
+        std::fs::write(dir.path().join("src/graph.rs"), "read codegraph.db\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "pattern": "memory\\.db|codegraph\\.db",
+                "glob": "src/**"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("engine: index"),
+            "an alternation of literal branches must be index-served: {}",
+            result.output
+        );
+        assert!(result.output.contains("store.rs:1"), "{}", result.output);
+        assert!(result.output.contains("graph.rs:1"), "{}", result.output);
+    }
+
     #[tokio::test]
     async fn index_matches_walk_on_large_tree() {
         // Synthetic large tree (the feature's target environment): the index
@@ -2435,6 +2793,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coding_logs_and_tmp_are_never_searched() {
+        // Backlog c439dda0: `.coding/logs` (session JSONL event streams) and
+        // `.coding/tmp` (gitignored red-check scratch) are noise, not
+        // searchable artifacts — unlike the other `.coding/` members
+        // (knowledge, plans, reviews), which stay searchable. The prune is
+        // path-scoped, so a project's own `logs/` dir still searches.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/logs")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/logs/events.jsonl"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".coding/tmp/redcheck")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/tmp/redcheck/copy.rs"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+        // Plain `logs/` — not the ignored path; must stay searchable.
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        std::fs::write(dir.path().join("logs/app.rs"), "uniqueneedle42").unwrap();
+        // `.coding/knowledge` — the prune is path-scoped, not a blanket
+        // `.coding/` exclusion; must stay searchable.
+        std::fs::create_dir_all(dir.path().join(".coding/knowledge")).unwrap();
+        std::fs::write(
+            dir.path().join(".coding/knowledge/fact.md"),
+            "uniqueneedle42",
+        )
+        .unwrap();
+
+        let (files, _) = walk_searchable(dir.path(), None).unwrap();
+        // Normalize separators: PathBuf strings are backslash-joined on
+        // Windows, and the asserts below compare forward-slash fragments
+        // (same normalization as the walk.rs tests).
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|p| !p.contains(".coding/logs") && !p.contains(".coding/tmp")),
+            "walk_searchable must exclude .coding/logs and .coding/tmp: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.contains("logs/app.rs")),
+            "a plain logs/ dir is not the ignored path: {names:?}"
+        );
+        assert!(
+            names.iter().any(|p| p.contains(".coding/knowledge")),
+            "the .coding prune must stay path-scoped: {names:?}"
+        );
+
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({"pattern": "uniqueneedle42"})).await;
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("logs/app.rs"), "{}", result.output);
+        assert!(
+            !result.output.contains("events.jsonl") && !result.output.contains("redcheck"),
+            ".coding/logs and .coding/tmp must never appear in results: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn caps_results_at_max_matches() {
         // A broad search producing more than MAX_MATCHES (100) matches should
         // be capped at MAX_MATCHES results, with an early-stop note appended.
@@ -2564,18 +2993,19 @@ mod tests {
 
     #[tokio::test]
     async fn bare_identifier_symbol_searches_earn_the_graph_nudge() {
-        // Backlog b804012f: grepping a symbol name DELEGATES — the graph
-        // answers inline (definition + callers) and the walk is skipped.
-        // The immediate repeat is the escape hatch: plain search results
-        // with the advisory nudge riding above them (byte-pinned sentence).
+        // Backlog b804012f + c439dda0: grepping a symbol name DELEGATES —
+        // the graph answer (definition + callers) rides inline ABOVE the
+        // plain file matches in the same response; the immediate repeat is
+        // the escape hatch: plain search results alone, with the advisory
+        // nudge riding above them (byte-pinned sentence).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
         let tool = make_indexed_tool(dir.path());
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(r.output.contains("def: a.rs::hello::1"), "{}", r.output);
@@ -2590,8 +3020,13 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("engine:"),
+            "the plain file search runs in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1"),
+            "the file matches ride below the block: {}",
             r.output
         );
 
@@ -2631,7 +3066,7 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -2649,6 +3084,44 @@ mod tests {
             "{}",
             r.output
         );
+    }
+
+    #[tokio::test]
+    async fn delegated_symbol_answer_carries_the_file_matches() {
+        // Backlog c439dda0: the delegated block and the plain file matches
+        // ride in ONE response — the walk is never skipped, so no identical
+        // re-issue is needed. The escape hatch stays: the repeat drops the
+        // block and returns the plain search alone.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn helper() {}\nlet helper = 2;\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let r = tool.execute(json!({"pattern": "helper"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            r.output.contains("AUTO-DELEGATED to the code graph"),
+            "the delegated block still rides inline: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("engine:"),
+            "the plain file search must run in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1") && r.output.contains("a.rs:2"),
+            "the file matches must be present alongside the graph answer: {}",
+            r.output
+        );
+        // The escape hatch still works: a repeat is the plain search, with
+        // the advisory nudge but WITHOUT a second delegated block.
+        let r = tool.execute(json!({"pattern": "helper"})).await;
+        assert!(r.success, "{}", r.output);
+        assert!(
+            !r.output.contains("AUTO-DELEGATED"),
+            "the repeat escapes the block: {}",
+            r.output
+        );
+        assert!(r.output.contains("a.rs:1"), "{}", r.output);
     }
 
     #[tokio::test]
@@ -2700,7 +3173,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with("AUTO-DELEGATED to the code graph"),
+                r.output.contains("AUTO-DELEGATED to the code graph"),
                 "pattern {pattern:?} must delegate: {}",
                 r.output
             );
@@ -2875,7 +3348,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with(
+                r.output.contains(
                     "AUTO-DELEGATED to the code graph — 'search_content' is an indexed symbol"
                 ),
                 "pattern {pattern:?} delegates: {}",
@@ -2902,7 +3375,7 @@ mod tests {
             let r = tool.execute(json!({"pattern": pattern})).await;
             assert!(r.success, "{}", r.output);
             assert!(
-                r.output.starts_with("AUTO-DELEGATED to the code graph"),
+                r.output.contains("AUTO-DELEGATED to the code graph"),
                 "{pattern:?} delegates: {}",
                 r.output
             );
@@ -2942,7 +3415,7 @@ mod tests {
         let r = tool.execute(json!({"pattern": "fn hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -3220,8 +3693,9 @@ mod tests {
     #[tokio::test]
     async fn memory_targeted_query_delegates_and_skips_the_walk() {
         // Backlog b804012f, execute level: a knowledge-dir glob gets the
-        // recall answer inline — the walk is skipped — and the immediate
-        // repeat escapes to the plain search.
+        // recall answer inline ABOVE the plain search results (backlog
+        // c439dda0 �� same response, no re-issue), and the immediate
+        // repeat escapes to the plain search alone.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
         let store: std::sync::Arc<dyn crate::memory::MemoryStoreTrait> = {
@@ -3245,8 +3719,8 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to memory"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to memory"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -3260,8 +3734,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("no matches found"),
+            "the plain file search runs in the same response: {}",
             r.output
         );
 
@@ -3326,10 +3800,10 @@ mod tests {
         let r = tool.execute(json!({"pattern": "hello|world"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with(
+            r.output.contains(
                 "AUTO-DELEGATED to the code graph — each hit below is an indexed symbol"
             ),
-            "prepended: {}",
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -3348,8 +3822,13 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("engine:"),
-            "the file walk is skipped entirely: {}",
+            r.output.contains("engine:"),
+            "the plain file search runs in the same response: {}",
+            r.output
+        );
+        assert!(
+            r.output.contains("a.rs:1"),
+            "the file matches ride below the block: {}",
             r.output
         );
 
@@ -3407,10 +3886,10 @@ mod tests {
         let tool = make_indexed_tool(dir.path());
         // A delegates.
         let r = tool.execute(json!({"pattern": "hello"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
         // B (a different delegating query) delegates.
         let r = tool.execute(json!({"pattern": "world"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
         // A's re-issue must ESCAPE (currently: delegates again — the key was
         // replaced by B).
         let r = tool.execute(json!({"pattern": "hello"})).await;
@@ -3474,7 +3953,7 @@ mod tests {
         let tool =
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("SYMBOL", 0.9, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
-        assert!(r.output.starts_with("AUTO-DELEGATED"), "{}", r.output);
+        assert!(r.output.contains("AUTO-DELEGATED"), "{}", r.output);
     }
 
     #[tokio::test]
@@ -3487,7 +3966,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.5, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED"),
+            r.output.contains("AUTO-DELEGATED"),
             "below threshold keeps the heuristics: {}",
             r.output
         );
@@ -3503,7 +3982,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.99, false));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED"),
+            r.output.contains("AUTO-DELEGATED"),
             "disabled keeps the heuristics: {}",
             r.output
         );

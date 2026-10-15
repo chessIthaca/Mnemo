@@ -73,6 +73,13 @@ pub struct ModelsConfigDto {
     pub reviewing: Option<Option<ModelRefDto>>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub complete: Option<Option<ModelRefDto>>,
+    /// Model for a headless / policy-less agent loop (`[models.free]`, the
+    /// `["free"]` routing key — a set slot resolves it, an unset slot rides
+    /// the default; pinned by model_resolver's
+    /// `free_slot_resolves_configured_or_falls_back_to_default`). Same
+    /// double-Option semantics as the other slots.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub free: Option<Option<ModelRefDto>>,
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub subagent: Option<Option<ModelRefDto>>,
     /// Model for compaction summaries (auto-compaction + the run-all
@@ -403,36 +410,13 @@ pub struct SettingsSaveDto {
     /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
     #[serde(default)]
     pub proxy_cache_ceiling_tokens: Option<usize>,
-    #[serde(default)]
-    pub theme: Option<String>,
-    #[serde(default)]
-    pub show_token_usage: Option<bool>,
-    #[serde(default)]
-    pub show_tool_images: Option<bool>,
-    #[serde(default)]
-    pub show_tool_activity: Option<bool>,
-    #[serde(default)]
-    pub show_knowledge_activity: Option<bool>,
-    #[serde(default)]
-    pub show_delegation_notes: Option<bool>,
-    /// Per-kind steering-note display overrides (`[ui.steering_notes]`) — see
-    /// [`SteeringNotesDto`].
-    #[serde(default)]
-    pub steering_notes: Option<SteeringNotesDto>,
-    #[serde(default)]
-    pub chat_thread_line: Option<bool>,
-    #[serde(default)]
-    pub chat_prose_cap: Option<bool>,
-    #[serde(default)]
-    pub chat_turn_tint: Option<bool>,
-    #[serde(default)]
-    pub chat_hover_timestamps: Option<bool>,
-    #[serde(default)]
-    pub sound_complete: Option<bool>,
-    #[serde(default)]
-    pub sound_input_needed: Option<bool>,
-    #[serde(default)]
-    pub sound_stopped_errors: Option<bool>,
+    // G9 (§5.9.9 :733-738, job 4 D3): the `[ui]` fields (theme, the
+    // show_*/chat_*/sound_* toggles, steering_notes) are ABSENT from
+    // the engine patch — compile-time absent (row 33: "SettingsPatch
+    // cannot set [ui] fields"). The app owns the `[ui]` table: the
+    // GUI's wire splits at the app boundary (ipc/settings.rs carries
+    // the UI half and applies it app-side). On disk nothing moves —
+    // same file, same tables.
     #[serde(default)]
     pub models: Option<ModelsConfigDto>,
     /// Pre-prompt model routing (`[general.routing]`, backlog 091e694d).
@@ -544,14 +528,6 @@ pub fn validate_and_apply_settings_patch(
             }
         }
     }
-    if let Some(theme) = &patch.theme {
-        let t = theme.to_ascii_lowercase();
-        if t != "dark" && t != "light" && t != "system" {
-            return Err(format!(
-                "theme must be 'dark', 'light', or 'system' (got '{theme}')"
-            ));
-        }
-    }
     let parsed_safety = match &patch.safety {
         Some(s) => Some(super::patch::parse_safety_mode(s)?),
         None => None,
@@ -640,6 +616,7 @@ pub fn validate_and_apply_settings_patch(
             &models.bug_fixing,
             &models.reviewing,
             &models.complete,
+            &models.free,
             &models.subagent,
             &models.summarize,
         ] {
@@ -828,81 +805,6 @@ pub fn validate_and_apply_settings_patch(
             cur.review_budget = v;
         }
     }
-    if let Some(theme) = &patch.theme {
-        general.ui.theme = theme.to_ascii_lowercase();
-    }
-    if let Some(show) = patch.show_token_usage {
-        general.ui.show_token_usage = show;
-    }
-    if let Some(show) = patch.show_tool_images {
-        general.ui.show_tool_images = show;
-    }
-    if let Some(show) = patch.show_tool_activity {
-        general.ui.show_tool_activity = show;
-    }
-    if let Some(show) = patch.show_knowledge_activity {
-        general.ui.show_knowledge_activity = show;
-    }
-    if let Some(show) = patch.show_delegation_notes {
-        general.ui.show_delegation_notes = show;
-    }
-    if let Some(notes) = &patch.steering_notes {
-        let cur = &mut general.ui.steering_notes;
-        if let Some(v) = notes.auto_delegated {
-            cur.auto_delegated = Some(v);
-        }
-        if let Some(v) = notes.search_nudge {
-            cur.search_nudge = Some(v);
-        }
-        if let Some(v) = notes.shell_tip {
-            cur.shell_tip = Some(v);
-        }
-        if let Some(v) = notes.graph_miss {
-            cur.graph_miss = Some(v);
-        }
-        if let Some(v) = notes.recall_rider {
-            cur.recall_rider = Some(v);
-        }
-        if let Some(v) = notes.read_nudge {
-            cur.read_nudge = Some(v);
-        }
-        if let Some(v) = notes.literal_tip {
-            cur.literal_tip = Some(v);
-        }
-        if let Some(v) = notes.known_memory_hit {
-            cur.known_memory_hit = Some(v);
-        }
-        if let Some(v) = notes.consolidation_due {
-            cur.consolidation_due = Some(v);
-        }
-        if let Some(v) = notes.shell_redirect {
-            cur.shell_redirect = Some(v);
-        }
-        if let Some(v) = notes.edit_stale_read {
-            cur.edit_stale_read = Some(v);
-        }
-    }
-    if let Some(on) = patch.chat_thread_line {
-        general.ui.chat_thread_line = on;
-    }
-    if let Some(on) = patch.chat_prose_cap {
-        general.ui.chat_prose_cap = on;
-    }
-    if let Some(on) = patch.chat_turn_tint {
-        general.ui.chat_turn_tint = on;
-    }
-    if let Some(on) = patch.chat_hover_timestamps {
-        general.ui.chat_hover_timestamps = on;
-    }
-    if let Some(on) = patch.sound_complete {
-        general.ui.sound_complete = on;
-    }
-    if let Some(on) = patch.sound_input_needed {
-        general.ui.sound_input_needed = on;
-    }
-    if let Some(on) = patch.sound_stopped_errors {
-        general.ui.sound_stopped_errors = on;
-    }
     if let Some(enabled) = patch.enable_browser_inspection {
         general.general.enable_browser_inspection = enabled;
     }
@@ -925,25 +827,30 @@ pub fn validate_and_apply_settings_patch(
     };
     if let Some(models) = &patch.models {
         if let Some(p) = &models.planning {
-            general.models.planning = p.as_ref().map(|m| to_ref(m));
+            general.models.planning = p.as_ref().map(to_ref);
         }
         if let Some(e) = &models.executing {
-            general.models.executing = e.as_ref().map(|m| to_ref(m));
+            general.models.executing = e.as_ref().map(to_ref);
         }
         if let Some(b) = &models.bug_fixing {
-            general.models.bug_fixing = b.as_ref().map(|m| to_ref(m));
+            general.models.bug_fixing = b.as_ref().map(to_ref);
         }
         if let Some(r) = &models.reviewing {
-            general.models.reviewing = r.as_ref().map(|m| to_ref(m));
+            general.models.reviewing = r.as_ref().map(to_ref);
         }
         if let Some(c) = &models.complete {
-            general.models.complete = c.as_ref().map(|m| to_ref(m));
+            general.models.complete = c.as_ref().map(to_ref);
+        }
+        if let Some(f) = &models.free {
+            // Lint-clean form (clippy redundant_closure): pass the mapper
+            // directly — every arm has since the efd1f4c3 clippy sweep.
+            general.models.free = f.as_ref().map(to_ref);
         }
         if let Some(s) = &models.subagent {
-            general.models.subagent = s.as_ref().map(|m| to_ref(m));
+            general.models.subagent = s.as_ref().map(to_ref);
         }
         if let Some(s) = &models.summarize {
-            general.models.summarize = s.as_ref().map(|m| to_ref(m));
+            general.models.summarize = s.as_ref().map(to_ref);
         }
         if let Some(skill_map) = &models.skill {
             general.models.skill = skill_map
@@ -955,19 +862,19 @@ pub fn validate_and_apply_settings_patch(
 
     if let Some(routing) = &patch.routing {
         if let Some(cheap) = &routing.cheap {
-            general.general.routing.cheap = cheap.as_ref().map(|m| to_ref(m));
+            general.general.routing.cheap = cheap.as_ref().map(to_ref);
         }
         if let Some(capable) = &routing.capable {
-            general.general.routing.capable = capable.as_ref().map(|m| to_ref(m));
+            general.general.routing.capable = capable.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.lane_medium {
-            general.general.routing.lane_medium = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.lane_medium = lane.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.lane_high {
-            general.general.routing.lane_high = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.lane_high = lane.as_ref().map(to_ref);
         }
         if let Some(lane) = &routing.escalate {
-            general.general.routing.escalate = lane.as_ref().map(|m| to_ref(m));
+            general.general.routing.escalate = lane.as_ref().map(to_ref);
         }
         if let Some(threshold) = routing.threshold {
             general.general.routing.threshold = threshold;
@@ -1036,57 +943,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_readability_flags_persist_through_the_save_patch() {
-        // Regression (review H1, plan afa81f0a): the four chat-readability
-        // toggles must ride the save path — a patch carrying them flips the
-        // UiConfig values. Before the fix, serde silently dropped the
-        // unknown keys and every toggle reverted on restart.
+    fn ui_fields_are_absent_from_the_engine_patch() {
+        // G9 (§5.9.9, job 4 D3; row 33 leg 2): the [ui] fields are
+        // COMPILE-TIME ABSENT from the engine patch — a wire still
+        // carrying them deserializes (serde drops unknown keys) and the
+        // apply leaves the [ui] table untouched. The app owns [ui]; the
+        // GUI's wire splits at the app boundary (ipc/settings.rs).
         let current = Config::default();
-        let patch = SettingsSaveDto {
-            chat_thread_line: Some(false),
-            chat_prose_cap: Some(false),
-            chat_turn_tint: Some(false),
-            chat_hover_timestamps: Some(false),
-            ..Default::default()
-        };
+        let patch = serde_json::from_value::<SettingsSaveDto>(serde_json::json!({
+            "theme": "dark",
+            "chat_thread_line": false,
+            "show_token_usage": true,
+            "steering_notes": { "auto_delegated": false },
+        }))
+        .unwrap();
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert!(!next.general.ui.chat_thread_line);
-        assert!(!next.general.ui.chat_prose_cap);
-        assert!(!next.general.ui.chat_turn_tint);
-        assert!(!next.general.ui.chat_hover_timestamps);
-        // Untouched fields keep their defaults.
-        assert!(next.general.ui.sound_complete);
+        let fresh = Config::default();
+        assert_eq!(next.general.ui.theme, fresh.general.ui.theme);
+        assert_eq!(
+            next.general.ui.chat_thread_line,
+            fresh.general.ui.chat_thread_line
+        );
+        assert_eq!(
+            next.general.ui.show_token_usage,
+            fresh.general.ui.show_token_usage
+        );
+        assert_eq!(
+            next.general.ui.steering_notes.auto_delegated,
+            fresh.general.ui.steering_notes.auto_delegated
+        );
     }
 
     #[test]
-    fn steering_notes_patch_applies_per_kind() {
-        // The per-kind steering-note overrides ride the save path: Some flips
-        // just that kind's override, None (absent) leaves the other kinds —
-        // and the legacy show_delegation_notes — untouched.
-        let current = Config::default();
+    fn ui_table_survives_an_engine_patch() {
+        // G9 (job 4 D3): "on disk nothing moves" — the app-owned [ui]
+        // table rides through an ENGINE patch untouched (the GUI's
+        // theme survives a standalone consumer's engine-side save).
+        let mut current = Config::default();
+        current.general.ui.theme = "dark".to_string();
+        current.general.ui.chat_thread_line = false;
         let patch = SettingsSaveDto {
-            show_delegation_notes: Some(true),
-            steering_notes: Some(SteeringNotesDto {
-                auto_delegated: Some(false),
-                literal_tip: Some(false),
-                ..Default::default()
-            }),
+            summarize_at_fill_rate: Some(0.5),
             ..Default::default()
         };
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert_eq!(next.general.ui.steering_notes.auto_delegated, Some(false));
-        assert_eq!(next.general.ui.steering_notes.literal_tip, Some(false));
-        // Only the patched kinds gained an override.
-        assert_eq!(next.general.ui.steering_notes.search_nudge, None);
-        // Resolution honors both: the explicit per-kind value beats the legacy
-        // toggle, untouched kinds keep their defaults.
-        assert!(!next.general.ui.effective_steering_note_visible("auto_delegated"));
-        assert!(!next.general.ui.effective_steering_note_visible("literal_tip"));
-        assert!(next.general.ui.effective_steering_note_visible("search_nudge"));
-        // An absent steering_notes patch changes nothing.
-        let patch = SettingsSaveDto::default();
-        let after = validate_and_apply_settings_patch(&next, &patch).unwrap();
-        assert_eq!(after.general.ui.steering_notes, next.general.ui.steering_notes);
+        assert_eq!(next.general.ui.theme, "dark");
+        assert!(!next.general.ui.chat_thread_line);
     }
 
     #[test]
@@ -1414,6 +1316,67 @@ mod tests {
         let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
         assert_eq!(
             next.general.models.bug_fixing,
+            Some(ModelRef {
+                endpoint: "ep".into(),
+                model: "old".into(),
+                reasoning_effort: None,
+            })
+        );
+    }
+
+    #[test]
+    fn free_patch_set_clear_keep() {
+        // 2c.6 (§5.2 :270-271): the free slot rides the [models] patch like
+        // the other slots — Some(Some(m)) replaces, Some(None) clears,
+        // outer None keeps — and validates against the configured endpoints.
+        // (The set→used / unset→default-ride WALK is pinned separately in
+        // model_resolver's free_slot_resolves_configured_or_falls_back_to_default
+        // — 2a.6, verify-only here per A8's row-7 verdict.)
+        let mut current = Config::default();
+        current.general.models.free = Some(ModelRef {
+            endpoint: "ep".into(),
+            model: "old".into(),
+            reasoning_effort: None,
+        });
+        // Set: Some(Some(m)) replaces (effort included).
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto {
+                free: Some(Some(ModelRefDto {
+                    endpoint: "ep2".into(),
+                    model: "m2".into(),
+                    reasoning_effort: Some("max".into()),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(
+            next.general.models.free,
+            Some(ModelRef {
+                endpoint: "ep2".into(),
+                model: "m2".into(),
+                reasoning_effort: Some("max".into()),
+            })
+        );
+        // Clear: Some(None) → None.
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto {
+                free: Some(None),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(next.general.models.free, None);
+        // Keep: outer None → unchanged.
+        let patch = SettingsSaveDto {
+            models: Some(ModelsConfigDto::default()),
+            ..Default::default()
+        };
+        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
+        assert_eq!(
+            next.general.models.free,
             Some(ModelRef {
                 endpoint: "ep".into(),
                 model: "old".into(),

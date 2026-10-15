@@ -73,7 +73,7 @@ pub fn corpus_digest(plans_dir: &Path, reviews_dir: &Path) -> String {
                 Some((mtime, e.path()))
             })
             .collect();
-        files.sort_by(|a, b| b.0.cmp(&a.0));
+        files.sort_by_key(|a| std::cmp::Reverse(a.0));
         for (_, path) in files.into_iter().take(CORPUS_MAX_FILES_PER_DIR) {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
@@ -144,11 +144,11 @@ pub(crate) async fn consolidate_session_with_events(
 
     // 2. Generate the episodic summary (synthetic or LLM-assisted).
     let (narrative, key_decisions, files_modified, concepts) = if let Some(llm) = provider {
-        synthesize_with_llm(&session_events, llm)
+        synthesize_with_llm(session_events, llm)
             .await
-            .unwrap_or_else(|_| synthesize_synthetic(&session_events))
+            .unwrap_or_else(|_| synthesize_synthetic(session_events))
     } else {
-        synthesize_synthetic(&session_events)
+        synthesize_synthetic(session_events)
     };
 
     // 3. Store the episodic memory.
@@ -217,7 +217,11 @@ pub(crate) async fn consolidate_session_with_events(
 }
 
 /// Synthesize an episodic summary without an LLM (synthetic compression).
-fn synthesize_synthetic(events: &[&Memory]) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+/// `pub(crate)`: also the turn-boundary auto-consolidation's compressor
+/// (backlog 4100f5e3 pillar C) — the same synthetic shape everywhere.
+pub(crate) fn synthesize_synthetic(
+    events: &[&Memory],
+) -> (String, Vec<String>, Vec<String>, Vec<String>) {
     let tool_count = events.len();
     let tools_used: Vec<String> = events
         .iter()
@@ -356,7 +360,7 @@ async fn extract_semantic_facts(
     // List the newest existing facts so the LLM can refine them in place
     // (via the optional 'id' field) instead of duplicating near-misses.
     let mut existing = store.list_by_tier(MemoryTier::Semantic).await?;
-    existing.sort_by(|a, b| b.last_accessed_at.cmp(&a.last_accessed_at));
+        existing.sort_by_key(|a| std::cmp::Reverse(a.last_accessed_at));
     existing.truncate(EXISTING_FACTS_LIMIT);
     let existing_section = if existing.is_empty() {
         String::new()
@@ -1246,7 +1250,7 @@ mod tests {
         // scoped to the owning fn bodies so this test's own needles never
         // self-match.
         let src = include_str!("consolidation.rs");
-        let core = fn_body(&src, "consolidate_session_with_events");
+        let core = fn_body(src, "consolidate_session_with_events");
         for needle in [
             "mnemo: semantic fact extraction failed",
             "mnemo: procedural workflow extraction failed",
@@ -1264,7 +1268,7 @@ mod tests {
                 "a swallow crept back into consolidate_session_with_events: {banned}"
             );
         }
-        let semantic = fn_body(&src, "extract_semantic_facts");
+        let semantic = fn_body(src, "extract_semantic_facts");
         assert!(
             semantic.contains("mnemo: failed to write semantic fact"),
             "the semantic-fact write must log its failure"
@@ -1273,7 +1277,7 @@ mod tests {
             !semantic.contains("let _ = store.write"),
             "a store.write swallow crept back into extract_semantic_facts"
         );
-        let procedural = fn_body(&src, "extract_procedural_workflows");
+        let procedural = fn_body(src, "extract_procedural_workflows");
         assert!(
             procedural.contains("mnemo: failed to write procedural workflow"),
             "the procedural-workflow write must log its failure"

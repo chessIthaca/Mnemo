@@ -37,71 +37,21 @@
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use mnemo::codegraph::extract::Symbol;
-use mnemo::codegraph::query::{GraphSliceFilter, GraphView};
-use mnemo::codegraph::store::EdgeRow;
-use mnemo::codegraph::{CodeGraph, IndexStats};
+use mnemo::codegraph::CodeGraph;
+use mnemo::headless::{CodegraphApi, CodegraphGraph, CodegraphStatus};
 
 use crate::ipc::error::IpcError;
 use crate::ipc::memory_maintenance::{should_forward_progress, PROGRESS_EVERY};
+
+pub(crate) use mnemo::index_progress::{
+    startup_index_snapshot, IndexProgressEvent, INDEX_PROGRESS_CHANNEL,
+};
+#[cfg(test)]
+use mnemo::host::index_progress::{
+    clear_startup_index, ensure_startup_index_visible, mark_startup_index_active,
+    record_startup_index_progress, startup_should_forward,
+};
 use crate::ipc::state::IpcState;
-
-/// The Graph tab's status line: is the graph available, how big is it, and
-/// is an indexing pass running right now.
-#[derive(Debug, Clone, Serialize)]
-pub struct CodegraphStatus {
-    /// False when codegraph is disabled (`[general] codegraph = false`),
-    /// the DB failed to open, or the brain failed to build — the tab shows
-    /// an "unavailable" state instead of empty counts.
-    pub available: bool,
-    /// True while an indexing pass is running (startup or a refresh).
-    pub indexing: bool,
-    /// Number of indexed files — every searchable file (source + content-only
-    /// rows), 0 when unavailable.
-    pub files: usize,
-    /// Number of stored symbols (0 when unavailable).
-    pub symbols: usize,
-    /// Number of stored edges (0 when unavailable).
-    pub edges: usize,
-    /// Unix seconds of the most recent `indexed_at`, if any file is indexed.
-    pub last_indexed_at: Option<i64>,
-}
-
-impl CodegraphStatus {
-    /// The `available: false` shape (counts zeroed, not indexing).
-    fn unavailable() -> Self {
-        Self {
-            available: false,
-            indexing: false,
-            files: 0,
-            symbols: 0,
-            edges: 0,
-            last_indexed_at: None,
-        }
-    }
-
-    /// Build the live shape from the graph's stats + indexing flag.
-    fn from_parts(stats: mnemo::codegraph::store::GraphStats, indexing: bool) -> Self {
-        Self {
-            available: true,
-            indexing,
-            files: stats.files,
-            symbols: stats.symbols,
-            edges: stats.edges,
-            last_indexed_at: stats.last_indexed_at,
-        }
-    }
-}
-
-/// A visualization subgraph: the selected nodes plus every edge whose both
-/// endpoints are among them.
-#[derive(Debug, Clone, Serialize)]
-pub struct CodegraphGraph {
-    /// The selected symbols, id-sorted.
-    pub nodes: Vec<Symbol>,
-    /// Edges between the selected symbols only.
-    pub edges: Vec<EdgeRow>,
-}
 
 /// The graph handle from IPC state: `None` when the brain failed to build
 /// (no factory) or codegraph is disabled/unavailable (no handle on the
@@ -110,24 +60,14 @@ fn graph_handle(state: &IpcState) -> Option<std::sync::Arc<CodeGraph>> {
     state.runtime.factory.as_ref()?.codegraph_handle()
 }
 
-/// Read the graph's stats on the blocking pool (the SQLite lock is sync).
-async fn stats_via_blocking(graph: std::sync::Arc<CodeGraph>) -> Result<CodegraphStatus, IpcError> {
-    let indexing = graph.is_indexing();
-    let stats = tokio::task::spawn_blocking(move || graph.stats())
-        .await
-        .map_err(|e| format!("codegraph stats task failed: {e}"))?
-        .map_err(IpcError::from)?;
-    Ok(CodegraphStatus::from_parts(stats, indexing))
-}
-
 /// The Graph tab's status: availability, counts, and the indexing flag.
 /// Never errors — an unavailable graph reports `available: false`.
+/// 3b.2 (D2): the logic lives in `mnemo::headless::CodegraphApi::status`
+/// — ONE implementation shared with `Engine::codegraph()`.
 #[tauri::command]
 pub async fn codegraph_status(state: State<'_, IpcState>) -> Result<CodegraphStatus, IpcError> {
-    let Some(graph) = graph_handle(&state) else {
-        return Ok(CodegraphStatus::unavailable());
-    };
-    Ok(stats_via_blocking(graph).await?)
+    let api = CodegraphApi::from_parts(graph_handle(&state));
+    Ok(api.status().await?)
 }
 
 /// Trigger a background re-index of the graph. Idempotent: when a pass is
@@ -141,38 +81,17 @@ pub async fn codegraph_status(state: State<'_, IpcState>) -> Result<CodegraphSta
 /// is unavailable.
 #[tauri::command]
 pub async fn codegraph_refresh(state: State<'_, IpcState>) -> Result<CodegraphStatus, IpcError> {
+    // The unavailable graph still ERRORS on an explicit refresh request —
+    // checked here before the API takes over (the API's own `refresh`
+    // degrades a `None` graph to the unavailable shape instead).
     let graph = graph_handle(&state)
         .ok_or_else(|| IpcError::msg("codegraph unavailable (disabled or failed to open)"))?;
-    // A pass is already running — don't stack a second one (the store writes
-    // would serialize safely, but the parse work would be duplicated).
-    if graph.is_indexing() {
-        return Ok(stats_via_blocking(graph).await?);
-    }
-    // Set the flag before spawning so the status we return (and the tab's
-    // poller) deterministically sees the scheduled pass (review F1: the old
-    // code raced the spawned task's entry).
-    graph.set_indexing(true);
-    let runner = graph.clone();
-    // index() owns the indexing flag (set on entry, cleared by a drop guard
-    // on every exit path); the parse itself is CPU + disk bound → blocking
-    // pool, mirroring the startup pass in main.rs.
-    tauri::async_runtime::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || runner.index(None)).await;
-        match result {
-            Ok(Ok(stats)) => log_refresh(&stats),
-            Ok(Err(e)) => eprintln!("codegraph: refresh failed: {e}"),
-            Err(e) => eprintln!("codegraph: refresh task panicked: {e}"),
-        }
-    });
-    Ok(stats_via_blocking(graph).await?)
-}
-
-/// Log a successful refresh pass (kept out of the command body for clarity).
-fn log_refresh(stats: &IndexStats) {
-    eprintln!(
-        "codegraph: refreshed — {} files scanned, {} re-parsed, {} symbols, {} edges in {}ms",
-        stats.files_scanned, stats.files_reindexed, stats.symbols, stats.edges, stats.elapsed_ms
-    );
+    // 3b.2 (D2): the schedule logic — the already-running guard, the SYNC
+    // flag-set before the spawn (review F1: the returned status must
+    // deterministically report the scheduled pass), the spawn + the
+    // scheduled status — lives in `CodegraphApi::refresh`.
+    let api = CodegraphApi::from_parts(Some(graph));
+    Ok(api.refresh().await?)
 }
 
 /// A visualization subgraph. With no filters: the top
@@ -182,6 +101,8 @@ fn log_refresh(stats: &IndexStats) {
 /// nodes. With `from_symbol` (+ optional `depth`, default 1): that symbol's
 /// both-directions neighborhood — a stale/unknown id yields an EMPTY graph
 /// (not an error), so the tab survives a re-index racing a click.
+/// 3b.2 (D2): the slice logic (blocking-pool snapshot + selection) lives
+/// in `CodegraphApi::query`.
 #[tauri::command]
 pub async fn codegraph_graph(
     state: State<'_, IpcState>,
@@ -192,30 +113,15 @@ pub async fn codegraph_graph(
 ) -> Result<CodegraphGraph, IpcError> {
     let graph = graph_handle(&state)
         .ok_or_else(|| IpcError::msg("codegraph unavailable (disabled or failed to open)"))?;
-    // Snapshot + slice on the blocking pool (sync SQLite lock + O(nodes)
-    // selection — never on a tokio worker). The owned filter strings move
-    // into the closure (spawn_blocking requires 'static); the borrowed
-    // `GraphSliceFilter` is constructed inside.
-    let slice = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let filter = GraphSliceFilter {
-            name: name.as_deref(),
-            kind: kind.as_deref(),
-            from_symbol: from_symbol.as_deref(),
+    let api = CodegraphApi::from_parts(Some(graph));
+    Ok(api
+        .query(
+            name.as_deref(),
+            kind.as_deref(),
+            from_symbol.as_deref(),
             depth,
-        };
-        let view: GraphView = graph.view().map_err(|e| e.to_string())?;
-        Ok(view.slice(&filter))
-    })
-    .await
-    .map_err(|e| format!("codegraph graph task failed: {e}"))??;
-    // Unknown `from_symbol` (slice → None) yields an EMPTY graph, not an
-    // error — a re-index can retire the clicked node between render and
-    // click, and the tab must survive that.
-    let slice = slice.unwrap_or_default();
-    Ok(CodegraphGraph {
-        nodes: slice.nodes,
-        edges: slice.edges,
-    })
+        )
+        .await?)
 }
 
 // ── Settings → Memory & Search: code-index rebuild ──────────────────────────
@@ -263,151 +169,11 @@ fn emit_reindex(app: &AppHandle, event: &ReindexEvent) {
 
 // ── Indexing-progress overlay stream (project open) ─────────────────────────
 
-/// The Tauri event channel the STARTUP indexing pass (main.rs) and the
-/// create-project seed pass (ipc/projects.rs) stream file progress on, so the
-/// open-project overlay can show a progress bar + "N/M files indexed"
-/// counter. Distinct from [`REINDEX_CHANNEL`] (the Settings card's manual
-/// rebuild) so the two UIs never fold each other's traffic.
-pub const INDEX_PROGRESS_CHANNEL: &str = "codegraph://index-progress";
-
-/// An event on the [`INDEX_PROGRESS_CHANNEL`] stream — the indexing progress
-/// behind the open-project overlay. The same `"type"`-tagged, kebab-case
-/// shape as [`ReconcileEvent`] (memory_maintenance.rs), but with NO `phase`
-/// field: a code index has exactly one phase. Pinned by
-/// `index_progress_event_wire_shape`; the frontend folds it via
-/// `applyIndexProgress` in IndexingOverlay.tsx.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum IndexProgressEvent {
-    /// The pass started (the overlay appears, counter "…").
-    Started,
-    /// A progress tick after a walked file (throttled — first, last, and
-    /// every `PROGRESS_EVERY`-th tick forward; the startup pass additionally
-    /// gates on 1s elapsed so a sub-second pass emits nothing).
-    Progress {
-        /// Files processed so far.
-        done: usize,
-        /// Total source files to walk.
-        total: usize,
-    },
-    /// Terminal success with a human-readable summary.
-    Done {
-        /// One-line summary for the overlay's result line.
-        summary: String,
-    },
-    /// Terminal failure (engine error or a panicked task).
-    Failed {
-        /// Error text for the overlay's result line.
-        error: String,
-    },
-}
-
 /// Best-effort emit on the [`INDEX_PROGRESS_CHANNEL`] (a dead window drops
 /// the event; the pass still runs). `pub(crate)`: the startup pass (main.rs)
 /// and the create-project seed pass (ipc/projects.rs) emit through it.
 pub(crate) fn emit_index_progress(app: &AppHandle, event: &IndexProgressEvent) {
     let _ = app.emit(INDEX_PROGRESS_CHANNEL, event);
-}
-
-/// Whether a STARTUP-pass progress tick should be forwarded to the overlay.
-///
-/// Cold start (`switched = false`): only after a full second has elapsed (an
-/// already-indexed project's sub-second pass emits nothing, so the overlay
-/// never flashes) AND the shared throttle accepts the tick (first /
-/// every-50th / last).
-///
-/// Post-switch startup (`switched = true`, a pending-project marker was
-/// consumed — this launch is the reload half of a `switch_project`): the
-/// 1-second gate is skipped. The user explicitly opened this project
-/// (mirroring the create-project seed pass, which never gates), and the UI
-/// they clicked from was just torn down for the restart — delaying feedback
-/// would only hide the dialog they expect to see. The shared throttle still
-/// applies.
-///
-/// `pub(crate)`: the startup pass (main.rs) gates its ticks through it.
-pub(crate) fn startup_should_forward(
-    elapsed: std::time::Duration,
-    done: usize,
-    total: usize,
-    switched: bool,
-) -> bool {
-    (switched || elapsed >= std::time::Duration::from_secs(1))
-        && should_forward_progress(done, total, PROGRESS_EVERY)
-}
-
-// ── Startup-pass snapshot (late-overlay catch-up) ────────────────────────────
-
-/// Whether a startup indexing pass is (possibly) running right now.
-static STARTUP_INDEX_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-/// Files processed so far by the startup pass (meaningful while active).
-static STARTUP_INDEX_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Total files the startup pass will walk (meaningful while active).
-static STARTUP_INDEX_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Mark the STARTUP indexing pass as begun and reset its counters. The
-/// snapshot becomes fetchable immediately only when `switched` is true (a
-/// post-switch startup always shows the overlay). On a COLD start the
-/// snapshot stays invisible until the first tick actually clears the 1s gate
-/// ([`ensure_startup_index_visible`]) — a sub-second cold pass on an
-/// already-indexed project must never expose the snapshot, or a late
-/// overlay's catch-up fetch would flash a dialog the cold-start contract
-/// says must not appear.
-///
-/// WHY a snapshot: the webview listening on `codegraph://index-progress` is
-/// (re)created on every app start AND every project switch; React mounts and
-/// subscribes some time after the startup pass has already begun, so events
-/// emitted before the subscription are lost. The pass mirrors its live
-/// progress here so a late-mounting overlay can fetch a snapshot via
-/// [`get_index_progress`] and catch up. Only the startup pass records — the
-/// Settings-card maintenance stream and the Graph-tab refresh have their own
-/// always-mounted UIs and never touch it.
-pub(crate) fn mark_startup_index_active(switched: bool) {
-    STARTUP_INDEX_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
-    STARTUP_INDEX_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
-    STARTUP_INDEX_ACTIVE.store(switched, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Make the startup-pass snapshot fetchable (idempotent). Called by the
-/// progress callback on the first FORWARDED tick, so a cold start whose
-/// 1s gate opens (a genuinely slow pass worth showing) becomes catch-up
-/// visible exactly when the overlay stream becomes active — while gated
-/// sub-second cold passes never publish anything.
-pub(crate) fn ensure_startup_index_visible() {
-    STARTUP_INDEX_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Record one startup-pass progress tick. Called on EVERY tick, before any
-/// gate, so the snapshot stays complete even for ticks the gate drops.
-pub(crate) fn record_startup_index_progress(done: usize, total: usize) {
-    STARTUP_INDEX_DONE.store(done as u64, std::sync::atomic::Ordering::Relaxed);
-    STARTUP_INDEX_TOTAL.store(total as u64, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Clear the snapshot when the startup pass ends (before its terminal event
-/// is emitted), so a fetch after the pass reports nothing rather than stale
-/// final counts.
-pub(crate) fn clear_startup_index() {
-    STARTUP_INDEX_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The startup pass's live progress, or `None` when no pass is running (or it
-/// already ended — the clear and the terminal event race harmlessly: an
-/// overlay that misses both sees nothing, which is correct for a finished
-/// pass).
-pub(crate) fn startup_index_snapshot() -> Option<(usize, usize)> {
-    if STARTUP_INDEX_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-        let done = STARTUP_INDEX_DONE.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        let total = STARTUP_INDEX_TOTAL.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        // The two counters are independent Relaxed atomics, so a concurrent
-        // read can transiently pair a new `done` with the previous tick's
-        // `total` (done > total for a nanosecond). Clamping keeps the
-        // frontend's percentage arithmetic sane; the tear is otherwise
-        // harmless and never persists (the next tick re-pairs them).
-        Some((done.min(total), total))
-    } else {
-        None
-    }
 }
 
 /// The live startup indexing progress, for overlays that mounted late.

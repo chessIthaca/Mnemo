@@ -29,6 +29,72 @@ use crate::error::{Error, Result};
 
 use super::sse_util::check_response;
 
+/// Resolve the credentials for a model-listing request (job 4 D2,
+/// moved from the app's ipc/models.rs so the GUI pickers and the
+/// standalone `Setup` surface share ONE implementation): the explicit
+/// override args first (empty strings treated as absent — the
+/// override path keeps a picker in sync with unsaved edits), then the
+/// saved endpoint (`endpoints.toml` base_url + kind, `keys.toml`
+/// key), then the kind-aware env fallback (mirroring the provider's
+/// `resolve_api_key`), then `"dummy"` (local endpoints often need no
+/// key). Returns `(base_url, api_key, kind-wire)`.
+pub fn resolve_endpoint_credentials(
+    config: &crate::config::Config,
+    endpoint_name: &str,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    kind: Option<String>,
+) -> std::result::Result<(String, String, String), String> {
+    let saved = config.endpoint(endpoint_name);
+    let base_url = base_url
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| saved.map(|e| e.base_url.clone()))
+        .ok_or_else(|| {
+            format!(
+                "endpoint '{endpoint_name}' has no base_url and does not match a saved endpoint"
+            )
+        })?;
+    let kind = kind
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| saved.map(|e| crate::config::kind_wire(e.kind).to_string()))
+        .unwrap_or_else(|| "openai".to_string());
+    // Kind-aware env fallback, mirroring the provider's resolve_api_key
+    // (client_factory.rs): an Anthropic-kind endpoint prefers
+    // ANTHROPIC_API_KEY; OpenAI/Local prefer OPENAI_API_KEY. Both share
+    // the historical ANTHROPIC_AUTH_TOKEN fallback.
+    let env_key = if kind == "anthropic" {
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
+    } else {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
+    };
+    let api_key = api_key
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| saved.and_then(|e| config.key_for(&e.name).map(|s| s.to_string())))
+        .or(env_key)
+        .unwrap_or_else(|| "dummy".to_string());
+    Ok((base_url, api_key, kind))
+}
+
+/// Fetch the live model list via the HTTP helper selected by the
+/// resolved kind wire string (job 4 D2, moved from ipc/models.rs):
+/// `"anthropic"` uses the Anthropic headers (`x-api-key` +
+/// `anthropic-version`), anything else the OpenAI-compatible path.
+pub async fn fetch_by_kind(
+    kind: &str,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelWithVision>> {
+    if kind == "anthropic" {
+        fetch_models_anthropic(base_url, api_key).await
+    } else {
+        fetch_models_with_vision(base_url, api_key).await
+    }
+}
+
 /// A model id paired with whether the provider reports it as vision-capable
 /// (i.e. it accepts image inputs). Used by the Settings → Vision picker to
 /// filter the live `/models` list down to vision-capable models.

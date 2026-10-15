@@ -38,7 +38,10 @@ command.
 
 - Follow the existing code style in this repository.
 - All public functions must have doc comments.
-- Run `cargo test` before marking a workflow step complete.
+- Run `cargo test --workspace` before marking a workflow step complete
+  (root-only `cargo test` builds only the root package — it never compiles
+  src-tauri, so app-crate breaks pass unnoticed; job 4 D9 review round 1,
+  commit 3373096).
 - A **feature-gated** dependency bump additionally requires the feature-enabled
   run — `cargo test --features embeddings` (fastembed/ONNX) or `--features
   browser` (chromiumoxide), whichever tree the bump touches. Plain `cargo test`

@@ -26,7 +26,6 @@ use crate::provider::{LlmClient, LlmEvent, Message, ToolCall};
 use crate::runtime::{AgentCommand, AgentEvent, AgentId};
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{OutputSink, ToolCall as ParsedToolCall, ToolFilter, ToolResult};
-use crate::workflow::WorkflowState;
 
 /// The file tools [`ToolFilter::ExecutingResearch`] denies wholesale — the set
 /// a research plan may nevertheless use on an ARTIFACT target (`.coding/**`).
@@ -140,7 +139,7 @@ fn judge_research_write(sandbox: &Sandbox, path: &Path) -> ResearchWrite {
 /// different remedies ("push an implementation sub-plan" does not unlock a
 /// protected file), so one shared message would send the model after the wrong
 /// fix.
-fn denial_message(name: &str, state: WorkflowState, verdict: ResearchWrite) -> String {
+fn denial_message(name: &str, state_token: String, verdict: ResearchWrite) -> String {
     match verdict {
         ResearchWrite::Protected => format!(
             "tool '{name}' is not allowed here: the target is a protected, app-owned file \
@@ -149,16 +148,37 @@ fn denial_message(name: &str, state: WorkflowState, verdict: ResearchWrite) -> S
              dedicated tools (plan/memory/safety/git) instead"
         ),
         ResearchWrite::NotAnArtifact => format!(
-            "tool '{name}' is not allowed here: the active plan is a research plan ({state}), \
+            "tool '{name}' is not allowed here: the active plan is a research plan ({state_token}), \
              which may write only its own artifacts under .coding/ — source, docs and other \
              app-owned files stay read-only; push an implementation sub-plan to change source"
         ),
         // The carve-out is granted, so this arm is unreachable from the gate —
         // or the call is not a carve-out candidate at all.
         ResearchWrite::Artifact | ResearchWrite::NotApplicable => format!(
-            "tool '{name}' is not allowed in the current workflow state ({state})"
+            "tool '{name}' is not allowed in the current workflow state ({state_token})"
         ),
     }
+}
+
+/// The interrupt plumbing threaded through the dispatch helpers
+/// (`dispatch_with_interrupt`, `dispatch_host_tool`): the agent identity +
+/// event fan-in, the command channel borrow, and the two mutable
+/// interrupt slots — the stop signal latched during approval waits /
+/// tool execution, and the command buffer drained mid-call and returned
+/// for re-injection. Grouped so the dispatch entry points stay under
+/// the argument budget; each helper destructures it at its head into
+/// plain locals.
+pub(crate) struct DispatchCtx<'a> {
+    /// The agent's identity — stamped on every emitted event.
+    pub(crate) agent_id: AgentId,
+    /// The event fan-in (host tool calls, live output deltas).
+    pub(crate) fanin_tx: &'a mpsc::Sender<(AgentId, AgentEvent)>,
+    /// The command channel borrow (interrupts, approvals, steers).
+    pub(crate) cmd_rx: &'a mut mpsc::Receiver<AgentCommand>,
+    /// The stop signal latched during approval waits / tool execution.
+    pub(crate) stop_signal: &'a mut Option<crate::agent::StopReason>,
+    /// Commands drained mid-call, returned to the caller for re-injection.
+    pub(crate) buffered: &'a mut Vec<AgentCommand>,
 }
 
 impl AgentLoop {
@@ -249,8 +269,14 @@ impl AgentLoop {
         let safety = tool.safety();
         let category = tool.category();
         {
-            let wf = self.workflow.lock().await;
-            let filter = wf.allowed_tools();
+            // 2a.3: the gate consult — the policy owns the enforcement
+            // filter (WorkflowPolicy wraps the workflow's allowed_tools();
+            // NoPolicy falls back to the raw read).
+            let surface = self.policy().tool_surface().await;
+            let filter = match surface.gate {
+                Some(f) => f,
+                None => self.workflow.allowed_tools().await,
+            };
             // The one carve-out: a RESEARCH plan may still write its own
             // artifacts under `.coding/**` with the file tools. The verdict is
             // computed once — it also picks the denial text below.
@@ -263,7 +289,13 @@ impl AgentLoop {
                 && research_write != ResearchWrite::Artifact
             {
                 return (
-                    ToolResult::error(denial_message(&tc.name, wf.state(), research_write)),
+                    ToolResult::error(denial_message(
+                        &tc.name,
+                        crate::agent::workflow_handle::capitalize_token(
+                            &self.workflow.state().await,
+                        ),
+                        research_write,
+                    )),
                     Vec::new(),
                 );
             }
@@ -338,9 +370,8 @@ impl AgentLoop {
                 match step_number {
                     Some(n) if n >= 1 => self
                         .workflow
-                        .lock()
-                        .await
-                        .completing_step_exits_executing((n - 1) as usize),
+                        .completing_step_exits_executing((n - 1) as usize)
+                        .await,
                     _ => false,
                 }
             }
@@ -438,7 +469,7 @@ impl AgentLoop {
                     &self.graph,
                     &tc.name,
                     pattern,
-                    crate::agent::steering_stats::SteeringStats::shared(),
+                    &self.steering,
                     agent_id,
                 ) {
                     return (redirect, Vec::new());
@@ -459,7 +490,7 @@ impl AgentLoop {
         if tc.name == "file_edit" {
             if let Some(path) = parsed_call.arguments.get("path").and_then(|v| v.as_str()) {
                 if let Some(redirect) = file_edit_redirect(
-                    crate::agent::steering_stats::SteeringStats::shared(),
+                    &self.steering,
                     agent_id,
                     path,
                 ) {
@@ -473,12 +504,33 @@ impl AgentLoop {
         // whole call — nothing executes, so nothing writes.
         if tc.name == "multi_edit" {
             if let Some(redirect) = multi_edit_redirect(
-                crate::agent::steering_stats::SteeringStats::shared(),
+                &self.steering,
                 agent_id,
                 &parsed_call.arguments,
             ) {
                 return (redirect, Vec::new());
             }
+        }
+
+        // 3c (§5.9.6): the per-call policy veto — consulted BEFORE the
+        // safety/approval machinery. WorkflowPolicy answers Allow today
+        // (the app is inert here — verified: `gate_call` had zero
+        // pre-3c call sites); the live veto users are the engine's
+        // external policy (tier 3) + the declarative gate rules (tier 2,
+        // D4). A Deny refuses the call outright — even under
+        // OverridePermissions (a veto is not an approval skip — R3);
+        // RequireApproval forces the gated branch (like `never_auto_for`).
+        let mut gate_requires_approval = false;
+        match self
+            .policy()
+            .gate_call(&parsed_call.name, &parsed_call.arguments)
+            .await
+        {
+            crate::agent::policy::GateVerdict::Deny { message } => {
+                return (ToolResult::error(message), Vec::new());
+            }
+            crate::agent::policy::GateVerdict::RequireApproval => gate_requires_approval = true,
+            crate::agent::policy::GateVerdict::Allow => {}
         }
 
         let mode = *self.safety_mode.read().expect("safety_mode lock poisoned");
@@ -490,22 +542,55 @@ impl AgentLoop {
         // enforces the hard user-sanction invariant those operations depend
         // on: landing commits on main / pushing to a remote always requires a
         // contemporaneous user approval.
-        let force_prompt = tool.never_auto_for(&parsed_call.arguments);
+        let force_prompt = tool.never_auto_for(&parsed_call.arguments) || gate_requires_approval;
         // Live-output sink for this call: throttled partial output from a
         // running tool is forwarded to the UI as ToolOutputDelta events tagged
         // with this call's id, so concurrent calls land in their own cards. The
         // sink is inert until the tool actually runs — a denied call emits
         // nothing — and it never affects the result.
         let output_sink = self.output_sink(fanin_tx, agent_id, &parsed_call.id);
-        if force_prompt
+        // 2c.5 (§5.4 :365-369): the policy decides whether a gated call
+        // is even a candidate for approval. Under OverridePermissions the
+        // whole approval branch below is skipped — force_prompt prompting
+        // included — and each call that WOULD have been gated emits an
+        // ApprovalBypassed audit event (reason "gate_rule" when the
+        // policy's gate required the approval, "core_op" when the call
+        // matched never_auto_for, else "safety_mode"), then dispatches
+        // directly. The predicates above are still evaluated (silently)
+        // so the audit reason is exact.
+        let gated = force_prompt
             || approval::needs_approval(
                 safety,
                 mode,
                 &tc.name,
                 &parsed_call.arguments,
                 &self.sandbox,
+            );
+        if gated
+            && matches!(
+                self.permission(),
+                crate::agent::policy::PermissionPolicy::OverridePermissions
             )
         {
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::ApprovalBypassed {
+                        tool: tc.name.clone(),
+                        reason: if gate_requires_approval {
+                            "gate_rule".to_string()
+                        } else if tool.never_auto_for(&parsed_call.arguments) {
+                            "core_op".to_string()
+                        } else {
+                            "safety_mode".to_string()
+                        },
+                    },
+                ))
+                .await;
+            // No approval branch at all — fall through to the direct
+            // dispatch below (§5.4 :365: no ApprovalRequest is ever
+            // emitted).
+        } else if gated {
             // Safety-rules shortcut: if a rule matches this call, skip the
             // approval prompt and execute directly. The rules file is
             // mtime-checked inside `is_safe`, so edits in the Safety tab take
@@ -520,11 +605,14 @@ impl AgentLoop {
                 let mut buffered = Vec::new();
                 let result = self
                     .dispatch_with_interrupt(
+                        DispatchCtx {
+                            agent_id,
+                            fanin_tx,
+                            cmd_rx: &mut *cmd_rx,
+                            stop_signal: &mut *stop_signal,
+                            buffered: &mut buffered,
+                        },
                         &parsed_call,
-                        agent_id,
-                        cmd_rx,
-                        stop_signal,
-                        &mut buffered,
                         output_sink.clone(),
                     )
                     .await;
@@ -602,11 +690,14 @@ impl AgentLoop {
             // Approved — execute the tool, returning any buffered commands.
             let result = self
                 .dispatch_with_interrupt(
+                    DispatchCtx {
+                        agent_id,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        stop_signal: &mut *stop_signal,
+                        buffered: &mut buffered,
+                    },
                     &parsed_call,
-                    agent_id,
-                    cmd_rx,
-                    stop_signal,
-                    &mut buffered,
                     output_sink.clone(),
                 )
                 .await;
@@ -624,11 +715,14 @@ impl AgentLoop {
         let mut buffered = Vec::new();
         let result = self
             .dispatch_with_interrupt(
+                DispatchCtx {
+                    agent_id,
+                    fanin_tx,
+                    cmd_rx: &mut *cmd_rx,
+                    stop_signal: &mut *stop_signal,
+                    buffered: &mut buffered,
+                },
                 &parsed_call,
-                agent_id,
-                cmd_rx,
-                stop_signal,
-                &mut buffered,
                 output_sink.clone(),
             )
             .await;
@@ -695,6 +789,108 @@ impl AgentLoop {
     /// - On a `Suggestion`/`Prompt` (steer), the command is buffered and the
     ///   loop continues re-polling the pinned future (the steer is re-injected
     ///   by the caller after the tool completes).
+    ///
+    /// G2 (§5.9.2): the kernel↔host round-trip for one host-tool call —
+    /// emit [`AgentEvent::HostToolCall`], then await the host's answer with
+    /// the same interrupt semantics as [`Self::dispatch_with_interrupt`]:
+    /// an Interrupt/Cancel arriving mid-wait resolves the call as an error
+    /// result (the stop signal set, the turn stops right after it), any
+    /// other command is buffered for the turn loop; a closed command
+    /// channel stops command polling but the answer still settles the call.
+    /// The per-tool timeout resolves to an error result and the turn
+    /// CONTINUES — an absent host can never hang the agent (R4) — and the
+    /// answer (or the timeout error) folds back through the normal
+    /// `ToolResult` path, so output compaction and the read cache treat it
+    /// like any tool result.
+    async fn dispatch_host_tool(
+        &self,
+        ctx: DispatchCtx<'_>,
+        parsed_call: &ParsedToolCall,
+        timeout_ms: u64,
+    ) -> ToolResult {
+        let DispatchCtx {
+            agent_id,
+            fanin_tx,
+            cmd_rx,
+            stop_signal,
+            buffered,
+        } = ctx;
+        let (responder_tx, mut responder_rx) =
+            oneshot::channel::<crate::runtime::channels::HostToolOutcome>();
+        let send_failed = fanin_tx
+            .send((
+                agent_id,
+                AgentEvent::HostToolCall {
+                    call_id: parsed_call.id.clone(),
+                    name: parsed_call.name.clone(),
+                    args: parsed_call.arguments.clone(),
+                    responder: responder_tx,
+                },
+            ))
+            .await
+            .is_err();
+        if send_failed {
+            // The engine's pump is gone — no host will ever see this
+            // call. An error result (not a panic): the turn continues and
+            // the model can react.
+            return ToolResult::error("the host event channel is closed (the session is gone)");
+        }
+        // ONE sleep, pinned, selected on each loop — a buffered command
+        // must never restart the timeout.
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        tokio::pin!(sleep);
+        let timeout_error = || {
+            ToolResult::error(format!(
+                "host tool '{}' timed out after {} ms without a result — the call was abandoned and the turn continues",
+                parsed_call.name, timeout_ms
+            ))
+        };
+        let settle = |outcome: std::result::Result<
+            crate::runtime::channels::HostToolOutcome,
+            oneshot::error::RecvError,
+        >| match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => ToolResult::error(error),
+            // The host's responder dropped without an answer (the engine
+            // dropped mid-call) — the same abandoned-call semantics as the
+            // timeout.
+            Err(_) => timeout_error(),
+        };
+        loop {
+            tokio::select! {
+                outcome = &mut responder_rx => return settle(outcome),
+                _ = &mut sleep => return timeout_error(),
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd @ (AgentCommand::Interrupt | AgentCommand::Cancel)) => {
+                        let (reason, interrupted_msg) = if matches!(cmd, AgentCommand::Interrupt) {
+                            (
+                                crate::agent::StopReason::Interrupt,
+                                "interrupted while awaiting the host tool's result",
+                            )
+                        } else {
+                            (
+                                crate::agent::StopReason::Cancel,
+                                "cancelled while awaiting the host tool's result",
+                            )
+                        };
+                        *stop_signal = Some(reason);
+                        return ToolResult::error(interrupted_msg);
+                    }
+                    Some(other) => buffered.push(other),
+                    None => {
+                        // The command channel closed — interrupts can no
+                        // longer arrive, but the host's answer still can:
+                        // settle on the responder or the timeout.
+                        return tokio::select! {
+                            outcome = &mut responder_rx => settle(outcome),
+                            _ = &mut sleep => timeout_error(),
+                        };
+                    }
+                },
+            }
+        }
+    }
+
     /// - On channel close (`None`), the command channel is no longer polled —
     ///   the tool future is awaited to completion and its result returned
     ///   (not a synthetic error; see the arm's inline comment).
@@ -711,14 +907,43 @@ impl AgentLoop {
     /// same way — see [`attach_escalations`].
     async fn dispatch_with_interrupt(
         &self,
+        ctx: DispatchCtx<'_>,
         parsed_call: &ParsedToolCall,
-        agent_id: AgentId,
-        cmd_rx: &mut mpsc::Receiver<AgentCommand>,
-        stop_signal: &mut Option<crate::agent::StopReason>,
-        buffered: &mut Vec<AgentCommand>,
         sink: OutputSink,
     ) -> ToolResult {
-        let steering = crate::agent::steering_stats::SteeringStats::shared();
+        let DispatchCtx {
+            agent_id,
+            fanin_tx,
+            cmd_rx,
+            stop_signal,
+            buffered,
+        } = ctx;
+        // G2 (§5.9.2): a host tool's execution is a round-trip, not an
+        // in-process call — the shim's `execute` never runs; dispatch
+        // emits the HostToolCall event and awaits the host's answer (or
+        // the per-tool timeout). The branch precedes the steering metrics
+        // on purpose: an external execution is outside the steering-lane
+        // contract.
+        if let Some(timeout_ms) = self
+            .tools
+            .get(&parsed_call.name)
+            .and_then(|t| t.host_tool_timeout_ms())
+        {
+            return self
+                .dispatch_host_tool(
+                    DispatchCtx {
+                        agent_id,
+                        fanin_tx,
+                        cmd_rx: &mut *cmd_rx,
+                        stop_signal: &mut *stop_signal,
+                        buffered: &mut *buffered,
+                    },
+                    parsed_call,
+                    timeout_ms,
+                )
+                .await;
+        }
+        let steering = &self.steering;
         steering.observe_call(agent_id, &parsed_call.name);
         let tool_fut = self.tools.dispatch_streaming(parsed_call, sink);
         tokio::pin!(tool_fut);
@@ -885,7 +1110,7 @@ impl AgentLoop {
     ) -> (ToolResult, Vec<AgentCommand>) {
         // Parse + validate the question + options.
         let (question, options) =
-            match crate::tool::workflow::ask_user::parse_ask_user_args(&parsed_call.arguments) {
+            match crate::agent::ask_user_args::parse_ask_user_args(&parsed_call.arguments) {
                 Ok(q) => q,
                 Err(e) => return (ToolResult::error(e), Vec::new()),
             };
@@ -1268,17 +1493,13 @@ fn observe_mutation_vehicle(
     result: &ToolResult,
 ) {
     match tool_name {
-        "file_edit" | "file_write" | "file_append" | "multi_edit" => {
-            if result.success {
-                steering.note_file_tool_mutation();
-            }
+        "file_edit" | "file_write" | "file_append" | "multi_edit" if result.success => {
+            steering.note_file_tool_mutation();
         }
-        "shell" => {
-            if result.success {
-                if let Some(command) = args.get("command").and_then(|c| c.as_str()) {
-                    if shell_command_mutates_files(command) {
-                        steering.note_shell_mutation();
-                    }
+        "shell" if result.success => {
+            if let Some(command) = args.get("command").and_then(|c| c.as_str()) {
+                if shell_command_mutates_files(command) {
+                    steering.note_shell_mutation();
                 }
             }
         }
@@ -1309,11 +1530,9 @@ fn observe_edit_freshness(
         // knowledge of P is fresh by construction — the ecosystem steers
         // drift-failure recovery to file_write full-file replacement, so the
         // gate lifts for P without a read (review L3).
-        "file_write" | "file_append" => {
-            if result.success {
-                if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    steering.clear_edit_drift_for(agent_id, path);
-                }
+        "file_write" | "file_append" if result.success => {
+            if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                steering.clear_edit_drift_for(agent_id, path);
             }
         }
         "file_edit" => {

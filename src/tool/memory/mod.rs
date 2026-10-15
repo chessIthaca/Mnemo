@@ -213,7 +213,7 @@ impl Tool for MemoryWriteTool {
                 ))
             }
         };
-        let tier = match MemoryTier::from_str(&args.tier) {
+        let tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
@@ -275,7 +275,7 @@ impl Tool for MemoryWriteTool {
         if let Some(support) = self.knowledge.as_ref().filter(|_| is_knowledge_type) {
             let body = args.content.clone();
             match support.knowledge.write(record_type, &title, &body) {
-                Ok(rel) => match support.reindex(&[rel.clone()]).await {
+                Ok(rel) => match support.reindex(std::slice::from_ref(&rel)).await {
                     Ok(()) => {
                         // Count the knowledge-file write (the run-all
                         // completion note diffs this across the run window).
@@ -603,7 +603,7 @@ impl Tool for MemoryRecallTool {
         };
         let mut filter = MemoryFilter::new();
         if let Some(tier_str) = &args.tier {
-            match MemoryTier::from_str(tier_str) {
+            match MemoryTier::from_str_opt(tier_str) {
                 Some(t) => filter = filter.tier(t),
                 None => return ToolResult::error(format!("unknown tier '{tier_str}'")),
             }
@@ -836,7 +836,7 @@ impl MemoryUpdateTool {
             if let Err(e) = support.knowledge.replace_in_body(&rel, find, replace_with) {
                 return ToolResult::error(format!("failed to repair knowledge record: {e}"));
             }
-            return match support.reindex(&[rel.clone()]).await {
+            return match support.reindex(std::slice::from_ref(&rel)).await {
                 Ok(()) => ToolResult::success(format!(
                     "Repaired knowledge record {id} — replaced 1 occurrence in \
                      .coding/knowledge/{rel}; the memory row re-indexed"
@@ -999,7 +999,7 @@ impl Tool for MemoryUpdateTool {
                 .knowledge
                 .update(&rel, args.title.as_deref(), args.content.as_deref())
             {
-                Ok(_) => match support.reindex(&[rel.clone()]).await {
+                Ok(_) => match support.reindex(std::slice::from_ref(&rel)).await {
                     Ok(()) => ToolResult::success(format!(
                         "Updated knowledge record {} ({} changed) — file .coding/knowledge/{rel} \
                          rewritten; the memory row re-indexed",
@@ -1144,7 +1144,7 @@ impl Tool for MemoryAmendTool {
             String::new()
         };
         match self.support.knowledge.amend(&record.rel, &args.paragraph) {
-            Ok(_) => match self.support.reindex(&[record.rel.clone()]).await {
+            Ok(_) => match self.support.reindex(std::slice::from_ref(&record.rel)).await {
                 Ok(()) => ToolResult::success(format!(
                     "Amended [{}] '{}' (id {id}) — dated paragraph appended to \
                      .coding/knowledge/{}; the memory row re-indexed{note}",
@@ -1295,13 +1295,12 @@ impl Tool for MemorySupersedeTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
         };
-        let tier = match MemoryTier::from_str(&args.tier) {
+        let tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
             None => return ToolResult::error(format!("unknown tier '{}'", args.tier)),
         };
         let old_id = args.id;
         let title = args.title;
-        let tier = tier;
         // Knowledge-backed supersede: the record's FILE is the truth. The
         // successor's tier must be a distilled tier (knowledge records are
         // semantic rows — an episodic/working successor has no file home).
@@ -1481,7 +1480,7 @@ impl Tool for MemoryDeleteTool {
                 ));
             };
             match support.knowledge.delete(&rel) {
-                Ok(_) => match support.reindex(&[rel.clone()]).await {
+                Ok(_) => match support.reindex(std::slice::from_ref(&rel)).await {
                     Ok(()) => ToolResult::success(format!(
                         "Deleted knowledge record {} — file .coding/knowledge/{rel} removed \
                          (the truth is gone); the memory row dropped by reindex",

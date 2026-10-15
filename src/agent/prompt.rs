@@ -11,10 +11,10 @@
 //! prompt, re-read from disk each turn. The workflow section tells the model
 //! where it is — especially after a restart.
 
+use crate::agent::policy::{assemble_stable_head, KernelPromptBlocks};
 use crate::memory::{Memory, ScoredMemory};
 use crate::project::Constitution;
 use crate::provider::Capabilities;
-use crate::workflow::{Workflow, WorkflowState};
 
 /// The coding system preamble — the base instructions.
 ///
@@ -299,69 +299,6 @@ assumed IN main — ABSENCE of an unmerged marker means merged (verify with \
 git_read when it matters).
 ";
 
-/// The default static guidance for the PLANNING state of the volatile tail's
-/// workflow section.
-const STATE_PLANNING: &str = "\
-PLANNING: read tools only. Explore, then create_plan your steps. Write tools \
-unlock only when a plan exists — no project changes without one.
-";
-
-/// The static guidance shown under the current step in EXECUTING; the dynamic
-/// CURRENT PLAN / GOAL / PROGRESS / CURRENT STEP lines are interpolated from
-/// live workflow state.
-const STATE_EXECUTING: &str = "Complete the current step, then complete_step. Stay in scope.\n";
-
-/// The static guidance for the REVIEWING state — the closing-sequence
-/// driver.
-///
-/// Deliberately a POINTER, not a restatement: this block lives in the volatile
-/// tail, which sits after the cached stable head and is re-processed on every
-/// turn. The verdict rule, the bug checklist and the reviewer-only authorship
-/// rule are stated once, in `APP_RULES` (cached). Keeping a second copy here
-/// cost ~200 tokens per Reviewing turn and bought nothing — the head is in
-/// context either way. Enforced by
-/// `reviewing_state_block_points_at_app_rules_without_duplicating_them`.
-const STATE_REVIEWING: &str = "\
-All steps complete — REVIEWING: run the closing sequence (APP RULES) — \
-spawn_agent role:\"reviewer\" (omit the model param — the configured \
-reviewing model is authoritative) over ALL uncommitted changes, then fix EVERY \
-finding yourself (the write tools are available to YOU, not the reviewer), \
-re-run the tests, commit, and finish(report path). No complete_step / \
-create_plan here — the plan is done; update_plan IS available (fix-findings \
-scope changes and appended follow-on steps — the workflow accepts full edits \
-in Reviewing; complete_step stays hidden, so appended steps can't be checked \
-off mid-review). backlog_add / backlog_status are available too — a user \
-request to queue or update a backlog item is never blocked mid-review.
-";
-
-/// The static guidance for the COMPLETE state.
-///
-/// Directive (user request 2026-09-06: "more eager switching to plan"): tells
-/// the agent WHEN to plan (code-change task) vs. when to answer freeform (pure
-/// question), so it doesn't explain how it *would* fix something instead of
-/// actually planning + executing it. The code-level nudge
-/// ([`append_plan_nudge`]) reinforces this when a work verb is detected in the
-/// user's latest message.
-const STATE_COMPLETE: &str = "\
-All steps complete. If the user's message implies code changes (fix, add, \
-implement, refactor, update + a code reference), treat it as a NEW TASK: \
-explore with read tools, then call create_plan — do NOT answer freeform. \
-Only answer freeform for pure questions (how/where/what). Skills (e.g. \
-merge_to_main) may also start here.
-";
-
-/// The static guidance for the SUBAGENT state — a parented sub-agent's role
-/// state (2026-01-03): a single-task worker, not a plan-lifecycle owner. The
-/// plan context above it is the parent's, shown read-only.
-const STATE_SUBAGENT: &str = "\
-You are a background sub-agent: a single-task worker spawned by a parent. \
-Work the task in your spawn prompt to completion and put your findings in \
-your final answer (the parent reads it). The plan context above is your \
-parent's — read-only orientation, not a work order: you cannot create or \
-advance plans, and your tools are exactly your spawn-time allow-list. When \
-done, stop — no plan lifecycle applies to you.
-";
-
 /// The directive text appended to the volatile tail when the agent is resting
 /// in Complete state and the user's latest message looks like a code-change
 /// task. Reinforces [`STATE_COMPLETE`] at the point of decision.
@@ -429,7 +366,7 @@ fn looks_like_work_intent(text: &str) -> bool {
                     return true;
                 }
                 stem.strip_prefix(v)
-                    .map_or(false, |rest| SUFFIXES.contains(&rest))
+                    .is_some_and(|rest| SUFFIXES.contains(&rest))
             })
     })
 }
@@ -445,10 +382,12 @@ fn looks_like_work_intent(text: &str) -> bool {
 /// (Executing) or is about to create one (Planning), so the nudge is moot.
 pub(crate) fn append_plan_nudge(
     tail: &mut String,
-    state: crate::workflow::WorkflowState,
+    is_complete: bool,
     user_message: Option<&str>,
 ) {
-    if state == crate::workflow::WorkflowState::Complete {
+    // 2b.3: the state arrives as the completion flag (the neutral handle's
+    // is_complete) — the kernel never names the workflow state type.
+    if is_complete {
         if let Some(msg) = user_message {
             if looks_like_work_intent(msg) {
                 tail.push_str("\n# PLAN NUDGE\n\n");
@@ -478,9 +417,190 @@ pub(crate) fn append_plan_nudge(
 /// `WORKFLOW STATE` or `RECALLED MEMORIES`. Keep it short (30-60 chars).
 pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ignore>";
 
-/// Append a section to the head, skipping empty ones (mirrors how the
-/// constitution sections are skipped).
-fn push_section(out: &mut String, text: &str) {
+/// The coding default's identity — what the mnemo console/GUI free mode
+/// passes (§5.9.1 :631-632). Deliberately WITHOUT the plan-first-workflow
+/// phrasing of the workflow preamble's identity (row 6's grep): the free
+/// head must contain no workflow text, and the identity is the CALLER's —
+/// the Engine path (3a) errors without one (`prompt_required`), while the
+/// console passes this explicitly.
+pub(crate) const KERNEL_CODING_DEFAULT_IDENTITY: &str = "\
+You are a coding agent. You help the user build software by reading files, \
+writing code, and running commands.
+";
+
+/// The kernel-safe core working principles — the preamble's tool-agnostic
+/// subset: the plan-first and one-step bullets are workflow-only (row 6's
+/// grep) and stay exclusively in the workflow const; the file-tool mutation
+/// discipline is the [`PromptBlock::FileToolRules`] block.
+const KERNEL_CODING_PRINCIPLES: &str = "\
+CORE PRINCIPLES:
+- Chain consecutive obvious steps: when the next action needs no user input \
+and no decision, take it in the same turn (retry a failed call with corrected \
+args, re-run a test after a fix). Tool results are continuations of your turn, \
+not new questions — keep going until you hit a real choice point or need the \
+user.
+- Read before you write. Understand existing code before modifying it.
+- Be precise. Use exact string matches for file_edit (its schema lists the \
+regex, counted, line-range, and fuzzy-whitespace modes, plus the compact \
+line-ops array `ops`).
+- To cut round-trips, read several files at once with read_files. Edit existing \
+files with file_edit (targeted) — or `multi_edit` for several files in one \
+atomic call — not a full file_write rewrite; for large files, write the first \
+section, then file_write mode:\"append\" the rest.
+- Explain what you're doing briefly.
+- Ask questions when unsure, unless you know the user is not available.
+";
+
+/// Kernel-safe tool-call discipline — the generation-time rules WITHOUT the
+/// plan-tool examples (create_plan/update_plan/complete_step are workflow
+/// tools absent from a free agent's registry).
+const KERNEL_TOOL_CALL_DISCIPLINE: &str = "\
+TOOL-CALL DISCIPLINE — generation-time rules for every call:
+- CONTENT FIRST, CALL SECOND — the JSON body of a tool call delivers text you \
+already wrote; it is never the place where the text gets invented. A multi-arg \
+call is valid only when its content is fully written in this same message: \
+write the content in your reply first, then emit the call carrying that exact \
+text. If you catch yourself opening a call with no content drafted, you are \
+not ready to call — write the content, then call.
+- SCHEMA-FIRST PRE-FLIGHT — before emitting, name the tool and its required \
+fields, then check each is present and non-blank in your call: memory_write → \
+tier, title, content; ask_user → question + options (≥2); spawn_agent → \
+name, task; file_edit/file_write → path (+ new_string/content); shell → \
+command, purpose; search → pattern. If you cannot name the fields, re-read \
+the schema BEFORE emitting — never emit to find out. No call goes out with \
+an empty argument object when it has required fields — a blank required \
+field means the content was never written.
+- ESCAPE TRAPS — a lone backslash starts an illegal JSON escape (\\x, \\d): \
+write Windows paths with forward slashes, C:/repo/path.
+- MALFORMED-JSON RECOVERY — the error NAMES the failing call and its required \
+fields: the call went out with no arguments, or with arguments that are not \
+valid JSON. It is NOT a hint to shrink the call or tweak one field: rewrite \
+the COMPLETE call with every required field, and emit the corrected call once.
+- TWO IDENTICAL FAILURES IN A ROW = STOP EMITTING — you are stuck in a loop: \
+re-read the tool's schema, re-draft the complete arguments from scratch, then \
+emit one carefully built call.
+";
+
+/// The file-tools-first discipline — kernel-worded (no workflow text; the
+/// workflow's version of this lives in APP_RULES, which the workflow head
+/// keeps byte-verbatim).
+const FILE_TOOL_RULES: &str = "\
+FILE TOOL RULES — file mutation goes through the file tools, not the shell. \
+file_edit / file_write are the sanctioned writers (diff preview, line-ending \
+safety, stale-read gate). Shell one-liners (Set-Content, sed -i, python \
+scripts) are a last resort for paths the file tools refuse (the knowledge \
+records — memory_amend to amend, memory_update's find/replace_with to repair \
+stray text) or a verified tool freeze, with the justification stated.
+";
+
+/// One kernel prompt block, selected by name (§5.9.1 :624, serde
+/// snake_case). The library is kernel-owned, additive, and byte-stable; the
+/// caller composes a session's head by listing blocks, and the head keeps
+/// the caller's listed order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptBlock {
+    /// The core working principles ([`KERNEL_CODING_PRINCIPLES`]).
+    CoreCodingPrinciples,
+    /// Generation-time call rules ([`KERNEL_TOOL_CALL_DISCIPLINE`]).
+    ToolCallDiscipline,
+    /// When-to-use-which-tool ([`TOOL_STRATEGY`]).
+    ToolStrategy,
+    /// The typed-record + hygiene conventions ([`MEMORY_RECORDS`]).
+    MemoryRecords,
+    /// The file-tools-first discipline ([`FILE_TOOL_RULES`]).
+    FileToolRules,
+}
+
+/// How much of the constitution rides the stable head (§5.9.1 :621) —
+/// applied by [`assemble_spec_head`] itself, so the spec field always
+/// governs its own head wherever it is assembled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstitutionMode {
+    /// No constitution text at all.
+    None,
+    /// Only the global `agent.md`.
+    Global,
+    /// Only the project `agent.md`.
+    Project,
+    /// Global first, then project — today's behavior (the default).
+    Both,
+}
+
+/// The caller-supplied prompt spec (§5.9.1 :617-622) — the free agent's
+/// stable-head recipe. REQUIRED for `NoPolicy` builds (the factory errors
+/// with the `prompt_required` code without one); `coding_default()` is the
+/// explicit convenience the mnemo console/GUI free mode passes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PromptSpec {
+    /// The caller's identity line(s) — the head's FIRST section. The kernel
+    /// carries no default identity (G1: never a silent coding agent).
+    pub identity: String,
+    /// The kernel blocks to include, kept in the caller's listed order.
+    pub blocks: Vec<PromptBlock>,
+    /// Caller text appended after the blocks (before the constitution).
+    pub extra_stable: Option<String>,
+    /// Which `agent.md` sources ride the head.
+    pub constitution: ConstitutionMode,
+}
+
+impl PromptSpec {
+    /// The mnemo coding default — the console/GUI free mode's explicit
+    /// convenience (§5.9.1 :631-632): the kernel-safe coding identity + the
+    /// full block library + the full constitution.
+    pub fn coding_default() -> Self {
+        Self {
+            identity: KERNEL_CODING_DEFAULT_IDENTITY.to_string(),
+            blocks: vec![
+                PromptBlock::CoreCodingPrinciples,
+                PromptBlock::ToolCallDiscipline,
+                PromptBlock::ToolStrategy,
+                PromptBlock::MemoryRecords,
+                PromptBlock::FileToolRules,
+            ],
+            extra_stable: None,
+            constitution: ConstitutionMode::Both,
+        }
+    }
+}
+
+/// The block library's map — a block's kernel text (G1: blocks are selected
+/// by name; the kernel carries no implicit set).
+pub fn prompt_block_text(block: &PromptBlock) -> &'static str {
+    match block {
+        PromptBlock::CoreCodingPrinciples => KERNEL_CODING_PRINCIPLES,
+        PromptBlock::ToolCallDiscipline => KERNEL_TOOL_CALL_DISCIPLINE,
+        PromptBlock::ToolStrategy => TOOL_STRATEGY,
+        PromptBlock::MemoryRecords => MEMORY_RECORDS,
+        PromptBlock::FileToolRules => FILE_TOOL_RULES,
+    }
+}
+
+/// The free agent's stable head (§5.9.1 :626-627): identity + the selected
+/// blocks + `extra_stable` + constitution, in that fixed order. Same
+/// empty-skip + raw-bytes + "\n\n" semantics as `assemble_stable_head`
+/// (policy.rs) so callers' caching assumptions hold; the constitution
+/// section rides the same shared pusher (byte-identical).
+pub fn assemble_spec_head(spec: &PromptSpec, c: &Constitution) -> String {
+    // §5.9.1 :621: the spec's constitution mode filters the loaded sources
+    // BEFORE the sections push (None drops both; Both = today's bytes).
+    let c = c.restricted(spec.constitution);
+    let mut out = String::new();
+    push_spec_section(&mut out, &spec.identity);
+    for block in &spec.blocks {
+        push_spec_section(&mut out, prompt_block_text(block));
+    }
+    if let Some(extra) = &spec.extra_stable {
+        push_spec_section(&mut out, extra);
+    }
+    crate::agent::policy::push_constitution_sections(&mut out, &c);
+    out
+}
+
+/// push_section's empty-skip semantics (skip if trim-empty, then RAW bytes
+/// + "\n\n") — shared by [`assemble_spec_head`].
+fn push_spec_section(out: &mut String, text: &str) {
     if !text.trim().is_empty() {
         out.push_str(text);
         out.push_str("\n\n");
@@ -503,37 +623,33 @@ fn push_section(out: &mut String, text: &str) {
 /// conversation: measured 2026-09-14, 5.1-9.0% cache hit and 115-120K tokens
 /// re-billed per `complete_step`.
 pub fn build_stable_head(constitution: &Constitution) -> String {
-    let mut prompt = String::new();
+    assemble_stable_head(&KernelPromptBlocks::workflow(), constitution)
+}
 
-    push_section(&mut prompt, CODING_SYSTEM_PREAMBLE);
-    push_section(&mut prompt, WORKFLOW_LIFECYCLE);
-    push_section(&mut prompt, APP_RULES);
-    push_section(&mut prompt, TOOL_CALL_DISCIPLINE);
-    push_section(&mut prompt, TOOL_STRATEGY);
-    push_section(&mut prompt, MEMORY_RECORDS);
-
-    // Constitution — global first, then project.
-    if !constitution.global.trim().is_empty() {
-        prompt.push_str("# HARD RULES — GLOBAL (agent.md)\n\n");
-        prompt.push_str(&constitution.global);
-        prompt.push_str("\n\n");
+/// The six compiled blocks as the policy's `KernelPromptBlocks` (2a.1):
+/// the app wrapper's WorkflowPolicy supplies exactly this set, so
+/// `stable_head` stays byte-identical (cache contract :237-240). Lives
+/// beside the consts (they are file-private here) instead of widening
+/// them to pub(crate) — E0603's minimal fix.
+pub fn kernel_prompt_blocks() -> KernelPromptBlocks {
+    KernelPromptBlocks {
+        preamble: CODING_SYSTEM_PREAMBLE,
+        lifecycle: WORKFLOW_LIFECYCLE,
+        rules: APP_RULES,
+        discipline: TOOL_CALL_DISCIPLINE,
+        strategy: TOOL_STRATEGY,
+        memory_records: MEMORY_RECORDS,
     }
-    if !constitution.project.trim().is_empty() {
-        prompt.push_str("# HARD RULES — PROJECT (agent.md)\n\n");
-        prompt.push_str(&constitution.project);
-        prompt.push_str("\n\n");
-    }
-
-    prompt
 }
 
 /// Build the **volatile tail** of the system prompt: the recalled-memories
 /// block (when present) + the workflow-state section.
 ///
-/// The workflow section's static per-state guidance comes from the compiled
-/// STATE_* consts; the dynamic lines — CURRENT PLAN / GOAL / PROGRESS /
-/// CURRENT STEP, the skill goal, the sub-agent notes, CAPABILITIES — are
-/// interpolated from live workflow state.
+/// The workflow section rides in via `app_tail: &str` — assembled by the
+/// agent's policy (2a.4: WorkflowPolicy::volatile_tail wraps the same bytes
+/// the kernel-side workflow_section produced pre-2a.4; CAPABILITIES stays
+/// kernel-side per the step file :639). This fn owns the recalled-memories
+/// block and the caps-driven CAPABILITIES block.
 ///
 /// This changes per step/turn (PROGRESS bumps, CURRENT STEP text, recall
 /// results). Production (`turn.rs`) appends it AFTER the conversation history,
@@ -549,7 +665,7 @@ pub fn build_stable_head(constitution: &Constitution) -> String {
 /// content at 160 chars.
 pub fn build_volatile_tail(
     caps: &Capabilities,
-    workflow: &Workflow,
+    app_tail: &str,
     memories: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
@@ -563,8 +679,22 @@ pub fn build_volatile_tail(
         }
     }
 
-    // Workflow section.
-    prompt.push_str(&workflow_section(caps, workflow));
+    // The app tail — the workflow section, assembled by the policy (2a.4).
+    prompt.push_str(app_tail);
+
+    // Capability notes (the kernel keeps CAPABILITIES per the step file
+    // :639; same bytes workflow_section emitted pre-2a.4).
+    prompt.push_str("\n# CAPABILITIES\n\n");
+    if caps.supports_tool_choice {
+        prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).\n");
+    } else {
+        prompt.push_str("- Tool choice: not supported. Choose tools freely.\n");
+    }
+    if !caps.reliable_finish_reason {
+        prompt.push_str(
+            "- Finish reason may be unreliable; tool calls are detected by their presence.\n",
+        );
+    }
 
     prompt
 }
@@ -574,55 +704,12 @@ pub fn build_volatile_tail(
 ///
 /// This is a back-compat wrapper: tests and any single-message caller use it
 /// to get the same string the old monolithic builder produced. Production
-/// (`turn.rs`) calls [`build_stable_head`] and [`build_volatile_tail`]
-/// separately so the head can live in `messages[0]` (cache-stable), the tail
+/// (`turn.rs`) consults the agent's policy for the head (the constitution
+/// holder's `policy.stable_head`, 2a.4) and composes the tail via
+/// [`build_volatile_tail`] so the head can live in `messages[0]` (cache-stable), the tail
 /// can be appended after the conversation history (cache-immune), and
 /// [`CONTEXT_FOOTER`] can be appended as the final message after the tail
 /// (cache-stable sentinel — this wrapper deliberately does NOT include it).
-pub fn build_system_prompt(
-    caps: &Capabilities,
-    workflow: &Workflow,
-    constitution: &Constitution,
-    memories: Option<&str>,
-) -> String {
-    let mut prompt = build_stable_head(constitution);
-    prompt.push_str(&build_volatile_tail(caps, workflow, memories));
-    prompt
-}
-
-/// Truncate a step's display text to a short punchline for the volatile tail.
-///
-/// The tail is the only part re-processed per `complete_step` (the R5
-/// byte-stable footer keeps everything before it cached), so the CURRENT STEP
-/// line must stay short: the bold header when present, else the first 120
-/// chars. Char-safe (`chars().take` never splits a UTF-8 sequence).
-fn short_step_text(text: &str) -> String {
-    const MAX: usize = 120;
-    if text.chars().count() <= MAX {
-        text.to_string()
-    } else {
-        let head: String = text.chars().take(MAX).collect();
-        format!("{head}…")
-    }
-}
-
-/// One-line, budget-truncated form of a plan's Bug/Context for the
-/// volatile tail (backlog 77ff8f45): a fresh session picking up an
-/// in-flight plan gets the symptom + the context gist in the footer —
-/// the tail is its only plan-derived injection. The full detail,
-/// including a bug plan's `## Detailed steps`, stays in the plan file
-/// (the crash-resumption document). Whitespace-collapsed to one line and
-/// char-safe (`chars().take` never splits a UTF-8 sequence).
-fn short_context_line(text: &str, budget: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= budget {
-        collapsed
-    } else {
-        let head: String = collapsed.chars().take(budget).collect();
-        format!("{head}…")
-    }
-}
-
 /// Format recalled memories into a compact section for the system prompt.
 ///
 /// Each entry shows the tier, title, stable id, score, and the first 160
@@ -711,172 +798,66 @@ pub fn format_primer(memories: &[Memory]) -> String {
     out
 }
 
-/// Push one state's static guidance, skipping empty sections and
-/// normalizing the trailing newline — byte-identical to the compiled consts,
-/// which each end with exactly one `\n`.
-fn push_state_text(out: &mut String, text: &str) {
-    let t = text.trim_end();
-    if !t.is_empty() {
-        out.push_str(t);
-        out.push('\n');
-    }
-}
-
-/// Build the workflow section of the system prompt.
-///
-/// The static per-state guidance comes from the compiled STATE_* consts; the
-/// dynamic lines — CURRENT PLAN / GOAL / PROGRESS / CURRENT STEP, the skill
-/// name/goal, the sub-agent plan context, the CAPABILITIES block — are interpolated
-/// from live workflow state.
-fn workflow_section(caps: &Capabilities, workflow: &Workflow) -> String {
-    let state = workflow.state();
-    let mut s = String::new();
-
-    s.push_str("# WORKFLOW STATE\n\n");
-    s.push_str(&format!("Current state: {state}\n\n"));
-
-    match state {
-        WorkflowState::Planning => {
-            push_state_text(&mut s, STATE_PLANNING);
-        }
-        WorkflowState::Executing => {
-            if let Some(plan) = workflow.plan() {
-                // Show the nesting breadcrumb when this is a sub-plan, so the
-                // agent knows there's a parent to fall back to.
-                let parents = workflow.parent_titles();
-                if parents.is_empty() {
-                    s.push_str(&format!("CURRENT PLAN: {}\n", plan.title));
-                } else {
-                    s.push_str(&format!(
-                        "CURRENT PLAN (sub-plan, depth {}): {} ▸ {}\n",
-                        workflow.plan_depth(),
-                        parents.join(" ▸ "),
-                        plan.title
-                    ));
-                }
-                s.push_str(&format!("GOAL: {}\n", plan.goal));
-                // Backlog 77ff8f45: surface the Bug + Context in the
-                // resume footer — a fresh session picking up an
-                // in-flight plan gets the symptom + the context gist
-                // here; the full detail, including a bug plan's
-                // Detailed steps, stays in the plan file (the
-                // crash-resumption document). One line each — the tail
-                // is re-processed per step bump, so every token is paid
-                // on every bump.
-                if let Some(bug) = &plan.bug_symptom {
-                    s.push_str(&format!("BUG: {}\n", short_context_line(bug, 160)));
-                }
-                if !plan.context.trim().is_empty() {
-                    s.push_str(&format!(
-                        "CONTEXT: {}\n",
-                        short_context_line(plan.context.trim(), 240)
-                    ));
-                }
-                s.push_str(&format!(
-                    "PROGRESS: {}/{} steps complete\n",
-                    plan.completed_count(),
-                    plan.steps.len()
-                ));
-                if let Some(step) = plan.current_step() {
-                    // Show the step HEADER (the bold punchline) when present,
-                    // else a truncated body. The full step text stays
-                    // available in the conversation (the create_plan /
-                    // update_plan results). Keeping this line short matters:
-                    // with the R5 CONTEXT_FOOTER the volatile tail is the
-                    // only part re-processed per complete_step, so every
-                    // token here is paid on every step bump.
-                    let current = step
-                        .header
-                        .as_deref()
-                        .map(short_step_text)
-                        .unwrap_or_else(|| short_step_text(&step.text));
-                    s.push_str(&format!("CURRENT STEP: \"{current}\" ← resume here\n\n",));
-                    push_state_text(&mut s, STATE_EXECUTING);
-                }
-            }
-        }
-        WorkflowState::Reviewing => {
-            push_state_text(&mut s, STATE_REVIEWING);
-        }
-        WorkflowState::Complete => {
-            push_state_text(&mut s, STATE_COMPLETE);
-        }
-        WorkflowState::Skill => {
-            if let Some(skill) = workflow.active_skill() {
-                s.push_str(&format!(
-                    "You are running the skill \"{name}\". Drive toward this goal:\n\n{prompt}\n\n",
-                    name = skill.name,
-                    prompt = skill.prompt
-                ));
-                s.push_str(&format!(
-                    "Goal achieved → skill_end (exits to {target}); rollback → \
-                     abandon_skill. Security controls still apply to every tool \
-                     call. If the user hand-edits a skill file mid-run, \
-                     skill_reload re-reads the library (no restart).\n",
-                    target = skill.target_state
-                ));
-            } else {
-                // Defensive: Skill state with no active skill overlay. This
-                // shouldn't happen (start_skill sets both atomically), but if
-                // it does, tell the agent to end the skill so the workflow
-                // recovers to a sane state.
-                s.push_str(
-                    "A skill is nominally active but no skill overlay is recorded. Call \
-                     skill_end or abandon_skill to return to a normal workflow state.\n",
-                );
-            }
-        }
-        WorkflowState::Subagent => {
-            // Parented sub-agent: the plan stack below is the READ-ONLY MIRROR
-            // of the main plan (loaded from the shared plans dir by
-            // build_inner) — orientation, not a work order. The sub-agent's
-            // actual task arrives in its spawn prompt; it cannot mutate plans
-            // and its tool surface comes from its spawn-time allow-list.
-            if let Some(plan) = workflow.plan() {
-                let parents = workflow.parent_titles();
-                if parents.is_empty() {
-                    s.push_str(&format!("PARENT PLAN (read-only context): {}\n", plan.title));
-                } else {
-                    s.push_str(&format!(
-                        "PARENT PLAN (read-only context, depth {}): {} ▸ {}\n",
-                        workflow.plan_depth(),
-                        parents.join(" ▸ "),
-                        plan.title
-                    ));
-                }
-                s.push_str(&format!("GOAL: {}\n", plan.goal));
-                s.push_str(&format!(
-                    "PROGRESS: {}/{} steps complete\n\n",
-                    plan.completed_count(),
-                    plan.steps.len()
-                ));
-            }
-            push_state_text(&mut s, STATE_SUBAGENT);
-        }
-    }
-
-    // Capability notes.
-    s.push_str("\n# CAPABILITIES\n\n");
-    if caps.supports_tool_choice {
-        s.push_str("- Tool choice: supported (you may be directed to call specific tools).\n");
-    } else {
-        s.push_str("- Tool choice: not supported. Choose tools freely.\n");
-    }
-    if !caps.reliable_finish_reason {
-        s.push_str(
-            "- Finish reason may be unreliable; tool calls are detected by their presence.\n",
-        );
-    }
-
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::project::Constitution;
-    use crate::workflow::Workflow;
+    use crate::app::workflow::Workflow;
     use tempfile::tempdir;
+    use crate::app::workflow_policy::workflow_section;
+    use crate::app::workflow::WorkflowState;
+
+    /// The composed volatile tail's section ORDER is pinned (2a.4, step file
+    /// :649-652): no existing test asserted the composed order — memories,
+    /// the per-state workflow section, then CAPABILITIES — so this golden is
+    /// added BEFORE the policy flip (green on today's shape; red on any
+    /// reorder).
+    #[test]
+    fn volatile_tail_section_order_pinned() {
+        const RECALLED_HEADER: &str = "# RECALLED MEMORIES";
+        const WORKFLOW_HEADER: &str = "# WORKFLOW STATE";
+        const CAPABILITIES_HEADER: &str = "# CAPABILITIES";
+        let dir = tempdir().unwrap();
+        let wf = Workflow::new(dir.path());
+        let caps = Capabilities::openai();
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), Some("memory text"));
+        let mem = tail
+            .find(RECALLED_HEADER)
+            .expect("memories header must appear");
+        let wfs = tail
+            .find(WORKFLOW_HEADER)
+            .expect("workflow header must appear");
+        let caps_pos = tail
+            .find(CAPABILITIES_HEADER)
+            .expect("capabilities header must appear");
+        assert!(
+            mem < wfs,
+            "the memories block must precede the workflow section"
+        );
+        assert!(
+            wfs < caps_pos,
+            "the workflow section must precede capabilities"
+        );
+        // 2a.4 round-1 regression (HIGH): the separator bytes are pinned
+        // too — real newlines + the blank-line separator between the
+        // workflow section and CAPABILITIES. The doubling slipped INSIDE
+        // the re-signed string literals, invisible to find()-based order
+        // checks and every newline-free content assertion.
+        assert!(
+            tail.contains("# RECALLED MEMORIES\n\n"),
+            "memories header needs its real newline + blank line"
+        );
+        assert!(
+            tail.contains(
+                "\n\n# CAPABILITIES\n\n- Tool choice: supported (you may be directed to call specific tools).\n"
+            ),
+            "capabilities block needs the blank-line separator + real newlines"
+        );
+        assert!(
+            !tail.contains("\\n"),
+            "the tail must contain real newlines, not literal backslash-n text"
+        );
+    }
 
     #[test]
     fn planning_prompt_mentions_planning() {
@@ -884,7 +865,7 @@ mod tests {
         let wf = Workflow::new(dir.path());
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("PLANNING"));
         assert!(prompt.contains("create_plan"));
     }
@@ -898,7 +879,7 @@ mod tests {
         let wf = Workflow::new(dir.path());
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(
             prompt.contains("research"),
             "lifecycle should encourage research planning"
@@ -958,6 +939,46 @@ mod tests {
         assert!(
             head.contains("continuations of your turn, not new questions"),
             "preamble should frame tool results as turn continuations"
+        );
+    }
+
+    #[test]
+    fn workflow_stable_head_bytes_unchanged() {
+        // Job 2a's golden (master-spec :913): the stable head is the provider
+        // cache prefix (:237-240) — every 2a rewire must keep these bytes
+        // identical. Pins build_stable_head's full byte stream against a
+        // fixed Constitution fixture (SHA-256 + length).
+        use sha2::{Digest, Sha256};
+        let constitution = Constitution {
+            global: "# HARD RULES — GLOBAL (agent.md)\n\n- fixture global rule one.\n".to_string(),
+            project: "# HARD RULES — PROJECT (agent.md)\n\n- fixture project rule one.\n".to_string(),
+        };
+        let head = build_stable_head(&constitution);
+        // GOLDEN: frozen from the first run on the pre-change tree. The
+        // single assertion below prints len + sha256 on any drift — fill
+        // GOLDEN_HEAD from that left side, then re-run green.
+        const GOLDEN_HEAD: &str =
+            "len=12351|sha256=7fda6b3b60375015ae2575e41fc3c952b76b7bd5be365f5a727a2e2f2499dfda";
+        for marker in [
+            "CORE PRINCIPLES:",
+            "WORKFLOW LIFECYCLE — a plan-first state machine.",
+            "APP RULES — universal hard rules",
+            "# HARD RULES — GLOBAL (agent.md)",
+            "# HARD RULES — PROJECT (agent.md)",
+        ] {
+            assert!(head.contains(marker), "head lacks marker: {marker}");
+        }
+        assert_eq!(
+            format!(
+                "len={}|sha256={}",
+                head.len(),
+                Sha256::digest(head.as_bytes())
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ),
+            GOLDEN_HEAD,
+            "stable head bytes drifted — fill GOLDEN_HEAD from the left side"
         );
     }
 
@@ -1079,7 +1100,7 @@ mod tests {
         .unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("Build feature X"));
         assert!(prompt.contains("CURRENT STEP"));
         assert!(prompt.contains("step 1"));
@@ -1094,7 +1115,7 @@ mod tests {
             global: "Never commit to main".into(),
             project: "Use edition 2021".into(),
         };
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("Never commit to main"));
         assert!(prompt.contains("Use edition 2021"));
         assert!(prompt.contains("HARD RULES — GLOBAL"));
@@ -1109,7 +1130,7 @@ mod tests {
         wf.complete_step(0).unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("complete"));
     }
 
@@ -1130,15 +1151,15 @@ mod tests {
             "G",
             "C",
             vec!["a".into()],
-            crate::workflow::PlanKind::Research,
+            crate::app::workflow::PlanKind::Research,
             None,
         )
         .unwrap();
         wf.complete_step(0).unwrap();
-        assert_eq!(wf.state(), crate::workflow::WorkflowState::Complete);
+        assert_eq!(wf.state(), crate::app::workflow::WorkflowState::Complete);
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(
             prompt.contains("NEW TASK"),
             "STATE_COMPLETE should frame code-change messages as a new task"
@@ -1206,7 +1227,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Complete,
+            true,
             Some("fix the bug in login.rs"),
         );
         assert!(tail.contains("PLAN NUDGE"), "nudge header appended");
@@ -1220,7 +1241,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Complete,
+            true,
             Some("how does the login work?"),
         );
         assert!(!tail.contains("PLAN NUDGE"), "no nudge for a pure question");
@@ -1234,7 +1255,7 @@ mod tests {
         let mut tail = String::from("base tail\n");
         append_plan_nudge(
             &mut tail,
-            crate::workflow::WorkflowState::Executing,
+            false,
             Some("fix the bug in login.rs"),
         );
         assert!(!tail.contains("PLAN NUDGE"), "no nudge outside Complete");
@@ -1245,7 +1266,7 @@ mod tests {
     fn append_plan_nudge_skips_when_no_user_message() {
         // Complete + no user message (e.g. a tool-result-only turn) → no nudge.
         let mut tail = String::from("base tail\n");
-        append_plan_nudge(&mut tail, crate::workflow::WorkflowState::Complete, None);
+        append_plan_nudge(&mut tail, true, None);
         assert!(
             !tail.contains("PLAN NUDGE"),
             "no nudge without a user message"
@@ -1260,13 +1281,13 @@ mod tests {
         wf.start_skill(
             "merge_to_main",
             "Merge this branch into main and delete it.",
-            crate::workflow::WorkflowState::Planning,
+            crate::app::workflow::WorkflowState::Planning,
             vec!["git".into(), "skill_end".into()],
         )
         .unwrap();
         let caps = Capabilities::openai();
         let constitution = Constitution::default();
-        let prompt = build_system_prompt(&caps, &wf, &constitution, None);
+        let prompt = crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
         assert!(prompt.contains("merge_to_main"), "prompt names the skill");
         assert!(
             prompt.contains("Merge this branch into main and delete it."),
@@ -1542,7 +1563,7 @@ mod tests {
         wf.complete_step(0).unwrap();
         assert_eq!(wf.state(), WorkflowState::Reviewing);
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("closing sequence (APP RULES)"),
             "Reviewing block points at the head's closing sequence"
@@ -1670,7 +1691,7 @@ mod tests {
         assert!(!head.contains("Build X"), "head excludes plan title");
         // `caps` + `wf` are only used by the tail; reference them so the
         // compiler doesn't warn about unused vars in this assertion-only test.
-        let _ = build_volatile_tail(&caps, &wf, None);
+        let _ = build_volatile_tail(&caps, &workflow_section(&wf), None);
     }
 
     #[test]
@@ -1721,7 +1742,7 @@ mod tests {
         let caps = Capabilities::openai();
 
         // With memories: tail has both workflow state + memories.
-        let tail_with_mem = build_volatile_tail(&caps, &wf, Some("memory text"));
+        let tail_with_mem = build_volatile_tail(&caps, &workflow_section(&wf), Some("memory text"));
         assert!(
             tail_with_mem.contains("WORKFLOW STATE"),
             "tail has workflow state"
@@ -1740,7 +1761,7 @@ mod tests {
         );
 
         // Without memories: tail has workflow state but no memories block.
-        let tail_no_mem = build_volatile_tail(&caps, &wf, None);
+        let tail_no_mem = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail_no_mem.contains("WORKFLOW STATE"),
             "tail still has workflow state"
@@ -1764,7 +1785,7 @@ mod tests {
         wf.create_plan("P", "G", "C", vec![format!("**Header A** — {long_body}")])
             .unwrap();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("CURRENT STEP: \"Header A\""),
             "tail shows the header"
@@ -1782,7 +1803,7 @@ mod tests {
         assert!(plain.chars().count() > 120);
         wf2.create_plan("P2", "G", "C", vec![plain.to_string()])
             .unwrap();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         let head_120: String = plain.chars().take(120).collect();
         assert!(
             tail2.contains(&format!("CURRENT STEP: \"{head_120}…\"")),
@@ -1804,17 +1825,19 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut wf = Workflow::new(dir.path().join("plans"));
         wf.create_plan_with_kind_and_detail(
-            "P",
-            "G",
-            "the root cause lives in src/app.rs:42",
-            vec!["s1".into()],
-            crate::workflow::PlanKind::BugFixing,
+            crate::app::workflow::PlanDraft {
+                title: "P",
+                goal: "G",
+                context: "the root cause lives in src/app.rs:42",
+                steps: vec!["s1".into()],
+            },
+            crate::app::workflow::PlanKind::BugFixing,
             Some("the app crashes on open"),
             Some("- Reproduce — run cargo test crashy"),
         )
         .unwrap();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("BUG: the app crashes on open"),
             "tail surfaces the bug symptom: {tail}"
@@ -1834,7 +1857,7 @@ mod tests {
         let long_context = "c ".repeat(300);
         wf2.create_plan("P2", "G", &long_context, vec!["s".into()])
             .unwrap();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         let head_240: String = long_context.trim().chars().take(240).collect();
         assert!(
             tail2.contains(&format!("CONTEXT: {head_240}…")),
@@ -1846,7 +1869,7 @@ mod tests {
         // them) — the crash-resumption read path.
         let mut resumed = Workflow::new(dir.path().join("plans"));
         resumed.load_latest().unwrap();
-        let tail3 = build_volatile_tail(&caps, &resumed, None);
+        let tail3 = build_volatile_tail(&caps, &workflow_section(&resumed), None);
         assert!(
             tail3.contains("BUG: the app crashes on open"),
             "the resumed tail surfaces the bug: {tail3}"
@@ -1870,7 +1893,7 @@ mod tests {
         wf.create_plan("P", "G", "C", vec!["s".into()]).unwrap();
         wf.enter_subagent_state();
         let caps = Capabilities::openai();
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             tail.contains("Current state: Subagent"),
             "tail reports the Subagent role state"
@@ -1897,7 +1920,7 @@ mod tests {
         // none): the guidance still renders, without any plan lines.
         let mut wf2 = Workflow::new(dir.path().join("plans2"));
         wf2.enter_subagent_state();
-        let tail2 = build_volatile_tail(&caps, &wf2, None);
+        let tail2 = build_volatile_tail(&caps, &workflow_section(&wf2), None);
         assert!(
             tail2.contains("Current state: Subagent"),
             "state line renders without a plan"
@@ -2085,7 +2108,7 @@ mod tests {
             project: "Use edition 2021".into(),
         };
         let head = build_stable_head(&constitution);
-        let tail = build_volatile_tail(&caps, &wf, None);
+        let tail = build_volatile_tail(&caps, &workflow_section(&wf), None);
         assert!(
             !head.contains(CONTEXT_FOOTER),
             "head does not contain the footer (turn.rs adds it separately)"
@@ -2096,5 +2119,104 @@ mod tests {
         );
         // Two calls produce identical bytes — the literal is byte-stable.
         assert_eq!(CONTEXT_FOOTER, CONTEXT_FOOTER);
+    }
+
+    /// 2c.1/G1 (§5.9.1 :626-627): the free head composes identity + the
+    /// selected blocks in the CALLER'S listed order + extra_stable +
+    /// constitution, with the same empty-skip/raw-bytes/blank-line
+    /// semantics as the workflow assembler; the blocks are listed here in a
+    /// NON-declaration order to pin the listed-order contract.
+    #[test]
+    fn prompt_spec_blocks_compose_in_fixed_order() {
+        let mut expected = String::new();
+        expected.push_str("IDENTITY LINE");
+        expected.push_str("\n\n");
+        expected.push_str(TOOL_STRATEGY);
+        expected.push_str("\n\n");
+        expected.push_str(KERNEL_CODING_PRINCIPLES);
+        expected.push_str("\n\n");
+        expected.push_str(MEMORY_RECORDS);
+        expected.push_str("\n\n");
+        expected.push_str("EXTRA STABLE TEXT");
+        expected.push_str("\n\n");
+        expected.push_str("# HARD RULES — GLOBAL (agent.md)\n\n");
+        expected.push_str("GLOBAL TEXT");
+        expected.push_str("\n\n");
+        expected.push_str("# HARD RULES — PROJECT (agent.md)\n\n");
+        expected.push_str("PROJECT TEXT");
+        expected.push_str("\n\n");
+        let spec = PromptSpec {
+            identity: "IDENTITY LINE".into(),
+            blocks: vec![
+                PromptBlock::ToolStrategy,
+                PromptBlock::CoreCodingPrinciples,
+                PromptBlock::MemoryRecords,
+            ],
+            extra_stable: Some("EXTRA STABLE TEXT".into()),
+            constitution: ConstitutionMode::Both,
+        };
+        let c = Constitution {
+            global: "GLOBAL TEXT".into(),
+            project: "PROJECT TEXT".into(),
+        };
+        assert_eq!(assemble_spec_head(&spec, &c), expected);
+    }
+
+    /// 2c.1/G1 (row 6's grep): the free coding-default head carries NO
+    /// workflow text — no WORKFLOW LIFECYCLE section, no APP RULES, no
+    /// plan-first/create_plan/complete_step mentions — and starts with the
+    /// (plan-free) default identity.
+    #[test]
+    fn kernel_head_has_no_workflow_text() {
+        let spec = PromptSpec::coding_default();
+        let head = assemble_spec_head(&spec, &Constitution::default());
+        assert!(
+            head.starts_with(KERNEL_CODING_DEFAULT_IDENTITY),
+            "the free head starts with the caller's identity"
+        );
+        assert!(
+            !head.contains("WORKFLOW LIFECYCLE"),
+            "no lifecycle section in the free head"
+        );
+        assert!(!head.contains("APP RULES"), "no app-rules section");
+        assert!(!head.contains("plan-first"), "no plan-first text");
+        assert!(!head.contains("create_plan"), "no create_plan text");
+        assert!(!head.contains("complete_step"), "no complete_step text");
+    }
+
+    /// 2c.1/G1 (§5.9.1 :621): the spec's constitution mode filters the
+    /// loaded sources at the head build — None drops both, Global keeps
+    /// only the global file, Project only the project file, Both = today's
+    /// bytes.
+    #[test]
+    fn prompt_spec_constitution_modes_filter_head() {
+        let c = Constitution {
+            global: "GLOBAL TEXT".into(),
+            project: "PROJECT TEXT".into(),
+        };
+        let base = |mode: ConstitutionMode| {
+            assemble_spec_head(
+                &PromptSpec {
+                    identity: "I".into(),
+                    blocks: Vec::new(),
+                    extra_stable: None,
+                    constitution: mode,
+                },
+                &c,
+            )
+        };
+        assert_eq!(base(ConstitutionMode::None), "I\n\n");
+        assert_eq!(
+            base(ConstitutionMode::Global),
+            "I\n\n# HARD RULES — GLOBAL (agent.md)\n\nGLOBAL TEXT\n\n"
+        );
+        assert_eq!(
+            base(ConstitutionMode::Project),
+            "I\n\n# HARD RULES — PROJECT (agent.md)\n\nPROJECT TEXT\n\n"
+        );
+        assert_eq!(
+            base(ConstitutionMode::Both),
+            "I\n\n# HARD RULES — GLOBAL (agent.md)\n\nGLOBAL TEXT\n\n# HARD RULES — PROJECT (agent.md)\n\nPROJECT TEXT\n\n"
+        );
     }
 }

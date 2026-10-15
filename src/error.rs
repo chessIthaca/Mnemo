@@ -37,8 +37,8 @@ pub enum Error {
     /// An operation was attempted in the wrong workflow state (e.g.
     /// `update_plan` outside `Executing`/`Reviewing`, `finish` outside
     /// `Reviewing`).
-    /// `current` and `expected` are the [`WorkflowState`](crate::workflow::WorkflowState)
-    /// display strings. Discriminates the wrong-state case from other
+    /// `current` and `expected` are the workflow state's display strings (the
+    /// lowercase state tokens). Discriminates the wrong-state case from other
     /// [`Workflow`](Error::Workflow) failures.
     #[error("workflow error: wrong state (current: {current}, expected: {expected})")]
     WorkflowWrongState { current: String, expected: String },

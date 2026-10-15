@@ -96,9 +96,10 @@ impl Embedder for HashEmbedder {
 /// as bare lowercase strings (`"ready"`, `"checking"`, …) so the existing
 /// frontend string comparisons keep working; `Downloading` serializes as
 /// `{"downloading": {"model": "…", "progress": 0.5}}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbedderStatus {
+    #[default]
     Ready,
     Checking,
     Fallback,
@@ -109,12 +110,6 @@ pub enum EmbedderStatus {
         progress: f64,
     },
     Failed,
-}
-
-impl Default for EmbedderStatus {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 /// Info about a bundled embedding model the user can pick in Settings.
@@ -289,7 +284,6 @@ fn dim_for_model(model: &fastembed::EmbeddingModel) -> usize {
 /// Used to detect whether a model is already installed (the subdir exists +
 /// has snapshot files) and to poll download progress (dir size vs. the
 /// catalog's `size_mb`). Returns `None` for an unknown model id.
-#[cfg(feature = "embeddings")]
 pub fn hf_cache_subdir(model_id: &str) -> Option<String> {
     let repo = match model_id {
         "all-MiniLM-L6-v2" => "Qdrant/all-MiniLM-L6-v2-onnx",

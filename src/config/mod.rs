@@ -22,7 +22,7 @@ pub mod patch;
 pub mod projects;
 pub mod settings_dto;
 
-pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry};
+pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, kind_wire};
 pub use general::{
     BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,
@@ -484,6 +484,33 @@ fn config_dir_named(dir_name: &str) -> PathBuf {
 /// installs are moved over by [`migrate_legacy_config_dir`].
 pub fn global_config_dir() -> PathBuf {
     config_dir_named(".mnemo")
+}
+
+/// Resolve an install's config dir (§5.8 :573-574, job 4 D1): an explicit
+/// dir wins, else `$MNEMO_HOME`, else `~/.mnemo` (the same base
+/// [`global_config_dir`] uses). The ONE resolver the engine and
+/// `Setup::open(None)` share — G4's close-grep keeps `global_config_dir`
+/// itself out of `src/headless`, and this fn (in `config/`) carries the
+/// env override it lacks.
+pub fn resolve_config_dir(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir;
+    }
+    if let Some(home) = std::env::var_os("MNEMO_HOME") {
+        return PathBuf::from(home);
+    }
+    global_config_dir()
+}
+
+/// The cache dir for bundled embedding models (§5.8 :575-576):
+/// `<config_dir>/models` — job 4 D6 re-derived it from the ENGINE's
+/// config dir (it was machine-global, ignoring a custom config dir;
+/// the brain's startup build already derived it this way). Callers
+/// pass their dir: the headless Setup its own `config_dir`, the app
+/// the machine-global one. Lives in `config/` so the G4 close-grep
+/// keeps `global_config_dir` out of `src/headless`.
+pub fn embedder_cache_dir(config_dir: &Path) -> PathBuf {
+    config_dir.join("models")
 }
 
 /// The pre-rename global config directory (`~/.myharness/`).
@@ -1198,7 +1225,7 @@ api_key = "sk-x"
         fs::write(staging_path(&endpoints), "staged\n").unwrap();
 
         let restore = |p: &Path| {
-            if p == &config {
+            if p == config {
                 Err(crate::error::Error::Config("disk full".into()))
             } else {
                 Ok(())

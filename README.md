@@ -36,7 +36,7 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | | |
 |---|---|
 | **Enforced workflow** | Planning → Executing → Reviewing → Complete — a state machine decides which tools exist at each moment; the agent cannot skip ahead. |
-| **Four-tier memory** | Working → episodic → semantic → procedural, persisted in SQLite with recall ranked by strength; consolidation compresses sessions into durable knowledge. |
+| **Four-tier memory** | Working → episodic → semantic → procedural, persisted in SQLite with recall ranked by relevance, recency and staleness (records not re-accessed within the decay half-life sink by up to −0.25); sessions auto-consolidate into durable knowledge at turn boundaries, not only via the manual tool. |
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |
@@ -46,6 +46,27 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | **Desktop shell** | Tauri 2 + React UI, embedded WebView2 browser tab (Windows), headless REPL console mode, MCP server integration. Extra Windows instances get their own WebView2 profile (the first keeps the persistent one); opening a project twice warns. |
 
 The [feature reference](docs/FEATURES.md) has the exhaustive detail; this is the tour.
+
+## Embedding the kernel
+
+The engine under the app is a library first. Cargo features slice it:
+`kernel` (the core — always compiled), `headless` (the public engine
+surface: `Engine`, `AgentSession`, `Setup`, the `*Api`s; implies
+`kernel`), `app` (the plan-first workflow module graph), plus the
+optional `embeddings` / `browser` heavies. Defaults give library
+consumers the full set; a second consumer builds the lean surface:
+
+```sh
+cargo build -p mnemo --no-default-features --features kernel,headless
+```
+
+`examples/second_consumer.rs` is the ~140-line proof — a NoPolicy
+agent with a non-coding identity, tools narrowed to `[Read, Host]`,
+one host tool the host answers itself, turn limits, every session
+event printed as JSON. The app crate is held to the same public
+surface: `tests/boundary.rs` fails the build if `src-tauri` reaches
+into `mnemo::agent::` / `mnemo::runtime::` / `mnemo::host::`
+internals.
 
 ---
 

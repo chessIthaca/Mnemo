@@ -188,7 +188,7 @@ impl Default for Endpoint {
 /// per-model default effort (unset = the endpoint's value applies), and
 /// `multimodal` overrides the endpoint's vision flag so one endpoint can mix
 /// text-only (e.g. GLM) and vision-capable (e.g. GLM flash) models.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelSpec {
     /// The model id (matches a `ModelRef.model` / `default_model` value).
     pub id: String,
@@ -253,26 +253,6 @@ pub struct ModelSpec {
     pub extra_body: Option<toml::Table>,
 }
 
-impl Default for ModelSpec {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            max_context: None,
-            max_output_tokens: None,
-            reasoning_efforts: Vec::new(),
-            reasoning_effort: None,
-            reasoning_effort_off_wire: None,
-            multimodal: None,
-            temperature: None,
-            top_p: None,
-            stop: Vec::new(),
-            stop_token_ids: Vec::new(),
-            stop_boundary_strings: Vec::new(),
-            extra_body: None,
-        }
-    }
-}
-
 impl From<&str> for ModelSpec {
     /// A bare id string — the legacy form, with no per-model overrides.
     fn from(id: &str) -> Self {
@@ -314,14 +294,14 @@ where
     #[serde(untagged)]
     enum ModelEntry {
         Id(String),
-        Spec(ModelSpec),
+        Spec(Box<ModelSpec>),
     }
     let entries = Vec::<ModelEntry>::deserialize(d)?;
     Ok(entries
         .into_iter()
         .map(|e| match e {
             ModelEntry::Id(id) => ModelSpec::from(id),
-            ModelEntry::Spec(spec) => spec,
+            ModelEntry::Spec(spec) => *spec,
         })
         .collect())
 }
@@ -542,7 +522,7 @@ impl Endpoint {
                 }
             });
         let mut list: Vec<String> = match model_list {
-            Some(specs) => specs.iter().cloned().collect(),
+            Some(specs) => specs.to_vec(),
             None => DEFAULT_REASONING_EFFORTS
                 .iter()
                 .map(|s| s.to_string())
@@ -706,6 +686,18 @@ pub enum EndpointKind {
     /// Anthropic-compatible provider (Anthropic, OpenRouter, gateways) via a
     /// configurable `base_url` + stored key.
     Anthropic,
+}
+
+/// The kind's serde wire form (job 4 D2, moved from the app's
+/// ipc/settings.rs so one mapping serves the GUI DTOs, the standalone
+/// `Setup` surface, and the credential resolution): `"openai"`,
+/// `"local"`, `"anthropic"`.
+pub fn kind_wire(kind: EndpointKind) -> &'static str {
+    match kind {
+        EndpointKind::OpenAI => "openai",
+        EndpointKind::Local => "local",
+        EndpointKind::Anthropic => "anthropic",
+    }
 }
 
 /// Load endpoints + pricing from `endpoints.toml`, or return empty lists if

@@ -19,12 +19,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::policy::{Continuation, GateVerdict, PromptHook};
 use crate::provider::{ApprovalPreview, FinishReason};
 use crate::tool::ToolResult;
-use crate::workflow::WorkflowState;
 
 /// A unique agent identifier.
 pub type AgentId = u64;
+
+/// The fan-in channel's item type: the emitting agent's id paired with the
+/// event it fans in — the pair every fan-in send/receive carries.
+pub type FaninItem = (AgentId, AgentEvent);
 
 /// One clickable option in an `ask_user` question.
 ///
@@ -123,6 +127,33 @@ pub enum AgentCommand {
     /// [`crate::agent::StopReason::Clear`]). Backed by the `/new` slash
     /// command.
     Clear,
+    /// Export the conversation (G5, 3a.6): reply over the channel with
+    /// the message history + the model + the context usage — the headless
+    /// `history()`/`snapshot()` source. A pure read: never mutates, never
+    /// folds into a running turn. Mid-request arrivals are answered by
+    /// the turn loop from the pre-request snapshot (the in-flight
+    /// assistant turn is not yet part of the history).
+    ExportHistory {
+        /// The reply channel (capacity ≥ 1) for the exported conversation.
+        reply: tokio::sync::mpsc::Sender<ConversationExport>,
+    },
+}
+
+/// The exported conversation state (G5, 3a.6): the full message history
+/// — roles, tool calls/results, reasoning, and the compaction summaries
+/// all live IN the messages, so a seeded resume reproduces the original
+/// request byte prefix (§5.9.5 :693-695) — plus the model + usage for the
+/// session snapshot.
+#[derive(Debug, Clone)]
+pub struct ConversationExport {
+    /// The conversation messages, oldest first.
+    pub messages: Vec<crate::provider::Message>,
+    /// The session's current model (None until the loop exposes one).
+    pub model: Option<String>,
+    /// The approximate prompt-token usage.
+    pub used_tokens: u32,
+    /// The context window.
+    pub max_tokens: u32,
 }
 
 /// The marker prefix of an unattended (run-all) dispatched prompt.
@@ -139,7 +170,7 @@ pub enum AgentCommand {
 pub const UNATTENDED_PROMPT_PREFIX: &str = "[backlog run-all — unattended mode]";
 
 /// One recalled memory in a [`AgentEvent::MemoryRecalled`] payload: its tier
-/// + title, so the transcript entry can expand to the full hit list (user
+/// and title, so the transcript entry can expand to the full hit list (user
 /// request 2026-08-20). The recall limit already caps the vec.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecallHit {
@@ -224,6 +255,13 @@ pub enum AgentEvent {
         core_operation: bool,
         responder: oneshot::Sender<Approval>,
     },
+    /// A gated call executed WITHOUT approval (2c.5, §5.4 :365-369): the
+    /// loop's policy is `OverridePermissions`, so the approval branch was
+    /// skipped entirely — this event is the audit trail for every call
+    /// that WOULD have been gated. `reason` is `"core_op"` when the call
+    /// matched `never_auto_for` (e.g. `git merge`/`git push`), else
+    /// `"safety_mode"`.
+    ApprovalBypassed { tool: String, reason: String },
     /// The result of a tool call.
     ToolResult {
         tool_call_id: String,
@@ -258,9 +296,58 @@ pub enum AgentEvent {
         /// "unchanged", so the popup keeps the last one instead of blanking.
         quality: Option<crate::agent::optimizer::QualityReport>,
     },
-    /// The workflow state changed.
+    /// A token-savings ledger event fanned LIVE (§5.7, job 3b.4): one
+    /// context-optimization lever's outcome, emitted by
+    /// `record_savings_event` at exactly the point its ledger row
+    /// persists — before, what was about to enter the context; after,
+    /// what actually entered. Display-only telemetry, no turn effect:
+    /// the GUI forwarder drops it (R8 — never on the transcript); the
+    /// headless side tallies live totals from it; the durable ledger
+    /// row is the memory store's half alone.
+    Savings {
+        /// The lever that produced the event: `truncation`, `compaction`,
+        /// `delta_read`, `skeleton`, `compression`, `archive`,
+        /// `archive_expand`, or `compaction_checkpoint`.
+        kind: String,
+        /// Token count of the original form (what would have entered the
+        /// context). Non-negative.
+        tokens_before: i64,
+        /// Token count of the served form (what actually entered the
+        /// context). Non-negative.
+        tokens_after: i64,
+        /// `tokens_before - tokens_after`. Negative for a re-expansion
+        /// (an `archive_expand` re-adds archived content).
+        tokens_saved: i64,
+        /// Whether the counts come from a metered source
+        /// (provider-reported usage) or an estimate (the chars-per-token
+        /// heuristics).
+        measured: bool,
+    },
+    /// A per-decision spend ledger event fanned LIVE (§5.7, job 3b.4):
+    /// the budget layer's bill for ONE request, emitted by
+    /// `record_spend_row` at exactly the point its ledger row persists.
+    /// Attribution-gated like the ledger (no plan, no event);
+    /// display-only telemetry, no turn effect — the GUI forwarder drops
+    /// it (R8); the headless side tallies live budget totals from it.
+    Spend {
+        /// The model that served the request (the effective model id).
+        model: String,
+        /// The lane the request ran on (`cheap` / `medium` / `high` /
+        /// `escalate`), when a lane decision applied.
+        lane: Option<String>,
+        /// Input tokens (prompt side).
+        tokens_in: i64,
+        /// Output tokens (completion side).
+        tokens_out: i64,
+        /// Prompt tokens served from the provider's cache (a subset of
+        /// `tokens_in`). `None` when the provider never reported usage.
+        cached_tokens: Option<i64>,
+    },
+    /// The workflow state changed. `state` is the state TOKEN (the
+    /// neutral handle's opaque representation since 2b.3 — the same Debug
+    /// string the pre-2b.3 label reads produced).
     WorkflowStateChanged {
-        state: WorkflowState,
+        state: String,
         /// The id of the ROOT plan (bottom of the plan stack), if any. Constant
         /// across sub-plan push/pop and skill transitions; changes only when a
         /// fresh top-level plan starts (`create_plan` from Planning or
@@ -487,6 +574,46 @@ pub enum AgentEvent {
         /// The auto-continue streak at the park.
         auto_continue_streak: u32,
     },
+    /// The model called a **host tool** — a tool registered by the session's
+    /// owner (G2, master-spec §5.9.2) whose execution lives outside the
+    /// kernel. Emitted by the dispatch layer INSTEAD of executing the tool
+    /// locally; the call suspends until the host answers with the matching
+    /// `HostToolResult` command, or the per-tool timeout elapses (the call
+    /// then resolves to an error result and the turn CONTINUES, so an
+    /// absent host can never hang the agent — R4). The result folds back
+    /// through the normal `ToolResult` path, so output compaction and the
+    /// read cache apply to host-tool results like any other.
+    HostToolCall {
+        /// The tool-call id (matches the model's call id).
+        call_id: String,
+        /// The host tool's name.
+        name: String,
+        /// The model's call arguments.
+        args: Value,
+        /// The host answers on this oneshot — the outcome carried by the
+        /// `HostToolResult` command.
+        responder: oneshot::Sender<HostToolOutcome>,
+    },
+    /// A selected external-policy hook fired (G6 tier 3, master-spec
+    /// §5.9.6). The kernel suspends at the hook site until the host answers
+    /// with the matching `PolicyAnswer` command, or the hook timeout
+    /// elapses (resolving to the spec's `on_timeout` action). The same
+    /// request/response shape as approvals, questions, and host tools, so
+    /// an orchestrator in any language can implement a policy — including
+    /// auto-continue outside the process via a `Continue` continuation at
+    /// `TurnEnd`. The policy may only GATE calls — it can never change the
+    /// tool array mid-session (R1).
+    PolicyHook {
+        /// The hook id the host echoes in its answer.
+        hook_id: String,
+        /// Which hook fired.
+        hook_kind: HookKind,
+        /// The hook's JSON payload (per-kind shapes documented on
+        /// [`HookKind`]).
+        payload: Value,
+        /// The host answers on this oneshot.
+        responder: oneshot::Sender<PolicyAnswer>,
+    },
 }
 
 /// The phases of the agent's request loop, reported via
@@ -524,6 +651,31 @@ pub enum PhaseKind {
     Streaming,
     /// Tool calls from the previous response are executing between requests.
     RunningTools,
+}
+
+/// The per-session limits (§5.9.7, G7) — all optional; `None` keeps the
+/// config's `BudgetConfig` default. 3a.7 implements `max_turns` +
+/// `wall_clock_ms` (the turn loop checks them before every provider
+/// request); the token/cost/idle fields ride 3b's spend accounting
+/// (typed now so the wire shape is pinned). Lives in the kernel-neutral
+/// channels module so the host spawn path carries it without reaching
+/// into `headless`; the public surface is the `headless` re-export.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLimits {
+    /// Max LLM turns per session.
+    pub max_turns: Option<u64>,
+    /// Max provider requests per session.
+    pub max_requests: Option<u64>,
+    /// Max prompt tokens across the session.
+    pub max_prompt_tokens: Option<u64>,
+    /// Max completion tokens across the session.
+    pub max_completion_tokens: Option<u64>,
+    /// Max spend (micros) across the session.
+    pub max_cost_micros: Option<u64>,
+    /// Max session wall-clock (ms).
+    pub wall_clock_ms: Option<u64>,
+    /// Max idle time between turns (ms).
+    pub idle_ms: Option<u64>,
 }
 
 /// A serializable version of `AgentEvent` for the IPC boundary.
@@ -568,6 +720,7 @@ pub enum SerializableAgentEvent {
         /// layer never auto-resolves these on a mode change.
         core_operation: bool,
     },
+    ApprovalBypassed { tool: String, reason: String },
     ToolResult {
         tool_call_id: String,
         result: ToolResult,
@@ -589,8 +742,34 @@ pub enum SerializableAgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<crate::agent::optimizer::QualityReport>,
     },
+    /// A live token-savings ledger event. See
+    /// [`AgentEvent::Savings`].
+    Savings {
+        /// The lever that produced the event — the ledger row's `kind`
+        /// column (truncation, compaction, archive, `archive_expand`, …).
+        /// Not named `kind` here: that's the enum's tag key, and serde
+        /// rejects a variant field named like the tag.
+        lever: String,
+        tokens_before: i64,
+        tokens_after: i64,
+        tokens_saved: i64,
+        measured: bool,
+    },
+    /// A live per-decision spend ledger event. See
+    /// [`AgentEvent::Spend`].
+    Spend {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lane: Option<String>,
+        tokens_in: i64,
+        tokens_out: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_tokens: Option<i64>,
+    },
     WorkflowStateChanged {
-        state: WorkflowState,
+        /// The state token (the neutral handle's opaque representation since
+        /// 2b.3 — mirrors [`AgentEvent::WorkflowStateChanged`]).
+        state: String,
         /// The id of the ROOT plan (bottom of the plan stack), if any. Constant
         /// across sub-plan push/pop and skill transitions; changes only when a
         /// fresh top-level plan starts. Lets the frontend reset per-top-plan
@@ -711,14 +890,38 @@ pub enum SerializableAgentEvent {
         /// The auto-continue streak at the park.
         auto_continue_streak: u32,
     },
+    /// The model called a host tool. See [`AgentEvent::HostToolCall`] —
+    /// the responder rides the [`SerializedEvent`] separately.
+    HostToolCall {
+        /// The tool-call id (matches the model's call id).
+        call_id: String,
+        /// The host tool's name.
+        name: String,
+        /// The model's call arguments.
+        args: Value,
+    },
+    /// A selected external-policy hook fired. See [`AgentEvent::PolicyHook`]
+    /// — the responder rides the [`SerializedEvent`] separately.
+    PolicyHook {
+        /// The hook id the host echoes in its answer.
+        hook_id: String,
+        /// Which hook fired (named `hook_kind` on the wire because the
+        /// enum's serde tag is `kind`).
+        hook_kind: HookKind,
+        /// The hook's JSON payload (per-kind shapes documented on
+        /// [`HookKind`]).
+        payload: Value,
+    },
 }
 
 /// The output of converting an [`AgentEvent`] to its serializable form: the
 /// serializable event itself plus any non-serializable oneshot senders the IPC
-/// adapter must hold separately (an approval sender and/or a question sender).
+/// adapter must hold separately (an approval, question, host-tool, or
+/// policy-hook sender).
 ///
-/// Both are `Option` because most events carry neither; `ApprovalRequest`
-/// carries only an approval sender, `UserQuestion` carries only a question
+/// All are `Option` because most events carry none; `ApprovalRequest`
+/// carries only an approval sender, `UserQuestion` only a question sender,
+/// `HostToolCall` only a host-tool sender, `PolicyHook` only a policy-hook
 /// sender. They never co-occur on a single event.
 #[derive(Debug)]
 pub struct SerializedEvent {
@@ -728,6 +931,10 @@ pub struct SerializedEvent {
     pub approval_sender: Option<oneshot::Sender<Approval>>,
     /// The question oneshot, when the event was a `UserQuestion`.
     pub question_sender: Option<oneshot::Sender<UserAnswer>>,
+    /// The host-tool outcome oneshot, when the event was a `HostToolCall`.
+    pub host_tool_sender: Option<oneshot::Sender<HostToolOutcome>>,
+    /// The policy-hook answer oneshot, when the event was a `PolicyHook`.
+    pub policy_hook_sender: Option<oneshot::Sender<PolicyAnswer>>,
 }
 
 impl AgentEvent {
@@ -743,26 +950,36 @@ impl AgentEvent {
                 event: SerializableAgentEvent::Started,
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::TextDelta(text) => SerializedEvent {
                 event: SerializableAgentEvent::TextDelta { text },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ReasoningDelta(text) => SerializedEvent {
                 event: SerializableAgentEvent::ReasoningDelta { text },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ToolCallStart { index, id, name } => SerializedEvent {
                 event: SerializableAgentEvent::ToolCallStart { index, id, name },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ToolCallArgDelta { index, fragment } => SerializedEvent {
                 event: SerializableAgentEvent::ToolCallArgDelta { index, fragment },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ToolOutputDelta {
                 tool_call_id,
@@ -776,6 +993,8 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ApprovalRequest {
                 tool_call_id,
@@ -794,6 +1013,15 @@ impl AgentEvent {
                 },
                 approval_sender: Some(responder),
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::ApprovalBypassed { tool, reason } => SerializedEvent {
+                event: SerializableAgentEvent::ApprovalBypassed { tool, reason },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ToolResult {
                 tool_call_id,
@@ -805,6 +1033,8 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Usage {
                 prompt_tokens,
@@ -824,6 +1054,8 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ContextUsage {
                 used,
@@ -839,31 +1071,81 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::Savings {
+                kind,
+                tokens_before,
+                tokens_after,
+                tokens_saved,
+                measured,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::Savings {
+                    lever: kind,
+                    tokens_before,
+                    tokens_after,
+                    tokens_saved,
+                    measured,
+                },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::Spend {
+                model,
+                lane,
+                tokens_in,
+                tokens_out,
+                cached_tokens,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::Spend {
+                    model,
+                    lane,
+                    tokens_in,
+                    tokens_out,
+                    cached_tokens,
+                },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::WorkflowStateChanged { state, top_plan_id } => SerializedEvent {
                 event: SerializableAgentEvent::WorkflowStateChanged { state, top_plan_id },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::StepCompleted { step_index } => SerializedEvent {
                 event: SerializableAgentEvent::StepCompleted { step_index },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::SuggestionInjected { text, images } => SerializedEvent {
                 event: SerializableAgentEvent::SuggestionInjected { text, images },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::PromptDispatched { text, images } => SerializedEvent {
                 event: SerializableAgentEvent::PromptDispatched { text, images },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::SkillStarted { name, prompt } => SerializedEvent {
                 event: SerializableAgentEvent::SkillStarted { name, prompt },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ModelChanged {
                 model,
@@ -877,11 +1159,15 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::MemoryRecalled { hits } => SerializedEvent {
                 event: SerializableAgentEvent::MemoryRecalled { hits },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::UserQuestion {
                 question_id,
@@ -896,21 +1182,29 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: Some(responder),
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Finished { reason } => SerializedEvent {
                 event: SerializableAgentEvent::Finished { reason },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Phase { phase } => SerializedEvent {
                 event: SerializableAgentEvent::Phase { phase },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Exited => SerializedEvent {
                 event: SerializableAgentEvent::Exited,
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::ChildFinished {
                 child_id,
@@ -924,21 +1218,29 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Error { error, retrying } => SerializedEvent {
                 event: SerializableAgentEvent::Error { error, retrying },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Compacted { before, after } => SerializedEvent {
                 event: SerializableAgentEvent::Compacted { before, after },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::CompactStarted => SerializedEvent {
                 event: SerializableAgentEvent::CompactStarted,
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::VisionDescribe {
                 index,
@@ -952,6 +1254,8 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::VisionDescribed {
                 index,
@@ -967,6 +1271,8 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
             },
             AgentEvent::Parked {
                 reason,
@@ -982,6 +1288,40 @@ impl AgentEvent {
                 },
                 approval_sender: None,
                 question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::HostToolCall {
+                call_id,
+                name,
+                args,
+                responder,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::HostToolCall {
+                    call_id,
+                    name,
+                    args,
+                },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: Some(responder),
+                policy_hook_sender: None,
+            },
+            AgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+                responder,
+            } => SerializedEvent {
+                event: SerializableAgentEvent::PolicyHook {
+                    hook_id,
+                    hook_kind,
+                    payload,
+                },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: Some(responder),
             },
         }
     }
@@ -1017,6 +1357,65 @@ pub enum UserAnswer {
     Freeform {
         /// The text the user entered.
         text: String,
+    },
+}
+
+/// The host's answer to an [`AgentEvent::HostToolCall`] — the `ToolResult`
+/// the kernel folds back into the conversation as the call's result, or an
+/// error string that becomes the call's error result. Carried across the
+/// pause/resume boundary by the session's `HostToolResult` command (the
+/// `result | error` pair, G2 master-spec §5.9.2).
+pub type HostToolOutcome = Result<ToolResult, String>;
+
+/// Which external-policy hook is firing (G6 tier 3, master-spec §5.9.6).
+/// Selected via the session's `ExternalPolicySpec::hooks`; the kernel emits
+/// one [`AgentEvent::PolicyHook`] per selected hook at the hook's site and
+/// waits for the host's [`PolicyAnswer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKind {
+    /// Before a tool call runs. Payload: `{ "tool", "args" }`; the answer is
+    /// [`PolicyAnswer::Gate`] — `Deny` blocks the call (it may never touch
+    /// the tool array — R1), `RequireApproval` routes the call through the
+    /// approval prompt.
+    ToolGate,
+    /// At prompt intake. Payload: `{ "text" }`; the answer is
+    /// [`PolicyAnswer::Prompt`] (the unattended marker read / optional
+    /// volatile-tail rewrite).
+    PromptIntake,
+    /// At the end of a turn. Payload: the turn summary; the answer is
+    /// [`PolicyAnswer::Continuation`] — `Continue { note }` runs another
+    /// turn (auto-continue implemented outside the process), `Stop` parks.
+    TurnEnd,
+    /// After a tool result. Payload: `{ "tool", "result" }`; the answer
+    /// acknowledges the observation (the call already ran — a `Deny` is
+    /// informational only).
+    AfterTool,
+    /// Once when the session ends. Payload: `{}`; the answer acknowledges.
+    SessionEnd,
+}
+
+/// The host's answer to an [`AgentEvent::PolicyHook`] — one arm per hook
+/// family (G6 tier 3). A mismatched arm for the hook kind (e.g. a `Gate`
+/// answer to a `TurnEnd` hook) is a protocol error the kernel resolves the
+/// same way as an unanswered hook: the spec's `on_timeout` action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PolicyAnswer {
+    /// The gate verdict for a `ToolGate` (or the `AfterTool` ack).
+    Gate {
+        /// Whether the call proceeds.
+        verdict: GateVerdict,
+    },
+    /// The prompt hook for a `PromptIntake` hook.
+    Prompt {
+        /// The unattended marker read / optional tail rewrite.
+        hook: PromptHook,
+    },
+    /// The continuation decision for a `TurnEnd` (or `SessionEnd`) hook.
+    Continuation {
+        /// `Stop` parks, `Continue { note }` runs another turn.
+        continuation: Continuation,
     },
 }
 
@@ -1158,6 +1557,135 @@ mod tests {
             _ => panic!("expected ApprovalRequest"),
         }
         assert!(sender.is_some(), "sender should be extracted");
+    }
+
+    /// 2c.5 (§5.4 :365-369): ApprovalBypassed forwards without senders —
+    /// the bypass audit event needs no responder.
+    #[test]
+    fn approval_bypassed_forwards_without_senders() {
+        let event = AgentEvent::ApprovalBypassed {
+            tool: "git".into(),
+            reason: "core_op".into(),
+        };
+        let SerializedEvent {
+            event: serial,
+            approval_sender,
+            question_sender,
+            ..
+        } = event.into_serializable();
+        match serial {
+            SerializableAgentEvent::ApprovalBypassed { tool, reason } => {
+                assert_eq!(tool, "git");
+                assert_eq!(reason, "core_op");
+            }
+            _ => panic!("expected ApprovalBypassed"),
+        }
+        assert!(approval_sender.is_none() && question_sender.is_none());
+    }
+
+    /// 3c (§5.9.2, G2): `HostToolCall` extracts its responder and mirrors
+    /// the payload — the pump stashes the sender keyed by `call_id` for
+    /// the session's `HostToolResult` arm, and the outcome flows back
+    /// through the oneshot in the session arm's shape (`Ok(ToolResult)`).
+    #[test]
+    fn host_tool_call_into_serializable_extracts_sender() {
+        let (tx, mut rx) = oneshot::channel::<HostToolOutcome>();
+        let event = AgentEvent::HostToolCall {
+            call_id: "call_7".into(),
+            name: "get_weather".into(),
+            args: serde_json::json!({"city": "Oslo"}),
+            responder: tx,
+        };
+        let SerializedEvent {
+            event: serial,
+            host_tool_sender: sender,
+            ..
+        } = event.into_serializable();
+        match serial {
+            SerializableAgentEvent::HostToolCall { call_id, name, args } => {
+                assert_eq!(call_id, "call_7");
+                assert_eq!(name, "get_weather");
+                assert_eq!(args, serde_json::json!({"city": "Oslo"}));
+            }
+            _ => panic!("expected HostToolCall"),
+        }
+        let sender = sender.expect("host tool sender should be extracted");
+        sender
+            .send(Ok(ToolResult::success("sunny".to_string())))
+            .expect("receiver alive");
+        match rx.try_recv().expect("outcome arrives") {
+            Ok(result) => assert_eq!(result.output, "sunny"),
+            Err(_) => panic!("expected a success outcome"),
+        }
+    }
+
+    /// 3c (§5.9.6, G6 tier 3): `PolicyHook` extracts its responder and the
+    /// hook kind rides the serial mirror as `hook_kind` (the mirror
+    /// enum's serde tag is `kind`, so the field carries its own name) —
+    /// the answer flows back through the oneshot in `PolicyAnswer`'s
+    /// shape.
+    #[test]
+    fn policy_hook_into_serializable_extracts_sender() {
+        let (tx, mut rx) = oneshot::channel::<PolicyAnswer>();
+        let event = AgentEvent::PolicyHook {
+            hook_id: "hook_1".into(),
+            hook_kind: HookKind::ToolGate,
+            payload: serde_json::json!({"tool": "search"}),
+            responder: tx,
+        };
+        let SerializedEvent {
+            event: serial,
+            policy_hook_sender: sender,
+            ..
+        } = event.into_serializable();
+        match serial {
+            SerializableAgentEvent::PolicyHook {
+                hook_id,
+                hook_kind,
+                payload,
+            } => {
+                assert_eq!(hook_id, "hook_1");
+                assert_eq!(hook_kind, HookKind::ToolGate);
+                assert_eq!(payload, serde_json::json!({"tool": "search"}));
+            }
+            _ => panic!("expected PolicyHook"),
+        }
+        let sender = sender.expect("policy hook sender should be extracted");
+        sender
+            .send(PolicyAnswer::Gate {
+                verdict: GateVerdict::Deny {
+                    message: "forbidden".into(),
+                },
+            })
+            .expect("receiver alive");
+        match rx.try_recv().expect("answer arrives") {
+            PolicyAnswer::Gate {
+                verdict: GateVerdict::Deny { message },
+            } => assert_eq!(message, "forbidden"),
+            _ => panic!("expected a Gate Deny answer"),
+        }
+    }
+
+    /// 3c (G6 tier 3): the wire vocabulary — `HookKind` serializes
+    /// snake_case, and `PolicyAnswer` carries its internally-tagged `kind`
+    /// discriminator with the verdict's own snake_case names.
+    #[test]
+    fn policy_hook_wire_vocabulary() {
+        assert_eq!(
+            serde_json::to_value(HookKind::ToolGate).unwrap(),
+            serde_json::json!("tool_gate")
+        );
+        assert_eq!(
+            serde_json::to_value(HookKind::SessionEnd).unwrap(),
+            serde_json::json!("session_end")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyAnswer::Gate {
+                verdict: GateVerdict::RequireApproval,
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "gate", "verdict": "require_approval"})
+        );
     }
 
     #[test]
@@ -1647,6 +2175,7 @@ mod tests {
             event: serial,
             approval_sender,
             question_sender,
+            ..
         } = event.into_serializable();
         match serial {
             SerializableAgentEvent::UserQuestion {

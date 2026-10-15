@@ -14,7 +14,6 @@
 
 use tauri::State;
 
-use super::settings::endpoint_kind_wire;
 use crate::ipc::error::IpcError;
 use crate::ipc::state::IpcState;
 
@@ -34,36 +33,18 @@ fn resolve_endpoint_credentials(
     api_key: Option<String>,
     kind: Option<String>,
 ) -> Result<(String, String, String), IpcError> {
-    let saved = config.endpoint(endpoint_name);
-    let base_url = base_url
-        .filter(|u| !u.trim().is_empty())
-        .or_else(|| saved.map(|e| e.base_url.clone()))
-        .ok_or_else(|| {
-            format!("endpoint '{endpoint_name}' has no base_url and does not match a saved endpoint")
-        })?;
-    let kind = kind
-        .filter(|k| !k.trim().is_empty())
-        .or_else(|| saved.map(|e| endpoint_kind_wire(e.kind).to_string()))
-        .unwrap_or_else(|| "openai".to_string());
-    // Kind-aware env fallback, mirroring the provider's resolve_api_key
-    // (client_factory.rs): an Anthropic-kind endpoint prefers
-    // ANTHROPIC_API_KEY; OpenAI/Local prefer OPENAI_API_KEY. Both share
-    // the historical ANTHROPIC_AUTH_TOKEN fallback.
-    let env_key = if kind == "anthropic" {
-        std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
-    } else {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
-    };
-    let api_key = api_key
-        .filter(|k| !k.trim().is_empty())
-        .or_else(|| saved.and_then(|e| config.key_for(&e.name).map(|s| s.to_string())))
-        .or_else(|| env_key)
-        .unwrap_or_else(|| "dummy".to_string());
-    Ok((base_url, api_key, kind))
+    // Job 4 D2: the resolution moved into the lib
+    // (`mnemo::provider::models`) so the pickers and the standalone
+    // `Setup` surface share ONE implementation; this wrapper only maps
+    // the error type.
+    mnemo::provider::models::resolve_endpoint_credentials(
+        config,
+        endpoint_name,
+        base_url,
+        api_key,
+        kind,
+    )
+    .map_err(IpcError::from)
 }
 
 /// Fetch the live model list via the library's HTTP helper selected by
@@ -79,15 +60,11 @@ async fn fetch_by_kind(
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<mnemo::provider::models::ModelWithVision>, IpcError> {
-    if kind == "anthropic" {
-        mnemo::provider::models::fetch_models_anthropic(base_url, api_key)
-            .await
-            .map_err(IpcError::from)
-    } else {
-        mnemo::provider::models::fetch_models_with_vision(base_url, api_key)
-            .await
-            .map_err(IpcError::from)
-    }
+    // Job 4 D2: the kind-selected fetch moved into the lib; this
+    // wrapper keeps the app's IpcError mapping.
+    mnemo::provider::models::fetch_by_kind(kind, base_url, api_key)
+        .await
+        .map_err(IpcError::from)
 }
 
 /// Fetch the live model list (with per-model token caps) from an endpoint's
@@ -191,15 +168,16 @@ mod tests {
     /// A saved-endpoint fixture: name "ep" with the given kind + base_url,
     /// no stored key unless the test inserts one.
     fn config_with_endpoint(kind: EndpointKind, base_url: &str) -> Config {
-        let mut config = Config::default();
-        config.endpoints = vec![Endpoint {
-            name: "ep".into(),
-            kind,
-            base_url: base_url.into(),
-            models: vec![],
-            ..Endpoint::test_default()
-        }];
-        config
+        Config {
+            endpoints: vec![Endpoint {
+                name: "ep".into(),
+                kind,
+                base_url: base_url.into(),
+                models: vec![],
+                ..Endpoint::test_default()
+            }],
+            ..Default::default()
+        }
     }
 
     #[test]

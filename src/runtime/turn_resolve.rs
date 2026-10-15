@@ -25,7 +25,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::runtime::AgentId;
-use crate::workflow::WorkflowState;
 
 /// Outcome of a terminal event for Run-All / auto-feed bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,7 +236,7 @@ impl TurnResolveLatch {
 /// with the unchanged state (defense in depth behind the `result.success`
 /// gating at the emission site — review finding 1, 2026-08-20: a failed
 /// workflow tool call must never fake "the loop ran" evidence).
-pub fn workflow_transition_counts(prev: Option<WorkflowState>, new: WorkflowState) -> bool {
+pub fn workflow_transition_counts(prev: Option<&str>, new: &str) -> bool {
     prev != Some(new)
 }
 
@@ -290,7 +289,6 @@ pub fn completion_suggestion_text(
 #[cfg(test)]
 mod turn_resolve_latch_tests {
     use super::{workflow_transition_counts, ResolveAction, TurnResolveLatch};
-    use crate::workflow::WorkflowState;
 
     /// Quality C1: final Error then Finished must not both count as terminal
     /// resolutions — Finished after a failure is idle bookkeeping only.
@@ -461,20 +459,19 @@ mod turn_resolve_latch_tests {
     #[test]
     fn workflow_transition_counts_requires_a_real_state_change() {
         assert!(
-            workflow_transition_counts(Some(WorkflowState::Complete), WorkflowState::Complete)
-                == false,
+            !workflow_transition_counts(Some("Complete"), "Complete"),
             "a no-op event (same state) is NOT evidence"
         );
         assert!(
-            workflow_transition_counts(None, WorkflowState::Complete),
+            workflow_transition_counts(None, "Complete"),
             "first-ever observation counts (prev unknown)"
         );
         assert!(
-            workflow_transition_counts(Some(WorkflowState::Complete), WorkflowState::Executing),
+            workflow_transition_counts(Some("Complete"), "Executing"),
             "Complete → Executing is evidence"
         );
         assert!(
-            workflow_transition_counts(Some(WorkflowState::Reviewing), WorkflowState::Complete),
+            workflow_transition_counts(Some("Reviewing"), "Complete"),
             "Reviewing → Complete is evidence"
         );
     }

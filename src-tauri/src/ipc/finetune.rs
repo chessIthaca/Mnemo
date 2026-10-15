@@ -42,7 +42,7 @@ use std::sync::{Arc, RwLock};
 
 use tauri::{AppHandle, Emitter};
 
-use mnemo::agent::failure_triage::{read_rows, training_log_path, FailureLogRow};
+use mnemo::{read_rows, training_log_path, FailureLogRow};
 use mnemo::config::Config;
 use mnemo::config::general::LayaConfig;
 use mnemo::memory::classifier::{Classifier, ClassifierStatus};

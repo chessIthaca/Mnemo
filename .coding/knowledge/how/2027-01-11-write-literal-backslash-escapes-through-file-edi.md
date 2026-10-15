@@ -1,0 +1,6 @@
++++
+title = "write literal backslash escapes through file_edit — regex-mode ${1} capture reconstruction"
+created = "2027-01-11"
++++
+
+Transport escape lesson (learned 2027-01-19, plan efd1f4c3 step 5): file_edit/multi_edit new_string content undergoes a naive `\n` (backslash-n) → real-newline replacement INSIDE single-quoted spans, and `\\n` (double backslash + n) degrades to backslash + newline. Writing a Rust char literal '\n' via a plain new_string is therefore impossible by direct spelling — it silently writes a real newline inside the char literal and breaks the build. WORKAROUND (verified): regex mode (use_regex=true) with a capture — the backslash already present in the file is captured by a group and reinserted via ${1}, so the replacement string carries no backslash at all: old_string regex `head_content\.push\('(\\)\n'\)` (matches `push('\` + real newline + `');`), new_string `head_content.push('${1}n')` → file gets `push('\n')` exactly. Double-quoted string literals are NOT touched (`\n` inside `\"...\"` lands literally, e.g. review_scope/git/backlog message literals worked first try). Always read back the edited region to verify bytes before compiling when a backslash appears anywhere near single quotes.

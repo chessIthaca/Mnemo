@@ -36,8 +36,10 @@ impl MemoryTier {
         }
     }
 
-    /// Parse a tier from its string form.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a tier from its string form (`_opt`: Option-returning parse —
+    /// deliberately NOT `std::str::FromStr`, which would force a `Result`
+    /// + error type).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "working" => Some(Self::Working),
             "episodic" => Some(Self::Episodic),
@@ -80,8 +82,10 @@ impl MemoryClass {
         }
     }
 
-    /// Parse a class from its string form.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a class from its string form (`_opt`: Option-returning parse —
+    /// deliberately NOT `std::str::FromStr`, which would force a `Result`
+    /// + error type).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "authored" => Some(Self::Authored),
             "derived" => Some(Self::Derived),
@@ -136,8 +140,10 @@ impl MemoryRecordType {
         }
     }
 
-    /// Parse a record type from its string form.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse a record type from its string form (`_opt`: Option-returning
+    /// parse — deliberately NOT `std::str::FromStr`, which would force a
+    /// `Result` + error type).
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "spec" => Some(Self::Spec),
             "decision" => Some(Self::Decision),
@@ -884,9 +890,9 @@ mod tests {
             MemoryTier::Procedural,
         ] {
             let s = tier.as_str();
-            assert_eq!(MemoryTier::from_str(s), Some(tier));
+            assert_eq!(MemoryTier::from_str_opt(s), Some(tier));
         }
-        assert_eq!(MemoryTier::from_str("bogus"), None);
+        assert_eq!(MemoryTier::from_str_opt("bogus"), None);
     }
 
     #[test]
@@ -926,9 +932,9 @@ mod tests {
     #[test]
     fn record_enums_roundtrip() {
         for class in [MemoryClass::Authored, MemoryClass::Derived] {
-            assert_eq!(MemoryClass::from_str(class.as_str()), Some(class));
+            assert_eq!(MemoryClass::from_str_opt(class.as_str()), Some(class));
         }
-        assert_eq!(MemoryClass::from_str("bogus"), None);
+        assert_eq!(MemoryClass::from_str_opt("bogus"), None);
         for rt in [
             MemoryRecordType::Spec,
             MemoryRecordType::Decision,
@@ -938,9 +944,9 @@ mod tests {
             MemoryRecordType::Review,
             MemoryRecordType::None,
         ] {
-            assert_eq!(MemoryRecordType::from_str(rt.as_str()), Some(rt));
+            assert_eq!(MemoryRecordType::from_str_opt(rt.as_str()), Some(rt));
         }
-        assert_eq!(MemoryRecordType::from_str("bogus"), None);
+        assert_eq!(MemoryRecordType::from_str_opt("bogus"), None);
     }
 
     #[test]

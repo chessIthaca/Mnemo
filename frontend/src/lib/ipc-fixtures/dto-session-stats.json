@@ -1,0 +1,27 @@
+{
+  "cached_tokens": 60,
+  "completion_tokens": 50,
+  "created_at": 100,
+  "ended_at": 200,
+  "generation_ms_total": 2000,
+  "per_model": [
+    {
+      "cached_tokens": 60,
+      "completion_tokens": 50,
+      "endpoint": "openai",
+      "generation_ms_total": 2000,
+      "model": "gpt-5",
+      "prompt_tokens": 100,
+      "reasoning_tokens": 10,
+      "request_count": 3,
+      "timed_requests": 2,
+      "ttft_ms_total": 300
+    }
+  ],
+  "prompt_tokens": 100,
+  "reasoning_tokens": 10,
+  "request_count": 3,
+  "session_id": "s-1",
+  "timed_requests": 2,
+  "ttft_ms_total": 300
+}

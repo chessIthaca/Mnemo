@@ -419,7 +419,7 @@ impl BrowserManager {
         // so it need not complete before launch — and running it inline held
         // the state lock across blocking `read_dir` + `remove_dir_all` calls
         // (Review M1-perf).
-        let _ = tokio::task::spawn_blocking(Self::sweep_orphan_profiles);
+        let _handle = tokio::task::spawn_blocking(Self::sweep_orphan_profiles);
 
         let profile = tempfile::Builder::new()
             .prefix("mnemo-browser-")
@@ -433,7 +433,7 @@ impl BrowserManager {
                 // outside the crate. The builder's `new_headless_mode()` sets
                 // exactly HeadlessMode::New — the mode this app wants.
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 // No plugins in this app: forbid extension loading explicitly
                 // (the throwaway profile already blocks extensions; this makes
                 // the policy explicit in case a profile dir is ever reused).
@@ -1568,10 +1568,10 @@ impl BrowserManager {
     }
 
     /// Navigate the Browser tab's child webview to `url`. Normalizes the URL
-    /// through the same [`normalize_url`] choke point (so the scheme allow-list
-    /// + omnibox autodetection apply), then drives the child webview's page
-    /// directly via CDP `Page.navigate` — no iframe `src` eval (the child is a
-    /// separate top-level webview, not an iframe in the app's DOM).
+    /// through the same [`normalize_url`] choke point (so the scheme
+    /// allow-list + omnibox autodetection apply), then drives the child
+    /// webview's page directly via CDP `Page.navigate` — no iframe `src` eval
+    /// (the child is a separate top-level webview, not an iframe in the app's DOM).
     ///
     /// BOOTSTRAP: when no child webview exists yet (the Browser tab was
     /// toggled on but never navigated), the app-layer
@@ -2061,9 +2061,10 @@ mod tests {
             if have_all {
                 break;
             }
-            match tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await {
-                Ok(Ok(ev)) => got.push(ev),
-                _ => {}
+            if let Ok(Ok(ev)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), sub.recv()).await
+            {
+                got.push(ev)
             }
         }
         let texts: Vec<&str> = got.iter().map(|e| e.text.as_str()).collect();
@@ -2366,6 +2367,7 @@ mod tests {
         std::fs::File::options()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(skewed.path().join(LIVE_MARKER))
             .expect("marker")
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
@@ -2603,7 +2605,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -2726,7 +2728,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -2905,7 +2907,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3136,7 +3138,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3248,7 +3250,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3345,7 +3347,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3512,7 +3514,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()
@@ -3573,7 +3575,7 @@ mod tests {
         let (launched, mut handler) = Browser::launch(
             BrowserConfig::builder()
                 .new_headless_mode()
-                .user_data_dir(profile.path().to_path_buf())
+                .user_data_dir(profile.path())
                 .port(0)
                 .args(vec!["--disable-extensions".to_string()])
                 .build()

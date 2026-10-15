@@ -26,6 +26,18 @@ use crate::safety_rules::SafetyRules;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::ToolRegistry;
 
+/// The explicit picker pin (2a.6 G2 hot-reload): the exact `(client,
+/// context)` pair an explicit pick installs, swappable in place so the
+/// running loop adopts it without a rebuild. `None` = no pin installed.
+pub(crate) type ExplicitProvider =
+    Arc<RwLock<Option<(Arc<dyn LlmClient>, super::context::ContextManager)>>>;
+
+/// The `(model, display effort, wire effort)` snapshot of the request
+/// last actually SERVED — the trio `served_effective` holds behind one
+/// mutex.
+pub(crate) type ServedEffective =
+    std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>;
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -104,6 +116,60 @@ pub(crate) struct FallbackInfo {
     pub model: String,
 }
 
+/// The enforcement half of G7 (§5.9.7): the limits plus the counters
+/// they check. Owned by [`AgentLoop`] behind a `Mutex` — `run_turn`
+/// calls `begin_request` at the top of every provider-request iteration
+/// (no await while held).
+pub(crate) struct SessionLimiter {
+    /// The limits in force (all `None` = unlimited).
+    limits: crate::runtime::channels::SessionLimits,
+    /// Requests served so far this session (incremented by
+    /// `begin_request`; provider-error retries count — every retry is a
+    /// provider request).
+    requests_served: u64,
+    /// When the limits were applied (the session's wall-clock epoch).
+    started_at: Option<std::time::Instant>,
+}
+
+impl SessionLimiter {
+    fn unlimited() -> Self {
+        Self {
+            limits: crate::runtime::channels::SessionLimits::default(),
+            requests_served: 0,
+            started_at: None,
+        }
+    }
+
+    /// Apply a fresh limits set: resets the counters + starts the
+    /// wall-clock epoch (the session's limits epoch = when they were
+    /// applied, i.e. the engine's spawn).
+    fn apply(&mut self, limits: crate::runtime::channels::SessionLimits) {
+        self.limits = limits;
+        self.requests_served = 0;
+        self.started_at = Some(std::time::Instant::now());
+    }
+
+    /// Admit the next provider request, or report the limit it hits
+    /// (G7): `max_turns` counts requests served, `wall_clock_ms` the
+    /// elapsed time since the limits were applied. On a hit the turn
+    /// ends with `FinishReason::LimitReached` and the session parks —
+    /// every later call hits the same limit again.
+    pub(crate) fn begin_request(&mut self) -> Option<crate::provider::LimitKind> {
+        if let Some(max) = self.limits.max_turns {
+            if self.requests_served >= max {
+                return Some(crate::provider::LimitKind::MaxTurns);
+            }
+        }
+        if let (Some(budget), Some(started)) = (self.limits.wall_clock_ms, self.started_at) {
+            if started.elapsed() >= std::time::Duration::from_millis(budget) {
+                return Some(crate::provider::LimitKind::WallClock);
+            }
+        }
+        self.requests_served += 1;
+        None
+    }
+}
+
 pub struct AgentLoop {
     /// The LLM provider. Behind an `RwLock` so the model can be swapped at
     /// runtime (e.g. the status-bar model picker) without rebuilding the loop.
@@ -141,7 +207,33 @@ pub struct AgentLoop {
     /// yet (no request has been built for this loop).
     pub(crate) live_token_count: std::sync::atomic::AtomicUsize,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) workflow: Arc<tokio::sync::Mutex<crate::workflow::Workflow>>,
+    /// The steering counters this loop reports to (2c.4/G4): injected by
+    /// the factory via `with_steering` so every loop the same factory
+    /// builds shares one instance — the process-wide singleton is
+    /// deleted. A loop built without wiring keeps its own fresh,
+    /// isolated set.
+    pub(crate) steering: Arc<crate::agent::steering_stats::SteeringStats>,
+    /// The approval policy (2c.5, §5.4): per-loop. Defaults in
+    /// `from_config` to today's semantics (`ApproveViaApi` over the
+    /// config's initial mode) so directly-built loops keep approval
+    /// gating; the factory wires it explicitly, and the free agent's
+    /// `OverridePermissions` is set via `with_permission` (the 3a
+    /// Engine's spawn path). Under Override, dispatch skips the approval
+    /// branch entirely, emitting `AgentEvent::ApprovalBypassed` for
+    /// calls that would have been gated. See
+    /// [`crate::agent::policy::PermissionPolicy`].
+    pub(crate) permission: std::sync::RwLock<crate::agent::policy::PermissionPolicy>,
+    /// G7 (§5.9.7): the session limits + their enforcement counters —
+    /// [`set_limits`](Self::set_limits) applies them post-build (the
+    /// `set_permission` precedent). All-`None` (the default) makes
+    /// every check a no-op.
+    pub(crate) limiter: std::sync::Mutex<SessionLimiter>,
+    /// The agent's own workflow — held as the kernel-neutral handle (2b.3):
+    /// the loop never names the app workflow type, and every consult rides
+    /// the trait's opaque representations (the state token, the completion
+    /// flag, the plan scope, the tool-filter envelope). The app side
+    /// recovers the concrete lockable Arc through `as_any_arc`.
+    pub(crate) workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The path sandbox — used by the approval gate to determine whether a
     /// tool call is project-scoped (for `AutoApproveProject` mode). Each
     /// agent shares the same sandbox (it's immutable after construction).
@@ -189,6 +281,21 @@ pub struct AgentLoop {
     /// `None` until the factory assigns it at build time (and for tests that
     /// construct a loop directly without an id).
     pub(crate) agent_id: std::sync::Mutex<Option<crate::runtime::AgentId>>,
+    /// The live event fan-in route (§5.7, job 3b.4): a clone of the agent
+    /// task's own fan-in sender, injected by `AgentTask::run` on entry — the
+    /// ONE task body every spawn path (GUI, console, headless host, tests)
+    /// funnels through. Lets the loop's SYNC persistence methods
+    /// (`record_spend_row` / `record_savings_event` in turn.rs) fan the live
+    /// `Spend` / `Savings` events from exactly the points where their ledger
+    /// rows persist, without threading a sender parameter through every
+    /// helper (the async turn paths carry `fanin_tx` as a parameter
+    /// instead). `None` for directly-built test loops that no runtime task
+    /// drives — the live events then simply don't fan (the store writes are
+    /// unaffected). The routing id comes from
+    /// [`agent_id`](Self::agent_id), so the emission always carries the
+    /// loop's own id.
+    pub(crate) event_fanin:
+        std::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>>>,
     /// Whether plan-mutation tools are allowed on this agent's workflow.
     /// False for sub-agents spawned via the tool (Phase 4 policy). Used both
     /// to filter schemas (so the model is not offered the tools) and as a
@@ -254,8 +361,7 @@ pub struct AgentLoop {
     /// global factory swap (plain [`set_provider`](Self::set_provider) must
     /// not silently undo an explicit per-agent choice) — but see
     /// [`pinned_state`](Self::pinned_state) for where it yields.
-    pub(crate) explicit_provider:
-        Arc<RwLock<Option<(Arc<dyn LlmClient>, super::context::ContextManager)>>>,
+    pub(crate) explicit_provider: ExplicitProvider,
     /// The workflow state the picker pin was first SERVED in — the pin's
     /// scope. Lazily stamped by [`resolve_turn_provider`](Self::resolve_turn_provider)
     /// (the pin exists the moment the picker acts; the state is recorded at
@@ -269,7 +375,15 @@ pub struct AgentLoop {
     /// pick re-stamps on its first serve; the pending-swap completion path
     /// in `run_turn` writes `explicit_provider` directly and intentionally
     /// leaves the stamp alone (same pick, completing).
-    pub(crate) pinned_state: std::sync::Mutex<Option<crate::workflow::WorkflowState>>,
+    /// The state the explicit picker was first served in (2a.6), held as
+    /// the handle's state TOKEN since 2b.3 — the opaque representation the
+    /// trait hands out; the comparison semantics are unchanged (hold in the
+    /// stamped state, cede on a state change with a configured slot). Reset
+    /// to `None` by [`set_explicit_provider`](Self::set_explicit_provider)
+    /// so a fresh pick re-stamps on its first serve; the pending-swap
+    /// completion path in `run_turn` writes `explicit_provider` directly and
+    /// intentionally leaves the stamp alone (same pick, completing).
+    pub(crate) pinned_state: std::sync::Mutex<Option<String>>,
     /// Endpoint stickiness recorded by the automatic 429 fallback
     /// ([`try_429_fallback`](Self::try_429_fallback)): model id →
     /// (the endpoint that 429'd, an alternate ModelRef serving the same model
@@ -338,8 +452,7 @@ pub struct AgentLoop {
     /// ([`seed_served_effective_if_empty`](Self::seed_served_effective_if_empty))
     /// so the first request does not re-announce what `list_agents` already
     /// reports.
-    pub(crate) served_effective:
-        std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>,
+    pub(crate) served_effective: ServedEffective,
     /// The DISPLAY-space effort of the DEFAULT provider slot — set by the
     /// factory at construction (from the default `ModelRef`), by `set_model`
     /// swaps, and by Settings saves that rebuild the default. `None` when
@@ -454,6 +567,11 @@ pub struct AgentLoop {
     /// that writes the row; overwritten each iteration, so a request that
     /// never reports usage cannot mis-attribute the next one.
     pub(crate) spend_attribution: std::sync::Mutex<Option<budget::SpendAttribution>>,
+    /// The kernel→app policy seam (2a.2): the free agent by default
+    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)); the factory attaches the
+    /// app's WorkflowPolicy for the workflow agent. Nothing consults it until
+    /// 2a.3+.
+    pub(crate) policy: std::sync::RwLock<Arc<dyn crate::agent::policy::AgentPolicy>>,
 }
 
 /// Holds either a live, mtime-checked constitution source or a static value.
@@ -478,7 +596,13 @@ impl ConstitutionHolder {
     /// so caching it avoids a few-KB string concatenation every turn. For
     /// `Static` (tests), the head is rebuilt every call (tests don't need the
     /// cache and value the simplicity).
-    pub(crate) fn stable_head(&self) -> String {
+    ///
+    /// `policy` supplies the head (2a.4 + 2c.1/G1): the factory-attached
+    /// `WorkflowPolicy` produces today's bytes
+    /// (`assemble_stable_head(&KernelPromptBlocks::workflow(), …)`), while
+    /// `NoPolicy` composes the free head from its caller's `PromptSpec`
+    /// (whose constitution mode filters the loaded sources).
+    pub(crate) fn stable_head(&self, policy: &dyn crate::agent::policy::AgentPolicy) -> String {
         match self {
             ConstitutionHolder::Source {
                 source,
@@ -488,7 +612,10 @@ impl ConstitutionHolder {
                 let changed = src.reload_if_changed();
                 let mut cache = cached_head.lock().expect("head cache lock poisoned");
                 if changed || cache.is_none() {
-                    let head = super::prompt::build_stable_head(src.constitution());
+                    let head = policy.stable_head(
+                        &super::policy::KernelPromptBlocks::workflow(),
+                        src.constitution(),
+                    );
                     *cache = Some(head.clone());
                     head
                 } else {
@@ -497,7 +624,9 @@ impl ConstitutionHolder {
                         .expect("head cache invariant: Some after is_none check")
                 }
             }
-            ConstitutionHolder::Static(c) => super::prompt::build_stable_head(c),
+            ConstitutionHolder::Static(c) => {
+                policy.stable_head(&super::policy::KernelPromptBlocks::workflow(), c)
+            }
         }
     }
 }
@@ -592,6 +721,9 @@ impl StopReason {
     pub fn fold(current: &mut Option<StopReason>, cmd: crate::runtime::AgentCommand) {
         use crate::runtime::AgentCommand as C;
         match cmd {
+            // G5 (3a.6): the export is a pure side-channel read — never a
+            // steer; the fold leaves any current stop reason untouched.
+            C::ExportHistory { .. } => {}
             // Both steer-carrying commands normalize to their payload — a
             // Prompt folded mid-stream rides the same steer pipeline, so its
             // images must ride along too (previously the fold discarded them
@@ -765,8 +897,9 @@ pub struct AgentLoopConfig {
     pub provider: Arc<dyn LlmClient>,
     /// The tool registry (shared, immutable after construction).
     pub tools: Arc<ToolRegistry>,
-    /// The workflow state machine (shared across agents).
-    pub workflow: Arc<tokio::sync::Mutex<crate::workflow::Workflow>>,
+    /// The workflow handle (kernel-neutral since 2b.3 — the state machine
+    /// lives app-side behind the trait).
+    pub workflow: Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle>,
     /// The project sandbox (root dir + path validation).
     pub sandbox: Arc<Sandbox>,
     /// The initial safety mode (also wired as a shared handle).
@@ -804,6 +937,86 @@ impl AgentLoop {
         )
     }
 
+    /// Wire the FACTORY's steering counters (2c.4/G4) into this loop so
+    /// every loop the same factory builds reports to one instance-scoped
+    /// set — the replacement for the deleted process-wide
+    /// `SteeringStats::shared()` singleton.
+    pub fn with_steering(
+        mut self,
+        steering: Arc<crate::agent::steering_stats::SteeringStats>,
+    ) -> Self {
+        self.steering = steering;
+        self
+    }
+
+    /// Set the approval policy (2c.5, §5.4). The factory wires
+    /// `ApproveViaApi` for GUI/console loops (today's semantics); the
+    /// kernel default (`OverridePermissions`) is the free agent's.
+    /// 3a.5: the field is RwLock-backed so a BUILT loop can swap it
+    /// ([`AgentLoop::set_permission`]) — the same live-swap shape as
+    /// `set_provider`.
+    pub fn with_permission(
+        mut self,
+        permission: crate::agent::policy::PermissionPolicy,
+    ) -> Self {
+        self.permission = std::sync::RwLock::new(permission);
+        self
+    }
+
+    /// The current approval policy (2c.5 → 3a.5: read through the lock —
+    /// the engine's per-session spawn may have swapped it post-build).
+    pub fn permission(&self) -> crate::agent::policy::PermissionPolicy {
+        self.permission
+            .read()
+            .expect("permission lock poisoned")
+            .clone()
+    }
+
+    /// Set the approval policy on a built loop — the 3a.5 Engine's
+    /// spawn path (`spawn_agent_shared`) applies the per-session
+    /// override after the factory build.
+    pub fn set_permission(&self, permission: crate::agent::policy::PermissionPolicy) {
+        *self.permission.write().expect("permission lock poisoned") = permission;
+    }
+
+    /// Set the session limits on a built loop (G7, §5.9.7) — the 3a
+    /// Engine's spawn path applies the per-session limits after the
+    /// factory build (the `set_permission` precedent). Resets the
+    /// counters + starts the wall-clock epoch; `Default` limits (all
+    /// `None`) disable enforcement.
+    pub fn set_limits(&self, limits: crate::runtime::channels::SessionLimits) {
+        self.limiter
+            .lock()
+            .expect("limiter lock poisoned")
+            .apply(limits);
+    }
+
+    /// Inject the live fan-in route (§5.7, job 3b.4) — called by the agent
+    /// task on entry (`AgentTask::run`, runtime/agent.rs), the ONE task body
+    /// every spawn path funnels through, so the sync persistence methods'
+    /// live `Savings`/`Spend` emissions ride this same task's fan-in
+    /// sender. Mirrors the other post-build setters (`set_limits`,
+    /// `set_permission`): the sender is minted per spawn, so it cannot
+    /// flow through the constructor.
+    pub(crate) fn set_event_fanin(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>,
+    ) {
+        *self.event_fanin.lock().expect("event_fanin lock poisoned") = Some(tx);
+    }
+
+    /// The live fan-in sender (3c/G6 tier 3): the external policy's hook
+    /// emission path — `None` only before the agent task runs (the
+    /// sender is minted per spawn) or after the task is gone.
+    pub(crate) fn event_fanin_sender(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::runtime::channels::FaninItem>> {
+        self.event_fanin
+            .lock()
+            .expect("event_fanin lock poisoned")
+            .clone()
+    }
+
     /// Shared constructor body for [`new`] and [`with_constitution_source`].
     fn from_config(config: AgentLoopConfig, constitution: ConstitutionHolder) -> Self {
         let AgentLoopConfig {
@@ -827,6 +1040,13 @@ impl AgentLoop {
             )),
             compaction_raise,
             live_token_count: std::sync::atomic::AtomicUsize::new(0),
+            steering: Arc::new(crate::agent::steering_stats::SteeringStats::new()),
+            permission: std::sync::RwLock::new(
+                crate::agent::policy::PermissionPolicy::ApproveViaApi {
+                    safety_mode,
+                },
+            ),
+            limiter: std::sync::Mutex::new(SessionLimiter::unlimited()),
             tools,
             workflow,
             sandbox,
@@ -839,6 +1059,7 @@ impl AgentLoop {
             vision,
             session: SessionState::new(),
             agent_id: std::sync::Mutex::new(None),
+            event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
             model_resolver: None,
             is_subagent: std::sync::Mutex::new(false),
@@ -873,6 +1094,12 @@ impl AgentLoop {
             plan_spend: std::sync::Mutex::new(budget::PlanSpend::default()),
             pending_lane_retry: std::sync::atomic::AtomicBool::new(false),
             spend_attribution: std::sync::Mutex::new(None),
+            // 2c.1/G1: the bare-loop default carries the kernel's EXPLICIT
+            // coding default (never a silent assembly; the factory may
+            // overwrite via set_policy).
+            policy: std::sync::RwLock::new(Arc::new(
+                crate::agent::policy::NoPolicy::with_coding_default(),
+            )),
         }
     }
 
@@ -1506,13 +1733,11 @@ impl AgentLoop {
     /// This variant threads no routing decision; use
     /// [`resolve_turn_provider_routed`](Self::resolve_turn_provider_routed)
     /// for the turn's pre-prompt routing arm (backlog 091e694d).
-    pub(crate) fn resolve_turn_provider(
+    pub(crate) async fn resolve_turn_provider(
         &self,
-        workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
-        plan_kind: Option<crate::workflow::PlanKind>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
-        self.resolve_turn_provider_routed(workflow_state, skill_name, plan_kind, None)
+        self.resolve_turn_provider_routed(skill_name, None).await
     }
 
     /// [`resolve_turn_provider`](Self::resolve_turn_provider) with the turn's
@@ -1525,11 +1750,9 @@ impl AgentLoop {
     /// target that is unset, dangling, or refused by
     /// [`resolve_routed`](crate::model_resolver::ModelResolver::resolve_routed)
     /// falls through to that chain, unchanged.
-    pub(crate) fn resolve_turn_provider_routed(
+    pub(crate) async fn resolve_turn_provider_routed(
         &self,
-        workflow_state: crate::workflow::WorkflowState,
         skill_name: Option<&str>,
-        plan_kind: Option<crate::workflow::PlanKind>,
         route: Option<model_routing::RouteTarget>,
     ) -> Option<(Arc<dyn LlmClient>, super::context::ContextManager)> {
         // 1. Configured skill override beats everything — including the
@@ -1544,15 +1767,17 @@ impl AgentLoop {
         // slot can fire in that context. That keeps pin > subagent/state.
         if let Some(name) = skill_name {
             if let Some(resolver) = self.model_resolver.as_ref() {
-                let skill_only = crate::model_resolver::ModelContext::new(
-                    crate::workflow::WorkflowState::Skill,
-                    Some(name),
-                    false,
-                    // The skill arm is skill-slot-only: only the skill slot
-                    // can fire in this probe context, so the plan kind is
-                    // deliberately not engaged here.
-                    None,
-                );
+                // The skill arm is skill-slot-only: only the skill slot can
+                // fire in this probe context. 2b.3: the probe key builds
+                // kernel-side from plain strings — the slot encoding is
+                // `skill:{name}` and the Skill state carries no state slot
+                // (build_route_key's arm, mirrored here byte-exactly).
+                let skill_only = crate::model_resolver::ModelContext {
+                    route: crate::agent::policy::RouteKey {
+                        slots: vec![format!("skill:{name}")],
+                    },
+                    is_subagent: false,
+                };
                 if let Some(model_ref) = resolver.resolve(skill_only) {
                     // 429 endpoint stickiness reroutes the same model id to
                     // its recorded alternate endpoint; the skill model
@@ -1604,11 +1829,17 @@ impl AgentLoop {
             // itself resolves None, so a pin survives unconfigured skill
             // turns exactly as before).
             let pin_holds = {
+                // 2b.3: the state rides the handle's token; the "is the
+                // state configured?" check rides the policy's live route
+                // consult (the state/skill/kind derivation lives app-side).
+                let current_state_token = self.workflow.state().await;
+                let live_route = self.policy().route().await;
                 let mut stamp = self
                     .pinned_state
                     .lock()
                     .expect("pinned_state lock poisoned");
-                match *stamp {
+                let stamped_now = stamp.clone();
+                match stamped_now.as_deref() {
                     None => {
                         // First serve of this pin — it belongs to the state
                         // of the turn that first serves it (normally the
@@ -1618,21 +1849,19 @@ impl AgentLoop {
                         // e.g. pick in Planning, then `create_plan` flips to
                         // Executing before the next turn: the first serve
                         // stamps Executing, not the pick-time state.
-                        *stamp = Some(workflow_state);
+                        *stamp = Some(current_state_token);
                         true
                     }
-                    Some(stamped) if stamped == workflow_state => true,
+                    Some(stamped) if stamped == current_state_token => true,
                     Some(_) => self
                         .model_resolver
                         .as_ref()
                         .map(|resolver| {
                             resolver
-                                .resolve(crate::model_resolver::ModelContext::new(
-                                    workflow_state,
-                                    skill_name,
-                                    self.is_subagent(),
-                                    plan_kind,
-                                ))
+                                .resolve(crate::model_resolver::ModelContext {
+                                    route: live_route.clone(),
+                                    is_subagent: self.is_subagent(),
+                                })
                                 .is_none()
                         })
                         // No resolver attached → nothing is ever configured
@@ -1720,12 +1949,12 @@ impl AgentLoop {
         // fire cannot smuggle routing past an explicit choice. Unset, dangling
         // or refused -> `None` -> the chain below runs exactly as before.
         if let Some(target) = route {
-            let ctx = crate::model_resolver::ModelContext::new(
-                workflow_state,
-                skill_name,
+            // 2b.3: the live route comes from the policy consult — the
+            // state/skill/kind derivation lives app-side.
+            let ctx = crate::model_resolver::ModelContext {
+                route: self.policy().route().await,
                 is_subagent,
-                plan_kind,
-            );
+            };
             if let Some(model_ref) = resolver.resolve_routed(target, ctx) {
                 // Same endpoint stickiness as every other arm: a recorded 429
                 // fallback reroutes the ENDPOINT of this model, never the
@@ -1744,12 +1973,10 @@ impl AgentLoop {
                 return built;
             }
         }
-        let model_ref = resolver.resolve(crate::model_resolver::ModelContext::new(
-            workflow_state,
-            skill_name,
+        let model_ref = resolver.resolve(crate::model_resolver::ModelContext {
+            route: self.policy().route().await,
             is_subagent,
-            plan_kind,
-        ));
+        });
         let Some(model_ref) = model_ref else {
             // No override resolved for this context — default provider,
             // unless 429 endpoint stickiness reroutes the default model to
@@ -2383,46 +2610,41 @@ impl AgentLoop {
     /// read a specific agent's plan via `get_workflow_state(agent_id)`. Each
     /// agent owns its own `Workflow` (built by the `AgentLoopFactory`), so
     /// this is per-agent, not shared.
-    pub fn workflow_handle(&self) -> Arc<tokio::sync::Mutex<crate::workflow::Workflow>> {
+    pub fn workflow_handle(
+        &self,
+    ) -> Arc<dyn crate::agent::workflow_handle::AgentWorkflowHandle> {
         Arc::clone(&self.workflow)
     }
 
-    /// Whether the workflow is in a state where the plan loop expects the
-    /// agent to keep making progress — Executing (an in-progress plan with
-    /// steps still to complete) or Reviewing (the closing sequence: review →
-    /// fix → commit → finish). Used by the auto-continue logic in
-    /// `run_turn_with_retry` to decide whether to push a synthetic "continue"
-    /// message after a normal turn end (Finish::Stop) instead of parking for
-    /// user input. Reviewing must self-resume too: a turn that ends
-    /// mid-closing-sequence there used to park until the user typed "c"
-    /// (observed live 2026-12-31, twice — the agent stalled after a garbled
-    /// tool result and waited for a manual nudge). Planning additionally
-    /// expects progress when `unattended` is true (a run-all dispatched
-    /// agent — its Prompt embedded the unattended preamble): a premature
-    /// turn end mid-exploration would otherwise park with nobody watching
-    /// and halt the whole run (backlog a6a7727a, live 2027-01-07).
-    /// Interactive Planning still parks — a deliberate turn end there is
-    /// usually a question-wait for the user, and a synthetic continue
-    /// would self-answer it. Any other state (Complete, Skill, Subagent)
-    /// is terminal/overlay/role — no synthetic turns there. Subagent in
-    /// particular is a parented sub-agent's role state, never a
-    /// plan-lifecycle phase, so it can never expect progress on its own.
-    pub async fn workflow_expects_progress(&self, unattended: bool) -> bool {
-        let wf = self.workflow.lock().await;
-        let state = wf.state();
-        matches!(
-            state,
-            crate::workflow::WorkflowState::Executing | crate::workflow::WorkflowState::Reviewing
-        ) || (unattended && state == crate::workflow::WorkflowState::Planning)
+    /// The agent's policy handle (2a.2) — the free agent
+    /// ([`NoPolicy`](crate::agent::policy::NoPolicy)) by default; the
+    /// factory attaches the workflow agent's WorkflowPolicy (app-side).
+    /// Interior-mutable since 3c (mirroring `permission`): the engine
+    /// layers policies post-build, before the first prompt.
+    pub fn policy(&self) -> Arc<dyn crate::agent::policy::AgentPolicy> {
+        Arc::clone(&self.policy.read().expect("policy lock poisoned"))
     }
+
+    /// Attach (or replace) the agent's policy — used by the factory at
+    /// build time (2a.2), later by the engine/session builders (3a), and
+    /// since 3c by the engine's tier-3 wrap: the layer is swapped in
+    /// POST-build, before the first prompt consults it (nothing reads the
+    /// policy between the build and the first turn). `&self` +
+    /// interior mutability (like `set_permission`) so an `Arc`-wrapped
+    /// loop can be re-pointed.
+    pub fn set_policy(&self, policy: Arc<dyn crate::agent::policy::AgentPolicy>) {
+        *self.policy.write().expect("policy lock poisoned") = policy;
+    }
+
 
     /// The workflow state as a short evidence label (e.g. "Reviewing") —
     /// carried by [`crate::runtime::channels::AgentEvent::Parked`] so the
     /// watchdog ring and the UI can see the pre-stall state without
     /// re-deriving it.
     pub async fn workflow_state_label(&self) -> String {
-        let wf = self.workflow.lock().await;
-        format!("{:?}", wf.state())
+        // The Parked label keeps the pre-2b.3 Debug shape (first letter
+        // capitalized); the token underneath is the serde shape.
+        crate::agent::workflow_handle::capitalize_token(&self.workflow.state().await)
     }
 
     /// Whether this agent has spawned background agents (reviewers, parallel
@@ -2753,9 +2975,11 @@ mod tests {
         };
 
         // First call builds and caches the head.
-        let head1 = holder.stable_head();
+        let head1 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         // Second call with no file change returns the cached head (identical).
-        let head2 = holder.stable_head();
+        let head2 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         assert_eq!(
             head1, head2,
             "head must be cached across calls when constitution unchanged"
@@ -2772,7 +2996,8 @@ mod tests {
         }
 
         // Third call rebuilds because the constitution changed.
-        let head3 = holder.stable_head();
+        let head3 =
+            holder.stable_head(&crate::agent::policy::NoPolicy::with_coding_default());
         assert_ne!(head3, head1, "head must rebuild when constitution changes");
     }
 }

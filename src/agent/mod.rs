@@ -31,12 +31,18 @@
 //! - [`reflex`] — the Laya classifier's compound REFLEX decision layer (one
 //!   typed complexity/action/risk decision per systemone request,
 //!   confidence-gated, plus the shadow training log).
+//! - [`ask_user_args`] — the `ask_user` argument parse (kernel-owned, 2b.3:
+//!   dispatch parses without importing the app's tool module; the app's
+//!   `AskUserTool` reads it back, app→kernel).
 //! - [`approval`] / [`context`] / [`factory`] / [`prompt`] — pre-existing
 //!   submodules (unchanged by the split).
+//! - [`policy`] — the kernel→app policy seam ([`AgentPolicy`], the
+//!   supporting types, [`NoPolicy`]); added by job 2a, nothing routed yet.
 //!
 //! The loop's tests live in [`tests`] (a `#[cfg(test)]`-only submodule).
 
 pub mod approval;
+pub mod ask_user_args; // 2b.3: the kernel-owned ask_user arg parse
 pub mod budget;
 pub mod optimizer;
 pub mod context;
@@ -45,11 +51,13 @@ pub mod failure_triage;
 pub mod failure_triage_knn;
 pub mod model_routing;
 pub mod prompt;
+pub mod policy;
 pub mod reflex;
 pub mod review_scope;
 pub mod steering_stats;
 pub mod step_lanes;
 pub mod step_verify;
+pub mod workflow_handle; // 2b.3: the kernel-neutral workflow handle
 
 mod dispatch;
 mod loop_impl;

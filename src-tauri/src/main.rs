@@ -12,25 +12,15 @@
 
 use std::sync::{Arc, RwLock};
 
-use mnemo::agent::context::ContextManager;
-use mnemo::agent::factory::AgentLoopFactory;
 use mnemo::config::{global_config_dir, Config, SafetyMode};
-use mnemo::memory::embedder::HashEmbedder;
-use mnemo::memory::MemoryStore;
-use mnemo::project::Project;
-use mnemo::provider::client_factory::{
-    build_client, build_embedder, build_vision_client, embedder_startup_plan,
-    EmbedderStartupPlan,
-};
-use mnemo::provider::openai::{OpenAiClient, OpenAiClientConfig};
+use mnemo::app::project::Project;
 use mnemo::provider::trace::LlmRequestLog;
-use mnemo::provider::{LlmClient, ProviderKind};
-use mnemo::runtime::AgentManager;
-use mnemo::safety_rules::SafetyRules;
+use mnemo::AgentManager;
 use mnemo::tool::agent::sandbox::Sandbox;
 use tauri::{Emitter, Manager, PhysicalPosition, WebviewBuilder, WebviewUrl, WindowBuilder};
 
 mod console;
+mod instance_marker;
 mod ipc;
 mod startup;
 mod watchdog;
@@ -39,6 +29,8 @@ mod webview_udf;
 use ipc::IpcState;
 use ipc::PendingApprovals;
 use ipc::PendingQuestions;
+pub(crate) use mnemo::brain::{build_brain, Brain, BrainOutcome};
+use mnemo::notifier::{HostEvent, HostNotifier};
 
 /// Read just the `enable_browser_inspection` flag from `config.toml`, without
 /// loading the full [`Config`] (which reads four files). Used at the very top
@@ -52,6 +44,86 @@ fn browser_inspection_enabled() -> bool {
     mnemo::config::GeneralConfig::load_or_default(&path)
         .map(|c| c.general.enable_browser_inspection)
         .unwrap_or(false)
+}
+
+/// Forwards the brain's background events to the webview, on the channels
+/// the frontend already listens on (unchanged payloads).
+struct TauriNotifier(tauri::AppHandle);
+
+impl HostNotifier for TauriNotifier {
+    fn notify(&self, event: HostEvent) {
+        match event {
+            HostEvent::Reconcile(ev) => {
+                let _ = self.0.emit(ipc::memory_maintenance::RECONCILE_CHANNEL, &ev);
+            }
+            HostEvent::IndexProgress(ev) => {
+                ipc::codegraph_cmds::emit_index_progress(&self.0, &ev);
+            }
+            HostEvent::EmbedderStatus(status) => {
+                // 3b.3 (§5.1): the embedder://status channel —
+                // payload-identical to the app's own emissions from the
+                // IPC load paths (the settings UI's listener). Today
+                // only the headless Engine's startup path notifies this
+                // variant; the app's load paths emit directly.
+                let _ = self.0.emit("embedder://status", &status);
+            }
+        }
+    }
+}
+
+/// The managed Laya classifier is app-owned (its runtime talks to the
+/// webview), so the kernel brain leaves the classifier slot empty and this
+/// fills it before the first agent spawns. The body is the block that used
+/// to live in `build_brain_inner`, unchanged.
+pub(crate) fn attach_laya(
+    brain: &Brain,
+    laya_cfg: &mnemo::config::LayaConfig,
+) -> (Arc<ipc::laya::LayaManager>, Option<(String, u16)>) {
+    let classifier_status = brain.classifier_status.clone();
+    let laya = Arc::new(ipc::laya::LayaManager::new(classifier_status.clone()));
+
+    // Laya is managed-only (the external-endpoint mode is gone): the app owns
+    // the runtime. When enabled + the English checkpoint is installed, the
+    // classifier client points at the loopback sidecar the startup hook
+    // spawns right after this (status Starting until the probe answers).
+    // Enabled but not installed ⇒ a hint is logged and no client exists (the
+    // Settings → Classifier setup completes it; `laya_setup` then starts the
+    // server and swaps the client in).
+    let mut pending_laya_start = None;
+    let classifier = if laya_cfg.enabled {
+        let checkpoint = ipc::laya::english_checkpoint();
+        if laya.is_checkpoint_installed(checkpoint.id) {
+            match ipc::laya::LayaManager::alloc_free_port() {
+                Some(port) => {
+                    pending_laya_start = Some((checkpoint.id.to_string(), port));
+                    *classifier_status.write().expect("classifier status lock poisoned") =
+                        mnemo::memory::classifier::ClassifierStatus::Starting;
+                    ipc::laya::build_managed_classifier(port, classifier_status.clone())
+                }
+                None => {
+                    eprintln!(
+                        "warning: no free loopback port for the managed laya-serve; \
+                         the classifier stays disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            eprintln!(
+                "info: [general.laya] is enabled but the '{}' checkpoint is not \
+                 downloaded — run the setup in Settings → Classifier",
+                checkpoint.id
+            );
+            None
+        }
+    } else {
+        None
+    };
+    *brain
+        .classifier_slot
+        .write()
+        .expect("classifier slot lock poisoned") = classifier;
+    (laya, pending_laya_start)
 }
 
 /// Install the app-layer child-webview ensurer on a shared [`BrowserManager`]
@@ -228,7 +300,7 @@ fn main() {
             // the in-session watchdog re-sweeps periodically; see
             // `BrowserManager::sweep_orphan_profiles`. Runs on every startup
             // path, even if this session never launches a browser.
-            let _ = tauri::async_runtime::spawn_blocking(
+            tauri::async_runtime::spawn_blocking(
                 mnemo::browser::BrowserManager::sweep_orphan_profiles,
             );
 
@@ -318,7 +390,10 @@ fn main() {
             // user can fix the code and restart. This prevents the
             // chicken-and-egg problem of the app crashing when you're using it
             // to code on itself.
-            let brain_result = build_brain(Some(app.handle().clone()));
+            let brain_result = build_brain(
+                Some(Arc::new(TauriNotifier(app.handle().clone()))),
+                tauri::async_runtime::handle().inner().clone(),
+            );
 
             let pending_approvals = Arc::new(PendingApprovals::new());
             let pending_questions = Arc::new(PendingQuestions::new());
@@ -328,9 +403,7 @@ fn main() {
             // the brain result (mirroring the Err path's cwd fallback) and
             // open the store before the match.
             let backlog_root = match &brain_result {
-                Ok(BrainOutcome::Ready(brain)) => tauri::async_runtime::block_on(async {
-                    brain.project.lock().await.root.clone()
-                }),
+                Ok(BrainOutcome::Ready(brain)) => brain.workspace.root.clone(),
                 // NeedsProject + Err: no project root — fall back to cwd. The
                 // backlog store tolerates a missing path (opens empty), and on
                 // the NeedsProject path no agent can run so nothing is added.
@@ -346,7 +419,7 @@ fn main() {
             // (the marker write is `let _ =`).
             let instance_conflict: Option<ipc::startup::InstanceConflict> =
                 if matches!(&brain_result, Ok(BrainOutcome::Ready(_))) {
-                    use mnemo::instance_marker::{conflict_for, InstanceMarker};
+                    use crate::instance_marker::{conflict_for, InstanceMarker};
 
                     let conflict = conflict_for(
                         &backlog_root,
@@ -377,7 +450,7 @@ fn main() {
                 let _ = window.set_title(&startup::window_title(needs_project, &backlog_root));
             }
 
-            let backlog = Arc::new(tokio::sync::Mutex::new(mnemo::backlog::BacklogStore::open(
+            let backlog = Arc::new(tokio::sync::Mutex::new(mnemo::app::backlog::BacklogStore::open(
                 backlog_root
                     .join(Project::CODING_DIR_NAME)
                     .join("backlog.jsonl"),
@@ -385,6 +458,11 @@ fn main() {
 
             match &brain_result {
                 Ok(BrainOutcome::Ready(brain)) => {
+                    attach_child_ensurer(&brain.browser, app.handle().clone());
+                    let laya_cfg = tauri::async_runtime::block_on(async {
+                        brain.config.lock().await.general.general.laya.clone()
+                    });
+                    let (laya, pending_laya_start) = attach_laya(brain, &laya_cfg);
                     // Create the agent manager + per-agent loop map, wrapped in
                     // Arcs up front so the spawner can share them.
                     let mut mgr = AgentManager::new(256);
@@ -417,6 +495,33 @@ fn main() {
                     brain.factory.set_spawner(spawner.clone());
                     brain.factory.set_descendant_tracker(spawner);
 
+                    // Wire the app-side policy factory (2b.2; master-spec
+                    // :266-269): the app impl builds each agent's WorkflowPolicy
+                    // and registers the app-owned tools (ask_user + the backlog
+                    // trio). The backlog store + notifier live on the app factory
+                    // (the app-owned wiring) — the kernel factory only sees the
+                    // trait. Wired before the first agent build (the policy and
+                    // its tool registrations are read per build). The skill
+                    // library loads HERE (2b.3: the kernel factory's skills
+                    // surface retired — the bin loads the same
+                    // `.coding/skills/*.toml` dir the brain used to wire and
+                    // hands it to the app factory, so the skill tools and
+                    // `enter_skill`'s handle resolve app→app).
+                    let skills_dir = brain.workspace.state_dir.join("skills");
+                    let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
+                    let policy_factory = Arc::new(
+                        mnemo::app::policy_factory::WorkflowPolicyFactory::new(
+                            brain.factory.memory_handle(),
+                            brain.factory.knowledge_handle(),
+                            brain.factory.codegraph_handle(),
+                            brain.factory.reviews_dir(),
+                            Some(skills),
+                        ),
+                    );
+                    let factory_dyn: Arc<dyn mnemo::AgentPolicyFactory> =
+                        policy_factory.clone();
+                    brain.factory.set_policy_factory(factory_dyn);
+
                     // Share the ONE backlog store Arc (created above, before
                     // the match) between the IPC `backlog_*` commands
                     // (state.backlog.store) and the agent's `backlog_add`
@@ -425,7 +530,7 @@ fn main() {
                     // each other. Wired before the main agent is built (the
                     // tool is read per registry build). No backlog wiring on
                     // the NeedsProject/Err paths — no factory, no agent.
-                    brain.factory.set_backlog(Arc::clone(&backlog));
+                    policy_factory.set_backlog(Arc::clone(&backlog));
 
                     // The UI seam for agent-side adds: the library crate has
                     // no Tauri dependency, so the factory's notifier callback
@@ -446,7 +551,7 @@ fn main() {
                                 crate::ipc::backlog_cmds::emit_backlog_changed(&app, &state).await;
                             });
                         });
-                        brain.factory.set_backlog_notifier(notifier);
+                        policy_factory.set_backlog_notifier(notifier);
                     }
 
                     // Build the first ("main") agent via the factory so it gets
@@ -458,16 +563,32 @@ fn main() {
                     // (the locks are uncontended at startup).
                     tauri::async_runtime::block_on(async {
                         ipc::spawn::spawn_agent_shared(
-                            brain.factory.clone(),
-                            manager.clone(),
-                            agent_loops.clone(),
+                            ipc::spawn::SpawnHost {
+                                factory: brain.factory.clone(),
+                                manager: manager.clone(),
+                                agent_loops: agent_loops.clone(),
+                            },
                             "main".to_string(),
                             None,
                             None,
-                            None,  // no forced model — the main agent uses the default
-                            None,  // no role — the main agent is unrestricted
-                            false, // own_plans_dir — main keeps .coding/plans/
-                            None,  // no worktree binding — the main agent works the main tree
+                            ipc::spawn::SessionOptions {
+                                // no forced model — the main agent uses the default
+                                model: None,
+                                // no role — the main agent is unrestricted
+                                role: None,
+                                // own_plans_dir — main keeps .coding/plans/
+                                own_plans_dir: false,
+                                // no worktree binding — the main agent works the main tree
+                                worktree: None,
+                                // 3a.5: keep the factory build's default policy (pre-3a.5 caller)
+                                permission: None,
+                                // 3a.6 (G5): the main agent never resumes
+                                initial_messages: None,
+                                // 3a.7 (G7): the main agent sets no session limits
+                                limits: None,
+                                // 3c (G2): the main agent registers no host tools
+                                host_tools: vec![],
+                            },
                         )
                         .await
                         .expect("main agent spawn must succeed");
@@ -503,6 +624,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: Some(Arc::clone(&policy_factory)),
                         runtime: ipc::state::AgentRuntimeContext {
                             manager,
                             agent_loops,
@@ -510,7 +632,7 @@ fn main() {
                                 std::collections::HashMap::new(),
                             )),
                             factory: Some(brain.factory.clone()),
-                            memory_store: brain.memory_store.clone(),
+                            memory_store: brain.own_memory_store.clone(),
                             safety_mode: brain.safety_mode.clone(),
                             safety_rules: Some(brain.safety_rules.clone()),
                             model_resolver: Some(brain.model_resolver.clone()),
@@ -520,11 +642,13 @@ fn main() {
                             embedder_status: brain.embedder_status.clone(),
                             classifier_status: brain.classifier_status.clone(),
                             classifier: brain.classifier_slot.clone(),
-                            laya: brain.laya.clone(),
+                            laya: laya.clone(),
                             instance_conflict,
                         },
                         project: ipc::state::ProjectContext {
-                            root: brain.project.clone(),
+                            root: Arc::new(tokio::sync::Mutex::new(
+                                mnemo::app::project::Project::from_root(&brain.workspace.root),
+                            )),
                             config: brain.config.clone(),
                             sandbox: brain.sandbox.clone(),
                         },
@@ -591,7 +715,7 @@ fn main() {
                     // real embedder into the live store + re-embeds rows, so
                     // semantic recall goes live without a restart.
                     if let Some(model) = &brain.pending_model_download {
-                        if let Some(store) = &brain.memory_store {
+                        if let Some(store) = &brain.own_memory_store {
                             ipc::embeddings::spawn_startup_download(
                                 app.handle().clone(),
                                 store.clone(),
@@ -607,7 +731,7 @@ fn main() {
                     // store + re-embed rows (the same install path as the
                     // download, minus the network).
                     if let Some(model) = &brain.pending_model_load {
-                        if let Some(store) = &brain.memory_store {
+                        if let Some(store) = &brain.own_memory_store {
                             ipc::embeddings::spawn_startup_load(
                                 app.handle().clone(),
                                 store.clone(),
@@ -618,12 +742,12 @@ fn main() {
                     }
 
                     // Managed Laya: the classifier client already points at
-                    // the pre-allocated loopback port (build_brain); spawn
+                    // the pre-allocated loopback port (attach_laya); spawn
                     // the sidecar now and drive the status to Ready/Failed
                     // (progress on classifier://status).
-                    if let Some((_checkpoint_id, port)) = &brain.pending_laya_start {
+                    if let Some((_checkpoint_id, port)) = &pending_laya_start {
                         let app_handle = Some(app.handle().clone());
-                        let manager = brain.laya.clone();
+                        let manager = laya.clone();
                         let checkpoint = ipc::laya::english_checkpoint();
                         let port = *port;
                         tauri::async_runtime::spawn(async move {
@@ -646,7 +770,7 @@ fn main() {
                     // the served checkpoint. Never blocks startup.
                     ipc::finetune::spawn_startup_finetune(
                         Some(app.handle().clone()),
-                        brain.laya.clone(),
+                        laya.clone(),
                         brain.classifier_slot.clone(),
                         brain.classifier_status.clone(),
                         brain.config.clone(),
@@ -688,6 +812,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -715,9 +840,10 @@ fn main() {
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
                             // `brain_result` is matched by reference (the Ready
-                            // arm borrows `brain`), so `config` is a `&Config`
-                            // here and must be cloned — it cannot be moved out.
-                            config: Arc::new(tokio::sync::Mutex::new(config.clone())),
+                            // arm borrows `brain`), so `config` is a
+                            // `&Box<Config>` here and must be cloned through
+                            // the box — it cannot be moved out.
+                            config: Arc::new(tokio::sync::Mutex::new((**config).clone())),
                             sandbox: Arc::new(fallback_sandbox),
                         },
                         approvals: pending_approvals.clone(),
@@ -783,6 +909,7 @@ fn main() {
                     );
 
                     app.manage(IpcState {
+                        app_policy_factory: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -1004,7 +1131,7 @@ fn main() {
                     let _ = tauri::async_runtime::block_on(browser.close());
                     // Destroy the child WebView2 (drop the handle) so no native
                     // HWND leaks on exit. Mirrors the headless-browser close above.
-                    let _ = tauri::async_runtime::block_on(async move {
+                    tauri::async_runtime::block_on(async move {
                         let mut bw = browser_webview.state.lock().await;
                         // Dropping the Webview handle tears down the platform
                         // webview (wry closes the child on drop).
@@ -1032,1114 +1159,6 @@ fn main() {
                 }
             }
         });
-}
-
-/// The built brain — everything needed to run the agent.
-///
-/// `pub(crate)` (with the four fields the console runtime needs also
-/// `pub(crate)`) so `-console` mode can reuse the exact same construction
-/// path without a Tauri app: `build_brain` is AppHandle-free by design.
-pub(crate) struct Brain {
-    pub(crate) factory: Arc<AgentLoopFactory>,
-    /// Concrete memory store for runtime embedder rewire (Settings → Memory).
-    /// `pub(crate)` so console mode can start the deferred background embedder
-    /// load (the GUI's setup hook does the same; console mode has no Tauri).
-    pub(crate) memory_store: Option<Arc<MemoryStore>>,
-    pub(crate) project: Arc<tokio::sync::Mutex<Project>>,
-    pub(crate) config: Arc<tokio::sync::Mutex<Config>>,
-    sandbox: Arc<Sandbox>,
-    safety_rules: Arc<SafetyRules>,
-    safety_mode: Arc<RwLock<SafetyMode>>,
-    /// The per-context model resolver (shared with the factory). The IPC layer
-    /// pushes reloaded config into it after a Settings save so `[models]`
-    /// overrides take effect on the next request (resolution runs per request,
-    /// 2027-01-25).
-    model_resolver: Arc<mnemo::model_resolver::ConfigModelResolver>,
-    /// The shared LLM request/response trace log — wired into the default
-    /// provider + every resolver-built provider and exposed to the IPC layer
-    /// (Trace tab). One instance for the whole app.
-    pub(crate) trace: Arc<LlmRequestLog>,
-    /// The shared headless debug browser — the same `Arc` wired into the
-    /// factory (agent tools) and the IPC state (Browser tab commands).
-    pub(crate) browser: Arc<mnemo::browser::BrowserManager>,
-    /// The shared embedder status — the same `Arc` held by `IpcState`, so
-    /// the circuit breaker's transitions surface live to the UI.
-    /// `pub(crate)` so console mode can drive the deferred embedder load.
-    pub(crate) embedder_status: Arc<RwLock<mnemo::memory::embedder::EmbedderStatus>>,
-    /// The shared classifier status — the same `Arc` held by `IpcState`, so
-    /// the enabled/disabled/failed state surfaces live to Settings. `Disabled`
-    /// unless the config enables Laya.
-    pub(crate) classifier_status: Arc<RwLock<mnemo::memory::classifier::ClassifierStatus>>,
-    /// The shared classifier SLOT (the live handle, backlog a147b63c):
-    /// created in `build_brain_inner` and shared by the factory's
-    /// `memory_write` tools (call-time read) and the IPC `RuntimeState`
-    /// (rewire swaps it) — one Arc, no rebuilds. The auto-typing FLAG
-    /// mirror lives in the factory's gate handle (Settings saves flip it
-    /// via `set_auto_typing_enabled`).
-    pub(crate) classifier_slot:
-        Arc<RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>>,
-    /// The managed Laya runtime owner — the same `Arc` held by `IpcState`,
-    /// so the startup auto-start hook, the Settings rewire, and app exit
-    /// all steer one sidecar. `pub(crate)` so those paths can reach it.
-    pub(crate) laya: Arc<ipc::laya::LayaManager>,
-    /// Managed Laya start work the startup hooks owe: the checkpoint id +
-    /// the pre-allocated loopback port the classifier client was built
-    /// against. `pub(crate)` so the GUI + console hooks can spawn the
-    /// sidecar (the mirror of the deferred embedder fields above).
-    pub(crate) pending_laya_start: Option<(String, u16)>,
-    /// A configured bundled embedding model that wasn't installed at startup
-    /// (first run): the store started on the hash embedder and the setup hook
-    /// must download this model in the background, swapping it into the live
-    /// store + re-embedding rows on success.
-    pending_model_download: Option<String>,
-    /// A configured bundled embedding model that WAS installed at startup but
-    /// whose ~110 MB ONNX load was deferred off the main thread (hang
-    /// diagnostics, AppHangB1 2026-08-20): the store started on the hash
-    /// embedder and the setup hook must load the model in the background and
-    /// swap it into the live store (mirror of the download swap).
-    /// `pub(crate)` so console mode starts the same background load.
-    pub(crate) pending_model_load: Option<String>,
-    /// The CodeGraph OS file watcher — held only to keep the watch alive for
-    /// the app's lifetime (dropping it stops watching). `None` when codegraph
-    /// is disabled, failed to open, or the watcher failed to start. The field
-    /// is never read by name (it exists purely for its Drop semantics), so it
-    /// is underscore-prefixed rather than `#[allow(dead_code)]`ed.
-    _graph_watcher: Option<mnemo::codegraph::watcher::GraphWatcher>,
-}
-
-/// The outcome of [`build_brain`]: either the brain is ready to run, or no
-/// project could be resolved and the app should show the project picker.
-///
-/// `NeedsProject` carries the loaded global `Config` (so the picker can list
-/// the registered projects from `projects.toml`) without building any of the
-/// project-scoped subsystems (provider, sandbox, memory, constitution…).
-pub(crate) enum BrainOutcome {
-    /// The brain built successfully — the app runs normally.
-    Ready(Brain),
-    /// No project resolved at startup — the frontend shows the project
-    /// picker. The window is open but the agent can't run until a project is
-    /// chosen (which restarts the app into the selected project).
-    NeedsProject(Config),
-}
-
-/// Build the brain: load config, resolve project, wire provider + factory —
-/// and always report how long it took.
-///
-/// The factory holds the shared, stateless deps (provider, constitution
-/// source, memory store, sandbox, safety rules, safety mode, context manager,
-/// plans dir). Each agent — including the first "main" agent — is built via
-/// `factory.build()`, which gives it its own `Workflow` + `ToolRegistry`.
-///
-/// Returns [`BrainOutcome::NeedsProject`] when no project can be resolved
-/// (the cwd is not inside a project, no `--project` flag was given, and no
-/// pending-project marker from a prior switch is present). In that case the
-/// frontend shows the project picker instead of the normal UI.
-///
-/// `build_brain` runs on the main thread (Tauri's sync `.setup` hook) BEFORE
-/// the event loop starts pumping messages, so its duration is the app's
-/// main-thread stall at startup. The measurement is printed permanently: it is
-/// the baseline for hang diagnostics (AppHangB1, 2026-08-20) — if this number
-/// ever grows to seconds, startup work must move off the main thread.
-///
-/// First measurement (2026-08-20): **537 ms total** — under the 1 s
-/// restructure bar, and its single largest contributor (the bundled model's
-/// ~110 MB ONNX init) is already deferred off the main thread
-/// ([`EmbedderStartupPlan::UseHashThenLocalLoad`]); the rest is config load +
-/// MemoryStore open + provider/factory wiring, all sub-100 ms pieces.
-pub(crate) fn build_brain(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutcome> {
-    let started = std::time::Instant::now();
-    let outcome = build_brain_inner(app);
-    eprintln!(
-        "mnemo: build_brain took {}ms on the main thread ({})",
-        started.elapsed().as_millis(),
-        match &outcome {
-            Ok(BrainOutcome::Ready(_)) => "ready",
-            Ok(BrainOutcome::NeedsProject(_)) => "needs-project",
-            Err(_) => "error",
-        }
-    );
-    outcome
-}
-
-/// The measured body of [`build_brain`] — see its doc comment for the timing
-/// wrapper above.
-fn build_brain_inner(app: Option<tauri::AppHandle>) -> anyhow::Result<BrainOutcome> {
-    let config_dir = global_config_dir();
-    let config = Config::load(&config_dir)?;
-
-    // The shared request/response trace log — created first so every provider
-    // built below (default, dummy fallback, resolver) records into the same
-    // instance the IPC layer hands to the Trace tab.
-    let trace = Arc::new(LlmRequestLog::new());
-
-    // Resolve the project. Resolution order:
-    //   1. Pending-project marker — set by a prior `switch_project` call
-    //      right before a restart. The marker is consumed here. The path must
-    //      already be a project; if its `.coding/` is missing (e.g. the user
-    //      deleted it), fall through to the picker rather than silently
-    //      re-initializing.
-    //   2. `--project <path>` flag — CLI override. Initializes the project if
-    //      it isn't one yet (preserves the CLI workflow).
-    //   3. Auto-detect — walk up from the cwd looking for `.coding/`.
-    //   4. Otherwise — no project; return NeedsProject so the picker shows.
-    //
-    // The registry is deliberately NOT auto-picked: the picker lists its
-    // entries but never opens one without an explicit choice (per the
-    // "always show the dialog unless the cwd is a project" rule).
-    //
-    // `switched_open` records that THIS launch is the reload half of a
-    // `switch_project` (a pending-project marker was consumed and valid):
-    // the startup indexing pass uses it to skip the 1-second progress gate —
-    // the user explicitly opened this project and the UI they clicked from
-    // was just torn down for the restart, so the splash dialog must show
-    // immediately rather than after a silent second.
-    let mut switched_open = false;
-    let project: Project = if let Some(pending) = mnemo::config::take_pending_project() {
-        if pending.join(Project::CODING_DIR_NAME).is_dir() {
-            switched_open = true;
-            Project::from_root(&pending)
-        } else {
-            // Marker pointed at a non-project dir — show the picker, but say
-            // WHY on stderr so a stale marker is diagnosable (backlog
-            // 16e4a7f8: the silent fall-through re-showed the picker with no
-            // explanation).
-            eprintln!(
-                "mnemo: pending-project marker pointed at '{}' which has no .coding/ — showing the picker",
-                pending.display()
-            );
-            return Ok(BrainOutcome::NeedsProject(config));
-        }
-    } else if let Some(flagged) = startup::project_flag_from_args(std::env::args()) {
-        if flagged.join(Project::CODING_DIR_NAME).exists() {
-            Project::from_root(&flagged)
-        } else {
-            eprintln!(
-                "No project found at '{}'. Initializing...",
-                flagged.display()
-            );
-            Project::init(&flagged)?
-        }
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(found) = Project::find_coding_dir_ancestor(&cwd) {
-            Project::from_root(&found)
-        } else {
-            return Ok(BrainOutcome::NeedsProject(config));
-        }
-    };
-
-    // Tell the trace log where to mirror records when the user opts in via the
-    // Trace tab's "Log to file" checkbox. The path is configured here (where
-    // coding_dir is known) but logging stays OFF by default — writing full
-    // request/response bodies to disk is a deliberate opt-in.
-    trace.set_log_file_path(project.coding_dir.join("logs").join("traces.jsonl"));
-
-    // Always-on provider-error log: every FAILED request (HTTP >= 400,
-    // transport / stream errors) is appended as one compact JSON line to
-    // .coding/logs/provider-errors.jsonl — independent of the traces.jsonl
-    // opt-in checkbox — so provider errors are diagnosable after the fact
-    // without full trace logging.
-    trace.set_error_log_path(
-        project
-            .coding_dir
-            .join("logs")
-            .join("provider-errors.jsonl"),
-    );
-
-    // Always-on user-cancel log (F3): every request the consumer drops
-    // mid-stream (a user interrupt — the D1 classification) is appended as
-    // one compact JSON line at stamping time, so a cancel survives the trace
-    // ring's rotation. Independent of the traces.jsonl opt-in checkbox.
-    trace.set_cancels_log_path(project.coding_dir.join("logs").join("cancels.jsonl"));
-
-    // Append-only terminal-record archive (F3): every record that reaches a
-    // terminal state is appended once to .coding/logs/traces-history.jsonl
-    // (rotated at 64 MiB, keeping the 4 newest archives), so a busy turn
-    // cannot erase earlier records retrievably. Gated on the same opt-in as
-    // the mirror — full request/response bodies are sensitive.
-    trace.set_history_log_path(
-        project
-            .coding_dir
-            .join("logs")
-            .join("traces-history.jsonl"),
-    );
-
-    // Apply the in-memory trace limits from `[trace]` (Advanced settings).
-    // Clamped at config load; the fallback branches above keep the defaults
-    // baked into LlmRequestLog (16 MiB budget / 256 KiB request cap).
-    trace.set_memory_budget(config.general.trace.memory_budget_mb * 1024 * 1024);
-    trace.set_request_body_cap(config.general.trace.request_body_cap_kb * 1024);
-
-    // Build the provider.
-    let (endpoint, model) = startup::resolve_startup_provider(&config);
-
-    // The DISPLAY-space twin of the startup effort (backlog 51dab4da):
-    // recorded on the factory below so every loop it builds reports the
-    // default model's effective effort (per-model override → endpoint
-    // default → "max") from the very first turn. The dummy-provider branch
-    // bakes "max" (see its config below).
-    let startup_display_effort = match endpoint {
-        Some(ep) => ep.display_reasoning_effort_for(Some(&model)),
-        None => "max".to_string(),
-    };
-
-    let provider: Arc<dyn LlmClient> = if let Some(ep) = endpoint {
-        // The shared construction path resolves the api key (stored key →
-        // kind-appropriate env var → "dummy") and dispatches by endpoint kind
-        // (OpenAI/Local → OpenAI-compatible client, Anthropic → native
-        // Messages client), so the main provider can never drift from the
-        // vision provider or the set_model runtime swap.
-        build_client(
-            &config,
-            ep,
-            &model,
-            ep.multimodal_for(&model),
-            ep.effective_reasoning_effort_for(Some(&model)),
-            Some(trace.clone()),
-        )
-    } else {
-        eprintln!("warning: no endpoint configured; using a dummy provider");
-        Arc::new(OpenAiClient::new_with_trace(
-            OpenAiClientConfig {
-                base_url: "http://localhost/v1/".into(),
-                api_key: "dummy".into(),
-                model: model.clone(),
-                kind: ProviderKind::Local,
-                max_context: None,
-                max_output_tokens: None,
-                multimodal: false,
-                reasoning_effort: Some("max".to_string()),
-                provider: "dummy".into(),
-                use_responses_api: false,
-                ..Default::default()
-            },
-            Some(trace.clone()),
-        ))
-    };
-
-    // The path sandbox — confines file operations to the project root.
-    let sandbox = Arc::new(Sandbox::new(&project.root)?);
-
-    // Memory store — uses the bundled in-process embedder when configured
-    // (failure-protected: zero-vector fallback, never dies), or the built-in
-    // deterministic hash embedder otherwise. The shared status Arc is the
-    // same handle IpcState exposes to the UI, so circuit-breaker transitions
-    // surface live.
-    let embedder_status = Arc::new(RwLock::new(
-        mnemo::memory::embedder::EmbedderStatus::Checking,
-    ));
-    // The bundled embedding model cache lives under the global config dir
-    // (NOT .coding/, which is committed to git — model binaries are per-machine).
-    let embedder_cache_dir = config_dir.join("models");
-    // First-run plan: a configured-but-not-installed model must not block
-    // startup on its ~100 MB download — build the hash embedder now and let
-    // the setup hook download the model in the background (swapping it into
-    // the live store + re-embedding rows on success). An INSTALLED model
-    // takes the same shape (hash now + background LOCAL load + swap): its
-    // ~110 MB ONNX init is the single largest main-thread block at startup
-    // (AppHangB1 diagnostics, 2026-08-20), and the store already supports
-    // swapping a late-arriving embedder.
-    let (embedder, pending_download, pending_load) = match embedder_startup_plan(
-        config.general.general.bundled_embedding_model.as_deref(),
-        &embedder_cache_dir,
-    ) {
-        EmbedderStartupPlan::UseHashThenDownload(model) => {
-            eprintln!(
-                "info: bundled embedding model '{model}' not installed yet; starting with \
-                 the built-in hash embedder and downloading in the background"
-            );
-            // Hash now, but advertise `Checking` (not Ready): the real
-            // configured model is still pending — the download task flips
-            // the status Downloading → Ready, so the UI never shows a
-            // misleading "ready" before the progress bar.
-            *embedder_status
-                .write()
-                .expect("embedder status lock poisoned") =
-                mnemo::memory::embedder::EmbedderStatus::Checking;
-            (
-                Arc::new(HashEmbedder::new()) as Arc<dyn mnemo::memory::embedder::Embedder>,
-                Some(model),
-                None,
-            )
-        }
-        EmbedderStartupPlan::UseHashThenLocalLoad(model) => {
-            eprintln!(
-                "info: bundled embedding model '{model}' is installed; starting with the \
-                 built-in hash embedder and loading the model in the background \
-                 (keeps the ONNX load off the main thread)"
-            );
-            // Hash now, status stays `Checking` — the load task flips it to
-            // Ready on success (Failed on error), same honesty contract as
-            // the download path.
-            *embedder_status
-                .write()
-                .expect("embedder status lock poisoned") =
-                mnemo::memory::embedder::EmbedderStatus::Checking;
-            (
-                Arc::new(HashEmbedder::new()) as Arc<dyn mnemo::memory::embedder::Embedder>,
-                None,
-                Some(model),
-            )
-        }
-        // HashOptOut / HashDefault go through build_embedder (sentinel +
-        // fallback respectively — nothing to load or download).
-        _ => (
-            build_embedder(&config, &embedder_cache_dir, embedder_status.clone()),
-            None,
-            None,
-        ),
-    };
-
-    // The optional Laya classifier (opt-in; disabled by default). Built only
-    // when [general.laya] enables it — otherwise `None` with
-    // status Disabled and no HTTP client at all, so the app behaves exactly as
-    // before. Constructing the client does no I/O: startup is never blocked.
-    let classifier_status = Arc::new(RwLock::new(
-        mnemo::memory::classifier::ClassifierStatus::Disabled,
-    ));
-    // The managed-runtime owner sharing the same status — inert until the
-    // startup hook / Settings rewire enable Laya.
-    let laya = Arc::new(ipc::laya::LayaManager::new(classifier_status.clone()));
-
-    // Laya is managed-only (the external-endpoint mode is gone): the app owns
-    // the runtime. When enabled + the English checkpoint is installed, the
-    // classifier client points at the loopback sidecar the startup hook
-    // spawns right after this (status Starting until the probe answers).
-    // Enabled but not installed ⇒ a hint is logged and no client exists (the
-    // Settings → Classifier setup completes it; `laya_setup` then starts the
-    // server and swaps the client in).
-    let mut pending_laya_start = None;
-    let classifier = if config.general.general.laya.enabled {
-        let checkpoint = ipc::laya::english_checkpoint();
-        if laya.is_checkpoint_installed(checkpoint.id) {
-            match ipc::laya::LayaManager::alloc_free_port() {
-                Some(port) => {
-                    pending_laya_start = Some((checkpoint.id.to_string(), port));
-                    *classifier_status.write().expect("classifier status lock poisoned") =
-                        mnemo::memory::classifier::ClassifierStatus::Starting;
-                    ipc::laya::build_managed_classifier(port, classifier_status.clone())
-                }
-                None => {
-                    eprintln!(
-                        "warning: no free loopback port for the managed laya-serve; \
-                         the classifier stays disabled"
-                    );
-                    None
-                }
-            }
-        } else {
-            eprintln!(
-                "info: [general.laya] is enabled but the '{}' checkpoint is not \
-                 downloaded — run the setup in Settings → Classifier",
-                checkpoint.id
-            );
-            None
-        }
-    } else {
-        None
-    };
-    // The shared classifier SLOT + the auto-typing flag (backlog a147b63c):
-    // one Arc pair feeds the factory's memory_write tools (call-time read)
-    // and the IPC RuntimeState (rewire swaps the slot; Settings saves flip
-    // the flag via `set_auto_typing_enabled`).
-    let classifier_slot: Arc<
-        RwLock<Option<Arc<dyn mnemo::memory::classifier::Classifier>>>,
-    > = Arc::new(RwLock::new(classifier.clone()));
-    let auto_typing_flag = Arc::new(std::sync::atomic::AtomicBool::new(
-        config.general.general.laya.auto_type_memories,
-    ));
-    // The tool-choice flag (backlog e2c47d5f): the SAME classifier slot feeds
-    // the search/search_read tools; Settings saves flip this flag via
-    // `set_tool_choice_enabled`.
-    let tool_choice_flag = Arc::new(std::sync::atomic::AtomicBool::new(
-        config.general.general.laya.steer_tool_choice,
-    ));
-    let store = match MemoryStore::open(&project.memory_db, embedder) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("warning: failed to open memory store: {e}; using in-memory");
-            Arc::new(MemoryStore::open_in_memory(Arc::new(HashEmbedder::new())).unwrap())
-        }
-    };
-    let store_trait: Arc<dyn mnemo::memory::MemoryStoreTrait> = store.clone();
-
-    // The failure-triage gate (backlog 1a4049c1): the SAME shared classifier
-    // slot plus the `[general.laya] failure_triage` flag mirror. The factory
-    // hands it to every loop it builds; the loop's dispatch site and both
-    // provider retry layers read both at failure time, and a Settings save
-    // flips the flag via `set_failure_triage_enabled` (no rebuild).
-    //
-    // The opt-in kNN overlay (item 4b, `failure_triage_knn`): a local
-    // classifier over the failure-triage training log, consulted by the
-    // gate BEFORE the shared slot while its flag is on. Its embedder
-    // getter reads the store's LIVE shared embedder slot per
-    // classification (a background bundled-model load or a
-    // Settings-driven embedder swap flows in — the index re-embeds on
-    // the model-id change), and its index tracks the training-log FILE,
-    // so dispositions appended by any writer are picked up on the next
-    // classification — genuinely online, no retraining, no `laya-serve`.
-    // Lazy by construction: with the flag off nothing is ever read or
-    // embedded. Constructed AFTER the store so the getter can capture a
-    // store clone.
-    let store_for_knn = store.clone();
-    let failure_triage_handle = mnemo::agent::failure_triage::FailureTriageHandle::new(
-        classifier_slot.clone(),
-        Arc::new(std::sync::atomic::AtomicBool::new(
-            config.general.general.laya.failure_triage,
-        )),
-    )
-    .with_knn(
-        Arc::new(mnemo::agent::failure_triage_knn::KnnClassifier::new(
-            Arc::new(move || store_for_knn.embedder_handle()),
-            mnemo::agent::failure_triage::training_log_path(),
-        )),
-        config.general.general.laya.failure_triage_knn,
-    );
-
-    // The pre-prompt routing gate (backlog 091e694d): the SAME shared
-    // classifier slot. The `[general.laya] routing` opt-in and the
-    // `[general.routing]` threshold / enforce are read from the live config
-    // by the model resolver per turn, so this gate carries no flag mirror and
-    // a Settings save needs no rewire.
-    let routing_gate = mnemo::agent::model_routing::RoutingGate::new(classifier_slot.clone());
-
-    // The compound-reflex handle (backlog a8495cc1) -- the escalation lane
-    // ladder's classifier (backlog ad56c7bd): the SAME shared classifier slot
-    // plus the `[general.laya] reflex` flag mirror, read at every plan-step
-    // boundary. A Settings save flips the flag live via `set_reflex_enabled`
-    // (no rebuild); the `[general.routing]` lane targets ride the live config
-    // the resolver reads per request.
-    let reflex_handle = mnemo::agent::reflex::ReflexHandle::new(
-        classifier_slot.clone(),
-        Arc::new(std::sync::atomic::AtomicBool::new(
-            config.general.general.laya.reflex,
-        )),
-    );
-
-    // Install the [memory] retrieval knobs (decay, caps, digest budgets) from
-    // the loaded config — recall + memory_write read the store's snapshot per
-    // call. Settings saves update it via rewire_vision_embedder_and_classifier.
-    store.set_memory_search_config(config.general.memory.clone());
-
-    // Startup reconciliation: check whether the semantic DB matches the
-    // on-disk truth (plans, reviews, knowledge records, backlog) and rebuild
-    // the derived index when it drifted. The staleness pre-check is cheap
-    // (content hashes vs the state table) and keeps the run SILENT when
-    // nothing changed — events + the progress dialog fire only when the
-    // corpus actually differs (a git merge landed, a record was edited, or
-    // memory.db was deleted and must be rebuilt from the files — the
-    // delete-to-rebuild recovery path). Runs in the background so startup
-    // never waits on it; the frontend shows the wait dialog while the
-    // `memory://reconcile` events stream.
-    //
-    // The maintenance busy guard is claimed for the run (review LOW 3): a
-    // manual "Rebuild derived index" clicked while the reconcile is mid-run
-    // must not interleave delete_derived + index_state_clear with reconcile
-    // writes — the guard serializes them (the manual command errors with
-    // "already running" instead of corrupting the state table).
-    {
-        let app_handle = app.clone();
-        let store_for_index = store.clone();
-        let plans_dir = project.plans_dir.clone();
-        let backlog_path = project.coding_dir.join("backlog.jsonl");
-        tauri::async_runtime::spawn(async move {
-            // Console mode (no app handle) has no frontend to notify — the
-            // reconcile still runs, but silently (the events are dropped).
-            let Some(app_handle) = app_handle else {
-                let guard = match ipc::memory_maintenance::claim_busy() {
-                    Ok(()) => Some(ipc::memory_maintenance::BusyGuard),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: derived-index reconcile skipped (maintenance busy): {}",
-                            e.message
-                        );
-                        None
-                    }
-                };
-                let Some(_guard) = guard else { return };
-                let noop = |_: usize, _: usize| {};
-                if let Err(e) = mnemo::memory::indexer::index_derived(
-                    store_for_index.as_ref(),
-                    &plans_dir,
-                    &backlog_path,
-                    &noop,
-                )
-                .await
-                {
-                    eprintln!("warning: derived-index reconcile failed: {e}");
-                }
-                return;
-            };
-            // Claim the single-op guard; skip (with a log) when a manual
-            // maintenance op is already running — the manual op will index
-            // the corpus anyway.
-            let guard = match ipc::memory_maintenance::claim_busy() {
-                Ok(()) => Some(ipc::memory_maintenance::BusyGuard),
-                Err(e) => {
-                    eprintln!(
-                        "warning: derived-index reconcile skipped (maintenance busy): {}",
-                        e.message
-                    );
-                    None
-                }
-            };
-            let Some(guard) = guard else {
-                return;
-            };
-            // Pre-existing authored typed rows (SPEC:/DECISION:/BUG:/HOW:
-            // written before knowledge files existed) migrate to files — the
-            // file becomes the truth, the row is deleted, and the derived
-            // index rebuilds it below. Idempotent: a migrated row no longer
-            // exists, so a re-run is a no-op. Only runs when a knowledge dir
-            // is wired (a plans dir that implies no root).
-            if let Some(knowledge_dir) = plans_dir
-                .parent()
-                .map(|p| p.join(mnemo::memory::knowledge::KNOWLEDGE_DIR_NAME))
-            {
-                let knowledge = mnemo::memory::KnowledgeStore::new(knowledge_dir);
-                match mnemo::memory::indexer::migrate_authored_typed_rows(
-                    store_for_index.as_ref(),
-                    &knowledge,
-                )
-                .await
-                {
-                    Ok(report) if report.migrated > 0 => eprintln!(
-                        "info: migrated {} authored typed row(s) to knowledge files{}",
-                        report.migrated,
-                        if report.skipped.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({} skipped)", report.skipped.len())
-                        }
-                    ),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("warning: authored-row migration failed: {e}"),
-                }
-            }
-            // The staleness pre-check decides whether the reconcile runs at
-            // all. A failure here (store error, scan failure) degrades to
-            // "run the index anyway" — the reconcile is the recovery path
-            // for a deleted DB, so it must never skip on a pre-check error.
-            let stale = match mnemo::memory::indexer::corpus_is_stale(
-                store_for_index.as_ref(),
-                &plans_dir,
-                &backlog_path,
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "warning: derived-index staleness check failed ({e}); reconciling anyway"
-                    );
-                    true
-                }
-            };
-            if !stale {
-                return;
-            }
-            let _ = app_handle.emit(
-                ipc::memory_maintenance::RECONCILE_CHANNEL,
-                &ipc::memory_maintenance::ReconcileEvent::Started,
-            );
-            // Progress events: one per completed source.
-            let progress = |done: usize, total: usize| {
-                let _ = app_handle.emit(
-                    ipc::memory_maintenance::RECONCILE_CHANNEL,
-                    &ipc::memory_maintenance::ReconcileEvent::Progress { done, total },
-                );
-            };
-            match mnemo::memory::indexer::index_derived(
-                store_for_index.as_ref(),
-                &plans_dir,
-                &backlog_path,
-                &progress,
-            )
-            .await
-            {
-                Ok(report) => {
-                    let summary = if report.indexed == 0 && report.removed == 0 {
-                        "derived index in sync".to_string()
-                    } else {
-                        format!(
-                            "derived index reconciled: {} indexed, {} skipped, {} removed",
-                            report.indexed, report.skipped, report.removed
-                        )
-                    };
-                    let _ = app_handle.emit(
-                        ipc::memory_maintenance::RECONCILE_CHANNEL,
-                        &ipc::memory_maintenance::ReconcileEvent::Done { summary },
-                    );
-                }
-                Err(e) => {
-                    eprintln!("warning: derived-index reconcile failed: {e}");
-                    let _ = app_handle.emit(
-                        ipc::memory_maintenance::RECONCILE_CHANNEL,
-                        &ipc::memory_maintenance::ReconcileEvent::Failed {
-                            error: e.to_string(),
-                        },
-                    );
-                }
-            }
-            drop(guard);
-        });
-    }
-
-    // Startup re-embed check: the memory DB is a gitignored per-machine cache
-    // (.gitignore), so git never carries it across machines — but its stored
-    // vectors can still mismatch the configured embedder: a Settings model
-    // swap (a config save changes the model) re-wires the embedder under an
-    // existing DB, a legacy/empty fingerprint set (rows embedded before
-    // fingerprint tracking) has nothing to compare against, and only a
-    // wholesale project-directory copy moves the DB between machines. If the
-    // configured model's fingerprint (model_id + dim) is absent from the
-    // stored fingerprints (or the set is empty/legacy-NULL), re-embed all rows
-    // in the background so the stored vectors match the configured model. Fire-
-    // and-forget: never blocks startup. Only fires when a bundled model is
-    // configured AND loaded successfully (status Ready) — when the model fails
-    // to load (status Failed, hash fallback), there's nothing useful to
-    // re-embed with, and re-embedding would corrupt the fingerprint semantics.
-    // Skipped on BOTH hash paths: the explicit "hash" opt-out (re-embedding
-    // with hash would destroy stored semantic vectors) and the deferred
-    // first-run download (the background download task owns the re-embed —
-    // running it here with the interim hash embedder would destroy vectors).
-    // Also skipped when a local model load is pending (the background load
-    // task owns the re-embed the same way).
-    let configured_bundled = config.general.general.bundled_embedding_model.as_deref();
-    let status_snapshot = embedder_status
-        .read()
-        .expect("embedder status lock poisoned")
-        .clone();
-    if startup::should_reembed_at_startup(
-        configured_bundled,
-        pending_download.is_some(),
-        pending_load.is_some(),
-        &status_snapshot,
-    ) {
-        let store_for_reembed = store.clone();
-        let embedder_for_reembed = store.embedder_handle();
-        tauri::async_runtime::spawn(async move {
-            mnemo::memory::reembed_if_needed(&store_for_reembed, &embedder_for_reembed).await;
-        });
-    }
-
-    // Load constitutions. We keep a live source (file paths + mtimes) so the
-    // agent loop can re-read agent.md from disk when it changes — edits take
-    // effect on the next turn without restarting.
-    let global_agent_md = config_dir.join("agent.md");
-    let constitution_source =
-        mnemo::project::ConstitutionSource::new(&global_agent_md, &project.agent_md)?;
-
-    // Safety rules — regex-based auto-approve backed by `.coding/safety.toml`.
-    // A missing file is fine (rules start empty); the store is mtime-checked
-    // so edits in the Safety tab take effect without restarting.
-    let safety_rules = Arc::new(match SafetyRules::new(&project.safety_toml) {
-        Ok(sr) => sr,
-        Err(e) => {
-            eprintln!(
-                "warning: failed to load safety rules from {}: {e}; starting empty",
-                project.safety_toml.display()
-            );
-            // Fall back to an empty store over the same path.
-            SafetyRules::new(&project.safety_toml)
-                .unwrap_or_else(|_| SafetyRules::new(std::path::Path::new(":memory:")).unwrap())
-        }
-    });
-
-    // The shared safety-mode handle — toggled by the UI, read by every agent
-    // loop on each tool call. Shared across all agents (a runtime toggle is a
-    // global setting, not per-agent).
-    let safety_mode = Arc::new(RwLock::new(config.general.general.safety));
-
-    let context_manager = ContextManager::new(
-        provider.capabilities().max_context,
-        config.general.context.summarize_at_fill_rate,
-    )
-    .with_preflight(
-        config.general.context.preflight_compact,
-        config.general.context.compact_headroom_tokens,
-    )
-    .with_proxy_cache_ceiling(config.general.context.proxy_cache_ceiling_tokens);
-
-    // Vision client from config (shared helper — also used by Settings rewire).
-    // Still useful when the main provider is multimodal (describe_image tool
-    // for on-disk image files). Warn if configured but endpoint is missing.
-    let vision = build_vision_client(&config);
-    if config.general.general.vision_model.is_some() && vision.is_none() {
-        if let Some(vm) = &config.general.general.vision_model {
-            eprintln!(
-                "warning: vision_model endpoint '{}' not found in endpoints.toml; \
-                 image-to-text fallback disabled",
-                vm.endpoint
-            );
-        }
-    }
-
-    // Build the factory — holds the shared, stateless deps. Each agent is
-    // built via factory.build(), getting its own Workflow + ToolRegistry.
-    //
-    // The per-context model resolver reads the `[models]` section each turn
-    // to pick a model per workflow state / skill / subagent. It holds its own
-    // sync handle to the config (separate from the async `state.project.config`
-    // mutex) so the turn driver can read it without an await; the IPC layer
-    // pushes reloaded config into it after a Settings save.
-    let model_resolver = Arc::new(mnemo::model_resolver::ConfigModelResolver::new(
-        Arc::new(RwLock::new(config.clone())),
-        trace.clone(),
-    ));
-    // The shared headless debug browser — one instance for the agent tools and
-    // the IPC layer (the right-panel Browser tab). Lazily spawned on first use.
-    let browser = mnemo::browser::BrowserManager::new();
-    // Agent-side bootstrap: browser_navigate can create the Browser tab's
-    // child webview when the tab was never opened (plan 5ae26d22).
-    if let Some(app) = app.as_ref() {
-        attach_child_ensurer(&browser, app.clone());
-    }
-    // In a release build, enable the WebView2 CDP attach only when the user
-    // opted in via `enable_browser_inspection` (the env var exposing the port
-    // was already set above in `main`). Debug builds always have it on.
-    if !cfg!(debug_assertions) && config.general.general.enable_browser_inspection {
-        browser.set_webview_enabled(true);
-    }
-    // The shared, runtime-mutable git core-operations list — seeded from the
-    // loaded `[git]` config section (default ["merge", "push"]). Every GitTool
-    // built from the factory shares this Arc<RwLock<...>>, so a save_settings
-    // call (which calls factory.set_core_operations) is observed live on the
-    // next never_auto_for check without a registry rebuild.
-    let core_operations = Arc::new(std::sync::RwLock::new(
-        config.general.git.core_operations.clone(),
-    ));
-    // The shared, runtime-mutable shell-output filter config — seeded from the
-    // loaded `[shell_filter]` config section (default: enabled, no overrides).
-    // Every ShellTool built from the factory shares this Arc<RwLock<...>>, so
-    // a save_settings call (which calls factory.set_shell_filter_config) is
-    // observed live on the next command without a registry rebuild.
-    let shell_filter = Arc::new(std::sync::RwLock::new(config.general.shell_filter.clone()));
-    // Token-optimizer levers (backlog e4a50d22): live mirror of
-    // `[general.optimizer]`, shared with every lever-bearing tool build.
-    let optimizer_config = Arc::new(std::sync::RwLock::new(
-        config.general.general.optimizer.clone(),
-    ));
-    // Harness-run deterministic verify (the cost-saving chain's verification
-    // item): live mirror of `[general.verify]`, shared with every
-    // StepVerifyHandle the factory builds (read at each plan-step boundary) —
-    // a save_settings call flips it via factory.set_verify_config.
-    let verify_config = Arc::new(std::sync::RwLock::new(config.general.general.verify.clone()));
-    // The deterministic budget layer (backlog a25a5323): live mirror of
-    // `[general.budget]`, shared with every loop the factory builds (read at
-    // each plan-step gate) — a save_settings call flips it via
-    // factory.set_budget_config.
-    let budget_config = Arc::new(std::sync::RwLock::new(config.general.general.budget.clone()));
-    // The per-project code knowledge graph (GitNexus-style). Opened here and
-    // indexed on a background thread — startup must never block on parsing
-    // the codebase. A DB-open failure disables the graph outright (the
-    // `graph_*` tools are omitted, the Graph tab shows unavailable). A
-    // mid-index error or panic keeps the handle live: the store lock is
-    // poison-tolerant and the DB is a rebuildable cache, so the tools
-    // degrade to per-call errors instead of being torn down.
-    let codegraph: Option<Arc<mnemo::codegraph::CodeGraph>> = if config.general.general.codegraph {
-        match mnemo::codegraph::CodeGraph::open(project.root.clone(), &project.codegraph_db) {
-            Ok(graph) => {
-                let graph = Arc::new(graph);
-                let g = graph.clone();
-                // The open-project overlay (IndexingOverlay.tsx) renders
-                // this pass as a progress bar + "N/M files indexed"
-                // counter. Console mode (no app handle) has no frontend
-                // to notify — the pass runs silently there.
-                let app_handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    // index() owns the indexing flag: set on entry,
-                    // cleared by a drop guard on every exit path (Ok,
-                    // Err, panic unwind) — review M1.
-                    //
-                    // With a window: the pass streams IndexProgressEvent
-                    // ticks on codegraph://index-progress. On a COLD
-                    // start the 1s gate in startup_should_forward keeps
-                    // an already-indexed project's sub-second pass
-                    // silent (no overlay flash). On a POST-SWITCH
-                    // startup (switched_open — a pending-project marker
-                    // was consumed) the gate is skipped and Started is
-                    // emitted immediately, so the splash dialog shows
-                    // right away like the create-project seed pass.
-                    // The terminal Done is always emitted (invisible
-                    // when no bar is showing); Failed only when ≥1
-                    // event was forwarded.
-                    let result = match app_handle {
-                        Some(handle) => {
-                            // Mirror live progress into the module
-                            // snapshot so an overlay that mounts after
-                            // the pass began (the webview is recreated
-                            // on every start AND every project switch)
-                            // can catch up via get_index_progress. The
-                            // snapshot is fetchable immediately only on
-                            // a switched launch; a cold start publishes
-                            // it when the first tick clears the 1s gate
-                            // (a sub-second cold pass stays invisible —
-                            // the no-flash contract).
-                            ipc::codegraph_cmds::mark_startup_index_active(switched_open);
-                            // A post-switch startup announces itself
-                            // immediately: the overlay appears before
-                            // the first throttled tick would arrive.
-                            let forwarded =
-                                Arc::new(std::sync::atomic::AtomicBool::new(switched_open));
-                            if switched_open {
-                                ipc::codegraph_cmds::emit_index_progress(
-                                    &handle,
-                                    &ipc::codegraph_cmds::IndexProgressEvent::Started,
-                                );
-                            }
-                            let t0 = std::time::Instant::now();
-                            let cb_forwarded = Arc::clone(&forwarded);
-                            let cb_app = handle.clone();
-                            let progress = move |done: usize, total: usize| {
-                                // Record EVERY tick before any gate — the
-                                // snapshot must stay complete for ticks
-                                // the throttle drops.
-                                ipc::codegraph_cmds::record_startup_index_progress(done, total);
-                                if ipc::codegraph_cmds::startup_should_forward(
-                                    t0.elapsed(),
-                                    done,
-                                    total,
-                                    switched_open,
-                                ) {
-                                    // The first FORWARDED tick publishes the
-                                    // snapshot on a cold start — catch-up
-                                    // visibility tracks the overlay stream
-                                    // exactly (gated sub-second cold passes
-                                    // never publish anything).
-                                    ipc::codegraph_cmds::ensure_startup_index_visible();
-                                    ipc::codegraph_cmds::emit_index_progress(
-                                        &cb_app,
-                                        &ipc::codegraph_cmds::IndexProgressEvent::Progress {
-                                            done,
-                                            total,
-                                        },
-                                    );
-                                    cb_forwarded.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            };
-                            let pass =
-                                tokio::task::spawn_blocking(move || g.index(Some(&progress))).await;
-                            // Clear the snapshot BEFORE the terminal event:
-                            // a fetch that lands after this reports no pass
-                            // rather than stale final counts.
-                            ipc::codegraph_cmds::clear_startup_index();
-                            // Terminal events: Done is ALWAYS emitted — a
-                            // lone Done folds to null in the overlay's
-                            // reducer (invisible when nothing is showing),
-                            // so cold starts stay flash-free, but any
-                            // overlay that mounted late (snapshot
-                            // catch-up) still gets a definitive end
-                            // instead of waiting on a pass that will never
-                            // tick again. Failed stays forwarded-gated:
-                            // never pop a failure card for a silent
-                            // sub-second cold pass.
-                            match &pass {
-                                Ok(Ok(stats)) => {
-                                    ipc::codegraph_cmds::emit_index_progress(
-                                        &handle,
-                                        &ipc::codegraph_cmds::IndexProgressEvent::Done {
-                                            summary: format!(
-                                                "{} files indexed · {} symbols · {} edges",
-                                                stats.files_scanned, stats.symbols, stats.edges
-                                            ),
-                                        },
-                                    );
-                                }
-                                Ok(Err(e)) => {
-                                    if forwarded.load(std::sync::atomic::Ordering::Relaxed) {
-                                        ipc::codegraph_cmds::emit_index_progress(
-                                            &handle,
-                                            &ipc::codegraph_cmds::IndexProgressEvent::Failed {
-                                                error: e.to_string(),
-                                            },
-                                        );
-                                    }
-                                }
-                                Err(join) => {
-                                    if forwarded.load(std::sync::atomic::Ordering::Relaxed) {
-                                        ipc::codegraph_cmds::emit_index_progress(
-                                            &handle,
-                                            &ipc::codegraph_cmds::IndexProgressEvent::Failed {
-                                                error: format!("index task panicked: {join}"),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            pass
-                        }
-                        None => tokio::task::spawn_blocking(move || g.index(None)).await,
-                    };
-                    match result {
-                            Ok(Ok(stats)) => eprintln!(
-                                "codegraph: indexed {} files ({} re-parsed, {} symbols, {} edges) in {}ms",
-                                stats.files_scanned,
-                                stats.files_reindexed,
-                                stats.symbols,
-                                stats.edges,
-                                stats.elapsed_ms
-                            ),
-                            Ok(Err(e)) => eprintln!("codegraph: index failed: {e}"),
-                            Err(e) => eprintln!("codegraph: index task panicked: {e}"),
-                        }
-                });
-                Some(graph)
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to open codegraph at {}: {e}; graph disabled",
-                    project.codegraph_db.display()
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let factory = AgentLoopFactory::new(
-        provider,
-        constitution_source,
-        Some(store_trait),
-        sandbox.clone(),
-        project.root.clone(),
-        Some(safety_rules.clone()),
-        safety_mode.clone(),
-        context_manager,
-        project.plans_dir.clone(),
-        vision,
-    )
-    // Load the skill library from `.coding/skills/*.toml` so the skill tools
-    // can validate + look up skills, and `skill_reload` can re-read the dir
-    // live (a hand-edited skill file never needs an app restart). A missing dir
-    // yields an empty registry (no skills available) — not an error.
-    .with_skills(Arc::new(mnemo::skill::SkillLibrary::load(
-        project.skills_dir.clone(),
-    )))
-    // Wire the per-context model resolver so `[models]` overrides take effect
-    // at turn time (skill > subagent > state > default).
-    .with_model_resolver(model_resolver.clone())
-    // Wire the shared git core-operations handle so a `[git]` config save is
-    // observed live by every GitTool (no registry rebuild).
-    .with_core_operations(core_operations)
-    // Wire the shared shell-output filter config so a `[shell_filter]` config
-    // save is observed live by every ShellTool (no registry rebuild).
-    .with_shell_filter_config(shell_filter)
-    // Wire the shared token-optimizer config (backlog e4a50d22) so the
-    // `[general.optimizer]` flags are observed by every lever-bearing
-    // tool build (read_files delta/skeleton re-reads, shell output
-    // compression, …).
-    .with_optimizer_config(optimizer_config)
-    // Wire the shared harness-run verify config so `[general.verify]`'s
-    // command + timeout are read at each plan-step boundary by every agent
-    // built from this factory (a Settings save flips the mirror live).
-    .with_verify_config(verify_config)
-    // Wire the shared budget config so `[general.budget]`'s caps are read at
-    // each plan-step gate by every agent built from this factory (a Settings
-    // save flips the mirror live).
-    .with_budget_config(budget_config)
-    // Wire the shared Laya auto-typing gate (backlog a147b63c):
-    // memory_write reads the classifier slot + flag at call time, and
-    // Settings saves flip the flag via `set_auto_typing_enabled` — no
-    // registry rebuild ever needed.
-    .with_auto_typing(mnemo::tool::memory::AutoTypingHandle {
-        classifier: classifier_slot.clone(),
-        enabled: auto_typing_flag.clone(),
-    })
-    // Wire the shared Laya tool-choice gate (backlog e2c47d5f): the search /
-    // search_read tools read the classifier slot + flag at call time, and a
-    // Settings save flips the flag via `set_tool_choice_enabled` — no rebuild.
-    .with_tool_choice(mnemo::tool::agent::tool_choice::ToolChoiceHandle {
-        classifier: classifier_slot.clone(),
-        enabled: tool_choice_flag.clone(),
-        // The app logs to the default `~/.mnemo/laya/training/` home.
-        log_path: None,
-    })
-    // Wire the shared Laya failure-triage gate (backlog 1a4049c1): every loop
-    // the factory builds carries the classifier slot + flag, so the
-    // tool-dispatch auto-retry and both provider retry layers act on
-    // confident classifications — and a Settings save flips the flag live via
-    // `set_failure_triage_enabled` (no rebuild).
-    .with_failure_triage(failure_triage_handle)
-    // Wire the shared Laya pre-prompt routing gate (backlog 091e694d): every
-    // loop the factory builds reads the classifier slot at turn start; the
-    // opt-in flag + the [general.routing] threshold/enforce ride the live
-    // config the resolver reads per turn (no rebuild, no flag mirror).
-    .with_routing_gate(routing_gate)
-    // Wire the shared compound-reflex handle (backlog a8495cc1) -- the
-    // escalation lane ladder's classifier (backlog ad56c7bd): every loop reads
-    // the same classifier slot + the `[general.laya] reflex` flag mirror at
-    // each plan-step boundary, and a Settings save flips the flag live via
-    // `set_reflex_enabled` (no rebuild).
-    .with_reflex(reflex_handle)
-    // Share the headless debug browser with the IPC layer (Browser tab).
-    .with_browser(browser.clone());
-    // Record the startup default's DISPLAY effort (backlog 51dab4da) —
-    // stamped onto every loop the factory builds (see build_inner).
-    factory.set_default_display_effort(Some(startup_display_effort));
-    // Seed the on-screen browser_* gate from the loaded config: those tools
-    // attach over the WebView2 CDP endpoint, which only exists when the user
-    // opted in, so with the flag off they stay out of the tools array
-    // entirely rather than advertising a guaranteed failure.
-    factory.set_browser_inspection(config.general.general.enable_browser_inspection);
-    // Wire the code knowledge graph when enabled + opened successfully.
-    let factory = match codegraph.clone() {
-        Some(graph) => factory.with_codegraph(graph),
-        None => factory,
-    };
-    // Wire the shared MCP manager: the GLOBAL set (config.mcp) union-merged
-    // with this project's `.coding/mcp.toml` overrides (project wins by
-    // name — same philosophy as skills). Inert by construction: connections
-    // happen lazily on the first load_tools("mcp.<server>") reveal; the IPC
-    // layer's Settings/Test commands reuse the same Arc.
-    let project_mcp = mnemo::config::mcp::load_or_default(&project.mcp_toml)?;
-    let mcp_servers = mnemo::config::mcp::merge_servers(&config.mcp, &project_mcp);
-    let factory = factory.with_mcp(Arc::new(mnemo::mcp::McpManager::from_config(&mcp_servers)));
-    let factory = Arc::new(factory);
-
-    // Start the CodeGraph OS file watcher so the graph stays fresh on every
-    // edit (agent tools, human editor, git ops) without a manual refresh. The
-    // watcher debounces change bursts into incremental index() passes and is
-    // best-effort: a start failure logs + disables auto-refresh, never fatal.
-    // The handle MUST live on Brain — dropping it stops the watch.
-    let graph_watcher = codegraph.clone().and_then(|graph| {
-        match mnemo::codegraph::watcher::GraphWatcher::spawn(
-            graph,
-            project.root.clone(),
-            std::time::Duration::from_millis(800),
-        ) {
-            Ok(w) => {
-                eprintln!("codegraph: file watcher started (auto-refresh on edits)");
-                Some(w)
-            }
-            Err(e) => {
-                eprintln!("codegraph: file watcher failed to start: {e}; auto-refresh disabled");
-                None
-            }
-        }
-    });
-
-    Ok(BrainOutcome::Ready(Brain {
-        factory,
-        memory_store: Some(store),
-        project: Arc::new(tokio::sync::Mutex::new(project)),
-        config: Arc::new(tokio::sync::Mutex::new(config)),
-        sandbox,
-        safety_rules,
-        safety_mode,
-        model_resolver,
-        trace,
-        browser,
-        embedder_status,
-        classifier_status,
-        classifier_slot,
-        laya,
-        pending_model_download: pending_download,
-        pending_model_load: pending_load,
-        pending_laya_start,
-        _graph_watcher: graph_watcher,
-    }))
 }
 
 #[cfg(test)]

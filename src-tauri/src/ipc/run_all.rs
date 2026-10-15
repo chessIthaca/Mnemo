@@ -229,15 +229,13 @@ use std::sync::atomic::Ordering;
 
 use tauri::Manager;
 
-use mnemo::runtime::channels::{
-    AgentCommand, SerializableAgentEvent, UNATTENDED_PROMPT_PREFIX,
-};
-use mnemo::workflow::{PlanFile, Workflow, WorkflowState};
+use mnemo::{AgentCommand, SerializableAgentEvent, UNATTENDED_PROMPT_PREFIX};
+use mnemo::app::workflow::{PlanFile, Workflow, WorkflowState};
 
 use crate::ipc::backlog_cmds::{dispatch_next_impl, emit_backlog_changed};
 use crate::ipc::events::{emit_agent_event, emit_prompt_dispatched};
 use crate::ipc::state::IpcState;
-use mnemo::backlog::BacklogStatus;
+use mnemo::app::backlog::BacklogStatus;
 use mnemo::project::git_ops::{
     checkpoint_on_work_branch, commit_success, commits_after_checkpoint,
 };
@@ -455,8 +453,10 @@ async fn recalled_context_block(state: &IpcState, item_text: &str) -> Option<Str
 ///
 /// This is a pure function, so it is unit-testable without a Tauri
 /// `AppHandle` or a live agent loop.
-pub fn plan_loop_allows_done(state: WorkflowState, changed_this_turn: bool) -> bool {
-    matches!(state, WorkflowState::Complete) && changed_this_turn
+pub fn plan_loop_allows_done(state: &str, changed_this_turn: bool) -> bool {
+    // 2b.3: the state arrives as the neutral handle's token (the Debug
+    // name) — the bin side may compare the string directly.
+    state == "complete" && changed_this_turn
 }
 
 /// (backlog 5bb1e4cd) May this item flip to `Done` for a completing plan?
@@ -545,11 +545,8 @@ pub fn plan_linkage_allows_failed(
 /// sub-plan push/pop never looks like an abandonment). `finish` goes to
 /// `Complete`. Drives the plan-tied `Failed` transition: failure means
 /// exactly "the plan was abandoned".
-pub fn is_root_plan_abandonment(prev: Option<WorkflowState>, new: WorkflowState) -> bool {
-    matches!(
-        prev,
-        Some(WorkflowState::Executing | WorkflowState::Reviewing)
-    ) && new == WorkflowState::Planning
+pub fn is_root_plan_abandonment(prev: Option<&str>, new: &str) -> bool {
+    matches!(prev, Some("executing" | "reviewing")) && new == "planning"
 }
 
 /// Build the note recorded on an item whose dispatched turn ended WITHOUT
@@ -562,17 +559,20 @@ pub fn is_root_plan_abandonment(prev: Option<WorkflowState>, new: WorkflowState)
 /// completing turn's resolution; auto-feed stays suppressed on the
 /// single-dispatch path until the item resolves). The note says exactly
 /// what happened, for the resumed session and the user.
-fn plan_open_note(main_state: Option<WorkflowState>) -> String {
+fn plan_open_note(main_state: Option<String>) -> String {
     match main_state {
         // Resting Complete with NO transition observed this turn: no plan
         // ever ran (e.g. the agent answered freeform). The item never left
         // `Pending` (the Executing-entry stamp never fired) — it stays
         // queued.
-        Some(WorkflowState::Complete) => "plan loop never ran this turn (workflow rested in Complete) — item left pending; run waits for the plan to run (the next turn resolution re-checks)".to_string(),
+        Some(s) if s == "complete" => "plan loop never ran this turn (workflow rested in Complete) — item left pending; run waits for the plan to run (the next turn resolution re-checks)".to_string(),
         // The turn ended with the plan still open: the item stays `InFlight`
         // — the plan persists and a resumed session continues it. The work
         // is NOT rolled back.
-        Some(ws) => format!("plan loop did not close (workflow: {ws}) — item left in_flight; work kept in tree; run waits for the plan to close (the next turn resolution re-checks)"),
+        Some(ws) => format!(
+            "plan loop did not close (workflow: {}) — item left in_flight; work kept in tree; run waits for the plan to close (the next turn resolution re-checks)",
+            mnemo::capitalize_token(&ws)
+        ),
         // The workflow state could not be verified — never mark Done on an
         // unverifiable closure, never destroy possibly-good work.
         None => "could not verify plan-loop closure (agent state unavailable) — work left in tree; run waits (the next turn resolution re-checks)".to_string(),
@@ -585,7 +585,7 @@ fn plan_open_note(main_state: Option<WorkflowState>) -> String {
 /// or its agent loop missing, e.g. during teardown). Callers must treat
 /// `None` as "unverifiable" — NEVER as success: the item must not be marked
 /// `Done` when we cannot prove the plan loop closed.
-pub(crate) async fn main_agent_workflow_state(state: &IpcState) -> Option<WorkflowState> {
+pub(crate) async fn main_agent_workflow_state(state: &IpcState) -> Option<String> {
     let main_id = state.runtime.manager.lock().await.main_agent_id()?;
     agent_workflow_state(state, main_id).await
 }
@@ -596,13 +596,13 @@ pub(crate) async fn main_agent_workflow_state(state: &IpcState) -> Option<Workfl
 /// main agent's).
 pub(crate) async fn agent_workflow_state(
     state: &IpcState,
-    agent_id: mnemo::runtime::AgentId,
-) -> Option<WorkflowState> {
+    agent_id: mnemo::AgentId,
+) -> Option<String> {
     let agent_loops = state.runtime.agent_loops.lock().await;
     let agent_loop = agent_loops.get(&agent_id)?;
-    let workflow = agent_loop.workflow_handle();
+    let workflow = crate::ipc::agent::workflow_concrete(&agent_loop.workflow_handle());
     let workflow = workflow.lock().await;
-    Some(workflow.state())
+    Some(format!("{:?}", workflow.state()))
 }
 
 /// Deterministic task-entry for a dispatched backlog item (plan 9057fa1f):
@@ -645,7 +645,7 @@ fn enter_planning_if_complete(workflow: &mut Workflow) -> Option<(WorkflowState,
 mod tests {
     use crate::ipc::contract_fixtures::normalize_lf;
     use super::*;
-    use mnemo::workflow::{PlanKind, Workflow, WorkflowState};
+    use mnemo::app::workflow::{PlanKind, Workflow, WorkflowState};
 
     // ---- deferred (skip Run-All) selection — backlog f2d2809b ----
 
@@ -656,7 +656,7 @@ mod tests {
     /// When nothing eligible remains, the existing `end_run` arm ends the
     /// run cleanly. The command needs a Tauri AppHandle, so the selection
     /// wiring is pinned as a source contract; the store method itself is
-    /// unit-tested in `mnemo::backlog::tests`.
+    /// unit-tested in `mnemo::app::backlog::tests`.
     #[test]
     fn run_all_dispatch_next_selects_via_next_pending_eligible() {
         let src = normalize_lf(include_str!("run_all.rs"));
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn run_all_dispatch_lands_bug_items_on_the_bug_fixing_slot() {
         use mnemo::config::{Endpoint, GeneralConfig, ModelRef, ModelsConfig};
-        use mnemo::model_resolver::{ConfigModelResolver, ModelContext, ModelResolver};
+        use mnemo::model_resolver::{ConfigModelResolver, ModelResolver};
         use std::sync::{Arc, RwLock};
 
         let config = mnemo::config::Config {
@@ -744,12 +744,12 @@ mod tests {
         // by RUN_ALL_STEER) → the loop resolves (Executing, BugFixing) → the
         // bug-fixing slot's model + effort.
         let bug = resolver
-            .resolve(ModelContext::new(
-                WorkflowState::Executing,
-                None,
-                false,
-                Some(PlanKind::BugFixing),
-            ))
+            .resolve(mnemo::model_resolver::ModelContext {
+                route: mnemo::RouteKey {
+                    slots: vec!["bug_fixing".into(), "executing".into()],
+                },
+                is_subagent: false,
+            })
             .expect("a dispatched bug item resolves the bug-fixing slot");
         assert_eq!(bug.endpoint, "openai");
         assert_eq!(bug.model, "o3");
@@ -757,12 +757,12 @@ mod tests {
 
         // A dispatched FEATURE item: implementation plan → the executing slot.
         let feature = resolver
-            .resolve(ModelContext::new(
-                WorkflowState::Executing,
-                None,
-                false,
-                Some(PlanKind::Implementation),
-            ))
+            .resolve(mnemo::model_resolver::ModelContext {
+                route: mnemo::RouteKey {
+                    slots: vec!["executing".into()],
+                },
+                is_subagent: false,
+            })
             .expect("a dispatched feature item resolves the executing slot");
         assert_eq!(feature.endpoint, "deepseek");
         assert_eq!(feature.model, "deepseek-v4-flash");
@@ -795,12 +795,12 @@ mod tests {
             Arc::new(mnemo::provider::trace::LlmRequestLog::new()),
         );
         let inherited = resolver
-            .resolve(ModelContext::new(
-                WorkflowState::Executing,
-                None,
-                false,
-                Some(PlanKind::BugFixing),
-            ))
+            .resolve(mnemo::model_resolver::ModelContext {
+                route: mnemo::agent::policy::RouteKey {
+                    slots: vec!["bug_fixing".into(), "executing".into()],
+                },
+                is_subagent: false,
+            })
             .expect("an unset bug-fixing slot inherits the executing slot");
         assert_eq!(inherited.model, "deepseek-v4-flash");
         assert_eq!(inherited.reasoning_effort.as_deref(), Some("low"));
@@ -812,7 +812,7 @@ mod tests {
     /// never be resurrected by adoption. The sweep needs Tauri state, so
     /// the read is pinned as a source contract; the
     /// items()-filters-deleted behavior is unit-tested in
-    /// `mnemo::backlog::tests`.
+    /// `mnemo::app::backlog::tests`.
     #[test]
     fn adopt_orphaned_in_flight_snapshots_the_live_only_view() {
         let src = normalize_lf(include_str!("run_all.rs"));
@@ -1540,7 +1540,7 @@ mod tests {
         // implementation plan that means `finish` ran (steps + review +
         // commit); a research plan auto-completes — AND a state transition
         // was observed during the turn (Complete is a resting state).
-        assert!(plan_loop_allows_done(WorkflowState::Complete, true));
+        assert!(plan_loop_allows_done("complete", true));
     }
 
     #[test]
@@ -1552,10 +1552,10 @@ mod tests {
         // marked Done, even with a transition observed. (Planning was allowed
         // by the old opt-in strict mode; that hole let freeform no-plan
         // turns count as done.)
-        assert!(!plan_loop_allows_done(WorkflowState::Planning, true));
-        assert!(!plan_loop_allows_done(WorkflowState::Executing, true));
-        assert!(!plan_loop_allows_done(WorkflowState::Reviewing, true));
-        assert!(!plan_loop_allows_done(WorkflowState::Skill, true));
+        assert!(!plan_loop_allows_done("planning", true));
+        assert!(!plan_loop_allows_done("executing", true));
+        assert!(!plan_loop_allows_done("reviewing", true));
+        assert!(!plan_loop_allows_done("skill", true));
     }
 
     #[test]
@@ -1566,9 +1566,9 @@ mod tests {
         // planning) ends with workflow == Complete and was wrongly marked
         // Done. The gate requires an observed in-turn state transition on top
         // of the terminal Complete state.
-        assert!(!plan_loop_allows_done(WorkflowState::Complete, false));
+        assert!(!plan_loop_allows_done("complete", false));
         // And the combination that DOES mean "loop closed this turn":
-        assert!(plan_loop_allows_done(WorkflowState::Complete, true));
+        assert!(plan_loop_allows_done("complete", true));
     }
 
     #[test]
@@ -1580,31 +1580,31 @@ mod tests {
         // must not count even if observed); an unchanged-state emit is not a
         // transition.
         assert!(is_root_plan_abandonment(
-            Some(WorkflowState::Executing),
-            WorkflowState::Planning
+            Some("executing"),
+            "planning"
         ));
         assert!(is_root_plan_abandonment(
-            Some(WorkflowState::Reviewing),
-            WorkflowState::Planning
+            Some("reviewing"),
+            "planning"
         ));
         // Sub-plan abandon pops to the parent — still Executing.
         assert!(!is_root_plan_abandonment(
-            Some(WorkflowState::Executing),
-            WorkflowState::Executing
+            Some("executing"),
+            "executing"
         ));
         // The dispatch-time planning entry (invisible to the forwarder, but
         // defensive: never count it).
         assert!(!is_root_plan_abandonment(
-            Some(WorkflowState::Complete),
-            WorkflowState::Planning
+            Some("complete"),
+            "planning"
         ));
         // Unchanged-state emit (a failed workflow tool).
         assert!(!is_root_plan_abandonment(
-            Some(WorkflowState::Planning),
-            WorkflowState::Planning
+            Some("planning"),
+            "planning"
         ));
         // First-ever observation (no prev) is never an abandonment.
-        assert!(!is_root_plan_abandonment(None, WorkflowState::Planning));
+        assert!(!is_root_plan_abandonment(None, "planning"));
     }
 
     #[test]
@@ -1616,18 +1616,18 @@ mod tests {
         // re-checks (the amplifier fix, 2027-01-07 — the agent routinely
         // recovers via auto-continue / reviewer-finish resume and finishes
         // the plan; a halted run never re-checked and the item stranded).
-        let never_ran = plan_open_note(Some(WorkflowState::Complete));
+        let never_ran = plan_open_note(Some("complete".to_string()));
         assert!(never_ran.contains("never ran"));
         assert!(never_ran.contains("left pending"));
         assert!(never_ran.contains("run waits"));
 
-        let open = plan_open_note(Some(WorkflowState::Executing));
+        let open = plan_open_note(Some("executing".to_string()));
         assert!(open.contains("did not close (workflow: Executing)"));
         assert!(open.contains("left in_flight"));
         assert!(open.contains("work kept in tree"));
         assert!(open.contains("run waits for the plan to close"));
 
-        let reviewing = plan_open_note(Some(WorkflowState::Reviewing));
+        let reviewing = plan_open_note(Some("reviewing".to_string()));
         assert!(reviewing.contains("did not close (workflow: Reviewing)"));
 
         let unverified = plan_open_note(None);
@@ -1692,28 +1692,28 @@ mod tests {
         // item to Failed — but nothing had actually started ("that is not
         // failed yet. It is pre-planning"). The stamp must fire only when
         // the workflow ENTERS Executing.
-        assert!(should_stamp_in_flight(None, WorkflowState::Executing));
+        assert!(should_stamp_in_flight(None, "executing"));
         assert!(should_stamp_in_flight(
-            Some(WorkflowState::Planning),
-            WorkflowState::Executing
+            Some("planning"),
+            "executing"
         ));
         assert!(should_stamp_in_flight(
-            Some(WorkflowState::Complete),
-            WorkflowState::Executing
+            Some("complete"),
+            "executing"
         ));
         // No re-entry: already-Executing is not a NEW execution entry.
         assert!(!should_stamp_in_flight(
-            Some(WorkflowState::Executing),
-            WorkflowState::Executing
+            Some("executing"),
+            "executing"
         ));
         // Anything else is not an entry into Executing.
         assert!(!should_stamp_in_flight(
-            Some(WorkflowState::Planning),
-            WorkflowState::Reviewing
+            Some("planning"),
+            "reviewing"
         ));
         assert!(!should_stamp_in_flight(
-            Some(WorkflowState::Planning),
-            WorkflowState::Planning
+            Some("planning"),
+            "planning"
         ));
     }
 
@@ -2330,10 +2330,10 @@ mod tests {
         // piece (the decomposition kept every assertion string).
         let success = fn_body(include_str!("run_all.rs"), "run_all_success_disposition");
         // Done: the gate arm (the gate + the linkage-guarded flip).
-        assert!(success.contains("plan_loop_allows_done(main_state, true)"));
+        assert!(success.contains("plan_loop_allows_done(&main_state, true)"));
         assert!(success.contains("_ if plan_abandoned =>"));
         let done_flip = fn_body(include_str!("run_all.rs"), "flip_done_if_linked");
-        assert!(done_flip.contains("commit_success(root.clone(), item.clone())"));
+        assert!(done_flip.contains("commit_success(root.clone(), item.id.clone(), item.text.clone())"));
         assert!(done_flip.contains("BacklogStatus::Done"));
         let failed_flip = fn_body(
             include_str!("run_all.rs"),
@@ -2370,7 +2370,7 @@ mod tests {
         // item↔plan linkage and through the same guard — never a relaxed
         // predicate, never CantResolve, never a rollback.
         let chat = fn_body(include_str!("run_all.rs"), "resolve_linked_chat_item");
-        assert!(chat.contains("plan_loop_allows_done(main_state, loop_evidence)"));
+        assert!(chat.contains("plan_loop_allows_done(&main_state, loop_evidence)"));
         assert!(chat.contains("run_all_success_disposition"));
         assert!(
             chat.contains("resolve_linkage_target"),
@@ -2468,7 +2468,7 @@ mod tests {
         // arm precedes the catch-all arm that delegates to the waiting
         // helper.
         let body = fn_body(include_str!("run_all.rs"), "run_all_success_disposition");
-        let arm = "(Some(WorkflowState::Complete), false)";
+        let arm = "if s == \"complete\" && item.status == BacklogStatus::Pending";
         let arm_ix = body
             .find(arm)
             .expect("the (Complete, false) re-queued-item arm");
@@ -2531,7 +2531,7 @@ mod tests {
         // (the plan file lives in the worktree's plans dir; the commits
         // are on the item's own branch).
         let body = fn_body(include_str!("run_all.rs"), "on_spawned_turn_resolved");
-        let arm = "(Some(WorkflowState::Complete), false)";
+        let arm = "if s == \"complete\" && item.status == BacklogStatus::Pending";
         let arm_ix = body
             .find(arm)
             .expect("the (Complete, false) re-queued-item arm");
@@ -2619,7 +2619,7 @@ mod tests {
             .find("plan_linkage_allows_done")
             .expect("the run-all gate arm must consult the guard");
         let commit = run_all
-            .find("commit_success(root.clone(), item.clone())")
+            .find("commit_success(root.clone(), item.id.clone(), item.text.clone())")
             .expect("the gate arm must commit");
         assert!(
             guard < commit,
@@ -2817,7 +2817,7 @@ mod tests {
         // resolution had no arm that could see it. Both halves now do, and
         // the Done guard itself is UNCHANGED throughout.
         let dir = unique_temp_dir("chat-linkage");
-        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let mut store = mnemo::app::backlog::BacklogStore::open(dir.clone());
         let item = store.add("chat-driven task".into(), vec![]);
         store.set_status(&item.id, BacklogStatus::InFlight, None);
 
@@ -2865,7 +2865,7 @@ mod tests {
         // entry — the same refresh the dispatched path performs — instead of
         // stranding `InFlight` on a dead plan forever.
         let dir = unique_temp_dir("chat-relink");
-        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let mut store = mnemo::app::backlog::BacklogStore::open(dir.clone());
         let item = store.add("chat-driven task".into(), vec![]);
         store.set_status(&item.id, BacklogStatus::InFlight, None);
         store.set_plan_id(&item.id, Some("plan-old"), Some("Abandoned plan"));
@@ -2910,7 +2910,7 @@ mod tests {
         // only be superseded when the abandonment is evidenced — never on
         // the strength of a stale foreign link.
         let dir = unique_temp_dir("chat-stale-link");
-        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let mut store = mnemo::app::backlog::BacklogStore::open(dir.clone());
         let item = store.add("stale item".into(), vec![]);
         store.set_status(&item.id, BacklogStatus::InFlight, None);
         store.set_plan_id(&item.id, Some("plan-done"), Some("Completed plan"));
@@ -2950,7 +2950,7 @@ mod tests {
         // (backlog 9e859618) Never guess which item a completed plan owned,
         // and never hand the resolution arm a dead or terminal item.
         let dir = unique_temp_dir("linkage-target");
-        let mut store = mnemo::backlog::BacklogStore::open(dir.clone());
+        let mut store = mnemo::app::backlog::BacklogStore::open(dir.clone());
         let a = store.add("first".into(), vec![]);
         store.set_status(&a.id, BacklogStatus::InFlight, None);
         store.set_plan_id(&a.id, Some("plan-a"), None);
@@ -3501,7 +3501,9 @@ mod tests {
             "the forwarder must track compaction starts"
         );
         assert!(
-            forwarder.contains("SerializableAgentEvent::Compacted { .. } => {"),
+            forwarder.contains(
+                "SerializableAgentEvent::Compacted { .. }\n                    if compact_in_flight.remove(&agent_id) =>"
+            ),
             "the forwarder must resolve the wait on Compacted"
         );
         assert!(
@@ -3515,7 +3517,7 @@ mod tests {
             .find("compact_in_flight.insert(agent_id)")
             .expect("CompactStarted must insert into the pairing set");
         let compacted = forwarder
-            .find("SerializableAgentEvent::Compacted { .. } => {")
+            .find("SerializableAgentEvent::Compacted { .. }")
             .expect("the Compacted arm must exist");
         assert!(
             insert < compacted,
@@ -3777,7 +3779,7 @@ fn should_between_items_compact(
 ) -> bool {
     match usage {
         Some((used, max)) if max > 0 => {
-            let threshold = mnemo::agent::context::ContextManager::effective_summarize_threshold(
+            let threshold = mnemo::ContextManager::effective_summarize_threshold(
                 max as usize,
                 fill_rate,
                 ceiling,
@@ -4250,7 +4252,7 @@ pub(crate) async fn run_all_dispatch_next(
 async fn dispatch_run_all_to_main(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: mnemo::backlog::BacklogItem,
+    item: mnemo::app::backlog::BacklogItem,
     checkpoint: String,
     context_block: Option<String>,
 ) -> Result<(), String> {
@@ -4318,7 +4320,8 @@ async fn dispatch_run_all_to_main(
         let agent_loops = state.runtime.agent_loops.lock().await;
         match agent_loops.get(&main_id) {
             Some(loop_handle) => {
-                let workflow_handle = loop_handle.workflow_handle();
+                let workflow_handle =
+                    crate::ipc::agent::workflow_concrete(&loop_handle.workflow_handle());
                 let mut workflow = workflow_handle.lock().await;
                 enter_planning_if_complete(&mut workflow)
             }
@@ -4334,7 +4337,7 @@ async fn dispatch_run_all_to_main(
             app,
             main_id,
             SerializableAgentEvent::WorkflowStateChanged {
-                state: new_state,
+                    state: format!("{:?}", new_state).to_lowercase(),
                 top_plan_id,
             },
         );
@@ -4387,11 +4390,11 @@ async fn dispatch_run_all_to_main(
 async fn checkpoint_run_all_item(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
 ) -> Result<String, String> {
     let checkpoint = {
         let root = state.project.root.lock().await.root.clone();
-        checkpoint_on_work_branch(root, item.clone()).await
+        checkpoint_on_work_branch(root, item.id.clone(), item.text.clone()).await
     };
     match checkpoint {
         Ok(sha) => Ok(sha),
@@ -4427,7 +4430,7 @@ async fn checkpoint_run_all_item(
 /// the note's head, breaking head-parsing.
 async fn record_in_flight_item(
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     checkpoint: &str,
 ) {
     {
@@ -4449,7 +4452,7 @@ async fn record_in_flight_item(
 /// SPAWNED worktree agent — item 1 stays on the main agent (the path
 /// above); items 2..N each get their own parentless agent + git worktree
 /// + `wt/runall-*` branch. Sequential runs (concurrency 1) never enter
-/// here — zero behavior change.
+///   here — zero behavior change.
 ///
 /// The window counts SPAWNED lanes only (`spawned.len() < concurrency -
 /// 1`): the main agent's lane is accounted by its own dispatch path
@@ -4537,13 +4540,13 @@ async fn fill_spawned_window(app: &tauri::AppHandle, state: &IpcState) {
 async fn dispatch_spawned_item(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: mnemo::backlog::BacklogItem,
+    item: mnemo::app::backlog::BacklogItem,
 ) -> Result<(), String> {
     // Provision the worktree + branch — each item starts from the LANDED
     // state (main), never from another item's in-flight work. Fails when
     // the branch already exists (a previous run of the same item never
     // landed) — surfaced, never silently reused.
-    let (worktree, branch) = mnemo::project::worktrees::provision_item_worktree(
+    let (worktree, branch) = mnemo::app::worktrees::provision_item_worktree(
         state.project.root.lock().await.root.clone(),
         item.id.clone(),
     )
@@ -4554,7 +4557,7 @@ async fn dispatch_spawned_item(
     // `main`'s tip — the provision point — as the anchor. A failure cleans
     // up the provisioned worktree (the item never left `Pending` — it
     // stays queued with the reason in its note).
-    let checkpoint = match checkpoint_on_work_branch(worktree.clone(), item.clone()).await {
+    let checkpoint = match checkpoint_on_work_branch(worktree.clone(), item.id.clone(), item.text.clone()).await {
         Ok(sha) => sha,
         Err(e) => {
             state
@@ -4563,7 +4566,7 @@ async fn dispatch_spawned_item(
                 .lock()
                 .await
                 .annotate(&item.id, &format!("git checkpoint failed: {e}"));
-            let _ = mnemo::project::worktrees::remove_item_worktree(
+            let _ = mnemo::app::worktrees::remove_item_worktree(
                 state.project.root.lock().await.root.clone(),
                 worktree,
                 branch,
@@ -4588,7 +4591,7 @@ async fn dispatch_spawned_item(
     // Spawn the parentless worktree agent (its own plans dir inside the
     // worktree, a fresh code graph over the worktree tree). No prompt yet
     // — the record below lands first, then the send.
-    let short = mnemo::project::worktrees::item_short_id(&item.id);
+    let short = mnemo::app::worktrees::item_short_id(&item.id);
     let factory = state
         .runtime
         .factory
@@ -4644,7 +4647,7 @@ async fn dispatch_spawned_item(
         // the fill's skip arm) for a later re-dispatch.
         remove_spawned_run(state, agent_id).await;
         retire_spawned_agent(state, agent_id).await;
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             worktree,
             branch,
@@ -4682,10 +4685,10 @@ static DISPATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 async fn land_spawned_branch(
     state: &IpcState,
     spawned: &crate::ipc::state::SpawnedRun,
-) -> Result<mnemo::project::worktrees::Landed, mnemo::project::worktrees::LandError> {
+) -> Result<mnemo::app::worktrees::Landed, mnemo::app::worktrees::LandError> {
     let _guard = LANDING_LOCK.lock().await;
     let root = state.project.root.lock().await.root.clone();
-    mnemo::project::worktrees::land_item_branch(root, spawned.branch.clone()).await
+    mnemo::app::worktrees::land_item_branch(root, spawned.branch.clone()).await
 }
 
 /// Retire a spawned run-all agent after its item resolved (plan
@@ -4693,7 +4696,7 @@ async fn land_spawned_branch(
 /// same cleanup the forwarder's `Exited` arm performs (dropping the handle
 /// closes the agent's inbox; its `Exited` event then runs the idempotent
 /// remainder of that arm).
-async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::runtime::AgentId) {
+async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::AgentId) {
     state.runtime.manager.lock().await.remove(agent_id);
     state.runtime.agent_loops.lock().await.remove(&agent_id);
 }
@@ -4707,7 +4710,7 @@ async fn retire_spawned_agent(state: &IpcState, agent_id: mnemo::runtime::AgentI
 /// fill/resolution paths).
 pub(crate) async fn any_lane_in_flight(state: &IpcState) -> bool {
     let guard = state.backlog.run_all.lock().await;
-    guard.as_ref().map_or(false, lanes_in_flight)
+    guard.as_ref().is_some_and(lanes_in_flight)
 }
 
 /// Whether any lane of a run is still in flight (the per-run core of
@@ -4726,7 +4729,7 @@ fn lanes_in_flight(r: &crate::ipc::state::RunAllState) -> bool {
 }
 
 /// Remove a spawned run entry from the run state (plan ffd7a86f).
-async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::runtime::AgentId) {
+async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::AgentId) {
     let guard = state.backlog.run_all.lock().await;
     if let Some(r) = guard.as_ref() {
         r.spawned
@@ -4740,11 +4743,11 @@ async fn remove_spawned_run(state: &IpcState, agent_id: mnemo::runtime::AgentId)
 /// event forwarder's routing check (cheap: one run-state lock + scan).
 pub(crate) async fn owns_spawned_run(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> bool {
     let state = app.state::<IpcState>();
     let guard = state.backlog.run_all.lock().await;
-    guard.as_ref().map_or(false, |r| {
+    guard.as_ref().is_some_and(|r| {
         r.spawned
             .lock()
             .expect("spawned lock poisoned")
@@ -4788,7 +4791,7 @@ pub(crate) async fn owns_spawned_run(
 /// eligible remains).
 pub async fn on_spawned_turn_resolved(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
     success: bool,
     error: Option<String>,
     loop_evidence: bool,
@@ -4826,7 +4829,7 @@ pub async fn on_spawned_turn_resolved(
     let Some(item) = item else {
         // The item vanished mid-run — drop the entry + clean up.
         remove_spawned_run(&state, agent_id).await;
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             spawned.worktree.clone(),
             spawned.branch.clone(),
@@ -4851,7 +4854,7 @@ pub async fn on_spawned_turn_resolved(
         // worktree-aware (the plan file lives in the worktree's plans
         // dir; the commits are on the item's own branch).
         let agent_state = agent_workflow_state(&state, agent_id).await;
-        let closed_earlier = agent_state == Some(WorkflowState::Complete)
+        let closed_earlier = agent_state.as_deref() == Some("complete")
             && !loop_evidence
             && item.status == BacklogStatus::InFlight
             && orphan_work_landed_at(
@@ -4862,7 +4865,7 @@ pub async fn on_spawned_turn_resolved(
             )
             .await;
         match (agent_state, loop_evidence || closed_earlier) {
-            (Some(ws), true) if plan_loop_allows_done(ws, true) => {
+            (Some(ws), true) if plan_loop_allows_done(&ws, true) => {
                 // The same linkage guard as the main path: only a
                 // still-InFlight item that owns the completing plan
                 // flips.
@@ -4877,7 +4880,7 @@ pub async fn on_spawned_turn_resolved(
                 if may_flip {
                     // Commit the worktree's bookkeeping on the item's own
                     // branch (the WORKTREE root, never the main tree).
-                    if let Err(e) = commit_success(spawned.worktree.clone(), item.clone()).await
+                    if let Err(e) = commit_success(spawned.worktree.clone(), item.id.clone(), item.text.clone()).await
                     {
                         eprintln!(
                             "backlog: commit failed for spawned item {}: {e}",
@@ -4889,11 +4892,11 @@ pub async fn on_spawned_turn_resolved(
                     // note carries the conflicted paths — the work still
                     // counts as Done.
                     let note = match land_spawned_branch(&state, &spawned).await {
-                        Ok(mnemo::project::worktrees::Landed::Merged) => {
+                        Ok(mnemo::app::worktrees::Landed::Merged) => {
                             remove_worktree = true;
                             None
                         }
-                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                        Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                             // Backlog b52b041a: a protected main lands via
                             // PR — the branch is KEPT (the PR's head; the
                             // human merges), only the worktree goes, and
@@ -4905,7 +4908,7 @@ pub async fn on_spawned_turn_resolved(
                                 spawned.branch
                             ))
                         }
-                        Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                        Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
                                 "backlog: landing conflict for branch {} (kept for manual resolution): {}",
                                 spawned.branch,
@@ -4917,7 +4920,7 @@ pub async fn on_spawned_turn_resolved(
                                 files.join(", ")
                             ))
                         }
-                        Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                        Err(mnemo::app::worktrees::LandError::Git(e)) => {
                             eprintln!(
                                 "backlog: landing failed for branch {}: {e}",
                                 spawned.branch
@@ -5037,8 +5040,7 @@ pub async fn on_spawned_turn_resolved(
             //     for re-dispatch); the spawned run is over. No annotate
             //     (the re-queue note is recovery evidence — the bba2c82d
             //     discipline).
-            (Some(WorkflowState::Complete), false)
-                if item.status == BacklogStatus::Pending =>
+            (Some(s), false) if s == "complete" && item.status == BacklogStatus::Pending =>
             {
                 // Snapshot note + plan id BEFORE any transition (the
                 // transition overwrites the note; the checkpoint sha
@@ -5074,10 +5076,10 @@ pub async fn on_spawned_turn_resolved(
                     // arm's landing discipline).
                     let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done, not re-dispatched".to_string();
                     match land_spawned_branch(&state, &spawned).await {
-                        Ok(mnemo::project::worktrees::Landed::Merged) => {
+                        Ok(mnemo::app::worktrees::Landed::Merged) => {
                             remove_worktree = true;
                         }
-                        Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                        Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                             // Backlog b52b041a: a protected main lands via
                             // PR — the branch is KEPT (the PR's head), only
                             // the worktree goes, and the note carries the
@@ -5089,7 +5091,7 @@ pub async fn on_spawned_turn_resolved(
                                 spawned.branch
                             );
                         }
-                        Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                        Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                             eprintln!(
                                 "backlog: landing conflict for branch {} (kept for manual resolution): {}",
                                 spawned.branch,
@@ -5101,7 +5103,7 @@ pub async fn on_spawned_turn_resolved(
                                 files.join(", ")
                             );
                         }
-                        Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                        Err(mnemo::app::worktrees::LandError::Git(e)) => {
                             eprintln!(
                                 "backlog: landing failed for branch {}: {e}",
                                 spawned.branch
@@ -5150,7 +5152,7 @@ pub async fn on_spawned_turn_resolved(
                         .iter()
                         .find(|i| i.id == item.id)
                         .and_then(|i| i.note.as_deref())
-                        .map_or(false, |n| n.contains(note.as_str()))
+                        .is_some_and(|n| n.contains(note.as_str()))
                 };
                 if !already_waiting {
                     state.backlog.store.lock().await.annotate(&item.id, &note);
@@ -5214,7 +5216,7 @@ pub async fn on_spawned_turn_resolved(
                 .iter()
                 .find(|i| i.id == item.id)
                 .and_then(|i| i.note.as_deref())
-                .map_or(false, |n| n.contains(note.as_str()))
+                .is_some_and(|n| n.contains(note.as_str()))
         };
         if !already_waiting {
             state.backlog.store.lock().await.annotate(&item.id, &note);
@@ -5239,13 +5241,13 @@ pub async fn on_spawned_turn_resolved(
         // (a stale `wt/runall-*` branch would block later dispatches).
         let root = state.project.root.lock().await.root.clone();
         let _ = if keep_branch {
-            mnemo::project::worktrees::remove_worktree_only(
+            mnemo::app::worktrees::remove_worktree_only(
                 root,
                 spawned.worktree.clone(),
             )
             .await
         } else {
-            mnemo::project::worktrees::remove_item_worktree(
+            mnemo::app::worktrees::remove_item_worktree(
                 root,
                 spawned.worktree.clone(),
                 spawned.branch.clone(),
@@ -5264,12 +5266,12 @@ pub async fn on_spawned_turn_resolved(
         let guard = state.backlog.run_all.lock().await;
         guard
             .as_ref()
-            .map_or(false, |r| r.stop.load(Ordering::Relaxed))
+            .is_some_and(|r| r.stop.load(Ordering::Relaxed))
     };
     if stopped {
         let any_in_flight = {
             let guard = state.backlog.run_all.lock().await;
-            guard.as_ref().map_or(false, |r| {
+            guard.as_ref().is_some_and(|r| {
                 r.current_item
                     .lock()
                     .expect("current_item lock poisoned")
@@ -5299,7 +5301,7 @@ pub async fn on_spawned_turn_resolved(
 /// explains). No-op when the agent owns no spawned run.
 pub(crate) async fn drain_spawned_on_exit(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) {
     let state = app.state::<IpcState>();
     // Find + take THIS agent's spawned run.
@@ -5349,19 +5351,19 @@ pub(crate) async fn drain_spawned_on_exit(
             // for duplicate re-dispatch.
             let mut suffix = "work already landed (plan complete + commits after the checkpoint) — auto-resolved done".to_string();
             match land_spawned_branch(&state, &spawned).await {
-                Ok(mnemo::project::worktrees::Landed::Merged) => {
-                    let _ = mnemo::project::worktrees::remove_item_worktree(
+                Ok(mnemo::app::worktrees::Landed::Merged) => {
+                    let _ = mnemo::app::worktrees::remove_item_worktree(
                         state.project.root.lock().await.root.clone(),
                         spawned.worktree.clone(),
                         spawned.branch.clone(),
                     )
                     .await;
                 }
-                Ok(mnemo::project::worktrees::Landed::PullRequest(url)) => {
+                Ok(mnemo::app::worktrees::Landed::PullRequest(url)) => {
                     // Backlog b52b041a: a protected main lands via PR —
                     // the branch is KEPT (the PR's head), only the
                     // worktree goes, and the note carries the URL.
-                    let _ = mnemo::project::worktrees::remove_worktree_only(
+                    let _ = mnemo::app::worktrees::remove_worktree_only(
                         state.project.root.lock().await.root.clone(),
                         spawned.worktree.clone(),
                     )
@@ -5371,14 +5373,14 @@ pub(crate) async fn drain_spawned_on_exit(
                         spawned.branch
                     );
                 }
-                Err(mnemo::project::worktrees::LandError::Conflict(files)) => {
+                Err(mnemo::app::worktrees::LandError::Conflict(files)) => {
                     suffix = format!(
                         "{suffix} — merge conflict on landing (branch {} kept): {}",
                         spawned.branch,
                         files.join(", ")
                     );
                 }
-                Err(mnemo::project::worktrees::LandError::Git(e)) => {
+                Err(mnemo::app::worktrees::LandError::Git(e)) => {
                     suffix = format!(
                         "{suffix} — landing failed (branch {} kept): {e}",
                         spawned.branch
@@ -5427,7 +5429,7 @@ pub(crate) async fn drain_spawned_on_exit(
     // work of a crashed agent is not kept; the note explains). A landed
     // branch was handled above (removed on Ok, kept on conflict).
     if !landed {
-        let _ = mnemo::project::worktrees::remove_item_worktree(
+        let _ = mnemo::app::worktrees::remove_item_worktree(
             state.project.root.lock().await.root.clone(),
             spawned.worktree.clone(),
             spawned.branch.clone(),
@@ -5444,7 +5446,7 @@ pub(crate) async fn drain_spawned_on_exit(
         let guard = state.backlog.run_all.lock().await;
         guard
             .as_ref()
-            .map_or(false, |r| r.stop.load(Ordering::Relaxed))
+            .is_some_and(|r| r.stop.load(Ordering::Relaxed))
     };
     if stopped {
         if !any_lane_in_flight(&state).await {
@@ -5466,7 +5468,7 @@ pub(crate) async fn drain_spawned_on_exit(
 /// agent owns no spawned run.
 pub(crate) async fn stamp_spawned_in_flight(
     app: &tauri::AppHandle,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
     top_plan_id: Option<&str>,
 ) {
     let state = app.state::<IpcState>();
@@ -5554,7 +5556,7 @@ pub async fn on_main_turn_resolved(
         .take();
     if let Some(iv) = intervention {
         let closed_loop = match main_agent_workflow_state(&state).await {
-            Some(ws) => success && plan_loop_allows_done(ws, loop_evidence),
+            Some(ws) => success && plan_loop_allows_done(&ws, loop_evidence),
             // Unverifiable state: treat as not-closed (conservative —
             // mirrors the plan gate's "None is never success" rule).
             None => false,
@@ -5717,7 +5719,7 @@ async fn resolve_linked_chat_item(
     let Some(main_state) = main_agent_workflow_state(state).await else {
         return;
     };
-    if !plan_loop_allows_done(main_state, loop_evidence) {
+    if !plan_loop_allows_done(&main_state, loop_evidence) {
         return;
     }
     let Some(completed_plan) = main_agent_top_plan_id(state).await else {
@@ -5805,7 +5807,7 @@ async fn resolve_single_dispatch_turn(
                             .iter()
                             .find(|i| i.id == in_flight_id)
                             .and_then(|i| i.note.as_deref())
-                            .map_or(false, |n| n.contains(note.as_str()))
+                            .is_some_and(|n| n.contains(note.as_str()))
                     };
                     if !already_waiting {
                         state
@@ -5833,7 +5835,7 @@ async fn resolve_single_dispatch_turn(
                 resolved_terminally = false;
             }
         }
-        emit_backlog_changed(app, &state).await;
+        emit_backlog_changed(app, state).await;
     }
     if resolved_terminally && state.backlog.auto_feed.load(Ordering::Relaxed) {
         // Auto-feed only past a terminally resolved item (Done/Failed) or
@@ -5842,7 +5844,7 @@ async fn resolve_single_dispatch_turn(
         // and a still-`Pending` item means no plan ran (a re-dispatch would
         // loop on the same item).
         // A9: log the dispatch error instead of silently swallowing it.
-        if let Err(e) = dispatch_next_impl(app, &state).await {
+        if let Err(e) = dispatch_next_impl(app, state).await {
             eprintln!("backlog: auto-feed failed to dispatch next item: {e}");
         }
     }
@@ -5916,11 +5918,11 @@ async fn single_dispatch_disposition(
     if success {
         match (main_agent_workflow_state(state).await, loop_evidence) {
             (Some(main_state), true)
-                if plan_loop_allows_done(main_state, true) && may_flip_done =>
+                if plan_loop_allows_done(&main_state, true) && may_flip_done =>
             {
                 (Some(BacklogStatus::Done), None)
             }
-            (Some(main_state), true) if plan_loop_allows_done(main_state, true) => {
+            (Some(main_state), true) if plan_loop_allows_done(&main_state, true) => {
                 // The plan loop closed but the item does not own the
                 // completing plan — keep the item (status + note
                 // preserved), no transition.
@@ -6000,7 +6002,7 @@ enum RunAllItemDisposition {
 /// item exactly once).
 async fn flip_done_if_linked(
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     root: std::path::PathBuf,
     closed_earlier: bool,
 ) -> bool {
@@ -6023,7 +6025,7 @@ async fn flip_done_if_linked(
             .unwrap_or(false)
     };
     if may_flip {
-        if let Err(e) = commit_success(root.clone(), item.clone()).await {
+        if let Err(e) = commit_success(root.clone(), item.id.clone(), item.text.clone()).await {
             eprintln!("backlog: commit failed for item {}: {e}", item.id);
         }
         // The transition's OWN result is the return value (review round-2
@@ -6063,7 +6065,7 @@ async fn flip_done_if_linked(
 /// item transitioned.
 async fn flip_failed_if_abandonment_linked(
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     abandoned_plan_id: Option<&str>,
 ) -> bool {
     let may_flip = {
@@ -6122,7 +6124,7 @@ async fn flip_failed_if_abandonment_linked(
 /// the bba2c82d discipline). Returns whether the item transitioned.
 async fn resolve_slid_pending_item(
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
 ) -> bool {
     // Snapshot note + plan id BEFORE any transition (the transition
     // overwrites the note; the checkpoint sha must survive).
@@ -6186,8 +6188,8 @@ async fn resolve_slid_pending_item(
 async fn annotate_run_all_waiting(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
-    main_state: Option<WorkflowState>,
+    item: &mnemo::app::backlog::BacklogItem,
+    main_state: Option<String>,
 ) {
     let note = plan_open_note(main_state);
     // annotate APPENDS — skip only an EXACT repeat: the same note text (the
@@ -6202,7 +6204,7 @@ async fn annotate_run_all_waiting(
             .iter()
             .find(|i| i.id == item.id)
             .and_then(|i| i.note.as_deref())
-            .map_or(false, |n| n.contains(note.as_str()))
+            .is_some_and(|n| n.contains(note.as_str()))
     };
     if !already_waiting {
         state
@@ -6227,7 +6229,7 @@ async fn annotate_run_all_waiting(
 async fn annotate_run_all_error(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     error: Option<String>,
 ) {
     let note = error.unwrap_or_else(|| "turn failed".to_string());
@@ -6242,7 +6244,7 @@ async fn annotate_run_all_error(
             .iter()
             .find(|i| i.id == item.id)
             .and_then(|i| i.note.as_deref())
-            .map_or(false, |n| n.contains(note.as_str()))
+            .is_some_and(|n| n.contains(note.as_str()))
     };
     if !already_waiting {
         state
@@ -6276,19 +6278,19 @@ async fn annotate_run_all_error(
 async fn run_all_success_disposition(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     root: std::path::PathBuf,
     loop_evidence: bool,
     plan_abandoned: bool,
     abandoned_plan_id: Option<&str>,
 ) -> RunAllItemDisposition {
     let main_state_opt = main_agent_workflow_state(state).await;
-    let closed_earlier = main_state_opt == Some(WorkflowState::Complete)
+    let closed_earlier = main_state_opt.as_deref() == Some("complete")
         && !loop_evidence
         && item.status == BacklogStatus::InFlight
         && orphan_work_landed(state, item.plan_id.as_deref(), item.note.as_deref()).await;
     match (main_state_opt, loop_evidence || closed_earlier) {
-        (Some(main_state), true) if plan_loop_allows_done(main_state, true) => {
+        (Some(main_state), true) if plan_loop_allows_done(&main_state, true) => {
             if flip_done_if_linked(state, item, root, closed_earlier).await {
                 RunAllItemDisposition::Proceed {
                     terminal_resolution: true,
@@ -6318,7 +6320,7 @@ async fn run_all_success_disposition(
         }
         // (backlog 8a6bcece, review LOW-3 2027-01-08) The slid-resolution +
         // re-queued-item combination — see resolve_slid_pending_item.
-        (Some(WorkflowState::Complete), false) if item.status == BacklogStatus::Pending => {
+        (Some(s), false)        if s == "complete" && item.status == BacklogStatus::Pending => {
             if resolve_slid_pending_item(state, item).await {
                 RunAllItemDisposition::Proceed {
                     terminal_resolution: true,
@@ -6346,7 +6348,7 @@ async fn run_all_success_disposition(
 async fn run_all_failure_disposition(
     app: &tauri::AppHandle,
     state: &IpcState,
-    item: &mnemo::backlog::BacklogItem,
+    item: &mnemo::app::backlog::BacklogItem,
     plan_abandoned: bool,
     abandoned_plan_id: Option<&str>,
     error: Option<String>,
@@ -6580,7 +6582,7 @@ pub async fn halt_run_all(app: &tauri::AppHandle, reason: &str, stamp_failed: bo
         };
         let already_halted = current_note
             .as_deref()
-            .map_or(false, |n| n.contains("halted"));
+            .is_some_and(|n| n.contains("halted"));
         drop(guard);
         let Some(item_id) = &item_id else {
             // No in-flight item to mark, but still clear the run state
@@ -6616,7 +6618,6 @@ pub async fn halt_run_all(app: &tauri::AppHandle, reason: &str, stamp_failed: bo
                     .await
                     .annotate(item_id, &format!("{reason} — halted"));
             }
-            return;
         } else {
             // Steer/interrupt halt: record the reason in the note (the
             // checkpoint sha stays at its head; annotate appends) and hand
@@ -6738,7 +6739,7 @@ pub(crate) async fn orphan_work_landed_at(
 /// worktree's top-level plans dir (which only the main agent uses).
 fn spawned_plans_dir(
     worktree: &std::path::Path,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> std::path::PathBuf {
     worktree
         .join(".coding")
@@ -6889,11 +6890,11 @@ pub(crate) async fn main_agent_top_plan_id(state: &IpcState) -> Option<String> {
 /// sibling of [`main_agent_top_plan_id`] for spawned run-all agents).
 pub(crate) async fn agent_top_plan_id(
     state: &IpcState,
-    agent_id: mnemo::runtime::AgentId,
+    agent_id: mnemo::AgentId,
 ) -> Option<String> {
     let agent_loops = state.runtime.agent_loops.lock().await;
     let agent_loop = agent_loops.get(&agent_id)?;
-    let workflow = agent_loop.workflow_handle();
+    let workflow = crate::ipc::agent::workflow_concrete(&agent_loop.workflow_handle());
     let workflow = workflow.lock().await;
     workflow.top_plan_id().map(|id| id.to_string())
 }
@@ -7017,13 +7018,13 @@ pub(crate) async fn adopt_orphaned_in_flight(state: &IpcState) {
     if !requeued.is_empty() {
         let root = state.project.root.lock().await.root.clone();
         for id in requeued {
-            let _ = mnemo::project::worktrees::remove_item_worktree(
+            let _ = mnemo::app::worktrees::remove_item_worktree(
                 root.clone(),
                 root.join(".worktrees").join(format!(
                     "runall-{}",
-                    mnemo::project::worktrees::item_short_id(&id)
+                    mnemo::app::worktrees::item_short_id(&id)
                 )),
-                mnemo::project::worktrees::item_branch(&id),
+                mnemo::app::worktrees::item_branch(&id),
             )
             .await;
         }
@@ -7254,7 +7255,7 @@ async fn finish_captured_item_done(app: &tauri::AppHandle, state: &IpcState, id:
     // automatic rollback arm is gone (backlog 45dcf577); the sha stays in
     // the note as the manual resume/rollback anchor.)
     let root = state.project.root.lock().await.root.clone();
-    if let Err(e) = commit_success(root, item.clone()).await {
+    if let Err(e) = commit_success(root, item.id.clone(), item.text.clone()).await {
         eprintln!("backlog: commit failed for item {}: {e}", item.id);
     }
     state
@@ -7313,7 +7314,7 @@ async fn finish_captured_item_done(app: &tauri::AppHandle, state: &IpcState, id:
 /// Pure function (unit-testable without a Tauri `AppHandle`), mirroring
 /// [`plan_linkage_allows_done`].
 pub fn chat_linkage_candidate(
-    items: &[mnemo::backlog::BacklogItem],
+    items: &[mnemo::app::backlog::BacklogItem],
     current_plan: Option<&str>,
     superseded_plan: Option<&str>,
 ) -> Option<String> {
@@ -7344,7 +7345,7 @@ pub fn chat_linkage_candidate(
 /// Pure function (unit-testable without a Tauri `AppHandle`), the mirror of
 /// [`chat_linkage_candidate`].
 pub fn resolve_linkage_target(
-    items: &[mnemo::backlog::BacklogItem],
+    items: &[mnemo::app::backlog::BacklogItem],
     completed_plan: &str,
 ) -> Option<String> {
     let mut matches = items.iter().filter(|item| {
@@ -7361,8 +7362,8 @@ pub fn resolve_linkage_target(
 
 /// Whether a main-agent workflow transition ENTERS `Executing` — the stamp
 /// gate for [`stamp_backlog_in_flight`].
-pub fn should_stamp_in_flight(prev: Option<WorkflowState>, new: WorkflowState) -> bool {
-    matches!(new, WorkflowState::Executing) && prev != Some(WorkflowState::Executing)
+pub fn should_stamp_in_flight(prev: Option<&str>, new: &str) -> bool {
+    new == "executing" && prev != Some("executing")
 }
 
 /// Stamp the run-all's in-flight item (or the single-dispatch in-flight item)

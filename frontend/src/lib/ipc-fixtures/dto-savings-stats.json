@@ -1,0 +1,25 @@
+{
+  "cache": {
+    "cached_not_null_requests": 2,
+    "cached_tokens": 400,
+    "prompt_tokens": 1000,
+    "request_count": 3
+  },
+  "event_count": 3,
+  "per_day": [
+    {
+      "day": 20000,
+      "event_count": 2,
+      "saved_tokens": 800
+    }
+  ],
+  "per_kind": [
+    {
+      "event_count": 2,
+      "kind": "compaction",
+      "saved_tokens": 800
+    }
+  ],
+  "recent": [],
+  "saved_tokens_total": 1200
+}

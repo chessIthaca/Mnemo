@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 /// General preferences from `config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// The `[general]` section.
@@ -48,22 +48,6 @@ pub struct GeneralConfig {
     /// output before it reaches the LLM transcript (errors and summaries are
     /// always kept; raw output stays in the tool result's `data` field).
     pub shell_filter: ShellFilterConfig,
-}
-
-impl Default for GeneralConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralSection::default(),
-            context: ContextConfig::default(),
-            ui: UiConfig::default(),
-            models: ModelsConfig::default(),
-            markdown: MarkdownConfig::default(),
-            git: GitConfig::default(),
-            trace: TraceConfig::default(),
-            memory: crate::memory::MemorySearchConfig::default(),
-            shell_filter: ShellFilterConfig::default(),
-        }
-    }
 }
 
 /// The `[general]` section of `config.toml`.
@@ -852,6 +836,13 @@ pub struct ModelsConfig {
     /// UI's spawn button with a parent). Falls back to the workflow-state
     /// override, then the default.
     pub subagent: Option<ModelRef>,
+    /// Model for a headless / policy-less agent loop (`[models.free]`, the
+    /// routing contract master-spec :241-246): `NoPolicy` emits the
+    /// `["free"]` routing key, so a free-running agent resolves this slot,
+    /// then the default. Unset = the default model (every existing config
+    /// behaves exactly as before — the field serde-defaults with the
+    /// section).
+    pub free: Option<ModelRef>,
     /// Model for compaction summaries — the auto-compaction summary call and
     /// the run-all between-items compact. Unset = the turn's model (today's
     /// behavior: no config, no change). Like [`Self::reviewing`], this slot
@@ -1099,7 +1090,9 @@ pub struct UiConfig {
     pub show_knowledge_activity: bool,
     /// Show the AUTO-DELEGATED steering line that `search` / `search_read`
     /// emit when a symbol-shaped query is auto-delegated to the code graph
-    /// or memory (raw fast-path block or `note: `-prefixed prepend).
+    /// or memory (a `note: `-prefixed prepend above the plain results —
+    /// backlog c439dda0: the file matches always follow in the same
+    /// response).
     /// GUI-only display filter: the tool result
     /// text (the model's context, including the re-issue escape-hatch hint)
     /// is unaffected — only the chat ToolCard's rendering hides the line;
@@ -2825,6 +2818,7 @@ model = "deepseek-v4-flash"
             context: ContextConfig::default(),
             ui: UiConfig::default(),
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),
@@ -2875,6 +2869,7 @@ model = "deepseek-v4-flash"
         let path = dir.path().join("config.toml");
         let cfg = GeneralConfig {
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),
@@ -2933,6 +2928,7 @@ reasoning_effort = "off"
     fn models_section_reasoning_effort_round_trips() {
         let cfg = GeneralConfig {
             models: ModelsConfig {
+                free: None,
                 planning: Some(ModelRef {
                     endpoint: "openai".into(),
                     model: "o3".into(),

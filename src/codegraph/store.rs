@@ -537,7 +537,7 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (id, name, kind, file, start_line, end_line) = row?;
-            let Some(kind) = SymbolKind::from_str(&kind) else {
+            let Some(kind) = SymbolKind::from_str_opt(&kind) else {
                 continue; // unknown kind from a future version — skip, never fail
             };
             out.push(Symbol {
@@ -567,7 +567,7 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (from_id, to_id, kind) = row?;
-            let Some(kind) = EdgeKind::from_str(&kind) else {
+            let Some(kind) = EdgeKind::from_str_opt(&kind) else {
                 continue;
             };
             out.push(EdgeRow {
@@ -600,7 +600,7 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (id, name, kind, file, start_line, end_line) = row?;
-            let Some(kind) = SymbolKind::from_str(&kind) else {
+            let Some(kind) = SymbolKind::from_str_opt(&kind) else {
                 continue;
             };
             out.push(Symbol {

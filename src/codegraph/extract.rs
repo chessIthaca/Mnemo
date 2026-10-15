@@ -71,7 +71,9 @@ impl SymbolKind {
     }
 
     /// Parse back from [`SymbolKind::as_str`] output; `None` on unknown.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// (`_opt`: an Option-returning parse — deliberately NOT
+    /// `std::str::FromStr`, which would force a `Result` + error type.)
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         Some(match s {
             "function" => Self::Function,
             "method" => Self::Method,
@@ -113,7 +115,9 @@ impl EdgeKind {
     }
 
     /// Parse back from [`EdgeKind::as_str`] output; `None` on unknown.
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// (`_opt`: an Option-returning parse — deliberately NOT
+    /// `std::str::FromStr`, which would force a `Result` + error type.)
+    pub fn from_str_opt(s: &str) -> Option<Self> {
         Some(match s {
             "calls" => Self::Calls,
             "imports" => Self::Imports,
@@ -188,6 +192,12 @@ fn module_id(rel: &str) -> String {
 /// constructing one per block. Not `Sync` — each worker owns its own.
 pub struct ParserCache {
     by_lang: HashMap<Lang, tree_sitter::Parser>,
+}
+
+impl Default for ParserCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ParserCache {
@@ -761,7 +771,7 @@ fn visit_php(node: tree_sitter::Node, ctx: &mut Ctx) {
                 let mut leaf = String::new();
                 walk_for_kind(child, &["name", "qualified_name"], &mut |n| {
                     if leaf.is_empty() {
-                        if let Some(last) = ctx.text(n).split('\\').filter(|s| !s.is_empty()).last() {
+                        if let Some(last) = ctx.text(n).split('\\').rfind(|s| !s.is_empty()) {
                             leaf = last.to_string();
                         }
                     }
@@ -1369,7 +1379,7 @@ fn php_use_names(node: tree_sitter::Node, ctx: &Ctx, out: &mut Vec<String>) {
     match node.kind() {
         "name" | "qualified_name" => {
             let text = ctx.text(node);
-            if let Some(last) = text.split('\\').filter(|s| !s.is_empty()).last() {
+            if let Some(last) = text.split('\\').rfind(|s| !s.is_empty()) {
                 out.push(last.to_string());
             }
         }
@@ -2422,13 +2432,13 @@ namespace App {
             SymbolKind::TsEnum,
             SymbolKind::Module,
         ] {
-            assert_eq!(SymbolKind::from_str(k.as_str()), Some(k));
+            assert_eq!(SymbolKind::from_str_opt(k.as_str()), Some(k));
         }
-        assert_eq!(SymbolKind::from_str("nope"), None);
+        assert_eq!(SymbolKind::from_str_opt("nope"), None);
         for k in [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::Contains] {
-            assert_eq!(EdgeKind::from_str(k.as_str()), Some(k));
+            assert_eq!(EdgeKind::from_str_opt(k.as_str()), Some(k));
         }
-        assert_eq!(EdgeKind::from_str("nope"), None);
+        assert_eq!(EdgeKind::from_str_opt("nope"), None);
     }
 
     #[test]

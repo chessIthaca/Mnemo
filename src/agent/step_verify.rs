@@ -96,6 +96,7 @@ pub enum VerifyOutcome {
 /// consumers (the `complete_step` tool and the agent loop's action=verify
 /// path); both read the same live config, so a Settings save is observed on
 /// the next boundary with no rebuild.
+#[derive(Clone)]
 pub struct StepVerifyHandle {
     cfg: Arc<RwLock<VerifyConfig>>,
     optimizer: Arc<RwLock<OptimizerConfig>>,
@@ -261,8 +262,7 @@ fn pass_summary(stdout: &str, stderr: &str) -> String {
         .lines()
         .chain(stderr.lines())
         .map(|line| line.trim_end_matches('\r').trim())
-        .filter(|line| !line.is_empty())
-        .next_back()
+        .rfind(|line| !line.is_empty())
         .unwrap_or("");
     let line = output_compactor::redact_secrets(line);
     if line.chars().count() > MAX_SUMMARY_CHARS {

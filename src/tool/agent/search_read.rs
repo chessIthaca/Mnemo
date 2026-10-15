@@ -11,10 +11,11 @@
 //!
 //! AUTO-DELEGATION (backlog b804012f): same contract as `search` — a symbol
 //! hunt the graph can answer (or a memory-targeted query: knowledge/reviews
-//! globs, typed SPEC:/DECISION:/… prefixes) gets the answer inline and the
-//! search+read is skipped entirely; re-issuing the SAME query runs the
-//! plain search+read (the escape hatch). See search.rs for the full
-//! contract.
+//! globs, typed SPEC:/DECISION:/… prefixes) gets the answer inline above
+//! the normal search+read results in the SAME response — never skipped, no
+//! identical re-issue (backlog c439dda0); re-issuing the SAME query drops
+//! the block and runs the plain search+read alone (the escape hatch). See
+//! search.rs for the full contract.
 //!
 //! OPTIONAL CLASSIFIER STEERING (backlog e2c47d5f): identical contract to
 //! `search` — with the opt-in `[general.laya] steer_tool_choice` flag on and
@@ -146,17 +147,20 @@ impl Tool for SearchReadTool {
             "Search + auto-read in one call: the same content search as `search`, then reads \
              the top matched files' full numbered content — collapsing the search→read \
              round-trip. Literal queries use the content index when populated (engine: \
-             index), walking otherwise. Build output and dependencies are always skipped. \
+             index), walking otherwise. A regex alternation whose every branch is an \
+             escape-only literal is served by per-branch index lookups, merged. \
+             Build output and dependencies are always skipped. \
               ESCAPE-HATCH: for text with regex metacharacters or backslashes \
               prefer literal:true (it avoids escaping); if a call is rejected as \
               malformed, do NOT resend it — reformulate. \
                Returns a summary line, then the matched files (capped per-file and total). \
-              For symbol questions — where is X defined, who calls X — call graph_search \
-              (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
-              symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
-              prefixes), auto-delegate: the answer rides inline and the search+read is skipped; \
-              re-issue the same search to get the plain search. With the optional Laya \
-              tool-choice classifier on and confident, it picks that route itself; otherwise the heuristics stand.",
+               For symbol questions — where is X defined, who calls X — call graph_search \
+               (then graph_context(id=...)) FIRST; symbol-shaped patterns naming an indexed \
+               symbol, and memory hunts (.coding/knowledge|reviews globs, typed SPEC:/DECISION:/ \
+               prefixes), auto-delegate: the answer rides inline above the matched files' \
+               reads in the same response — nothing is skipped; re-issue the same search \
+               to drop the block. With the optional Laya \
+               tool-choice classifier on and confident, it picks that route itself; otherwise the heuristics stand.",
             json!({
                 "type": "object",
                 "properties": {
@@ -192,8 +196,7 @@ impl Tool for SearchReadTool {
         let max_files = args
             .max_files
             .unwrap_or(MAX_FILES_TO_READ)
-            .min(MAX_FILES_TO_READ)
-            .max(1);
+            .clamp(1, MAX_FILES_TO_READ);
 
         let sandbox = self.sandbox.clone();
         let root = sandbox.root().to_path_buf();
@@ -267,13 +270,18 @@ impl Tool for SearchReadTool {
             };
             let re = compiled.regex;
             let fallback_note = compiled.fallback_note;
+            // Backlog c439dda0: captured here, before merged_note moves
+            // `fallback_note` — the alternation split gate below must know
+            // whether the regex compiled clean (a fallback-fired pattern
+            // matches verbatim, review B1 — never split).
+            let fallback_fired = fallback_note.is_some();
 
             // Auto-delegation (backlog b804012f): same contract as `search`
             // — a symbol hunt the graph can answer (or a memory-targeted
-            // query) gets the answer inline; when it fully serves the query
-            // the search+read is skipped entirely and the key is recorded
-            // for the escape hatch; a symbol hunt narrowed by a glob
-            // prepends the block above the normal results instead.
+            // query) gets the answer inline; the block PREPENDS above the
+            // normal search+read results in the SAME response (backlog
+            // c439dda0 — never skipped, no identical re-issue), and the
+            // key is recorded so the repeat drops the block (escape hatch).
             let symbol_block = if escape || !allow_symbol {
                 None
             } else {
@@ -283,7 +291,6 @@ impl Tool for SearchReadTool {
                     })
                 })
             };
-            let memory_delegated = memory_block.is_some();
             let delegated = memory_block.or(symbol_block);
             if log_live {
                 crate::tool::agent::tool_choice::log_decision(
@@ -298,12 +305,12 @@ impl Tool for SearchReadTool {
             }
             let mut prepended: Option<String> = None;
             if let Some(block) = delegated {
-                // Record the key on BOTH arms: the fast-path return AND the
-                // glob-narrowed prepend — the block promises the escape
-                // ("re-issue this exact search…") either way, so the repeat
-                // must run the plain search+read (review 2026-12-28 H1). Set
-                // semantics: the key joins the bypass set (dedup, bounded —
-                // oldest evicted) without replacing other queries' escapes.
+                // Record the key on the delegated arm — the block promises
+                // the escape ("re-issue this exact search…"), so the repeat
+                // must run the plain search+read (review 2026-12-28 H1).
+                // Set semantics: the key joins the bypass set (dedup,
+                // bounded — oldest evicted) without replacing other
+                // queries' escapes.
                 {
                     let mut set = delegation_state.lock().unwrap();
                     set.retain(|k| *k != key);
@@ -311,9 +318,11 @@ impl Tool for SearchReadTool {
                     let overflow = set.len().saturating_sub(search::DELEGATION_SET_CAP);
                     set.drain(..overflow);
                 }
-                if memory_delegated || args.glob.is_none() {
-                    return ToolResult::success(block);
-                }
+                // Backlog c439dda0: the search+read is NEVER skipped — the
+                // block rides ABOVE the normal results in the SAME
+                // response, so no identical re-issue is needed; the
+                // recorded key keeps the escape hatch (repeat = plain
+                // search+read without the block).
                 prepended = Some(block);
             }
 
@@ -406,6 +415,72 @@ impl Tool for SearchReadTool {
                             ));
                         }
                         None => {}
+                    }
+                }
+            }
+            // Backlog c439dda0: same alternation contract as `search` —
+            // every branch an escape-only literal → per-branch index run,
+            // merged, deduped, regex-verified; any branch miss or
+            // staleness falls the whole query back to the walk+read below.
+            if !args.literal && !fallback_fired && !args.pattern.contains('\n') {
+                if let Some(branches) = search::split_alternation_literals(&args.pattern) {
+                    if let Some(g) = &graph {
+                        match search::try_index_alternation(
+                            g,
+                            &root,
+                            &branches,
+                            args.glob.as_deref(),
+                            &re,
+                        ) {
+                            Some(search::FtsOutcome::Hits(ix)) => {
+                                let note = if ix.reindexed > 0 {
+                                    let sample = search::log_stale(
+                                        staleness_log.as_ref(),
+                                        "search_read",
+                                        &root,
+                                        &ix.stale,
+                                        crate::index_staleness::Action::InlineReindex,
+                                    );
+                                    search::push_note(
+                                        note,
+                                        format!(
+                                            "reindexed {} stale file(s){} — serving fresh index results",
+                                            ix.reindexed,
+                                            search::stale_detail(
+                                                &sample,
+                                                ix.stale.len(),
+                                                staleness_log.is_some()
+                                            )
+                                        ),
+                                    )
+                                } else {
+                                    note
+                                };
+                                return build_index_output(ix, max_files, &sandbox, &note);
+                            }
+                            Some(search::FtsOutcome::Stale { stale, repaired }) => {
+                                search::log_stale(
+                                    staleness_log.as_ref(),
+                                    "search_read",
+                                    &root,
+                                    &repaired,
+                                    crate::index_staleness::Action::InlineReindex,
+                                );
+                                let sample = search::log_stale(
+                                    staleness_log.as_ref(),
+                                    "search_read",
+                                    &root,
+                                    &stale,
+                                    crate::index_staleness::Action::SurfacedOnly,
+                                );
+                                stale_note = Some(format!(
+                                    "content index stale for {} file(s){} — serving tree-walk results",
+                                    stale.len(),
+                                    search::stale_detail(&sample, stale.len(), staleness_log.is_some())
+                                ));
+                            }
+                            None => {}
+                        }
                     }
                 }
             }
@@ -816,6 +891,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alternation_of_literal_branches_uses_index_engine() {
+        // Backlog c439dda0 (mirror of search.rs): a regex alternation of
+        // escape-only literal branches rides the per-branch index run —
+        // merged hits, relevance-ranked reads — instead of walking.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("store.rs"), "open memory.db\n").unwrap();
+        std::fs::write(dir.path().join("graph.rs"), "read codegraph.db\n").unwrap();
+        let tool = make_indexed_tool(dir.path());
+        let result = tool
+            .execute(json!({"pattern": "memory\\.db|codegraph\\.db"}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("engine: index"),
+            "alternation of literal branches is index-served: {}",
+            result.output
+        );
+        assert!(result.output.contains("=== store.rs"), "{}", result.output);
+        assert!(result.output.contains("=== graph.rs"), "{}", result.output);
+    }
+
+    #[tokio::test]
     async fn empty_index_falls_back_to_walk() {
         // Graph present but never indexed → zero content rows → walk.
         let dir = tempdir().unwrap();
@@ -1128,7 +1225,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("SYMBOL", 0.9, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "{}",
             r.output
         );
@@ -1144,7 +1241,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.5, true));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "below threshold keeps the heuristics: {}",
             r.output
         );
@@ -1159,7 +1256,7 @@ mod tests {
             make_indexed_tool(dir.path()).with_tool_choice(steering_handle("TEXT", 0.99, false));
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph"),
+            r.output.contains("AUTO-DELEGATED to the code graph"),
             "disabled keeps the heuristics: {}",
             r.output
         );
@@ -1168,18 +1265,18 @@ mod tests {
     #[tokio::test]
     async fn bare_identifier_symbol_search_earns_the_graph_nudge() {
         // Mirrors search.rs: grepping a symbol name DELEGATES — the graph
-        // answers inline and the search+read is skipped; the escape repeat
-        // runs the plain search+read with the advisory nudge above the
-        // summary + read sections. A spaced pattern (a text search) never
-        // delegates nor nudges.
+        // answer rides inline ABOVE the summary + read sections (backlog
+        // c439dda0 — same response, no re-issue); the escape repeat runs
+        // the plain search+read with the advisory nudge above them. A
+        // spaced pattern (a text search) never delegates nor nudges.
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\nfn world() {}").unwrap();
         let tool = make_indexed_tool(dir.path());
         let r = tool.execute(json!({"pattern": "hello"})).await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to the code graph — 'hello' is an indexed symbol"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(r.output.contains("def: a.rs::hello::1"), "{}", r.output);
@@ -1189,8 +1286,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("=== a.rs"),
-            "the search+read is skipped entirely: {}",
+            r.output.contains("=== a.rs"),
+            "the search+read runs in the same response: {}",
             r.output
         );
 
@@ -1222,7 +1319,8 @@ mod tests {
     #[tokio::test]
     async fn memory_targeted_query_delegates_and_skips_the_read() {
         // Backlog b804012f, search_read twin: a knowledge-dir glob gets the
-        // recall answer inline — the search+read is skipped entirely.
+        // recall answer inline above the plain search+read results (backlog
+        // c439dda0 — same response, no re-issue).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn hello() {}\n").unwrap();
         let store: std::sync::Arc<dyn crate::memory::MemoryStoreTrait> = {
@@ -1246,8 +1344,8 @@ mod tests {
             .await;
         assert!(r.success, "{}", r.output);
         assert!(
-            r.output.starts_with("AUTO-DELEGATED to memory"),
-            "prepended: {}",
+            r.output.contains("AUTO-DELEGATED to memory"),
+            "the delegated block rides inline: {}",
             r.output
         );
         assert!(
@@ -1256,8 +1354,8 @@ mod tests {
             r.output
         );
         assert!(
-            !r.output.contains("=== "),
-            "the search+read is skipped entirely: {}",
+            r.output.contains("no matches"),
+            "the plain search runs in the same response (the glob matches nothing here): {}",
             r.output
         );
 

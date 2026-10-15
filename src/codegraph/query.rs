@@ -414,7 +414,7 @@ impl GraphView {
         }
         // Kind filter (as_str form; an unknown kind string matches nothing).
         if let Some(kind) = filter.kind {
-            let wanted = SymbolKind::from_str(kind);
+            let wanted = SymbolKind::from_str_opt(kind);
             candidates.retain(|&i| Some(self.symbols[i].kind) == wanted);
         }
         // Cap: most-connected first, id as tiebreaker.

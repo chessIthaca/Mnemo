@@ -264,7 +264,7 @@ impl Tool for MultiEditTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema::new(
             "multi_edit",
-            &format!(
+            format!(
                 "{} Apply ops to SEVERAL files ATOMICALLY: nothing is written until \
                  every file applies cleanly, so a failing op leaves ALL files untouched. \
                  Entries are {{path, ops}} — the ops array is file_edit's (compact line \

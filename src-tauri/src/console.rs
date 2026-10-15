@@ -28,16 +28,16 @@
 
 use std::sync::Arc;
 
-use mnemo::agent::factory::AgentLoopFactory;
-use mnemo::config::{Config, ModelRef};
+use mnemo::config::Config;
 use mnemo::provider::trace::LlmRequestLog;
-use mnemo::runtime::channels::{AgentEvent, Approval, QuestionOption, UserAnswer};
-use mnemo::runtime::{
-    AgentCommand, AgentId, AgentManager, AgentSpawner, DescendantTracker, ParentAwareSpawner,
+use mnemo::{
+    AgentCommand, AgentEvent, AgentId, Approval, QuestionOption, UserAnswer,
 };
 use mnemo::tool::ToolResult;
 
-use crate::ipc::state::AgentLoopMap;
+use mnemo::headless::HostRuntime;
+#[cfg(test)]
+use mnemo::runtime::ParentAwareSpawner;
 
 /// The reasoning-effort values the status-bar picker offers; `/reasoning`
 /// validates its argument against this list before swapping.
@@ -342,6 +342,12 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             lines.push("  approve? [y]es / [n]o / [a]ll-no".to_string());
             Rendered::Lines(lines)
         }
+        // 2c.5 (§5.4 :365-369): the audit trail for a gated call that
+        // executed WITHOUT approval (the loop's policy is
+        // OverridePermissions) — one notice line, like steer-landed.
+        AgentEvent::ApprovalBypassed { tool, reason } => {
+            Rendered::Lines(vec![format!("· approval bypassed: {tool} ({reason})")])
+        }
         AgentEvent::Finished { .. } => Rendered::Lines(vec![String::new()]),
         // Phase transitions are UI state, not console text — silent (the
         // console REPL has no inflight bar to update).
@@ -388,6 +394,21 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
                 truncate(description, 160)
             )])
         }
+        // R8 (§9, job 3b.4): the live `Savings`/`Spend` ledger events are
+        // display-only telemetry — the console (like the GUI forwarder)
+        // never prints them; the durable ledger + the stats pulls are
+        // their consumers.
+        AgentEvent::Savings { .. } | AgentEvent::Spend { .. } => Rendered::Silent,
+        // 3c (§5.9.2/§5.9.6): host-tool calls + external-policy hooks are
+        // headless-engine interactions — the console's app-spawned agents
+        // never produce them, but the match stays exhaustive: a one-line
+        // notice if one ever arrives.
+        AgentEvent::HostToolCall { name, .. } => {
+            Rendered::Lines(vec![format!("— host tool call: {name} (awaiting the host's result)")])
+        }
+        AgentEvent::PolicyHook { hook_kind, .. } => Rendered::Lines(vec![format!(
+            "— policy hook {hook_kind:?} (awaiting the answer)"
+        )]),
     }
 }
 
@@ -498,7 +519,7 @@ pub(crate) fn help_text() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Headless core — ConsoleRuntime + ConsoleSpawner
+// Headless core — ConsoleRuntime + HostSpawner
 // ---------------------------------------------------------------------------
 
 /// The console's tracked model selection — the endpoint + model the live
@@ -569,331 +590,70 @@ fn model_swap_effort(sel: Option<&ModelSelection>, target_supports: bool) -> Opt
     sel.requested_effort.clone()
 }
 
-/// The console's [`AgentSpawner`] — the AppHandle-free twin of
-/// [`crate::ipc::spawn::IpcSpawner`]. Delegates to the same shared spawn
-/// path (`spawn_agent_shared`) so a console-spawned background agent is
-/// indistinguishable from a GUI one (own workflow, manager registration,
-/// loop-map tracking). Two GUI-only niceties are skipped: no
-/// `PromptDispatched` event (it exists purely to render the task as the
-/// first message in a UI transcript) and no `ChildFinished` emit (a
-/// sidebar-only marker) — the parent completion Suggestion IS sent, by the
-/// console's [`LifecycleBookkeeping`], with the same text the GUI uses.
-pub(crate) struct ConsoleSpawner {
-    factory: Arc<AgentLoopFactory>,
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
-}
-
-impl ConsoleSpawner {
-    /// Create a spawner over the shared runtime pieces.
-    pub(crate) fn new(
-        factory: Arc<AgentLoopFactory>,
-        manager: Arc<tokio::sync::Mutex<AgentManager>>,
-        agent_loops: AgentLoopMap,
-    ) -> Self {
-        Self {
-            factory,
-            manager,
-            agent_loops,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl AgentSpawner for ConsoleSpawner {
-    /// Spawn a background agent with no parent and no forced model —
-    /// delegates to `spawn_with_parent` with both as `None` (mirrors
-    /// `IpcSpawner`).
-    async fn spawn(&self, name: &str, task: &str, role: Option<String>) -> Result<AgentId, String> {
-        self.spawn_with_parent(name, task, None, None, role).await
-    }
-
-    /// This spawner is parent-aware (tool-spawned agents record their
-    /// parent, closing the completion-notification loop).
-    fn parent_aware(&self) -> Option<&dyn ParentAwareSpawner> {
-        Some(self)
-    }
-}
-
-#[async_trait::async_trait]
-impl ParentAwareSpawner for ConsoleSpawner {
-    /// Spawn a background agent on behalf of the given parent (the agent
-    /// whose `spawn_agent` tool call triggered this). Same semantics as
-    /// `IpcSpawner::spawn_with_parent` minus the UI-only event emit.
-    async fn spawn_with_parent(
-        &self,
-        name: &str,
-        task: &str,
-        parent_id: Option<AgentId>,
-        model: Option<ModelRef>,
-        role: Option<String>,
-    ) -> Result<AgentId, String> {
-        let (id, _) = crate::ipc::spawn::spawn_agent_shared(
-            self.factory.clone(),
-            self.manager.clone(),
-            self.agent_loops.clone(),
-            name.to_string(),
-            Some(task.to_string()),
-            parent_id,
-            model,
-            role,
-            false, // own_plans_dir — subagents share the main dir (can't mutate)
-            None, // no worktree binding — subagents inherit the parent's root
-        )
-        .await?;
-        Ok(id)
-    }
-}
-
-#[async_trait::async_trait]
-impl DescendantTracker for ConsoleSpawner {
-    /// Whether the agent has any running spawned descendants — delegates to
-    /// the manager's `parent_id`-chain walk, same as the IPC twin.
-    async fn has_running_descendants(&self, agent_id: AgentId) -> bool {
-        let mgr = self.manager.lock().await;
-        mgr.has_running_descendants(agent_id)
-    }
-}
-
-/// Console-side lifecycle bookkeeping — the console's equivalent of the GUI
-/// event forwarder's manager maintenance, minus the UI emits. The REPL calls
-/// one of these for EVERY agent event, exactly where the forwarder would:
-///
-/// - [`on_started`](Self::on_started) / [`on_turn_ended`](Self::on_turn_ended)
-///   keep `AgentHandle.running` current. Those flags drive two security-
-///   relevant behaviors that silently break without maintenance: the
-///   workflow state-transition gate ("no plan mutations while subagents
-///   run", via [`DescendantTracker`]) and
-///   `cleanup_inactive_subagents` (which must never Cancel a RUNNING child).
-/// - [`on_turn_ended`](Self::on_turn_ended) also sends the child's parent the
-///   completion-notification `Suggestion` (once per child, with the child's
-///   `last_review_report` path — the same text the GUI forwarder composes),
-///   closing the orchestrator feedback loop.
-/// - [`on_exited`](Self::on_exited) removes the dead agent from the manager
-///   and the per-agent loop map, so both stay bounded over a long session.
-struct LifecycleBookkeeping {
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
-    /// Children already notified (first terminal event wins — a multi-turn
-    /// child must not re-notify its parent).
-    notified_children: std::sync::Mutex<std::collections::HashSet<AgentId>>,
-}
-
-impl LifecycleBookkeeping {
-    /// Create bookkeeping over the shared manager + loop map.
-    fn new(manager: Arc<tokio::sync::Mutex<AgentManager>>, agent_loops: AgentLoopMap) -> Self {
-        Self {
-            manager,
-            agent_loops,
-            notified_children: std::sync::Mutex::new(std::collections::HashSet::new()),
-        }
-    }
-
-    /// The agent started a turn — mark it running.
-    pub(crate) async fn on_started(&self, id: AgentId) {
-        self.manager.lock().await.set_running(id, true);
-    }
-
-    /// The agent's turn ended (a `Finished` or a final non-retrying `Error`)
-    /// — mark it idle and, for a tool-spawned child, notify its parent once.
-    /// `success` mirrors the GUI forwarder: `true` for `Finished`, `false`
-    /// for a final error (drives the failed-reviewer protocol).
-    pub(crate) async fn on_turn_ended(&self, id: AgentId, success: bool) {
-        {
-            let mgr = self.manager.lock().await;
-            mgr.set_running(id, false);
-        }
-        // Notify at most once per child (mirrors the forwarder's
-        // `notified_children` set — the insert decides, before the
-        // parent-existence check, exactly like `events.rs`).
-        if self
-            .notified_children
-            .lock()
-            .expect("notified_children lock poisoned")
-            .insert(id)
-        {
-            self.notify_parent(id, success).await;
-        }
-    }
-
-    /// The agent's task truly terminated — mark it idle and remove it from
-    /// the manager + the per-agent loop map (and from the notified set, so
-    /// neither grows without bound over a long session).
-    pub(crate) async fn on_exited(&self, id: AgentId) {
-        {
-            let mut mgr = self.manager.lock().await;
-            mgr.set_running(id, false);
-            mgr.remove(id);
-        }
-        self.agent_loops.lock().await.remove(&id);
-        self.notified_children
-            .lock()
-            .expect("notified_children lock poisoned")
-            .remove(&id);
-    }
-
-    /// Send the child's parent the completion-notification `Suggestion`,
-    /// including the child's last review-report path when it wrote one — the
-    /// same composition as the GUI's `notify_parent_on_completion` (minus
-    /// the sidebar-only `ChildFinished` emit), including the failed-reviewer
-    /// protocol: a `role: "reviewer"` child that ended (failed OR finished
-    /// cleanly) with no report sets the parent's reviewer-failure latch and
-    /// gets the ask-the-user text instead of the generic no-report steer.
-    /// Best-effort: a full inbox or a gone parent drops the notification
-    /// silently (a nicety, not a guarantee — same as the GUI).
-    async fn notify_parent(&self, id: AgentId, success: bool) {
-        let (parent_id, child_name, child_role) = {
-            let mgr = self.manager.lock().await;
-            let Some(pid) = mgr.parent_id(id) else {
-                return; // no parent (the main agent / a UI-spawned agent)
-            };
-            let name = mgr
-                .get(id)
-                .map(|h| h.name.clone())
-                .unwrap_or_else(|| format!("agent-{id}"));
-            let role = mgr.role(id);
-            (pid, name, role)
-        };
-        let report_path: Option<String> = self
-            .agent_loops
-            .lock()
-            .await
-            .get(&id)
-            .map(|l| l.last_review_report())
-            .flatten();
-        // Backlog 5b46674d: no !success gate — a reviewer that FINISHES
-        // report-less is just as report-less as a failed one (the review did
-        // not happen either way).
-        let reviewer_failed_no_report =
-            child_role.as_deref() == Some("reviewer") && report_path.is_none();
-        if reviewer_failed_no_report {
-            if let Some(parent_loop) = {
-                let loops = self.agent_loops.lock().await;
-                loops.get(&parent_id).cloned()
-            } {
-                parent_loop.set_reviewer_failure_pending(true);
-            }
-        }
-        let text = if reviewer_failed_no_report {
-            mnemo::runtime::turn_resolve::reviewer_failure_suggestion_text(&child_name)
-        } else {
-            let outcome = if success { "finished" } else { "failed" };
-            mnemo::runtime::turn_resolve::completion_suggestion_text(
-                &child_name,
-                outcome,
-                report_path.as_deref(),
-            )
-        };
-        let mgr = self.manager.lock().await;
-        let _ = mgr.send(parent_id, AgentCommand::Suggestion(text.into()));
-    }
-}
-
-/// The headless core of console mode: the brain + agent manager + per-agent
-/// loop map + the fan-in event receiver, with typed operations.
+/// The headless core of console mode: the brain + the shared
+/// [`HostRuntime`] (agent manager, per-agent loop map, spawner, fan-in
+/// receiver, bookkeeping) + the console's own state, with typed
+/// operations.
 ///
 /// This is the seam a future headless daemon reuses — nothing here reads
 /// stdin, writes to stdout, or touches a Tauri `AppHandle`. The REPL
 /// (`run_console`) is a thin interactive frontend over these operations; a
 /// daemon would drive the same ops from a socket/stdin-less loop instead.
+/// Since 3a.2 (D2) the shared core itself lives in [`HostRuntime`]; this
+/// struct is the console's thin wrapper over it.
 pub(crate) struct ConsoleRuntime {
     /// The whole brain, held for the process lifetime so its Drop-managed
     /// pieces (the CodeGraph file watcher) stay alive — mirroring the GUI,
     /// which keeps the same Arcs alive inside its managed `IpcState`.
     _brain: crate::Brain,
-    factory: Arc<AgentLoopFactory>,
-    manager: Arc<tokio::sync::Mutex<AgentManager>>,
-    agent_loops: AgentLoopMap,
+    /// The shared host core (3a.2, D2): manager + loop map + spawner +
+    /// fan-in receiver + main id + bookkeeping — the hoist of what this
+    /// struct assembled inline until now. A headless Engine wraps the
+    /// same struct.
+    runtime: HostRuntime,
     config: Arc<tokio::sync::Mutex<Config>>,
-    project: Arc<tokio::sync::Mutex<mnemo::project::Project>>,
+    project: Arc<tokio::sync::Mutex<mnemo::app::project::Project>>,
     trace: Arc<LlmRequestLog>,
     browser: Arc<mnemo::browser::BrowserManager>,
-    fanin_rx: tokio::sync::mpsc::Receiver<(AgentId, AgentEvent)>,
-    main_id: AgentId,
     /// The tracked model selection (see [`ModelSelection`]). Std mutex —
     /// never held across an await.
     selection: std::sync::Mutex<Option<ModelSelection>>,
-    /// Lifecycle bookkeeping (running flags, parent notifications, dead-agent
-    /// cleanup) — the console's forwarder-equivalent. See
-    /// [`LifecycleBookkeeping`].
-    bookkeeping: LifecycleBookkeeping,
 }
 
 impl ConsoleRuntime {
-    /// Build the runtime from a ready brain: create the manager, wire the
-    /// [`ConsoleSpawner`] into the factory, and spawn the main agent via the
-    /// same shared path as the GUI's main agent (id allocation, channel
-    /// setup, loop-map insert, and registration are identical).
+    /// Build the runtime from a ready brain: the host core (manager,
+    /// spawner wiring, the main-agent spawn, bookkeeping) assembles inside
+    /// [`HostRuntime::start`]; the console adds its model-selection
+    /// tracking and the brain-held shared Arcs.
     pub(crate) async fn start(brain: crate::Brain) -> anyhow::Result<Self> {
-        let mut mgr = AgentManager::new(256);
-        // Take the fan-in receiver before wrapping the manager (the runtime
-        // owns it, like the GUI's event forwarder does).
-        let fanin_rx = mgr.take_fanin_rx().expect("fan-in receiver already taken");
-        let manager = Arc::new(tokio::sync::Mutex::new(mgr));
-        let agent_loops: AgentLoopMap =
-            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-        // Wire the spawn_agent tool's spawner BEFORE building the main agent
-        // (the tool is registered per build) — same ordering as the GUI
-        // setup. One ConsoleSpawner serves as both AgentSpawner and
-        // DescendantTracker.
-        let spawner = Arc::new(ConsoleSpawner::new(
-            brain.factory.clone(),
-            manager.clone(),
-            agent_loops.clone(),
+        // Clone the shared handles out of the brain BEFORE the host core
+        // takes the factory (the brain then moves into `_brain`, keeping
+        // its Drop-managed pieces alive for the process lifetime).
+        let factory = brain.factory.clone();
+        let config = brain.config.clone();
+        let project = Arc::new(tokio::sync::Mutex::new(
+            mnemo::app::project::Project::from_root(&brain.workspace.root),
         ));
-        brain.factory.set_spawner(spawner.clone());
-        brain.factory.set_descendant_tracker(spawner);
+        let trace = brain.trace.clone();
+        let browser = brain.browser.clone();
 
-        // The main agent — identical args to the GUI's main-agent spawn in
-        // main.rs setup: no initial prompt, no parent, no forced model, no
-        // role, and the shared main plans dir.
-        let (main_id, _) = crate::ipc::spawn::spawn_agent_shared(
-            brain.factory.clone(),
-            manager.clone(),
-            agent_loops.clone(),
-            "main".to_string(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            None, // no worktree binding — the main agent works the main tree
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("main agent spawn failed: {e}"))?;
+        let runtime = HostRuntime::start(factory)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let selection = {
             let config = brain.config.lock().await;
             initial_selection(&config)
         };
 
-        // Clone the shared handles out of the brain BEFORE moving the brain
-        // itself into `_brain` (its Drop-managed pieces must stay alive for
-        // the process lifetime).
-        let factory = brain.factory.clone();
-        let config = brain.config.clone();
-        let project = brain.project.clone();
-        let trace = brain.trace.clone();
-        let browser = brain.browser.clone();
-
-        // The bookkeeping struct shares the manager + loop map (cloned before
-        // they move into the runtime's own fields).
-        let bookkeeping = LifecycleBookkeeping::new(manager.clone(), agent_loops.clone());
-
         Ok(Self {
             _brain: brain,
-            factory,
-            manager,
-            agent_loops,
+            runtime,
             config,
             project,
             trace,
             browser,
-            fanin_rx,
-            main_id,
             selection: std::sync::Mutex::new(selection),
-            bookkeeping,
         })
     }
 
@@ -904,12 +664,12 @@ impl ConsoleRuntime {
 
     /// Read the next fanned-in agent event (`None` when all senders closed).
     pub(crate) async fn next_event(&mut self) -> Option<(AgentId, AgentEvent)> {
-        self.fanin_rx.recv().await
+        self.runtime.fanin_rx.recv().await
     }
 
     /// The main agent's id (the agent prompts are sent to).
     pub(crate) fn main_id(&self) -> AgentId {
-        self.main_id
+        self.runtime.main_id
     }
 
     /// The shared headless browser (for bounded teardown on exit).
@@ -924,9 +684,9 @@ impl ConsoleRuntime {
 
     /// Send a prompt to the main agent.
     pub(crate) async fn send_prompt(&self, text: String) -> Result<(), String> {
-        let mgr = self.manager.lock().await;
+        let mgr = self.runtime.manager.lock().await;
         mgr.send(
-            self.main_id,
+            self.runtime.main_id,
             AgentCommand::Prompt {
                 text,
                 images: vec![],
@@ -1005,10 +765,10 @@ impl ConsoleRuntime {
         // as set_model) and swap factory + every live loop. The resolved
         // DISPLAY effort rides along so the loops' status-bar mirrors track
         // the new default (backlog 51dab4da).
-        let context_manager = self.factory.context_manager_for(resolved.provider.as_ref());
+        let context_manager = self.runtime.factory.context_manager_for(resolved.provider.as_ref());
         crate::ipc::config_io::swap_provider_into_loops(
-            &self.factory,
-            &self.agent_loops,
+            &self.runtime.factory,
+            &self.runtime.agent_loops,
             resolved.provider,
             context_manager,
             Some(resolved.display_effort),
@@ -1045,7 +805,7 @@ impl ConsoleRuntime {
     /// waits, bounded, for the main agent's `Exited` event). Errors are
     /// ignored — an agent that is already gone needs no cancel.
     pub(crate) async fn request_shutdown(&self) {
-        let mgr = self.manager.lock().await;
+        let mgr = self.runtime.manager.lock().await;
         for handle in mgr.list() {
             let _ = mgr.send(handle.id, AgentCommand::Cancel);
         }
@@ -1053,26 +813,26 @@ impl ConsoleRuntime {
 
     /// Lifecycle bookkeeping: the agent started a turn.
     pub(crate) async fn mark_started(&self, id: AgentId) {
-        self.bookkeeping.on_started(id).await;
+        self.runtime.bookkeeping.on_started(id).await;
     }
 
     /// Lifecycle bookkeeping: the agent's turn ended (Finished / final
     /// Error) — also notifies a child's parent once. `success` is `true`
     /// for a clean `Finished`, `false` for a final error.
     pub(crate) async fn mark_turn_ended(&self, id: AgentId, success: bool) {
-        self.bookkeeping.on_turn_ended(id, success).await;
+        self.runtime.bookkeeping.on_turn_ended(id, success).await;
     }
 
     /// Lifecycle bookkeeping: the agent's task terminated — removes it from
     /// the manager + loop map.
     pub(crate) async fn mark_exited(&self, id: AgentId) {
-        self.bookkeeping.on_exited(id).await;
+        self.runtime.bookkeeping.on_exited(id).await;
     }
 
     /// Cancel every INACTIVE subagent (a fresh plan from Complete) — the
     /// forwarder's Complete→Executing cleanup, shared via the same helper.
     pub(crate) async fn cleanup_inactive_subagents(&self, trigger: AgentId) {
-        crate::ipc::events::cleanup_inactive_subagents(&self.manager, trigger).await;
+        crate::ipc::events::cleanup_inactive_subagents(&self.runtime.manager, trigger).await;
     }
 
     /// The reasoning-effort value a `/model <endpoint>/<model>` swap should
@@ -1124,7 +884,7 @@ struct ReplState {
     /// Each agent's last observed workflow state, for the Complete→Executing
     /// transition that triggers inactive-subagent cleanup (mirrors the GUI
     /// forwarder's `prev_workflow_state`).
-    prev_workflow_state: std::collections::HashMap<AgentId, mnemo::workflow::WorkflowState>,
+    prev_workflow_state: std::collections::HashMap<AgentId, String>,
 }
 
 /// Print the idle prompt marker (`> `) and flush — called at startup and
@@ -1226,10 +986,9 @@ async fn handle_event(
             // Complete → Executing = a fresh plan started — cancel INACTIVE
             // subagents from the previous plan (running ones are left
             // alone), mirroring the GUI forwarder.
-            let was_complete = state.prev_workflow_state.get(&id)
-                == Some(&mnemo::workflow::WorkflowState::Complete);
-            state.prev_workflow_state.insert(id, new_state);
-            if was_complete && new_state == mnemo::workflow::WorkflowState::Executing {
+            let was_complete = state.prev_workflow_state.get(&id).is_some_and(|s| s == "complete");
+            state.prev_workflow_state.insert(id, new_state.clone());
+            if was_complete && new_state == "executing" {
                 runtime.cleanup_inactive_subagents(id).await;
             }
         }
@@ -1418,8 +1177,8 @@ async fn begin_shutdown(state: &mut ReplState, runtime: &ConsoleRuntime) {
 /// helpers above — a future headless daemon swaps this function for a
 /// non-interactive loop over the same runtime.
 pub(crate) async fn run_console() -> i32 {
-    let brain = match crate::build_brain(None) {
-        Ok(crate::BrainOutcome::Ready(brain)) => brain,
+    let brain = match crate::build_brain(None, tokio::runtime::Handle::current()) {
+        Ok(crate::BrainOutcome::Ready(brain)) => *brain,
         Ok(crate::BrainOutcome::NeedsProject(_)) => {
             eprintln!(
                 "mnemo console: no project resolved — run from a project directory, \
@@ -1432,13 +1191,38 @@ pub(crate) async fn run_console() -> i32 {
             return 1;
         }
     };
+    // 2b.2: wire the app-side policy factory (master-spec :266-269) so
+    // console-mode agents keep the WorkflowPolicy semantics the GUI arm gets
+    // (the workflow state section in the volatile tail + the state-scoped
+    // routing chain) — the reviewer's HIGH catch: the kernel factory built
+    // WorkflowPolicy UNCONDITIONALLY pre-2b.2, so a GUI-arm-only wiring would
+    // have silently regressed console agents to NoPolicy. NO backlog wiring
+    // here: console opens no store (review finding 7 keeps `backlog_add` and
+    // its siblings out of console registries — the policy factory's
+    // None-wired backlog slot reproduces that exactly while `ask_user` stays).
+    // 2b.3: the skill library loads bin-side (the kernel factory's skills
+    // surface retired) — the same `.coding/skills/*.toml` dir the GUI arm
+    // loads, handed to the app factory so the skill tools resolve.
+    let skills_dir = brain.workspace.state_dir.join("skills");
+    let skills = Arc::new(mnemo::app::skill::SkillLibrary::load(skills_dir));
+    let policy_factory = Arc::new(mnemo::app::policy_factory::WorkflowPolicyFactory::new(
+        brain.factory.memory_handle(),
+        brain.factory.knowledge_handle(),
+        brain.factory.codegraph_handle(),
+        brain.factory.reviews_dir(),
+        Some(skills),
+    ));
+    let factory_dyn: Arc<dyn mnemo::AgentPolicyFactory> = policy_factory.clone();
+    brain.factory.set_policy_factory(factory_dyn);
+    let laya_cfg = brain.config.lock().await.general.general.laya.clone();
+    let (laya, pending_laya_start) = crate::attach_laya(&brain, &laya_cfg);
 
     // Installed bundled embedding model: build_brain deferred its ~110 MB
     // ONNX load off the main thread (AppHangB1 diagnostics) and left the
     // store on the hash embedder. Load + swap in the background — same path
     // the GUI's setup hook runs (review finding 1, 2026-08-20: without this
     // the console silently degraded to hash for the whole session).
-    if let (Some(model), Some(store)) = (&brain.pending_model_load, &brain.memory_store) {
+    if let (Some(model), Some(store)) = (&brain.pending_model_load, &brain.own_memory_store) {
         crate::ipc::embeddings::spawn_startup_load_console(
             store.clone(),
             brain.embedder_status.clone(),
@@ -1450,8 +1234,8 @@ pub(crate) async fn run_console() -> i32 {
     // sidecar on the port the classifier client was built against. No
     // Tauri events in console mode — the status transitions still land in
     // the shared status for any GUI process reading it.
-    if let Some((_checkpoint_id, port)) = &brain.pending_laya_start {
-        let manager = brain.laya.clone();
+    if let Some((_checkpoint_id, port)) = &pending_laya_start {
+        let manager = laya.clone();
         let checkpoint = crate::ipc::laya::english_checkpoint();
         let port = *port;
         let no_app: Option<tauri::AppHandle> = None;
@@ -1629,7 +1413,7 @@ pub(crate) fn attach_console() {
         // 1. Already attached to a console (debug builds, or a launcher that
         //    handed us a real one): the standard handles are already valid
         //    and we already own input — leave it alone.
-        if GetConsoleWindow() != std::ptr::null_mut() {
+        if !GetConsoleWindow().is_null() {
             return;
         }
         let handle_is_absent = |id: u32| -> bool {
@@ -1706,6 +1490,12 @@ pub(crate) fn attach_console() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 3a.2 (D2): the host-core types moved from the top level (unused in
+    // the non-test build after the HostRuntime hoist) — the fixtures
+    // still construct them directly.
+    use mnemo::agent::factory::AgentLoopFactory;
+    use mnemo::host::runtime::{AgentLoopMap, HostSpawner, LifecycleBookkeeping};
+    use mnemo::runtime::AgentManager;
 
     use mnemo::runtime::channels::QuestionOption;
 
@@ -2291,7 +2081,7 @@ mod tests {
         assert_eq!(model_swap_effort(None, true), None);
     }
 
-    // --- ConsoleSpawner ---------------------------------------------------
+    // --- HostSpawner ------------------------------------------------------
 
     use mnemo::agent::context::ContextManager;
     use mnemo::project::ConstitutionSource;
@@ -2334,18 +2124,20 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         Arc::new(AgentLoopFactory::new(
-            provider,
-            ConstitutionSource::new(&gpath, &ppath).unwrap(),
-            None,
-            sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(
-                mnemo::config::SafetyMode::Autonomous,
-            )),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
-            None,
+            mnemo::agent::factory::FactoryDeps {
+                provider,
+                constitution_source: ConstitutionSource::new(&gpath, &ppath).unwrap(),
+                memory: None,
+                sandbox,
+                project_root: dir.to_path_buf(),
+                safety_rules: None,
+                safety_mode: Arc::new(std::sync::RwLock::new(
+                    mnemo::config::SafetyMode::Autonomous,
+                )),
+                context_manager: ContextManager::new(128_000, 0.5),
+                plans_dir: dir.join("plans"),
+                vision: None,
+            },
         ))
     }
 
@@ -2360,9 +2152,18 @@ mod tests {
         let agent_loops: AgentLoopMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-        let spawner = ConsoleSpawner::new(factory, manager.clone(), agent_loops.clone());
+        let spawner = HostSpawner::new(factory, manager.clone(), agent_loops.clone());
         let id = spawner
-            .spawn_with_parent("reviewer", "review the diff", Some(7), None, None)
+            .spawn_with_parent(
+                "reviewer",
+                "review the diff",
+                Some(7),
+                None,
+                None,
+                // §5.4 :377 — the parent's policy; the bookkeeping under
+                // test does not depend on it.
+                mnemo::agent::policy::PermissionPolicy::default(),
+            )
             .await
             .expect("spawn must succeed");
 
@@ -2802,8 +2603,8 @@ mod tests {
     ///    state: no console, NULL std handles after nulling) and waits.
     /// 3. Grandchild runs `attach_console()` and exits PASS only when its
     ///    console HWND is non-null **and distinct from the intermediate's**.
-    /// Fails against AttachConsole (child HWND == parent HWND); passes once
-    /// AllocConsole-only is in.
+    ///    Fails against AttachConsole (child HWND == parent HWND); passes once
+    ///    AllocConsole-only is in.
     #[test]
     #[cfg(windows)]
     fn attach_console_allocates_own_console_not_parent() {

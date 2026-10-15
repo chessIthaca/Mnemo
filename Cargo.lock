@@ -3099,6 +3099,7 @@ dependencies = [
  "clap",
  "directories",
  "fastembed",
+ "flate2",
  "futures",
  "glob",
  "image",
@@ -3110,6 +3111,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "similar",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tiktoken-rs",
@@ -3131,6 +3133,8 @@ dependencies = [
  "tree-sitter-typescript",
  "uuid",
  "windows-sys 0.61.2",
+ "zeroize",
+ "zip",
 ]
 
 [[package]]

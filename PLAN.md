@@ -31,6 +31,20 @@ approval-gated coding harness — not a UI swap.
 6 suites) + 21 integration + 92 vitest files / 1319 frontend tests;
 `cargo check` and `tsc --noEmit` clean.
 
+**Kernel/headless feature lattice (2026-10-13, G10).** The library
+now slices into Cargo features — `kernel` (the core, always
+compiled), `headless` (the public engine surface:
+Engine/AgentSession/Setup/*Api; implies `kernel`), `app` (the
+plan-first workflow graph) — with `default = [kernel, app, headless]`
+so the app and the integration tests see zero change. A second
+consumer builds `--no-default-features --features kernel,headless`
+(no app machinery, no embeddings/browser;
+`examples/second_consumer.rs` is the proof). The app crate reaches
+the kernel ONLY through the public surface — `mnemo::headless::*`,
+`mnemo::app::*`, and the curated crate-root re-export facade in
+`src/lib.rs` — enforced by
+`tests/boundary.rs::tauri_uses_only_public_api`.
+
 **Dependency & security posture (2026-09-29).** The dependabot + CodeQL sweep
 (PRs #16–#60) modernized the dependency set and hardened CI: React 19,
 TypeScript 7, Tailwind v4 (`@tailwindcss/postcss`; `autoprefixer` dropped),
@@ -77,7 +91,8 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   New items carry the headline+body shape the Backlog tab renders (backlog
   45a4eb88): first line a short headline (≤100 chars), then a blank line,
   then the body — enforced at both write paths by the shared
-  `normalize_item_text` validator in `src/backlog.rs` (the agent-facing
+  `normalize_item_text` validator in `src/app/backlog.rs` (relocated under
+  `crate::app` by the job-2b module moves; the agent-facing
   `backlog_add` tool directly; the UI's IPC command via the image-aware
   `normalize_new_item_text`, which exempts image-only items — a pasted
   screenshot with no caption has no headline to validate), with the Backlog
@@ -262,16 +277,21 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   workflow state. The two read tools cross-hint each other's argument shape
   in their invalid-args error when a model mixes up a call. `search`/
   `search_read` serve literal single-line queries from the FTS5 content
-  index (`engine: index`, bm25-ranked, glob-filtered) and walk the tree
-  otherwise; the walk PRUNES ignored directories (their children are never
-  enumerated). When the pattern names an indexed symbol
+  index (`engine: index`, bm25-ranked, glob-filtered) — and, since backlog
+  c439dda0, regex-mode alternations whose every branch is an escape-only
+  literal too (per-branch index lookups, merged, regex-verified) — and walk
+  the tree otherwise; the walk PRUNES ignored directories (their children
+  are never enumerated) and the path-scoped `.coding/logs`/`.coding/tmp`
+  scratch dirs. When the pattern names an indexed symbol
   (`CodeGraph::symbol_id`, exact, best-effort) through a recognized shape —
   a bare identifier, a definition-prefixed name (`fn X`, `pub struct X` —
   `strip_definition_prefix`), or a symbol-INTENT pattern (`X(`, `a::b`,
   "who calls X" — `strip_symbol_intent`, backlog 8b8f40d2) — the search
   AUTO-DELEGATES to the code graph (backlog b804012f): a compact block
   (definition, top callers/callees, the `graph_context(id="file::name::line")`
-  pointer) rides above the output and the file walk is skipped entirely; a
+  pointer) rides above the output with the plain file matches following in
+  the SAME response — the walk is never skipped, so no identical re-issue
+  (backlog c439dda0); a
   query targeting semantic memory (a glob under `.coding/knowledge`/
   `.coding/reviews` or a typed `SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/
   `REVIEW:` prefix) delegates to `memory_search` the same way. With the
@@ -357,8 +377,8 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   Persist and retrieve project-scoped memory across the four tiers
   (working/episodic/semantic/procedural); typed title prefixes
   (`SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/`REVIEW:`) classify records with
-  auto-truncated digests (configurable length), and supersede-not-delete keeps history
-  (superseded records excluded from default recall). Live in `tool/memory/`.
+   auto-truncated digests (configurable length), and supersede-not-delete keeps history
+   (superseded records excluded from default recall). Recall ranks by similarity, keyword, tier, class and decayed strength, minus a staleness de-rank: a record not re-accessed within the configured decay half-life sinks by up to −0.25 over a 23-day ramp (grace = the decay tau, so closed-session digests can no longer dominate an injected recall block); tool events more than 300s apart mark a turn boundary, auto-compressing the previous turn's working rows into one episodic summary — the same synthetic path as the manual `memory_consolidate` tool. Live in `tool/memory/`.
   **Always available** regardless of workflow state.
 - **Spawn tool** — `spawn_agent` (`tool/agent/spawn_agent.rs`). Starts a
   background subagent; parent-aware so completion notifies the spawner.

@@ -10,6 +10,20 @@ name = "mnemo"
 path = "src/lib.rs"
 
 [features]
+# The G10 consumption lattice (job 5 D1, master-spec §5.9.10 :740-743):
+# `kernel` = the core modules (agent/runtime/host/memory/tool/... —
+# always compiled; the feature names the slice for explicit selects),
+# `headless` = the public engine surface (src/headless — Engine/
+# AgentSession/Setup/*Api; implies kernel), `app` = the workflow
+# module graph (src/app — plan-first, backlog, skills). Default = the
+# full library, so existing consumers (the app crate, the integration
+# tests) see zero change; a second consumer builds
+# `--no-default-features --features kernel,headless` — no app
+# machinery, no embeddings, no browser.
+default = ["kernel", "app", "headless"]
+kernel = []
+headless = ["kernel"]
+app = []
 # Headless-browser automation (chromiumoxide): the offscreen_browser_* tools,
 # the shared BrowserManager, and the src/browser module. Off by default —
 # coding-only/library consumers skip the heavy chromiumoxide dep tree; the
@@ -54,6 +68,8 @@ directories = "6"
 glob = "0.3"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
+# Secret zeroize-on-drop (job 4 D2, §5.8 :577-580)
+zeroize = "1"
 
 # OS file watching (codegraph auto-index — keeps the graph fresh on every edit)
 notify = "8"
@@ -84,6 +100,13 @@ sha2 = "0.11"
 
 # Base64 encoding for image attachments (vision fallback + describe_image tool)
 base64 = "0.23"
+
+# Managed-Laya setup pipeline (job 4 D5, §5.1 :168 — the Tauri-free core in
+# src/host/laya.rs): the uv release asset extraction (zip on Windows,
+# tar/flate2 elsewhere). Small pure-Rust crates.
+zip = "8"
+tar = "0.4"
+flate2 = "1"
 
 # Image decode/crop/re-encode for the agentic zoom loop in the image_* tools
 # (grid → model votes → crop the full-resolution original → re-read). Already a

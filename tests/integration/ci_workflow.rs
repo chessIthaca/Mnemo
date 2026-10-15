@@ -55,8 +55,8 @@ fn build_workflow_ci_env_is_clap_bool() {
     .expect("build.yml readable");
     for (idx, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("CI:") {
-            let value = trimmed["CI:".len()..]
+        if let Some(rest) = trimmed.strip_prefix("CI:") {
+            let value = rest
                 .trim()
                 .trim_matches('"')
                 .trim_matches('\'');

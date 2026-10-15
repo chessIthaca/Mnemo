@@ -129,11 +129,12 @@ impl Answer {
 /// `Downloading` serializes as `{"downloading": {"label": …, "progress": …}}`
 /// exactly like [`EmbedderStatus::Downloading`], and `FineTuning` as
 /// `{"finetuning": {"label": …}}`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ClassifierStatus {
     /// Laya is off (the default) or enabled without an endpoint; no
     /// classifier call is ever attempted and no backend object exists.
+    #[default]
     Disabled,
     /// Enabled with an endpoint; calls are attempted.
     Ready,
@@ -167,12 +168,6 @@ pub enum ClassifierStatus {
         /// Human-facing description (the checkpoint id being fine-tuned).
         label: String,
     },
-}
-
-impl Default for ClassifierStatus {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// A classifier answers typed [`Question`]s about a state text with
@@ -212,6 +207,14 @@ pub trait Classifier: Send + Sync {
         answers
     }
 }
+
+/// The shared, swappable classifier slot (D5): the hot-reload handle every
+/// owner that can replace a live classifier mid-run holds — the factory's
+/// free slot, the Laya setup arms, the GUI's `laya_setup`. The outer
+/// `Option` each site carries on top means "no slot at all" (Laya
+/// disabled), distinct from a slot that is present but empty.
+pub type ClassifierSlot =
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn Classifier>>>>;
 
 /// The no-op classifier: never answers, never calls anything — an explicit
 /// total [`Classifier`] for callers that want one (tests, or a default in

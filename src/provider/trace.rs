@@ -534,8 +534,10 @@ enum Msg {
     /// The record is cloned at its terminal transition (under the records
     /// lock, while it is guaranteed still in the ring) and the writer thread
     /// does the redaction/serialization/append — heavy work stays off the
-    /// request path, per the module's writer-thread invariant.
-    ArchiveRecord(LlmRequestRecord),
+    /// request path, per the module's writer-thread invariant. The record
+    /// rides boxed — `LlmRequestRecord` is ~384 B against the other
+    /// variants' 16-24 B, so every channel send stays cheap.
+    ArchiveRecord(Box<LlmRequestRecord>),
     /// Acknowledge once every write queued before this message is on disk.
     Flush(std::sync::mpsc::Sender<()>),
 }
@@ -991,7 +993,7 @@ impl LlmRequestLog {
                 && self.shared.log_enabled.load(Ordering::Relaxed)
             {
                 let snapshot = r.clone();
-                let _ = self.ensure_writer().send(Msg::ArchiveRecord(snapshot));
+                let _ = self.ensure_writer().send(Msg::ArchiveRecord(Box::new(snapshot)));
             }
         }
         // Re-enforce the global raw budget — `append_response` may have grown
@@ -1045,7 +1047,7 @@ impl LlmRequestLog {
     /// thread and I/O errors are tolerated there (the request path must never
     /// break because logging failed).
     fn maybe_log_error(&self, record: &LlmRequestRecord) {
-        let is_error = record.http_status.map_or(false, |s| s >= 400) || record.error.is_some();
+        let is_error = record.http_status.is_some_and(|s| s >= 400) || record.error.is_some();
         if !is_error {
             return;
         }
@@ -1285,25 +1287,21 @@ fn cap_request_json(value: &mut serde_json::Value, cap_bytes: usize) -> bool {
         return false; // already fits (or not serializable — leave verbatim)
     }
     let mut truncated_any = false;
-    loop {
-        if let Some(leaf) = longest_string_leaf_mut(value) {
-            let total_chars = leaf.chars().count();
-            // Aim for roughly a quarter of the cap per pass so a few big
-            // leaves converge quickly without overshooting on tiny bodies.
-            let keep_chars = (cap_bytes / 4).min(total_chars);
-            // Progress guarantee: only cut when the savings exceed the
-            // marker's own length. A body of many short strings (nothing
-            // sensible to cut) falls through and is accepted over-cap.
-            if total_chars - keep_chars < MIN_CUT_CHARS {
-                break;
-            }
-            let mut kept: String = leaf.chars().take(keep_chars).collect();
-            kept.push_str(&format!("…(+{} chars truncated)", total_chars - keep_chars));
-            *leaf = kept;
-            truncated_any = true;
-        } else {
-            break; // no string leaves left to cut
+    while let Some(leaf) = longest_string_leaf_mut(value) {
+        let total_chars = leaf.chars().count();
+        // Aim for roughly a quarter of the cap per pass so a few big
+        // leaves converge quickly without overshooting on tiny bodies.
+        let keep_chars = (cap_bytes / 4).min(total_chars);
+        // Progress guarantee: only cut when the savings exceed the
+        // marker's own length. A body of many short strings (nothing
+        // sensible to cut) falls through and is accepted over-cap.
+        if total_chars - keep_chars < MIN_CUT_CHARS {
+            break;
         }
+        let mut kept: String = leaf.chars().take(keep_chars).collect();
+        kept.push_str(&format!("…(+{} chars truncated)", total_chars - keep_chars));
+        *leaf = kept;
+        truncated_any = true;
         if serde_json::to_string(value).map_or(true, |s| s.len() <= cap_bytes) {
             break; // fits now
         }
@@ -1322,11 +1320,9 @@ fn longest_string_leaf_mut(value: &mut serde_json::Value) -> Option<&mut String>
         best_len: &mut usize,
     ) {
         match v {
-            serde_json::Value::String(s) => {
-                if s.len() > *best_len {
-                    *best_len = s.len();
-                    *best = Some(s);
-                }
+            serde_json::Value::String(s) if s.len() > *best_len => {
+                *best_len = s.len();
+                *best = Some(s);
             }
             serde_json::Value::Array(items) => {
                 for item in items {
@@ -1398,7 +1394,7 @@ fn writer_main(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Msg>) {
                 }
                 Msg::ErrorLine(line) => error_lines.push(line),
                 Msg::CancelLine(line) => cancel_lines.push(line),
-                Msg::ArchiveRecord(rec) => archive_records.push(rec),
+                Msg::ArchiveRecord(rec) => archive_records.push(*rec),
                 Msg::Flush(ack) => flush_acks.push(ack),
             }
         }
@@ -1599,7 +1595,7 @@ fn redacted_record_line(record: &LlmRequestRecord) -> Option<String> {
 /// than the original synchronous implementation; the caps are unchanged):
 /// - **The file is capped** at [`MAX_TRACE_FILE_BYTES`], with residual
 ///   behavior to be aware of: below the cap each writer wakeup still re-reads
-///   + rewrites the whole file (up to ~`MAX_TRACE_FILE_BYTES` of I/O per
+///   and rewrites the whole file (up to ~`MAX_TRACE_FILE_BYTES` of I/O per
 ///   batch). When the file exceeds the cap the merge is skipped and every row
 ///   not in the current batch is dropped — so the file is effectively
 ///   "recent history past 8 MiB", not a complete log. With a hot ring

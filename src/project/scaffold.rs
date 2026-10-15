@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-//! Project-init git-file scaffolding — the app-owned `.gitignore` /
+//! Project-init git-file scaffolding — the agent's `.gitignore` /
 //! `.gitattributes` entries a project needs for its own `.coding/` state to
 //! travel through git safely.
 //!
@@ -10,8 +10,14 @@
 //! reviews, skills, `backlog.jsonl`), while the per-machine caches and
 //! ephemeral state inside it must never be — and `backlog.jsonl` must merge by
 //! concatenation across worktrees instead of conflicting. Both rules live in
-//! git's own files, so [`Project::init`](crate::project::Project::init) ensures
-//! them here rather than leaving every new project to rediscover them:
+//! git's own files, so project init — the app's
+//! [`Project::init`](crate::app::project::Project::init) and the headless
+//! `Setup::init_project` — ensures them here rather than leaving every new
+//! project to rediscover them:
+//!
+//! Job 4 D8 (§5.8 :556): the core MOVED here from the app's
+//! `src/app/scaffold.rs` (which keeps re-exports — the 2b pattern) so the
+//! kernel's `Setup::init_project` needs no `mnemo::app` import.
 //!
 //! - a project whose first commit sweeps `.coding/memory.db` /
 //!   `.coding/codegraph.db` (multi-MB SQLite caches) into its repo because no

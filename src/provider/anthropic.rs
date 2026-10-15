@@ -411,8 +411,7 @@ impl AnthropicClient {
             .max_output_tokens
             .max(4096)
             .min(quantized_context_budget)
-            .min(SANE_MAX_OUTPUT_TOKENS)
-            .max(1024);
+            .clamp(1024, SANE_MAX_OUTPUT_TOKENS);
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -1562,7 +1561,7 @@ impl LlmClient for AnthropicClient {
                             // The authoritative set_usage (the Usage event
                             // arm below) overwrites it at stream end.
                             if !final_usage_seen
-                                && last_usage_push.map_or(true, |t| {
+                                && last_usage_push.is_none_or(|t| {
                                     now.duration_since(t) >= std::time::Duration::from_millis(500)
                                 })
                             {
@@ -1597,10 +1596,10 @@ impl LlmClient for AnthropicClient {
                                             }
                                         }
                                         LlmEvent::ToolCallStart { .. }
-                                        | LlmEvent::ToolCallArgumentDelta { .. } => {
-                                            if first_content_chunk.is_none() {
-                                                first_content_chunk = Some(now);
-                                            }
+                                        | LlmEvent::ToolCallArgumentDelta { .. }
+                                            if first_content_chunk.is_none() =>
+                                        {
+                                            first_content_chunk = Some(now);
                                         }
                                         _ => {}
                                     }

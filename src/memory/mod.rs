@@ -17,6 +17,7 @@ pub mod finish_capture;
 pub mod indexer;
 pub mod knowledge;
 pub mod maintenance;
+pub mod plan_format;
 pub mod schema;
 pub mod strength;
 pub mod types;
@@ -52,8 +53,8 @@ pub struct ScoredMemory {
 /// when the fingerprint set already matches.
 ///
 /// Extracted from the duplicated startup (main.rs) + post-config-save
-/// (rewire.rs) re-embed paths. The caller is responsible for the Ready-status
-/// + hash-opt-out + pending-download guards (they differ between the two call
+/// (rewire.rs) re-embed paths. The caller is responsible for the Ready-status +
+/// hash-opt-out + pending-download guards (they differ between the two call
 /// sites) and for spawning this on a background task (it awaits DB I/O).
 pub async fn reembed_if_needed(store: &Arc<MemoryStore>, embedder: &Arc<dyn Embedder>) {
     let expected_model = embedder.model_id().to_string();
@@ -1003,7 +1004,7 @@ impl MemoryStore {
         // Slide a window the length of the needle; compare ASCII-case-insensitively.
         'outer: for i in 0..=(h.len() - n.len()) {
             for j in 0..n.len() {
-                if h[i + j].to_ascii_lowercase() != n[j].to_ascii_lowercase() {
+                if !h[i + j].eq_ignore_ascii_case(&n[j]) {
                     continue 'outer;
                 }
             }
@@ -1096,7 +1097,7 @@ impl MemoryStore {
         let rtype_str: String = row.get(12)?;
         Ok(Memory {
             id: row.get(0)?,
-            tier: MemoryTier::from_str(&tier_str).unwrap_or(MemoryTier::Working),
+            tier: MemoryTier::from_str_opt(&tier_str).unwrap_or(MemoryTier::Working),
             title: row.get(2)?,
             content: row.get(3)?,
             data: serde_json::from_str(&data_json).unwrap_or(serde_json::Value::Null),
@@ -1107,8 +1108,8 @@ impl MemoryStore {
             source_session_ids: serde_json::from_str(&source_json).unwrap_or_default(),
             // Unknown/legacy strings degrade to the defaults (Authored/None)
             // rather than failing the whole load.
-            record_class: MemoryClass::from_str(&class_str).unwrap_or_default(),
-            record_type: MemoryRecordType::from_str(&rtype_str).unwrap_or_default(),
+            record_class: MemoryClass::from_str_opt(&class_str).unwrap_or_default(),
+            record_type: MemoryRecordType::from_str_opt(&rtype_str).unwrap_or_default(),
             superseded_by: row.get(13)?,
             embedding,
         })
@@ -1181,7 +1182,7 @@ impl MemoryStore {
         sql.push_str(" ORDER BY last_accessed_at DESC LIMIT ?");
         params_vec.push(Box::new(limit as i64));
         let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(Self::parse_memory_row(row)?);
@@ -1220,9 +1221,9 @@ impl MemoryStore {
                 .map(|r| Box::new(*r) as Box<dyn rusqlite::ToSql>)
                 .collect();
             params_vec.push(Box::new(t.as_str().to_string()));
-            stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?
+            stmt.query(rusqlite::params_from_iter(params_vec))?
         } else {
-            stmt.query(rusqlite::params_from_iter(rowids.iter().map(|r| *r as i64)))?
+            stmt.query(rusqlite::params_from_iter(rowids.iter().copied()))?
         };
         while let Some(row) = rows.next()? {
             out.push(Self::parse_memory_row(row)?);
@@ -1293,7 +1294,7 @@ impl MemoryStore {
             Ok(s) => s,
             Err(_) => return FtsResult::Unavailable,
         };
-        let mut rows = match stmt.query(rusqlite::params_from_iter(params_vec.into_iter())) {
+        let mut rows = match stmt.query(rusqlite::params_from_iter(params_vec)) {
             Ok(r) => r,
             Err(_) => return FtsResult::Unavailable,
         };
@@ -1308,6 +1309,98 @@ impl MemoryStore {
             FtsResult::NoMatches
         } else {
             FtsResult::Matches(out)
+        }
+    }
+
+    /// Delete a session's working-tier rows created at or before `before`
+    /// — the timestamp-scoped form of `delete_working_for_session` the
+    /// turn-boundary auto-consolidation uses (it must leave the live
+    /// turn's rows alone). Returns the removed count.
+    async fn delete_working_for_session_before(
+        &self,
+        session_id: &str,
+        before: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            // Same JSON1 session match as delete_working_for_session,
+            // bounded to rows written at or before the turn boundary.
+            // The FTS delete trigger fires automatically.
+            let deleted = conn.execute(
+                "DELETE FROM memories
+                 WHERE tier = 'working'
+                   AND created_at <= ?2
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(memories.source_session_ids)
+                       WHERE json_each.value = ?1
+                   )",
+                params![session_id, before],
+            )?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("delete_working_for_session_before task failed: {e}")))?
+    }
+
+    /// Turn-boundary auto-consolidation (backlog 4100f5e3 pillar C).
+    ///
+    /// A session's tool events cluster within a turn; a gap of
+    /// TURN_BOUNDARY_GAP_SECS since the session's previous rows means
+    /// the previous turn ended. When a new tool event crosses that gap,
+    /// the pre-gap rows are compressed into one episodic summary (the
+    /// synthetic no-LLM path — the same shape the manual pipeline and
+    /// the stale-session cleanup produce) and deleted, so the working
+    /// tier stays bounded during long sessions instead of waiting for
+    /// the manual consolidate tool or the stale-session cleanup.
+    ///
+    /// Fire-and-forget on error: the triggering write has already
+    /// succeeded, so a failed consolidation logs (mirroring the manual
+    /// pipeline's error handling in `consolidation.rs`) rather than
+    /// failing the caller.
+    async fn maybe_consolidate_turn_boundary(&self, session_id: &str, now: i64) {
+        const TURN_BOUNDARY_GAP_SECS: i64 = 300;
+        let boundary = now - TURN_BOUNDARY_GAP_SECS;
+        let working = match self.list_by_tier(MemoryTier::Working).await {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("mnemo: turn-boundary consolidation load failed: {e}");
+                return;
+            }
+        };
+        let expired: Vec<&Memory> = working
+            .iter()
+            .filter(|m| {
+                m.source_session_ids.iter().any(|s| s == session_id)
+                    && m.created_at <= boundary
+            })
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let (narrative, key_decisions, files_modified, concepts) =
+            consolidation::synthesize_synthetic(&expired);
+        let data = types::EpisodicData {
+            narrative: narrative.clone(),
+            key_decisions: key_decisions.clone(),
+            files_modified: files_modified.clone(),
+            concepts: concepts.clone(),
+        };
+        let mut episodic = Memory::new(
+            MemoryTier::Episodic,
+            format!("session {session_id} summary"),
+            data.narrative.clone(),
+            now,
+        );
+        episodic.data = serde_json::to_value(&data).unwrap_or(serde_json::Value::Null);
+        episodic.source_session_ids = vec![session_id.to_string()];
+        if let Err(e) = self.write(episodic).await {
+            eprintln!("mnemo: turn-boundary episodic write failed: {e}");
+            return;
+        }
+        if let Err(e) = self.delete_working_for_session_before(session_id, boundary).await {
+            eprintln!("mnemo: turn-boundary working cleanup failed: {e}");
         }
     }
 }
@@ -1471,6 +1564,23 @@ impl MemoryStoreTrait for MemoryStore {
         // This is in-memory only — the stored `strength` is NOT mutated; only
         // the ranking score uses the decayed form.
         let now = (self.now)();
+        // Staleness de-rank (backlog 4100f5e3 pillar B): a record not
+        // accessed within the grace window sinks by a ramping penalty.
+        // Closed-session digests ride surface similarity + keyword + tier
+        // long after their strength term has decayed to ~0 (the peek paths
+        // never bump last_accessed_at, so it stays frozen at write time),
+        // so the strength term alone cannot demote them. A fresh record
+        // of equal relevance outranks the stale one; a stale one must
+        // earn ~0.25 more relevance to compete. In-memory ranking only —
+        // nothing is stored.
+        // The grace tracks the live decay half-life (review 084978b3
+        // LOW-2): grace = the decay tau, then a fixed 23-day ramp to the
+        // full −0.25 — at the default tau (7d) the endpoints stay 7d/30d,
+        // and a user configuring a slower decay sees staleness begin
+        // correspondingly later instead of at a hardcoded 7 days.
+        const STALE_PENALTY_RAMP_DAYS: f64 = 23.0;
+        const STALE_PENALTY_MAX: f64 = 0.25;
+        let stale_grace_days = search_config.decay_half_life_days;
         let mut scored: Vec<ScoredMemory> = memories
             .into_iter()
             .map(|m| {
@@ -1503,7 +1613,16 @@ impl MemoryStoreTrait for MemoryStore {
                 // superseded row gets NO penalty here — SQL exclusion is the
                 // mechanism; penalizing too would double-punish history.
                 let cw = Self::class_weight(m.record_class);
-                let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw;
+                let age_days = (now - m.last_accessed_at).max(0) as f64 / 86_400.0;
+                let staleness_penalty = if age_days <= stale_grace_days {
+                    0.0
+                } else {
+                    STALE_PENALTY_MAX
+                        * ((age_days - stale_grace_days) / STALE_PENALTY_RAMP_DAYS)
+                            .min(1.0)
+                };
+                let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw
+                    - staleness_penalty;
                 ScoredMemory { memory: m, score }
             })
             .collect();
@@ -1544,7 +1663,7 @@ impl MemoryStoreTrait for MemoryStore {
         self.log_access(
             "read",
             filter.tier.map(|t| t.as_str().to_string()),
-            query.to_string(),
+            query,
             Some(scored.len()),
         );
         Ok(scored)
@@ -1592,7 +1711,7 @@ impl MemoryStoreTrait for MemoryStore {
             for id in &ids {
                 params_vec.push(Box::new(id.clone()));
             }
-            conn.execute(&sql, rusqlite::params_from_iter(params_vec.into_iter()))?;
+            conn.execute(&sql, rusqlite::params_from_iter(params_vec))?;
             Ok(())
         })
         .await
@@ -1860,7 +1979,7 @@ impl MemoryStoreTrait for MemoryStore {
                 params_vec.push(Box::new(limit as i64));
             }
             let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
                 out.push(Self::parse_memory_row(row)?);
@@ -1909,7 +2028,7 @@ impl MemoryStoreTrait for MemoryStore {
             let mut stmt = conn.prepare(&sql)?;
             let params_vec: Vec<Box<dyn rusqlite::ToSql>> =
                 wanted.iter().map(|t| Box::new(t.as_str().to_string()) as Box<dyn rusqlite::ToSql>).collect();
-            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec.into_iter()))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(params_vec))?;
             let mut memories = Vec::new();
             while let Some(row) = rows.next()? {
                 memories.push(Self::parse_memory_row(row)?);
@@ -2110,7 +2229,14 @@ impl MemoryStoreTrait for MemoryStore {
         if let Some(sid) = session_id {
             memory.source_session_ids = vec![sid.to_string()];
         }
-        self.write(memory).await
+        let id = self.write(memory).await?;
+        // Turn-boundary auto-consolidation (backlog 4100f5e3 pillar C):
+        // fire-and-forget after the write — the boundary check itself must
+        // never fail (nor delay) the event's own recording.
+        if let Some(sid) = session_id {
+            self.maybe_consolidate_turn_boundary(sid, now).await;
+        }
+        Ok(id)
     }
 
     async fn record_request_stats(&self, stats: &RequestStats) -> Result<()> {
@@ -2629,11 +2755,13 @@ impl MemoryStoreTrait for MemoryStore {
         let read_conn = self.read_conn().clone();
         tokio::task::spawn_blocking(move || -> Result<ProjectStats> {
             let conn = read_conn.lock().expect("read conn lock poisoned");
-            let mut stats = ProjectStats::default();
             // Session count.
-            stats.session_count = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0).map(|n| n as u64)
-            })?;
+            let mut stats = ProjectStats {
+                session_count: conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                    row.get::<_, i64>(0).map(|n| n as u64)
+                })?,
+                ..ProjectStats::default()
+            };
             // Per-model × endpoint breakdown (accumulates totals). NULL
             // endpoints group together — the pre-dimension per-model view.
             let mut stmt = conn.prepare(

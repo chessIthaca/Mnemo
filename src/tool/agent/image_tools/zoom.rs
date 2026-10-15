@@ -31,18 +31,13 @@ use super::prompts::{build_prompt, zoom_control_prompt, ImageTool, PromptArgs};
 /// How much detail to apply. `Overview` = single fast pass; `Normal`/`Fine`/
 /// `Auto` drive the zoom loop (`Auto` zooms only when needed, early-exits when
 /// clear).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DetailLevel {
     Overview,
     Normal,
     Fine,
+    #[default]
     Auto,
-}
-
-impl Default for DetailLevel {
-    fn default() -> Self {
-        DetailLevel::Auto
-    }
 }
 
 /// Parse a detail-level string (case-insensitive); unknown values default to
@@ -103,22 +98,30 @@ struct ZoomVote {
     answer: Option<String>,
 }
 
+/// One zoom request — the image (data URL for the vision model + raw bytes
+/// for local decoding), the optional region, and the loop knobs, grouped so
+/// the entry point stays under clippy's argument budget.
+pub(crate) struct ZoomRequest<'a> {
+    pub data_url: &'a str,
+    pub bytes: &'a [u8],
+    pub region: Option<&'a str>,
+    pub detail_level: DetailLevel,
+    pub max_rounds: u32,
+}
+
 /// Run the agentic zoom loop (or a single overview pass) for one image.
 ///
-/// `data_url` is the full image as a base64 data URL (sent to the vision model
-/// on the overview pass); `bytes` are the raw image bytes (decoded locally for
-/// cropping). `tool` + `args` build the task-specific prompt; `region`
-/// optionally restricts to a named/bbox region.
+/// `req.data_url` is the full image as a base64 data URL (sent to the vision
+/// model on the overview pass); `req.bytes` are the raw image bytes (decoded
+/// locally for cropping). `tool` + `args` build the task-specific prompt;
+/// `req.region` optionally restricts to a named/bbox region.
 pub(crate) async fn analyze_with_zoom(
     vision: &dyn ImageDescriber,
-    data_url: &str,
-    bytes: &[u8],
+    req: ZoomRequest<'_>,
     tool: ImageTool,
     args: &PromptArgs,
-    detail_level: DetailLevel,
-    region: Option<&str>,
-    max_rounds: u32,
 ) -> Result<ZoomResult> {
+    let ZoomRequest { data_url, bytes, region, detail_level, max_rounds } = req;
     // Decode the full-resolution original on the blocking pool. On any decode
     // failure, fall back to a single overview pass (the data URL is still
     // valid for the model). Returns the decoded image + the overview data URL
@@ -268,13 +271,13 @@ async fn zoom_loop(
     let vote = parse_vote(&overview_answer);
     match vote {
         Some(v) if v.action == "done" => {
-            return Ok(ZoomResult {
+            Ok(ZoomResult {
                 markdown: v.answer.unwrap_or(overview_answer),
                 confidence: v.confidence,
                 rounds,
                 regions,
                 warnings,
-            });
+            })
         }
         Some(v) => {
             // action == "zoom": crop the voted region and re-read.
@@ -379,7 +382,7 @@ async fn zoom_loop(
                     }
                     // Max rounds exhausted.
                     warnings.push("max zoom rounds reached".into());
-                    return Ok(ZoomResult {
+                    Ok(ZoomResult {
                         markdown: crop_vote_result
                             .as_ref()
                             .and_then(|v| v.answer.clone())
@@ -388,20 +391,20 @@ async fn zoom_loop(
                         rounds,
                         regions,
                         warnings,
-                    });
+                    })
                 }
                 None => {
                     // Couldn't crop the voted region — fall back to the overview answer.
                     warnings.push(
                         "model voted a region that could not be cropped; used overview".into(),
                     );
-                    return Ok(ZoomResult {
+                    Ok(ZoomResult {
                         markdown: v.answer.unwrap_or(overview_answer),
                         confidence: v.confidence,
                         rounds,
                         regions,
                         warnings,
-                    });
+                    })
                 }
             }
         }
@@ -605,13 +608,15 @@ mod tests {
         let vision: Arc<dyn ImageDescriber> = mock.clone();
         let result = analyze_with_zoom(
             vision.as_ref(),
-            &tiny_png_data_url(),
-            b"not an image",
+            ZoomRequest {
+                data_url: &tiny_png_data_url(),
+                bytes: b"not an image",
+                region: None,
+                detail_level: DetailLevel::Fine,
+                max_rounds: 3,
+            },
             ImageTool::ImageAnalysis,
             &PromptArgs::default(),
-            DetailLevel::Fine,
-            None,
-            3,
         )
         .await
         .unwrap();
@@ -628,13 +633,15 @@ mod tests {
         let bytes = tiny_png_bytes();
         let result = analyze_with_zoom(
             vision.as_ref(),
-            &tiny_png_data_url(),
-            &bytes,
+            ZoomRequest {
+                data_url: &tiny_png_data_url(),
+                bytes: &bytes,
+                region: None,
+                detail_level: DetailLevel::Overview,
+                max_rounds: 3,
+            },
             ImageTool::ImageAnalysis,
             &PromptArgs::default(),
-            DetailLevel::Overview,
-            None,
-            3,
         )
         .await
         .unwrap();
@@ -650,13 +657,15 @@ mod tests {
         let bytes = tiny_png_bytes();
         let result = analyze_with_zoom(
             vision.as_ref(),
-            &tiny_png_data_url(),
-            &bytes,
+            ZoomRequest {
+                data_url: &tiny_png_data_url(),
+                bytes: &bytes,
+                region: Some("top-right"),
+                detail_level: DetailLevel::Fine,
+                max_rounds: 3,
+            },
             ImageTool::ImageAnalysis,
             &PromptArgs::default(),
-            DetailLevel::Fine,
-            Some("top-right"),
-            3,
         )
         .await
         .unwrap();
@@ -678,13 +687,15 @@ mod tests {
         let bytes = tiny_png_bytes();
         let result = analyze_with_zoom(
             vision.as_ref(),
-            &tiny_png_data_url(),
-            &bytes,
+            ZoomRequest {
+                data_url: &tiny_png_data_url(),
+                bytes: &bytes,
+                region: None,
+                detail_level: DetailLevel::Fine,
+                max_rounds: 3,
+            },
             ImageTool::ImageAnalysis,
             &PromptArgs::default(),
-            DetailLevel::Fine,
-            None,
-            3,
         )
         .await
         .unwrap();
@@ -706,13 +717,15 @@ mod tests {
         let bytes = tiny_png_bytes();
         let result = analyze_with_zoom(
             vision.as_ref(),
-            &tiny_png_data_url(),
-            &bytes,
+            ZoomRequest {
+                data_url: &tiny_png_data_url(),
+                bytes: &bytes,
+                region: None,
+                detail_level: DetailLevel::Fine,
+                max_rounds: 3,
+            },
             ImageTool::ImageAnalysis,
             &PromptArgs::default(),
-            DetailLevel::Fine,
-            None,
-            3,
         )
         .await
         .unwrap();

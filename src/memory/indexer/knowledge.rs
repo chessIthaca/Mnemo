@@ -618,8 +618,8 @@ pub async fn migrate_authored_typed_rows(
         // collision). The same title+date re-migrates idempotently (the
         // partial-failure heal); anything else is skipped, not destroyed.
         let rel = format!("{}/{}", record_type, slug);
-        if let Some(existing) =
-            std::fs::read_to_string(knowledge.dir().join(format!("{rel}.md"))).ok()
+        if let Ok(existing) =
+            std::fs::read_to_string(knowledge.dir().join(format!("{rel}.md")))
         {
             let parsed = knowledge::parse_file(&format!("{rel}.md"), &existing);
             if parsed.as_ref().map(|r| r.title.as_str()) != Some(bare_title) {

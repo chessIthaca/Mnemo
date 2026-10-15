@@ -19,8 +19,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::backlog::BacklogItem;
-
 /// Run a git command in `root`, returning its stdout on success, WITHOUT
 /// trimming. Trimming is dangerous for output where leading whitespace is
 /// data — e.g. `git status --porcelain`, whose first line begins with the
@@ -49,40 +47,6 @@ pub(crate) fn git_raw(root: &Path, args: &[&str]) -> Result<String, String> {
     } else {
         Err(format!(
             "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-/// Run a `gh` (GitHub CLI) subcommand in `root`, returning stdout on
-/// success — the gh twin of [`git_raw`], same hardening
-/// (CREATE_NO_WINDOW on Windows, stderr on failure).
-///
-/// `pub(crate)` for the same reason as [`git_raw`]: the worktree
-/// module's ruleset-aware landing (backlog b52b041a) reuses the
-/// hardened runner instead of duplicating it. Failures are EXPECTED
-/// and handled by the caller — gh missing / unauthenticated means the
-/// landing takes its direct path (mirroring the merge_to_main skill's
-/// decision: gh-missing also means `gh pr create` would fail).
-pub(crate) fn gh_raw(root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(root);
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to spawn gh {args:?}: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(format!(
-            "gh {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
@@ -158,7 +122,7 @@ pub(crate) fn validate_base_ref(base: &str) -> Result<(), String> {
 }
 
 /// The current HEAD sha in `root` — the base revision a reviewer round stamps
-/// when it is dispatched (see [`crate::workflow::Workflow::record_review_round`]).
+/// when it is dispatched (stamped via the workflow's `record_review_round`).
 /// Runs on the blocking thread pool like every git op here and owns its
 /// argument so the closure is `'static + Send`.
 pub async fn head_commit_sha(root: PathBuf) -> Result<String, String> {
@@ -235,15 +199,16 @@ fn changed_paths_since_impl(
 ///
 /// Runs the blocking git subprocesses on the blocking thread pool so the
 /// async runtime (and thus every agent's event fan-in) is not stalled while
-/// a commit runs. Owns its arguments (`root`, `item`) so the
+/// a commit runs. Owns its arguments (`root`, `item_id`, `item_text`) so the
 /// `spawn_blocking` closure is `'static + Send`.
 pub async fn checkpoint_on_work_branch(
     root: PathBuf,
-    item: BacklogItem,
+    item_id: String,
+    item_text: String,
 ) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let git = RealGit;
-        checkpoint_on_work_branch_impl(&git, &root, &item)
+        checkpoint_on_work_branch_impl(&git, &root, &item_id, &item_text)
     })
     .await
     .map_err(|e| format!("checkpoint task failed: {e}"))?
@@ -252,7 +217,12 @@ pub async fn checkpoint_on_work_branch(
 /// The branch-agnostic commit core of [`checkpoint_on_work_branch`] — split
 /// out so tests can inject a [`GitRunner`] mock instead of spawning a real
 /// `git` process.
-fn checkpoint_impl(git: &dyn GitRunner, root: &Path, item: &BacklogItem) -> Result<String, String> {
+fn checkpoint_impl(
+    git: &dyn GitRunner,
+    root: &Path,
+    item_id: &str,
+    item_text: &str,
+) -> Result<String, String> {
     let dirty = !git_run(git, root, &["status", "--porcelain"])?.is_empty();
     if dirty {
         git_run(git, root, &["add", "-A"])?;
@@ -264,8 +234,8 @@ fn checkpoint_impl(git: &dyn GitRunner, root: &Path, item: &BacklogItem) -> Resu
                 "-m",
                 &format!(
                     "backlog: pre-item checkpoint ({} {})",
-                    item.id,
-                    first_line(&item.text)
+                    item_id,
+                    first_line(item_text)
                 ),
             ],
         )?;
@@ -283,7 +253,8 @@ fn checkpoint_impl(git: &dyn GitRunner, root: &Path, item: &BacklogItem) -> Resu
 fn checkpoint_on_work_branch_impl(
     git: &dyn GitRunner,
     root: &Path,
-    item: &BacklogItem,
+    item_id: &str,
+    item_text: &str,
 ) -> Result<String, String> {
     match ensure_work_branch_impl(git, root) {
         // Refused: NEVER checkpoint onto main — surface the refusal so the
@@ -292,7 +263,7 @@ fn checkpoint_on_work_branch_impl(
         Err(reason) => Err(format!("work-branch fork refused: {reason}")),
         // Forked, already on the work branch, or not a git repo at all:
         // checkpoint on whatever branch we're on now.
-        Ok(_) => checkpoint_impl(git, root, item),
+        Ok(_) => checkpoint_impl(git, root, item_id, item_text),
     }
 }
 
@@ -302,7 +273,12 @@ fn checkpoint_on_work_branch_impl(
 /// [`checkpoint_on_work_branch`]). Owns its arguments so the closure is `'static + Send`.
 /// The synchronous core of [`commit_success`] — split out so tests can inject
 /// a [`GitRunner`] mock.
-fn commit_success_impl(git: &dyn GitRunner, root: &Path, item: &BacklogItem) -> Result<(), String> {
+fn commit_success_impl(
+    git: &dyn GitRunner,
+    root: &Path,
+    item_id: &str,
+    item_text: &str,
+) -> Result<(), String> {
     let dirty = !git_run(git, root, &["status", "--porcelain"])?.is_empty();
     if dirty {
         git_run(git, root, &["add", "-A"])?;
@@ -312,17 +288,21 @@ fn commit_success_impl(git: &dyn GitRunner, root: &Path, item: &BacklogItem) -> 
             &[
                 "commit",
                 "-m",
-                &format!("backlog: {} {}", item.id, first_line(&item.text)),
+                &format!("backlog: {} {}", item_id, first_line(item_text)),
             ],
         )?;
     }
     Ok(())
 }
 
-pub async fn commit_success(root: PathBuf, item: BacklogItem) -> Result<(), String> {
+pub async fn commit_success(
+    root: PathBuf,
+    item_id: String,
+    item_text: String,
+) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let git = RealGit;
-        commit_success_impl(&git, &root, &item)
+        commit_success_impl(&git, &root, &item_id, &item_text)
     })
     .await
     .map_err(|e| format!("commit_success task failed: {e}"))?
@@ -1007,7 +987,7 @@ pub(crate) mod mock_git {
         fn run(&self, _root: &Path, args: &[&str]) -> Result<String, String> {
             let mut s = self.state.lock().unwrap();
             s.calls.push(args.iter().map(|a| a.to_string()).collect());
-            let args: Vec<&str> = args.iter().copied().collect();
+            let args: Vec<&str> = args.to_vec();
 
             // status --porcelain
             if args == ["status", "--porcelain"] {
@@ -1192,7 +1172,6 @@ pub(crate) mod mock_git {
 mod tests {
     use super::mock_git::MockGit;
     use super::*;
-    use crate::backlog::BacklogStatus;
     use std::fs;
 
     /// A temp dir + MockGit combo for testing the git-orchestration logic
@@ -1249,21 +1228,6 @@ mod tests {
         repo
     }
 
-    fn item(id: &str, text: &str) -> BacklogItem {
-        BacklogItem {
-            id: id.to_string(),
-            text: text.to_string(),
-            images: vec![],
-            status: BacklogStatus::Pending,
-            created_at: 0,
-            note: None,
-            deferred: false,
-            plan_id: None,
-            plan_title: None,
-            deleted_at: None,
-        }
-    }
-
     #[test]
     fn first_line_truncates_and_strips() {
         assert_eq!(first_line("hello world"), "hello world");
@@ -1287,10 +1251,8 @@ mod tests {
     fn checkpoint_then_commit_success_commits_edits() {
         let git = MockGit::new();
         let root = Path::new("/tmp/mock");
-        let item = item("item-7", "add a feature");
-
         // Checkpoint on a clean tree just returns the current HEAD sha.
-        let sha = checkpoint_impl(&git, root, &item).unwrap();
+        let sha = checkpoint_impl(&git, root, "item-7", "add a feature").unwrap();
         assert_eq!(
             sha,
             git.head_sha(),
@@ -1303,7 +1265,7 @@ mod tests {
 
         // Simulate the agent's edits (dirty tree), then commit them as a success.
         git.set_dirty(true);
-        commit_success_impl(&git, root, &item).unwrap();
+        commit_success_impl(&git, root, "item-7", "add a feature").unwrap();
 
         let commits = git.commits();
         assert_eq!(commits.len(), 2, "commit_success added one commit");
@@ -1323,36 +1285,31 @@ mod tests {
     fn commits_after_checkpoint_impl_detects_landed_work() {
         let git = MockGit::new();
         let root = Path::new("/tmp/mock");
-        let item = item("item-9", "landed work");
-
         // Checkpoint on a clean tree anchors at the current HEAD.
-        let sha = checkpoint_impl(&git, root, &item).unwrap();
+        let sha = checkpoint_impl(&git, root, "item-9", "landed work").unwrap();
         assert_eq!(sha, "abc123");
 
         // The session died BEFORE committing anything: no commits after
         // the checkpoint → not landed.
-        assert_eq!(
-            commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
-            false,
+        assert!(
+            !commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
             "no commits after the checkpoint — work did not land"
         );
 
         // The session committed its work, then died before finish:
         // commits after the checkpoint → landed.
         git.set_dirty(true);
-        commit_success_impl(&git, root, &item).unwrap();
-        assert_eq!(
+        commit_success_impl(&git, root, "item-9", "landed work").unwrap();
+        assert!(
             commits_after_checkpoint_impl(&git, root, &sha).unwrap(),
-            true,
             "a commit after the checkpoint — the work landed"
         );
 
         // The checkpoint sha itself is excluded (it IS the anchor): the
         // range from the new HEAD sees nothing after it.
         let head = git.head_sha();
-        assert_eq!(
-            commits_after_checkpoint_impl(&git, root, &head).unwrap(),
-            false,
+        assert!(
+            !commits_after_checkpoint_impl(&git, root, &head).unwrap(),
             "the anchor commit itself must not count as landed work"
         );
 
@@ -1369,11 +1326,9 @@ mod tests {
     fn checkpoint_commits_dirty_tree_before_returning_sha() {
         let git = MockGit::new();
         let root = Path::new("/tmp/mock");
-        let item = item("item-3", "fix a bug\nwith details");
-
         // Leave the tree dirty before checkpointing.
         git.set_dirty(true);
-        let sha = checkpoint_impl(&git, root, &item).unwrap();
+        let sha = checkpoint_impl(&git, root, "item-3", "fix a bug\nwith details").unwrap();
         let commits = git.commits();
         assert_eq!(commits.len(), 2, "checkpoint must commit a dirty tree");
         assert!(
@@ -1390,9 +1345,7 @@ mod tests {
     fn checkpoint_then_rollback_restores_pre_edit_state() {
         let git = MockGit::new();
         let root = Path::new("/tmp/mock");
-        let item = item("item-11", "risky change");
-
-        let sha = checkpoint_impl(&git, root, &item).unwrap();
+        let sha = checkpoint_impl(&git, root, "item-11", "risky change").unwrap();
 
         // Simulate the agent making edits (dirty tree).
         git.set_dirty(true);
@@ -1413,10 +1366,9 @@ mod tests {
     fn commit_success_on_clean_tree_is_noop() {
         let git = MockGit::new();
         let root = Path::new("/tmp/mock");
-        let item = item("item-1", "nothing to do");
         let before = git.head_sha();
         let commits_before = git.commits().len();
-        commit_success_impl(&git, root, &item).unwrap();
+        commit_success_impl(&git, root, "item-1", "nothing to do").unwrap();
         assert_eq!(git.head_sha(), before, "no new commit");
         assert_eq!(
             git.commits().len(),
@@ -1896,7 +1848,7 @@ mod tests {
         let expected = work_branch_name(repo.root());
 
         let sha =
-            checkpoint_on_work_branch_impl(&repo.git, repo.root(), &item("i1", "do the thing"))
+            checkpoint_on_work_branch_impl(&repo.git, repo.root(), "i1", "do the thing")
                 .unwrap();
 
         assert_eq!(sha, repo.git.head_sha(), "returns the post-commit HEAD");
@@ -1936,7 +1888,7 @@ mod tests {
         );
 
         let sha =
-            checkpoint_on_work_branch_impl(&repo.git, repo.root(), &item("i1", "do the thing"))
+            checkpoint_on_work_branch_impl(&repo.git, repo.root(), "i1", "do the thing")
                 .unwrap();
 
         assert_eq!(sha, repo.git.head_sha());
@@ -1963,7 +1915,7 @@ mod tests {
         repo.write("src/lib.rs", "fn real_work() {}\n");
 
         let res =
-            checkpoint_on_work_branch_impl(&repo.git, repo.root(), &item("i1", "do the thing"));
+            checkpoint_on_work_branch_impl(&repo.git, repo.root(), "i1", "do the thing");
 
         let err = res.expect_err("the refused fork stops the checkpoint");
         assert!(

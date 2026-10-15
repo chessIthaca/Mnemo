@@ -1,0 +1,50 @@
+## Verdict: FINDINGS (0 high, 1 low)
+
+The round-2 HIGH is closed. The six `build_volatile_tail` literals are landed as single-physical-line, single-`\n`-escaped statements, byte-exact against the round-1 report's :38-45 fix block — verified over three independent channels (current-tree read, the 0843a08 diff, a backslash-n census), counts exactly 2/2/3/1/1/1 with zero other backslashes in the region, the `\n# CAPABILITIES\n\n` leading separator restored, the bullets `\n`-terminated, and the raw-newline parse blocker gone by construction; the order-pin golden's three separator asserts + literal-backslash-n sentinel are present and statically green on these bytes. One LOW: the HOW record's amendment (echoed by the 0843a08 commit message) states the fix `.ps1` is "committed with the round-2 close-out" — it is not (`.coding/tmp/` is gitignored; no commit in the delta carries it; it exists on disk only and will not travel with the repo).
+
+### Scope & method
+- Delta since base `fcaba75` enumerated with git log: exactly **0843a08** (src = prompt.rs only, +6/−10; plus the plan-frame Reviews stamp +1 and the round-2 report +75 — bookkeeping), **e49df3d** (4 `.coding/knowledge/bug` files, no src), **395658e** (1 HOW file, no src). Uncommitted remainder: one line — the plan frame's round-3 base stamp (`3 395658e…`), harness bookkeeping, accurate. Working-tree src is clean, so the tree IS the committed fix. (Since 6177d95 the src surface is prompt.rs + loop_impl.rs — 1746b2d's loop_impl.rs +4 was round-2-verified, outside this base; since this base, exactly prompt.rs.)
+- Read: git show 0843a08 in full (both prompt.rs hunks, :482-:490 and :493-:507 new numbering); prompt.rs :448-:548 (the fn doc, the full fixed body, the wrapper doc + compose) and :630-:701 (the order-pin golden + asserts) in the current tree; loop_impl.rs :478-:509 (the holder doc + L4 arms); the round-1 report's fix block + assert prescription (:33-:52) and the round-2 report in full (as committed in 0843a08); all four touched bug files, the amended HOW record, the plan frame, and the gitignored fix artifact `.coding/tmp/fix_literal_block.ps1` (56 lines, in full).
+- Byte triangulation: read_files, the git diff, and a content-index search for backslash-n (24 file matches) all agree on the physical bytes and numbering. The line-shift arithmetic corroborates isolation: the golden fn at :640 = pre-fix :650 − 10; asserts :671/:676/:681 = pre-fix :681/:686/:691 − 10 — exactly the six-literal block's net shrink; nothing else in prompt.rs moved.
+- Instrument disclosure: my read-only surface carries no shell — I could not run cargo. Compile/test outcomes quoted below are the dispatcher's coerced runs, corroborated by my byte-level verification (the same instrument class that produced round-1's ground truth — its shell probe backed exactly these byte counts, here re-derived by read over three channels).
+
+### The round-2 HIGH — closed (verified)
+Current bytes (prompt.rs :485/:487/:496/:498/:500/:504, ONE physical line each, closing `");` on the same line):
+```
+prompt.push_str("# RECALLED MEMORIES\n\n");
+prompt.push_str("\n\n");
+prompt.push_str("\n# CAPABILITIES\n\n");
+prompt.push_str("- Tool choice: supported (you may be directed to call specific tools).\n");
+prompt.push_str("- Tool choice: not supported. Choose tools freely.\n");
+"- Finish reason may be unreliable; tool calls are detected by their presence.\n",
+```
+- Byte-exact vs six independent sources: the round-1 fix block (:38-45), the round-2 Fix block, the plan's own :13-14 anchors and step-3 spec (:29), the 0843a08 diff `+` lines, and the `.ps1`'s six `$new` constructions — one text.
+- Backslash census: exactly **2/2/3/1/1/1** backslash chars on the six lines; zero backslashes of any form elsewhere in the fn body (:483-:509 post-fix ≡ the brief's :483-:517 pre-fix region) — full-region read confirms no `\"`/EOL-continuation/other escapes. Census matches in the region: exactly those six lines, nothing else.
+- Round-1 defect (b) closed: :496 carries the leading `\n` separator. Composed bytes = the pre-flip bytes the plan's anchors quote: [memories `"# RECALLED MEMORIES\n\n"+mem+"\n\n"`][app_tail][`"\n# CAPABILITIES\n\n"` + bullets each `\n`-terminated] — round-2's "the intent is right" confirmation now holds in escaped form.
+- Parse validity by construction: six single-line, properly-terminated plain `"…"` literals — the unterminated-string blocker round-2 found is gone from the bytes I read, independent of any cache.
+- The order-pin golden (:639-:684): original order asserts intact (:648-:664); the three regression asserts are the round-1 prescription verbatim — the memories real-newline+blank needle (:671), the capabilities separator needle (:676 — it pins the restored leading separator: app_tail's single trailing `\n` + ours), and the literal-backslash-n sentinel (:681, `!tail.contains("\\n")`). Statically red on both intermediate defect states (doubled: needles fail + sentinel fires; raw-newline: no compile) and green on the current bytes — the red→green design holds.
+- Corroborated runs on these bytes (dispatcher, quoted): order-pin 1 passed 0.00s; `cargo clean -p mnemo` (39562 files / 69.5GiB) + full rebuild build_exit=0 in 34.51s; the battery — workspace -q 0 failed (3010 lib + 368 integration/doc across 8 batches), `-p mnemo -q` 2983, `--features browser,embeddings -q` exit 0, goldens trio 3 passed. The stale-binary hazard round-2 identified is neutralized by the forced-clean rebuild. Under `#![deny(warnings)]` a green build also proves zero warnings; the delta adds no code that could warn.
+
+### The three LOW doc rewrites (round-1 Finding 2) — intact
+build_volatile_tail's app_tail doc (:454-:474) ✓; build_system_prompt's production-calls line (:511-:521) ✓; the holder's policy-param note (loop_impl.rs :486-:489) with the L4 arms (:490-:509) unchanged ✓. All match round-2's verification; the wrapper composes via `crate::app::workflow_policy::workflow_section(workflow)` (:529-:533) as prescribed, untouched by the fix hunks.
+
+### Finding 1 — LOW — .coding/knowledge/how/2027-01-11-file-edit-string-literal-escape-trips-typed-deli.md :14 (echoed in the 0843a08 commit message) — the fix .ps1's provenance is misstated as committed
+The amendment's parenthetical says "(the .ps1 committed with the round-2 close-out is the artifact of record)"; the commit message says "The .ps1 rides the commit as the artifact of record". Neither matches what shipped: `.coding/tmp/` is gitignored — none of the three delta commits carries the script (0843a08's full diff = prompt.rs + plan stamp + round-2 report; e49df3d = 4 bug files; 395658e = 1 HOW file), and git status shows it as neither tracked-modified nor untracked. It exists on disk only, for this instance; a fresh clone loses it. A future agent following this record in a similar byte-debugging incident would search git history for the artifact and find nothing. The recipe itself (char-code construction, probe counts 2/2/3/1/1/1, clean-before-green) is accurate and verified — only the provenance clause is wrong.
+**Fix** — memory_amend the HOW record: restate the clause as "the .ps1 lives at `.coding/tmp/fix_literal_block.ps1` — gitignored, on-disk for this instance only, not in git history; the durable byte evidence is the 0843a08 commit message, round-1's :38-45 fix block, and the round-3 review" (the commit message is immutable history; the amendment speaks for both).
+
+### Harness checks on the delta
+- Documentation sync — PASS: the code delta restores already-documented intent (no behavior change vs the pre-2a.4 documentation); the three doc rewrites are the sync and are intact; the HOW amendment captures the lesson (Finding 1's clause aside).
+- Multi-platform neutrality — PASS: the src delta is six string-literal lines, platform-neutral; no `cfg(windows)`, no Windows-only API, no path/shell assumptions in library or app code. The .ps1 is a gitignored dev-session artifact under `.coding/tmp/` (the project's own shell is Windows PowerShell), not shipped code.
+- File-tools-first — PASS, justification verified: the shell mutation of prompt.rs is the sanctioned last resort — a verified file-tool freeze (the same six-line block was delivered wrong twice — doubled escapes, then raw newlines — on verified-identical intent, both caught by review), documented in the commit message and codified as the recipe in the HOW record. The .ps1 itself (read in full): `$esc` from `[char]92+"n"`, `$LF` from `[char]10`, `Expect-Once` uniqueness guards per needle, six raw-LF→escape replacements — no backslash-n text in any payload, exactly as claimed. (One vestigial unused `$fixes` array at :26-28 — cosmetic, in the gitignored artifact, no action.)
+- Warning-free build — corroborated PASS: green forced-clean build under `#![deny(warnings)]`; the delta is literal bytes only.
+
+### `.coding/**` accuracy (one line each)
+- Plan frame: steps 1-4 checked, step 5 open pending this round's close — accurate; the Reviews stamps (1 6177d95, 2 fcaba75, 3 395658e) match the round bases/dispatch state.
+- The two new closed-bug records + the two `status = "superseded"` marks: match the standing state of both bugs (ctrl-cmd-click fixed/landed/reviewed — plan 941d1c26 round-2; image_* family fixed via the ToolFilter name-gate, round-1 review on disk); supersede-not-delete convention followed.
+- The HOW record's amendment: substantively correct — it supersedes the record's "type ONE backslash" recipe and round-2's untested `\\n`-typing prescription with the actually-verified char-code recipe (an improvement; the "can decode" hedge is honest), corrects the green claim via the stale-binary explanation, and pins the probe + clean-before-green invariants; the sole inaccuracy is Finding 1's provenance clause.
+- The round-2 report, committed verbatim in 0843a08: contract-conformant (FINDINGS verdict); its findings re-verified here as closed.
+
+### Process remark (one line)
+The uncommitted round-3 base stamp on the plan frame is harness bookkeeping — accurate, not re-reviewed.
+
+Reviewed-state: 395658eda42ebfae446723422c311be2320ecafd

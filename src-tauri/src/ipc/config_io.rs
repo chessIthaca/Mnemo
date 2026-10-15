@@ -14,15 +14,15 @@
 
 use std::sync::Arc;
 
-use mnemo::agent::context::ContextManager;
-use mnemo::agent::factory::AgentLoopFactory;
+use mnemo::ContextManager;
+use mnemo::AgentLoopFactory;
 use mnemo::config::{Config, Endpoint};
 use mnemo::provider::client_factory::{build_client, provider_kind};
 use mnemo::provider::policy::reasoning_effort_off_wire_value;
 use mnemo::provider::trace::LlmRequestLog;
 use mnemo::provider::LlmClient;
-use mnemo::runtime::channels::SerializableAgentEvent;
-use mnemo::runtime::AgentId;
+use mnemo::SerializableAgentEvent;
+use mnemo::AgentId;
 use tauri::{AppHandle, State};
 
 use crate::ipc::error::IpcError;
@@ -663,18 +663,18 @@ mod tests {
         std::fs::write(&gpath, "").unwrap();
         std::fs::write(&ppath, "").unwrap();
         let source = ConstitutionSource::new(&gpath, &ppath).unwrap();
-        AgentLoopFactory::new(
+        AgentLoopFactory::new(mnemo::agent::factory::FactoryDeps {
             provider,
-            source,
-            None,
+            constitution_source: source,
+            memory: None,
             sandbox,
-            dir.to_path_buf(),
-            None,
-            Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
-            ContextManager::new(128_000, 0.5),
-            dir.join("plans"),
-            None,
-        )
+            project_root: dir.to_path_buf(),
+            safety_rules: None,
+            safety_mode: Arc::new(std::sync::RwLock::new(SafetyMode::Autonomous)),
+            context_manager: ContextManager::new(128_000, 0.5),
+            plans_dir: dir.join("plans"),
+            vision: None,
+        })
     }
 
     #[tokio::test]

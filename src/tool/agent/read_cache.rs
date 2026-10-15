@@ -48,6 +48,12 @@ pub struct ReadCache {
     inner: RwLock<HashMap<PathBuf, FileSnapshot>>,
 }
 
+impl Default for ReadCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReadCache {
     /// An empty cache.
     pub fn new() -> Self {

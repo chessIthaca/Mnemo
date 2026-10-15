@@ -678,7 +678,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".coding")).unwrap();
         let sandbox = Sandbox::new(dir.path()).unwrap();
         if !crate::tool::agent::sandbox::link_fixture::plant_dir_link(
-            &outside.path(),
+            outside.path(),
             &dir.path().join(".coding/link"),
         ) {
             eprintln!("SKIP: could not create a directory link for the escape fixture");

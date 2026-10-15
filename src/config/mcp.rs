@@ -620,3 +620,117 @@ url = "https://mcp.example.com/mcp"
         assert!(!path.exists(), "an invalid set never creates the file");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The Setup-surface wire + the split-by-source save (job 4 D8, §5.8 :551)
+// ---------------------------------------------------------------------------
+
+/// The source tag for a project-scoped server (`.coding/mcp.toml`).
+pub const SOURCE_PROJECT: &str = "project";
+
+/// The source tag for a global server (`<config_dir>/mcp.toml`).
+pub const SOURCE_GLOBAL: &str = "global";
+
+/// One configured MCP server + the file it lives in (§5.8 :551's wire):
+/// `def` is flattened so a payload is the plain server fields plus
+/// `source`. Job 4 D8 moved it lib-side from the app's `ipc/mcp.rs` so
+/// the headless `Setup` shares the exact wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerWire {
+    /// The server definition (flattened — the payload is the plain
+    /// server fields).
+    #[serde(flatten)]
+    pub def: McpServerDef,
+    /// `"global"` or `"project"` (defaults to global when absent — a
+    /// legacy payload or a hand-rolled caller lands in the global file,
+    /// matching v1 behavior).
+    #[serde(default = "default_source")]
+    pub source: String,
+}
+
+fn default_source() -> String {
+    SOURCE_GLOBAL.to_string()
+}
+
+impl McpServerWire {
+    /// A wire wrapping `def` tagged `source`.
+    pub fn new(def: McpServerDef, source: &str) -> Self {
+        Self {
+            def,
+            source: source.to_string(),
+        }
+    }
+}
+
+/// List the configured servers as wires (§5.8 :551): the global file +
+/// the project's (when given), each tagged with its source, the project
+/// definition WINNING by name (the shadow semantics [`merge_servers`]
+/// applies at runtime). Read errors degrade to an empty set — a listing
+/// never fails a UI.
+pub fn list_wires(global_path: &Path, project_path: Option<&Path>) -> Vec<McpServerWire> {
+    let global = load_or_default(global_path).unwrap_or_default();
+    let project = project_path
+        .and_then(|p| load_or_default(p).ok())
+        .unwrap_or_default();
+    let merged = merge_servers(&global, &project);
+    merged
+        .into_iter()
+        .map(|def| {
+            let source = if project.iter().any(|p| p.name == def.name) {
+                SOURCE_PROJECT
+            } else {
+                SOURCE_GLOBAL
+            };
+            McpServerWire { def, source: source.to_string() }
+        })
+        .collect()
+}
+
+/// The outcome of [`save_split`]: the merged set (for a live manager
+/// swap) + the global subset (for the live config's `mcp` field, so a
+/// later `save_all` round-trips it instead of clobbering the file).
+#[derive(Debug, Clone)]
+pub struct SplitSave {
+    /// The merged (project-wins) set — what a live manager replaces with.
+    pub merged: Vec<McpServerDef>,
+    /// The global subset as saved — the in-memory Config's `mcp` value.
+    pub global: Vec<McpServerDef>,
+}
+
+/// Split `servers` by source and save both files (§5.8 :551 — the core
+/// moved lib-side from the app's `ipc/mcp.rs`, byte-identical semantics):
+/// validate each subset, re-add shadowed global twins from the CURRENT
+/// global file (a project override SHADOWS its twin — the twin is
+/// invisible in the merged list, so rewriting from the payload alone
+/// would silently DELETE the baseline), validate the merged set, save
+/// the global file, and save the project file only when there is
+/// something to put in it or it already exists (a purely-global save
+/// must not materialize an empty `.coding/mcp.toml`).
+pub fn save_split(
+    global_path: &Path,
+    project_path: Option<&Path>,
+    servers: Vec<McpServerWire>,
+) -> Result<SplitSave> {
+    let mut global_defs: Vec<McpServerDef> = Vec::new();
+    let mut project_defs: Vec<McpServerDef> = Vec::new();
+    for wire in servers {
+        match wire.source.as_str() {
+            SOURCE_PROJECT => project_defs.push(wire.def),
+            _ => global_defs.push(wire.def),
+        }
+    }
+    validate_set(&global_defs)?;
+    validate_set(&project_defs)?;
+    let current_global = load_or_default(global_path)?;
+    let global_defs = restore_shadowed_globals(&global_defs, &project_defs, &current_global);
+    validate_set(&global_defs)?;
+    let merged = merge_servers(&global_defs, &project_defs);
+    validate_set(&merged)?;
+    save(global_path, &global_defs)?;
+    if let Some(project_path) = project_path {
+        if !project_defs.is_empty() || project_path.exists() {
+            save(project_path, &project_defs)?;
+        }
+    }
+    Ok(SplitSave { merged, global: global_defs })
+}

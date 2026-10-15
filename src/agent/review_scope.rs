@@ -18,8 +18,8 @@
 //! - [`render_review_preamble`] is appended to EVERY reviewer spawn's task by
 //!   the spawn tool, so the contract cannot be forgotten.
 //! - For round >= 2 it also renders the delta scope for the round: the base
-//!   revision the previous round verified (stamped on the plan frame,
-//!   [`crate::workflow::Workflow::record_review_round`]), the
+//!   revision the previous round verified (stamped on the plan frame by the
+//!   workflow's `record_review_round`), the
 //!   delta-since-`<base>` instruction (naming the reviewer's own `git_read`
 //!   ops), and the mechanically-derived changed file set — so the reviewer
 //!   verifies the delta instead of the whole tree.
@@ -183,13 +183,13 @@ pub fn render_review_preamble(scope: &ReviewScope) -> String {
         }
     }
 
-    out.push_str(&format!(
+    out.push_str(
         "- **Uncommitted carry-over.** If the delta re-shows hunks that a round ending in PASS \
          already verified (that material was never committed), note it in ONE line as a process \
          remark — do not re-line-review it. Hunks a round ending in FINDINGS reported are NOT in \
          that class: if your task names findings awaiting a fix, verify each fix is present in \
          the delta before you report PASS.\n",
-    ));
+    );
     out
 }
 
@@ -287,7 +287,7 @@ mod tests {
         });
         assert!(text.contains("(round 3 of this plan)"), "{text}");
         assert!(text.contains("round 2 verified"), "{text}");
-        assert!(text.contains("`git diff def5678`") == false, "{text}");
+        assert!(!text.contains("`git diff def5678`"), "{text}");
         assert!(text.contains("the delta since `def5678`"), "{text}");
     }
 

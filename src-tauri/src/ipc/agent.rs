@@ -550,15 +550,6 @@ pub async fn context_caps(state: State<'_, IpcState>) -> Result<Vec<(AgentId, u3
         .collect())
 }
 
-/// Spawn a new agent with the given name.
-///
-/// Allocates a new agent id, creates a command channel + `AgentTask` (built
-/// via the `AgentLoopFactory` so the new agent gets its own workflow + tool
-/// registry while sharing the provider, memory store, sandbox, and safety
-/// rules), spawns the task, and registers the handle. The new agent's loop is
-/// tracked in the `agent_loops` map so `get_workflow_state(agent_id)` can read
-/// its plan. Returns the new agent's id + name.
-
 /// Switch the active model (or reasoning effort) at runtime — per agent.
 ///
 /// Models are agent-specific (user decision 2026-08-22): the GUI model picker

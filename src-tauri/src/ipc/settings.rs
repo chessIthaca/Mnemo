@@ -46,18 +46,6 @@ pub async fn get_classifier_status(
     state.classifier_status()
 }
 
-/// Get the global config for the Settings UI, minus secrets.
-///
-/// Returns a JSON object `{ general, endpoints, pricing }`: `general` holds
-/// the default provider/model + safety mode; `endpoints` lists each configured
-/// endpoint (name, kind, base_url, models, context/output caps, multimodal,
-/// supports_reasoning_effort, reasoning_effort); `pricing` lists per-model
-/// pricing entries. API keys are never included (the `keys.toml` store is not
-/// serialized).
-///
-/// (E5: the legacy `get_config` command was deleted — `get_settings` is a
-/// strict superset and all callers migrated to it.)
-
 /// The editable shape of an endpoint as sent by the Settings → Endpoints tab.
 ///
 /// Mirrors [`mnemo::config::Endpoint`] but with `kind` as a `String`

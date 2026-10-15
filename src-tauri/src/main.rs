@@ -300,7 +300,7 @@ fn main() {
             // the in-session watchdog re-sweeps periodically; see
             // `BrowserManager::sweep_orphan_profiles`. Runs on every startup
             // path, even if this session never launches a browser.
-            let _ = tauri::async_runtime::spawn_blocking(
+            tauri::async_runtime::spawn_blocking(
                 mnemo::browser::BrowserManager::sweep_orphan_profiles,
             );
 
@@ -462,7 +462,7 @@ fn main() {
                     let laya_cfg = tauri::async_runtime::block_on(async {
                         brain.config.lock().await.general.general.laya.clone()
                     });
-                    let (laya, pending_laya_start) = attach_laya(&brain, &laya_cfg);
+                    let (laya, pending_laya_start) = attach_laya(brain, &laya_cfg);
                     // Create the agent manager + per-agent loop map, wrapped in
                     // Arcs up front so the spawner can share them.
                     let mut mgr = AgentManager::new(256);
@@ -1131,7 +1131,7 @@ fn main() {
                     let _ = tauri::async_runtime::block_on(browser.close());
                     // Destroy the child WebView2 (drop the handle) so no native
                     // HWND leaks on exit. Mirrors the headless-browser close above.
-                    let _ = tauri::async_runtime::block_on(async move {
+                    tauri::async_runtime::block_on(async move {
                         let mut bw = browser_webview.state.lock().await;
                         // Dropping the Webview handle tears down the platform
                         // webview (wry closes the child on drop).

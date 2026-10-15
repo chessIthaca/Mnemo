@@ -508,7 +508,7 @@ async fn dispatch_item(
             .single_in_flight
             .lock()
             .expect("single_in_flight lock poisoned") = None;
-        return Err(format!("failed to dispatch backlog item to main agent: {e:?}").into());
+        return Err(format!("failed to dispatch backlog item to main agent: {e:?}"));
     }
     drop(manager);
 

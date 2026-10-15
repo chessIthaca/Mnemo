@@ -154,7 +154,7 @@ pub async fn startup_snapshot(state: State<'_, IpcState>) -> Result<StartupSnaps
     // The same-project conflict was resolved at startup, before this
     // instance's marker overwrote the incumbent's (main.rs) — the snapshot
     // reports the state that existed the moment this instance launched.
-    let instance_conflict = state.runtime.instance_conflict.clone();
+    let instance_conflict = state.runtime.instance_conflict;
 
     Ok(StartupSnapshot {
         agents,

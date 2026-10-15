@@ -1413,7 +1413,7 @@ pub(crate) fn attach_console() {
         // 1. Already attached to a console (debug builds, or a launcher that
         //    handed us a real one): the standard handles are already valid
         //    and we already own input — leave it alone.
-        if GetConsoleWindow() != std::ptr::null_mut() {
+        if !GetConsoleWindow().is_null() {
             return;
         }
         let handle_is_absent = |id: u32| -> bool {

@@ -222,7 +222,7 @@ impl DeltaBatcher {
         let bucket = self
             .buckets
             .entry((agent_id, kind, index))
-            .or_insert_with(DeltaBucket::default);
+            .or_default();
         bucket.bytes += fragment.len();
         bucket.text.push_str(&fragment);
         if bucket.bytes >= DELTA_BUCKET_CAP {

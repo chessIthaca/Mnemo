@@ -527,8 +527,7 @@ mod tests {
         });
         let err = handle
             .await
-            .err()
-            .expect("a panicking task must join with Err");
+            .expect_err("a panicking task must join with Err");
         assert!(err.is_panic());
         match join_panic_event(MaintenanceOp::Cleanup, err) {
             MaintenanceEvent::Failed { op, error } => {

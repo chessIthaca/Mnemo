@@ -5833,7 +5833,7 @@ async fn resolve_single_dispatch_turn(
                 resolved_terminally = false;
             }
         }
-        emit_backlog_changed(app, &state).await;
+        emit_backlog_changed(app, state).await;
     }
     if resolved_terminally && state.backlog.auto_feed.load(Ordering::Relaxed) {
         // Auto-feed only past a terminally resolved item (Done/Failed) or
@@ -5842,7 +5842,7 @@ async fn resolve_single_dispatch_turn(
         // and a still-`Pending` item means no plan ran (a re-dispatch would
         // loop on the same item).
         // A9: log the dispatch error instead of silently swallowing it.
-        if let Err(e) = dispatch_next_impl(app, &state).await {
+        if let Err(e) = dispatch_next_impl(app, state).await {
             eprintln!("backlog: auto-feed failed to dispatch next item: {e}");
         }
     }
@@ -6616,7 +6616,6 @@ pub async fn halt_run_all(app: &tauri::AppHandle, reason: &str, stamp_failed: bo
                     .await
                     .annotate(item_id, &format!("{reason} — halted"));
             }
-            return;
         } else {
             // Steer/interrupt halt: record the reason in the note (the
             // checkpoint sha stays at its head; annotate appends) and hand

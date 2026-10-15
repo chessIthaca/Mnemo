@@ -1109,7 +1109,7 @@ async fn stats_totals_match_events() {
     let mut stored_ok = false;
     for _ in 0..100 {
         match session.stored_stats().await {
-            Ok(stored) if stored.prompt_tokens as u64 >= prompt_sum => {
+            Ok(stored) if stored.prompt_tokens >= prompt_sum => {
                 stored_ok = true;
                 break;
             }

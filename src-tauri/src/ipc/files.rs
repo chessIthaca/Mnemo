@@ -1191,7 +1191,7 @@ fn git_history_at(root: &std::path::Path) -> Result<GitHistory, String> {
             "log",
             "--branches",
             "--topo-order",
-            &format!("--pretty=format:%H\u{1f}%h\u{1f}%P\u{1f}%s\u{1f}%an\u{1f}%at\u{1f}%D"),
+            "--pretty=format:%H\u{1f}%h\u{1f}%P\u{1f}%s\u{1f}%an\u{1f}%at\u{1f}%D",
             "-n",
             &GIT_HISTORY_COMMIT_CAP.to_string(),
         ],

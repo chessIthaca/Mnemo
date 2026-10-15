@@ -208,6 +208,14 @@ pub trait Classifier: Send + Sync {
     }
 }
 
+/// The shared, swappable classifier slot (D5): the hot-reload handle every
+/// owner that can replace a live classifier mid-run holds — the factory's
+/// free slot, the Laya setup arms, the GUI's `laya_setup`. The outer
+/// `Option` each site carries on top means "no slot at all" (Laya
+/// disabled), distinct from a slot that is present but empty.
+pub type ClassifierSlot =
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn Classifier>>>>;
+
 /// The no-op classifier: never answers, never calls anything — an explicit
 /// total [`Classifier`] for callers that want one (tests, or a default in
 /// place of `Option`). This is NOT what the app builds while Laya is off:

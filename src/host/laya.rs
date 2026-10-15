@@ -36,7 +36,7 @@ use anyhow::{anyhow, Context as _, Result};
 use reqwest::Client;
 
 use crate::config::{global_config_dir, LayaConfig};
-use crate::memory::classifier::{Classifier, ClassifierStatus, LayaClassifier};
+use crate::memory::classifier::{Classifier, ClassifierSlot, ClassifierStatus, LayaClassifier};
 
 /// A status-change push (job 4 D5): the core writes the shared status
 /// Arc AND hands every change to this sink — the app's command layer
@@ -813,7 +813,7 @@ pub fn spawn_setup_task(
     manager: Arc<LayaManager>,
     checkpoint: &'static LayaCheckpoint,
     config: Arc<tokio::sync::Mutex<crate::config::Config>>,
-    classifier_slot: Option<Arc<RwLock<Option<Arc<dyn Classifier>>>>>,
+    classifier_slot: Option<ClassifierSlot>,
 ) {
     tokio::spawn(async move {
         let status = Arc::clone(&manager.status);

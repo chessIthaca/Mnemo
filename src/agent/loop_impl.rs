@@ -26,6 +26,18 @@ use crate::safety_rules::SafetyRules;
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::ToolRegistry;
 
+/// The explicit picker pin (2a.6 G2 hot-reload): the exact `(client,
+/// context)` pair an explicit pick installs, swappable in place so the
+/// running loop adopts it without a rebuild. `None` = no pin installed.
+pub(crate) type ExplicitProvider =
+    Arc<RwLock<Option<(Arc<dyn LlmClient>, super::context::ContextManager)>>>;
+
+/// The `(model, display effort, wire effort)` snapshot of the request
+/// last actually SERVED — the trio `served_effective` holds behind one
+/// mutex.
+pub(crate) type ServedEffective =
+    std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>;
+
 /// Per-session state extracted from [`AgentLoop`] (A2: reduce the loop's field
 /// count). Holds the memory session id + the prompt-token cache heuristic.
 /// Both are behind `Mutex` so they can be mutated through a `&AgentLoop`.
@@ -349,8 +361,7 @@ pub struct AgentLoop {
     /// global factory swap (plain [`set_provider`](Self::set_provider) must
     /// not silently undo an explicit per-agent choice) — but see
     /// [`pinned_state`](Self::pinned_state) for where it yields.
-    pub(crate) explicit_provider:
-        Arc<RwLock<Option<(Arc<dyn LlmClient>, super::context::ContextManager)>>>,
+    pub(crate) explicit_provider: ExplicitProvider,
     /// The workflow state the picker pin was first SERVED in — the pin's
     /// scope. Lazily stamped by [`resolve_turn_provider`](Self::resolve_turn_provider)
     /// (the pin exists the moment the picker acts; the state is recorded at
@@ -441,8 +452,7 @@ pub struct AgentLoop {
     /// ([`seed_served_effective_if_empty`](Self::seed_served_effective_if_empty))
     /// so the first request does not re-announce what `list_agents` already
     /// reports.
-    pub(crate) served_effective:
-        std::sync::Mutex<Option<(String, Option<String>, Option<String>)>>,
+    pub(crate) served_effective: ServedEffective,
     /// The DISPLAY-space effort of the DEFAULT provider slot — set by the
     /// factory at construction (from the default `ModelRef`), by `set_model`
     /// swaps, and by Settings saves that rebuild the default. `None` when

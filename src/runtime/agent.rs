@@ -5496,6 +5496,15 @@ mod tests {
         }
     }
 
+    /// What [`spawn_capturing_task`] hands back: the captured messages, the
+    /// command channel, the event-fanin receiver, and the task handle.
+    type SpawnedCapture = (
+        std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
+        mpsc::Sender<AgentCommand>,
+        mpsc::Receiver<(AgentId, AgentEvent)>,
+        tokio::task::JoinHandle<()>,
+    );
+
     /// Build an agent task with a capturing provider + optional vision client,
     /// spawn it, and return (captured messages, cmd sender, event-fanin
     /// receiver, task handle). The fanin receiver lets tests assert the
@@ -5504,12 +5513,7 @@ mod tests {
     fn spawn_capturing_task(
         caps: Capabilities,
         vision: Option<std::sync::Arc<dyn crate::provider::vision::ImageDescriber>>,
-    ) -> (
-        std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
-        mpsc::Sender<AgentCommand>,
-        mpsc::Receiver<(AgentId, AgentEvent)>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    ) -> SpawnedCapture {
         let dir = tempdir().unwrap();
         let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
             dir.path().join("plans"),

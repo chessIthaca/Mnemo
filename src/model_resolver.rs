@@ -42,6 +42,10 @@ use crate::agent::model_routing::{RouteTarget, RoutingPolicy};
 use crate::config::{Config, ModelRef};
 use crate::provider::LlmClient;
 
+/// Cached clients keyed by `(endpoint_name, model_id, effort)` — the
+/// reuse pool behind `ConfigModelResolver::cache` (see its field docs).
+type ClientCache = RwLock<HashMap<(String, String, Option<String>), Arc<dyn LlmClient>>>;
+
 /// A configured endpoint and the model ids it serves — the payload of
 /// [`ModelResolver::list_models`].
 ///
@@ -272,7 +276,7 @@ pub struct ConfigModelResolver {
     /// `set_config`. The per-context effort is part of the key: two contexts
     /// pointing at the same endpoint+model with different efforts must not
     /// share a provider.
-    cache: RwLock<HashMap<(String, String, Option<String>), Arc<dyn LlmClient>>>,
+    cache: ClientCache,
 }
 
 impl ConfigModelResolver {

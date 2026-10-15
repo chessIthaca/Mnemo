@@ -107,7 +107,7 @@ pub use crate::host::embed_download::EmbeddingModelDto;
 #[cfg(feature = "embeddings")]
 use crate::host::embed_download::EmbedderStatusSink;
 use crate::host::laya::{LayaManager, StatusSink};
-use crate::memory::classifier::{Classifier, ClassifierStatus};
+use crate::memory::classifier::{ClassifierSlot, ClassifierStatus};
 use crate::memory::embedder::EmbedderStatus;
 
 /// One to-do of a first-run flow (§5.8 :570) — the ordered list a setup
@@ -301,7 +301,7 @@ struct LiveHandles {
     /// The brain's classifier slot (D5) — the classifier-setup
     /// autostart arm swaps it to the fresh sidecar endpoint, the same
     /// swap the GUI's `laya_setup` performs.
-    classifier_slot: Option<Arc<std::sync::RwLock<Option<Arc<dyn Classifier>>>>>,
+    classifier_slot: Option<ClassifierSlot>,
 }
 
 impl fmt::Debug for LiveHandles {

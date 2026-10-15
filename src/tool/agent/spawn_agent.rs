@@ -555,16 +555,17 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    /// One recorded spawn call: (agent name, task, model override, policy).
+    type RecordedSpawn = (
+        String,
+        String,
+        Option<String>,
+        crate::agent::policy::PermissionPolicy,
+    );
+
     /// A mock spawner that records calls and returns a canned id.
     struct MockSpawner {
-        calls: Mutex<
-            Vec<(
-                String,
-                String,
-                Option<String>,
-                crate::agent::policy::PermissionPolicy,
-            )>,
-        >,
+        calls: Mutex<Vec<RecordedSpawn>>,
         result: Result<u64, String>,
     }
 

@@ -3373,6 +3373,14 @@ async fn cache_heuristic_skipped_after_summarization() {
     );
 }
 
+/// The per-`complete` string captures a [`CapturingProvider`] hands out:
+/// one entry per call (system prompt, last message, serialized tools).
+type StringCapture = Arc<Mutex<Vec<String>>>;
+
+/// The `(role, content)` of the LAST TWO messages of each `complete`
+/// call — the trailing-placement assertion capture.
+type TrailingCapture = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
 /// A mock provider that captures the system prompt from each `complete`
 /// call, so tests can assert on the constitution injected into the prompt.
 struct CapturingProvider {
@@ -3384,7 +3392,7 @@ struct CapturingProvider {
     /// lets tests assert the trailing placement's roles (user on
     /// `tail_as_user_messages` vendors, which must never see a trailing system
     /// block) as well as the byte-stable footer position.
-    captured_trailing: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    captured_trailing: TrailingCapture,
     /// The serialized tools array of each `complete` call — lets tests assert
     /// the plan-frozen advertisement is byte-stable across state transitions.
     captured_tool_sets: Arc<Mutex<Vec<String>>>,
@@ -3406,7 +3414,7 @@ impl CapturingProvider {
 
     /// Like [`new`](Self::new) but also returns the captured last-message
     /// contents (one entry per `complete` call).
-    fn new_with_tails() -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    fn new_with_tails() -> (Self, StringCapture, StringCapture) {
         Self::build(ProviderKind::OpenAI)
     }
 
@@ -3414,7 +3422,7 @@ impl CapturingProvider {
     /// `ProviderKind::Local` — drives the Ollama message-placement branch in
     /// `run_turn` (tail + footer as trailing USER messages, no trailing system
     /// block).
-    fn new_local_with_tails() -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    fn new_local_with_tails() -> (Self, StringCapture, StringCapture) {
         Self::build(ProviderKind::Local)
     }
 
@@ -3423,7 +3431,7 @@ impl CapturingProvider {
     /// DeepSeek's `tail_as_user_messages`) while `kind()` stays OpenAI.
     fn new_with_model_with_tails(
         model: &'static str,
-    ) -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    ) -> (Self, StringCapture, StringCapture) {
         let (mut provider, captured, tails) = Self::build(ProviderKind::OpenAI);
         provider.model = model;
         (provider, captured, tails)
@@ -3431,7 +3439,7 @@ impl CapturingProvider {
 
     /// Shared constructor for the `new_with_tails` / `new_local_with_tails`
     /// variants; `kind` is what `LlmClient::kind()` reports.
-    fn build(kind: ProviderKind) -> (Self, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    fn build(kind: ProviderKind) -> (Self, StringCapture, StringCapture) {
         let (provider, captured, tails, _tool_sets) = Self::build_with_tool_sets(kind);
         (provider, captured, tails)
     }
@@ -3440,12 +3448,7 @@ impl CapturingProvider {
     /// capture (one entry per `complete` call).
     fn build_with_tool_sets(
         kind: ProviderKind,
-    ) -> (
-        Self,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Vec<String>>>,
-    ) {
+    ) -> (Self, StringCapture, StringCapture, StringCapture) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_tails = Arc::new(Mutex::new(Vec::new()));
         let captured_tool_sets = Arc::new(Mutex::new(Vec::new()));
@@ -3468,19 +3471,14 @@ impl CapturingProvider {
 
     /// Provider + all three captures: the system prompt (head), the last
     /// message (footer), and the serialized tools array per `complete` call.
-    fn new_with_tool_sets() -> (
-        Self,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Vec<String>>>,
-        Arc<Mutex<Vec<String>>>,
-    ) {
+    fn new_with_tool_sets() -> (Self, StringCapture, StringCapture, StringCapture) {
         Self::build_with_tool_sets(ProviderKind::OpenAI)
     }
 
     /// Handle to the trailing (role, content) pairs captured so far — grab it
     /// before the provider is moved into the agent loop. One entry per
     /// `complete` call: the last two messages of the request.
-    fn trailing_handle(&self) -> Arc<Mutex<Vec<Vec<(String, String)>>>> {
+    fn trailing_handle(&self) -> TrailingCapture {
         Arc::clone(&self.captured_trailing)
     }
 }

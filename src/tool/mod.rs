@@ -119,6 +119,11 @@ pub enum ToolOutputStream {
     Stderr,
 }
 
+/// The callback a live [`OutputSink`] wraps: one partial chunk on one
+/// stream, shared by reference across a call's reader tasks (hence
+/// `Arc<dyn Fn>` + `Clone` rather than an `FnMut` trait object).
+pub type OutputSinkFn = std::sync::Arc<dyn Fn(ToolOutputStream, &str) + Send + Sync>;
+
 /// Per-call sink for PARTIAL tool output — the live view of a call that is
 /// still running (user request 2027-01-16: a long `shell` command showed
 /// nothing until it exited).
@@ -133,7 +138,7 @@ pub enum ToolOutputStream {
 /// Shared by reference across a call's reader tasks, hence `Arc<dyn Fn>` +
 /// `Clone` rather than an `FnMut` trait object.
 #[derive(Clone)]
-pub struct OutputSink(Option<std::sync::Arc<dyn Fn(ToolOutputStream, &str) + Send + Sync>>);
+pub struct OutputSink(Option<OutputSinkFn>);
 
 impl OutputSink {
     /// A sink that discards everything — for a call nobody is watching

@@ -371,7 +371,12 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   text in a record body in place, `memory_amend` — appends a dated amendment
   paragraph to a knowledge record's file, stripping any leading `Amended …:`
   heading the caller supplies so exactly one heading lands, dated by the
-   tool, `memory_supersede`, `memory_delete`), and the read-only git bridge
+   tool, `memory_supersede`, `memory_delete`), `recall_feedback` (per-session
+  dismissal of noisy auto-recalled rows, backlog c68a8c3b: the agent passes
+  the `(id: ...)` values from the RECALLED MEMORIES block and the injector
+  drops them for the session's remainder — the store is untouched, so
+  `memory_search` still finds them and future sessions re-derive normally),
+  and the read-only git bridge
    (`git_read`: diff/log/show/status, `tool/agent/git_read_tool.rs`).
    `memory_search` is the single read path — one
   tool replaced the six former per-purpose read tools (they differed only by
@@ -655,7 +660,7 @@ green, now that they opt a lever out explicitly.
 | Compaction survival | `compaction_survival` | Before a summary replaces the dropped region, the region is archived as a checkpoint, the decisions seen so far ride the summarizer as a must-preserve block, and a post-compaction digest note points back at the checkpoint. |
 | Quality score | `quality_score` | Grades the context S–F from fill, wasted tokens and stale re-reads, riding `ContextUsage` to the frontend ctx popup. |
 | Lean-output nudge | `lean_output_nudge` | Past `lean_output_fill_pct` fill, one steering line rides the volatile tail to keep the model's own output lean. |
-| Recall delta | `recall_delta` | A repeat auto-recall of a memory whose id AND content hash were already injected in the same compaction epoch renders a compact reference — tier, title, stable id, score, `unchanged since injection (turn N)` — instead of re-sending the 160-char snippet; a new, changed, or post-compaction recall still arrives in full. |
+| Recall delta | `recall_delta` | A repeat auto-recall of a memory whose id AND content hash were already injected in the same compaction epoch renders a compact reference — tier, title, stable id, score, `unchanged since injection (turn N)` — instead of re-sending the 160-char snippet; a new, changed, or post-compaction recall still arrives in full; an ALL-elided set (every row already injected — the set unchanged since its last sighting) renders ONE sentinel line — `N recalled memories unchanged since injection (first at turn M); re-read with memory_search if needed.` — instead of N references (backlog c68a8c3b). |
 
 **Two tables** (`src/memory/schema.rs`) record what the levers do:
 `savings_events` (`id, session_id, kind, detail, tokens_before, tokens_after,

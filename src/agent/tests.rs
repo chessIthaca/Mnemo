@@ -17036,7 +17036,7 @@ async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
                 && r
                     .detail
                     .as_deref()
-                    .map_or(false, |d| d.contains("sentinel"))),
+                    .is_some_and(|d| d.contains("sentinel"))),
         "a savings row names the sentinel: {rows:?}"
     );
 }

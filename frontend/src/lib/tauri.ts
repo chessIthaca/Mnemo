@@ -286,6 +286,16 @@ export interface InstanceConflict {
 }
 
 /**
+ * Re-check the incumbent's liveness for the same-project conflict dialog
+ * (the launch-time conflict is a snapshot that goes stale when the other
+ * instance exits — lib/incumbentWatch.ts drives the cadence and retracts
+ * the dialog once this reports dead; backlog ea9576d7).
+ */
+export async function isIncumbentAlive(pid: number): Promise<boolean> {
+  return await invoke("incumbent_pid_alive", { pid });
+}
+
+/**
  * Fetch the startup snapshot in one call. Seeds agents, context caps, ALL
  * workflow states, backlog, and embedder + classifier status on mount.
  */

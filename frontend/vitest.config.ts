@@ -66,6 +66,7 @@ export default defineConfig({
       "src/lib/delegationNotes.test.ts",
       "src/lib/endpoints.test.ts",
       "src/lib/format.test.ts",
+      "src/lib/incumbentWatch.test.ts",
       "src/lib/inflightPanelPref.test.ts",
       "src/lib/language.test.ts",
       "src/lib/linkGesture.test.ts",

@@ -1311,6 +1311,98 @@ impl MemoryStore {
             FtsResult::Matches(out)
         }
     }
+
+    /// Delete a session's working-tier rows created at or before `before`
+    /// — the timestamp-scoped form of `delete_working_for_session` the
+    /// turn-boundary auto-consolidation uses (it must leave the live
+    /// turn's rows alone). Returns the removed count.
+    async fn delete_working_for_session_before(
+        &self,
+        session_id: &str,
+        before: i64,
+    ) -> Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = conn.lock().expect("conn lock poisoned");
+            // Same JSON1 session match as delete_working_for_session,
+            // bounded to rows written at or before the turn boundary.
+            // The FTS delete trigger fires automatically.
+            let deleted = conn.execute(
+                "DELETE FROM memories
+                 WHERE tier = 'working'
+                   AND created_at <= ?2
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(memories.source_session_ids)
+                       WHERE json_each.value = ?1
+                   )",
+                params![session_id, before],
+            )?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| Error::Memory(format!("delete_working_for_session_before task failed: {e}")))?
+    }
+
+    /// Turn-boundary auto-consolidation (backlog 4100f5e3 pillar C).
+    ///
+    /// A session's tool events cluster within a turn; a gap of
+    /// TURN_BOUNDARY_GAP_SECS since the session's previous rows means
+    /// the previous turn ended. When a new tool event crosses that gap,
+    /// the pre-gap rows are compressed into one episodic summary (the
+    /// synthetic no-LLM path — the same shape the manual pipeline and
+    /// the stale-session cleanup produce) and deleted, so the working
+    /// tier stays bounded during long sessions instead of waiting for
+    /// the manual consolidate tool or the stale-session cleanup.
+    ///
+    /// Fire-and-forget on error: the triggering write has already
+    /// succeeded, so a failed consolidation logs (mirroring the manual
+    /// pipeline's error handling in `consolidation.rs`) rather than
+    /// failing the caller.
+    async fn maybe_consolidate_turn_boundary(&self, session_id: &str, now: i64) {
+        const TURN_BOUNDARY_GAP_SECS: i64 = 300;
+        let boundary = now - TURN_BOUNDARY_GAP_SECS;
+        let working = match self.list_by_tier(MemoryTier::Working).await {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("mnemo: turn-boundary consolidation load failed: {e}");
+                return;
+            }
+        };
+        let expired: Vec<&Memory> = working
+            .iter()
+            .filter(|m| {
+                m.source_session_ids.iter().any(|s| s == session_id)
+                    && m.created_at <= boundary
+            })
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        let (narrative, key_decisions, files_modified, concepts) =
+            consolidation::synthesize_synthetic(&expired);
+        let data = types::EpisodicData {
+            narrative: narrative.clone(),
+            key_decisions: key_decisions.clone(),
+            files_modified: files_modified.clone(),
+            concepts: concepts.clone(),
+        };
+        let mut episodic = Memory::new(
+            MemoryTier::Episodic,
+            format!("session {session_id} summary"),
+            data.narrative.clone(),
+            now,
+        );
+        episodic.data = serde_json::to_value(&data).unwrap_or(serde_json::Value::Null);
+        episodic.source_session_ids = vec![session_id.to_string()];
+        if let Err(e) = self.write(episodic).await {
+            eprintln!("mnemo: turn-boundary episodic write failed: {e}");
+            return;
+        }
+        if let Err(e) = self.delete_working_for_session_before(session_id, boundary).await {
+            eprintln!("mnemo: turn-boundary working cleanup failed: {e}");
+        }
+    }
 }
 
 #[async_trait]
@@ -1472,6 +1564,18 @@ impl MemoryStoreTrait for MemoryStore {
         // This is in-memory only — the stored `strength` is NOT mutated; only
         // the ranking score uses the decayed form.
         let now = (self.now)();
+        // Staleness de-rank (backlog 4100f5e3 pillar B): a record not
+        // accessed within the grace window sinks by a ramping penalty.
+        // Closed-session digests ride surface similarity + keyword + tier
+        // long after their strength term has decayed to ~0 (the peek paths
+        // never bump last_accessed_at, so it stays frozen at write time),
+        // so the strength term alone cannot demote them. A fresh record
+        // of equal relevance outranks the stale one; a stale one must
+        // earn ~0.25 more relevance to compete. In-memory ranking only —
+        // nothing is stored.
+        const STALE_GRACE_DAYS: f64 = 7.0;
+        const FULL_PENALTY_DAYS: f64 = 30.0;
+        const STALE_PENALTY_MAX: f64 = 0.25;
         let mut scored: Vec<ScoredMemory> = memories
             .into_iter()
             .map(|m| {
@@ -1504,7 +1608,17 @@ impl MemoryStoreTrait for MemoryStore {
                 // superseded row gets NO penalty here — SQL exclusion is the
                 // mechanism; penalizing too would double-punish history.
                 let cw = Self::class_weight(m.record_class);
-                let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw;
+                let age_days = (now - m.last_accessed_at).max(0) as f64 / 86_400.0;
+                let staleness_penalty = if age_days <= STALE_GRACE_DAYS {
+                    0.0
+                } else {
+                    STALE_PENALTY_MAX
+                        * ((age_days - STALE_GRACE_DAYS)
+                            / (FULL_PENALTY_DAYS - STALE_GRACE_DAYS))
+                            .min(1.0)
+                };
+                let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw
+                    - staleness_penalty;
                 ScoredMemory { memory: m, score }
             })
             .collect();
@@ -2111,7 +2225,14 @@ impl MemoryStoreTrait for MemoryStore {
         if let Some(sid) = session_id {
             memory.source_session_ids = vec![sid.to_string()];
         }
-        self.write(memory).await
+        let id = self.write(memory).await?;
+        // Turn-boundary auto-consolidation (backlog 4100f5e3 pillar C):
+        // fire-and-forget after the write — the boundary check itself must
+        // never fail (nor delay) the event's own recording.
+        if let Some(sid) = session_id {
+            self.maybe_consolidate_turn_boundary(sid, now).await;
+        }
+        Ok(id)
     }
 
     async fn record_request_stats(&self, stats: &RequestStats) -> Result<()> {

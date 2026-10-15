@@ -217,7 +217,11 @@ pub(crate) async fn consolidate_session_with_events(
 }
 
 /// Synthesize an episodic summary without an LLM (synthetic compression).
-fn synthesize_synthetic(events: &[&Memory]) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+/// `pub(crate)`: also the turn-boundary auto-consolidation's compressor
+/// (backlog 4100f5e3 pillar C) — the same synthetic shape everywhere.
+pub(crate) fn synthesize_synthetic(
+    events: &[&Memory],
+) -> (String, Vec<String>, Vec<String>, Vec<String>) {
     let tool_count = events.len();
     let tools_used: Vec<String> = events
         .iter()

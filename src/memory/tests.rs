@@ -752,6 +752,122 @@ async fn recall_peek_does_not_bump_access() {
 }
 
 #[tokio::test]
+async fn stale_record_ranks_below_fresh_of_equal_relevance() {
+    // Backlog 4100f5e3 pillar B: closed-session digests dominated the
+    // injected recall block because they ride surface similarity + keyword
+    // + tier long after their strength term decayed to ~0 (the peek paths
+    // never bump last_accessed_at, so it stays frozen at write time). The
+    // staleness penalty sinks a record not accessed within the grace
+    // window, so a fresh record of equal relevance outranks it.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    // The stale record: fully query-aligned (sim 1.0 under the anchor
+    // embedder), 60 days unaccessed — the surface-similarity dominator
+    // the old ranking rewarded. Strength is pinned on both records so the
+    // arithmetic is exact.
+    let mut stale = Memory::new(
+        MemoryTier::Semantic,
+        "stale review digest",
+        "pipeline pipeline",
+        1000,
+    );
+    stale.strength = 0.5;
+    store.write(stale).await.unwrap();
+
+    // 60 days later: a fresh record, lower similarity (axis-mixed content,
+    // sim ~0.447) but equal keyword/tier/class and a live strength term.
+    now_val.store(1000 + 60 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "fresh pipeline note",
+        "pipeline unrelated unrelated",
+        1000 + 60 * DAY,
+    );
+    fresh.strength = 0.5;
+    store.write(fresh).await.unwrap();
+
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "fresh pipeline note",
+        "the fresh record must outrank the stale one of equal relevance"
+    );
+}
+
+#[tokio::test]
+async fn turn_boundary_auto_consolidates_previous_turns_working_rows() {
+    // Backlog 4100f5e3 pillar C: a gap between a session's tool events
+    // marks a turn boundary — the previous turn's working rows are
+    // compressed into one episodic summary and deleted automatically,
+    // without the manual consolidate tool or the stale-session cleanup.
+    // The live turn's row stays.
+    let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::new());
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+
+    // Turn one: two tool events a second apart.
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_read",
+            serde_json::json!({"path": "a.rs"}),
+            "a",
+            None,
+        )
+        .await
+        .unwrap();
+    now_val.store(1001, Ordering::SeqCst);
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_write",
+            serde_json::json!({"path": "b.rs"}),
+            "b",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 400 seconds later: the new tool event crosses the 300s turn gap.
+    now_val.store(1401, Ordering::SeqCst);
+    store
+        .record_tool_event(
+            Some("sess-t"),
+            "file_read",
+            serde_json::json!({"path": "c.rs"}),
+            "c",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The two pre-gap rows are gone from working; the live row remains.
+    let working = store.list_by_tier(MemoryTier::Working).await.unwrap();
+    assert_eq!(working.len(), 1, "only the live turn's row remains in working");
+    assert_eq!(working[0].source_session_ids, vec!["sess-t".to_string()]);
+
+    // The previous turn was compressed into one episodic summary.
+    let episodic = store.list_by_tier(MemoryTier::Episodic).await.unwrap();
+    assert_eq!(episodic.len(), 1, "the previous turn left an episodic summary");
+    assert_eq!(episodic[0].title, "session sess-t summary");
+    assert_eq!(episodic[0].source_session_ids, vec!["sess-t".to_string()]);
+}
+
+#[tokio::test]
 async fn recall_bumps_access_via_batch() {
     // End-to-end: recall should still bump access counts (now via the
     // batched path). After recalling 3 memories, each should have

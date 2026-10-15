@@ -236,19 +236,19 @@ impl EndpointDto {
     /// implementation). The lean surface carries no per-model
     /// configs: model ids become bare specs.
     fn into_endpoint(self) -> Result<crate::config::Endpoint, String> {
-        crate::config::patch::validate_endpoint(
-            &self.name,
-            &self.kind,
-            &self.base_url,
-            self.models,
-            Vec::new(),
-            self.max_context,
-            self.max_output_tokens,
-            self.multimodal,
-            self.supports_reasoning_effort,
-            self.reasoning_effort,
-            self.workspace_id,
-        )
+        crate::config::patch::validate_endpoint(crate::config::patch::EndpointDraft {
+            name: self.name,
+            kind: self.kind,
+            base_url: self.base_url,
+            models: self.models,
+            model_configs: Vec::new(),
+            max_context: self.max_context,
+            max_output_tokens: self.max_output_tokens,
+            multimodal: self.multimodal,
+            supports_reasoning_effort: self.supports_reasoning_effort,
+            reasoning_effort: self.reasoning_effort,
+            workspace_id: self.workspace_id,
+        })
     }
 }
 

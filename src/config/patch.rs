@@ -18,6 +18,25 @@ use crate::config::{Config, Endpoint, EndpointKind, KeyStore, SafetyMode};
 
 // ── Endpoint save ───────────────────────────────────────────────────────
 
+/// One endpoint's submitted fields — the input to [`validate_endpoint`].
+/// `Default::default()` supplies the "unset" values (empty strings, empty
+/// vecs, `None`, `false`), so callers and tests only spell the fields they
+/// set.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointDraft {
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    pub model_configs: Vec<crate::config::ModelSpec>,
+    pub max_context: Option<usize>,
+    pub max_output_tokens: Option<usize>,
+    pub multimodal: bool,
+    pub supports_reasoning_effort: bool,
+    pub reasoning_effort: Option<String>,
+    pub workspace_id: Option<String>,
+}
+
 /// Validate one endpoint's fields + convert to an [`Endpoint`].
 ///
 /// Validation: name non-empty (trimmed), base_url non-empty + normalized to
@@ -27,19 +46,20 @@ use crate::config::{Config, Endpoint, EndpointKind, KeyStore, SafetyMode};
 /// Empty/whitespace-only model ids are dropped from the `models` list.
 /// `workspace_id` is trimmed; an empty/whitespace value clears to `None`
 /// (the header is never sent empty).
-pub fn validate_endpoint(
-    name: &str,
-    kind: &str,
-    base_url: &str,
-    models: Vec<String>,
-    model_configs: Vec<crate::config::ModelSpec>,
-    max_context: Option<usize>,
-    max_output_tokens: Option<usize>,
-    multimodal: bool,
-    supports_reasoning_effort: bool,
-    reasoning_effort: Option<String>,
-    workspace_id: Option<String>,
-) -> Result<Endpoint, String> {
+pub fn validate_endpoint(draft: EndpointDraft) -> Result<Endpoint, String> {
+    let EndpointDraft {
+        name,
+        kind,
+        base_url,
+        models,
+        model_configs,
+        max_context,
+        max_output_tokens,
+        multimodal,
+        supports_reasoning_effort,
+        reasoning_effort,
+        workspace_id,
+    } = draft;
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("endpoint name must not be empty".to_string());
@@ -56,7 +76,7 @@ pub fn validate_endpoint(
     } else {
         format!("{base_url}/")
     };
-    let kind = match kind {
+    let kind = match kind.as_str() {
         "openai" => EndpointKind::OpenAI,
         "local" => EndpointKind::Local,
         "anthropic" => EndpointKind::Anthropic,
@@ -311,37 +331,25 @@ mod tests {
     use crate::config::{Endpoint, PricingEntry};
 
     fn ep(name: &str, kind: &str, base_url: &str, models: Vec<&str>) -> Endpoint {
-        validate_endpoint(
-            name,
-            kind,
-            base_url,
-            models.into_iter().map(String::from).collect(),
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        validate_endpoint(EndpointDraft {
+            name: name.into(),
+            kind: kind.into(),
+            base_url: base_url.into(),
+            models: models.into_iter().map(String::from).collect(),
+            supports_reasoning_effort: true,
+            ..Default::default()
+        })
         .unwrap()
     }
 
     #[test]
     fn validate_endpoint_rejects_empty_name() {
-        let r = validate_endpoint(
-            "",
-            "openai",
-            "https://x/v1/",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        );
+        let r = validate_endpoint(EndpointDraft {
+            name: "".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            ..Default::default()
+        });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("name must not be empty"));
     }
@@ -352,19 +360,12 @@ mod tests {
         // auto-normalized, NOT rejected — the providers already tolerate both
         // forms via trim_end_matches('/'), so the stored config just gets the
         // canonical form.
-        let ep = validate_endpoint(
-            "x",
-            "openai",
-            "https://x/v1",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1".into(),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.base_url, "https://x/v1/");
     }
@@ -373,81 +374,54 @@ mod tests {
     fn validate_endpoint_normalizes_whitespace_padded_base_url() {
         // The trim also applies to surrounding whitespace (a pasted URL with
         // accidental spaces must not poison the stored config).
-        let ep = validate_endpoint(
-            "x",
-            "openai",
-            "  https://x/v1  ",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "  https://x/v1  ".into(),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.base_url, "https://x/v1/");
     }
 
     #[test]
     fn validate_endpoint_rejects_unknown_kind() {
-        let r = validate_endpoint(
-            "x",
-            "claude",
-            "https://x/v1/",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        );
+        let r = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "claude".into(),
+            base_url: "https://x/v1/".into(),
+            ..Default::default()
+        });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("unknown kind"));
     }
 
     #[test]
     fn validate_endpoint_accepts_anthropic_kind() {
-        let ep = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.kind, EndpointKind::Anthropic);
     }
 
     #[test]
     fn validate_endpoint_drops_empty_models() {
-        let ep = validate_endpoint(
-            "x",
-            "openai",
-            "https://x/v1/",
-            vec![
+        let ep = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec![
                 "gpt-4o".to_string(),
                 "".to_string(),
                 "  ".to_string(),
                 "mini".to_string(),
             ],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.model_ids(), vec!["gpt-4o", "mini"]);
     }
@@ -456,34 +430,24 @@ mod tests {
     fn validate_endpoint_trims_and_clears_workspace_id() {
         // A padded value is trimmed; a whitespace-only value clears to None
         // so the header is never sent empty.
-        let ep = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec!["claude-sonnet-4-5".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("  ws_abc  ".to_string()),
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            workspace_id: Some("  ws_abc  ".to_string()),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.workspace_id.as_deref(), Some("ws_abc"));
-        let cleared = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec!["claude-sonnet-4-5".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("   ".to_string()),
-        )
+        let cleared = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            workspace_id: Some("   ".to_string()),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(cleared.workspace_id, None, "whitespace-only clears to None");
     }
@@ -494,48 +458,33 @@ mod tests {
         // control/non-ASCII chars at Save time (surfaced in the settings
         // error dialog) instead of silently dropping the header at request
         // time.
-        let r = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec!["claude-sonnet-4-5".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("ws_a\tb".to_string()),
-        );
+        let r = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            workspace_id: Some("ws_a\tb".to_string()),
+            ..Default::default()
+        });
         assert!(r.is_err(), "control char must be rejected");
-        let r2 = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec!["claude-sonnet-4-5".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("ws_ä".to_string()),
-        );
+        let r2 = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            workspace_id: Some("ws_ä".to_string()),
+            ..Default::default()
+        });
         assert!(r2.is_err(), "non-ASCII must be rejected");
         // A tab-free, ASCII-only value still passes (boundary sanity).
-        let ok = validate_endpoint(
-            "claude",
-            "anthropic",
-            "https://api.anthropic.com/v1/",
-            vec!["claude-sonnet-4-5".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("ws_ok-1.2".to_string()),
-        )
+        let ok = validate_endpoint(EndpointDraft {
+            name: "claude".into(),
+            kind: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1/".into(),
+            models: vec!["claude-sonnet-4-5".to_string()],
+            workspace_id: Some("ws_ok-1.2".to_string()),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ok.workspace_id.as_deref(), Some("ws_ok-1.2"));
     }
@@ -545,38 +494,26 @@ mod tests {
         // Review L2 (2026-12-06): the form hides the field for non-anthropic
         // kinds, so a persisted value would be invisible and un-clearable —
         // clear it at Save time instead.
-        let cleared = validate_endpoint(
-            "openai",
-            "openai",
-            "https://api.openai.com/v1/",
-            vec!["gpt-4o".to_string()],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            Some("ws_leftover".to_string()),
-        )
+        let cleared = validate_endpoint(EndpointDraft {
+            name: "openai".into(),
+            kind: "openai".into(),
+            base_url: "https://api.openai.com/v1/".into(),
+            models: vec!["gpt-4o".to_string()],
+            workspace_id: Some("ws_leftover".to_string()),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(cleared.workspace_id, None, "non-anthropic kinds drop it");
     }
 
     #[test]
     fn validate_endpoint_trims_name() {
-        let ep = validate_endpoint(
-            "  openai  ",
-            "openai",
-            "https://x/v1/",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "  openai  ".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.name, "openai");
     }
@@ -600,19 +537,14 @@ mod tests {
                 ..crate::config::ModelSpec::test_default()
             },
         ];
-        let ep = validate_endpoint(
-            "x",
-            "openai",
-            "https://x/v1/",
-            vec!["gpt-4o".to_string(), "mini".to_string()],
-            specs,
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec!["gpt-4o".to_string(), "mini".to_string()],
+            model_configs: specs,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.model_ids(), vec!["gpt-4o", "mini"]);
         assert_eq!(ep.model_spec("gpt-4o").unwrap().max_context, Some(200000));
@@ -639,19 +571,14 @@ mod tests {
             max_context: Some(64000),
             ..crate::config::ModelSpec::test_default()
         }];
-        let ep = validate_endpoint(
-            "x",
-            "openai",
-            "https://x/v1/",
-            vec!["gpt-4o".to_string()],
-            specs,
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        )
+        let ep = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "https://x/v1/".into(),
+            models: vec!["gpt-4o".to_string()],
+            model_configs: specs,
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(ep.model_ids(), vec!["gpt-4o"]);
         assert_eq!(ep.model_spec("gpt-4o").unwrap().max_context, Some(64000));
@@ -939,19 +866,12 @@ mod tests {
 
     #[test]
     fn validate_endpoint_rejects_empty_base_url() {
-        let r = validate_endpoint(
-            "x",
-            "openai",
-            "",
-            vec![],
-            Vec::new(),
-            None,
-            None,
-            false,
-            true,
-            None,
-            None,
-        );
+        let r = validate_endpoint(EndpointDraft {
+            name: "x".into(),
+            kind: "openai".into(),
+            base_url: "".into(),
+            ..Default::default()
+        });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("base_url must not be empty"));
     }

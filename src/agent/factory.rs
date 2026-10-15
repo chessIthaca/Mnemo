@@ -1139,7 +1139,20 @@ impl AgentLoopFactory {
 
         // Fresh per-agent tool registry, wired to this agent's workflow and
         // stamped with this agent's id (for the parent-aware spawn_agent tool).
-        let registry = self.build_registry(&workflow, agent_id, root, &plans_dir);
+        let mut registry = self.build_registry(&workflow, agent_id, root, &plans_dir);
+        // Session dismissal (backlog c68a8c3b): ONE Arc per built loop,
+        // shared between the recall_feedback tool registered here and the
+        // loop's auto-recall injector (with_dismissed_recall below), so the
+        // tool's writes and the injector's filter see the same per-session
+        // set. Registered at the array tail — AFTER build_registry — so the
+        // grouped registration order inside build_registry (and its test
+        // callers) stays untouched.
+        let dismissed_recall = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        registry.register(Box::new(crate::tool::memory::RecallFeedbackTool::new(
+            dismissed_recall.clone(),
+        )));
 
         // Snapshot the shared provider + context manager (swappable at
         // runtime). The locks are released immediately (cheap clones).
@@ -1179,6 +1192,9 @@ impl AgentLoopFactory {
         // the ingestion-time levers (progressive disclosure, compaction
         // survival) see a config save without rebuilding the loop.
         .with_optimizer(Arc::clone(&self.optimizer))
+        // Backlog c68a8c3b: share the per-loop dismissal set with the
+        // recall_feedback tool registered above.
+        .with_dismissed_recall(dismissed_recall)
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).

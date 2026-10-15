@@ -12091,6 +12091,152 @@ async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
 }
 
 #[tokio::test]
+async fn recall_feedback_dismissed_row_never_reinjects_this_session() {
+    // Session dismissal (backlog c68a8c3b), end-to-end: turn 1 recalls both
+    // merge-topic rows; turn 2 calls recall_feedback dismissing M1's id;
+    // turn 3 re-runs the same query — M1 must NOT re-inject while M2 still
+    // does, and the store row must survive untouched (dismissal is
+    // injection-scoped, never a delete).
+    const M1: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path so the history stays linear";
+    const M1_HEAD: &str = "how to merge feature branches into main safely";
+    const M2: &str = "steps to merge a release branch into main";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // Registry with ONLY recall_feedback — the dismissal tool and the
+    // loop's injector share one per-loop Arc.
+    let dismissed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(crate::tool::memory::RecallFeedbackTool::new(
+        dismissed.clone(),
+    )));
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let m1_id = store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions",
+            M1,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "merge checklist",
+            M2,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![
+        // Turn 1: text only — recalls M1 + M2 in full.
+        vec![
+            LlmEvent::TextDelta { text: "one".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // Turn 2: the model dismisses M1 via recall_feedback ...
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_dismiss".into(),
+                name: "recall_feedback".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: format!(r#"{{"dismissed":["{}"]}}"#, m1_id),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        // ... then finishes the turn with text.
+        vec![
+            LlmEvent::TextDelta { text: "two".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // Turn 3: same query — the dismissal must hold.
+        vec![
+            LlmEvent::TextDelta {
+                text: "three".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: Arc::new(registry),
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_dismissed_recall(dismissed.clone());
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tails = probe.request_tails();
+    let turn1 = &tails[0];
+    let turn3 = tails.last().unwrap();
+    assert!(
+        turn1.contains(M1_HEAD) && turn1.contains("merge checklist"),
+        "turn 1 recalls both rows: {turn1}"
+    );
+    assert!(
+        !turn3.contains(M1_HEAD),
+        "the dismissed row never re-injects: {turn3}"
+    );
+    assert!(
+        turn3.contains("merge checklist"),
+        "the undismissed row still injects: {turn3}"
+    );
+    // Dismissal never deletes: the row still ranks in the store's own
+    // recall path (the injector filter is render-scoped only).
+    let hits = store
+        .recall_peek("merge it", &crate::memory::MemoryFilter::new().limit(5))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|sm| sm.memory.id == m1_id),
+        "the dismissed row still ranks in the store — dismissal is injection-scoped: {hits:?}"
+    );
+}
+
+#[tokio::test]
 async fn auto_recall_emits_memory_recalled_event() {
     // Regression (2026-04-20, user request + review finding 1): the per-turn
     // AUTO-recall injected memories into the prompt invisibly — there must be

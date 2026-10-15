@@ -1505,6 +1505,107 @@ impl Tool for MemoryDeleteTool {
     }
 }
 
+/// Per-session dismissal of auto-recalled rows (backlog c68a8c3b).
+///
+/// The agent calls this after judging recall rows as noise: the ids are
+/// the `(id: ...)` values printed in the volatile tail's RECALLED
+/// MEMORIES block. Dismissal is SESSION-SCOPED — the tool and this loop's
+/// auto-recall injector share ONE `Arc<Mutex<HashSet>>` (the factory mints
+/// it per built loop), and the store is never touched: a dismissed row
+/// still ranks in `memory_search` and re-derives normally next session.
+pub struct RecallFeedbackTool {
+    /// Dismissed record ids, shared with this agent loop's injector.
+    dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl RecallFeedbackTool {
+    /// Wire the tool to the per-loop dismissal set — the same Arc the
+    /// loop's injector filters on (see `AgentLoop::with_dismissed_recall`).
+    pub fn new(dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>) -> Self {
+        Self { dismissed }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RecallFeedbackArgs {
+    dismissed: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for RecallFeedbackTool {
+    fn name(&self) -> &str {
+        "recall_feedback"
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "recall_feedback",
+            "Dismiss noisy auto-recalled memories for the REST of this session. Call it when the \
+             RECALLED MEMORIES block surfaces rows irrelevant to the active task — pass their \
+             (id: ...) values. Dismissed rows never re-inject this session (the store is \
+             untouched; they rank again next session and stay reachable via memory_search).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "dismissed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The memory ids to dismiss — the (id: ...) values from the RECALLED MEMORIES block."
+                    }
+                },
+                "required": ["dismissed"]
+            }),
+        )
+    }
+
+    fn safety(&self) -> SafetyLevel {
+        // Session-scoped prompt-rendering bookkeeping only — never prompts
+        // for approval.
+        SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        let args: RecallFeedbackArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
+                    self.name(),
+                    &e,
+                ))
+            }
+        };
+        if args.dismissed.is_empty() {
+            return ToolResult::error(
+                "dismissed must name at least one memory id — the (id: ...) values from the RECALLED MEMORIES block.",
+            );
+        }
+        let mut set = match self.dismissed.lock() {
+            Ok(set) => set,
+            Err(_) => {
+                return ToolResult::error(
+                    "the dismissal set is unavailable (poisoned lock); nothing was dismissed",
+                )
+            }
+        };
+        let newly = args
+            .dismissed
+            .iter()
+            .filter(|id| set.insert((*id).clone()))
+            .count();
+        let total = set.len();
+        drop(set);
+        ToolResult::success(format!(
+            "{newly} dismissed ({total} total this session): they will not be auto-recalled again \
+             this session. The store is untouched — memory_search still finds them, and future \
+             sessions re-derive normally."
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

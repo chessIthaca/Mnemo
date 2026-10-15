@@ -3421,6 +3421,24 @@ impl AgentLoop {
                             _ => Vec::new(),
                         }
                     };
+                // Session dismissal (backlog c68a8c3b): rows the agent
+                // dismissed via the recall_feedback tool never re-inject
+                // for this session's remainder. Applied at the RENDER
+                // boundary — after the cache write (the per-turn cache
+                // keeps the UNFILTERED set, so a dismissal that lands
+                // between turns is honored even on a cache hit) and
+                // before the visibility event, so both the
+                // MemoryRecalled announcement and the block respect it.
+                // Lock poisoning degrades to "no filtering" (the block
+                // still renders; nothing is silently hidden).
+                let results: Vec<crate::memory::ScoredMemory> =
+                    match self.dismissed_recall.lock() {
+                        Ok(set) if !set.is_empty() => results
+                            .into_iter()
+                            .filter(|sm| !set.contains(&sm.memory.id))
+                            .collect(),
+                        _ => results,
+                    };
                 if !results.is_empty() {
                     // Visibility of memory access (user request
                     // 2026-04-20): tell the UI a FRESH auto-recall just

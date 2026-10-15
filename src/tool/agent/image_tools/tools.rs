@@ -21,7 +21,7 @@ use crate::provider::vision::ImageDescriber;
 use crate::provider::ToolSchema;
 use crate::tool::agent::image_tools::load_image_data_url_and_bytes;
 use crate::tool::agent::image_tools::prompts::{build_prompt, ImageTool, PromptArgs};
-use crate::tool::agent::image_tools::zoom::{analyze_with_zoom, parse_detail_level, ZoomResult};
+use crate::tool::agent::image_tools::zoom::{analyze_with_zoom, parse_detail_level, ZoomRequest, ZoomResult};
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
@@ -86,13 +86,15 @@ async fn run_single(
     let detail_level = parse_detail_level(&common.detail_level);
     let result: ZoomResult = match analyze_with_zoom(
         state.vision.as_ref(),
-        &data_url,
-        &bytes,
+        ZoomRequest {
+            data_url: &data_url,
+            bytes: &bytes,
+            region: common.region.as_deref(),
+            detail_level,
+            max_rounds: MAX_ZOOM_ROUNDS,
+        },
         tool,
         &args,
-        detail_level,
-        common.region.as_deref(),
-        MAX_ZOOM_ROUNDS,
     )
     .await
     {

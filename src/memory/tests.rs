@@ -1979,12 +1979,10 @@ async fn superseded_strongest_match_stays_hidden_by_default() {
 
 // ── request_stats + aggregation ────────────────────────────────────────
 
-/// A helper that records a stats row with sensible defaults.
-async fn record(
-    store: &MemoryStore,
-    session_id: Option<&str>,
-    model: &str,
-    endpoint: Option<&str>,
+/// The token/timing numbers of one stats row [`record`] files — grouped so
+/// the helper stays under clippy's argument budget: prompt/completion/
+/// reasoning/cached tokens, TTFT ms, generation ms, epoch seconds.
+struct StatsRow {
     p: u32,
     c: u32,
     r: u32,
@@ -1992,7 +1990,17 @@ async fn record(
     ttft: Option<u32>,
     gen: Option<u32>,
     at: i64,
+}
+
+/// A helper that records a stats row with sensible defaults.
+async fn record(
+    store: &MemoryStore,
+    session_id: Option<&str>,
+    model: &str,
+    endpoint: Option<&str>,
+    row: StatsRow,
 ) {
+    let StatsRow { p, c, r, cached, ttft, gen, at } = row;
     let stats = RequestStats {
         id: uuid::Uuid::new_v4().to_string(),
         session_id: session_id.map(|s| s.to_string()),
@@ -2358,13 +2366,15 @@ async fn request_stats_rows_separates_outcome_and_purpose_tags() {
         Some("s1"),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        800,
-        Some(420),
-        Some(2000),
-        now,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 800,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: now,
+        },
     )
     .await;
     // An error row: our estimated prompt, cached NULL, outcome='error'.
@@ -2443,13 +2453,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o",
         None,
-        1000,
-        200,
-        50,
-        800,
-        Some(420),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 50,
+            cached: 800,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2457,13 +2469,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o",
         None,
-        2000,
-        400,
-        100,
-        0,
-        Some(500),
-        Some(4000),
-        6000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 100,
+            cached: 0,
+            ttft: Some(500),
+            gen: Some(4000),
+            at: 6000,
+        },
     )
     .await;
     record(
@@ -2471,13 +2485,15 @@ async fn session_stats_aggregates_tokens_and_timing() {
         Some(&session.id),
         "gpt-4o-mini",
         None,
-        500,
-        100,
-        0,
-        0,
-        None,
-        None,
-        7000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 7000,
+        },
     )
     .await;
 
@@ -2525,13 +2541,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        0,
-        Some(400),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 0,
+            ttft: Some(400),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2539,13 +2557,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         Some("b200"),
-        2000,
-        400,
-        0,
-        0,
-        Some(600),
-        Some(4000),
-        6000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(600),
+            gen: Some(4000),
+            at: 6000,
+        },
     )
     .await;
     record(
@@ -2553,13 +2573,15 @@ async fn session_stats_splits_same_model_across_endpoints() {
         Some(&session.id),
         "glm-5.3",
         None,
-        500,
-        100,
-        0,
-        0,
-        None,
-        None,
-        7000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 7000,
+        },
     )
     .await;
 
@@ -2606,13 +2628,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        1000,
-        200,
-        0,
-        100,
-        Some(420),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 100,
+            ttft: Some(420),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2620,13 +2644,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        2000,
-        400,
-        0,
-        0,
-        Some(500),
-        Some(4000),
-        5000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(500),
+            gen: Some(4000),
+            at: 5000,
+        },
     )
     .await;
     // Day 2 (86400 + 5000s) — one request in s2.
@@ -2635,13 +2661,15 @@ async fn project_stats_aggregates_across_sessions_and_days() {
         Some(&s2.id),
         "gpt-4o-mini",
         None,
-        500,
-        100,
-        0,
-        0,
-        Some(300),
-        Some(1000),
-        86400 + 5000,
+        StatsRow {
+            p: 500,
+            c: 100,
+            r: 0,
+            cached: 0,
+            ttft: Some(300),
+            gen: Some(1000),
+            at: 86400 + 5000,
+        },
     )
     .await;
 
@@ -2677,13 +2705,15 @@ async fn project_stats_splits_same_model_across_endpoints() {
         Some(&s1.id),
         "glm-5.3",
         Some("a100"),
-        1000,
-        200,
-        0,
-        0,
-        Some(400),
-        Some(2000),
-        5000,
+        StatsRow {
+            p: 1000,
+            c: 200,
+            r: 0,
+            cached: 0,
+            ttft: Some(400),
+            gen: Some(2000),
+            at: 5000,
+        },
     )
     .await;
     record(
@@ -2691,13 +2721,15 @@ async fn project_stats_splits_same_model_across_endpoints() {
         Some(&s2.id),
         "glm-5.3",
         Some("b200"),
-        2000,
-        400,
-        0,
-        0,
-        Some(600),
-        Some(4000),
-        86400 + 5000,
+        StatsRow {
+            p: 2000,
+            c: 400,
+            r: 0,
+            cached: 0,
+            ttft: Some(600),
+            gen: Some(4000),
+            at: 86400 + 5000,
+        },
     )
     .await;
 
@@ -2730,13 +2762,15 @@ async fn session_list_orders_newest_first_with_token_totals() {
         Some(&s1.id),
         "gpt-4o",
         None,
-        100,
-        20,
-        0,
-        0,
-        None,
-        None,
-        100,
+        StatsRow {
+            p: 100,
+            c: 20,
+            r: 0,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 100,
+        },
     )
     .await;
     let s2 = store.start_session("proj").await.unwrap();
@@ -2745,13 +2779,15 @@ async fn session_list_orders_newest_first_with_token_totals() {
         Some(&s2.id),
         "gpt-4o",
         None,
-        500,
-        80,
-        10,
-        0,
-        None,
-        None,
-        200,
+        StatsRow {
+            p: 500,
+            c: 80,
+            r: 10,
+            cached: 0,
+            ttft: None,
+            gen: None,
+            at: 200,
+        },
     )
     .await;
 

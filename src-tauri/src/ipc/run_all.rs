@@ -3382,38 +3382,20 @@ mod tests {
         // Backlog ffd4bac3: the gate is the SAME effective threshold the
         // fill-rate path uses — 50% of a 500k window = 250k. Below →
         // skip; at/above → compact (>= is inclusive).
-        assert!(!should_between_items_compact(
-            Some((100_000, 500_000)),
-            0.5,
-            None
-        ));
-        assert!(should_between_items_compact(
-            Some((250_000, 500_000)),
-            0.5,
-            None
-        ));
-        assert!(should_between_items_compact(
-            Some((300_000, 500_000)),
-            0.5,
-            None
-        ));
+        assert!(!should_between_items_compact(Some((100_000, 500_000)), 0.5));
+        assert!(should_between_items_compact(Some((250_000, 500_000)), 0.5));
+        assert!(should_between_items_compact(Some((300_000, 500_000)), 0.5));
     }
 
     #[test]
-    fn should_between_items_compact_includes_the_proxy_ceiling_cap() {
-        // 90% of 500k = 450k, but the 340k ceiling − 32k margin caps the
-        // threshold at 308k — the gate must use the CAPPED value, exactly
-        // like the fill-rate path.
-        assert!(should_between_items_compact(
-            Some((310_000, 500_000)),
-            0.9,
-            Some(340_000)
-        ));
-        assert!(!should_between_items_compact(
-            Some((300_000, 500_000)),
-            0.9,
-            Some(340_000)
-        ));
+    fn should_between_items_compact_has_no_hidden_ceiling_cap() {
+        // Removal regression (2027-01-25): the fill-rate product is the
+        // ONLY threshold — 0.9 × 500k = 450k, uncapped. 350k sits between
+        // the removed cap (340k − 32k = 307_232) and the product, so it
+        // must NOT compact (the RED form of this assert failed pre-fix,
+        // when the gate compacted at 307_232).
+        assert!(!should_between_items_compact(Some((350_000, 500_000)), 0.9));
+        assert!(should_between_items_compact(Some((450_000, 500_000)), 0.9));
     }
 
     #[test]
@@ -3421,8 +3403,8 @@ mod tests {
         // No usage data or a zero window → compact (the pre-ffd4bac3
         // behavior — the overnight-stability default when the fill is
         // unknown).
-        assert!(should_between_items_compact(None, 0.5, None));
-        assert!(should_between_items_compact(Some((5, 0)), 0.5, None));
+        assert!(should_between_items_compact(None, 0.5));
+        assert!(should_between_items_compact(Some((5, 0)), 0.5));
     }
 
     #[test]
@@ -3447,16 +3429,11 @@ mod tests {
             "the skip path must log why it skipped"
         );
         // The gate reads the LIVE loop's fill rate (what the engine's
-        // fill-rate path uses) and the ceiling from the factory's
-        // startup snapshot.
+        // fill-rate path uses).
         let gate_body = fn_body(include_str!("run_all.rs"), "between_items_compact_gate");
         assert!(
             gate_body.contains("l.fill_rate()"),
             "the gate must read the live loop's fill rate"
-        );
-        assert!(
-            gate_body.contains("f.proxy_cache_ceiling()"),
-            "the gate must read the proxy cache ceiling from the factory snapshot (the same source the engine's context managers are built from)"
         );
         assert!(
             gate_body.contains("context_usage"),
@@ -3768,22 +3745,16 @@ async fn wait_for_compact_signal(
 /// Backlog ffd4bac3: decide whether the between-items auto-compact should
 /// fire for the given post-item usage. The threshold is the SAME effective
 /// fill-rate trigger the engine's summarization path uses —
-/// `summarize_at_fill_rate` × window, proxy-ceiling cap included — computed
-/// through the shared `ContextManager::effective_summarize_threshold`
-/// helper so the two can never drift. No usage data or a zero window means
-/// we are blind, so compact (the pre-ffd4bac3 behavior).
-fn should_between_items_compact(
-    usage: Option<(u64, u64)>,
-    fill_rate: f64,
-    ceiling: Option<usize>,
-) -> bool {
+/// `summarize_at_fill_rate` × window, no other cap (the proxy-cache
+/// ceiling was removed 2027-01-25) — computed through the shared
+/// `ContextManager::effective_summarize_threshold` helper so the two can
+/// never drift. No usage data or a zero window means we are blind, so
+/// compact (the pre-ffd4bac3 behavior).
+fn should_between_items_compact(usage: Option<(u64, u64)>, fill_rate: f64) -> bool {
     match usage {
         Some((used, max)) if max > 0 => {
-            let threshold = mnemo::ContextManager::effective_summarize_threshold(
-                max as usize,
-                fill_rate,
-                ceiling,
-            );
+            let threshold =
+                mnemo::ContextManager::effective_summarize_threshold(max as usize, fill_rate);
             used as usize >= threshold
         }
         // Blind (no usage event seen, or a zero window) — compact anyway.
@@ -3792,22 +3763,15 @@ fn should_between_items_compact(
 }
 
 /// Backlog ffd4bac3: read the main agent's post-item context fill and
-/// decide whether the between-items auto-compact should fire. Both the
-/// fill rate (from the LIVE loop) and the proxy cache ceiling (from the
-/// factory's startup snapshot) are the SAME values the engine's
-/// fill-rate path uses — the factory threads them into every loop and
-/// every rebuilt context manager, so the gate's threshold matches the
-/// dial the engine actually applies even after a mid-session settings
-/// edit (review LOW-1: reading the ceiling from the current config
-/// instead would diverge from the engine's snapshot until restart).
-/// Exception (round-2 LOW-1): turns served by resolver-built CMs (a
-/// `[models.*]` slot serving the turn, a 429-sticky reroute — on a
-/// picker pin or the default provider — or a forced model) read the
-/// LIVE config's ceiling — on those paths a mid-session ceiling edit
-/// diverges until restart; the impact is bounded, restart-healed, and
-/// the preflight backstop (window − headroom) still guards the window.
-/// Missing pieces (no main agent, no loop, no factory) mean we are
-/// blind, so compact.
+/// decide whether the between-items auto-compact should fire. The fill
+/// rate (from the LIVE loop) is the SAME value the engine's fill-rate
+/// path uses — the factory threads it into every loop and every rebuilt
+/// context manager, so the gate's threshold matches the dial the engine
+/// actually applies even after a mid-session settings edit. (The
+/// proxy-cache ceiling this gate used to read from the factory snapshot
+/// was removed 2027-01-25 — the trigger is the fill-rate product only.)
+/// Missing pieces (no main agent, no loop) mean we are blind, so
+/// compact.
 async fn between_items_compact_gate(state: &tauri::State<'_, IpcState>) -> bool {
     let main_id = {
         let mgr = state.runtime.manager.lock().await;
@@ -3830,12 +3794,7 @@ async fn between_items_compact_gate(state: &tauri::State<'_, IpcState>) -> bool 
             None => return true,
         }
     };
-    let ceiling = match &state.runtime.factory {
-        Some(f) => f.proxy_cache_ceiling(),
-        // No factory (brain failed to build) — blind: compact.
-        None => return true,
-    };
-    should_between_items_compact(usage, fill_rate, ceiling)
+    should_between_items_compact(usage, fill_rate)
 }
 
 /// The run-all heartbeat period (backlog 0ed9d24f): while a run is armed,

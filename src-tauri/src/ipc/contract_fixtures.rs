@@ -278,7 +278,6 @@ fn dto_fixtures_match_serde() {
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: 0.5,
-            proxy_cache_ceiling_tokens: Some(340_000),
         },
         ui: GetSettingsUi {
             theme: "dark".into(),

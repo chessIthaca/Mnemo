@@ -901,8 +901,7 @@ pub(crate) fn wire_brain(
     .with_preflight(
         config.general.context.preflight_compact,
         config.general.context.compact_headroom_tokens,
-    )
-    .with_proxy_cache_ceiling(config.general.context.proxy_cache_ceiling_tokens);
+    );
 
     // Vision client from config (shared helper — also used by Settings rewire).
     // Still useful when the main provider is multimodal (describe_image tool

@@ -295,10 +295,6 @@ pub struct AgentLoopFactory {
     /// The fill rate the context manager was built with — needed to rebuild a
     /// `ContextManager` when the provider (and thus its max context) changes.
     fill_rate: f64,
-    /// The proxy cache ceiling (cliff guard) — preserved across model swaps
-    /// so the rebuilt `ContextManager` keeps it (same preservation contract
-    /// as the preflight settings).
-    proxy_cache_ceiling: Option<usize>,
     /// Whether the pre-flight hard-ceiling guard is enabled — preserved across
     /// model swaps so the rebuilt `ContextManager` keeps the setting.
     preflight_compact: bool,
@@ -511,15 +507,11 @@ impl AgentLoopFactory {
         // swap) keep the same hard-ceiling guard behavior.
         let preflight_compact = context_manager.preflight_compact();
         let compact_headroom_tokens = context_manager.compact_headroom_tokens();
-        // Preserve the proxy cache ceiling so rebuilt ContextManagers keep
-        // the cliff guard (same preservation contract as preflight).
-        let proxy_cache_ceiling = context_manager.proxy_cache_ceiling();
         Self {
             provider: Arc::new(RwLock::new(provider.clone())),
             default_display_effort: Arc::new(RwLock::new(None)),
             context_manager: Arc::new(RwLock::new(context_manager)),
             fill_rate,
-            proxy_cache_ceiling,
             preflight_compact,
             compact_headroom_tokens,
             constitution_source,
@@ -945,8 +937,7 @@ impl AgentLoopFactory {
             .write()
             .expect("context_manager lock poisoned") =
             ContextManager::new(max_context, self.fill_rate)
-                .with_preflight(self.preflight_compact, self.compact_headroom_tokens)
-                .with_proxy_cache_ceiling(self.proxy_cache_ceiling);
+                .with_preflight(self.preflight_compact, self.compact_headroom_tokens);
     }
 
     /// Record the DISPLAY-space effort of the shared default provider slot
@@ -1036,7 +1027,6 @@ impl AgentLoopFactory {
     pub fn context_manager_for(&self, provider: &dyn LlmClient) -> ContextManager {
         ContextManager::new(provider.capabilities().max_context, self.fill_rate)
             .with_preflight(self.preflight_compact, self.compact_headroom_tokens)
-            .with_proxy_cache_ceiling(self.proxy_cache_ceiling)
     }
 
     /// A handle to the shared memory store (if any). The IPC layer uses this
@@ -1044,17 +1034,6 @@ impl AgentLoopFactory {
     /// store's SQLite DB at `.coding/memory.db`).
     pub fn memory_handle(&self) -> Option<Arc<dyn MemoryStoreTrait>> {
         self.memory.clone()
-    }
-
-
-    /// The proxy cache ceiling the factory's context managers are built
-    /// with — the startup snapshot (backlog ffd4bac3): the run-all
-    /// between-items auto-compact gate reads it so its threshold uses the
-    /// SAME ceiling the engine's fill-rate path applies, even after a
-    /// mid-session settings edit (the config file may be newer than the
-    /// factory until restart).
-    pub fn proxy_cache_ceiling(&self) -> Option<usize> {
-        self.proxy_cache_ceiling
     }
 
     /// Build a fresh `AgentLoop` with its own `Workflow` + `ToolRegistry`,

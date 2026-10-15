@@ -119,8 +119,8 @@ pub struct ContextManager {
     /// The configured fill-rate fraction (e.g. 0.3) — stored so
     /// [`Self::effective_summarize_at`] can delegate to the shared
     /// [`Self::effective_summarize_threshold`] helper (backlog ffd4bac3:
-    /// the run-all between-items gate computes the SAME threshold through
-    /// it, proxy-ceiling cap included).
+    /// the run-all between-items gate computes the SAME threshold
+    /// through it).
     fill_rate: f64,
     summarize_at: usize,
     /// Whether to use aggressive compaction when the conversation exceeds the
@@ -133,12 +133,6 @@ pub struct ContextManager {
     /// Compaction turns aggressive once `token_count > max_tokens -
     /// headroom`, reserving this much room for the model's reply.
     compact_headroom_tokens: usize,
-    /// Total input tokens above which LiteLLM-class proxies drop
-    /// whole-conversation prefix caching (hit rate collapses from ~99% to
-    /// ~4%). When set, the effective summarize trigger caps at
-    /// `ceiling - PROXY_CACHE_PRESSURE_MARGIN_TOKENS` so long sessions
-    /// summarize before crossing the cliff. `None` disables the guard.
-    proxy_cache_ceiling: Option<usize>,
     /// The per-session temporary raise of the effective trigger
     /// ([`Self::effective_limit`]): the cumulative +10% ladder applied when a
     /// compaction pass still does not fit (see [`CompactionRaise`]). Shared by
@@ -259,7 +253,6 @@ impl ContextManager {
             summarize_at,
             preflight_compact: true,
             compact_headroom_tokens: 32_000,
-            proxy_cache_ceiling: None,
             compaction_raise: Arc::new(CompactionRaise::default()),
         }
     }
@@ -272,38 +265,24 @@ impl ContextManager {
         self
     }
 
-    /// Builder: set the proxy cache ceiling (the ~340K-token cliff above which
-    /// LiteLLM-class proxies drop whole-conversation prefix caching). When
-    /// set, the effective summarize trigger caps at
-    /// `ceiling - PROXY_CACHE_PRESSURE_MARGIN_TOKENS`. `None` disables the
-    /// guard. Callers pass a value validated by the config layer (>= 65_536).
-    pub fn with_proxy_cache_ceiling(mut self, ceiling: Option<usize>) -> Self {
-        self.proxy_cache_ceiling = ceiling;
-        self
-    }
-
     /// The token threshold at which summarization triggers — the raw
-    /// fill-rate product, NOT capped by the proxy cache ceiling. The check
-    /// sites use [`effective_summarize_at`](Self::effective_summarize_at).
+    /// fill-rate product (`summarize_at_fill_rate` × window, the ONLY
+    /// trigger dial since the proxy-cache ceiling removal, 2027-01-25).
+    /// The check sites use [`effective_summarize_at`](Self::effective_summarize_at).
     pub fn summarize_at(&self) -> usize {
         self.summarize_at
     }
 
-    /// The effective summarize trigger: `min(summarize_at, ceiling -
-    /// PROXY_CACHE_PRESSURE_MARGIN_TOKENS)` when a proxy cache ceiling is
-    /// set, otherwise the raw fill-rate product. Both summarize check sites
-    /// (preflight and the turn loop) consult this so compaction fires before
-    /// the request crosses the proxy cliff.
+    /// The effective summarize trigger: the fill-rate product
+    /// (`summarize_at_fill_rate` × window — the only trigger dial since
+    /// the proxy-cache ceiling removal, 2027-01-25). Both summarize check
+    /// sites (preflight and the turn loop) consult this.
     ///
     /// The BASE trigger — before any temporary raise. In-loop trigger checks
     /// read [`effective_limit`](Self::effective_limit), which scales this by
     /// the session's raise ladder.
     pub fn effective_summarize_at(&self) -> usize {
-        Self::effective_summarize_threshold(
-            self.max_tokens,
-            self.fill_rate,
-            self.proxy_cache_ceiling,
-        )
+        Self::effective_summarize_threshold(self.max_tokens, self.fill_rate)
     }
 
     /// Builder: install the SESSION's raise ladder so every clone of this
@@ -397,30 +376,16 @@ impl ContextManager {
         }
     }
 
-    /// The effective summarize trigger for a `(max_tokens, fill_rate,
-    /// ceiling)` triple — the shared core of
-    /// [`Self::effective_summarize_at`], so off-manager callers compute
-    /// the SAME threshold as the fill-rate path (proxy-ceiling cap
-    /// included) instead of duplicating the formula. The run-all
-    /// between-items auto-compact gate (backlog ffd4bac3) reads the
-    /// user's `summarize_at_fill_rate` dial through this.
-    pub fn effective_summarize_threshold(
-        max_tokens: usize,
-        fill_rate: f64,
-        ceiling: Option<usize>,
-    ) -> usize {
-        let summarize_at = (max_tokens as f64 * fill_rate) as usize;
-        match ceiling {
-            None => summarize_at,
-            Some(ceiling) => summarize_at.min(
-                ceiling.saturating_sub(crate::provider::PROXY_CACHE_PRESSURE_MARGIN_TOKENS),
-            ),
-        }
-    }
-
-    /// The proxy cache ceiling (cliff guard), if configured.
-    pub fn proxy_cache_ceiling(&self) -> Option<usize> {
-        self.proxy_cache_ceiling
+    /// The effective summarize trigger for a `(max_tokens, fill_rate)`
+    /// pair — the shared core of [`Self::effective_summarize_at`], so
+    /// off-manager callers compute the SAME threshold as the fill-rate
+    /// path instead of duplicating the formula. The run-all between-items
+    /// auto-compact gate (backlog ffd4bac3) reads the user's
+    /// `summarize_at_fill_rate` dial through this. Exactly the fill-rate
+    /// product, no other cap — the proxy-cache ceiling was removed
+    /// 2027-01-25 (a LiteLLM user sets a lower fill rate instead).
+    pub fn effective_summarize_threshold(max_tokens: usize, fill_rate: f64) -> usize {
+        (max_tokens as f64 * fill_rate) as usize
     }
 
     /// The max context window (in tokens).
@@ -2328,43 +2293,32 @@ mod tests {
     fn effective_summarize_threshold_mirrors_effective_summarize_at() {
         // Backlog ffd4bac3: the between-items gate computes its threshold
         // through the shared helper — it must agree with the manager's
-        // own effective trigger for the same triple, ceiling cap included.
-        for &(max, rate, ceiling) in &[
-            (500_000usize, 0.5, None),
-            (500_000, 0.5, Some(340_000)),
-            (500_000, 0.9, Some(340_000)), // the cap binds
-            (200_000, 0.3, Some(340_000)), // the product binds
-            (0, 0.3, None),
+        // own effective trigger for the same pair.
+        for &(max, rate) in &[
+            (500_000usize, 0.5),
+            (500_000, 0.9),
+            (200_000, 0.3),
+            (0, 0.3),
         ] {
-            let mut m = ContextManager::new(max, rate);
-            if ceiling.is_some() {
-                m = m.with_proxy_cache_ceiling(ceiling);
-            }
+            let m = ContextManager::new(max, rate);
             assert_eq!(
-                ContextManager::effective_summarize_threshold(max, rate, ceiling),
+                ContextManager::effective_summarize_threshold(max, rate),
                 m.effective_summarize_at(),
-                "max={max} rate={rate} ceiling={ceiling:?}"
+                "max={max} rate={rate}"
             );
         }
     }
 
     #[test]
-    fn effective_summarize_threshold_caps_at_the_proxy_ceiling() {
-        // 90% of 500k = 450k, above the 340k ceiling − 32k margin → the
-        // cap binds; 30% of 500k = 150k → the product binds; no ceiling →
-        // the raw product.
-        assert_eq!(
-            ContextManager::effective_summarize_threshold(500_000, 0.9, Some(340_000)),
-            340_000 - crate::provider::PROXY_CACHE_PRESSURE_MARGIN_TOKENS
-        );
-        assert_eq!(
-            ContextManager::effective_summarize_threshold(500_000, 0.3, Some(340_000)),
-            150_000
-        );
-        assert_eq!(
-            ContextManager::effective_summarize_threshold(500_000, 0.5, None),
-            250_000
-        );
+    fn effective_summarize_threshold_is_the_fill_rate_product() {
+        // Removal regression (2027-01-25): the fill-rate product is the
+        // ONLY trigger — no hidden proxy-ceiling cap. The 0.9 × 1M case
+        // returned 340_000 − 32_768 = 307_232 under the removed cap (the
+        // RED form of that assert failed at 307_232 pre-fix).
+        assert_eq!(ContextManager::effective_summarize_threshold(200_000, 0.3), 60_000);
+        assert_eq!(ContextManager::effective_summarize_threshold(1_000_000, 0.9), 900_000);
+        assert_eq!(ContextManager::effective_summarize_threshold(500_000, 0.5), 250_000);
+        assert_eq!(ContextManager::effective_summarize_threshold(0, 0.3), 0);
     }
 
     #[test]
@@ -3391,32 +3345,23 @@ mod tests {
     }
 
     #[test]
-    fn proxy_cache_ceiling_caps_effective_summarize_at() {
-        // Raw trigger stays the fill-rate product; only the effective trigger
-        // (used by both summarize check sites) is capped below the cliff.
+    fn effective_summarize_at_is_uncapped_on_large_windows() {
+        // Removal regression (2027-01-25): on a window large enough that
+        // the old proxy-cache cap WOULD have bound (0.5 × 1M = 500K is
+        // above the removed 307_232), the effective trigger is the raw
+        // fill-rate product — no hidden ceiling.
         let cm = ContextManager::new(1_000_000, 0.5);
         assert_eq!(cm.summarize_at(), 500_000);
-        let cm = cm.with_proxy_cache_ceiling(Some(crate::provider::PROXY_CACHE_CEILING_TOKENS));
-        assert_eq!(
-            cm.effective_summarize_at(),
-            crate::provider::PROXY_CACHE_CEILING_TOKENS
-                - crate::provider::PROXY_CACHE_PRESSURE_MARGIN_TOKENS
-        );
+        assert_eq!(cm.effective_summarize_at(), 500_000);
         // should_summarize consults the effective trigger: a message pushing
-        // the count past the capped trigger fires, a short one does not.
-        let big = "word ".repeat(400_000); // ~2M chars → ~500K tokens (chars/4)
+        // the count past it fires, a short one does not.
+        let big = "word ".repeat(800_000); // ~4M chars → ~1M tokens (chars/4)
         assert!(cm.should_summarize(&[Message::user_text(big)]));
         assert!(!cm.should_summarize(&[Message::user_text("short message")]));
-        // Small models: the fill-rate product sits below the cliff, so the
-        // ceiling changes nothing.
-        let small = ContextManager::new(128_000, 0.3)
-            .with_proxy_cache_ceiling(Some(crate::provider::PROXY_CACHE_CEILING_TOKENS));
+        // Small windows: the same formula, nothing extra.
+        let small = ContextManager::new(128_000, 0.3);
         assert_eq!(small.effective_summarize_at(), 38_400);
         assert_eq!(small.summarize_at(), 38_400);
-        // No ceiling: raw behavior preserved everywhere.
-        let uncapped = ContextManager::new(1_000_000, 0.5);
-        assert_eq!(uncapped.effective_summarize_at(), 500_000);
-        assert_eq!(uncapped.proxy_cache_ceiling(), None);
     }
 
     // --- Mock provider for summarization tests ---

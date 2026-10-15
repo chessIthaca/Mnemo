@@ -940,12 +940,6 @@ pub struct ContextConfig {
     /// for a substantial response while leaving room for the system prompt +
     /// tools array the conversation-token count doesn't include.
     pub compact_headroom_tokens: usize,
-    /// Total input tokens above which LiteLLM-class proxies drop
-    /// whole-conversation prefix caching (hit rate collapses from ~99% to
-    /// ~4%). When set, the context manager summarizes before
-    /// `ceiling - 32_768` so long sessions stay below the proxy cliff.
-    /// Default 340 000; set 0 (or omit) to disable the guard.
-    pub proxy_cache_ceiling_tokens: Option<usize>,
 }
 
 impl Default for ContextConfig {
@@ -954,7 +948,6 @@ impl Default for ContextConfig {
             summarize_at_fill_rate: 0.3,
             preflight_compact: true,
             compact_headroom_tokens: 32_000,
-            proxy_cache_ceiling_tokens: Some(crate::provider::PROXY_CACHE_CEILING_TOKENS),
         }
     }
 }
@@ -2624,7 +2617,6 @@ chat_hover_timestamps = true
                 summarize_at_fill_rate: 0.3,
                 preflight_compact: true,
                 compact_headroom_tokens: 32_000,
-                proxy_cache_ceiling_tokens: Some(340_000),
             },
             ui: UiConfig {
                 theme: "light".into(),

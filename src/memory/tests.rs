@@ -805,6 +805,72 @@ async fn stale_record_ranks_below_fresh_of_equal_relevance() {
 }
 
 #[tokio::test]
+async fn staleness_grace_follows_the_configured_decay_tau() {
+    // Review 084978b3 LOW-2: the staleness grace was hardcoded at 7 days
+    // while the adjacent strength-decay tau is live-configurable — a 30-day
+    // half-life still saw penalties begin at 7 days. The grace must track
+    // the configured tau. Identical text on both records isolates the
+    // strength + penalty terms: the 20-day-old record (strength 1.0,
+    // decayed term 0.154 under tau=30) beats the fresh pinned 0.35
+    // (term 0.105) — but only while its grace window exempts it; under the
+    // pre-fix constant grace the 0.141 penalty sinks it.
+    let embedder: Arc<dyn Embedder> = Arc::new(AnchorEmbedder { model_id: "anchor-real" });
+    let now_val = Arc::new(AtomicI64::new(1000));
+    let clock = now_val.clone();
+    let store = MemoryStore::open_in_memory_with_clock(embedder, move || {
+        clock.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    const DAY: i64 = 86_400;
+
+    let mut old = Memory::new(
+        MemoryTier::Semantic,
+        "old pipeline digest",
+        "pipeline pipeline",
+        1000,
+    );
+    old.strength = 1.0;
+    store.write(old).await.unwrap();
+
+    now_val.store(1000 + 20 * DAY, Ordering::SeqCst);
+    let mut fresh = Memory::new(
+        MemoryTier::Semantic,
+        "fresh pipeline note",
+        "pipeline pipeline",
+        1000 + 20 * DAY,
+    );
+    fresh.strength = 0.35;
+    store.write(fresh).await.unwrap();
+
+    // Configured tau = 30 days: the 20-day-old record is inside its grace
+    // window — no penalty — and keeps the top slot.
+    store.set_memory_search_config(MemorySearchConfig {
+        decay_half_life_days: 30.0,
+        ..MemorySearchConfig::default()
+    });
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "both records are recall candidates");
+    assert_eq!(
+        results[0].memory.title, "old pipeline digest",
+        "a record within the configured tau's grace must not be de-ranked"
+    );
+
+    // Default 7-day tau: the same record is deep in the ramp and sinks.
+    store.set_memory_search_config(MemorySearchConfig::default());
+    let results = store
+        .recall_peek("pipeline", &MemoryFilter::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0].memory.title, "fresh pipeline note",
+        "under the default tau the aged record sinks again"
+    );
+}
+
+#[tokio::test]
 async fn turn_boundary_auto_consolidates_previous_turns_working_rows() {
     // Backlog 4100f5e3 pillar C: a gap between a session's tool events
     // marks a turn boundary — the previous turn's working rows are

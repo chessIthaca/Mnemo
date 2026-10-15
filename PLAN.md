@@ -377,8 +377,8 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
   Persist and retrieve project-scoped memory across the four tiers
   (working/episodic/semantic/procedural); typed title prefixes
   (`SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/`REVIEW:`) classify records with
-  auto-truncated digests (configurable length), and supersede-not-delete keeps history
-  (superseded records excluded from default recall). Live in `tool/memory/`.
+   auto-truncated digests (configurable length), and supersede-not-delete keeps history
+   (superseded records excluded from default recall). Recall ranks by similarity, keyword, tier, class and decayed strength, minus a staleness de-rank: a record not re-accessed within the configured decay half-life sinks by up to −0.25 over a 23-day ramp (grace = the decay tau, so closed-session digests can no longer dominate an injected recall block); tool events more than 300s apart mark a turn boundary, auto-compressing the previous turn's working rows into one episodic summary — the same synthetic path as the manual `memory_consolidate` tool. Live in `tool/memory/`.
   **Always available** regardless of workflow state.
 - **Spawn tool** — `spawn_agent` (`tool/agent/spawn_agent.rs`). Starts a
   background subagent; parent-aware so completion notifies the spawner.

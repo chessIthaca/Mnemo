@@ -1573,9 +1573,14 @@ impl MemoryStoreTrait for MemoryStore {
         // of equal relevance outranks the stale one; a stale one must
         // earn ~0.25 more relevance to compete. In-memory ranking only —
         // nothing is stored.
-        const STALE_GRACE_DAYS: f64 = 7.0;
-        const FULL_PENALTY_DAYS: f64 = 30.0;
+        // The grace tracks the live decay half-life (review 084978b3
+        // LOW-2): grace = the decay tau, then a fixed 23-day ramp to the
+        // full −0.25 — at the default tau (7d) the endpoints stay 7d/30d,
+        // and a user configuring a slower decay sees staleness begin
+        // correspondingly later instead of at a hardcoded 7 days.
+        const STALE_PENALTY_RAMP_DAYS: f64 = 23.0;
         const STALE_PENALTY_MAX: f64 = 0.25;
+        let stale_grace_days = search_config.decay_half_life_days;
         let mut scored: Vec<ScoredMemory> = memories
             .into_iter()
             .map(|m| {
@@ -1609,12 +1614,11 @@ impl MemoryStoreTrait for MemoryStore {
                 // mechanism; penalizing too would double-punish history.
                 let cw = Self::class_weight(m.record_class);
                 let age_days = (now - m.last_accessed_at).max(0) as f64 / 86_400.0;
-                let staleness_penalty = if age_days <= STALE_GRACE_DAYS {
+                let staleness_penalty = if age_days <= stale_grace_days {
                     0.0
                 } else {
                     STALE_PENALTY_MAX
-                        * ((age_days - STALE_GRACE_DAYS)
-                            / (FULL_PENALTY_DAYS - STALE_GRACE_DAYS))
+                        * ((age_days - stale_grace_days) / STALE_PENALTY_RAMP_DAYS)
                             .min(1.0)
                 };
                 let score = sim * sim_weight + decayed_strength * 0.3 + keyword_boost + tw + cw

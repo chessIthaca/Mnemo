@@ -36,7 +36,7 @@ The spec-loop, enforced end to end: **spec → plan → code → test → review
 | | |
 |---|---|
 | **Enforced workflow** | Planning → Executing → Reviewing → Complete — a state machine decides which tools exist at each moment; the agent cannot skip ahead. |
-| **Four-tier memory** | Working → episodic → semantic → procedural, persisted in SQLite with recall ranked by strength; consolidation compresses sessions into durable knowledge. |
+| **Four-tier memory** | Working → episodic → semantic → procedural, persisted in SQLite with recall ranked by relevance, recency and staleness (records not re-accessed within the decay half-life sink by up to −0.25); sessions auto-consolidate into durable knowledge at turn boundaries, not only via the manual tool. |
 | **Knowledge graph** | Tree-sitter parses 12 languages (Rust, TS/TSX, JS, Python, Go, Java, C/C++, C#, Ruby, PHP, HTML) into a per-project SQLite graph: callers, callees, imports, blast radius, shortest paths. |
 | **Safety first** | Approval gates on mutations, git merge/push always gated, read-only reviewer agents that cannot self-approve, `.coding/` state sandboxed from the file tools. |
 | **Multi-model routing** | Per-workflow-state model slots, per-model context/reasoning budgets, effort control, stop-boundary handling for exotic tokenizers. |

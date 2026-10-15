@@ -6089,6 +6089,113 @@ async fn dispatch_drops_stringified_nulls_from_optional_params() {
     );
 }
 
+/// Backlog c19ec2ff (c): a sequence-typed argument delivered as one
+/// stringified JSON array is repaired at the dispatch seam before the tool
+/// sees the args — pinned end-to-end through execute_tool_call with an
+/// echo tool whose result IS the args it received. A string that parses to
+/// another kind stays untouched — the tool's own positional error names
+/// it (read_files' recovery layer).
+#[tokio::test]
+async fn dispatch_repairs_stringified_sequence_args() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // A purpose-built echo tool: the assertion pins the SEAM (what crossed
+    // execute_tool_call), not any one tool's internals. Memory category =
+    // available in every workflow state, so the filter admits it in
+    // Planning without a live plan.
+    struct SequenceEchoTool;
+    #[async_trait]
+    impl crate::tool::Tool for SequenceEchoTool {
+        fn name(&self) -> &str {
+            "sequence_echo"
+        }
+        fn category(&self) -> crate::tool::ToolCategory {
+            crate::tool::ToolCategory::Memory
+        }
+        fn schema(&self) -> crate::provider::ToolSchema {
+            crate::provider::ToolSchema::new(
+                "sequence_echo",
+                "echo the args it received",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {"type": "array"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["items"]
+                }),
+            )
+        }
+        fn safety(&self) -> crate::tool::SafetyLevel {
+            crate::tool::SafetyLevel::AutoRun
+        }
+        async fn execute(&self, args: serde_json::Value) -> crate::tool::ToolResult {
+            crate::tool::ToolResult::success(args.to_string())
+        }
+    }
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(SequenceEchoTool));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    let call = |id: &str, args: &str| {
+        crate::provider::ToolCall::new(id, "sequence_echo", args.to_string())
+    };
+
+    // A clean stringified JSON array is spliced in: the tool sees the
+    // parsed array, not the string (the 2027-01-25 read_files failures
+    // were exactly this shape, rejected with the generic sequence error).
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c1", r#"{"items":"[\"a\",\"b\"]"}"#),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "echo call ran: {}", result.output);
+    assert!(
+        result.output.contains(r#""items":["a","b"]"#),
+        "stringified array must be repaired at the seam, tool saw: {}",
+        result.output
+    );
+
+    // A string that parses to an OBJECT stays a string — the seam repairs
+    // arrays only; the tool's own decode error names the rest.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c2", r#"{"items":"{\"a\":1}"}"#),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        result.output.contains(r#""items":"{\"a\":1}""#),
+        "non-array string stays for the tool to reject, tool saw: {}",
+        result.output
+    );
+}
+
 /// A mock descendant tracker whose "running descendants" answer is fixed at
 /// construction. Used to exercise the dispatch state-transition gate.
 struct FixedDescendantTracker {

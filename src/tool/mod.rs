@@ -294,6 +294,106 @@ fn sanitize_stringified_nulls(schema: &Value, args: &mut Value) {
     }
 }
 
+/// Backlog c19ec2ff (c): parse a sequence-typed argument that arrived as
+/// one stringified JSON value — the same transport degradation class that
+/// produces the "null" artifact [`drop_stringified_nulls`] cleans. On
+/// success returns the parsed elements; on failure returns the 0-based
+/// byte position of serde's error (0 when the payload parses to another
+/// JSON kind) plus the reason, so callers can point the model at the
+/// exact spot instead of getting a re-emitted identical payload.
+pub(crate) fn parse_stringified_sequence(s: &str) -> Result<Vec<Value>, (usize, String)> {
+    let trimmed = s.trim();
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Array(elements)) => Ok(elements),
+        Ok(other) => Err((0, format!("parses to {}, not an array", json_kind(&other)))),
+        Err(e) => Err((e.column().saturating_sub(1), e.to_string())),
+    }
+}
+
+/// The JSON kind name for a parse-repair error message.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
+    }
+}
+
+/// Whether a property schema declares a sequence type — `"type": "array"`
+/// or a type union listing it.
+fn schema_declares_array(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(t)) => t == "array",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
+    }
+}
+
+/// Backlog c19ec2ff (c): repair sequence-typed arguments delivered as one
+/// stringified JSON array at the dispatch seam — the same single seam
+/// every model-generated call flows through as [`drop_stringified_nulls`]
+/// (read_files' `files` was hit 3x in one turn, 2027-01-25, and the
+/// generic "an argument must be a sequence, not a string" taught
+/// nothing). When the string cleanly parses as a JSON array it is spliced
+/// in place; unparseable strings and other kinds are left untouched — the
+/// tool's own decode (or read_files' positional recovery) names them.
+///
+/// The walk mirrors [`drop_stringified_nulls`] (`normalize_in_place`,
+/// `src/provider/strict.rs`): it recurses into `anyOf`/`oneOf`/`allOf`
+/// branches, `items` (single schema or draft-04 tuple), and nested
+/// properties, so entries inside arrays (a `multi_edit` file entry's
+/// `ops`) get the same repair.
+pub(crate) fn repair_stringified_sequences(schema: &Value, args: &mut Value) {
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(branches)) = schema.get(key) {
+            for branch in branches {
+                repair_stringified_sequences(branch, args);
+            }
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        match items {
+            Value::Array(schemas) => {
+                if let Value::Array(arr) = args {
+                    for (s, a) in schemas.iter().zip(arr.iter_mut()) {
+                        repair_stringified_sequences(s, a);
+                    }
+                }
+            }
+            single => {
+                if let Value::Array(arr) = args {
+                    for a in arr.iter_mut() {
+                        repair_stringified_sequences(single, a);
+                    }
+                }
+            }
+        }
+    }
+    let Some(Value::Object(props)) = schema.get("properties") else {
+        return;
+    };
+    let Some(args_obj) = args.as_object_mut() else {
+        return;
+    };
+    for (name, value) in args_obj.iter_mut() {
+        let Some(prop_schema) = props.get(name) else {
+            continue;
+        };
+        if schema_declares_array(prop_schema) {
+            if let Some(repaired) = value
+                .as_str()
+                .and_then(|s| parse_stringified_sequence(s).ok())
+            {
+                *value = Value::Array(repaired);
+            }
+        }
+        repair_stringified_sequences(prop_schema, value);
+    }
+}
+
 /// The trait every tool implements.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -1399,6 +1499,92 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog c19ec2ff (c): a sequence-typed param delivered as one
+    /// stringified JSON array is repaired at the dispatch seam; anything
+    /// that doesn't parse as a clean array is left for the tool's own
+    /// positional error.
+    #[test]
+    fn repair_stringified_sequences_splices_parsed_array() {
+        // A clean stringified array is spliced in.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["files"]
+        });
+        let mut args = serde_json::json!({
+            "files": "[{\"path\": \"a.rs\"}, {\"path\": \"b.rs\"}]"
+        });
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(
+            args["files"],
+            serde_json::json!([{"path": "a.rs"}, {"path": "b.rs"}])
+        );
+
+        // A string-typed param is untouched.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let mut args = serde_json::json!({"path": "a.rs"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["path"], serde_json::json!("a.rs"));
+
+        // A string parsing to an OBJECT is left for the tool's error.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"files": {"type": "array"}}
+        });
+        let mut args = serde_json::json!({"files": "{\"path\": \"a.rs\"}"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], serde_json::json!("{\"path\": \"a.rs\"}"));
+
+        // A malformed string stays a string (read_files' lenient layer).
+        let mut args = serde_json::json!({"files": "[{\"path\": \"a.rs\""});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], serde_json::json!("[{\"path\": \"a.rs\""));
+
+        // Nested repair: an array-typed property inside array items
+        // (the multi_edit files[].ops shape) is repaired too.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "ops": {"type": "array"}
+                        }
+                    }
+                }
+            }
+        });
+        let mut args = serde_json::json!({"files": [{"path": "a.rs", "ops": "[\"d2\"]"}]});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"][0]["ops"], serde_json::json!(["d2"]));
+    }
+
+    /// Backlog c19ec2ff (c): the parse helper reports the 0-based byte
+    /// position of a parse failure and names the JSON kind on a clean
+    /// non-array parse — the positional input read_files' error needs.
+    #[test]
+    fn parse_stringified_sequence_reports_byte_position() {
+        assert_eq!(
+            Value::Array(parse_stringified_sequence("[1, 2]").unwrap()),
+            serde_json::json!([1, 2])
+        );
+        // A stray quote lands the position at the offending byte.
+        let (pos, reason) = parse_stringified_sequence("[1, 2\"").unwrap_err();
+        assert_eq!(pos, 5, "reason: {reason}");
+        // A clean object parse reports kind, position 0 (nothing to point at).
+        let (pos, reason) = parse_stringified_sequence("{\"a\": 1}").unwrap_err();
+        assert_eq!(pos, 0);
+        assert!(reason.contains("object"), "reason: {reason}");
+    }
 
     #[test]
     fn stringified_null_dropped_from_optional_properties() {

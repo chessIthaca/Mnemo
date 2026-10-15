@@ -254,7 +254,15 @@ impl AgentLoop {
         // tool's own deserialization all see clean args. The raw
         // tc.arguments string is untouched (the UI keeps fidelity).
         let mut args = args;
-        crate::tool::drop_stringified_nulls(&tool.schema().parameters, &mut args);
+        let schema = tool.schema();
+        crate::tool::drop_stringified_nulls(&schema.parameters, &mut args);
+        // Backlog c19ec2ff (c): the same transport degradation also
+        // delivers sequence-typed arguments as one stringified JSON array
+        // (read_files' `files` was hit 3x in one turn, 2027-01-25, and
+        // the generic "an argument must be a sequence, not a string"
+        // error taught nothing). Repair a CLEAN parse at the seam;
+        // anything left unparseable stays for the tool's positional error.
+        crate::tool::repair_stringified_sequences(&schema.parameters, &mut args);
 
         let parsed_call = ParsedToolCall {
             id: tc.id.clone(),

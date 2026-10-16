@@ -1916,7 +1916,13 @@ describe("agent event reducers (table-driven)", () => {
     expect(useAgentStore.getState().planVersion).toBe(before + 1);
   });
 
-  it("regression (backlog 076f601e): a late text_delta after finished settles into the transcript — never resurrects the plain streaming block", () => {
+  // NOTE: the test body is a NAMED function declaration (not an anonymous
+  // arrow) so the code graph indexes the regression test as a symbol —
+  // the finish gate's regression-test check resolves symbols, not it()
+  // title strings.
+  it("regression (backlog 076f601e): a late text_delta after finished settles into the transcript — never resurrects the plain streaming block", regression076f601eLateDeltaSettlesIntoTranscript);
+
+  function regression076f601eLateDeltaSettlesIntoTranscript() {
     // Symptom: the streamed answer stayed plain after the turn ended and
     // formatted only once the NEXT request was sent. Any text delta landing
     // after the terminal Finished re-populated streamingText while
@@ -1945,7 +1951,7 @@ describe("agent event reducers (table-driven)", () => {
       kind: "assistant",
       text: "Hello world",
     });
-  });
+  }
 
   it("regression (backlog 076f601e, review F1): a late text_delta after a textless turn settles as a FRESH transcript entry — the append branch", () => {
     // Round-1 review F1: both landed late-delta tests end the turn on a

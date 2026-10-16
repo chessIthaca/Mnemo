@@ -601,19 +601,6 @@ fn main() {
                         .expect("main agent spawn must succeed");
                     });
 
-                    // Spawn the event forwarder — takes ownership of the
-                    // fan-in receiver, a clone of the manager Arc, and a
-                    // clone of the per-agent loops map (so it can remove dead
-                    // agents' loops on Exited).
-                    ipc::spawn_event_forwarder(
-                        app.handle().clone(),
-                        fanin_rx,
-                        manager.clone(),
-                        pending_approvals.clone(),
-                        pending_questions.clone(),
-                        agent_loops.clone(),
-                    );
-
                     // Push live console events from the shared browser to the
                     // Browser tab as `browser://console`.
                     ipc::browser::spawn_console_forwarder(
@@ -682,8 +669,8 @@ fn main() {
                         app_policy_factory: Some(Arc::clone(&policy_factory)),
                         engine: Some(engine),
                         runtime: ipc::state::AgentRuntimeContext {
-                            manager,
-                            agent_loops,
+                            manager: manager.clone(),
+                            agent_loops: agent_loops.clone(),
                             context_usage: Arc::new(tokio::sync::Mutex::new(
                                 std::collections::HashMap::new(),
                             )),
@@ -731,6 +718,28 @@ fn main() {
                             run_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         },
                     });
+
+                    // Spawn the event forwarder — takes ownership of the
+                    // fan-in receiver, a clone of the manager Arc, and a
+                    // clone of the per-agent loops map (so it can remove dead
+                    // agents' loops on Exited). MUST come after
+                    // `app.manage(IpcState)`: the forwarder calls
+                    // `app.state::<IpcState>()` on the main agent's very
+                    // first event (ContextUsage), and `state()` panics before
+                    // `manage()` — killing the forwarder silently, so no
+                    // agent event ever reaches the UI and every prompt looks
+                    // dead. The race was latent (setup usually won by
+                    // microseconds) until the job-6 engine start widened the
+                    // gap. Nothing is lost by starting late: the fan-in
+                    // channel buffers the main agent's early events.
+                    ipc::spawn_event_forwarder(
+                        app.handle().clone(),
+                        fanin_rx,
+                        manager,
+                        pending_approvals.clone(),
+                        pending_questions.clone(),
+                        agent_loops,
+                    );
 
                     // The embedder status was already determined by
                     // `build_embedder` during brain construction (Ready for a
@@ -1241,6 +1250,35 @@ mod switch_restart_focus_contract {
         assert!(
             src.contains("window.set_focus()"),
             "the restarted window must be focused (brought on top)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarder_after_manage_contract {
+    //! Source-contract regression test for the dead-prompt bug: the event
+    //! forwarder calls `app.state::<IpcState>()` on the main agent's first
+    //! event, and Tauri's `state()` panics before `manage()`. Spawned ahead
+    //! of `app.manage(IpcState ..)`, the forwarder died on event #1 —
+    //! silently in a release build — so no agent event ever reached the UI.
+    //! The race needs the real setup hook to reproduce, so the guard pins
+    //! the ordering (the same convention as switch_restart_focus_contract).
+
+    /// The first (Ready-arm) `app.manage(IpcState ..)` must precede the
+    /// event-forwarder spawn.
+    #[test]
+    fn event_forwarder_spawns_after_ipc_state_is_managed() {
+        let src = include_str!("main.rs");
+        let managed = src
+            .find(concat!("app.manage(", "IpcState {"))
+            .expect("the Ready arm manages IpcState");
+        let forwarder = src
+            .find(concat!("ipc::spawn_event_", "forwarder("))
+            .expect("the Ready arm spawns the event forwarder");
+        assert!(
+            managed < forwarder,
+            "spawn the event forwarder AFTER app.manage(IpcState) — its first \
+             event calls app.state::<IpcState>(), which panics before manage()"
         );
     }
 }

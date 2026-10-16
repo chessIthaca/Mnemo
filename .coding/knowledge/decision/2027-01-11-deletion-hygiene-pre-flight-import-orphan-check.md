@@ -1,0 +1,6 @@
++++
+title = "deletion hygiene — pre-flight import-orphan check before the battery"
+created = "2027-01-11"
++++
+
+Ratified 2027-01-14: agent.md '## Code style' (repo root) now carries the deletion-hygiene rule — after any deletion edit, for every symbol named in the touched files' `use` statements, run a literal search (glob the file, engine: index) for remaining use sites BEFORE the first battery run, and trim every orphaned import in the same edit; under #![deny(warnings)] (both crate roots) each orphan is a hard build failure — one search pass replaces N build cycles. Origin: wt/mnemo job 2c step 2c.4, commit 6fe6768 ('feat(2c.4): G4 — steering de-globalization + the trace reroute', 2027-01-14): deleting SteeringStats::shared() (src/agent/steering_stats.rs:445-452) orphaned OnceLock (caught by the literal probe) and then Arc (missed — removed only from the use statement's tail, never checked for remaining sites; caught by the battery: 'error: unused import: Arc' at steering_stats.rs:45) — two full cargo cycles burned on a mechanically predictable failure. Behavioral half: HOW 9cc7e643 (literal-first search discipline). Landed as a documentation-only rider on plan 5a21fc8f's closing review cycle (wt/stream-plain), pre-dispatch resolution of backlog 1ead68c3. Truth: agent.md at the repo root, '## Code style' section.

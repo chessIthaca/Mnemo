@@ -35,6 +35,7 @@ import {
   flushStreamingText,
   getOrCreate,
   pushTranscriptEntry,
+  settleTextIntoTranscript,
   selectMainAgentId,
 } from "./agentState";
 
@@ -275,19 +276,39 @@ export function appendAnswerEntry(activityLog: ActivityEntry[], text: string): A
  *
  *  Also mirrors the chunk into the activity log via [`appendAnswerEntry`] —
  *  the completion is visible in the reasoning box as it streams; a following
- *  reasoning_delta replaces the log per the existing rule. */
-export const reduceTextDelta: Reducer<Ev<"text_delta">> = (agent, event) => ({
-  agent: {
-    ...agent,
-    streamingText: agent.streamingText + event.text,
-    activityLog: appendAnswerEntry(agent.activityLog, event.text),
-    // Live tokens-received estimate (chars/4 — the same heuristic the
-    // backend uses for incremental token counting), completion bucket. Snaps
-    // to the real count on the next usage event.
-    liveCompletionTokens:
-      agent.liveCompletionTokens + Math.max(1, Math.round(event.text.length / 4)),
-  },
-});
+ *  reasoning_delta replaces the log per the existing rule.
+ *
+ *  Backlog 076f601e: a delta arriving while the turn is OVER (running=false —
+ *  a trailing chunk landing after the terminal Finished) settles straight
+ *  into the transcript via [`settleTextIntoTranscript`] instead — appending
+ *  to streamingText would re-mount the plain streaming block below the
+ *  formatted answer, and the next started reset would silently drop the
+ *  tail. The mirror still updates; the live token estimate does not (the
+ *  turn is over — a bump would show a phantom count until the next turn). */
+export const reduceTextDelta: Reducer<Ev<"text_delta">> = (agent, event) => {
+  if (!agent.running) {
+    const settled = { ...agent };
+    settleTextIntoTranscript(settled, event.text);
+    return {
+      agent: {
+        ...settled,
+        activityLog: appendAnswerEntry(agent.activityLog, event.text),
+      },
+    };
+  }
+  return {
+    agent: {
+      ...agent,
+      streamingText: agent.streamingText + event.text,
+      activityLog: appendAnswerEntry(agent.activityLog, event.text),
+      // Live tokens-received estimate (chars/4 — the same heuristic the
+      // backend uses for incremental token counting), completion bucket. Snaps
+      // to the real count on the next usage event.
+      liveCompletionTokens:
+        agent.liveCompletionTokens + Math.max(1, Math.round(event.text.length / 4)),
+    },
+  };
+};
 
 /**
  * reasoning_delta: append to the streaming reasoning + the last reasoning

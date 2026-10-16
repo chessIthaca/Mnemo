@@ -479,3 +479,68 @@ describe("approval_request auto-reveal (file-edit family)", () => {
     expect(useAgentStore.getState().rightPanelVisible).toBe(false);
   });
 });
+
+describe("late delta flush after finished (backlog 076f601e)", () => {
+  // Regression: the streamed answer stayed plain until the NEXT request. A
+  // buffered text flush landing after the terminal Finished re-populated
+  // streamingText with running=false — the plain streamingBlock re-mounted
+  // below the formatted transcript entry and lingered until the next
+  // started, whose reset silently DROPPED the tail. The dispatcher flushes
+  // buffered deltas before every structural event, so in-order events
+  // cannot trigger this; the test pins the STORE contract for the
+  // out-of-order case (any future ordering hole upstream): the late flush
+  // settles into the transcript, never into streamingText.
+  it("a buffered text flush firing after finished settles into the transcript, never resurrects streamingText", () => {
+    useAgentStore.setState({ agents: {} });
+    const rafTools = makeRaf();
+    const timerTools = makeTimers();
+    let clock = 1000;
+    const dispatcher = createAgentEventDispatcher({
+      textBuffers: new Map(),
+      reasoningBuffers: new Map(),
+      argBuffers: new Map(),
+      outputBuffers: new Map(),
+      rafId: { current: 0 },
+      timerId: { current: null },
+      raf: rafTools.raf,
+      caf: rafTools.caf,
+      setTimer: timerTools.setTimer,
+      clearTimer: timerTools.clearTimer,
+      now: () => clock,
+      appendStreamingText: (id, t) => useAgentStore.getState().appendStreamingText(id, t),
+      appendStreamingReasoning: (id, t) => useAgentStore.getState().appendStreamingReasoning(id, t),
+      applyToolCallArgDeltas: (id, deltas) => useAgentStore.getState().applyToolCallArgDeltas(id, deltas),
+      applyToolOutputDeltas: (id, deltas) => useAgentStore.getState().applyToolOutputDeltas(id, deltas),
+      handleAgentEvent: (payload) => useAgentStore.getState().handleAgentEvent(payload),
+    });
+    const id = 1 as AgentId;
+
+    dispatcher.dispatch({ agent_id: id, event: { kind: "started" } });
+    // First delta flushes immediately (the zeroed lastFlushAt time-gap
+    // rule); the second is dense → buffered behind a scheduled frame.
+    dispatcher.dispatch(textDelta(id, "Hello"));
+    dispatcher.dispatch(textDelta(id, " world"));
+    // Finished drains the buffer synchronously BEFORE dispatching, so the
+    // transcript has the full answer and the streaming block is gone.
+    dispatcher.dispatch({ agent_id: id, event: { kind: "finished", reason: "stop" } });
+    const settled = useAgentStore.getState().agents[id]!;
+    expect(settled.running).toBe(false);
+    expect(settled.streamingText).toBe("");
+    expect(settled.transcript[settled.transcript.length - 1]).toMatchObject({
+      kind: "assistant",
+      text: "Hello world",
+    });
+
+    // The late delta: buffered with the turn already over, then flushed by
+    // the scheduled frame AFTER finished ran.
+    dispatcher.dispatch(textDelta(id, " again"));
+    rafTools.fire();
+
+    const a = useAgentStore.getState().agents[id]!;
+    expect(a.streamingText).toBe("");
+    expect(a.transcript[a.transcript.length - 1]).toMatchObject({
+      kind: "assistant",
+      text: "Hello world again",
+    });
+  });
+});

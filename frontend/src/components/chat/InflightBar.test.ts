@@ -263,3 +263,30 @@ describe("InflightBar ctx popup quality badge", () => {
     expect(source).toContain("contextUsage.quality.decision_density");
   });
 });
+
+describe("InflightBar settled answer mirror (backlog 076f601e)", () => {
+  // Regression: the answer mirrored into the activity log rendered as
+  // PLAIN text forever. The log is not cleared when the turn ends
+  // (2026-08-22 request: it stays visible until new reasoning starts), so
+  // the thinking box kept a plain-text answer after the turn until the
+  // NEXT request's started cleared it — exactly the "stays plain until
+  // the next request" report. Once the turn is over the settled answer
+  // must render as markdown, same as the transcript. LIVE answers stay
+  // plain — the deliberate per-token perf choice Message.tsx pins — and
+  // reasoning entries stay plain by design.
+  it("renders answer entries as markdown once the turn is over (settled); live answers stay plain", () => {
+    // The panel passes the turn state down so the line can switch modes.
+    expect(source).toContain("settled={!running}");
+    expect(source).toContain("function ActivityLine({ entry, settled }");
+    // The markdown path is gated on the SETTLED answer — live answers,
+    // reasoning and info entries keep the plain render.
+    expect(source).toContain('entry.kind === "answer" && settled');
+    expect(source).toContain("<Markdown");
+    // Links open through the sanctioned opener — raw anchors are dead
+    // under the webview CSP (user report 2027-01-07), in the thinking box
+    // too.
+    expect(source).toContain("a: MarkdownLink");
+    // The plain streaming line itself is preserved for the live path.
+    expect(source).toContain("whitespace-pre-wrap wrap-break-word py-0.5");
+  });
+});

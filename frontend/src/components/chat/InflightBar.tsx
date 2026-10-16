@@ -10,6 +10,9 @@ import { fmtTokens, fmtRate, fmtDuration, fmtPct } from "../../lib/format";
 import { readInflightPanelOpen, writeInflightPanelOpen } from "../../lib/inflightPanelPref";
 import { compact } from "../../lib/tauri";
 import type { TurnPhase } from "../../lib/types";
+import { Markdown } from "./Markdown";
+import { MarkdownLink } from "./MarkdownLink";
+import { CodeBlock } from "./CodeBlock";
 
 /** Props for the inner panel — the agent's state slice + id. */
 interface InflightBarProps {
@@ -580,7 +583,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
                 should just be an empty gray space). */}
             {hasActivity &&
               activityLog.map((entry, i) => (
-                <ActivityLine key={i} entry={entry} />
+                <ActivityLine key={i} entry={entry} settled={!running} />
               ))}
           </div>
         </div>
@@ -589,7 +592,7 @@ function InflightBarPanel({ state, agentId }: InflightBarProps) {
   );
 }
 
-function ActivityLine({ entry }: { entry: ActivityEntry }) {
+function ActivityLine({ entry, settled }: { entry: ActivityEntry; settled: boolean }) {
   // Color decision (user 2026-08-22): reasoning keeps its historical dimmed
   // italic gray; the live answer channel renders in blueish gray (slate-400)
   // so the two are distinguishable in the box.
@@ -601,6 +604,52 @@ function ActivityLine({ entry }: { entry: ActivityEntry }) {
         : entry.kind === "error"
           ? "text-red-400"
           : "text-slate-300";
+
+  // Backlog 076f601e: the answer mirror lingers after the turn ends (the
+  // log is not cleared at flush — 2026-08-22 request: it stays visible
+  // until new reasoning starts), and `settled` is set exactly when the
+  // turn is over. The settled answer must render as markdown — the plain
+  // remnant read as "the answer stays plain until the next request"
+  // (it formatted only once the next started cleared the log). While the
+  // turn is still streaming the answer stays PLAIN: re-parsing markdown
+  // per streamed chunk is the per-token cost Message.tsx's streaming path
+  // deliberately avoids.
+  if (entry.kind === "answer" && settled) {
+    return (
+      <div className="py-0.5 prose prose-invert prose-sm max-w-none prose-pre:m-0 prose-pre:bg-bg-primary">
+        <Markdown
+          components={{
+            // Same overrides as Message.tsx — sanctioned link openers
+            // (raw anchors are dead under the webview CSP, user report
+            // 2027-01-07) + the chat inline-code style / CodeBlock for
+            // fenced code, so the box's answer renders like the transcript's.
+            a: MarkdownLink,
+            // `node`/`ref`/`key` are dropped from the spread: react-markdown
+            // 10 ships the React-18 JSX shape (`ref?: LegacyRef`, plus its
+            // `node` extra prop), which no longer spreads onto a DOM element
+            // under @types/react 19. The element owns its own ref and `node`
+            // was never a real attribute.
+            code({ className, children, node: _node, ref: _ref, key: _key, ...props }) {
+              const isInline = !className;
+              if (isInline) {
+                return (
+                  <code
+                    className="inline-code rounded-sm bg-bg-tertiary px-1.5 py-0.5 text-xs"
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                );
+              }
+              return <CodeBlock className={className}>{children}</CodeBlock>;
+            },
+          }}
+        >
+          {entry.text}
+        </Markdown>
+      </div>
+    );
+  }
 
   return (
     <div className={`whitespace-pre-wrap wrap-break-word py-0.5 ${color}`}>{entry.text}</div>

@@ -118,6 +118,15 @@ behave as before) stand.
   already-wired engine path (verify at execution).
 - Test: the live-apply through the Engine is observable in the GUI-visible
   config (the IPC-contract fixture pattern).
+- Landed (2026-10-16, execution-time verification — the section's own
+  verify clause fired): laya.rs has no live-apply route of its own (only
+  the doc mention at :40); the classifier settings already land in the
+  shared brain's classifier_slot via attach_laya's manager (main.rs:465),
+  so a `Setup::for_engine` re-route would duplicate existing wiring, not
+  prove the share. Consumer landed as the stretch option: the
+  `engine_status` IPC command (ipc/agent.rs) serving `engine.stats()` +
+  the `dto-engine-stats` contract fixture. The brain-share itself stays
+  pinned by the seam's Arc-identity unit tests (src/headless/engine.rs).
 
 ### D4 — the console slice plan (battery per slice = cargo test --workspace —
 the 83 integration fixtures + the console fixtures + tests/boundary.rs — plus

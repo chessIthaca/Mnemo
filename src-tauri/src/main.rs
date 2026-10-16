@@ -456,13 +456,20 @@ fn main() {
                     .join("backlog.jsonl"),
             )));
 
-            match &brain_result {
+            match brain_result {
                 Ok(BrainOutcome::Ready(brain)) => {
+                    // Job 6 (§5.9.10 :747-753): the ONE shared brain — the
+                    // Box<Brain> moves into an Arc (zero-copy, std's
+                    // From<Box<T>> for Arc<T>) so the GUI wiring below and
+                    // the IpcState-held Engine share the SAME brain through
+                    // the EngineBuilder::brain seam. Every `brain.X` access
+                    // is unchanged (the Arc derefs like the Box did).
+                    let brain: Arc<mnemo::headless::Brain> = Arc::from(brain);
                     attach_child_ensurer(&brain.browser, app.handle().clone());
                     let laya_cfg = tauri::async_runtime::block_on(async {
                         brain.config.lock().await.general.general.laya.clone()
                     });
-                    let (laya, pending_laya_start) = attach_laya(brain, &laya_cfg);
+                    let (laya, pending_laya_start) = attach_laya(&brain, &laya_cfg);
                     // Create the agent manager + per-agent loop map, wrapped in
                     // Arcs up front so the spawner can share them.
                     let mut mgr = AgentManager::new(256);
@@ -623,8 +630,39 @@ fn main() {
                         backlog_root.join(Project::CODING_DIR_NAME).join("logs"),
                     );
 
+                    // Job 6 (§5.9.10 :747-753): the headless Engine over the
+                    // SAME brain — the IpcState-held twin of the runtime
+                    // wiring above. Held, not yet served (the proving
+                    // consumer + the console rebuild land in the later
+                    // slices). The options carry only what the shared brain
+                    // does not: the workspace facts (the start gates' sanity
+                    // checks) + the free default permission policy (the same
+                    // factory-build default the main agent uses). The
+                    // brain's own memory/graph/embedder govern everything
+                    // else — the seam adopted them wholesale.
+                    let engine = tauri::async_runtime::block_on(async {
+                        mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+                            workspace: (*brain.workspace).clone(),
+                            // build_brain resolved the default config dir —
+                            // None resolves the same one for the engine.
+                            config_dir: None,
+                            permissions: mnemo::PermissionPolicy::default(),
+                            // Inert for an injected brain (the shared brain
+                            // owns its store); pass the app's reality.
+                            memory: mnemo::headless::MemoryBackend::Sqlite { path: None },
+                            index_codegraph: false,
+                            require_git: false,
+                            auto_install_embedder: false,
+                        })
+                        .brain(brain.clone())
+                        .start()
+                        .await
+                        .expect("engine over the ready brain must start")
+                    });
+
                     app.manage(IpcState {
                         app_policy_factory: Some(Arc::clone(&policy_factory)),
+                        engine: Some(engine),
                         runtime: ipc::state::AgentRuntimeContext {
                             manager,
                             agent_loops,
@@ -813,6 +851,7 @@ fn main() {
 
                     app.manage(IpcState {
                         app_policy_factory: None,
+                        engine: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -839,11 +878,11 @@ fn main() {
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
-                            // `brain_result` is matched by reference (the Ready
-                            // arm borrows `brain`), so `config` is a
-                            // `&Box<Config>` here and must be cloned through
-                            // the box — it cannot be moved out.
-                            config: Arc::new(tokio::sync::Mutex::new((**config).clone())),
+                            // The match consumes `brain_result` (job 6: the
+                            // Ready arm moves the Box<Brain> into the shared
+                            // Arc), so `config` is an owned `Box<Config>`
+                            // here; the clone out of the box stands.
+                            config: Arc::new(tokio::sync::Mutex::new((*config).clone())),
                             sandbox: Arc::new(fallback_sandbox),
                         },
                         approvals: pending_approvals.clone(),
@@ -910,6 +949,7 @@ fn main() {
 
                     app.manage(IpcState {
                         app_policy_factory: None,
+                        engine: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -990,6 +1030,7 @@ fn main() {
             ipc::agent::list_agents,
             ipc::agent::ui_diag,
             ipc::agent::context_caps,
+            ipc::agent::engine_status,
             ipc::startup::startup_snapshot,
             ipc::spawn::spawn_agent,
             ipc::agent::set_model,

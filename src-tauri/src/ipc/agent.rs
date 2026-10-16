@@ -16,6 +16,7 @@ use tauri::State;
 
 use mnemo::{AgentCommand, AgentId, SerializableAgentEvent};
 use mnemo::app::workflow::{PlanFile, WorkflowState};
+use mnemo::headless::stats::EngineStats;
 
 use crate::ipc::error::IpcError;
 use crate::ipc::events::emit_agent_event;
@@ -548,6 +549,21 @@ pub async fn context_caps(state: State<'_, IpcState>) -> Result<Vec<(AgentId, u3
         .iter()
         .map(|(id, l)| (*id, l.context_manager().max_tokens() as u32))
         .collect())
+}
+
+/// Job 6 (§5.9.10 :747-753): the headless Engine's §5.7 stats pull — the
+/// proving consumer for the IpcState-held Engine (built over the SAME
+/// shared brain via the EngineBuilder::brain seam). The project +
+/// savings aggregates are reads of the brain's ONE store; a wrong-brain
+/// engine would report a different store here (the brain-share itself is
+/// pinned by the seam's Arc-identity tests in the headless crate).
+#[tauri::command]
+pub async fn engine_status(state: State<'_, IpcState>) -> Result<EngineStats, IpcError> {
+    let engine = state.engine()?;
+    engine
+        .stats()
+        .await
+        .map_err(|e| IpcError::msg(format!("{e:#}")))
 }
 
 /// Switch the active model (or reasoning effort) at runtime — per agent.

@@ -36,6 +36,7 @@ use mnemo::headless::{
     CodegraphGraph, CodegraphStatus, MemoryCounts, MemoryDebugOverview, MemoryDebugWire,
     MemoryIndexStatus, ScoredMemoryDebugWire,
 };
+use mnemo::headless::stats::EngineStats;
 use mnemo::memory::{
     CacheEfficiency, ModelBreakdown, ProjectStats, SavingsDayBreakdown, SavingsKindBreakdown,
     SavingsStats, SessionStats,
@@ -522,6 +523,23 @@ fn stats_memory_codegraph_ipc_unchanged() {
         ..Default::default()
     };
     assert_fixture("dto-project-stats", &project, &mut generated);
+
+    // ── job 6 (§5.9.10): the engine_status pull — the headless Engine's
+    // §5.7 aggregate over the SAME shared brain (the IpcState-held
+    // engine's proving consumer). Reuses the two store aggregates above;
+    // the steering half mirrors the get_steering_stats shape.
+    let engine_stats = EngineStats {
+        project_stats: project.clone(),
+        savings_stats: savings.clone(),
+        steering_snapshot: mnemo::SteeringStatsSnapshot {
+            fired: 2,
+            switched: 1,
+            by_marker: vec![],
+            file_tool_mutations: 3,
+            shell_mutations: 1,
+        },
+    };
+    assert_fixture("dto-engine-stats", &engine_stats, &mut generated);
 
     // ── the derived-index status behind memory_index_status ────────
     let index_status = MemoryIndexStatus {

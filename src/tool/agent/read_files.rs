@@ -197,7 +197,13 @@ impl Tool for ReadFilesTool {
                  Read files — one or many, in one call instead of N round-trips. \
                  Each file comes back under a header with line numbers; start_line + \
                  max_lines read only the relevant slice. A directory path returns a \
-                 sorted listing. Per-file errors are reported inline, never fatal.",
+                 sorted listing. Per-file errors are reported inline, never fatal. \
+                 Every real serve mints a short read-receipt id in its section \
+                 trailer — cite it in file_edit/multi_edit as \
+                 {{\"from_read\": \"<id>\", \"lines\": [s, e], \"new_string\": …}} to \
+                 anchor an edit without carrying the verbatim bytes (validated \
+                 server-side against the current file; drift hard-fails with a \
+                 fresh-read steer).",
                 tool_contract::contract(
                     "`files`",
                     "{\"files\":[{\"path\":\"a.js\",\"start_line\":10,\"max_lines\":40}]}"
@@ -311,7 +317,7 @@ impl Tool for ReadFilesTool {
             let mut savings: Vec<serde_json::Value> = Vec::new();
             for spec in &args.files {
                 if is_whole_file_source_read(spec) {
-                    let (section, content) = match (delta_reads, read_cache.as_ref()) {
+                    let (section, content, _) = match (delta_reads, read_cache.as_ref()) {
                         (true, Some(cache)) => read_one_delta(&sandbox, spec, cache, &mut savings),
                         _ => read_one_with_count(&sandbox, spec),
                     };
@@ -427,12 +433,23 @@ pub(crate) fn read_one(sandbox: &Sandbox, spec: &ReadSpec) -> String {
 /// `read_files::execute` uses the line count for the whole-file SYMBOL
 /// NUDGE without a second disk read. `search_read` keeps calling
 /// [`read_one`]; it is behavior-identical there.
-pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String, Option<String>) {
+///
+/// The third element is the minted read-receipt id (backlog 3fdc605f,
+/// plan 5a21fc8f): every real serve mints a receipt for the lines it
+/// showed and appends the cite-form trailer to the section — `None`
+/// when nothing was minted (per-spec errors, directories, empty
+/// ranges). `read_one_delta` revokes it on its reduced serves (the
+/// model never saw those lines verbatim).
+pub(crate) fn read_one_with_count(
+    sandbox: &Sandbox,
+    spec: &ReadSpec,
+) -> (String, Option<String>, Option<String>) {
     let validated = match sandbox.validate(Path::new(&spec.path)) {
         Ok(p) => p,
         Err(e) => {
             return (
                 format!("=== {} (error) ===\npath validation failed: {e}", spec.path),
+                None,
                 None,
             )
         }
@@ -442,13 +459,14 @@ pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String
     // sent the model to search, whose 100-match cap + display truncation
     // made enumeration unreliable). Return a sorted listing instead.
     if validated.is_dir() {
-        return (directory_listing(&validated, &spec.path), None);
+        return (directory_listing(&validated, &spec.path), None, None);
     }
     let content = match std::fs::read_to_string(&validated) {
         Ok(c) => c,
         Err(e) => {
             return (
                 format!("=== {} (error) ===\nfailed to read: {e}", spec.path),
+                None,
                 None,
             )
         }
@@ -496,6 +514,24 @@ pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String
 
     let first_line = start + 1;
     let last_line = start + showed;
+    // Backlog 3fdc605f (plan 5a21fc8f): mint the receipt for what was
+    // ACTUALLY served (post-truncation) and teach the cite form in the
+    // trailer — the from_read anchor cites the id instead of carrying
+    // the verbatim bytes, so context compaction is harmless to the
+    // edit path. Only a real serve mints (directories, errors, and
+    // empty ranges never do).
+    let receipt = if showed > 0 {
+        let served: Vec<&str> = content.lines().skip(start).take(showed).collect();
+        let id =
+            crate::tool::agent::read_registry::mint(validated.clone(), first_line, &served);
+        body.push_str(&format!(
+            "\n[read receipt {id} — edit via file_edit \
+             {{\"from_read\": \"{id}\", \"lines\": [s, e], \"new_string\": …}}]"
+        ));
+        Some(id)
+    } else {
+        None
+    };
     let header = if showed == 0 {
         format!("=== {} (empty range) ===", spec.path)
     } else {
@@ -504,7 +540,7 @@ pub(crate) fn read_one_with_count(sandbox: &Sandbox, spec: &ReadSpec) -> (String
             spec.path
         )
     };
-    (format!("{header}\n{body}"), Some(content))
+    (format!("{header}\n{body}"), Some(content), receipt)
 }
 
 /// Whole-file read with the delta/skeleton lever applied (backlog
@@ -524,12 +560,12 @@ fn read_one_delta(
     spec: &ReadSpec,
     cache: &ReadCache,
     savings: &mut Vec<serde_json::Value>,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, Option<String>) {
     // Today's full serve — the baseline path and the fallback on every
     // reduced-path miss (per-spec errors, directories, degenerate input).
-    let (full_section, content) = read_one_with_count(sandbox, spec);
+    let (full_section, content, receipt) = read_one_with_count(sandbox, spec);
     let Some(content) = content else {
-        return (full_section, None);
+        return (full_section, None, receipt);
     };
     let Some(lang) = Path::new(&spec.path)
         .extension()
@@ -538,23 +574,23 @@ fn read_one_delta(
     else {
         // is_whole_file_source_read guarantees a known Lang; this is a
         // belt-and-braces fail-open (full serve) if that ever drifts.
-        return (full_section, Some(content));
+        return (full_section, Some(content), receipt);
     };
     let Ok(key) = sandbox.validate(Path::new(&spec.path)) else {
-        return (full_section, Some(content));
+        return (full_section, Some(content), receipt);
     };
     let before_tokens = estimate_tokens(&full_section);
     match cache.snapshot(&key) {
         None => {
             cache.record(key, content.clone());
-            (full_section, Some(content))
+            (full_section, Some(content), receipt)
         }
         Some(old) if old == content => {
             if lang == Lang::Html {
                 // No line-level signatures in HTML — a skeleton would be
                 // noise. Serve the full content; the baseline stays cached
                 // so future DIFF serves work.
-                return (full_section, Some(content));
+                return (full_section, Some(content), receipt);
             }
             let sk = skeleton_for(&content, lang);
             let total = content.lines().count();
@@ -580,7 +616,7 @@ fn read_one_delta(
                 // the full serve. A reduced serve must never cost MORE
                 // than the full one — serve the full content (the cached
                 // baseline is already current; no savings row).
-                return (full_section, Some(content));
+                return (full_section, Some(content), receipt);
             }
             savings.push(savings_event(
                 "skeleton",
@@ -588,7 +624,13 @@ fn read_one_delta(
                 before_tokens,
                 after_tokens,
             ));
-            (section, Some(content))
+            // The model saw a SIGNATURE SKELETON, not the lines — the
+            // full-serve receipt minted inside read_one_with_count must
+            // not stay anchorable (backlog 3fdc605f).
+            if let Some(id) = receipt.as_deref() {
+                crate::tool::agent::read_registry::revoke(id);
+            }
+            (section, Some(content), None)
         }
         Some(old) => match diff_if_small(&old, &content) {
             Some(diff) => {
@@ -609,7 +651,7 @@ fn read_one_delta(
                     // cost MORE than the full one — fall back to the full
                     // re-serve and refresh the baseline.
                     cache.record(key, content.clone());
-                    return (full_section, Some(content));
+                    return (full_section, Some(content), receipt);
                 }
                 savings.push(savings_event(
                     "delta_read",
@@ -618,14 +660,19 @@ fn read_one_delta(
                     after_tokens,
                 ));
                 cache.record(key, content.clone());
-                (section, Some(content))
+                // A unified DIFF is not the lines — revoke like the
+                // skeleton path (backlog 3fdc605f).
+                if let Some(id) = receipt.as_deref() {
+                    crate::tool::agent::read_registry::revoke(id);
+                }
+                (section, Some(content), None)
             }
             None => {
                 // Mostly-rewritten file: a diff would cost more than a
                 // full re-serve. Keep today's full section; refresh the
                 // baseline.
                 cache.record(key, content.clone());
-                (full_section, Some(content))
+                (full_section, Some(content), receipt)
             }
         },
     }
@@ -682,6 +729,33 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, src).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_mints_a_receipt_id_trailer() {
+        // Backlog 3fdc605f (plan 5a21fc8f): every successful file read
+        // mints a short read-receipt id in its section trailer — the
+        // anchor file_edit/multi_edit cite instead of re-emitting (and
+        // post-compaction re-reading) the verbatim bytes. Red-first:
+        // today no trailer exists.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("[read receipt "),
+            "the read section must carry the receipt trailer: {}",
+            result.output
+        );
+        let id = result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .expect("the trailer carries the id");
+        assert!(!id.is_empty(), "the receipt id must be non-empty");
     }
 
     #[test]
@@ -1314,20 +1388,38 @@ three
             .with_optimizer(Arc::new(std::sync::RwLock::new(cfg)))
     }
 
+    /// The per-read receipt trailer (backlog 3fdc605f) carries a fresh id
+    /// on EVERY read — strip it for the byte-identity comparisons below;
+    /// the CONTENT is the pin, the id is necessarily per-read.
+    fn without_receipt_trailer(output: &str) -> String {
+        output
+            .lines()
+            .filter(|l| !l.contains("[read receipt "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[tokio::test]
     async fn delta_lever_off_serves_full_content_identically() {
         // No optimizer attached (CLI contract builds, pre-lever tests):
         // re-reads serve the full content again, byte-identical to the
         // pre-lever build, and no savings data rides the result — the
         // regression pin for the ABSENT-optimizer path (an explicit
-        // `delta_reads = false` is pinned by the test below).
+        // `delta_reads = false` is pinned by the test below). The
+        // per-read receipt trailer (backlog 3fdc605f) is the one new
+        // line — its id differs per read, so the comparison normalizes
+        // it away (content identity is the pin).
         let dir = tempdir().unwrap();
         let tool = make_tool(dir.path());
         std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n").unwrap();
         let r1 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         assert!(r1.success && r2.success);
-        assert_eq!(r1.output, r2.output, "flag off: byte-identical re-reads");
+        assert_eq!(
+            without_receipt_trailer(&r1.output),
+            without_receipt_trailer(&r2.output),
+            "flag off: byte-identical re-reads"
+        );
         assert!(r1.data.is_none() && r2.data.is_none());
         assert!(r1.output.contains("fn b() {}"));
     }
@@ -1361,7 +1453,11 @@ three
         let r1 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         let r2 = tool.execute(json!({"files":[{"path":"a.rs"}]})).await;
         assert!(r1.success && r2.success);
-        assert_eq!(r1.output, r2.output, "flag off: byte-identical re-reads");
+        assert_eq!(
+            without_receipt_trailer(&r1.output),
+            without_receipt_trailer(&r2.output),
+            "flag off: byte-identical re-reads"
+        );
         assert!(r1.data.is_none() && r2.data.is_none());
         // Flip the flag on mid-session: no cache entry may exist yet.
         cfg.write().unwrap().delta_reads = true;

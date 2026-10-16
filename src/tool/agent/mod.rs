@@ -50,6 +50,7 @@ pub mod output_compactor;
 pub mod pattern;
 pub mod read_cache;
 pub mod read_files;
+pub mod read_registry;
 pub mod sandbox;
 pub mod search;
 pub mod search_read;

@@ -42,7 +42,9 @@ pub use session::AgentSession;
 /// `Setup::set_api_key`.
 pub use crate::config::keys::{KeySource, Secret};
 pub use crate::config::mcp::McpServerWire;
-pub use crate::host::brain::SharedResources;
+/// Job 6 (§5.9.10 :747-753): the whole-brain injection seam's type —
+/// [`EngineBuilder::brain`] shares the host app's ONE brain.
+pub use crate::host::brain::{Brain, SharedResources};
 /// Job 5 D4 (§5.9.10 :750-753): the host-runtime integration seams
 /// the app's wiring consumes (IpcState's loop map, the shared spawn
 /// path, the console runtime, the subagent sweep) — bare headless

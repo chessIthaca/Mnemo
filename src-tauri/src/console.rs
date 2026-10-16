@@ -862,6 +862,13 @@ impl ConsoleRuntime {
     /// Cancel every registered agent so their tasks exit (the REPL then
     /// waits, bounded, for the main agent's `Exited` event). Errors are
     /// ignored — an agent that is already gone needs no cancel.
+    /// The drain phase of the two-phase exit (job 6, slice 3): cancel
+    /// EVERY agent through the ENGINE's manager (`engine.host()` — the
+    /// same manager every session cancel routes through) while the pump
+    /// stays alive, so the Exited events still flow and the REPL can
+    /// observe the drain. The cleanup phase (run_console's exit tail)
+    /// then consumes the engine (`into_engine().shutdown()`) — sessions
+    /// deregistered, pump stopped, no leaked tasks.
     pub(crate) async fn request_shutdown(&self) {
         let mgr = self.engine.host().manager.lock().await;
         for handle in mgr.list() {
@@ -879,6 +886,16 @@ impl ConsoleRuntime {
     /// forwarder's Complete→Executing cleanup, shared via the same helper.
     pub(crate) async fn cleanup_inactive_subagents(&self, trigger: AgentId) {
         crate::ipc::events::cleanup_inactive_subagents(&self.engine.host().manager, trigger).await;
+    }
+
+    /// Consume the runtime and hand the Engine back (job 6, slice 3): the
+    /// exit tail calls `engine.shutdown()` — the drain already completed
+    /// (begin_shutdown's sweep cancelled every agent while the pump stayed
+    /// alive for the Exited events), so this cleanup phase only
+    /// deregisters the sessions + stops the pump cleanly: no leaked tasks,
+    /// the same contract every headless consumer honors.
+    pub(crate) fn into_engine(self) -> Engine {
+        self.engine
     }
 
     /// The reasoning-effort value a `/model <endpoint>/<model>` swap should
@@ -1435,6 +1452,13 @@ pub(crate) async fn run_console() -> i32 {
     .await;
     // Drain the asynchronous trace mirror so the session's last requests land.
     runtime.trace().flush_file_writes();
+    // Job 6 (§5.9.10, slice 3): the cleanup phase of the two-phase exit —
+    // the engine's own shutdown path. The drain already completed
+    // (begin_shutdown's manager sweep cancelled every agent while the
+    // pump stayed alive for the Exited events); consuming the engine now
+    // deregisters the sessions + stops the pump: no leaked tasks, the
+    // same contract every headless consumer honors.
+    let _ = runtime.into_engine().shutdown().await;
     println!("bye.");
     0
 }

@@ -494,9 +494,10 @@ impl Engine {
     /// The engine's host core (job 6, §5.9.10) — the shared
     /// manager/loops/factory/bookkeeping assembly every frontend holds
     /// (`HostRuntime`'s own doc names the Engine a direct holder). The
-    /// console's remaining legs (the shutdown cancel sweep, the
-    /// inactive-subagent cleanup) read it until engine-level APIs
-    /// replace them in the later slices.
+    /// console's drain-phase sweep (cancel every agent while the pump
+    /// stays alive for the Exited events) + the inactive-subagent
+    /// cleanup read the engine's manager through it — the engine-level
+    /// session surface serves the rest.
     pub fn host(&self) -> &HostRuntime {
         &self.inner.host
     }

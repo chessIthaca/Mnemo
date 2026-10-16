@@ -500,7 +500,7 @@ fn main() {
                         app.handle().clone(),
                     ));
                     brain.factory.set_spawner(spawner.clone());
-                    brain.factory.set_descendant_tracker(spawner);
+                    brain.factory.set_descendant_tracker(spawner.clone());
 
                     // Wire the app-side policy factory (2b.2; master-spec
                     // :266-269): the app impl builds each agent's WorkflowPolicy
@@ -659,6 +659,24 @@ fn main() {
                         .await
                         .expect("engine over the ready brain must start")
                     });
+
+                    // Review H1 (2026-10-16): the engine's
+                    // HostRuntime::start re-wired the shared factory's
+                    // spawner + descendant-tracker slots to its OWN
+                    // HostSpawner (the slot is read per build —
+                    // src/host/runtime.rs:775-781): every GUI agent built
+                    // after startup would spawn background agents into
+                    // the ENGINE's manager — invisible to the GUI (no
+                    // list_agents, no events, no cancel/set_model reach)
+                    // and running until process exit. Restore the host's
+                    // wiring — the seam's own philosophy: an injected
+                    // brain keeps the host app's wiring. The GUI-held
+                    // engine spawns no sessions, so nothing of the engine
+                    // is lost (the console's process-local factory has no
+                    // competing consumer — it keeps the engine's spawner
+                    // by design).
+                    brain.factory.set_spawner(spawner.clone());
+                    brain.factory.set_descendant_tracker(spawner);
 
                     app.manage(IpcState {
                         app_policy_factory: Some(Arc::clone(&policy_factory)),

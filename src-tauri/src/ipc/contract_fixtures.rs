@@ -10,8 +10,11 @@
 //! fixture under `frontend/src/lib/ipc-fixtures/`. Missing fixtures are
 //! written (pretty-printed) and reported at the end; once committed, any
 //! shape change makes the test fail until the fixture is consciously updated.
-//! The frontend vitest contract suite imports the same fixtures, so a change
-//! is caught on the TS side too.
+//! The frontend vitest contract suite imports the same fixtures for the
+//! DTOs it consumes, so a change is caught on the TS side too; the
+//! Rust-side-only pins (e.g. `dto-engine-stats` — the `engine_status`
+//! command the frontend has not adopted yet) are caught here alone until
+//! the TS side adds its import.
 //!
 //! Fixtures are read via `env!("CARGO_MANIFEST_DIR")` (the app crate root =
 //! `src-tauri`), so the path is `../frontend/src/lib/ipc-fixtures/<name>.json`.

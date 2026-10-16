@@ -106,6 +106,19 @@ behave as before) stand.
 - Console (console.rs :1179-1234): the same recipe on its process-local brain
   — one construction path for both consumers.
 
+- Landed (2026-10-16, review H1): the engine's HostRuntime::start re-wires
+  the shared factory's spawner + descendant-tracker slots to its OWN
+  HostSpawner (the slot is read per build — src/host/runtime.rs:775-781),
+  so the GUI's post-startup agent builds would spawn background agents
+  into the ENGINE's manager — invisible to the GUI (no list_agents, no
+  events, no cancel/set_model reach; they run until process exit). The
+  GUI's Ready branch restores its IpcSpawner AFTER the engine
+  construction (src-tauri/src/main.rs) — the seam's own philosophy: an
+  injected brain keeps the host app's wiring; the GUI-held engine spawns
+  no sessions, so nothing of the engine is lost. The console is
+  unaffected: its process-local factory has no competing consumer — the
+  engine's HostSpawner IS its spawner by design.
+
 ### D3 — the proving consumer (DECISION: the Setup::for_engine live-apply)
 
 - The GUI's classifier live-apply (src-tauri/src/ipc/laya.rs) routes through

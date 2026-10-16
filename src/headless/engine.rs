@@ -491,6 +491,16 @@ impl Engine {
         CodegraphApi::from_parts(self.brain.factory.codegraph_handle())
     }
 
+    /// The engine's host core (job 6, §5.9.10) — the shared
+    /// manager/loops/factory/bookkeeping assembly every frontend holds
+    /// (`HostRuntime`'s own doc names the Engine a direct holder). The
+    /// console's transitional legs (the global model swap, the shutdown
+    /// cancel sweep, the inactive-subagent cleanup) read it while the
+    /// engine-level swap + shutdown APIs land in the later slices.
+    pub fn host(&self) -> &HostRuntime {
+        &self.inner.host
+    }
+
     /// §5.7's engine-wide stats pull — the store's project + savings
     /// aggregates plus the steering-effectiveness snapshot (the same
     /// counters the app's Trace tab reads). Errors `memory_disabled`

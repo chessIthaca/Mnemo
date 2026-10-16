@@ -31,6 +31,14 @@ impl SessionId {
     pub(crate) fn new(agent: AgentId) -> Self {
         Self(agent)
     }
+
+    /// The session's underlying agent id — job 6 (§5.9.10): a consumer
+    /// (the console REPL) correlates the session's events with the
+    /// emitting agents (`SessionEvent` tags each event with its
+    /// `AgentId`; a subagent's events are tagged with the child).
+    pub fn agent_id(&self) -> AgentId {
+        self.0
+    }
 }
 
 /// The outcome of a completed turn (§5.3 :322 — `run_to_completion`):

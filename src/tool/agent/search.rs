@@ -1705,9 +1705,9 @@ impl Tool for SearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: SearchArgs = match serde_json::from_value(args) {
+        let args: SearchArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
 
         // Validate the glob BEFORE use so a pattern that escapes the sandbox

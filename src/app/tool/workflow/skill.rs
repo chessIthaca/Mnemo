@@ -119,9 +119,9 @@ impl Tool for SkillStartTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: SkillStartArgs = match serde_json::from_value(args) {
+        let args: SkillStartArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let spec = match self.library.read(|r| r.get(&args.skill).cloned()) {
             Some(s) => s,
@@ -476,9 +476,9 @@ impl Tool for SkillCreateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: SkillCreateArgs = match serde_json::from_value(args) {
+        let args: SkillCreateArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         if let Err(e) = validate_skill_name(&args.name) {
             return ToolResult::error(e);

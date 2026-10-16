@@ -221,6 +221,20 @@ fn large_payload_note(args: &FileEditArgs) -> Option<String> {
 /// line-range mode (`lines`) requires no `old_string`; otherwise the
 /// `use_regex`/literal path runs.
 pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+    prepare_edit_ctx(args, content, "")
+}
+
+/// [`prepare_edit`] with the received-arguments truncation note threaded
+/// in: the old_string-empty arm (the arg-shape rejection a truncated call
+/// lands on when its edit payload was dropped in emission) appends it so
+/// the rejection shows what the executor received (backlog 05a0905f). The
+/// note is execute-only; every other caller (approval previews, tests)
+/// passes "" and gets the historical text unchanged.
+fn prepare_edit_ctx(
+    args: &FileEditArgs,
+    content: &str,
+    received_note: &str,
+) -> Result<PreparedEdit> {
     if args.ops.is_some() {
         prepare_edit_ops(args, content)
     } else if args.append {
@@ -234,14 +248,17 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
         // empty pattern matches at every position) — silent corruption. The
         // line-range path above doesn't use old_string, so it's exempt.
         if args.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(
+            // The {received_note} hole (backlog 05a0905f): "" keeps the
+            // historical text byte-identical; execute threads the
+            // received-bytes context + truncation remedy through so a
+            // truncated call is never blind-retryable.
+            return Err(crate::error::Error::InvalidInput(format!(
                 "old_string is empty — provide old_string (string matching) or \
                  lines: [start, end] (line range). If you meant the literal text \
                  'null' (dropped by the null-stringify defense), use batch mode \
                  (an ops anchor item's old_string is required, never dropped) or \
-                 use_regex (e.g. nul[l])"
-                    .into(),
-            ));
+                 use_regex (e.g. nul[l]){received_note}"
+            )));
         }
         if args.use_regex {
             prepare_edit_regex(args, content)
@@ -737,9 +754,16 @@ impl Tool for FileEditTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: FileEditArgs = match serde_json::from_value(args) {
+        // Backlog 05a0905f: the truncation note for the old_string-empty
+        // rejection — captured while the raw arguments Value is still
+        // alive (before it is shadowed by the parsed args; post-parse
+        // the payload fields are gone, so this is the only place the
+        // received bytes are visible).
+        let received_note =
+            crate::tool::error_message::received_truncation_note(&args);
+        let args: FileEditArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // (backlog 1db26c95) Restore boundary-token markers to the raw
         // tokens in BOTH edit strings: the agent reconstructs old_string
@@ -828,7 +852,7 @@ impl Tool for FileEditTool {
                 Err(e) => return ToolResult::error(format!("failed to read '{}': {e}", args.path)),
             };
 
-            let prepared = match prepare_edit(&args, &content) {
+            let prepared = match prepare_edit_ctx(&args, &content, &received_note) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::error(format!("{e}")),
             };
@@ -938,6 +962,29 @@ mod tests {
         assert_eq!(args.count, None);
         assert!(args.ops.is_none());
         assert_eq!(args.lines, Some(vec![1, 2]));
+    }
+
+    #[tokio::test]
+    async fn old_string_empty_rejection_carries_received_bytes_context() {
+        // Backlog 05a0905f regression (plan 81a1b70d): a truncated
+        // file_edit payload whose old_string/new_string were dropped in
+        // emission used to reject with only "old_string is empty — …",
+        // never showing that the executor received just the path — the
+        // model blind-retried the identical payload. The rejection must
+        // carry the received byte count + keys + the truncation remedy.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+        let result = tool.execute(serde_json::json!({"path": "a.txt"})).await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("old_string is empty"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("received"), "{}", result.output);
+        assert!(result.output.contains("bytes"), "{}", result.output);
+        assert!(result.output.contains("re-emit"), "{}", result.output);
     }
 
     /// Build literal-mode args (the common case for existing tests).

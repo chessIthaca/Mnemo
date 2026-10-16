@@ -743,9 +743,9 @@ impl Tool for CreatePlanTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: CreatePlanArgs = match serde_json::from_value(args) {
+        let args: CreatePlanArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Non-blank content guard: serde enforces PRESENCE of title/goal but a
         // whitespace-only string deserializes fine — and a blank title/goal is
@@ -1156,9 +1156,9 @@ impl Tool for UpdatePlanTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: UpdatePlanArgs = match serde_json::from_value(args) {
+        let args: UpdatePlanArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Normalize map steps into the stored string form (same as create_plan).
         let steps = args.steps.map(steps_to_text);
@@ -1497,9 +1497,9 @@ impl Tool for CompleteStepTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: CompleteStepArgs = match serde_json::from_value(args) {
+        let args: CompleteStepArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Exactly one of step_index / detailed_step_index (backlog
         // 9441d776): the skeleton-step tick or the detailed sub-step tick.
@@ -2076,9 +2076,9 @@ impl Tool for FinishTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: FinishArgs = match serde_json::from_value(args) {
+        let args: FinishArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Snapshot-and-drop: the workflow lock is held ONLY for the state
         // check + the plan snapshot — never across the capture awaits below

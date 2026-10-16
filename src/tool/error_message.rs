@@ -35,8 +35,16 @@
 //!   generic fallback that still names the tool and carries serde's own
 //!   one-line detail — instructive, and never a stack trace.
 //!
-//! The raw arguments blob is never echoed (it can be huge, and it teaches
-//! the model nothing the schema does not already say).
+//! The raw arguments blob is never echoed in full (it can be huge, and it
+//! teaches the model nothing the schema does not already say). The one
+//! sanctioned exception (backlog 05a0905f): a bounded ~120-character
+//! received-tail around the failure point. The enriched producers
+//! ([`sanitize_arguments_json_error`], [`sanitize_arguments_error_with`],
+//! [`received_args_context`]) echo exactly what the executor received —
+//! byte count, keys, and the tail around the break — because a truncated
+//! payload is otherwise blind-retryable: the model believes it sent valid
+//! JSON, so a bare rejection brings the identical (re-truncated) call
+//! back, one full round-trip per retry.
 
 use serde_json::{error::Category, Error};
 
@@ -150,6 +158,222 @@ pub fn sanitize_arguments_error(tool: &str, err: &Error) -> String {
         "Error: The tool '{tool}' failed because its arguments do not \
          match its schema ({raw}). Please check the tool's schema and \
          try again with correctly-typed arguments."
+    )
+}
+
+/// The remedy appended to every enriched argument rejection: what to do
+/// instead of blind-retrying (backlog 05a0905f — a truncated payload
+/// re-sent identically fails identically, one full round-trip per retry).
+const TRUNCATION_REMEDY: &str = "re-emit a smaller payload (fewer/shorter \
+     items), split the work across multiple calls, or — for file changes — \
+     use file_write to write the whole file instead";
+
+/// Received-tail window: up to this many characters before the break,
+/// plus [`RECEIVED_TAIL_AFTER`] after it (a mid-payload break shows both
+/// sides; an EOF break is all tail).
+const RECEIVED_TAIL_CHARS: usize = 120;
+const RECEIVED_TAIL_AFTER: usize = 40;
+
+/// Step back to the nearest UTF-8 char boundary at or before `i`.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Step forward to the nearest UTF-8 char boundary at or after `i`.
+fn ceil_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Byte offset of `err` inside the raw payload it came from. serde
+/// reports a 1-based `line`/`column` (the column counts bytes within the
+/// line): walk the payload to that line's start, add the column, clamp
+/// to the payload length — an EOF error reports one past the last byte.
+fn byte_offset(raw: &str, err: &Error) -> usize {
+    let mut offset = 0usize;
+    let mut rest = raw;
+    for _ in 1..err.line().max(1) {
+        match rest.find('\n') {
+            Some(i) => {
+                offset += i + 1;
+                rest = &rest[i + 1..];
+            }
+            // Fewer lines than the error claims: the break is at (or
+            // past) the end — clamp.
+            None => return raw.len(),
+        }
+    }
+    (offset + err.column().max(1) - 1).min(raw.len())
+}
+
+/// The bounded received-tail around the break — the sanctioned diagnostic
+/// exception to "never echo the raw arguments": the full blob stays
+/// unechoed (huge, mostly noise), the tail shows where the emission was
+/// cut. Char-boundary safe, backtick-quoted.
+fn received_tail(raw: &str, offset: usize) -> String {
+    let start = floor_boundary(raw, offset.saturating_sub(RECEIVED_TAIL_CHARS));
+    let end = ceil_boundary(raw, offset.saturating_add(RECEIVED_TAIL_AFTER));
+    if start >= end {
+        return "`` (nothing was received)".into();
+    }
+    format!("`{}`", &raw[start..end])
+}
+
+/// The tail of the already-serialized received arguments (schema path —
+/// the Value a tool received, re-serialized for the byte count).
+fn value_tail(serialized: &str) -> String {
+    let start =
+        floor_boundary(serialized, serialized.len().saturating_sub(RECEIVED_TAIL_CHARS));
+    format!("`{}`", &serialized[start..])
+}
+
+/// The top-level keys the received arguments actually carried (or the
+/// value's kind when it is not an object — so the model sees why the
+/// fields it meant to send could not land).
+fn received_keys(received: &serde_json::Value) -> String {
+    match received.as_object() {
+        Some(map) if map.is_empty() => "none — an empty object".into(),
+        Some(map) => map
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        None => format!(
+            "none — the arguments are {}, not an object",
+            match received {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Array(_) => "an array",
+                // The Object arm matched above; the kind list is
+                // exhaustive so the value's shape is always named.
+                serde_json::Value::Object(_) => "an object",
+            }
+        ),
+    }
+}
+
+/// Whether `err` is a serde missing-field error — the one schema shape
+/// with truncation ambiguity: a field dropped in emission looks exactly
+/// like an omitted one from the model's side.
+fn is_missing_field(err: &Error) -> bool {
+    between_ticks(&err.to_string(), "missing field").is_some()
+}
+
+/// Rewrite the dispatch-layer JSON-parse rejection so it is
+/// self-diagnosing: the failure kind (cut off vs malformed), the byte
+/// offset, the exact byte count the executor received, a bounded
+/// received-tail around the break, and the truncation remedy. Without
+/// this the rejection is blind-retryable — the model believes it sent
+/// valid JSON, so a bare "not valid JSON" gets the identical
+/// (re-truncated) call back (observed: repeated identical rejections on
+/// ~2.5-4 KB multi_edit/file_edit payloads, one full round-trip each).
+///
+/// Successor of [`sanitize_arguments_error`]'s Syntax/EOF arm for the one
+/// rejection path that has the raw payload in scope — the `from_str`
+/// failure in `execute_tool_call`. The base text is kept verbatim (its
+/// pinned tests stay green); the context is appended. The raw blob is
+/// still never echoed in full — only the bounded tail is.
+pub fn sanitize_arguments_json_error(tool: &str, err: &Error, raw_args: &str) -> String {
+    // from_str failures are Syntax or EOF; anything else keeps the plain
+    // shape (defensive: a future caller cannot double-enrich).
+    if !matches!(err.classify(), Category::Syntax | Category::Eof) {
+        return sanitize_arguments_error(tool, err);
+    }
+    let offset = byte_offset(raw_args, err);
+    let what = if matches!(err.classify(), Category::Eof) {
+        format!(
+            "A payload that ends mid-document like this was cut off in \
+             emission, not mis-drafted — re-sending the identical payload \
+             will fail identically; {TRUNCATION_REMEDY}"
+        )
+    } else {
+        format!(
+            "A break at that byte is malformed JSON; a large payload \
+             damaged in emission breaks exactly there — do not re-send it \
+             identically; {TRUNCATION_REMEDY}"
+        )
+    };
+    format!(
+        "{} The failure is a JSON-parse break at byte {} of the {} bytes \
+         received; the received bytes around the break: {}. {}.",
+        sanitize_arguments_error(tool, err),
+        offset,
+        raw_args.len(),
+        received_tail(raw_args, offset),
+        what
+    )
+}
+
+/// Enrich a schema-layer argument rejection (a `serde_json::from_value`
+/// failure inside a tool's `execute`) with what the executor received:
+/// the byte count, the top-level keys, the tail of the received
+/// arguments — and, for missing-field failures, the truncation remedy
+/// (a model whose large payload was dropped in emission genuinely
+/// believes it sent the field, so the base text's "was not provided"
+/// reads as false and gets the identical call back). The base text is
+/// byte-identical ([`sanitize_arguments_error`]); only context is
+/// appended.
+pub fn sanitize_arguments_error_with(
+    tool: &str,
+    err: &Error,
+    received: &serde_json::Value,
+) -> String {
+    let mut msg = format!(
+        "{}{}",
+        sanitize_arguments_error(tool, err),
+        received_args_context(received)
+    );
+    if is_missing_field(err) {
+        msg.push_str(&format!(
+            " A required field that is absent on a large call was likely \
+             dropped in emission rather than omitted — do not re-send the \
+             identical payload; {TRUNCATION_REMEDY}."
+        ));
+    }
+    msg
+}
+
+/// The received-arguments context sentence, ready to append to a pinned
+/// arg-shape rejection text (the custom validators that fire after
+/// deserialization succeeded — e.g. multi_edit's `files is required`).
+/// Compute this BEFORE `from_value` consumes the arguments Value, and
+/// thread it down to the validator.
+pub fn received_args_context(received: &serde_json::Value) -> String {
+    let serialized = serde_json::to_string(received).unwrap_or_default();
+    format!(
+        " The executor received {} bytes of arguments (keys: {}); the \
+         received arguments end: {}.",
+        serialized.len(),
+        received_keys(received),
+        value_tail(&serialized)
+    )
+}
+
+/// The full truncation note for post-parse arg-shape rejections (the
+/// custom validators that fire after deserialization succeeded — e.g.
+/// multi_edit's `files is required`): the received-arguments context plus
+/// the remedy, ready to append to the pinned leading text. Computed in
+/// `execute`, where the raw arguments Value is still alive, and threaded
+/// down; every other path (approval previews, direct `prepare_edit`
+/// callers, tests) passes "" and keeps the historical text unchanged —
+/// the bare text is otherwise blind-retryable (backlog 05a0905f: the
+/// model believes it sent the payload, so it re-emits the identical call
+/// and fails identically, one full round-trip per retry).
+pub fn received_truncation_note(received: &serde_json::Value) -> String {
+    format!(
+        "{ctx} A payload whose content never arrived is almost always \
+         emission truncation, not a drafting omission — do not re-send the \
+         identical call; {TRUNCATION_REMEDY}.",
+        ctx = received_args_context(received)
     )
 }
 
@@ -447,5 +671,114 @@ mod tests {
             msg.contains("(allowed: A or B)"),
             "the allowed set must come from the real anchor: {msg}"
         );
+    }
+
+    #[test]
+    fn truncated_json_mid_string_names_kind_offset_bytes_tail_and_remedy() {
+        // Backlog 05a0905f regression: a payload cut mid-string used to
+        // reject with only "not valid JSON (EOF while parsing a string at
+        // line 1 column 69)" — no byte count, no tail, nothing showing
+        // WHERE the emission stopped, so the model re-sent the identical
+        // (re-truncated) call, one full round-trip per retry.
+        let raw = r#"{"files":[{"path":"src/tool/agent/multi_edit.rs","ops":[{"i":"b","pay"#;
+        let err = serde_json::from_str::<serde_json::Value>(raw)
+            .expect_err("payload cut mid-string must fail to parse");
+        let msg = sanitize_arguments_json_error("multi_edit", &err, raw);
+        // (1) the failure kind + (2) the byte offset and byte count — an
+        // EOF-at-the-end break sits at the LAST received byte (serde's
+        // 1-based column == len, so the 0-based offset is len-1):
+        assert!(
+            msg.contains(&format!(
+                "JSON-parse break at byte {} of the {} bytes received",
+                raw.len() - 1,
+                raw.len()
+            )),
+            "{msg}"
+        );
+        // (2) the received tail shows the literal cut point:
+        assert!(msg.contains(r#""pay"#), "the tail must show the cut: {msg}");
+        assert!(msg.contains("cut off in emission"), "{msg}");
+        // (4) the remedy line:
+        assert!(msg.contains("re-emit a smaller payload"), "{msg}");
+        assert!(msg.contains("use file_write"), "{msg}");
+        // The pinned base opening is kept:
+        assert!(
+            msg.starts_with("Error: The tool 'multi_edit' failed"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn truncated_json_mid_brace_names_kind_offset_bytes_tail_and_remedy() {
+        // The mid-BRACE cut: EOF while parsing an object — the received
+        // tail ends at the opening brace the emission never closed.
+        let raw = r#"{"files":[{"path":"src/x.rs","ops":[{"#;
+        let err = serde_json::from_str::<serde_json::Value>(raw)
+            .expect_err("payload cut mid-brace must fail to parse");
+        let msg = sanitize_arguments_json_error("multi_edit", &err, raw);
+        assert!(
+            msg.contains(&format!(
+                "JSON-parse break at byte {} of the {} bytes received",
+                raw.len() - 1,
+                raw.len()
+            )),
+            "{msg}"
+        );
+        assert!(msg.contains(r#"ops":[{"#), "the tail must show the cut: {msg}");
+        assert!(msg.contains("cut off in emission"), "{msg}");
+        assert!(msg.contains("use file_write"), "{msg}");
+    }
+
+    #[test]
+    fn malformed_json_mid_payload_marks_the_break_byte() {
+        // A mid-payload SYNTAX break (not EOF): the kind wording switches
+        // to "malformed JSON" while the offset/bytes/tail/remedy stay —
+        // the failure kind is part of the diagnostic.
+        let raw = r#"{"files": [{path: "src/x.rs"}]}"#;
+        let err = serde_json::from_str::<serde_json::Value>(raw)
+            .expect_err("unquoted key must fail to parse");
+        let msg = sanitize_arguments_json_error("multi_edit", &err, raw);
+        assert!(msg.contains("malformed JSON"), "{msg}");
+        assert!(msg.contains("bytes received"), "{msg}");
+        assert!(msg.contains("received bytes around the break"), "{msg}");
+        assert!(msg.contains("do not re-send it identically"), "{msg}");
+        assert!(msg.contains("re-emit a smaller payload"), "{msg}");
+    }
+
+    #[test]
+    fn schema_missing_field_error_carries_received_bytes_and_remedy() {
+        // Backlog 05a0905f regression: the missing-field arm used to end
+        // at "was not provided" — on a truncated call the model believes
+        // it sent the field, so that text invites the identical retry.
+        // The with-variant appends the received byte count, keys, tail,
+        // and the truncation remedy (gated to missing-field errors).
+        let received = json!({"count": 5});
+        let err = real_error(received.clone());
+        let msg = sanitize_arguments_error_with("file_edit", &err, &received);
+        assert!(
+            msg.contains("parameter 'path' is required but was not provided"),
+            "{msg}"
+        );
+        // The received args serialize to exactly `{"count":5}`:
+        assert!(msg.contains("received 11 bytes"), "{msg}");
+        assert!(msg.contains("keys: count"), "{msg}");
+        assert!(
+            msg.contains("received arguments end: `{\"count\":5}`"),
+            "{msg}"
+        );
+        assert!(msg.contains("dropped in emission"), "{msg}");
+        assert!(msg.contains("re-emit a smaller payload"), "{msg}");
+    }
+
+    #[test]
+    fn schema_type_error_gets_context_without_truncation_remedy() {
+        // Non-missing-field schema failures (a type error) get the
+        // received context but NOT the truncation remedy — a wrong type
+        // is a drafting error, not emission decay.
+        let received = json!({"path": "a.rs", "count": "5"});
+        let err = real_error(received.clone());
+        let msg = sanitize_arguments_error_with("file_edit", &err, &received);
+        assert!(msg.contains("bytes of arguments"), "{msg}");
+        assert!(!msg.contains("dropped in emission"), "{msg}");
     }
 }

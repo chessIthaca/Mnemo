@@ -97,11 +97,13 @@ pub(crate) fn invalid_args_error(
         format!(" {hint}")
     };
     // The sanitized base (plan 21118961) names the offending
-    // parameter/type in plain words instead of serde vocabulary;
-    // the received-keys + hint context rides on top of it.
+    // parameter/type in plain words instead of serde vocabulary; the
+    // received-keys + hint context rides on top of it, and the
+    // with-variant adds the received-bytes context (byte count + tail +
+    // truncation remedy, backlog 05a0905f).
     format!(
         "{} (received keys: {keys}).{hint}",
-        crate::tool::error_message::sanitize_arguments_error(tool, e)
+        crate::tool::error_message::sanitize_arguments_error_with(tool, e, args)
     )
 }
 

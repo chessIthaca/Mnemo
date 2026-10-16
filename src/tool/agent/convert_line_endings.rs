@@ -99,9 +99,9 @@ impl Tool for ConvertLineEndingsTool {
     // and the tool's result already reports the exact before/after counts.
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: ConvertLineEndingsArgs = match serde_json::from_value(args) {
+        let args: ConvertLineEndingsArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let target = match parse_target(&args.to) {
             Ok(t) => t,

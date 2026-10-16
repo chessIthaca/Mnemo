@@ -597,9 +597,9 @@ impl Tool for MemoryRecallTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryRecallArgs = match serde_json::from_value(args) {
+        let args: MemoryRecallArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let mut filter = MemoryFilter::new();
         if let Some(tier_str) = &args.tier {
@@ -730,9 +730,9 @@ impl Tool for MemoryConsolidateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryConsolidateArgs = match serde_json::from_value(args) {
+        let args: MemoryConsolidateArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Snapshot the provider (if a swappable handle was wired in) so manual
         // consolidation runs the full extraction pipeline — matching the
@@ -944,9 +944,9 @@ impl Tool for MemoryUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryUpdateArgs = match serde_json::from_value(args) {
+        let args: MemoryUpdateArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let repair = match (&args.find, &args.replace_with) {
             (Some(find), Some(replace_with)) => Some((find.as_str(), replace_with.as_str())),
@@ -1113,9 +1113,9 @@ impl Tool for MemoryAmendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryAmendArgs = match serde_json::from_value(args) {
+        let args: MemoryAmendArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let id = args.id;
         // The id is the deterministic row id of a knowledge record — resolve
@@ -1291,9 +1291,9 @@ impl Tool for MemorySupersedeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemorySupersedeArgs = match serde_json::from_value(args) {
+        let args: MemorySupersedeArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let tier = match MemoryTier::from_str_opt(&args.tier) {
             Some(t) => t,
@@ -1461,9 +1461,9 @@ impl Tool for MemoryDeleteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MemoryDeleteArgs = match serde_json::from_value(args) {
+        let args: MemoryDeleteArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Knowledge-backed delete: the id is the deterministic row id of a
         // knowledge record — remove the FILE (the truth dies) + targeted

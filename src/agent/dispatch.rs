@@ -214,16 +214,21 @@ impl AgentLoop {
 
         // Parse the arguments. A malformed-JSON failure is sanitized
         // (tool::error_message): the model gets a clean, instructive
-        // message naming the tool — never the raw serde text, never the
-        // raw arguments blob echoed back into the conversation.
+        // message naming the tool — never the raw serde text, and the raw
+        // arguments blob is never echoed in full, only the bounded
+        // received-tail diagnostic (byte offset, byte count, tail around
+        // the break) so a truncated payload is not blind-retryable.
         let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
                 return (
-                    ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
-                        &tc.name,
-                        &e,
-                    )),
+                    ToolResult::error(
+                        crate::tool::error_message::sanitize_arguments_json_error(
+                            &tc.name,
+                            &e,
+                            &tc.arguments,
+                        ),
+                    ),
                     Vec::new(),
                 );
             }

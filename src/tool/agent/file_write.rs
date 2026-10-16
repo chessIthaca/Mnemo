@@ -110,9 +110,9 @@ impl Tool for FileWriteTool {
         if Self::is_append(args_ref(&args)) {
             return self.append.execute(args).await;
         }
-        let args: FileWriteArgs = match serde_json::from_value(args) {
+        let args: FileWriteArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // (backlog 1db26c95) Restore boundary-token markers to the raw
         // tokens: the request layer escapes configured boundary tokens in

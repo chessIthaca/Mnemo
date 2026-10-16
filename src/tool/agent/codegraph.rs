@@ -576,9 +576,9 @@ impl Tool for GraphContextTool {
     }
 
     async fn execute(&self, args: Value) -> ToolResult {
-        let args: SymbolArgs = match serde_json::from_value(args) {
+        let args: SymbolArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         run_query(self.graph.clone(), move |view| {
             let key = args
@@ -671,9 +671,9 @@ impl Tool for GraphImpactTool {
             name: Option<String>,
             max_depth: Option<usize>,
         }
-        let args: Args = match serde_json::from_value(args) {
+        let args: Args = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         run_query(self.graph.clone(), move |view| {
             let key = args

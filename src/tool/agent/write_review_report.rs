@@ -293,9 +293,9 @@ impl Tool for WriteReviewReportTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: WriteReviewReportArgs = match serde_json::from_value(args) {
+        let args: WriteReviewReportArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         if args.path.trim().is_empty() {
             return ToolResult::error("write_review_report requires a non-empty 'path'");

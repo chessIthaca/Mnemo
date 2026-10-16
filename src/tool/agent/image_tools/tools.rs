@@ -236,9 +236,9 @@ impl Tool for ImageUiToArtifactTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: UiToArtifactArgs = match serde_json::from_value(args) {
+        let args: UiToArtifactArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(t) = &args.target {
@@ -316,9 +316,9 @@ impl Tool for ImageExtractTextTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: ExtractTextArgs = match serde_json::from_value(args) {
+        let args: ExtractTextArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(l) = &args.lang_hint {
@@ -393,9 +393,9 @@ impl Tool for ImageDiagnoseErrorTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: DiagnoseErrorArgs = match serde_json::from_value(args) {
+        let args: DiagnoseErrorArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let mut extra = std::collections::HashMap::new();
         if let Some(c) = &args.code_context {
@@ -458,9 +458,9 @@ impl Tool for ImageUnderstandDiagramTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: UnderstandDiagramArgs = match serde_json::from_value(args) {
+        let args: UnderstandDiagramArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         run_single(
             &self.0,
@@ -518,9 +518,9 @@ impl Tool for ImageAnalyzeChartTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: AnalyzeChartArgs = match serde_json::from_value(args) {
+        let args: AnalyzeChartArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         run_single(
             &self.0,
@@ -627,9 +627,9 @@ impl Tool for ImageUiDiffTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: UiDiffArgs = match serde_json::from_value(args) {
+        let args: UiDiffArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Load both images to data URLs. Both are sent to the vision model in
         // ONE call (via describe_images) so the model actually sees both
@@ -721,9 +721,9 @@ impl Tool for ImageAnalysisTool {
         SafetyLevel::NeedsApproval
     }
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: ImageAnalysisArgs = match serde_json::from_value(args) {
+        let args: ImageAnalysisArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         run_single(
             &self.0,

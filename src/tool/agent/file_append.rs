@@ -76,9 +76,9 @@ impl Tool for FileAppendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: FileAppendArgs = match serde_json::from_value(args) {
+        let args: FileAppendArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // (backlog 1db26c95) Restore boundary-token markers to the raw
         // tokens: the request layer escapes configured boundary tokens in

@@ -1947,6 +1947,73 @@ describe("agent event reducers (table-driven)", () => {
     });
   });
 
+  it("regression (backlog 076f601e, review F1): a late text_delta after a textless turn settles as a FRESH transcript entry — the append branch", () => {
+    // Round-1 review F1: both landed late-delta tests end the turn on a
+    // trailing assistant entry, so they pin only the MERGE branch of
+    // settleTextIntoTranscript. This pins its other half — the fresh-append
+    // branch, the "never drop the tail" guarantee for a turn that streamed
+    // no text at all (flushStreamingText early-returns on empty, so the
+    // transcript has no assistant tail to merge into). Red pre-fix: the idle
+    // delta re-populated streamingText (" world") and the transcript stayed
+    // empty — the tail would drop at the next started.
+    const dispatch = useAgentStore.getState().handleAgentEvent;
+    dispatch({ agent_id: ID, event: { kind: "started" } });
+    dispatch({ agent_id: ID, event: { kind: "finished", reason: "stop" } });
+    expect(agent(ID).transcript).toEqual([]);
+
+    // The late delta — a trailing chunk landing after a textless turn.
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: " world" } });
+    const a = agent(ID);
+    expect(a.streamingText).toBe("");
+    expect(a.transcript).toHaveLength(1);
+    const settled = a.transcript[0];
+    if (!settled || settled.kind !== "assistant") throw new Error("settled entry missing");
+    expect(settled.text).toBe(" world");
+    // Fresh entries are stamped by the helper itself (the batched store path
+    // bypasses applyAgentEvent's stamping) — pin the stamped-fresh shape, a
+    // merged entry would keep the flushed entry's original stamp.
+    expect(settled.entryId).toBeTruthy();
+    expect(settled.ts).toBeTruthy();
+    // The settle path skips the live token estimate while idle — no phantom
+    // count until the next turn.
+    expect(a.liveCompletionTokens).toBe(0);
+  });
+
+  it("regression (backlog 076f601e, review F1): a late text_delta after a turn ending on a tool card settles as a fresh entry after the card", () => {
+    // The production-realistic append-branch case: the turn's answer flushed
+    // ABOVE the tool card (the flush-before-structural contract), the card
+    // is the transcript tail when the turn ends, and the late chunk cannot
+    // merge into it — it must land as a fresh assistant entry AFTER the
+    // card, never resurrecting the plain streaming block, never dropped.
+    const dispatch = useAgentStore.getState().handleAgentEvent;
+    dispatch({ agent_id: ID, event: { kind: "started" } });
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: "Hello" } });
+    dispatch({ agent_id: ID, event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" } });
+    dispatch({ agent_id: ID, event: { kind: "finished", reason: "stop" } });
+    const flushed = agent(ID).transcript;
+    if (!flushed.length || flushed[flushed.length - 1].kind !== "tool") {
+      throw new Error("precondition: the turn must end on the tool card");
+    }
+
+    // The late delta — a trailing chunk landing after the tool-card turn.
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: " world" } });
+    const a = agent(ID);
+    expect(a.streamingText).toBe("");
+    const settled = a.transcript[a.transcript.length - 1];
+    if (!settled || settled.kind !== "assistant") throw new Error("settled entry missing");
+    expect(settled.text).toBe(" world");
+    expect(settled.entryId).toBeTruthy();
+    // The card stays directly above the settled tail; the earlier answer is
+    // untouched (no cross-entry merge).
+    const prev = a.transcript[a.transcript.length - 2];
+    if (!prev) throw new Error("tool card missing");
+    expect(prev.kind).toBe("tool");
+    const first = a.transcript[0];
+    if (!first || first.kind !== "assistant") throw new Error("flushed answer missing");
+    expect(first.text).toBe("Hello");
+    expect(a.liveCompletionTokens).toBe(0);
+  });
+
   it("exited: removes the agent from all maps + falls back to main", () => {
     useAgentStore.getState().registerAgents([
       { id: ID, name: "main", running: true, parent_id: null, model: "gpt-5" },

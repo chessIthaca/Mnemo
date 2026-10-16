@@ -41,8 +41,16 @@ pub(crate) struct AskUserOption {
 pub(crate) fn parse_ask_user_args(
     args: &serde_json::Value,
 ) -> Result<(String, Vec<QuestionOption>), String> {
-    let a: AskUserArgs = serde_json::from_value(args.clone())
-        .map_err(|e| format!("invalid ask_user arguments: {e}"))?;
+    let a: AskUserArgs = serde_json::from_value(args.clone()).map_err(|e| {
+        // Backlog 05a0905f (plan 81a1b70d, review round-1 F1): this was
+        // the one decode rejection that escaped the sanitizer sweep —
+        // this module predates it, lives under src/agent/, and never
+        // called the bare-message predecessor. Route through the
+        // enriched producer so the model sees the received
+        // bytes/keys/tail and the truncation remedy instead of
+        // blind-retrying an identical truncated payload.
+        crate::tool::error_message::sanitize_arguments_error_with("ask_user", &e, args)
+    })?;
     if a.question.trim().is_empty() {
         return Err("ask_user requires a non-empty 'question'".into());
     }

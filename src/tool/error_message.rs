@@ -195,7 +195,9 @@ fn ceil_boundary(s: &str, i: usize) -> usize {
 /// Byte offset of `err` inside the raw payload it came from. serde
 /// reports a 1-based `line`/`column` (the column counts bytes within the
 /// line): walk the payload to that line's start, add the column, clamp
-/// to the payload length — an EOF error reports one past the last byte.
+/// to the payload length. An EOF-at-the-end error's column sits at the
+/// last byte (1-based column == len, so the offset is len-1); the clamp
+/// absorbs line-count and column overshoots.
 fn byte_offset(raw: &str, err: &Error) -> usize {
     let mut offset = 0usize;
     let mut rest = raw;

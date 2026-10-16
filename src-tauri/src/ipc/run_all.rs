@@ -2144,8 +2144,11 @@ mod tests {
         // steer spec — DECISION 581e39fa): the shared "returned to queue"
         // suffix was stamped on a PRE-EXECUTION steer (the Pending arm) —
         // factually false, the item never left the queue. The phrase is
-        // reserved for actual requeues: plan abandonment + the drained-run
-        // recovery. The arm records the truthful kind-neutral phrase
+        // reserved for actual requeues — the drained-run recovery plus
+        // the two dead-run composers; plan abandonment has its OWN
+        // disposition (Failed, the "plan abandoned" note) and never
+        // uses the phrase. The arm records the truthful kind-neutral
+        // phrase
         // ("before execution — still queued" — this fn also serves
         // interrupts, so it must not name the intervention kind).
         let body = fn_body(include_str!("run_all.rs"), "handle_user_intervention");
@@ -2153,8 +2156,10 @@ mod tests {
             !body.contains("format!(\"{}, returned to queue\", iv.reason)"),
             "no intervention-led \", returned to queue\" suffix composer — a \
              plain steer is a course correction, never a requeue (DECISION \
-             581e39fa); the phrase is reserved for actual requeues \
-             (abandonment + the drained-run recovery)"
+             581e39fa); the phrase is reserved for actual requeues — the \
+             drained-run recovery plus the two dead-run composers \
+             (abandonment has its own Failed disposition and never uses \
+             the phrase)"
         );
         let pending_arm = body
             .find("BacklogStatus::Pending => {")

@@ -494,11 +494,55 @@ impl Engine {
     /// The engine's host core (job 6, §5.9.10) — the shared
     /// manager/loops/factory/bookkeeping assembly every frontend holds
     /// (`HostRuntime`'s own doc names the Engine a direct holder). The
-    /// console's transitional legs (the global model swap, the shutdown
-    /// cancel sweep, the inactive-subagent cleanup) read it while the
-    /// engine-level swap + shutdown APIs land in the later slices.
+    /// console's remaining legs (the shutdown cancel sweep, the
+    /// inactive-subagent cleanup) read it until engine-level APIs
+    /// replace them in the later slices.
     pub fn host(&self) -> &HostRuntime {
         &self.inner.host
+    }
+
+    /// §5.9.10 (job 6, slice 2): the engine-level GLOBAL model swap — the
+    /// console REPL's `/model` + `/reasoning` surface (the documented
+    /// divergence: a REPL has no agent focus, so the swap keeps GLOBAL
+    /// semantics — the factory's provider slot + every live loop). The
+    /// engine builds the context manager from the new provider itself;
+    /// the resolution/validation/effort mapping stay with the caller
+    /// (the shared app-side resolver). Returns the ids of the agents
+    /// whose loops were swapped, so the caller can surface the change
+    /// through its own channel.
+    pub async fn swap_model(
+        &self,
+        provider: Arc<dyn crate::provider::LlmClient>,
+        display_effort: Option<String>,
+    ) -> Vec<crate::runtime::AgentId> {
+        let context_manager = self
+            .inner
+            .host
+            .factory
+            .context_manager_for(provider.as_ref());
+        self.inner.host.factory.set_provider(provider.clone());
+        // Keep the factory's default-effort record in sync (stamped onto
+        // every loop built from now on — backlog 51dab4da).
+        self.inner
+            .host
+            .factory
+            .set_default_display_effort(display_effort.clone());
+        // Swap into every live agent loop + clear the stale resolved
+        // model/provider/effort — the next request re-resolves (the
+        // per-request resolution, 2027-01-25), so a mid-run swap lands
+        // before the next call.
+        let agent_ids = {
+            let agent_loops = self.inner.host.agent_loops.lock().await;
+            for agent_loop in agent_loops.values() {
+                agent_loop.set_provider(provider.clone(), context_manager.clone());
+                agent_loop.set_resolved_model(None);
+                agent_loop.set_resolved_provider(None);
+                agent_loop.set_default_display_effort(display_effort.clone());
+                agent_loop.set_resolved_effort(None);
+            }
+            agent_loops.keys().copied().collect()
+        };
+        agent_ids
     }
 
     /// §5.7's engine-wide stats pull — the store's project + savings

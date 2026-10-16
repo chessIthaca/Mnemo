@@ -17,14 +17,16 @@
 //!
 //! The REPL replicates exactly two UI affordances — the status-bar model
 //! picker (`/model`) and its reasoning-effort dropdown (`/reasoning`) — via
-//! the same shared swap path as the IPC `set_model` command's legacy global
-//! switch ([`crate::ipc::config_io::resolve_model_provider`] +
-//! [`crate::ipc::config_io::swap_provider_into_loops`]). One deliberate
-//! divergence (user decision 2026-08-22, models are agent-specific): the GUI
-//! picker switches only the active agent, while the console `/model` is a
-//! REPL surface with no agent focus, so it keeps the global semantics
-//! (factory + every live loop). Resolution/validation/effort mapping stay
-//! shared, so they can never drift.
+//! the same shared resolver as the IPC `set_model` command
+//! ([`crate::ipc::config_io::resolve_model_provider`]) plus the
+//! engine-level GLOBAL swap ([`mnemo::headless::Engine::swap_model`] —
+//! job 6, §5.9.10: the Engine's own surface replaced the legacy global
+//! switch path). One deliberate divergence (user decision 2026-08-22,
+//! models are agent-specific): the GUI picker switches only the active
+//! agent, while the console `/model` is a REPL surface with no agent
+//! focus, so it keeps the global semantics (factory + every live loop).
+//! Resolution/validation/effort mapping stay shared, so they can never
+//! drift.
 
 use std::sync::Arc;
 
@@ -778,11 +780,12 @@ impl ConsoleRuntime {
         (endpoints, config.general.general.default_model.clone())
     }
 
-    /// Swap the live model and/or reasoning effort — the exact semantics of
+    /// Swap the live model and/or reasoning effort — the console's twin of
     /// the IPC `set_model` command (status-bar picker): validate + build via
-    /// the shared resolver, swap into the factory + every live loop via the
-    /// shared swap, and update the tracked selection. Live swap only — the
-    /// on-disk config is NOT written (same as the picker).
+    /// the shared resolver, then the engine-level GLOBAL swap
+    /// (`Engine::swap_model` — job 6, §5.9.10), and update the tracked
+    /// selection. Live swap only — the on-disk config is NOT written (same
+    /// as the picker).
     ///
     /// Returns the new [`ModelStatus`] for display.
     pub(crate) async fn swap_model(
@@ -822,19 +825,13 @@ impl ConsoleRuntime {
         // as set_model) and swap factory + every live loop. The resolved
         // DISPLAY effort rides along so the loops' status-bar mirrors track
         // the new default (backlog 51dab4da).
-        let context_manager = self
-            .engine
-            .host()
-            .factory
-            .context_manager_for(resolved.provider.as_ref());
-        crate::ipc::config_io::swap_provider_into_loops(
-            &self.engine.host().factory,
-            &self.engine.host().agent_loops,
-            resolved.provider,
-            context_manager,
-            Some(resolved.display_effort),
-        )
-        .await;
+        // The engine-level swap (job 6, slice 2): GLOBAL semantics through
+        // the Engine's public surface — the resolution/validation/effort
+        // mapping stay shared (resolve_model_provider); the factory +
+        // every-live-loop swap lives kernel-side now.
+        self.engine
+            .swap_model(resolved.provider, Some(resolved.display_effort))
+            .await;
         Ok(self.status().expect("selection was just set"))
     }
 

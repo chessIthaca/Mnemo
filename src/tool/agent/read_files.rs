@@ -68,13 +68,15 @@ pub(crate) fn truncate_to_boundary(s: &mut String, max: usize) {
 
 /// Build an actionable "invalid arguments" error for a failed arg parse.
 ///
-/// The bare serde message (e.g. `missing field 'path'`) is technically true
+/// The bare serde message (e.g. `missing field 'files'`) is technically true
 /// but useless when a model mixed up two similar tool shapes: serde silently
-/// ignores unknown keys (no `deny_unknown_fields`), so a `file_read` call
-/// that received `read_files`-shaped args (`{"files": [...]}`) reports only
-/// the missing required field. This helper appends the sorted list of keys
-/// the call actually sent plus a `hint` pointing at the sibling tool, so the
-/// model can self-correct on the next attempt.
+/// ignores unknown keys (no `deny_unknown_fields`), so a `read_files` call
+/// that received `file_write`-shaped args (`{"path": ..., "content": ...}`)
+/// reports only the missing required field. This helper appends the sorted
+/// list of keys the call actually sent plus a `hint`, so the model can
+/// self-correct on the next attempt. (The retired `file_read` name never
+/// reaches argument deserialization any more — it dies at the unknown-tool
+/// check, already carrying the one-shot redirect.)
 pub(crate) fn invalid_args_error(
     tool: &str,
     e: &serde_json::Error,
@@ -111,10 +113,10 @@ pub(crate) fn invalid_args_error(
 #[derive(Debug, Deserialize)]
 pub(crate) struct ReadSpec {
     pub path: String,
-    /// Optional 1-indexed start line (mirrors `file_read`).
+    /// Optional 1-indexed start line.
     #[serde(default)]
     pub start_line: Option<usize>,
-    /// Optional maximum number of lines to read (mirrors `file_read`).
+    /// Optional maximum number of lines to read.
     #[serde(default)]
     pub max_lines: Option<usize>,
 }

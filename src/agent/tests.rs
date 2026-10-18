@@ -906,7 +906,7 @@ async fn phase_events_cycle_across_requests_and_tools() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_1".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -1862,16 +1862,16 @@ async fn distinct_tool_errors_do_not_fire_the_correction() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    let read_call = |n: usize, path: &str| {
+    let read_call = |n: usize, fragment: &str| {
         vec![
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: format!("call_{n}"),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
-                fragment: format!(r#"{{"path":"{path}"}}"#),
+                fragment: fragment.into(),
             },
             LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
@@ -1879,8 +1879,11 @@ async fn distinct_tool_errors_do_not_fire_the_correction() {
         ]
     };
     let provider = Arc::new(MockProvider::sequence(vec![
-        read_call(1, "missing_one.txt"),
-        read_call(2, "missing_two.txt"),
+        // Distinct real failures: an empty body (execute failure) vs a wrong-
+        // typed files value (invalid-args failure) — different texts, neither
+        // a name error, so the identical-errors gate sees real inputs.
+        read_call(1, r#"{"files":[]}"#),
+        read_call(2, r#"{"files":"nope"}"#),
         vec![
             LlmEvent::TextDelta {
                 text: "done".into(),
@@ -2040,7 +2043,7 @@ async fn review_report_failures_abort_with_distinct_error() {
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
     )));
-    // The reviewer allow-list: write_review_report + file_read dispatchable
+    // The reviewer allow-list: write_review_report + read_files dispatchable
     // (write_review_report is only visible under the Reviewer filter).
     workflow
         .lock()
@@ -2059,7 +2062,7 @@ async fn review_report_failures_abort_with_distinct_error() {
     ));
     let registry = Arc::new(registry);
     // A failing write_review_report call (verdict-less content → validation
-    // rejection) and a SUCCESSFUL file_read (the file exists) — the
+    // rejection) and a SUCCESSFUL read_files (the file exists) — the
     // interleaved success must NOT reset the report-failure counter.
     let fail_report = |n: usize| {
         vec![
@@ -4627,7 +4630,7 @@ async fn auto_compaction_announces_only_once_per_turn() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_1".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -10515,7 +10518,7 @@ async fn run_turn_model_switch_interrupt_emits_paired_compact_event() {
 /// A provider for the over-threshold re-compaction regression test: branches
 /// on the request shape. The summarizer's one-message prompt (it contains
 /// "summar") gets a short summary; every model request gets the same
-/// `file_read` call whose result is the big file the test writes — so the
+/// `read_files` call whose result is the big file the test writes — so the
 /// context stays over the threshold even when the kept-verbatim tail
 /// shrinks to a single message. Counts both call kinds; after 12 model
 /// responses it returns Stop so an unguarded (pre-fix) turn still
@@ -10605,7 +10608,7 @@ impl LlmClient for BranchMock {
 
 /// A provider for the compaction-raise regression test. The summarizer's prompt
 /// (it contains "summar") gets a short summary; the first `tool_rounds` model
-/// requests ask for a `file_read` of the TINY test file (so each round keeps the
+/// requests ask for a `read_files` of the TINY test file (so each round keeps the
 /// conversation size roughly constant — the raised limit can therefore catch up
 /// with it), and every later request gets a plain text answer that ends the
 /// turn. What the test watches is that a session whose compaction cannot bring
@@ -10700,7 +10703,7 @@ async fn over_threshold_turn_bounds_compaction_attempts() {
     // Observed live: ~114 LLM requests over 95 minutes with no new work,
     // and a 5,526,459-token request rejected 400 (limit 1,048,576).
     //
-    // Sizing: window 20_000 (summarize_at = 10_000). The file_read result
+    // Sizing: window 20_000 (summarize_at = 10_000). The read_files result
     // is ~50K chars of diverse English (~11K tokens) — over the threshold
     // on its own, so even the escalated keep_recent=1 tail stays over and
     // the ladder must abort the turn instead of looping forever.
@@ -13853,7 +13856,7 @@ fn mid_run_swap_agent(
         agent: agent_slot.clone(),
         swap,
         swapped: std::sync::atomic::AtomicBool::new(false),
-        tool_call: ("file_read", format!(r#"{{"path": "{note_arg}"}}"#)),
+        tool_call: ("read_files", format!(r#"{{"path": "{note_arg}"}}"#)),
         caps: Capabilities::openai(),
     });
     let mut agent = AgentLoop::new(
@@ -14617,7 +14620,7 @@ async fn routing_classifies_once_per_turn_across_iterations() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let gate = routing_gate(Some(("trivial", 0.93)), calls.clone(), log_path.clone());
     let scripted: Arc<dyn LlmClient> = Arc::new(MockProvider::sequence(vec![
-        one_call_batch("call_1", "file_read"),
+        one_call_batch("call_1", "read_files"),
         text_stop("from-cheap-model"),
     ]));
     let resolver = Arc::new(RoutingStubResolver {
@@ -14821,21 +14824,12 @@ async fn failed_tool_result_is_serialized_for_the_provider_as_an_error() {
         Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
 
     let scripted = MockProvider::sequence(vec![
-        // Round 1: read a file that does not exist — a deterministic failure.
-        vec![
-            LlmEvent::ToolCallStart {
-                index: 0,
-                id: "call_missing".into(),
-                name: "file_read".into(),
-            },
-            LlmEvent::ToolCallArgumentDelta {
-                index: 0,
-                fragment: r#"{"path":"missing-does-not-exist.txt"}"#.into(),
-            },
-            LlmEvent::Finish {
-                reason: FinishReason::ToolCalls,
-            },
-        ],
+        // Round 1: a call the tool deterministically REJECTS (an empty files
+        // array executes and fails) — the failure result must be serialized
+        // for the provider as an error. (A missing path merely surfaces as a
+        // tolerated inline error inside a SUCCESS — read_files is lenient on
+        // missing files — so it can no longer fixture a tool FAILURE.)
+        failing_read_call(0, "call_missing"),
         // Round 2: the model's follow-up turn, ending normally.
         vec![LlmEvent::Finish {
             reason: FinishReason::Stop,

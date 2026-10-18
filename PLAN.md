@@ -276,17 +276,22 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
 
 ## Terminology
 
-- **Agent tools** — the coding tools the agent uses to do work: `file_read`,
-  `read_files` (batch sibling), `file_edit` (EOL-agnostic literal/fuzzy
+- **Agent tools** — the coding tools the agent uses to do work: `read_files`
+  (the one read tool; a top-level `{path, start_line?, max_lines?}` object
+  with no `files` key is absorbed as a one-element array, and the retired
+  `file_read`/`file_append` names redirect at the unknown-tool error),
+  `file_edit` (EOL-agnostic literal/fuzzy
   matching, atomic multi-edit batches via `ops` — compact line ops (`i`/`b`/
   `d`/`r` verbs with ranges and payloads) and anchor items sharing one array,
   append mode via `append`), `multi_edit` (atomic multi-file edits,
   `files: [{path, ops}]`, every file prepared before any write — one combined
-  diff, one approval), `file_write`, `file_append`, `shell`, `search`, `git`,
+  diff, one approval), `file_write` (mode:"append"), `shell`, `search`, `git`,
   `describe_image`.
   Live in `tool/agent/`. Gated by
-  workflow state. The two read tools cross-hint each other's argument shape
-  in their invalid-args error when a model mixes up a call. `search`/
+  workflow state. Argument mix-ups self-correct in the errors: an
+  invalid-args rejection carries the recovery hint naming the files-array
+  shape, and the retired names get the one-shot legacy redirect
+  (`legacy_tool_redirect`, `error_message.rs`). `search`/
   `search_read` serve literal single-line queries from the FTS5 content
   index (`engine: index`, bm25-ranked, glob-filtered) — and, since backlog
   c439dda0, regex-mode alternations whose every branch is an escape-only

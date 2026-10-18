@@ -240,14 +240,21 @@ impl AgentLoop {
         let tool = match self.tools.get(&tc.name) {
             Some(t) => t,
             None => {
-                return (
-                    ToolResult::error(format!(
-                        "unknown tool '{}'. Available: {}",
-                        tc.name,
-                        self.available_tool_names()
-                    )),
-                    Vec::new(),
+                // A retired name gets the one-shot redirect sentence
+                // appended (backlog 6954f3e9) — the model recovers on the
+                // next call instead of dead-ending on "unknown tool".
+                let mut msg = format!(
+                    "unknown tool '{}'. Available: {}",
+                    tc.name,
+                    self.available_tool_names()
                 );
+                if let Some(redirect) =
+                    crate::tool::error_message::legacy_tool_redirect(&tc.name)
+                {
+                    msg.push_str(" — ");
+                    msg.push_str(redirect);
+                }
+                return (ToolResult::error(msg), Vec::new());
             }
         };
 

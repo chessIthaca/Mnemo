@@ -27,7 +27,7 @@ fn concrete(
 }
 use crate::tool::agent::sandbox::Sandbox;
 use crate::tool::agent::{
-    file_read::FileReadTool, file_write::FileWriteTool, git::GitTool,
+    file_write::FileWriteTool, git::GitTool, read_files::ReadFilesTool,
     sandbox::link_fixture::plant_dir_link,
 };
 use crate::tool::memory::retrieval::MemorySearchTool;
@@ -259,7 +259,7 @@ fn make_registry(
     workflow: Arc<tokio::sync::Mutex<Workflow>>,
 ) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new(sandbox.clone())));
+    registry.register(Box::new(ReadFilesTool::new(sandbox.clone())));
     registry.register(Box::new(FileWriteTool::new(sandbox.clone())));
     registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
     registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -837,14 +837,14 @@ async fn full_turn_with_tool_call() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    // First response: a tool call to file_read.
+    // First response: a tool call to read_files.
     // Second response: text finishing the turn.
     let provider = Arc::new(MockProvider::sequence(vec![
         vec![
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_1".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -1218,7 +1218,7 @@ async fn error_recovery_malformed_json() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_1".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -1259,14 +1259,14 @@ async fn error_recovery_malformed_json() {
     );
     // Plan d3aedfee: the first-failure guidance is a per-call one-liner:
     // it NAMES the failing tool and the fields its schema requires
-    // (`file_read` is registered here; its schema requires `path`).
+    // (`read_files` is registered here; its schema requires `files`).
     assert!(
-        tool_msg.content.as_text().contains("`file_read`"),
+        tool_msg.content.as_text().contains("`read_files`"),
         "feedback should name the failing tool, got: {}",
         tool_msg.content.as_text()
     );
     assert!(
-        tool_msg.content.as_text().contains("required: path"),
+        tool_msg.content.as_text().contains("required: files"),
         "feedback should list the schema's required fields, got: {}",
         tool_msg.content.as_text()
     );
@@ -1303,6 +1303,75 @@ async fn error_recovery_malformed_json() {
             tc.arguments
         );
     }
+}
+
+#[tokio::test]
+async fn unknown_tool_error_redirects_retired_read_name() {
+    // The retired read-tool name reaches the agent unknown-tool error too —
+    // the same redirect must ride the structured [tool error] block so the
+    // model recovers in one shot (backlog 6954f3e9). A minimal registry
+    // (file_write only) keeps the probe honest: no registration carries
+    // the name anywhere post-retirement, so it is genuinely unknown.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
+    let registry = Arc::new(registry);
+
+    let provider = Arc::new(MockProvider::sequence(vec![
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_1".into(),
+                name: "file_read".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: "{}".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        vec![LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        }],
+    ]));
+
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox.clone()),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("read the file")];
+
+    let _outcome = agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await;
+
+    let tool_msg = messages
+        .iter()
+        .find(|m| m.role == Role::Tool)
+        .expect("should have a tool message");
+    let text = tool_msg.content.as_text();
+    assert!(
+        text.contains("unknown tool 'file_read'"),
+        "the unknown-tool prefix stays: {text}"
+    );
+    assert!(
+        text.contains("folded into read_files"),
+        "the redirect names the live tool: {text}"
+    );
+    assert!(
+        text.contains("files"),
+        "the redirect carries the files-array shape: {text}"
+    );
+    assert!(text.starts_with("[tool error]"), "structured-error contract: {text}");
 }
 
 #[tokio::test]
@@ -1420,10 +1489,11 @@ async fn successful_tool_results_are_not_wrapped_in_tool_error_marker() {
 
 #[tokio::test]
 async fn max_retries_aborts_after_consecutive_tool_errors() {
-    // A tool that runs but FAILS (file_read on a non-existent path) returns
-    // success:false. After MAX_RETRIES (3) consecutive such failures the agent
-    // must emit a final Error and stop — it must not loop forever. (Bad-JSON
-    // errors use the separate MAX_BAD_JSON_RETRIES cap, tested below.)
+    // A tool that runs but FAILS (read_files with an EMPTY files array)
+    // returns success:false. After MAX_RETRIES (3) consecutive such failures
+    // the agent must emit a final Error and stop — it must not loop forever.
+    // (Bad-JSON errors use the separate MAX_BAD_JSON_RETRIES cap, tested
+    // below.)
     let dir = tempdir().unwrap();
     let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
         dir.path().join("plans"),
@@ -1431,18 +1501,18 @@ async fn max_retries_aborts_after_consecutive_tool_errors() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    // Each response emits a file_read call with VALID JSON args for a path
-    // that does not exist — the tool executes and returns success:false.
+    // Each response emits a read_files call with VALID JSON args the tool
+    // rejects — the tool executes and returns success:false.
     let fail_call = |n: usize| {
         vec![
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: format!("call_{n}"),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
-                fragment: r#"{"path":"does_not_exist.txt"}"#.into(),
+                fragment: r#"{"files":[]}"#.into(),
             },
             LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
@@ -1567,11 +1637,11 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: format!("call_{n}"),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
-                fragment: r#"{"path":"does_not_exist.txt"}"#.into(),
+                fragment: r#"{"files":[]}"#.into(),
             },
             LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
@@ -1621,7 +1691,7 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
     );
     let correction = corrections[0].content.as_text();
     assert!(
-        correction.contains("file_read"),
+        correction.contains("read_files"),
         "the correction must name the failing tool"
     );
     assert!(
@@ -1860,16 +1930,16 @@ async fn repeat_failure_across_an_intervening_success_still_fires() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
 
-    let read_call = |n: usize, path: &str| {
+    let read_call = |n: usize, fragment: &str| {
         vec![
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: format!("call_{n}"),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
-                fragment: format!(r#"{{"path":"{path}"}}"#),
+                fragment: fragment.into(),
             },
             LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
@@ -1877,9 +1947,12 @@ async fn repeat_failure_across_an_intervening_success_still_fires() {
         ]
     };
     let provider = Arc::new(MockProvider::sequence(vec![
-        read_call(1, "missing.txt"),
-        read_call(2, "exists.txt"),
-        read_call(3, "missing.txt"),
+        // Fail: a valid body the tool rejects (the identical error fires again
+        // in the third call, across the intervening success).
+        read_call(1, r#"{"files":[]}"#),
+        // The intervening success: an existing file reads clean.
+        read_call(2, r#"{"files":[{"path":"exists.txt"}]}"#),
+        read_call(3, r#"{"files":[]}"#),
         vec![
             LlmEvent::TextDelta {
                 text: "done".into(),
@@ -1974,11 +2047,11 @@ async fn review_report_failures_abort_with_distinct_error() {
         .await
         .set_reviewer_allowlist(Some(vec![
             "write_review_report".into(),
-            "file_read".into(),
+            "read_files".into(),
         ]));
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+    registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
     registry.register(Box::new(
         crate::tool::agent::write_review_report::WriteReviewReportTool::new(
             dir.path().join("reviews"),
@@ -2009,7 +2082,7 @@ async fn review_report_failures_abort_with_distinct_error() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: format!("call_{n}"),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -2646,7 +2719,7 @@ async fn run_turn_records_session_id_on_tool_events() {
     let store: Arc<dyn crate::memory::MemoryStoreTrait> =
         Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+    registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
     registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
     registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
     registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4084,7 +4157,7 @@ async fn plan_frozen_tool_set_is_stable_within_and_across_plans() {
             set.contains("\"name\":\"file_write\""),
             "turn {i} must advertise the full frozen surface"
         );
-        assert!(set.contains("\"name\":\"file_read\""));
+        assert!(set.contains("\"name\":\"read_files\""));
     }
     assert_eq!(
         tool_sets[0], tool_sets[1],
@@ -6586,7 +6659,7 @@ async fn dispatch_denies_tool_outside_skill_allow_list() {
             "narrow",
             "do the skill",
             crate::app::workflow::WorkflowState::Planning,
-            vec!["file_read".into()],
+            vec!["read_files".into()],
         )
         .unwrap();
     }
@@ -6975,7 +7048,8 @@ async fn dispatch_allows_read_tool_on_skill_allow_list() {
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let (agent, fanin_tx, mut cmd_rx) = make_dispatch_fixture(workflow, sandbox);
 
-    let tc = crate::provider::ToolCall::new("c1", "file_read", r#"{"path":"hello.txt"}"#);
+    let tc =
+        crate::provider::ToolCall::new("c1", "read_files", r#"{"path":"hello.txt"}"#);
     let mut deny_all_latched = false;
     let mut stop_signal: Option<super::StopReason> = None;
     let (result, _) = agent
@@ -6991,7 +7065,7 @@ async fn dispatch_allows_read_tool_on_skill_allow_list() {
 
     assert!(
         result.success,
-        "Skill allow-list must allow file_read, got: {}",
+        "Skill allow-list must allow read_files, got: {}",
         result.output
     );
     assert!(result.output.contains("hi"), "should return file contents");
@@ -10513,7 +10587,7 @@ impl LlmClient for BranchMock {
                     LlmEvent::ToolCallStart {
                         index: 0,
                         id: format!("call_{n}"),
-                        name: "file_read".into(),
+                        name: "read_files".into(),
                     },
                     LlmEvent::ToolCallArgumentDelta {
                         index: 0,
@@ -10600,7 +10674,7 @@ impl LlmClient for BoundaryMock {
                     LlmEvent::ToolCallStart {
                         index: 0,
                         id: format!("call_{n}"),
-                        name: "file_read".into(),
+                        name: "read_files".into(),
                     },
                     LlmEvent::ToolCallArgumentDelta {
                         index: 0,
@@ -10877,8 +10951,8 @@ async fn identical_responses_after_successful_batches_do_not_abort() {
     // within-response loops by the in-stream R10 guard.)
     let responses: Vec<Vec<LlmEvent>> = (0..3)
         .map(|i| {
-            let mut r = file_read_call(0, &format!("call_a{i}"), "a.txt");
-            r.extend(file_read_call(1, &format!("call_b{i}"), "b.txt"));
+            let mut r = read_files_call(0, &format!("call_a{i}"), "a.txt");
+            r.extend(read_files_call(1, &format!("call_b{i}"), "b.txt"));
             r.push(LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
             });
@@ -12131,7 +12205,7 @@ async fn auto_recall_emits_memory_recalled_event() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_read".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -12335,7 +12409,7 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
             LlmEvent::ToolCallStart {
                 index: 0,
                 id: "call_read".into(),
-                name: "file_read".into(),
+                name: "read_files".into(),
             },
             LlmEvent::ToolCallArgumentDelta {
                 index: 0,
@@ -12725,19 +12799,36 @@ async fn bad_json_first_failure_names_the_tool_and_its_required_fields() {
         guidance.len()
     );
 }
-/// A `file_read` tool-call event pair (Start + ArgumentDelta) for the given
-/// index/id/path — the building block of the tool-loop regression tests
-/// (backlog 7f72d3d7).
-fn file_read_call(index: u32, id: &str, path: &str) -> Vec<LlmEvent> {
+/// A `read_files` tool-call event pair (Start + ArgumentDelta) reading a
+/// file via the unadvertised top-level `{path}` shorthand — the building
+/// block of the tool-loop regression tests (backlog 7f72d3d7).
+fn read_files_call(index: u32, id: &str, path: &str) -> Vec<LlmEvent> {
     vec![
         LlmEvent::ToolCallStart {
             index,
             id: id.into(),
-            name: "file_read".into(),
+            name: "read_files".into(),
         },
         LlmEvent::ToolCallArgumentDelta {
             index,
             fragment: format!(r#"{{"path":"{path}"}}"#),
+        },
+    ]
+}
+
+/// A `read_files` call that DETERMINISTICALLY fails: a valid JSON body with
+/// an empty files array — the tool executes and errors (the byte-identical
+/// error fixture for the repeat-failure/MAX_RETRIES/breaker tests).
+fn failing_read_call(index: u32, id: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index,
+            id: id.into(),
+            name: "read_files".into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index,
+            fragment: r#"{"files":[]}"#.into(),
         },
     ]
 }
@@ -12783,9 +12874,9 @@ async fn single_batch_of_identical_failing_calls_does_not_abort() {
     // to repair. Pre-fix, tool_error_count was per-call: the batch
     // incremented it 0→3 and the post-batch MAX_RETRIES check aborted the
     // turn after a single interaction.
-    let mut batch = file_read_call(0, "call_a", "missing.txt");
-    batch.extend(file_read_call(1, "call_b", "missing.txt"));
-    batch.extend(file_read_call(2, "call_c", "missing.txt"));
+    let mut batch = failing_read_call(0, "call_a");
+    batch.extend(failing_read_call(1, "call_b"));
+    batch.extend(failing_read_call(2, "call_c"));
     batch.push(LlmEvent::Finish {
         reason: FinishReason::ToolCalls,
     });
@@ -12821,8 +12912,8 @@ async fn mixed_error_success_batch_is_one_interaction_and_resets_ring() {
     // any) comes from MAX_RETRIES at the same error across three
     // interactions — never from a repetition guard (removed 2027-01-24).
     let mixed_batch = |i: usize| {
-        let mut r = file_read_call(0, &format!("call_f{i}"), "missing.txt");
-        r.extend(file_read_call(1, &format!("call_s{i}"), "present.txt"));
+        let mut r = failing_read_call(0, &format!("call_f{i}"));
+        r.extend(read_files_call(1, &format!("call_s{i}"), "present.txt"));
         r.push(LlmEvent::Finish {
             reason: FinishReason::ToolCalls,
         });
@@ -12868,7 +12959,7 @@ async fn error_retries_owned_by_max_retries_not_repetition_guard() {
     // the model gets a repair chance between interactions.
     let responses: Vec<Vec<LlmEvent>> = (0..4)
         .map(|i| {
-            let mut r = file_read_call(0, &format!("call_{i}"), "missing.txt");
+            let mut r = failing_read_call(0, &format!("call_{i}"));
             r.push(LlmEvent::Finish {
                 reason: FinishReason::ToolCalls,
             });

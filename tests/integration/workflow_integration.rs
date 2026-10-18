@@ -27,7 +27,7 @@ use mnemo::provider::{
 use mnemo::runtime::channels::AgentEvent;
 use mnemo::runtime::AgentManager;
 use mnemo::tool::agent::sandbox::Sandbox;
-use mnemo::tool::agent::{file_read::FileReadTool, file_write::FileWriteTool};
+use mnemo::tool::agent::{file_write::FileWriteTool, read_files::ReadFilesTool};
 use mnemo::tool::memory::{MemoryRecallTool, MemoryWriteTool};
 use mnemo::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool, UpdatePlanTool};
 use mnemo::tool::{Tool, ToolRegistry};
@@ -82,7 +82,7 @@ impl LlmClient for MockProvider {
 
 fn make_registry(sandbox: Sandbox, workflow: Arc<Mutex<Workflow>>) -> Arc<ToolRegistry> {
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(FileReadTool::new(sandbox.clone())));
+    registry.register(Box::new(ReadFilesTool::new(sandbox.clone())));
     registry.register(Box::new(FileWriteTool::new(sandbox)));
     registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
     registry.register(Box::new(CompleteStepTool::new(workflow)));
@@ -110,8 +110,8 @@ async fn planning_gate_hides_write_tools_until_a_plan_exists() {
     let schemas = registry.schemas(&caps, &mnemo::tool::ToolFilter::Planning);
 
     let names: Vec<String> = schemas.iter().map(|s| s.name.clone()).collect();
-    // file_read should be present (auto-run read).
-    assert!(names.contains(&"file_read".to_string()));
+    // read_files should be present (auto-run read).
+    assert!(names.contains(&"read_files".to_string()));
     // create_plan should be present (the way forward).
     assert!(names.contains(&"create_plan".to_string()));
     // file_write is HIDDEN (a mutation) — no changes without a plan.

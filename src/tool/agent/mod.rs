@@ -34,7 +34,6 @@ pub mod edit_ops;
 pub mod expand_result;
 pub mod file_append;
 pub mod file_edit;
-pub mod file_read;
 pub mod file_write;
 pub mod git;
 pub mod git_diff;

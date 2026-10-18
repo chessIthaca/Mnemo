@@ -4,9 +4,10 @@
 
 //! `read_files` — batch read of multiple files in one call.
 //!
-//! Like `file_read`, but takes an array of `{path, start_line?, max_lines?}`
-//! specs so the agent can read several files (or slices of them) in a single
-//! round-trip. Each file is validated through the sandbox, numbered, and
+//! The single read tool: takes an array of `{path, start_line?, max_lines?}`
+//! specs so the agent can read one file, or several, in a single round-trip
+//! (the retired `file_read` name redirects here at the unknown-tool error).
+//! Each file is validated through the sandbox, numbered, and
 //! capped independently; per-file errors are reported inline without failing
 //! the whole call. A whole-file read (no `start_line`/`max_lines`) of a large
 //! indexed source file (an extension the code graph parses — any indexed
@@ -31,7 +32,7 @@ use crate::tool::agent::tool_contract;
 use crate::tool::{SafetyLevel, Tool, ToolCategory, ToolResult};
 
 /// Default maximum number of lines returned per file when the caller doesn't
-/// specify `max_lines`. Mirrors `file_read`.
+/// specify `max_lines`.
 pub(crate) const DEFAULT_MAX_LINES: usize = 500;
 
 /// A whole-file read must exceed this line count to trigger the SYMBOL
@@ -39,8 +40,7 @@ pub(crate) const DEFAULT_MAX_LINES: usize = 500;
 /// keep when the agent just swallowed a big chunk of source.
 pub(crate) const READ_NUDGE_MIN_LINES: usize = 300;
 
-/// Default maximum output size in bytes per file (~100 KB). Mirrors
-/// `file_read`.
+/// Default maximum output size in bytes per file (~100 KB).
 pub(crate) const DEFAULT_MAX_BYTES: usize = 102_400;
 
 /// Maximum number of files accepted in a single call. Prevents unbounded
@@ -475,7 +475,7 @@ pub(crate) fn read_one_with_count(
     let total_lines = content.lines().count();
     let start = spec.start_line.unwrap_or(1).saturating_sub(1);
     // Cap the number of lines at DEFAULT_MAX_LINES unless the caller
-    // explicitly requested fewer (mirrors file_read).
+    // explicitly requested fewer.
     let max = spec
         .max_lines
         .unwrap_or(DEFAULT_MAX_LINES)
@@ -492,8 +492,8 @@ pub(crate) fn read_one_with_count(
     let showed = numbered.len();
     let mut body = numbered.join("\n");
 
-    // Byte-cap per file (mirrors file_read). Back up to a char boundary so a
-    // multi-byte char at the cut point doesn't panic.
+    // Byte-cap per file. Back up to a char boundary so a multi-byte char at
+    // the cut point doesn't panic.
     let truncated_by_bytes = if body.len() > DEFAULT_MAX_BYTES {
         truncate_to_boundary(&mut body, DEFAULT_MAX_BYTES);
         true
@@ -503,7 +503,7 @@ pub(crate) fn read_one_with_count(
 
     // Truncation note only when the default line cap was the limiting factor
     // (not when the caller explicitly requested a range). The byte cap always
-    // notes. Mirrors file_read.
+    // notes.
     let available_from_start = total_lines.saturating_sub(start);
     let default_capped = spec.max_lines.is_none() && showed < available_from_start;
     if truncated_by_bytes || default_capped {

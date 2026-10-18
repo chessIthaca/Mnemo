@@ -17,13 +17,13 @@
 # The prompt below is injected into the system prompt EVERY turn the skill runs,
 # so it stays a terse checklist. Rationale lives here in comments (never
 # injected) — do not move it into the prompt; each rule encodes a real failure:
-# - LIVE tool names only. `file_read`/`file_append` are legacy redirect shims
-#   (src/agent/approval.rs: "folded into read_files / file_write"): the model
-#   calls `read_files`/`file_write`, so a shim entry in an allow-list is
-#   SILENTLY USELESS. That exact trap denied `read_files` inside merge_to_main
-#   (backlog 834ec126) — since closed wholesale: the Skill state grants the
-#   whole READ-ONLY surface (every Agent+AutoRun tool; trusted mcp__ ones
-#   excluded), so a skill's allow-list
+# - LIVE tool names only. `file_read`/`file_append` are RETIRED names: the
+#   unknown-tool error redirects them one-shot ("folded into read_files /
+#   file_write" — legacy_tool_redirect, src/tool/error_message.rs), so a
+#   shim entry in an allow-list is SILENTLY USELESS. That exact trap denied
+#   `read_files` inside merge_to_main (backlog 834ec126) — since closed
+#   wholesale: the Skill state grants the whole READ-ONLY surface (every
+#   Agent+AutoRun tool; trusted mcp__ ones excluded), so a skill's allow-list
 #   only needs the MUTATING tools; the read_files entries are belt-and-braces.
 #   The live-name rule still matters for the write side (file_write, not the
 #   file_append shim).

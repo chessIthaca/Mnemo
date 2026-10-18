@@ -2240,6 +2240,109 @@ mod tests {
         }
     }
 
+    // The browser deferred-group seam (backlog 3cc97a3d): after
+    // load_tools("browser"), the revealed tools must be per-state visible
+    // (they are research-class — the allows() arms say so) — the ungated
+    // regression guard for the contract the feature-gated factory tests
+    // cover deep. Fake tool table: category/safety are the property under
+    // test; the real Chromium stack is not needed.
+    struct FakeBrowserTool;
+    #[async_trait]
+    impl Tool for FakeBrowserTool {
+        fn name(&self) -> &str {
+            "browser_navigate_fixture"
+        }
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Browser
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                "browser_navigate_fixture",
+                "fixture: navigate a page",
+                serde_json::json!({}),
+            )
+        }
+        fn safety(&self) -> SafetyLevel {
+            SafetyLevel::NeedsApproval
+        }
+        async fn execute(&self, _args: Value) -> ToolResult {
+            ToolResult::success("navigated")
+        }
+        fn deferred_group(&self) -> Option<&str> {
+            Some("browser")
+        }
+    }
+
+    #[test]
+    fn revealed_browser_tools_visible_in_every_state() {
+        let mut r = registry();
+        r.register(Box::new(FakeBrowserTool));
+
+        // While hidden, the index advertises the browser group in both
+        // plan-first states (the load_tools door must open onto something).
+        let caps = Capabilities::openai();
+        for (state, filter) in [
+            ("Planning", ToolFilter::Planning),
+            ("Complete", ToolFilter::Complete),
+        ] {
+            assert!(
+                r.hidden_groups_for(&filter)
+                    .iter()
+                    .any(|(g, _)| g == "browser"),
+                "the browser group must be advertised in {state}"
+            );
+        }
+
+        r.load_group("browser");
+
+        for filter in [
+            ToolFilter::Planning,
+            ToolFilter::Executing,
+            ToolFilter::ExecutingResearch,
+            ToolFilter::PlanFrozen,
+            ToolFilter::Reviewing,
+            ToolFilter::Complete,
+        ] {
+            let names: Vec<String> = r
+                .schemas(&caps, &filter)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert!(
+                names.iter().any(|n| n == "browser_navigate_fixture"),
+                "revealed browser tools must be visible in {filter:?}"
+            );
+            assert!(
+                filter.allows(
+                    ToolCategory::Browser,
+                    SafetyLevel::NeedsApproval,
+                    "browser_navigate_fixture"
+                ),
+                "revealed browser tools must be callable in {filter:?}"
+            );
+        }
+        // The plan-first hard rule survives the carve-out: mutations stay hidden.
+        let plan_names: Vec<String> = r
+            .schemas(&caps, &ToolFilter::Planning)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for m in ["file_write", "file_edit", "shell", "git"] {
+            assert!(
+                !plan_names.contains(&m.to_string()),
+                "{m} must stay hidden in Planning (no changes without a plan)"
+            );
+        }
+        // Visibility never drops the approval prompt.
+        assert_eq!(
+            r.get("browser_navigate_fixture")
+                .expect("registered above")
+                .safety(),
+            SafetyLevel::NeedsApproval,
+            "visibility never drops the approval prompt"
+        );
+    }
+
     #[test]
     fn browser_tools_available_in_every_base_state() {
         // Browser tools drive the user-visible Browser tab (child WebView2 via

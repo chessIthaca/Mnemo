@@ -68,7 +68,8 @@ const WORKFLOW_LIFECYCLE: &str = "\
 WORKFLOW LIFECYCLE — a plan-first state machine. Tool visibility per state is \
 enforced, not advisory:
 
-- PLANNING: read tools + create_plan only — no project mutation without a \
+- PLANNING: read tools + create_plan + web interaction (web_fetch / the \
+revealed browser tools) only — no project mutation without a \
 plan. Always plan first, even research/investigation work: kind:\"research\" \
 structures it into steps and skips the end-of-plan review.
 - EXECUTING: all tools. complete_step in order. create_plan pushes a sub-plan \
@@ -79,7 +80,8 @@ last resort.
 RULES): reviewer subagent → fix findings → re-run tests → commit → finish. \
 finish is the only exit to Complete and is gated on a non-empty review \
 report.
-- COMPLETE: read tools + create_plan only — plan any follow-up change. \
+- COMPLETE: read tools + create_plan + web interaction (web_fetch / the \
+revealed browser tools) — plan any follow-up change. \
 Skills (e.g. merge_to_main) may also start here.
 
 PLAN KIND (set at create_plan, persisted): \"implementation\" (default) → \
@@ -304,7 +306,7 @@ git_read when it matters).
 /// task. Reinforces [`STATE_COMPLETE`] at the point of decision.
 const PLAN_NUDGE_TEXT: &str = "\
 The user's message looks like a code-change task. You are in Complete state — \
-explore with read tools if needed, then call create_plan to start a new plan. \
+explore with read tools and web interaction if needed, then call create_plan to start a new plan. \
 Do NOT answer freeform or explain how you would do it; plan and execute it.\
 ";
 
@@ -895,6 +897,38 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_carries_web_interaction_research_carve_out() {
+        // Backlog 3cc97a3d: web interaction is research — the state-rule text
+        // must not read as if the revealed browser tools / web_fetch were
+        // off-limits in Planning/Complete. The tool layer already allows
+        // ToolCategory::Browser in every state (tool/mod.rs allows arms +
+        // browser_tools_available_in_every_base_state); these pins hold the
+        // model-side contract to the same shape.
+        let dir = tempdir().unwrap();
+        let wf = Workflow::new(dir.path());
+        let caps = Capabilities::openai();
+        let constitution = Constitution::default();
+        let prompt =
+            crate::app::workflow_policy::build_system_prompt(&caps, &wf, &constitution, None);
+        assert!(
+            prompt.contains("web interaction"),
+            "the lifecycle must name web interaction as allowed (web_fetch / revealed browser tools)"
+        );
+        let planning_u = prompt.find("PLANNING").expect("PLANNING section");
+        let complete_u = prompt.find("COMPLETE").expect("COMPLETE section");
+        let planning = &prompt[planning_u..complete_u];
+        let complete = &prompt[complete_u..];
+        assert!(
+            planning.contains("web_fetch") && planning.contains("revealed browser tools"),
+            "the PLANNING rule must carry the web-interaction carve-out"
+        );
+        assert!(
+            complete.contains("web_fetch") && complete.contains("revealed browser tools"),
+            "the COMPLETE rule must carry the web-interaction carve-out"
+        );
+    }
+
+    #[test]
     fn preamble_carries_core_working_principles() {
         // The stable head's CORE PRINCIPLES (the very first thing the model
         // reads) must carry the core working principles directly — not rely on
@@ -957,8 +991,11 @@ mod tests {
         // GOLDEN: frozen from the first run on the pre-change tree. The
         // single assertion below prints len + sha256 on any drift — fill
         // GOLDEN_HEAD from that left side, then re-run green.
+        // Golden bumped 2027-01-14: the web-interaction carve-out joined the
+        // Planning/Complete state rules (backlog 3cc97a3d, plan 254091f1) —
+        // a deliberate, documented head change.
         const GOLDEN_HEAD: &str =
-            "len=12351|sha256=7fda6b3b60375015ae2575e41fc3c952b76b7bd5be365f5a727a2e2f2499dfda";
+            "len=12464|sha256=226b726944df3be804df6ddd9b5c58d498e8a0c19b7808642a3d6678ebb15f98";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",

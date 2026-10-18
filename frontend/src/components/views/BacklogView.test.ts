@@ -240,3 +240,29 @@ describe("BacklogView parallel run-all — plan ffd7a86f", () => {
     expect(source).toContain("runAll.note");
   });
 });
+
+/**
+ * Live-phase badge — plan/status vocabulary split (user ask 2027-01-14):
+ * the in-flight card's single badge slot shows the tied plan's live
+ * workflow phase, not the item status — a bare phase string ("complete")
+ * beside item statuses ("done") read as two statuses of one thing. The
+ * phase is prefixed "plan: " and carries a two-layer tooltip; every
+ * other card's badge keeps the queue vocabulary. The live-phase branch
+ * reads the agent store (invisible to the SSR render harness), so it's
+ * pinned on source here.
+ */
+describe("BacklogView live-phase badge (plan/status vocabulary split, user ask 2027-01-14)", () => {
+  it("the in-flight badge prefixes the live plan phase with 'plan: '", () => {
+    expect(source).toContain('plan: ${workflowState}');
+  });
+
+  it("the badge carries the two-layer tooltip (plan phase vs item status)", () => {
+    expect(source).toContain(
+      "The tied plan's live workflow phase — the item's status flips to done when the turn resolves.",
+    );
+  });
+
+  it("the fallback keeps the queue-vocabulary item status untouched", () => {
+    expect(source).toContain('item.status.replace("_", "-")');
+  });
+});

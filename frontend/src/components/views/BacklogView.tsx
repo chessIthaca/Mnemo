@@ -398,9 +398,11 @@ export function BacklogItemCard({
   });
 
   // For the in-flight item, mirror the main agent's live workflow phase
-  // (planning/executing/complete) instead of a static "in-flight" label.
+  // (planning/executing/complete) instead of a static "in-flight" label
+  // — prefixed "plan: " so the plan's phase can't be mistaken for the
+  // item's queue status (plan/status vocabulary split, 2027-01-14).
   const isInFlight = item.status === "in_flight";
-  const badgeLabel = isInFlight && workflowState ? workflowState : item.status.replace("_", "-");
+  const badgeLabel = isInFlight && workflowState ? `plan: ${workflowState}` : item.status.replace("_", "-");
   const badgeStyle = isInFlight && workflowState
     ? (PHASE_STYLES[workflowState] ?? STATUS_STYLES.in_flight)
     : STATUS_STYLES[item.status];
@@ -829,6 +831,11 @@ export function BacklogItemCard({
           <div className="flex items-start gap-1.5">
             <span
               className={`mt-0.5 shrink-0 rounded-sm px-1.5 py-0.5 text-[0.65em] font-medium uppercase tracking-wide ${badgeStyle}`}
+              title={
+                isInFlight && workflowState
+                  ? "The tied plan's live workflow phase — the item's status flips to done when the turn resolves."
+                  : undefined
+              }
             >
               {badgeLabel}
             </span>

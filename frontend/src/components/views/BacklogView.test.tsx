@@ -350,3 +350,25 @@ describe("backlogItemTemplate (2027-01-07 detail bar)", () => {
     expect(source).toContain("disabled={!!text.trim()}");
   });
 });
+
+/**
+ * Badge text regression (plan/status vocabulary split, user ask
+ * 2027-01-14): every card except the live in-flight one renders its ITEM
+ * status as the badge text node — here a done card renders "done". The
+ * live-phase branch itself can't be render-tested under
+ * renderToStaticMarkup (zustand's SSR snapshot only reads the initial
+ * store state, so workflowState stays null) — it's pinned on source in
+ * BacklogView.test.ts.
+ */
+describe("BacklogItemCard badge text (plan/status vocabulary split, user ask 2027-01-14)", () => {
+  it("a done card renders the item-status badge text node 'done'", () => {
+    const html = renderToStaticMarkup(
+      <BacklogItemCard
+        item={item("Task\nbody", { status: "done" })}
+        index={0}
+        total={1}
+      />,
+    );
+    expect(html).toContain(">done<");
+  });
+});

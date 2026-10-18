@@ -2409,7 +2409,10 @@ impl Tool for FinishTool {
                                              the code graph and no code file on disk \
                                              contains the name (verified after a forced \
                                              re-index) — the verify step must record the \
-                                             actual test function name"
+                                             test function name OR the exact \
+                                             it()/test()/describe() title literal as \
+                                             written in source (escapes included) for a \
+                                             string-titled test"
                                         ));
                                     }
                                     if outcome.matched_unparsed > 0 {
@@ -2452,12 +2455,53 @@ impl Tool for FinishTool {
                                              re-run finish, do not rename the test",
                                             outcome.matched
                                         ));
+                                    } else if let Some(hit) = {
+                                        // Backlog 5f3f5123 (the live case: plan
+                                        // 3d40e529): a string-titled vitest/Jest
+                                        // test — `it("title", () => …)` —
+                                        // produces no symbol rows (anonymous
+                                        // callbacks are not indexed), so resolve
+                                        // can never find it even though the test
+                                        // exists and is runnable. The forced
+                                        // re-index above ran FIRST (648e0ad5 —
+                                        // the stale-index contract), so this walk
+                                        // reflects disk exactly as freshly upserted.
+                                        // The exact it()/test()/describe() title
+                                        // literal is the same class of disk
+                                        // evidence the unparsable-language tier
+                                        // accepts. Substring/partial/comment
+                                        // mentions and chained variants
+                                        // (it.only/test.skip) never satisfy this
+                                        // tier — the else below still errors,
+                                        // naming both accepted forms.
+                                        let g = graph.clone();
+                                        let recorded = test.to_string();
+                                        tokio::task::spawn_blocking(move || {
+                                            g.find_exact_test_title(&recorded)
+                                        })
+                                        .await
+                                        .ok()
+                                        .and_then(|r| r.ok())
+                                        .unwrap_or(None)
+                                    } {
+                                        found = true;
+                                        notes.push(format!(
+                                            "regression test symbol '{test}' not \
+                                             graph-indexed — found as an exact \
+                                             it()/test()/describe() title literal in \
+                                             {}; symbol check satisfied by the exact \
+                                             test-title literal",
+                                            hit.path.display()
+                                        ));
                                     } else {
                                         return ToolResult::error(format!(
                                             "regression test symbol '{test}' not found in \
                                              the code graph even after a forced re-index \
-                                             of {} file(s) containing the name{} — the verify \
-                                             step must record the actual test function name",
+                                             of {} file(s) containing the name{} — the \
+                                             verify step must record the test function \
+                                             name OR the exact it()/test()/describe() \
+                                             title literal as written in source (escapes \
+                                             included) for a string-titled test",
                                             outcome.reparsed,
                                             if outcome.capped {
                                                 format!(
@@ -6725,6 +6769,159 @@ mod tests {
         assert_eq!(
             wf.lock().await.state(),
             crate::app::workflow::WorkflowState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_accepts_exact_vitest_it_title_as_regression_test() {
+        // Backlog 5f3f5123 (live case: plan 3d40e529 rejected the exact
+        // on-disk it() title twice). A string-titled vitest test produces no
+        // graph symbols — the anonymous callback is not indexed — so the
+        // force-reindexed resolve can never find the title, yet the test
+        // exists and is runnable. The gate must accept the EXACT full
+        // it()/test()/describe() title literal recorded as the regression
+        // test, mirroring the unparsable-language tier's disk evidence.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        bug_plan_to_reviewing(&wf, Some(title)).await;
+        let report = write_pass_report(dir.path());
+
+        let graph = Arc::new(
+            crate::codegraph::CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap(),
+        );
+        std::fs::write(
+            dir.path().join("use_agent_store.test.ts"),
+            format!("it({title:?}, () => {{\n  // assertions\n}});\n"),
+        )
+        .unwrap();
+        graph.index(None).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), dir.path().join("reviews")).with_codegraph(graph);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+        assert!(
+            res.output.contains("test-title literal"),
+            "the pass must carry the exact-test-title note: {}",
+            res.output
+        );
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::app::workflow::WorkflowState::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_rejects_string_titled_test_suffix_paraphrase() {
+        // The anti-paraphrase contract: the recorded name must equal the
+        // ENTIRE it() title literal — an appended-suffix paraphrase of a
+        // real on-disk title must still reject (this is the gate's first
+        // 3d40e529 rejection, which was CORRECT).
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        let recorded = format!("{title} — with extra trailing words");
+        bug_plan_to_reviewing(&wf, Some(&recorded)).await;
+        let report = write_pass_report(dir.path());
+
+        let graph = Arc::new(
+            crate::codegraph::CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap(),
+        );
+        std::fs::write(
+            dir.path().join("use_agent_store.test.ts"),
+            format!("it({title:?}, () => {{\n  // assertions\n}});\n"),
+        )
+        .unwrap();
+        graph.index(None).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), dir.path().join("reviews")).with_codegraph(graph);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(!res.success, "the suffix paraphrase must reject: {}", res.output);
+        assert!(
+            res.output.contains("it()/test()/describe() title literal"),
+            "the error must name both accepted forms: {}",
+            res.output
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_rejects_partial_string_titled_test_title() {
+        // A partial title (a prefix) must not satisfy the exact-title tier.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        let recorded = "regression (backlog 076f601e): a late text_delta after finished";
+        bug_plan_to_reviewing(&wf, Some(recorded)).await;
+        let report = write_pass_report(dir.path());
+
+        let graph = Arc::new(
+            crate::codegraph::CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap(),
+        );
+        std::fs::write(
+            dir.path().join("use_agent_store.test.ts"),
+            format!("it({title:?}, () => {{\n  // assertions\n}});\n"),
+        )
+        .unwrap();
+        graph.index(None).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), dir.path().join("reviews")).with_codegraph(graph);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(!res.success, "the partial title must reject: {}", res.output);
+        assert!(
+            res.output.contains("it()/test()/describe() title literal"),
+            "the error must name both accepted forms: {}",
+            res.output
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_rejects_comment_only_title_mention() {
+        // A comment-only mention of the title (no it()/test()/describe()
+        // call with the exact literal) must still reject: the exact-title
+        // tier accepts a runnable test call, not prose.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        bug_plan_to_reviewing(&wf, Some(title)).await;
+        let report = write_pass_report(dir.path());
+
+        let graph = Arc::new(
+            crate::codegraph::CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap(),
+        );
+        std::fs::write(
+            dir.path().join("use_agent_store.test.ts"),
+            format!("// {title}\n// mentioned only in a comment\n"),
+        )
+        .unwrap();
+        graph.index(None).unwrap();
+
+        let finish = FinishTool::new(wf.clone(), dir.path().join("reviews")).with_codegraph(graph);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(
+            !res.success,
+            "a comment-only mention must reject: {}",
+            res.output
+        );
+        assert!(
+            res.output.contains("it()/test()/describe() title literal"),
+            "the error must name both accepted forms: {}",
+            res.output
         );
     }
 

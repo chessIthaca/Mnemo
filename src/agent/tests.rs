@@ -2785,7 +2785,7 @@ async fn run_turn_records_session_id_on_tool_events() {
         .unwrap();
 
     // A working-memory event should have been recorded with the session_id.
-    // (file_write is a durable action; read-only tools like file_read are no
+    // (file_write is a durable action; read-only tools like read_files are no
     // longer recorded to avoid flooding recall with raw snapshots.)
     let working = store.list_by_tier(MemoryTier::Working).await.unwrap();
     let tool_event = working
@@ -12173,7 +12173,7 @@ async fn auto_recall_emits_memory_recalled_event() {
     // AUTO-recall injected memories into the prompt invisibly — there must be
     // a notification when memory is accessed — but it must fire ONCE per
     // FRESH recall, not on every cache-reuse iteration. This is a
-    // TWO-iteration turn: round 1 is a small file_read, kept small so this
+    // TWO-iteration turn: round 1 is a small read_files, kept small so this
     // test isolates the cache-reuse path (under the OLD code a > 4096-byte
     // result would have separately invalidated the cache — that invalidation
     // was removed 2026-08-20 and is covered by
@@ -12388,7 +12388,7 @@ async fn large_tool_result_does_not_reemit_memory_recalled() {
     let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
     let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
     let registry = make_registry((*sandbox).clone(), workflow.clone());
-    // A file whose file_read output exceeds the old 4 KiB invalidation
+    // A file whose read_files output exceeds the old 4 KiB invalidation
     // threshold (8 KiB of content → line-numbered output well above it).
     std::fs::write(dir.path().join("big.txt"), "x".repeat(8192)).unwrap();
 
@@ -13832,7 +13832,7 @@ impl LlmClient for SwapTargetProvider {
 }
 
 /// Build a loop whose default provider performs `swap` mid-stream (while
-/// serving request #1) and then answers with a `file_read` tool call against
+/// serving request #1) and then answers with a `read_files` tool call against
 /// an existing sandbox file, so the SAME run issues a second request — the
 /// request the swap must already serve. `resolver` attaches a model resolver
 /// when the test exercises the override chain (the forced-model guard).

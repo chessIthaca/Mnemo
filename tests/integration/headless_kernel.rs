@@ -368,6 +368,44 @@ async fn snapshot_reports_pending_approval() {
     engine.shutdown().await.expect("shutdown");
 }
 
+/// §5.9.10 (job 6, slice 2): the engine-level GLOBAL model swap — the
+/// console REPL's `/model` + `/reasoning` surface. Every live loop swaps
+/// (the documented divergence: a REPL has no agent focus, so the swap
+/// keeps GLOBAL semantics), keyed by agent id.
+#[tokio::test]
+async fn engine_swap_model_sweeps_every_live_loop() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![g5_text_turn(&["one"])]);
+    let engine = Engine::builder(opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf())))
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("engine starts");
+    let s1 = engine
+        .spawn(SpawnOptions::default())
+        .await
+        .expect("session 1");
+    let s2 = engine
+        .spawn(SpawnOptions::default())
+        .await
+        .expect("session 2");
+
+    let llm2 = RecordingLlm::new(vec![g5_text_turn(&["two"])]);
+    let swapped = engine.swap_model(llm2, Some("high".to_string())).await;
+
+    // The engine's HostRuntime also spawned its internal main agent
+    // (idle, session-less) — GLOBAL semantics swap it too: every live
+    // loop, session or not.
+    let mut got = swapped;
+    got.sort();
+    let mut want = vec![engine.host().main_id, s1.id().agent_id(), s2.id().agent_id()];
+    want.sort();
+    assert_eq!(got, want, "the global swap touches every live loop");
+
+    engine.shutdown().await.expect("shutdown");
+}
+
 // --- 3a.7: G7 (the limits fixtures) ---
 
 /// §5.9.7 :718-723: `max_turns` counts the session's provider requests —

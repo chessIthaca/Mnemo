@@ -1,0 +1,47 @@
+{
+  "project_stats": {
+    "cached_tokens": 600,
+    "completion_tokens": 500,
+    "generation_ms_total": 0,
+    "per_day": [],
+    "per_model": [],
+    "prompt_tokens": 1000,
+    "reasoning_tokens": 100,
+    "request_count": 3,
+    "session_count": 0,
+    "timed_requests": 0,
+    "ttft_ms_total": 0
+  },
+  "savings_stats": {
+    "cache": {
+      "cached_not_null_requests": 2,
+      "cached_tokens": 400,
+      "prompt_tokens": 1000,
+      "request_count": 3
+    },
+    "event_count": 3,
+    "per_day": [
+      {
+        "day": 20000,
+        "event_count": 2,
+        "saved_tokens": 800
+      }
+    ],
+    "per_kind": [
+      {
+        "event_count": 2,
+        "kind": "compaction",
+        "saved_tokens": 800
+      }
+    ],
+    "recent": [],
+    "saved_tokens_total": 1200
+  },
+  "steering_snapshot": {
+    "by_marker": [],
+    "file_tool_mutations": 3,
+    "fired": 2,
+    "shell_mutations": 1,
+    "switched": 1
+  }
+}

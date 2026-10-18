@@ -17,25 +17,29 @@
 //!
 //! The REPL replicates exactly two UI affordances — the status-bar model
 //! picker (`/model`) and its reasoning-effort dropdown (`/reasoning`) — via
-//! the same shared swap path as the IPC `set_model` command's legacy global
-//! switch ([`crate::ipc::config_io::resolve_model_provider`] +
-//! [`crate::ipc::config_io::swap_provider_into_loops`]). One deliberate
-//! divergence (user decision 2026-08-22, models are agent-specific): the GUI
-//! picker switches only the active agent, while the console `/model` is a
-//! REPL surface with no agent focus, so it keeps the global semantics
-//! (factory + every live loop). Resolution/validation/effort mapping stay
-//! shared, so they can never drift.
+//! the same shared resolver as the IPC `set_model` command
+//! ([`crate::ipc::config_io::resolve_model_provider`]) plus the
+//! engine-level GLOBAL swap ([`mnemo::headless::Engine::swap_model`] —
+//! job 6, §5.9.10: the Engine's own surface replaced the legacy global
+//! switch path). One deliberate divergence (user decision 2026-08-22,
+//! models are agent-specific): the GUI picker switches only the active
+//! agent, while the console `/model` is a REPL surface with no agent
+//! focus, so it keeps the global semantics (factory + every live loop).
+//! Resolution/validation/effort mapping stay shared, so they can never
+//! drift.
 
 use std::sync::Arc;
 
 use mnemo::config::Config;
 use mnemo::provider::trace::LlmRequestLog;
-use mnemo::{
-    AgentCommand, AgentEvent, AgentId, Approval, QuestionOption, UserAnswer,
-};
 use mnemo::tool::ToolResult;
+use mnemo::{
+    AgentCommand, AgentId, Approval, QuestionOption, SerializableAgentEvent, UserAnswer,
+};
 
-use mnemo::headless::HostRuntime;
+use mnemo::headless::{
+    AgentSession, Engine, EventReceiver, RecvError, SessionCommand, SessionEvent, SpawnOptions,
+};
 #[cfg(test)]
 use mnemo::runtime::ParentAwareSpawner;
 
@@ -238,25 +242,29 @@ fn summarize_value(v: &serde_json::Value) -> String {
 /// printing. Approval/question events render their prompt lines here too (the
 /// oneshot responders stay untouched — only their serializable sibling fields
 /// are read).
-pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
+pub(crate) fn render_event(event: &SerializableAgentEvent) -> Rendered {
     match event {
-        AgentEvent::Started => Rendered::Silent,
-        AgentEvent::TextDelta(text) => Rendered::Fragment {
+        SerializableAgentEvent::Started => Rendered::Silent,
+        SerializableAgentEvent::TextDelta { text } => Rendered::Fragment {
             channel: StreamChannel::Text,
             text: text.clone(),
         },
-        AgentEvent::ReasoningDelta(text) => Rendered::Fragment {
+        SerializableAgentEvent::ReasoningDelta { text } => Rendered::Fragment {
             channel: StreamChannel::Reasoning,
             text: text.clone(),
         },
-        AgentEvent::ToolCallStart { name, .. } => Rendered::Lines(vec![format!("→ {name}")]),
-        AgentEvent::ToolCallArgDelta { .. } => Rendered::Silent,
+        SerializableAgentEvent::ToolCallStart { name, .. } => {
+            Rendered::Lines(vec![format!("→ {name}")])
+        }
+        SerializableAgentEvent::ToolCallArgDelta { .. } => Rendered::Silent,
         // Live partial output is a UI affordance, not console text: the console
         // prints the FULL result when the call finishes, so streaming chunks
         // here would duplicate every line (and interleave two calls' output).
-        AgentEvent::ToolOutputDelta { .. } => Rendered::Silent,
-        AgentEvent::ToolResult { result, .. } => Rendered::Lines(render_tool_result(result)),
-        AgentEvent::Usage {
+        SerializableAgentEvent::ToolOutputDelta { .. } => Rendered::Silent,
+        SerializableAgentEvent::ToolResult { result, .. } => {
+            Rendered::Lines(render_tool_result(result))
+        }
+        SerializableAgentEvent::Usage {
             prompt_tokens,
             completion_tokens,
             reasoning_tokens,
@@ -265,17 +273,17 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         } => Rendered::Lines(vec![format!(
             "  [tokens in {prompt_tokens} (cached {cached_tokens}) · out {completion_tokens} · reasoning {reasoning_tokens}]"
         )]),
-        AgentEvent::ContextUsage { .. } => Rendered::Silent,
-        AgentEvent::WorkflowStateChanged { state, .. } => {
+        SerializableAgentEvent::ContextUsage { .. } => Rendered::Silent,
+        SerializableAgentEvent::WorkflowStateChanged { state, .. } => {
             Rendered::Lines(vec![format!("— workflow: {state:?}")])
         }
-        AgentEvent::StepCompleted { step_index } => {
+        SerializableAgentEvent::StepCompleted { step_index } => {
             Rendered::Lines(vec![format!("✓ step {step_index} complete")])
         }
-        AgentEvent::SuggestionInjected { text, .. } => {
+        SerializableAgentEvent::SuggestionInjected { text, .. } => {
             Rendered::Lines(vec![format!("· steer landed: {text}")])
         }
-        AgentEvent::Parked {
+        SerializableAgentEvent::Parked {
             reason,
             workflow_state,
             descendants_running,
@@ -283,12 +291,12 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         } => Rendered::Lines(vec![format!(
             "⏸ parked: {reason:?} (wf={workflow_state}, descendants={descendants_running}, streak={auto_continue_streak})"
         )]),
-        AgentEvent::PromptDispatched { .. } => Rendered::Silent,
-        AgentEvent::SkillStarted { name, prompt } => Rendered::Lines(vec![format!(
+        SerializableAgentEvent::PromptDispatched { .. } => Rendered::Silent,
+        SerializableAgentEvent::SkillStarted { name, prompt } => Rendered::Lines(vec![format!(
             "▶ skill {name}: {}",
             truncate(prompt, 80)
         )]),
-        AgentEvent::ModelChanged { model, provider, .. } => {
+        SerializableAgentEvent::ModelChanged { model, provider, .. } => {
             match provider.as_deref() {
                 Some(p) if !p.is_empty() => {
                     Rendered::Lines(vec![format!("— model changed: {model} ({p})")])
@@ -296,7 +304,7 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
                 _ => Rendered::Lines(vec![format!("— model changed: {model}")]),
             }
         }
-        AgentEvent::MemoryRecalled { hits } => {
+        SerializableAgentEvent::MemoryRecalled { hits } => {
             let parts: Vec<String> = hits
                 .iter()
                 .map(|h| format!("{}: {}", h.tier, h.title))
@@ -311,7 +319,7 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
                 }
             )])
         }
-        AgentEvent::UserQuestion {
+        SerializableAgentEvent::UserQuestion {
             question,
             options,
             ..
@@ -326,7 +334,7 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             lines.push("  answer with a number or free text".to_string());
             Rendered::Lines(lines)
         }
-        AgentEvent::ApprovalRequest {
+        SerializableAgentEvent::ApprovalRequest {
             tool_name,
             args,
             core_operation,
@@ -345,15 +353,15 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         // 2c.5 (§5.4 :365-369): the audit trail for a gated call that
         // executed WITHOUT approval (the loop's policy is
         // OverridePermissions) — one notice line, like steer-landed.
-        AgentEvent::ApprovalBypassed { tool, reason } => {
+        SerializableAgentEvent::ApprovalBypassed { tool, reason } => {
             Rendered::Lines(vec![format!("· approval bypassed: {tool} ({reason})")])
         }
-        AgentEvent::Finished { .. } => Rendered::Lines(vec![String::new()]),
+        SerializableAgentEvent::Finished { .. } => Rendered::Lines(vec![String::new()]),
         // Phase transitions are UI state, not console text — silent (the
         // console REPL has no inflight bar to update).
-        AgentEvent::Phase { .. } => Rendered::Silent,
-        AgentEvent::Exited => Rendered::Lines(vec!["— agent exited".to_string()]),
-        AgentEvent::ChildFinished {
+        SerializableAgentEvent::Phase { .. } => Rendered::Silent,
+        SerializableAgentEvent::Exited => Rendered::Lines(vec!["— agent exited".to_string()]),
+        SerializableAgentEvent::ChildFinished {
             child_id,
             name,
             success,
@@ -361,16 +369,18 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             "— background agent {name} ({child_id}) finished ({})",
             if *success { "ok" } else { "failed" }
         )]),
-        AgentEvent::Error { error, retrying } => Rendered::Lines(vec![format!(
+        SerializableAgentEvent::Error { error, retrying } => Rendered::Lines(vec![format!(
             "! {}{}",
             if *retrying { "(retrying) " } else { "" },
             truncate(error, 300)
         )]),
-        AgentEvent::Compacted { before, after } => Rendered::Lines(vec![format!(
+        SerializableAgentEvent::Compacted { before, after } => Rendered::Lines(vec![format!(
             "— context compacted: {before} → {after}"
         )]),
-        AgentEvent::CompactStarted => Rendered::Lines(vec!["— compacting context…".to_string()]),
-        AgentEvent::VisionDescribe {
+        SerializableAgentEvent::CompactStarted => {
+            Rendered::Lines(vec!["— compacting context…".to_string()])
+        }
+        SerializableAgentEvent::VisionDescribe {
             index,
             total,
             query,
@@ -378,7 +388,7 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             "— describing image {index}/{total} via vision model… ({})",
             truncate(query, 120)
         )]),
-        AgentEvent::VisionDescribed {
+        SerializableAgentEvent::VisionDescribed {
             index,
             total,
             success,
@@ -398,15 +408,17 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
         // display-only telemetry — the console (like the GUI forwarder)
         // never prints them; the durable ledger + the stats pulls are
         // their consumers.
-        AgentEvent::Savings { .. } | AgentEvent::Spend { .. } => Rendered::Silent,
+        SerializableAgentEvent::Savings { .. } | SerializableAgentEvent::Spend { .. } => {
+            Rendered::Silent
+        }
         // 3c (§5.9.2/§5.9.6): host-tool calls + external-policy hooks are
         // headless-engine interactions — the console's app-spawned agents
         // never produce them, but the match stays exhaustive: a one-line
         // notice if one ever arrives.
-        AgentEvent::HostToolCall { name, .. } => {
+        SerializableAgentEvent::HostToolCall { name, .. } => {
             Rendered::Lines(vec![format!("— host tool call: {name} (awaiting the host's result)")])
         }
-        AgentEvent::PolicyHook { hook_kind, .. } => Rendered::Lines(vec![format!(
+        SerializableAgentEvent::PolicyHook { hook_kind, .. } => Rendered::Lines(vec![format!(
             "— policy hook {hook_kind:?} (awaiting the answer)"
         )]),
     }
@@ -602,15 +614,20 @@ fn model_swap_effort(sel: Option<&ModelSelection>, target_supports: bool) -> Opt
 /// Since 3a.2 (D2) the shared core itself lives in [`HostRuntime`]; this
 /// struct is the console's thin wrapper over it.
 pub(crate) struct ConsoleRuntime {
-    /// The whole brain, held for the process lifetime so its Drop-managed
-    /// pieces (the CodeGraph file watcher) stay alive — mirroring the GUI,
-    /// which keeps the same Arcs alive inside its managed `IpcState`.
-    _brain: crate::Brain,
-    /// The shared host core (3a.2, D2): manager + loop map + spawner +
-    /// fan-in receiver + main id + bookkeeping — the hoist of what this
-    /// struct assembled inline until now. A headless Engine wraps the
-    /// same struct.
-    runtime: HostRuntime,
+    /// The headless Engine over the console's ONE shared brain (job 6,
+    /// §5.9.10 :747-753) — the Engine holds its own `Arc<Brain>`, so the
+    /// brain's Drop-managed pieces (the CodeGraph file watcher) stay
+    /// alive for the process lifetime, exactly like the retired `_brain`
+    /// field did.
+    engine: Engine,
+    /// The REPL's main session, spawned via the PUBLIC engine surface
+    /// (`engine.spawn(SpawnOptions)`) — prompts, approvals, and question
+    /// answers route as `SessionCommand`s on it.
+    main: AgentSession,
+    /// The ONE session-event subscription the REPL loop reads (the
+    /// engine's pump broadcasts every agent's events on it, each tagged
+    /// with the emitting `AgentId`).
+    events: EventReceiver<SessionEvent>,
     config: Arc<tokio::sync::Mutex<Config>>,
     project: Arc<tokio::sync::Mutex<mnemo::app::project::Project>>,
     trace: Arc<LlmRequestLog>,
@@ -621,15 +638,18 @@ pub(crate) struct ConsoleRuntime {
 }
 
 impl ConsoleRuntime {
-    /// Build the runtime from a ready brain: the host core (manager,
-    /// spawner wiring, the main-agent spawn, bookkeeping) assembles inside
-    /// [`HostRuntime::start`]; the console adds its model-selection
+    /// Build the runtime from a ready brain + the Engine over it (job 6,
+    /// §5.9.10): the main session spawns via the PUBLIC engine surface
+    /// (`engine.spawn`) — the same host core assembles inside the engine
+    /// (manager, spawner wiring, bookkeeping, and the event pump that
+    /// feeds the session bus); the console adds its model-selection
     /// tracking and the brain-held shared Arcs.
-    pub(crate) async fn start(brain: crate::Brain) -> anyhow::Result<Self> {
-        // Clone the shared handles out of the brain BEFORE the host core
-        // takes the factory (the brain then moves into `_brain`, keeping
-        // its Drop-managed pieces alive for the process lifetime).
-        let factory = brain.factory.clone();
+    pub(crate) async fn start(
+        brain: Arc<mnemo::headless::Brain>,
+        engine: Engine,
+    ) -> anyhow::Result<Self> {
+        // Clone the shared handles out of the brain (the engine holds its
+        // own Arc of the SAME brain — one store, one config Arc).
         let config = brain.config.clone();
         let project = Arc::new(tokio::sync::Mutex::new(
             mnemo::app::project::Project::from_root(&brain.workspace.root),
@@ -637,9 +657,14 @@ impl ConsoleRuntime {
         let trace = brain.trace.clone();
         let browser = brain.browser.clone();
 
-        let runtime = HostRuntime::start(factory)
+        let main = engine
+            .spawn(SpawnOptions {
+                name: Some("console".to_string()),
+                ..Default::default()
+            })
             .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let events = main.events();
 
         let selection = {
             let config = brain.config.lock().await;
@@ -647,8 +672,9 @@ impl ConsoleRuntime {
         };
 
         Ok(Self {
-            _brain: brain,
-            runtime,
+            engine,
+            main,
+            events,
             config,
             project,
             trace,
@@ -662,14 +688,25 @@ impl ConsoleRuntime {
         self.project.lock().await.root.clone()
     }
 
-    /// Read the next fanned-in agent event (`None` when all senders closed).
-    pub(crate) async fn next_event(&mut self) -> Option<(AgentId, AgentEvent)> {
-        self.runtime.fanin_rx.recv().await
+    /// Read the next session event off the engine's session bus (`None`
+    /// when the pump ended — the bus closed). The pump broadcasts EVERY
+    /// agent's events, each tagged with the emitting `AgentId`; a lagged
+    /// consumer (bounded buffer) skips the missed events and keeps
+    /// reading instead of stalling the REPL.
+    pub(crate) async fn next_event(&mut self) -> Option<SessionEvent> {
+        loop {
+            match self.events.recv().await {
+                Ok(ev) => return Some(ev),
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
     }
 
-    /// The main agent's id (the agent prompts are sent to).
+    /// The main session's agent id (prompts are sent to the session; the
+    /// REPL's state machine compares event tags against it).
     pub(crate) fn main_id(&self) -> AgentId {
-        self.runtime.main_id
+        self.main.id().agent_id()
     }
 
     /// The shared headless browser (for bounded teardown on exit).
@@ -682,17 +719,39 @@ impl ConsoleRuntime {
         self.trace.clone()
     }
 
-    /// Send a prompt to the main agent.
+    /// Send a prompt to the main session.
     pub(crate) async fn send_prompt(&self, text: String) -> Result<(), String> {
-        let mgr = self.runtime.manager.lock().await;
-        mgr.send(
-            self.runtime.main_id,
-            AgentCommand::Prompt {
-                text,
-                images: vec![],
-            },
-        )
-        .map_err(|_| "failed to send prompt — agent not running".to_string())
+        self.main
+            .send(SessionCommand::Prompt { text, images: vec![] })
+            .await
+            .map_err(|e| format!("failed to send prompt — {e}"))
+    }
+
+    /// Answer a pending approval by its request id (the engine's pump
+    /// stashed the responder keyed by it; the session command routes to
+    /// it — the pending map is engine-wide, so the MAIN session answers
+    /// any agent's approval).
+    pub(crate) async fn answer_approval(
+        &self,
+        request_id: String,
+        decision: Approval,
+    ) -> Result<(), String> {
+        self.main
+            .send(SessionCommand::Approve { request_id, decision })
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    /// Answer a pending question by its id (same routing as approvals).
+    pub(crate) async fn answer_question(
+        &self,
+        question_id: String,
+        answer: UserAnswer,
+    ) -> Result<(), String> {
+        self.main
+            .send(SessionCommand::Answer { question_id, answer })
+            .await
+            .map_err(|e| format!("{e}"))
     }
 
     /// The tracked selection as a display status for `/model` + `/reasoning`.
@@ -721,11 +780,12 @@ impl ConsoleRuntime {
         (endpoints, config.general.general.default_model.clone())
     }
 
-    /// Swap the live model and/or reasoning effort — the exact semantics of
+    /// Swap the live model and/or reasoning effort — the console's twin of
     /// the IPC `set_model` command (status-bar picker): validate + build via
-    /// the shared resolver, swap into the factory + every live loop via the
-    /// shared swap, and update the tracked selection. Live swap only — the
-    /// on-disk config is NOT written (same as the picker).
+    /// the shared resolver, then the engine-level GLOBAL swap
+    /// (`Engine::swap_model` — job 6, §5.9.10), and update the tracked
+    /// selection. Live swap only — the on-disk config is NOT written (same
+    /// as the picker).
     ///
     /// Returns the new [`ModelStatus`] for display.
     pub(crate) async fn swap_model(
@@ -765,15 +825,13 @@ impl ConsoleRuntime {
         // as set_model) and swap factory + every live loop. The resolved
         // DISPLAY effort rides along so the loops' status-bar mirrors track
         // the new default (backlog 51dab4da).
-        let context_manager = self.runtime.factory.context_manager_for(resolved.provider.as_ref());
-        crate::ipc::config_io::swap_provider_into_loops(
-            &self.runtime.factory,
-            &self.runtime.agent_loops,
-            resolved.provider,
-            context_manager,
-            Some(resolved.display_effort),
-        )
-        .await;
+        // The engine-level swap (job 6, slice 2): GLOBAL semantics through
+        // the Engine's public surface — the resolution/validation/effort
+        // mapping stay shared (resolve_model_provider); the factory +
+        // every-live-loop swap lives kernel-side now.
+        self.engine
+            .swap_model(resolved.provider, Some(resolved.display_effort))
+            .await;
         Ok(self.status().expect("selection was just set"))
     }
 
@@ -804,35 +862,40 @@ impl ConsoleRuntime {
     /// Cancel every registered agent so their tasks exit (the REPL then
     /// waits, bounded, for the main agent's `Exited` event). Errors are
     /// ignored — an agent that is already gone needs no cancel.
+    /// The drain phase of the two-phase exit (job 6, slice 3): cancel
+    /// EVERY agent through the ENGINE's manager (`engine.host()` — the
+    /// same manager every session cancel routes through) while the pump
+    /// stays alive, so the Exited events still flow and the REPL can
+    /// observe the drain. The cleanup phase (run_console's exit tail)
+    /// then consumes the engine (`into_engine().shutdown()`) — sessions
+    /// deregistered, pump stopped, no leaked tasks.
     pub(crate) async fn request_shutdown(&self) {
-        let mgr = self.runtime.manager.lock().await;
+        let mgr = self.engine.host().manager.lock().await;
         for handle in mgr.list() {
             let _ = mgr.send(handle.id, AgentCommand::Cancel);
         }
     }
 
-    /// Lifecycle bookkeeping: the agent started a turn.
-    pub(crate) async fn mark_started(&self, id: AgentId) {
-        self.runtime.bookkeeping.on_started(id).await;
-    }
-
-    /// Lifecycle bookkeeping: the agent's turn ended (Finished / final
-    /// Error) — also notifies a child's parent once. `success` is `true`
-    /// for a clean `Finished`, `false` for a final error.
-    pub(crate) async fn mark_turn_ended(&self, id: AgentId, success: bool) {
-        self.runtime.bookkeeping.on_turn_ended(id, success).await;
-    }
-
-    /// Lifecycle bookkeeping: the agent's task terminated — removes it from
-    /// the manager + loop map.
-    pub(crate) async fn mark_exited(&self, id: AgentId) {
-        self.runtime.bookkeeping.on_exited(id).await;
-    }
+    // Lifecycle bookkeeping is the ENGINE's pump now (job 6, slice 1): the
+    // retired mark_started / mark_turn_ended / mark_exited wrappers
+    // (runtime.bookkeeping) duplicated the pump's own
+    // on_started/on_turn_ended/on_exited — exactly where the console run
+    // loop + the GUI forwarder do it (src/headless/session.rs).
 
     /// Cancel every INACTIVE subagent (a fresh plan from Complete) — the
     /// forwarder's Complete→Executing cleanup, shared via the same helper.
     pub(crate) async fn cleanup_inactive_subagents(&self, trigger: AgentId) {
-        crate::ipc::events::cleanup_inactive_subagents(&self.runtime.manager, trigger).await;
+        crate::ipc::events::cleanup_inactive_subagents(&self.engine.host().manager, trigger).await;
+    }
+
+    /// Consume the runtime and hand the Engine back (job 6, slice 3): the
+    /// exit tail calls `engine.shutdown()` — the drain already completed
+    /// (begin_shutdown's sweep cancelled every agent while the pump stayed
+    /// alive for the Exited events), so this cleanup phase only
+    /// deregisters the sessions + stops the pump cleanly: no leaked tasks,
+    /// the same contract every headless consumer honors.
+    pub(crate) fn into_engine(self) -> Engine {
+        self.engine
     }
 
     /// The reasoning-effort value a `/model <endpoint>/<model>` swap should
@@ -861,13 +924,13 @@ impl ConsoleRuntime {
 /// fragment/line boundaries, and the exit handshake.
 #[derive(Default)]
 struct ReplState {
-    /// The unresolved approval's oneshot (the agent blocks on it).
-    pending_approval: Option<tokio::sync::oneshot::Sender<Approval>>,
-    /// The unresolved question's oneshot + its options (for answer parsing).
-    pending_question: Option<(
-        tokio::sync::oneshot::Sender<UserAnswer>,
-        Vec<QuestionOption>,
-    )>,
+    /// The unresolved approval's request id — the engine's pump stashed
+    /// the responder keyed by it; the answer routes through
+    /// `SessionCommand::Approve` on the session surface.
+    pending_approval: Option<String>,
+    /// The unresolved question's id + its options (for answer parsing) —
+    /// same stash-and-route as approvals.
+    pending_question: Option<(String, Vec<QuestionOption>)>,
     /// The channel of the last printed fragment (`Some` = mid-line).
     last_channel: Option<StreamChannel>,
     /// Whether the main agent is mid-turn (suppresses the prompt marker).
@@ -948,39 +1011,50 @@ fn print_swap_result(result: Result<ModelStatus, String>) {
 /// dead-agent cleanup, Complete→Executing inactive-subagent cleanup).
 async fn handle_event(
     id: AgentId,
-    event: AgentEvent,
+    event: &SerializableAgentEvent,
     state: &mut ReplState,
     runtime: &ConsoleRuntime,
 ) {
-    print_rendered(render_event(&event), state);
+    print_rendered(render_event(event), state);
     match event {
-        AgentEvent::ApprovalRequest { responder, .. } => {
+        SerializableAgentEvent::ApprovalRequest { tool_call_id, .. } => {
             if state.pending_approval.is_some() {
                 // Sequential REPL: a second approval while one is pending is
                 // denied immediately (fail-closed, like the GUI's auto-deny
-                // paths) rather than silently queued behind the first.
-                let _ = responder.send(Approval::Deny);
+                // paths) rather than silently queued behind the first. The
+                // engine's pump stashed the responder keyed by this id.
+                let _ = runtime
+                    .answer_approval(tool_call_id.clone(), Approval::Deny)
+                    .await;
                 println!("⚠ second approval arrived while one is pending — denied");
             } else {
-                state.pending_approval = Some(responder);
+                state.pending_approval = Some(tool_call_id.clone());
             }
         }
-        AgentEvent::UserQuestion {
-            options, responder, ..
+        SerializableAgentEvent::UserQuestion {
+            question_id,
+            options,
+            ..
         } => {
             if state.pending_question.is_some() {
                 // Can't normally happen (each agent blocks on its own
                 // question); if a subagent races one in, answer it with a
-                // clear deferral instead of dropping the oneshot silently.
-                let _ = responder.send(UserAnswer::Freeform {
-                    text: "(console: superseded by another question)".to_string(),
-                });
+                // clear deferral instead of dropping it silently — routed
+                // by id through the engine's pending map.
+                let _ = runtime
+                    .answer_question(
+                        question_id.clone(),
+                        UserAnswer::Freeform {
+                            text: "(console: superseded by another question)".to_string(),
+                        },
+                    )
+                    .await;
                 println!("⚠ second question arrived while one is pending — deferred");
             } else {
-                state.pending_question = Some((responder, options));
+                state.pending_question = Some((question_id.clone(), options.clone()));
             }
         }
-        AgentEvent::WorkflowStateChanged {
+        SerializableAgentEvent::WorkflowStateChanged {
             state: new_state, ..
         } => {
             // Complete → Executing = a fresh plan started — cancel INACTIVE
@@ -992,14 +1066,15 @@ async fn handle_event(
                 runtime.cleanup_inactive_subagents(id).await;
             }
         }
-        AgentEvent::Started => {
-            runtime.mark_started(id).await;
+        SerializableAgentEvent::Started => {
+            // The pump does the lifecycle bookkeeping (running flags,
+            // parent notifications, dead-agent cleanup) — the console
+            // keeps only its own REPL state machine.
             if id == runtime.main_id() {
                 state.running = true;
             }
         }
-        AgentEvent::Finished { .. } => {
-            runtime.mark_turn_ended(id, true).await;
+        SerializableAgentEvent::Finished { .. } => {
             if id == runtime.main_id() && state.running {
                 // Guarded: a final Error already ended the turn (the agent
                 // then also emits a bookkeeping Finished) — one prompt only.
@@ -1009,10 +1084,9 @@ async fn handle_event(
                 }
             }
         }
-        AgentEvent::Error {
+        SerializableAgentEvent::Error {
             retrying: false, ..
         } => {
-            runtime.mark_turn_ended(id, false).await;
             if id == runtime.main_id() && state.running {
                 state.running = false;
                 if !state.exiting {
@@ -1020,14 +1094,13 @@ async fn handle_event(
                 }
             }
         }
-        AgentEvent::Exited => {
-            runtime.mark_exited(id).await;
+        SerializableAgentEvent::Exited => {
             if id == runtime.main_id() {
                 state.main_exited = true;
             }
         }
         // Retrying errors keep the agent running; delta events need no
-        // bookkeeping at all.
+        // REPL state at all.
         _ => {}
     }
 }
@@ -1056,7 +1129,7 @@ async fn handle_input(line: String, state: &mut ReplState, runtime: &ConsoleRunt
     }
 
     // Pending interactions take precedence: the next line answers them.
-    if let Some(sender) = state.pending_approval.take() {
+    if let Some(request_id) = state.pending_approval.take() {
         match parse_approval_answer(&line) {
             Some(approval) => {
                 let label = match approval {
@@ -1064,23 +1137,27 @@ async fn handle_input(line: String, state: &mut ReplState, runtime: &ConsoleRunt
                     Approval::Deny => "denied",
                     Approval::DenyAll => "denied (this and the rest of the turn)",
                 };
-                let _ = sender.send(approval);
+                if let Err(e) = runtime.answer_approval(request_id, approval).await {
+                    println!("! {e}");
+                }
                 println!("— {label}");
             }
             None => {
-                state.pending_approval = Some(sender);
+                state.pending_approval = Some(request_id);
                 println!("  answer with y / n / a");
             }
         }
         return;
     }
-    if let Some((sender, options)) = state.pending_question.take() {
+    if let Some((question_id, options)) = state.pending_question.take() {
         match parse_question_answer(&line, &options) {
             Some(answer) => {
-                let _ = sender.send(answer);
+                if let Err(e) = runtime.answer_question(question_id, answer).await {
+                    println!("! {e}");
+                }
             }
             None => {
-                state.pending_question = Some((sender, options));
+                state.pending_question = Some((question_id, options));
                 println!("  answer with a number or free text");
             }
         }
@@ -1177,8 +1254,12 @@ async fn begin_shutdown(state: &mut ReplState, runtime: &ConsoleRuntime) {
 /// helpers above — a future headless daemon swaps this function for a
 /// non-interactive loop over the same runtime.
 pub(crate) async fn run_console() -> i32 {
-    let brain = match crate::build_brain(None, tokio::runtime::Handle::current()) {
-        Ok(crate::BrainOutcome::Ready(brain)) => *brain,
+    // Job 6 (§5.9.10 :747-753): the Box moves into an Arc — the wiring
+    // below and the Engine share the ONE brain (the same zero-copy
+    // conversion the GUI's Ready branch performs).
+    let brain: Arc<mnemo::headless::Brain> =
+        match crate::build_brain(None, tokio::runtime::Handle::current()) {
+        Ok(crate::BrainOutcome::Ready(brain)) => Arc::from(brain),
         Ok(crate::BrainOutcome::NeedsProject(_)) => {
             eprintln!(
                 "mnemo console: no project resolved — run from a project directory, \
@@ -1244,7 +1325,48 @@ pub(crate) async fn run_console() -> i32 {
         });
     }
 
-    let mut runtime = match ConsoleRuntime::start(brain).await {
+    // The session permission default mirrors what the factory wires for
+    // permission:None builds: ApproveViaApi over the config's safety
+    // mode (the same mode build_brain shared into the factory at
+    // startup). Read BEFORE the engine construction — the config lock
+    // must never span the engine's async start.
+    let session_permission = {
+        let config = brain.config.lock().await;
+        mnemo::PermissionPolicy::ApproveViaApi {
+            safety_mode: config.general.general.safety.clone(),
+        }
+    };
+    // Job 6 (§5.9.10 :747-753): the console's own Engine over the SAME
+    // brain — the GUI's twin construction (one process, one Engine). The
+    // injected brain governs memory/graph/embedder (the seam adopted
+    // them wholesale), so the options carry only the workspace facts +
+    // the session permission default above (the engine's spawn always
+    // passes Some(permission)).
+    let engine = match mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+        workspace: (*brain.workspace).clone(),
+        // build_brain resolved the default config dir — None resolves
+        // the same one for the engine.
+        config_dir: None,
+        permissions: session_permission,
+        // Inert for an injected brain (the shared brain owns its store);
+        // pass the console's reality.
+        memory: mnemo::headless::MemoryBackend::Sqlite { path: None },
+        index_codegraph: false,
+        require_git: false,
+        auto_install_embedder: false,
+    })
+    .brain(brain.clone())
+    .start()
+    .await
+    {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("mnemo console: failed to start the engine: {e:#}");
+            return 1;
+        }
+    };
+
+    let mut runtime = match ConsoleRuntime::start(brain, engine).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("mnemo console: failed to start the agent: {e:#}");
@@ -1289,8 +1411,8 @@ pub(crate) async fn run_console() -> i32 {
         tokio::select! {
             maybe_ev = runtime.next_event() => {
                 match maybe_ev {
-                    None => break, // every agent gone
-                    Some((id, event)) => handle_event(id, event, &mut state, &runtime).await,
+                    None => break, // the engine's session bus closed
+                    Some(ev) => handle_event(ev.agent, &ev.event, &mut state, &runtime).await,
                 }
             }
             maybe_line = input_rx.recv(), if !state.stdin_closed => {
@@ -1330,6 +1452,13 @@ pub(crate) async fn run_console() -> i32 {
     .await;
     // Drain the asynchronous trace mirror so the session's last requests land.
     runtime.trace().flush_file_writes();
+    // Job 6 (§5.9.10, slice 3): the cleanup phase of the two-phase exit —
+    // the engine's own shutdown path. The drain already completed
+    // (begin_shutdown's manager sweep cancelled every agent while the
+    // pump stayed alive for the Exited events); consuming the engine now
+    // deregisters the sessions + stops the pump: no leaked tasks, the
+    // same contract every headless consumer honors.
+    let _ = runtime.into_engine().shutdown().await;
     println!("bye.");
     0
 }
@@ -1493,6 +1622,7 @@ mod tests {
     // 3a.2 (D2): the host-core types moved from the top level (unused in
     // the non-test build after the HostRuntime hoist) — the fixtures
     // still construct them directly.
+    use mnemo::AgentEvent;
     use mnemo::agent::factory::AgentLoopFactory;
     use mnemo::host::runtime::{AgentLoopMap, HostSpawner, LifecycleBookkeeping};
     use mnemo::runtime::AgentManager;
@@ -1686,14 +1816,14 @@ mod tests {
     #[test]
     fn render_event_text_and_reasoning_are_fragments_with_channel() {
         assert_eq!(
-            render_event(&AgentEvent::TextDelta("hello".into())),
+            render_event(&AgentEvent::TextDelta("hello".into()).into_serializable().event),
             Rendered::Fragment {
                 channel: StreamChannel::Text,
                 text: "hello".to_string()
             }
         );
         assert_eq!(
-            render_event(&AgentEvent::ReasoningDelta("thinking…".into())),
+            render_event(&AgentEvent::ReasoningDelta("thinking…".into()).into_serializable().event),
             Rendered::Fragment {
                 channel: StreamChannel::Reasoning,
                 text: "thinking…".to_string()
@@ -1703,39 +1833,58 @@ mod tests {
 
     #[test]
     fn render_event_quiet_events_are_silent() {
-        assert_eq!(render_event(&AgentEvent::Started), Rendered::Silent);
         assert_eq!(
-            render_event(&AgentEvent::ToolCallArgDelta {
-                index: 0,
-                fragment: "{\"a\":".into()
-            }),
+            render_event(&AgentEvent::Started.into_serializable().event),
             Rendered::Silent
         );
         assert_eq!(
-            render_event(&AgentEvent::PromptDispatched {
-                text: "x".into(),
-                images: vec![]
-            }),
+            render_event(
+                &AgentEvent::ToolCallArgDelta {
+                    index: 0,
+                    fragment: "{\"a\":".into()
+                }
+                .into_serializable()
+                .event
+            ),
+            Rendered::Silent
+        );
+        assert_eq!(
+            render_event(
+                &AgentEvent::PromptDispatched {
+                    text: "x".into(),
+                    images: vec![]
+                }
+                .into_serializable()
+                .event
+            ),
             Rendered::Silent
         );
     }
 
     #[test]
     fn render_event_error_carries_retry_marker() {
-        let retrying = render_event(&AgentEvent::Error {
-            error: "boom".into(),
-            retrying: true,
-        });
+        let retrying = render_event(
+            &AgentEvent::Error {
+                error: "boom".into(),
+                retrying: true,
+            }
+            .into_serializable()
+            .event,
+        );
         match retrying {
             Rendered::Lines(lines) => {
                 assert_eq!(lines, vec!["! (retrying) boom".to_string()]);
             }
             other => panic!("expected Lines, got {other:?}"),
         }
-        let final_err = render_event(&AgentEvent::Error {
-            error: "dead".into(),
-            retrying: false,
-        });
+        let final_err = render_event(
+            &AgentEvent::Error {
+                error: "dead".into(),
+                retrying: false,
+            }
+            .into_serializable()
+            .event,
+        );
         match final_err {
             Rendered::Lines(lines) => assert_eq!(lines, vec!["! dead".to_string()]),
             other => panic!("expected Lines, got {other:?}"),
@@ -1756,7 +1905,8 @@ mod tests {
             core_operation: false,
             responder: _tx,
         };
-        match render_event(&event) {
+        let serial = event.into_serializable();
+        match render_event(&serial.event) {
             Rendered::Lines(lines) => {
                 assert!(
                     lines[0].starts_with("⚠ approval needed: shell("),
@@ -1767,8 +1917,9 @@ mod tests {
             }
             other => panic!("expected Lines, got {other:?}"),
         }
-        // The responder is still pending (not consumed/cancelled by render).
-        drop(event);
+        // The responder is still pending (not consumed/cancelled by render —
+        // it rides in the serial wrapper, untouched by the render read).
+        drop(serial);
         assert!(rx.try_recv().is_err());
     }
 
@@ -1790,7 +1941,8 @@ mod tests {
             ],
             responder: _tx,
         };
-        match render_event(&event) {
+        let serial = event.into_serializable();
+        match render_event(&serial.event) {
             Rendered::Lines(lines) => {
                 assert_eq!(lines[0], "? Which approach?");
                 assert_eq!(lines[1], "  1. Ship it — merge now");
@@ -1798,7 +1950,7 @@ mod tests {
             }
             other => panic!("expected Lines, got {other:?}"),
         }
-        drop(event);
+        drop(serial);
         assert!(rx.try_recv().is_err());
     }
 
@@ -1808,7 +1960,7 @@ mod tests {
         // without a render_event arm, which broke the bin crate build
         // (non-exhaustive match) — start.bat / `tauri build` died on E0004
         // while root cargo build (lib only) stayed green.
-        match render_event(&AgentEvent::CompactStarted) {
+        match render_event(&AgentEvent::CompactStarted.into_serializable().event) {
             Rendered::Lines(lines) => {
                 assert_eq!(lines, vec!["— compacting context…".to_string()]);
             }
@@ -1822,11 +1974,15 @@ mod tests {
         // must render explicit console lines — a missing arm here broke the
         // bin crate build for CompactStarted (non-exhaustive match), so new
         // AgentEvent variants always get arms + a test.
-        let describe = render_event(&AgentEvent::VisionDescribe {
-            index: 1,
-            total: 2,
-            query: "Describe this image in detail.".into(),
-        });
+        let describe = render_event(
+            &AgentEvent::VisionDescribe {
+                index: 1,
+                total: 2,
+                query: "Describe this image in detail.".into(),
+            }
+            .into_serializable()
+            .event,
+        );
         match describe {
             Rendered::Lines(lines) => {
                 assert_eq!(lines.len(), 1);
@@ -1835,12 +1991,16 @@ mod tests {
             }
             other => panic!("expected Lines, got {other:?}"),
         }
-        let ok = render_event(&AgentEvent::VisionDescribed {
-            index: 2,
-            total: 2,
-            success: true,
-            description: "a photo of a cat".into(),
-        });
+        let ok = render_event(
+            &AgentEvent::VisionDescribed {
+                index: 2,
+                total: 2,
+                success: true,
+                description: "a photo of a cat".into(),
+            }
+            .into_serializable()
+            .event,
+        );
         match ok {
             Rendered::Lines(lines) => {
                 assert!(lines[0].contains("image 2/2 described"), "{lines:?}");
@@ -1848,12 +2008,16 @@ mod tests {
             }
             other => panic!("expected Lines, got {other:?}"),
         }
-        let failed = render_event(&AgentEvent::VisionDescribed {
-            index: 1,
-            total: 1,
-            success: false,
-            description: "vision is down".into(),
-        });
+        let failed = render_event(
+            &AgentEvent::VisionDescribed {
+                index: 1,
+                total: 1,
+                success: false,
+                description: "vision is down".into(),
+            }
+            .into_serializable()
+            .event,
+        );
         match failed {
             Rendered::Lines(lines) => {
                 assert!(

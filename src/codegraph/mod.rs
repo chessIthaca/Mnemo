@@ -165,6 +165,128 @@ fn contains_whole_identifier(haystack: &[u8], needle: &[u8]) -> bool {
 /// skipped, and [`ReindexOutcome::capped`] flags the partial refresh.
 const REPARSE_CAP: usize = 16;
 
+/// The exact test-title hit behind the finish gate's string-titled tier
+/// (backlog 5f3f5123, live case: plan 3d40e529): a vitest/Jest test is
+/// string-titled — `it("title", () => …)` — and its anonymous callback
+/// body produces no symbol rows, so the graph can never resolve the
+/// title even though the test exists on disk and is runnable. When the
+/// recorded regression name equals the ENTIRE quoted literal argument of
+/// a test-call in a test file, this records where.
+#[derive(Debug, Clone)]
+pub struct TestTitleHit {
+    /// The file (relative to the graph root) whose source carries the
+    /// call.
+    pub path: std::path::PathBuf,
+    /// The test call whose first (title) argument is the literal.
+    pub call: &'static str,
+}
+
+/// Test-call names whose first (title) argument is a string literal —
+/// the accepted set of [`CodeGraph::find_exact_test_title`]. Chained
+/// variants (`it.only(`/`test.skip(`) are deliberately outside it: the
+/// gate's error names the accepted forms so the agent self-corrects.
+const TEST_TITLE_CALLS: [&str; 3] = ["it", "test", "describe"];
+
+/// Whether `rel` (a path relative to the graph root, backslashes
+/// normalized) is a test file by the finish gate's filter: the FILE name
+/// carries one of the test suffixes (`*.test.*` / `*.spec.*` /
+/// `*_test.*` / `*_tests.*`, case-insensitive) or a path component is a
+/// `tests` directory.
+fn is_test_file(rel: &str) -> bool {
+    let lower = rel.replace('\\', "/").to_ascii_lowercase();
+    if lower.split('/').any(|c| c == "tests") {
+        return true;
+    }
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    [".test.", ".spec.", "_test.", "_tests."]
+        .iter()
+        .any(|suffix| name.contains(suffix))
+}
+
+/// The byte-level scan behind [`CodeGraph::find_exact_test_title`]:
+/// report the first test call in `bytes` whose ENTIRE quoted literal
+/// argument equals `title` (exact byte-for-byte equality between the
+/// opening and closing quote — a word-bounded substring, a
+/// suffix-composed variant, or a comment mention does not satisfy it).
+/// The call must be written in its `call(` form: the call name sits at a
+/// word start (the byte before is not an identifier byte —
+/// `submit(`/`knit(`/`testify(` never read as `it(`/`test(`) and the
+/// byte right after the call name must not be an identifier byte (so
+/// `testify(` cannot split into `test` + `ify(`), followed after
+/// optional whitespace by the open paren, then a quote.
+/// Quotes: `"`, `'`, `` ` `` — the closing quote must match the opening
+/// one, and the argument terminator (`,`/`)`) must follow it: an
+/// argument built by string concatenation (`it("a" + "b", …)`) is not
+/// a single quoted literal, so its runtime title is not `a`.
+fn scan_exact_test_title(bytes: &[u8], title: &str) -> Option<&'static str> {
+    if title.is_empty() {
+        return None;
+    }
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    for call in TEST_TITLE_CALLS {
+        let opener = call.as_bytes();
+        let mut from = 0usize;
+        while from + opener.len() <= bytes.len() {
+            let Some(at) = bytes[from..]
+                .windows(opener.len())
+                .position(|w| w == opener)
+                .map(|i| i + from)
+            else {
+                break;
+            };
+            from = at + 1;
+            let before_ok = at == 0 || !is_ident(bytes[at - 1]);
+            let after = at + opener.len();
+            if !before_ok || after >= bytes.len() || is_ident(bytes[after]) {
+                continue;
+            }
+            // `it(`-form: optional whitespace, the open paren, optional
+            // whitespace (including newlines), then the title quote.
+            let mut cursor = after;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() || bytes[cursor] != b'(' {
+                continue;
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() {
+                continue;
+            }
+            let quote = bytes[cursor];
+            if quote != b'"' && quote != b'\'' && quote != b'`' {
+                continue;
+            }
+            cursor += 1;
+            let needle = title.as_bytes();
+            if bytes.len() < cursor + needle.len() + 1 {
+                continue;
+            }
+            if &bytes[cursor..cursor + needle.len()] != needle {
+                continue;
+            }
+            if bytes[cursor + needle.len()] != quote {
+                continue;
+            }
+            // The argument terminator (`,` or `)`) must follow: an argument
+            // built by string concatenation (`it("a" + "b", …)`) is not a
+            // single quoted literal, so its runtime title is not `a` — the
+            // recorded name must match the whole literal.
+            let mut term = cursor + needle.len() + 1;
+            while term < bytes.len() && bytes[term].is_ascii_whitespace() {
+                term += 1;
+            }
+            if term < bytes.len() && (bytes[term] == b',' || bytes[term] == b')') {
+                return Some(call);
+            }
+        }
+    }
+    None
+}
+
 /// Copy the graph DB at `src_db` into a fresh, consistent snapshot at
 /// `dest_db` — run-all worktree seeding (2026-09-08 performance LOW-2
 /// lever b): a spawned worktree agent's cold index pass otherwise re-reads,
@@ -833,6 +955,72 @@ impl CodeGraph {
         })
     }
 
+    /// The exact test-title check behind the finish gate's string-titled
+    /// tier (backlog 5f3f5123, live case: plan 3d40e529). Walks the
+    /// searchable disk (the same pattern as
+    /// [`Self::reindex_files_containing`]) restricted to TEST files
+    /// ([`is_test_file`]) and returns the first file whose source carries
+    /// an `it()`/`test()`/`describe()` call whose ENTIRE quoted literal
+    /// argument equals `title` ([`scan_exact_test_title`]). A fresh disk
+    /// walk is byte-identical to the store's fresh upsert rows: the finish
+    /// gate runs this AFTER its forced re-index escalation (backlog
+    /// 648e0ad5), so disk truth and store truth agree — no store-schema
+    /// dependency is added. Exact equality ONLY: a suffix paraphrase, a
+    /// partial title, or a comment mention never satisfies the check (the
+    /// anti-paraphrase contract of the symbol-name containment grounds
+    /// this fn).
+    ///
+    /// The scan is byte-exact with NO escape unescaping: the recorded
+    /// name must be the title literal AS WRITTEN in source — an escaped
+    /// inner quote (`it("says \"hi\"")`) or a template-literal `${…}`
+    /// interpolation appears in the source with its escape bytes, so
+    /// recording the runtime title (`says "hi"`) rejects. The
+    /// conservative contract lets the agent self-correct in one shot
+    /// with the gate's both-forms hint (LOW-2, review round 1).
+    pub fn find_exact_test_title(&self, title: &str) -> Result<Option<TestTitleHit>> {
+        if title.is_empty() {
+            return Ok(None);
+        }
+        let root_canon = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        for path in walk_searchable(&self.root) {
+            let Some(rel) = relpath(&self.root, &path) else {
+                continue;
+            };
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            if !ext.as_deref().is_some_and(is_code_extension) {
+                continue;
+            }
+            if !is_test_file(&rel) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Some(call) = scan_exact_test_title(&bytes, title) {
+                // Defense-in-depth (mirroring reindex_files_containing):
+                // never read content from outside the project root —
+                // canonicalize failure skips the file exactly like the
+                // precedent, no lenient fall-through (LOW-1, review round 1).
+                let Ok(canon) = path.canonicalize() else {
+                    eprintln!("codegraph: skipping {rel}: unreadable path");
+                    continue;
+                };
+                if !canon.starts_with(&root_canon) {
+                    eprintln!("codegraph: skipping {rel}: outside the project root");
+                    continue;
+                }
+                return Ok(Some(TestTitleHit { path, call }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Detect staleness among the indexed SOURCE files — the symbol index's
     /// freshness sweep, the sibling of the search tool's F10 content check
     /// (backlog 95f21af0). Every indexed file whose extension parses as a
@@ -1224,6 +1412,107 @@ mod tests {
         assert_eq!(
             partial.matched_unparsed, 0,
             "substring hits inside a longer identifier are not containment"
+        );
+    }
+
+    #[test]
+    fn find_exact_test_title_resolves_string_titled_calls() {
+        // Backlog 5f3f5123 (live case: plan 3d40e529): a string-titled
+        // vitest/Jest test (`it("title", () => …)`) produces no symbol rows —
+        // the anonymous callback body is not indexed — so the graph can
+        // never resolve the title, yet the test exists and is runnable.
+        // find_exact_test_title resolves the EXACT full title literal of an
+        // it()/test()/describe() call, restricted to test files
+        // (*.test.* / *.spec.* / *_test.* / *_tests.* names or a tests/
+        // directory).
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        let dir = tempfile::tempdir().unwrap();
+        // The live-case title, as an it() argument in a .test.ts fixture.
+        std::fs::write(
+            dir.path().join("use_agent_store.test.ts"),
+            format!("it({title:?}, () => {{\n  // assertions\n}});\n"),
+        )
+        .unwrap();
+        // A tests/ directory counts as a test file too.
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("late_delta.ts"),
+            format!("describe({title:?}, () => {{\n  it(\"inner\", () => {{}});\n}});\n"),
+        )
+        .unwrap();
+        let graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        let hit = graph.find_exact_test_title(title).unwrap().unwrap();
+        assert!(
+            hit.call == "it" || hit.call == "describe",
+            "the hit names the call carrying the title: {:?}",
+            hit
+        );
+        let hit_text = hit.path.to_string_lossy().replace('\\', "/");
+        assert!(
+            hit_text.ends_with("use_agent_store.test.ts")
+                || hit_text.ends_with("tests/late_delta.ts"),
+            "the hit lands in one of the two test fixtures: {:?}",
+            hit.path
+        );
+    }
+
+    #[test]
+    fn find_exact_test_title_rejects_paraphrase_partial_comment_non_test() {
+        // The anti-paraphrase contract (the gate's precision is the point):
+        // a suffix paraphrase, a partial title, and a comment-only mention
+        // must ALL reject — only the entire quoted literal argument of an
+        // it()/test()/describe() call in a TEST file satisfies the check.
+        let title = "regression (backlog 076f601e): a late text_delta after \
+                     finished settles into the transcript — never resurrects \
+                     the plain streaming block";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        // Suffix paraphrase: the on-disk title TOOK extra trailing words.
+        std::fs::write(
+            dir.path().join("a.test.ts"),
+            format!(
+                "it({title:?} + \" — with extra trailing words\", () => {{}});\n"
+            ),
+        )
+        .unwrap();
+        // Comment-only mention in an otherwise call-free test file.
+        std::fs::write(
+            dir.path().join("b.test.ts"),
+            format!("// {title}\n// mentioned only in a comment\n"),
+        )
+        .unwrap();
+        // The EXACT it() title in a NON-test file (src/, not a tests/
+        // component, name without .test./.spec./_test./_tests.).
+        std::fs::write(
+            dir.path().join("src").join("main.ts"),
+            format!("it({title:?}, () => {{}});\n"),
+        )
+        .unwrap();
+        let graph = CodeGraph::open_in_memory(dir.path().to_path_buf()).unwrap();
+        assert!(
+            graph.find_exact_test_title(title).unwrap().is_none(),
+            "a comment-only mention must reject"
+        );
+        assert!(
+            graph
+                .find_exact_test_title(&format!("{title} — with extra trailing words"))
+                .unwrap()
+                .is_none(),
+            "a suffix-composed title is not an on-disk exact literal"
+        );
+        // Word-boundary discipline (the contains_whole_identifier
+        // precedent): `submit(`/`testify(` must not read as `test(`
+        // with a title argument.
+        std::fs::write(
+            dir.path().join("c.test.ts"),
+            format!("submit({title:?});\ntestify({title:?});\n"),
+        )
+        .unwrap();
+        assert!(
+            graph.find_exact_test_title(title).unwrap().is_none(),
+            "non-call word shapes must reject"
         );
     }
 

@@ -69,6 +69,15 @@ command.
   build, so a green `cargo test` already proves there are zero warnings. Never
   add `#[allow(...)]` to silence a warning — fix the root cause (remove the dead
   code, drop the unused import, drop the unneeded `mut`, etc.).
+- **Deletion hygiene — pre-flight import-orphan check.** After any deletion
+  edit, for every symbol named in the touched files' `use` statements, run a
+  literal search (glob the file, engine: index) for remaining use sites BEFORE
+  the first battery run, and trim every orphaned import in the same edit —
+  under `#![deny(warnings)]` each orphan is a hard build failure, so one
+  search pass replaces N build cycles (2027-01-14, job 2c step 2c.4 on
+  wt/mnemo, commit 6fe6768: deleting `SteeringStats::shared()` orphaned
+  `OnceLock`, then `Arc`, one at a time — two full cargo cycles burned on a
+  mechanically predictable failure).
 
 ## Documentation expectations
 

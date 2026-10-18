@@ -90,6 +90,17 @@ pub struct FileEditArgs {
     /// `old_string`/`use_regex`/`replace_all`/`count`.
     #[serde(default)]
     pub lines: Option<Vec<usize>>,
+    /// Read-receipt cite (backlog 3fdc605f, plan 5a21fc8f): the id a
+    /// prior read_files call minted (the read section's `[read receipt …]`
+    /// trailer). With `lines` it turns the line-range mode into a VALIDATED
+    /// anchor — the current bytes at those lines must still match what the
+    /// read served (any drift hard-fails with a fresh-read steer, never a
+    /// fuzzy apply) — so the edit needs no `old_string` and the verbatim
+    /// bytes never have to live in the model's context (compaction-proof).
+    /// Mutually exclusive with every other field; requires `lines` +
+    /// `new_string`.
+    #[serde(default)]
+    pub from_read: Option<String>,
     /// When true (literal mode only), locate `old_string` by normalizing
     /// whitespace — collapse runs of spaces/tabs to a single space and ignore
     /// trailing whitespace per line — so tab-vs-space or off-by-one-space
@@ -221,12 +232,55 @@ fn large_payload_note(args: &FileEditArgs) -> Option<String> {
 /// line-range mode (`lines`) requires no `old_string`; otherwise the
 /// `use_regex`/literal path runs.
 pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+    // No sandbox at this layer (the ~80 direct test callers): the display
+    // path stands in for the validated one. A from_read cite resolves
+    // against the receipt's sandbox-canonical path, so the tool paths
+    // (execute + the approval preview) thread the real validated path
+    // through prepare_edit_ctx — the tests never mint receipts.
+    prepare_edit_ctx(args, content, "", Path::new(&args.path))
+}
+
+/// [`prepare_edit`] with the received-arguments truncation note threaded
+/// in: the old_string-empty arm (the arg-shape rejection a truncated call
+/// lands on when its edit payload was dropped in emission) appends it so
+/// the rejection shows what the executor received (backlog 05a0905f). The
+/// note is execute-only; every other caller (approval previews, tests)
+/// passes "" and gets the historical text unchanged.
+fn prepare_edit_ctx(
+    args: &FileEditArgs,
+    content: &str,
+    received_note: &str,
+    validated_path: &Path,
+) -> Result<PreparedEdit> {
+    if args.from_read.is_some() {
+        // The read-receipt cite (backlog 3fdc605f) is the lines mode's
+        // validated anchor — it combines with lines + new_string only.
+        if args.ops.is_some() {
+            return Err(crate::error::Error::InvalidInput(
+                "from_read is mutually exclusive with ops — the anchor items carry \
+                 their own from_read cites"
+                    .into(),
+            ));
+        }
+        if args.append {
+            return Err(crate::error::Error::InvalidInput(
+                "from_read is mutually exclusive with append".into(),
+            ));
+        }
+        if args.lines.is_none() {
+            return Err(crate::error::Error::InvalidInput(
+                "from_read needs lines: [start, end] — it is the line-range mode's \
+                 validated anchor (cite the receipt a read_files call minted)"
+                    .into(),
+            ));
+        }
+    }
     if args.ops.is_some() {
-        prepare_edit_ops(args, content)
+        prepare_edit_ops(args, content, validated_path)
     } else if args.append {
         prepare_edit_append(args, content)
     } else if args.lines.is_some() {
-        prepare_edit_lines(args, content)
+        prepare_edit_lines(args, content, validated_path)
     } else {
         // String-matching mode (literal or regex) requires a non-empty
         // old_string. An empty needle would insert new_string between every
@@ -234,14 +288,17 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
         // empty pattern matches at every position) — silent corruption. The
         // line-range path above doesn't use old_string, so it's exempt.
         if args.old_string.is_empty() {
-            return Err(crate::error::Error::InvalidInput(
+            // The {received_note} hole (backlog 05a0905f): "" keeps the
+            // historical text byte-identical; execute threads the
+            // received-bytes context + truncation remedy through so a
+            // truncated call is never blind-retryable.
+            return Err(crate::error::Error::InvalidInput(format!(
                 "old_string is empty — provide old_string (string matching) or \
                  lines: [start, end] (line range). If you meant the literal text \
                  'null' (dropped by the null-stringify defense), use batch mode \
                  (an ops anchor item's old_string is required, never dropped) or \
-                 use_regex (e.g. nul[l])"
-                    .into(),
-            ));
+                 use_regex (e.g. nul[l]){received_note}"
+            )));
         }
         if args.use_regex {
             prepare_edit_regex(args, content)
@@ -258,7 +315,11 @@ pub fn prepare_edit(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> 
 /// mismatch cannot cause a failure. The file's line-ending style is
 /// preserved: `new_string` is normalized to the file's detected style
 /// before insertion.
-fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+fn prepare_edit_lines(
+    args: &FileEditArgs,
+    content: &str,
+    validated_path: &Path,
+) -> Result<PreparedEdit> {
     // Exactly [start, end] (backlog 838b6f4e): one tuple parameter — the
     // half-filled start/end pair ("must both be set") is unrepresentable.
     let bounds = args.lines.as_deref().unwrap_or(&[]);
@@ -283,6 +344,23 @@ fn prepare_edit_lines(args: &FileEditArgs, content: &str) -> Result<PreparedEdit
         return Err(crate::error::Error::InvalidInput(format!(
             "lines[1] (end, {end}) must be >= lines[0] (start, {start})"
         )));
+    }
+
+    // The read-receipt cite (backlog 3fdc605f): the lines mode's
+    // validated anchor. Exactly one anchor form per call, and the
+    // CURRENT bytes at [start, end] must still match what the cited
+    // read served — drift hard-fails with the fresh-read steering,
+    // never a fuzzy apply. Without a cite the range stays blind (the
+    // historical line-range semantics).
+    if let Some(id) = &args.from_read {
+        if !args.old_string.is_empty() {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "from_read and old_string are BOTH set — exactly one anchor form: \
+                 {{old_string, new_string}} (verbatim) or {{from_read, lines, \
+                 new_string}} (read-receipt cite)"
+            )));
+        }
+        crate::tool::agent::read_registry::resolve(id, validated_path, start, end, content)?;
     }
 
     // Split into lines. Rust's `str::lines()` splits on \n (dropping the
@@ -439,8 +517,16 @@ fn prepare_edit_literal(args: &FileEditArgs, content: &str) -> Result<PreparedEd
 /// op's 1-based index. Emission artifacts are validated per op and once on
 /// the combined brace delta (a legitimate two-step array can be temporarily
 /// unbalanced mid-apply); the diff is one combined diff.
-fn prepare_edit_ops(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
+fn prepare_edit_ops(
+    args: &FileEditArgs,
+    content: &str,
+    validated_path: &Path,
+) -> Result<PreparedEdit> {
     let ops = validate_ops(args)?;
+    // The read-receipt cites resolve against the CURRENT bytes BEFORE any
+    // op applies (backlog 3fdc605f): drift hard-fails with the fresh-read
+    // steering and nothing is written.
+    let ops = crate::tool::agent::edit_ops::resolve_read_anchors(validated_path, content, ops)?;
     let (new_content, notes) = apply_ops(
         &args.path,
         content,
@@ -697,7 +783,11 @@ impl Tool for FileEditTool {
                backslash, or is >3 lines, prefer the ops array with a compact line op. Six modes: \
               LITERAL (default, first \
               occurrence), REGEX (use_regex), LINE-RANGE (lines: [start, end] — no \
-              old_string needed, so whitespace mismatches cannot bite), FUZZY \
+              old_string needed, so whitespace mismatches cannot bite; with \
+              from_read — the read-receipt id a read_files trailer minted — \
+              the range becomes a VALIDATED anchor: the current bytes at \
+              those lines must match the cited read, drift hard-fails with a \
+              fresh-read steer), FUZZY \
              (fuzzy_whitespace, literal only), OPS (ops — an atomic ops array \
              applied in order with ONE write; any failing op aborts the whole \
              array with the file untouched on disk; an element is a compact \
@@ -718,7 +808,11 @@ impl Tool for FileEditTool {
                     "count": {"type": "integer", "description": "Replace at most N matches (vi-style count); overrides replace_all."},
                     "lines": {"type": "array", "items": {"type": "integer"}, "description": "Line-range mode: exactly [start, end] — 1-indexed, inclusive; use the numbers shown by file_read. That range is replaced by new_string — old_string, replace_all, use_regex, count and fuzzy_whitespace are all ignored in this mode. One tuple, so the pair can never be half-filled."},
                     "fuzzy_whitespace": {"type": "boolean", "description": "Literal mode only: locate old_string with whitespace normalized — runs of spaces/tabs collapse to one space, trailing whitespace ignored — catching tab-vs-space and off-by-one mismatches. The replacement is spliced in verbatim (default: false)."},
-                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}}, "required": ["old_string", "new_string"]}]}},
+                    "from_read": {"type": "string", "description": "Read-receipt cite (backlog 3fdc605f): the id from a prior read_files section trailer. With lines: [start, end] the range becomes a VALIDATED anchor — the current bytes at those lines must match what the cited read served (drift hard-fails with a fresh-read steer, never a fuzzy apply), so the edit needs no old_string and survives context compaction. Mutually exclusive with every other field; requires lines + new_string."},
+                    "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
+                  read-receipt cite {from_read, lines, new_string} (backlog \
+                  3fdc605f: validated server-side against the cited read's bytes; \
+                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
                     "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
@@ -737,9 +831,16 @@ impl Tool for FileEditTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: FileEditArgs = match serde_json::from_value(args) {
+        // Backlog 05a0905f: the truncation note for the old_string-empty
+        // rejection — captured while the raw arguments Value is still
+        // alive (before it is shadowed by the parsed args; post-parse
+        // the payload fields are gone, so this is the only place the
+        // received bytes are visible).
+        let received_note =
+            crate::tool::error_message::received_truncation_note(&args);
+        let args: FileEditArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // (backlog 1db26c95) Restore boundary-token markers to the raw
         // tokens in BOTH edit strings: the agent reconstructs old_string
@@ -828,7 +929,7 @@ impl Tool for FileEditTool {
                 Err(e) => return ToolResult::error(format!("failed to read '{}': {e}", args.path)),
             };
 
-            let prepared = match prepare_edit(&args, &content) {
+            let prepared = match prepare_edit_ctx(&args, &content, &received_note, &validated) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::error(format!("{e}")),
             };
@@ -879,7 +980,10 @@ impl FileEditTool {
         }
         self.sandbox.refuse_if_protected(&validated)?;
         let content = std::fs::read_to_string(&validated)?;
-        let prepared = prepare_edit(args, &content)?;
+        // Thread the validated path (backlog 3fdc605f): a from_read cite
+        // must resolve its receipt in the preview too, exactly as execute
+        // would.
+        let prepared = prepare_edit_ctx(args, &content, "", &validated)?;
         let diff = if prepared.diff.chars().count() > PREVIEW_DIFF_CHAR_BUDGET {
             let mut d: String = prepared
                 .diff
@@ -940,9 +1044,201 @@ mod tests {
         assert_eq!(args.lines, Some(vec![1, 2]));
     }
 
+    #[tokio::test]
+    async fn old_string_empty_rejection_carries_received_bytes_context() {
+        // Backlog 05a0905f regression (plan 81a1b70d): a truncated
+        // file_edit payload whose old_string/new_string were dropped in
+        // emission used to reject with only "old_string is empty — …",
+        // never showing that the executor received just the path — the
+        // model blind-retried the identical payload. The rejection must
+        // carry the received byte count + keys + the truncation remedy.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+        let result = tool.execute(serde_json::json!({"path": "a.txt"})).await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("old_string is empty"),
+            "{}",
+            result.output
+        );
+        assert!(result.output.contains("received"), "{}", result.output);
+        assert!(result.output.contains("bytes"), "{}", result.output);
+        assert!(result.output.contains("re-emit"), "{}", result.output);
+    }
+
+    /// Read `path` via the read tool and return the receipt id it minted
+    /// (backlog 3fdc605f, plan 5a21fc8f): the from_read cite form needs
+    /// the id, not the verbatim bytes — the whole point of the reference
+    /// anchor.
+    async fn mint_receipt(dir: &Path, path: &str) -> String {
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(Sandbox::new(dir).unwrap());
+        let result = read
+            .execute(serde_json::json!({"files": [{"path": path}]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", result.output))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn from_read_anchor_applies_cleanly_on_unchanged_file() {
+        // Backlog 3fdc605f acceptance (1): an edit whose anchor is a
+        // line-range reference to a prior read applies cleanly while the
+        // file is unchanged — the verbatim old_string never needs to
+        // live in the model's context.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nB\nc\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_anchor_hard_fails_on_drift_never_fuzzy() {
+        // Backlog 3fdc605f acceptance (2): when the file changed since the
+        // read, the reference anchor HARD-FAILS with the fresh-read
+        // steering — never a blind/fuzzy apply of stale line numbers.
+        // Pre-fix red: the unknown from_read key was silently ignored and
+        // the blind lines-mode replace applied anyway.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        std::fs::write(dir.path().join("a.txt"), "a\nZZ\nc\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(!result.success, "drift must hard-fail: {}", result.output);
+        assert!(
+            result
+                .output
+                .contains(crate::agent::steering_stats::EDIT_STALE_READ_MARK),
+            "the drift rejection carries the fresh-read steering: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nZZ\nc\n",
+            "never a fuzzy apply: the file keeps the drifted content"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_unknown_id_steers_to_a_fresh_read() {
+        // An unknown receipt id is rejected with the id named and a
+        // steering to re-read — never silently ignored. Pre-fix red: the
+        // unknown key fell through to the BLIND lines-mode replace and
+        // the edit applied anyway.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": "r404", "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("r404"),
+            "the unknown id must be named: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains(crate::agent::steering_stats::EDIT_STALE_READ_MARK),
+            "steering to a fresh read: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_rejects_both_forms_set() {
+        // Shape rule: exactly one of old_string | from_read+lines — both
+        // set is ambiguous. Pre-fix red: lines mode won and old_string
+        // was silently ignored.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "a.txt",
+                "from_read": "rwhatever",
+                "lines": [2, 2],
+                "old_string": "b",
+                "new_string": "B"
+            }))
+            .await;
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("from_read") && result.output.contains("old_string"),
+            "the shape error names both forms: {}",
+            result.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nb\nc\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_read_resumes_a_sequence_without_rereading() {
+        // Backlog 3fdc605f acceptance (3): one read serves a whole
+        // interrupted edit sequence — two sequential edits cite the SAME
+        // receipt at disjoint ranges with no re-read between them (the
+        // post-compaction resume: the bytes are gone from context, the
+        // id is not). Validation is per-line (the receipt's line
+        // hashes), not whole-file: edit 1 touching line 2 must not
+        // invalidate the line-5 anchor.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let id = mint_receipt(dir.path(), "a.txt").await;
+        let first = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [2, 2], "new_string": "B"
+            }))
+            .await;
+        assert!(first.success, "{}", first.output);
+        // No re-read: the same receipt, a disjoint range.
+        let second = tool
+            .execute(serde_json::json!({
+                "path": "a.txt", "from_read": id, "lines": [5, 5], "new_string": "E"
+            }))
+            .await;
+        assert!(second.success, "{}", second.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nB\nc\nd\nE\n"
+        );
+    }
+
     /// Build literal-mode args (the common case for existing tests).
     fn lit_args(path: &str, old: &str, new: &str, replace_all: bool) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: old.into(),
             new_string: new.into(),
@@ -966,6 +1262,7 @@ mod tests {
         count: Option<usize>,
     ) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: pat.into(),
             new_string: new.into(),
@@ -983,6 +1280,7 @@ mod tests {
     /// Build line-range-mode args.
     fn line_args(path: &str, start: usize, end: usize, new: &str) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: String::new(),
             new_string: new.into(),
@@ -1814,6 +2112,7 @@ mod tests {
     /// Build literal-mode args with fuzzy_whitespace=true.
     fn fuzzy_args(path: &str, old: &str, new: &str, replace_all: bool) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: old.into(),
             new_string: new.into(),
@@ -1906,6 +2205,7 @@ mod tests {
     fn fuzzy_ignored_in_regex_mode() {
         // use_regex=true + fuzzy=true: fuzzy is ignored, regex path runs.
         let args = FileEditArgs {
+            from_read: None,
             path: "a.txt".into(),
             old_string: r"\d+".into(),
             new_string: "N".into(),
@@ -1987,6 +2287,7 @@ mod tests {
     /// Build batch-mode args with empty single-edit fields.
     fn batch_args(path: &str, items: Vec<EditItem>) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: String::new(),
             new_string: String::new(),
@@ -2028,18 +2329,21 @@ mod tests {
             "a.rs",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn a() {}".into(),
                     new_string: "fn a2() {}".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn a2() {}".into(),
                     new_string: "fn a3() {}".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn b() {}".into(),
                     new_string: "fn b2() {}".into(),
                     count: None,
@@ -2134,6 +2438,7 @@ mod tests {
         let args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: "x".into(),
                 new_string: "y".into(),
                 count: None,
@@ -2146,6 +2451,7 @@ mod tests {
         let args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: "x".into(),
                 new_string: "y".into(),
                 count: Some(2),
@@ -2163,12 +2469,14 @@ mod tests {
             "a.rs",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn a() {}".into(),
                     new_string: "fn a2() {}".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn b() {}".into(),
                     new_string: "fn b2() {}".into(),
                     count: None,
@@ -2189,6 +2497,7 @@ mod tests {
         let mut args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: "x".into(),
                 new_string: "y".into(),
                 count: None,
@@ -2201,6 +2510,7 @@ mod tests {
         let mut args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: "x".into(),
                 new_string: "y".into(),
                 count: None,
@@ -2213,6 +2523,7 @@ mod tests {
         let mut args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: "x".into(),
                 new_string: "y".into(),
                 count: None,
@@ -2228,6 +2539,7 @@ mod tests {
     /// Build append-mode args with every other field at its default.
     fn append_args(path: &str, new_string: &str) -> FileEditArgs {
         FileEditArgs {
+            from_read: None,
             path: path.into(),
             old_string: String::new(),
             new_string: new_string.into(),
@@ -2295,6 +2607,7 @@ mod tests {
 
         let mut args = append_args("a.txt", "tail");
         args.ops = Some(vec![serde_json::to_value(EditItem {
+            from_read: None, lines: None,
             old_string: "x".into(),
             new_string: "y".into(),
             count: None,
@@ -2322,6 +2635,7 @@ mod tests {
         let args = batch_args(
             "a.txt",
             vec![EditItem {
+                from_read: None, lines: None,
                 old_string: String::new(),
                 new_string: "x".into(),
                 count: None,
@@ -2462,12 +2776,14 @@ mod tests {
             "a.rs",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn a() {}".into(),
                     new_string: "placeholder".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn b() {}".into(),
                     new_string: "fn b2() {}".into(),
                     count: None,
@@ -2486,12 +2802,14 @@ mod tests {
             "a.rs",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn a() {}".into(),
                     new_string: "fn a2() {}\n/// foo".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "fn c() {}".into(),
                     new_string: "/// foo\nfn c2() {}".into(),
                     count: None,
@@ -2575,12 +2893,14 @@ mod tests {
             "a.txt",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "it's here".into(),
                     new_string: "it was here".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "plain".into(),
                     new_string: "PLAIN".into(),
                     count: None,
@@ -2694,12 +3014,14 @@ mod tests {
             "a.txt",
             vec![
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "keep".into(),
                     new_string: "KEEP".into(),
                     count: None,
                     fuzzy_whitespace: None,
                 },
                 EditItem {
+                    from_read: None, lines: None,
                     old_string: "same".into(),
                     new_string: "same".into(),
                     count: None,

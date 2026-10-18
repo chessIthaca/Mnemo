@@ -129,9 +129,9 @@ impl Tool for ExpandResultTool {
         )
     }
     async fn execute(&self, args: Value) -> ToolResult {
-        let args: ExpandResultArgs = match serde_json::from_value(args) {
+        let args: ExpandResultArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         let store = match self.store_or_error() {
             Ok(s) => s,

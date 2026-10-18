@@ -31,10 +31,17 @@ approval-gated coding harness — not a UI swap.
 6 suites) + 21 integration + 92 vitest files / 1319 frontend tests;
 `cargo check` and `tsc --noEmit` clean.
 
-**Kernel/headless feature lattice (2026-10-13, G10).** The library
+**Kernel/headless feature lattice (2026-10-13, G10; app unification
+2026-10-16, job 6).** The library
 now slices into Cargo features — `kernel` (the core, always
 compiled), `headless` (the public engine surface:
-Engine/AgentSession/Setup/*Api; implies `kernel`), `app` (the
+Engine/AgentSession/Setup/*Api, plus the job-6 app-share seams —
+`EngineBuilder::brain` (an injected `Arc<Brain>` keeps the host
+app's wiring: no second brain/store/embedder; exclusive with
+provider/memory_store/shared_resources), `Engine::swap_model` (the
+GLOBAL model swap the console's /model uses), `Engine::host` (the
+host core for the drain-phase sweep + the subagent cleanup);
+implies `kernel`), `app` (the
 plan-first workflow graph) — with `default = [kernel, app, headless]`
 so the app and the integration tests see zero change. A second
 consumer builds `--no-default-features --features kernel,headless`
@@ -43,7 +50,11 @@ consumer builds `--no-default-features --features kernel,headless`
 the kernel ONLY through the public surface — `mnemo::headless::*`,
 `mnemo::app::*`, and the curated crate-root re-export facade in
 `src/lib.rs` — enforced by
-`tests/boundary.rs::tauri_uses_only_public_api`.
+`tests/boundary.rs::tauri_uses_only_public_api`. The app itself now
+holds an Engine over its one shared brain (IpcState, served by the
+`engine_status` IPC command) and the console REPL runs on
+Engine/AgentSession (engine-spawned main session, session-bus
+events, the two-phase exit through `engine.shutdown()`).
 
 **Dependency & security posture (2026-09-29).** The dependabot + CodeQL sweep
 (PRs #16–#60) modernized the dependency set and hardened CI: React 19,
@@ -265,17 +276,22 @@ snapshot and every fix: `.coding/analysis/2026-09-29-github-security-defects.md`
 
 ## Terminology
 
-- **Agent tools** — the coding tools the agent uses to do work: `file_read`,
-  `read_files` (batch sibling), `file_edit` (EOL-agnostic literal/fuzzy
+- **Agent tools** — the coding tools the agent uses to do work: `read_files`
+  (the one read tool; a top-level `{path, start_line?, max_lines?}` object
+  with no `files` key is absorbed as a one-element array, and the retired
+  `file_read`/`file_append` names redirect at the unknown-tool error),
+  `file_edit` (EOL-agnostic literal/fuzzy
   matching, atomic multi-edit batches via `ops` — compact line ops (`i`/`b`/
   `d`/`r` verbs with ranges and payloads) and anchor items sharing one array,
   append mode via `append`), `multi_edit` (atomic multi-file edits,
   `files: [{path, ops}]`, every file prepared before any write — one combined
-  diff, one approval), `file_write`, `file_append`, `shell`, `search`, `git`,
+  diff, one approval), `file_write` (mode:"append"), `shell`, `search`, `git`,
   `describe_image`.
   Live in `tool/agent/`. Gated by
-  workflow state. The two read tools cross-hint each other's argument shape
-  in their invalid-args error when a model mixes up a call. `search`/
+  workflow state. Argument mix-ups self-correct in the errors: an
+  invalid-args rejection carries the recovery hint naming the files-array
+  shape, and the retired names get the one-shot legacy redirect
+  (`legacy_tool_redirect`, `error_message.rs`). `search`/
   `search_read` serve literal single-line queries from the FTS5 content
   index (`engine: index`, bm25-ranked, glob-filtered) — and, since backlog
   c439dda0, regex-mode alternations whose every branch is an escape-only

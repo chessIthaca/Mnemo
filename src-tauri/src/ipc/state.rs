@@ -50,6 +50,12 @@ pub struct IpcState {
     /// retired with the registration move. `None` on the arms that build
     /// no agent (no skill path to serve).
     pub app_policy_factory: Option<Arc<mnemo::app::policy_factory::WorkflowPolicyFactory>>,
+    /// The app's headless Engine (job 6, §5.9.10 :747-753): constructed in
+    /// the Ready branch over the SAME shared brain (the EngineBuilder::brain
+    /// injection seam) — one brain, one store, one config Arc. `None` on
+    /// the arms that build no agent (no brain to share). Held, not yet
+    /// served: IPC routing moves onto it in the later job-6 slices.
+    pub engine: Option<mnemo::headless::Engine>,
     /// The agent runtime: manager, per-agent loops, factory, safety.
     pub runtime: AgentRuntimeContext,
     /// The project: project handle, config, sandbox.
@@ -315,6 +321,15 @@ impl IpcState {
             .safety_rules
             .as_ref()
             .ok_or_else(|| "safety rules unavailable (brain failed to start)".into())
+    }
+
+    /// The headless Engine (job 6, §5.9.10), or an error if the brain
+    /// failed to start — the Ready branch holds one over the SAME shared
+    /// brain.
+    pub fn engine(&self) -> Result<&mnemo::headless::Engine, crate::ipc::error::IpcError> {
+        self.engine
+            .as_ref()
+            .ok_or_else(|| "engine unavailable (brain failed to start)".into())
     }
 
     /// Set the runtime safety mode + re-evaluate pending approvals against it.

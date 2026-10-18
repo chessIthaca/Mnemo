@@ -60,10 +60,14 @@ consumers the full set; a second consumer builds the lean surface:
 cargo build -p mnemo --no-default-features --features kernel,headless
 ```
 
-`examples/second_consumer.rs` is the ~140-line proof — a NoPolicy
+`examples/second_consumer.rs` is the ~280-line proof — a NoPolicy
 agent with a non-coding identity, tools narrowed to `[Read, Host]`,
 one host tool the host answers itself, turn limits, every session
-event printed as JSON. The app crate is held to the same public
+event printed as JSON. It runs two ways: `MNEMO_HOME` set resolves a
+configured endpoint like a real deployment; unset, an in-file scripted
+provider (the public `Engine::builder(..).provider(..)` override)
+drives the whole host-tool round trip offline — the shape CI's
+`examples` job runs and asserts. The app crate is held to the same public
 surface: `tests/boundary.rs` fails the build if `src-tauri` reaches
 into `mnemo::agent::` / `mnemo::runtime::` / `mnemo::host::`
 internals.

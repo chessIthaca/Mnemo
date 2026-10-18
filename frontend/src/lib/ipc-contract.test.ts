@@ -140,6 +140,9 @@ describe("IPC contract — event fixtures dispatch through the reducer", () => {
   });
 
   it("event-text-delta: appends to streaming text", () => {
+    // Mid-turn context: a delta arriving while the turn is over settles into
+    // the transcript instead (backlog 076f601e), so open the turn first.
+    useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: { kind: "started" } }));
     useAgentStore.getState().handleAgentEvent(asPayload({ agent_id: ID, event: textDelta }));
     expect(agent(ID).streamingText).toBe("hi");
   });

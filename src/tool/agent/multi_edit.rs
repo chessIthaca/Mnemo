@@ -105,11 +105,17 @@ fn file_error(idx: usize, path: &str, source: crate::error::Error) -> crate::err
 /// Path uniqueness is NOT checked here — raw spellings are not the identity
 /// (`a.txt` and `./a.txt` are one file), so the duplicate guard runs on the
 /// sandbox-validated targets in `prepare_files`.
-fn validate_files(args: &MultiEditArgs) -> Result<Vec<(String, Vec<crate::tool::agent::edit_ops::EditOp>)>> {
+fn validate_files(
+    args: &MultiEditArgs,
+    received_note: &str,
+) -> Result<Vec<(String, Vec<crate::tool::agent::edit_ops::EditOp>)>> {
     let files = args.files.as_deref().ok_or_else(|| {
-        crate::error::Error::InvalidInput(
-            "files is required — provide at least one {path, ops} entry".into(),
-        )
+        // Backlog 05a0905f: the received-note makes the bare text
+        // self-diagnosing — a truncated call shows its own byte count,
+        // keys and tail instead of inviting an identical retry.
+        crate::error::Error::InvalidInput(format!(
+            "files is required — provide at least one {{path, ops}} entry{received_note}"
+        ))
     })?;
     if files.is_empty() {
         return Err(crate::error::Error::InvalidInput(
@@ -125,7 +131,7 @@ fn validate_files(args: &MultiEditArgs) -> Result<Vec<(String, Vec<crate::tool::
         }
         let values = file.ops.as_deref().ok_or_else(|| {
             crate::error::Error::InvalidInput(format!(
-                "files[{idx}] '{}': ops is required — provide at least one op",
+                "files[{idx}] '{}': ops is required — provide at least one op{received_note}",
                 file.path
             ))
         })?;
@@ -152,8 +158,12 @@ fn validate_files(args: &MultiEditArgs) -> Result<Vec<(String, Vec<crate::tool::
 /// file prepare against the same original, then write in order with the LAST
 /// entry winning — silently dropping the first entry's edit while the
 /// combined preview claimed both applied (review L2).
-fn prepare_files(sandbox: &Sandbox, args: &MultiEditArgs) -> Result<Vec<PreparedFile>> {
-    let entries = validate_files(args)?;
+fn prepare_files(
+    sandbox: &Sandbox,
+    args: &MultiEditArgs,
+    received_note: &str,
+) -> Result<Vec<PreparedFile>> {
+    let entries = validate_files(args, received_note)?;
     let mut prepared = Vec::with_capacity(entries.len());
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(entries.len());
     for (idx, (path, ops)) in entries.into_iter().enumerate() {
@@ -184,6 +194,11 @@ fn prepare_files(sandbox: &Sandbox, args: &MultiEditArgs) -> Result<Vec<Prepared
             }
             Err(e) => return Err(file_error(idx, &path, crate::error::Error::Io(e))),
         };
+        // The read-receipt cites resolve against the CURRENT bytes BEFORE
+        // any op applies (backlog 3fdc605f): drift hard-fails with the
+        // fresh-read steering and nothing is written.
+        let ops = crate::tool::agent::edit_ops::resolve_read_anchors(&validated, &content, ops)
+            .map_err(|e| file_error(idx, &path, e))?;
         let (new_content, notes) = apply_ops(
             &path,
             &content,
@@ -268,9 +283,10 @@ impl Tool for MultiEditTool {
                 "{} Apply ops to SEVERAL files ATOMICALLY: nothing is written until \
                  every file applies cleanly, so a failing op leaves ALL files untouched. \
                  Entries are {{path, ops}} — the ops array is file_edit's (compact line \
-                 ops + anchor objects, applied IN ORDER, line numbers as left by the \
-                 preceding ops). One combined diff is returned. Use file_edit for a \
-                 single file.",
+                  ops + anchor objects — verbatim old_string anchors or read-receipt \
+                  cites — applied IN ORDER, line numbers as left by the \
+                  preceding ops). One combined diff is returned. Use file_edit for a \
+                  single file.",
                 tool_contract::contract(
                     "`files`",
                     "{\"files\":[{\"path\":\"a.rs\",\"ops\":[\"d202-205\"]}]}"
@@ -281,7 +297,7 @@ impl Tool for MultiEditTool {
                 "properties": {
                     "files": {"type": "array", "description": "The files to edit, each with its own ops. Nothing is written until ALL files succeed — a failing op aborts the whole call with no write anywhere.", "items": {"type": "object", "properties": {
                         "path": {"type": "string", "description": "Path to the file, relative to the project root."},
-                        "ops": {"type": "array", "description": "The ops to apply IN ORDER — the same forms as file_edit's ops array: compact line-op strings (e.g. 'i101:text' insert after line 101, 'b101:text' insert before, 'd202-205' delete, 'd100-' to EOF, 'r102:text' replace; {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed) or anchor objects {old_string, new_string, count?, fuzzy_whitespace?} (an anchor must match exactly once unless it sets count). Line numbers refer to the content as left by the preceding ops.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default false)."}}, "required": ["old_string", "new_string"]}]}}
+                        "ops": {"type": "array", "description": "The ops to apply IN ORDER — the same forms as file_edit's ops array: compact line-op strings (e.g. 'i101:text' insert after line 101, 'b101:text' insert before, 'd202-205' delete, 'd100-' to EOF, 'r102:text' replace; {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed) or anchor objects {old_string, new_string, count?, fuzzy_whitespace?} (an anchor must match exactly once unless it sets count), or read-receipt cites {from_read, lines, new_string} (backlog 3fdc605f: the id a read_files trailer minted, validated server-side against the cited read's bytes — drift hard-fails with a fresh-read steer). Line numbers refer to the content as left by the preceding ops.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Max occurrences to replace (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant match (default false)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}}
                     }, "required": ["path", "ops"]}},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation for every file in this call (see the rejection message)."}
                 },
@@ -300,13 +316,23 @@ impl Tool for MultiEditTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: MultiEditArgs = match serde_json::from_value(args) {
+        // Backlog 05a0905f: capture the received-arguments note while the
+        // raw Value is still alive — the arg-shape validators
+        // (validate_files) run post-parse, so this is the only place the
+        // bytes the executor received are still visible. Without it the
+        // bare "ops is required" is blind-retryable: the model believes
+        // it sent the payload, so it re-emits the identical truncated
+        // call, one full round-trip per retry.
+        let received_note =
+            crate::tool::error_message::received_truncation_note(&args);
+        let args: MultiEditArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
             Err(e) => {
-                return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
-                    self.name(),
-                    &e,
-                ))
+                return ToolResult::error(
+                    crate::tool::error_message::sanitize_arguments_error_with(
+                        self.name(), &e, &args,
+                    ),
+                )
             }
         };
         let sandbox = self.sandbox.clone();
@@ -314,7 +340,7 @@ impl Tool for MultiEditTool {
         // (Perf H1, the file_edit shape). Every prepare runs before the first
         // write: that ordering IS the atomicity guarantee.
         tokio::task::spawn_blocking(move || {
-            let prepared = match prepare_files(&sandbox, &args) {
+            let prepared = match prepare_files(&sandbox, &args, &received_note) {
                 Ok(p) => p,
                 Err(e) => return ToolResult::error(format!("{e}")),
             };
@@ -362,7 +388,10 @@ impl MultiEditTool {
     /// validated, read, and spliced in memory, and the caller gets ONE
     /// combined diff covering every changed file. Does not write to disk.
     pub fn prepare_for_approval(&self, args: &MultiEditArgs) -> Result<ApprovalPreview> {
-        let prepared = prepare_files(&self.sandbox, args)?;
+        // The received-note is execute-only (backlog 05a0905f): a
+        // preview arg-shape error is discarded before it reaches the
+        // model, so the historical text stays here.
+        let prepared = prepare_files(&self.sandbox, args, "")?;
         Ok(ApprovalPreview::MultiDiff {
             paths: prepared.iter().map(|f| f.validated.clone()).collect(),
             diff: truncate_preview(combined_diff(&prepared)),
@@ -644,6 +673,72 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "a\nb\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn arg_shape_rejections_carry_received_bytes_context() {
+        // Backlog 05a0905f regression (plan 81a1b70d): an arg-shape
+        // rejection used to be bare ("ops is required") — on a truncated
+        // payload the model blind-retried the identical call and failed
+        // identically, burning a full round-trip per retry. The rejection
+        // must show what the executor actually received (byte count +
+        // keys) plus the truncation remedy, so one rejection is enough
+        // for the model to recover.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+        for (args, needle) in [
+            (json!({}), "files is required"),
+            (json!({"files": [{"path": "a.txt"}]}), "ops is required"),
+        ] {
+            let result = tool.execute(args).await;
+            assert!(!result.success, "{}", result.output);
+            // The pinned leading text stays (see
+            // rejects_bad_shapes_before_any_write):
+            assert!(result.output.contains(needle), "{}", result.output);
+            // …and the received-bytes context + remedy are new:
+            assert!(result.output.contains("received"), "{}", result.output);
+            assert!(result.output.contains("bytes"), "{}", result.output);
+            assert!(result.output.contains("re-emit"), "{}", result.output);
+        }
+    }
+
+    #[tokio::test]
+    async fn from_read_ops_items_resolve_against_one_receipt() {
+        // Backlog 3fdc605f (plan 5a21fc8f): a from_read anchor item —
+        // {from_read, lines, new_string} — resolves server-side against
+        // the receipt minted by a prior read_files call; two items cite
+        // the SAME receipt at disjoint ranges, and the verbatim bytes
+        // never ride the payload (the emission-truncation surface
+        // shrinks with them). Red-first: today the item fails EditItem
+        // deserialization (old_string required), and no receipt is
+        // minted at all.
+        let dir = tempdir().unwrap();
+        let tool = make_tool(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let read = crate::tool::agent::read_files::ReadFilesTool::new(
+            crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+        );
+        let read_result = read.execute(json!({"files": [{"path": "a.txt"}]})).await;
+        assert!(read_result.success, "{}", read_result.output);
+        let id = read_result
+            .output
+            .lines()
+            .find(|l| l.contains("[read receipt "))
+            .and_then(|l| l.split("[read receipt ").nth(1))
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .unwrap_or_else(|| panic!("read must mint a receipt: {}", read_result.output));
+        let result = tool
+            .execute(json!({"files": [{"path": "a.txt", "ops": [
+                {"from_read": id, "lines": [2, 2], "new_string": "B"},
+                {"from_read": id, "lines": [5, 5], "new_string": "E"},
+            ]}]}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "a\nB\nc\nd\nE\n"
         );
     }
 

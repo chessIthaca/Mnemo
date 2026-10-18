@@ -686,6 +686,38 @@ export function flushStreamingText(s: AgentState): void {
 }
 
 /**
+ * Settle a text chunk that arrives after the turn is over (running=false —
+ * e.g. a trailing delta landing after the terminal Finished) straight into
+ * the transcript, bypassing `streamingText` entirely.
+ *
+ * Backlog 076f601e: appending to `streamingText` while the turn is over
+ * re-mounts the PLAIN streaming block below the formatted answer (the
+ * streaming render deliberately skips markdown — Message.tsx) and the next
+ * `started` reset would silently DROP that tail — data loss. The chunk
+ * instead merges into the trailing assistant entry when there is one (the
+ * common case: the late tail belongs to the turn's answer and the merged
+ * entry keeps its original ts/entryId), or lands as a fresh assistant entry
+ * (a late chunk trailing a non-assistant tail, e.g. an error card). Fresh
+ * entries are stamped here: the batched store path (appendStreamingText)
+ * bypasses applyAgentEvent's stamping, and applyAgentEvent skips entries
+ * that already carry the fields — both routes converge on the same shape.
+ * The activity-log mirror is NOT touched here; the callers keep mirroring
+ * (the settled answer renders as markdown in the thinking box).
+ */
+export function settleTextIntoTranscript(s: AgentState, text: string): void {
+  if (!text) return;
+  const last = s.transcript[s.transcript.length - 1];
+  if (last !== undefined && last.kind === "assistant") {
+    s.transcript = [...s.transcript.slice(0, -1), { ...last, text: last.text + text }];
+    return;
+  }
+  s.transcript = capTranscript([
+    ...s.transcript,
+    { kind: "assistant", text, ts: Date.now(), entryId: allocEntryId() },
+  ]);
+}
+
+/**
  * Flush any pending streaming text, then append a transcript entry. Shared by
  * the reducers that inject a display entry from a backend-synthesized event
  * (a backlog-dispatched prompt, a toolbar-started skill, a landed steer) —

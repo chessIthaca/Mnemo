@@ -456,13 +456,20 @@ fn main() {
                     .join("backlog.jsonl"),
             )));
 
-            match &brain_result {
+            match brain_result {
                 Ok(BrainOutcome::Ready(brain)) => {
+                    // Job 6 (§5.9.10 :747-753): the ONE shared brain — the
+                    // Box<Brain> moves into an Arc (zero-copy, std's
+                    // From<Box<T>> for Arc<T>) so the GUI wiring below and
+                    // the IpcState-held Engine share the SAME brain through
+                    // the EngineBuilder::brain seam. Every `brain.X` access
+                    // is unchanged (the Arc derefs like the Box did).
+                    let brain: Arc<mnemo::headless::Brain> = Arc::from(brain);
                     attach_child_ensurer(&brain.browser, app.handle().clone());
                     let laya_cfg = tauri::async_runtime::block_on(async {
                         brain.config.lock().await.general.general.laya.clone()
                     });
-                    let (laya, pending_laya_start) = attach_laya(brain, &laya_cfg);
+                    let (laya, pending_laya_start) = attach_laya(&brain, &laya_cfg);
                     // Create the agent manager + per-agent loop map, wrapped in
                     // Arcs up front so the spawner can share them.
                     let mut mgr = AgentManager::new(256);
@@ -493,7 +500,7 @@ fn main() {
                         app.handle().clone(),
                     ));
                     brain.factory.set_spawner(spawner.clone());
-                    brain.factory.set_descendant_tracker(spawner);
+                    brain.factory.set_descendant_tracker(spawner.clone());
 
                     // Wire the app-side policy factory (2b.2; master-spec
                     // :266-269): the app impl builds each agent's WorkflowPolicy
@@ -594,19 +601,6 @@ fn main() {
                         .expect("main agent spawn must succeed");
                     });
 
-                    // Spawn the event forwarder — takes ownership of the
-                    // fan-in receiver, a clone of the manager Arc, and a
-                    // clone of the per-agent loops map (so it can remove dead
-                    // agents' loops on Exited).
-                    ipc::spawn_event_forwarder(
-                        app.handle().clone(),
-                        fanin_rx,
-                        manager.clone(),
-                        pending_approvals.clone(),
-                        pending_questions.clone(),
-                        agent_loops.clone(),
-                    );
-
                     // Push live console events from the shared browser to the
                     // Browser tab as `browser://console`.
                     ipc::browser::spawn_console_forwarder(
@@ -623,11 +617,60 @@ fn main() {
                         backlog_root.join(Project::CODING_DIR_NAME).join("logs"),
                     );
 
+                    // Job 6 (§5.9.10 :747-753): the headless Engine over the
+                    // SAME brain — the IpcState-held twin of the runtime
+                    // wiring above. Held, not yet served (the proving
+                    // consumer + the console rebuild land in the later
+                    // slices). The options carry only what the shared brain
+                    // does not: the workspace facts (the start gates' sanity
+                    // checks) + the free default permission policy (the same
+                    // factory-build default the main agent uses). The
+                    // brain's own memory/graph/embedder govern everything
+                    // else — the seam adopted them wholesale.
+                    let engine = tauri::async_runtime::block_on(async {
+                        mnemo::headless::EngineBuilder::new(mnemo::headless::EngineOptions {
+                            workspace: (*brain.workspace).clone(),
+                            // build_brain resolved the default config dir —
+                            // None resolves the same one for the engine.
+                            config_dir: None,
+                            permissions: mnemo::PermissionPolicy::default(),
+                            // Inert for an injected brain (the shared brain
+                            // owns its store); pass the app's reality.
+                            memory: mnemo::headless::MemoryBackend::Sqlite { path: None },
+                            index_codegraph: false,
+                            require_git: false,
+                            auto_install_embedder: false,
+                        })
+                        .brain(brain.clone())
+                        .start()
+                        .await
+                        .expect("engine over the ready brain must start")
+                    });
+
+                    // Review H1 (2026-10-16): the engine's
+                    // HostRuntime::start re-wired the shared factory's
+                    // spawner + descendant-tracker slots to its OWN
+                    // HostSpawner (the slot is read per build —
+                    // src/host/runtime.rs:775-781): every GUI agent built
+                    // after startup would spawn background agents into
+                    // the ENGINE's manager — invisible to the GUI (no
+                    // list_agents, no events, no cancel/set_model reach)
+                    // and running until process exit. Restore the host's
+                    // wiring — the seam's own philosophy: an injected
+                    // brain keeps the host app's wiring. The GUI-held
+                    // engine spawns no sessions, so nothing of the engine
+                    // is lost (the console's process-local factory has no
+                    // competing consumer — it keeps the engine's spawner
+                    // by design).
+                    brain.factory.set_spawner(spawner.clone());
+                    brain.factory.set_descendant_tracker(spawner);
+
                     app.manage(IpcState {
                         app_policy_factory: Some(Arc::clone(&policy_factory)),
+                        engine: Some(engine),
                         runtime: ipc::state::AgentRuntimeContext {
-                            manager,
-                            agent_loops,
+                            manager: manager.clone(),
+                            agent_loops: agent_loops.clone(),
                             context_usage: Arc::new(tokio::sync::Mutex::new(
                                 std::collections::HashMap::new(),
                             )),
@@ -675,6 +718,28 @@ fn main() {
                             run_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         },
                     });
+
+                    // Spawn the event forwarder — takes ownership of the
+                    // fan-in receiver, a clone of the manager Arc, and a
+                    // clone of the per-agent loops map (so it can remove dead
+                    // agents' loops on Exited). MUST come after
+                    // `app.manage(IpcState)`: the forwarder calls
+                    // `app.state::<IpcState>()` on the main agent's very
+                    // first event (ContextUsage), and `state()` panics before
+                    // `manage()` — killing the forwarder silently, so no
+                    // agent event ever reaches the UI and every prompt looks
+                    // dead. The race was latent (setup usually won by
+                    // microseconds) until the job-6 engine start widened the
+                    // gap. Nothing is lost by starting late: the fan-in
+                    // channel buffers the main agent's early events.
+                    ipc::spawn_event_forwarder(
+                        app.handle().clone(),
+                        fanin_rx,
+                        manager,
+                        pending_approvals.clone(),
+                        pending_questions.clone(),
+                        agent_loops,
+                    );
 
                     // The embedder status was already determined by
                     // `build_embedder` during brain construction (Ready for a
@@ -813,6 +878,7 @@ fn main() {
 
                     app.manage(IpcState {
                         app_policy_factory: None,
+                        engine: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -839,11 +905,11 @@ fn main() {
                         },
                         project: ipc::state::ProjectContext {
                             root: Arc::new(tokio::sync::Mutex::new(fallback_project)),
-                            // `brain_result` is matched by reference (the Ready
-                            // arm borrows `brain`), so `config` is a
-                            // `&Box<Config>` here and must be cloned through
-                            // the box — it cannot be moved out.
-                            config: Arc::new(tokio::sync::Mutex::new((**config).clone())),
+                            // The match consumes `brain_result` (job 6: the
+                            // Ready arm moves the Box<Brain> into the shared
+                            // Arc), so `config` is an owned `Box<Config>`
+                            // here; the clone out of the box stands.
+                            config: Arc::new(tokio::sync::Mutex::new((*config).clone())),
                             sandbox: Arc::new(fallback_sandbox),
                         },
                         approvals: pending_approvals.clone(),
@@ -910,6 +976,7 @@ fn main() {
 
                     app.manage(IpcState {
                         app_policy_factory: None,
+                        engine: None,
                         runtime: ipc::state::AgentRuntimeContext {
                             manager: Arc::new(tokio::sync::Mutex::new(mgr)),
                             agent_loops: Arc::new(tokio::sync::Mutex::new(
@@ -990,6 +1057,7 @@ fn main() {
             ipc::agent::list_agents,
             ipc::agent::ui_diag,
             ipc::agent::context_caps,
+            ipc::agent::engine_status,
             ipc::startup::startup_snapshot,
             ipc::spawn::spawn_agent,
             ipc::agent::set_model,
@@ -1182,6 +1250,35 @@ mod switch_restart_focus_contract {
         assert!(
             src.contains("window.set_focus()"),
             "the restarted window must be focused (brought on top)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwarder_after_manage_contract {
+    //! Source-contract regression test for the dead-prompt bug: the event
+    //! forwarder calls `app.state::<IpcState>()` on the main agent's first
+    //! event, and Tauri's `state()` panics before `manage()`. Spawned ahead
+    //! of `app.manage(IpcState ..)`, the forwarder died on event #1 —
+    //! silently in a release build — so no agent event ever reached the UI.
+    //! The race needs the real setup hook to reproduce, so the guard pins
+    //! the ordering (the same convention as switch_restart_focus_contract).
+
+    /// The first (Ready-arm) `app.manage(IpcState ..)` must precede the
+    /// event-forwarder spawn.
+    #[test]
+    fn event_forwarder_spawns_after_ipc_state_is_managed() {
+        let src = include_str!("main.rs");
+        let managed = src
+            .find(concat!("app.manage(", "IpcState {"))
+            .expect("the Ready arm manages IpcState");
+        let forwarder = src
+            .find(concat!("ipc::spawn_event_", "forwarder("))
+            .expect("the Ready arm spawns the event forwarder");
+        assert!(
+            managed < forwarder,
+            "spawn the event forwarder AFTER app.manage(IpcState) — its first \
+             event calls app.state::<IpcState>(), which panics before manage()"
         );
     }
 }

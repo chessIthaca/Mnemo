@@ -364,7 +364,6 @@ pub async fn spawn_agent_shared(
 /// file writes, shell, git, spawn_agent, skill tools, browser control.
 const REVIEWER_BASE_TOOLS: &[&str] = &[
     // File/read + search.
-    "file_read",
     "read_files",
     "search",
     "search_read",
@@ -1012,7 +1011,7 @@ mod tests {
     // (contract_fixtures.rs).
 
     /// Build an `AgentLoop` in a given workflow state, register a realistic
-    /// tool set (file_read + file_write + git + git_read +
+    /// tool set (read_files + file_write + git + git_read +
     /// write_review_report + create_plan + complete_step + web_fetch +
     /// memory_recall), and insert it into an `agent_loops` map under
     /// `parent_id`. Returns the map + the loop's workflow handle so the test
@@ -1049,7 +1048,7 @@ mod tests {
         // intersect against.
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(
-            crate::tool::agent::file_read::FileReadTool::new((*sandbox).clone()),
+            crate::tool::agent::read_files::ReadFilesTool::new((*sandbox).clone()),
         ));
         registry.register(Box::new(
             crate::tool::agent::file_write::FileWriteTool::new((*sandbox).clone()),
@@ -1253,7 +1252,7 @@ mod tests {
             .expect("reviewer spawn with a parent returns a list");
 
         // Read tools the parent allows (Planning allows AutoRun Agent tools).
-        assert!(list.contains(&"file_read".to_string()), "file_read allowed");
+        assert!(list.contains(&"read_files".to_string()), "read_files allowed");
         // The read-only role tools are always kept (AutoRun / safe).
         assert!(
             list.contains(&"git_read".to_string()),
@@ -1298,7 +1297,7 @@ mod tests {
             .await
             .expect("reviewer spawn with a parent returns a list");
 
-        assert!(list.contains(&"file_read".to_string()));
+        assert!(list.contains(&"read_files".to_string()));
         assert!(list.contains(&"git_read".to_string()));
         assert!(list.contains(&"write_review_report".to_string()));
         // Even though the parent (Executing) allows file_write + git, the
@@ -1353,7 +1352,7 @@ mod tests {
     async fn unrestricted_spawn_gets_parent_subset() {
         // An unrestricted spawn (no role) from a parent in Planning gets
         // EXACTLY the parent's current allowed set — so file_write/git are
-        // absent (Planning hides them) but file_read + create_plan are
+        // absent (Planning hides them) but read_files + create_plan are
         // present. This is the core "subagent ⊆ parent" property.
         let (agent_loops, _wf) =
             parent_in_state(3, crate::app::workflow::WorkflowState::Planning).await;
@@ -1362,8 +1361,8 @@ mod tests {
             .expect("unrestricted spawn with a parent returns a list");
 
         assert!(
-            list.contains(&"file_read".to_string()),
-            "parent allows file_read"
+            list.contains(&"read_files".to_string()),
+            "parent allows read_files"
         );
         assert!(
             list.contains(&"create_plan".to_string()),

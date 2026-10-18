@@ -227,6 +227,31 @@ jobs:
             target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
+  # The second-consumer example's end-to-end run (master-spec §5.9.10 :924 —
+  # "run in CI against the mock provider"; job-5 review round 1, H1, backlog
+  # c96a96ca). With MNEMO_HOME unset the example injects its in-file scripted
+  # provider through the public EngineBuilder.provider() override and runs the
+  # whole host-tool round trip offline (the same shapes the integration suite
+  # uses); this job proves the run, the round trip, and the closing reply in
+  # the captured output. Ubuntu is the cheapest runner for a platform-neutral
+  # cargo run; the tauri jobs above are untouched.
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Run second_consumer (scripted provider, the host-tool round trip)
+        run: |
+          set -o pipefail
+          cargo run --example second_consumer --no-default-features --features kernel,headless 2>&1 | tee second-consumer-output.log
+      - name: Assert the host-tool round trip and the closing reply
+        run: |
+          grep -q "acme_ticket_lookup" second-consumer-output.log
+          grep -q "weather widget shows rain for Oslo" second-consumer-output.log
+          grep -q "turn finished:" second-consumer-output.log
+
   # The GitHub release itself — created by CI, only on v* tag pushes (a manual
   # dispatch builds + uploads artifacts but never publishes). CI owns release
   # creation: never create a release for a v* tag manually — an asset-less

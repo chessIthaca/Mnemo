@@ -178,9 +178,9 @@ impl Tool for BacklogAddTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: BacklogAddArgs = match serde_json::from_value(args) {
+        let args: BacklogAddArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         // Normalize + validate once through the shared shape contract
         // (empty / length / headline+body — the same validator the IPC add
@@ -365,9 +365,9 @@ impl Tool for BacklogStatusTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: BacklogStatusArgs = match serde_json::from_value(args) {
+        let args: BacklogStatusArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
         if args.status.is_none() && args.deferred.is_none() && args.note.is_none() {
             return ToolResult::error(

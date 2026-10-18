@@ -56,11 +56,15 @@ pub(crate) const SCREENSHOT_DIR: &str = ".coding/browser/screenshots";
 /// where `self` genuinely exists.
 macro_rules! parse_args {
     ($t:ty, $args:expr, $tool:expr) => {
-        match serde_json::from_value::<$t>($args) {
+        match serde_json::from_value::<$t>($args.clone()) {
             Ok(a) => a,
             Err(e) => {
                 return ToolResult::error(
-                    crate::tool::error_message::sanitize_arguments_error($tool, &e),
+                    crate::tool::error_message::sanitize_arguments_error_with(
+                        $tool,
+                        &e,
+                        &($args),
+                    ),
                 )
             }
         }

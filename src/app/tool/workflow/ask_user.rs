@@ -115,14 +115,21 @@ impl Tool for AskUserTool {
         // reached, it means the tool was called outside the dispatch path
         // (e.g. a test calling execute directly) — validate the args and
         // return a clear error so the caller knows to use the question path.
-        match serde_json::from_value::<AskUserArgs>(args) {
+        match serde_json::from_value::<AskUserArgs>(args.clone()) {
             Ok(a) => ToolResult::error(format!(
                 "ask_user must be dispatched via the question path (emit UserQuestion + await \
                  the oneshot), not executed directly. Question was: \"{}\" ({} options).",
                 a.question,
                 a.options.len()
             )),
-            Err(e) => ToolResult::error(format!("invalid ask_user arguments: {e}")),
+            // Backlog 05a0905f (review round-1 F1): keep this copy in
+            // lockstep with parse_ask_user_args — the enriched producer,
+            // not the bare pre-fix text. This arm is
+            // dispatch-intercepted (test/direct-call-only), but it must
+            // not drift bare while the model-visible path is enriched.
+            Err(e) => ToolResult::error(
+                crate::tool::error_message::sanitize_arguments_error_with("ask_user", &e, &args),
+            ),
         }
     }
 }
@@ -131,6 +138,27 @@ impl Tool for AskUserTool {
 mod tests {
     use super::*;
     use crate::agent::ask_user_args::parse_ask_user_args;
+
+    #[test]
+    fn invalid_args_rejection_carries_received_bytes_context() {
+        // Backlog 05a0905f (plan 81a1b70d, review round-1 F1): the decode
+        // rejection used to be the bare "invalid ask_user arguments: {e}"
+        // — the one sanitizer-sweep miss (this parse predates the
+        // sanitizer and lives under src/agent/). The enriched producer
+        // shows the received bytes/keys/tail + the truncation remedy so a
+        // truncated call is never blind-retryable.
+        let args = serde_json::json!({"options": []});
+        let err = parse_ask_user_args(&args).expect_err("missing question must fail");
+        assert!(
+            err.contains("parameter 'question' is required"),
+            "{err}"
+        );
+        assert!(err.contains("received "), "{err}");
+        assert!(err.contains("bytes of arguments"), "{err}");
+        assert!(err.contains("keys: options"), "{err}");
+        assert!(err.contains("dropped in emission"), "{err}");
+        assert!(err.contains("re-emit a smaller payload"), "{err}");
+    }
 
     #[test]
     fn parses_args_with_options() {

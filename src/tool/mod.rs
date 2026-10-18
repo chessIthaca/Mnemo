@@ -31,7 +31,7 @@ use crate::provider::{ApprovalPreview, Capabilities, ToolSchema};
 /// A tool's category — determines how it's gated by the workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategory {
-    /// Coding tools (`file_read`, `shell`, etc.).
+    /// Coding tools (`read_files`, `shell`, etc.).
     Agent,
     /// Plan-lifecycle tools (`create_plan`, `complete_step`).
     Workflow,
@@ -1326,11 +1326,21 @@ impl ToolRegistry {
             // its maps): `execute_streaming` takes `serde_json::Value` by value
             // and runs across awaits with no borrow of the registry.
             Some(tool) => tool.execute_streaming(call.arguments.clone(), sink).await,
-            None => ToolResult::error(format!(
-                "unknown tool '{}'. Available: {}",
-                call.name,
-                self.available_names()
-            )),
+            None => {
+                // A retired name gets the one-shot redirect sentence
+                // appended (backlog 6954f3e9) — the model recovers on the
+                // next call instead of dead-ending on "unknown tool".
+                let mut msg = format!(
+                    "unknown tool '{}'. Available: {}",
+                    call.name,
+                    self.available_names()
+                );
+                if let Some(redirect) = error_message::legacy_tool_redirect(&call.name) {
+                    msg.push_str(" — ");
+                    msg.push_str(redirect);
+                }
+                ToolResult::error(msg)
+            }
         }
     }
 
@@ -1375,7 +1385,6 @@ fn priority_class(name: &str) -> u8 {
         "backlog_list",
         "convert_line_endings",
         "current_plan",
-        "file_read",
         "git_read",
         "list_models",
         "read_files",
@@ -2229,6 +2238,109 @@ mod tests {
                 "{name} stays available on a research plan"
             );
         }
+    }
+
+    // The browser deferred-group seam (backlog 3cc97a3d): after
+    // load_tools("browser"), the revealed tools must be per-state visible
+    // (they are research-class — the allows() arms say so) — the ungated
+    // regression guard for the contract the feature-gated factory tests
+    // cover deep. Fake tool table: category/safety are the property under
+    // test; the real Chromium stack is not needed.
+    struct FakeBrowserTool;
+    #[async_trait]
+    impl Tool for FakeBrowserTool {
+        fn name(&self) -> &str {
+            "browser_navigate_fixture"
+        }
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Browser
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                "browser_navigate_fixture",
+                "fixture: navigate a page",
+                serde_json::json!({}),
+            )
+        }
+        fn safety(&self) -> SafetyLevel {
+            SafetyLevel::NeedsApproval
+        }
+        async fn execute(&self, _args: Value) -> ToolResult {
+            ToolResult::success("navigated")
+        }
+        fn deferred_group(&self) -> Option<&str> {
+            Some("browser")
+        }
+    }
+
+    #[test]
+    fn revealed_browser_tools_visible_in_every_state() {
+        let mut r = registry();
+        r.register(Box::new(FakeBrowserTool));
+
+        // While hidden, the index advertises the browser group in both
+        // plan-first states (the load_tools door must open onto something).
+        let caps = Capabilities::openai();
+        for (state, filter) in [
+            ("Planning", ToolFilter::Planning),
+            ("Complete", ToolFilter::Complete),
+        ] {
+            assert!(
+                r.hidden_groups_for(&filter)
+                    .iter()
+                    .any(|(g, _)| g == "browser"),
+                "the browser group must be advertised in {state}"
+            );
+        }
+
+        r.load_group("browser");
+
+        for filter in [
+            ToolFilter::Planning,
+            ToolFilter::Executing,
+            ToolFilter::ExecutingResearch,
+            ToolFilter::PlanFrozen,
+            ToolFilter::Reviewing,
+            ToolFilter::Complete,
+        ] {
+            let names: Vec<String> = r
+                .schemas(&caps, &filter)
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+            assert!(
+                names.iter().any(|n| n == "browser_navigate_fixture"),
+                "revealed browser tools must be visible in {filter:?}"
+            );
+            assert!(
+                filter.allows(
+                    ToolCategory::Browser,
+                    SafetyLevel::NeedsApproval,
+                    "browser_navigate_fixture"
+                ),
+                "revealed browser tools must be callable in {filter:?}"
+            );
+        }
+        // The plan-first hard rule survives the carve-out: mutations stay hidden.
+        let plan_names: Vec<String> = r
+            .schemas(&caps, &ToolFilter::Planning)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        for m in ["file_write", "file_edit", "shell", "git"] {
+            assert!(
+                !plan_names.contains(&m.to_string()),
+                "{m} must stay hidden in Planning (no changes without a plan)"
+            );
+        }
+        // Visibility never drops the approval prompt.
+        assert_eq!(
+            r.get("browser_navigate_fixture")
+                .expect("registered above")
+                .safety(),
+            SafetyLevel::NeedsApproval,
+            "visibility never drops the approval prompt"
+        );
     }
 
     #[test]
@@ -3141,7 +3253,6 @@ mod tests {
         for name in CLASS0 {
             assert_eq!(priority_class(name), 0, "{name} must be class 0");
         }
-        assert_eq!(priority_class("file_read"), 1, "universal read tools are class 1");
         assert_eq!(priority_class("read_files"), 1);
         assert_eq!(priority_class("ask_user"), 1);
         assert_eq!(priority_class("backlog_list"), 1);
@@ -3213,5 +3324,84 @@ mod tests {
         assert!(!result.success);
         assert!(result.output.contains("unknown tool"));
         assert!(result.output.contains("file_read")); // lists available
+    }
+
+    // Retired read-tool names must not dead-end: the unknown-tool error
+    // carries the one-shot redirect naming the live tool + its arg shape
+    // (backlog 6954f3e9 — models call `file_read`/`file_append` from
+    // priors). `registry()` registers a "file_read" STUB, so the redirect
+    // is probed on a fresh registry that only carries a live tool — both
+    // legacy names are genuinely unknown to it.
+    #[tokio::test]
+    async fn dispatch_unknown_tool_legacy_names_redirect() {
+        struct ProbeStub;
+        #[async_trait]
+        impl Tool for ProbeStub {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn category(&self) -> ToolCategory {
+                ToolCategory::Agent
+            }
+            fn schema(&self) -> ToolSchema {
+                ToolSchema::new("shell", "probe stub", serde_json::json!({}))
+            }
+            fn safety(&self) -> SafetyLevel {
+                SafetyLevel::NeedsApproval
+            }
+            async fn execute(&self, _args: Value) -> ToolResult {
+                ToolResult::success("ran")
+            }
+        }
+        let mut r = ToolRegistry::new();
+        r.register(Box::new(ProbeStub));
+
+        // file_read → read_files with the files-array arg shape.
+        let call = ToolCall {
+            id: "1".into(),
+            name: "file_read".into(),
+            arguments: serde_json::json!({}),
+        };
+        let result = r.dispatch(&call).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("unknown tool 'file_read'"),
+            "the unknown-tool prefix stays: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("folded into read_files"),
+            "the redirect names the live tool: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("files"),
+            "the redirect carries the files-array shape: {}",
+            result.output
+        );
+
+        // file_append → file_write with mode:"append".
+        let call = ToolCall {
+            id: "2".into(),
+            name: "file_append".into(),
+            arguments: serde_json::json!({}),
+        };
+        let result = r.dispatch(&call).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("unknown tool 'file_append'"),
+            "the unknown-tool prefix stays: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("folded into file_write"),
+            "the redirect names the live tool: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("mode"),
+            "the redirect carries the mode/append shape: {}",
+            result.output
+        );
     }
 }

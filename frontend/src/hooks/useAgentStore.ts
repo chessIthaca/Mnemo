@@ -110,6 +110,7 @@ import {
   didMainTurnEnd,
   emptyAgentState,
   getOrCreate,
+  settleTextIntoTranscript,
   recentOutputTokPerSec,
   selectMainAgentId,
   MAX_ACTIVITY_ENTRIES,
@@ -1147,6 +1148,25 @@ export const useAgentStore = create<AppState>((set, get) => ({
   appendStreamingText: (id, text) =>
     set((s) => {
       const agent = getOrCreate(s.agents, id);
+      // Backlog 076f601e: a chunk landing while the turn is OVER (a buffered
+      // delta flushing after the terminal Finished) settles straight into the
+      // transcript, never into streamingText — the plain streaming block must
+      // not re-mount below the formatted answer, and the next started reset
+      // must not silently drop the tail. The activity-log mirror still
+      // updates (the settled answer renders as markdown in the thinking box).
+      if (!agent.running) {
+        const settled = { ...agent };
+        settleTextIntoTranscript(settled, text);
+        return {
+          agents: {
+            ...s.agents,
+            [id]: {
+              ...settled,
+              activityLog: appendAnswerEntry(agent.activityLog, text),
+            },
+          },
+        };
+      }
       return {
         agents: {
           ...s.agents,

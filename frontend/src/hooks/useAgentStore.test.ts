@@ -111,6 +111,10 @@ describe("agent event reducers (table-driven)", () => {
   });
 
   it("liveTokens: deltas accumulate chars/4 estimates per bucket and usage snaps them to zero", () => {
+    // Mid-turn context: every real turn opens with started. A delta that
+    // arrives while the turn is OVER settles into the transcript instead
+    // (backlog 076f601e), so the streaming tests must open the turn first.
+    useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "started" } });
     // 8 chars → 2 estimated tokens, completion bucket.
     useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "text_delta", text: "12345678" } });
     expect(agent(ID).liveCompletionTokens).toBe(2);
@@ -153,6 +157,8 @@ describe("agent event reducers (table-driven)", () => {
   });
 
   it("text_delta: appends to streaming text", () => {
+    // Mid-turn context (started) — see the liveTokens note (backlog 076f601e).
+    useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "started" } });
     useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "text_delta", text: "hel" } });
     useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "text_delta", text: "lo" } });
     expect(agent(ID).streamingText).toBe("hello");
@@ -192,6 +198,8 @@ describe("agent event reducers (table-driven)", () => {
   it("text_delta: mirrors the answer into the activity log (coalescing)", () => {
     // Regression (2026-08-22): the completion must stream into the reasoning
     // box too — consecutive chunks coalesce into one "answer" entry.
+    // Mid-turn context (started) — see the liveTokens note (backlog 076f601e).
+    useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "started" } });
     useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "text_delta", text: "Hel" } });
     useAgentStore.getState().handleAgentEvent({ agent_id: ID, event: { kind: "text_delta", text: "lo" } });
     const a = agent(ID);
@@ -1906,6 +1914,110 @@ describe("agent event reducers (table-driven)", () => {
     // Without this, the "Merge to main" button (gated on complete/planning)
     // can stay hidden after the last step completes.
     expect(useAgentStore.getState().planVersion).toBe(before + 1);
+  });
+
+  // NOTE: the test body is a NAMED function declaration (not an anonymous
+  // arrow) so the code graph indexes the regression test as a symbol —
+  // the finish gate's regression-test check resolves symbols, not it()
+  // title strings.
+  it("regression (backlog 076f601e): a late text_delta after finished settles into the transcript — never resurrects the plain streaming block", regression076f601eLateDeltaSettlesIntoTranscript);
+
+  function regression076f601eLateDeltaSettlesIntoTranscript() {
+    // Symptom: the streamed answer stayed plain after the turn ended and
+    // formatted only once the NEXT request was sent. Any text delta landing
+    // after the terminal Finished re-populated streamingText while
+    // running=false — the plain streamingBlock re-mounted below the
+    // formatted transcript entry and lingered until the next started, whose
+    // reset silently DROPPED the tail (data loss). A delta arriving while
+    // the agent is not running must instead settle straight into the
+    // transcript — merged into the trailing assistant entry, the turn's
+    // answer — leaving streamingText empty.
+    const dispatch = useAgentStore.getState().handleAgentEvent;
+    dispatch({ agent_id: ID, event: { kind: "started" } });
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: "Hello" } });
+    dispatch({ agent_id: ID, event: { kind: "finished", reason: "stop" } });
+    expect(agent(ID).running).toBe(false);
+    expect(agent(ID).streamingText).toBe("");
+    expect(agent(ID).transcript[agent(ID).transcript.length - 1]).toMatchObject({
+      kind: "assistant",
+      text: "Hello",
+    });
+
+    // The late delta — a trailing chunk landing after the turn ended.
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: " world" } });
+    const a = agent(ID);
+    expect(a.streamingText).toBe("");
+    expect(a.transcript[a.transcript.length - 1]).toMatchObject({
+      kind: "assistant",
+      text: "Hello world",
+    });
+  }
+
+  it("regression (backlog 076f601e, review F1): a late text_delta after a textless turn settles as a FRESH transcript entry — the append branch", () => {
+    // Round-1 review F1: both landed late-delta tests end the turn on a
+    // trailing assistant entry, so they pin only the MERGE branch of
+    // settleTextIntoTranscript. This pins its other half — the fresh-append
+    // branch, the "never drop the tail" guarantee for a turn that streamed
+    // no text at all (flushStreamingText early-returns on empty, so the
+    // transcript has no assistant tail to merge into). Red pre-fix: the idle
+    // delta re-populated streamingText (" world") and the transcript stayed
+    // empty — the tail would drop at the next started.
+    const dispatch = useAgentStore.getState().handleAgentEvent;
+    dispatch({ agent_id: ID, event: { kind: "started" } });
+    dispatch({ agent_id: ID, event: { kind: "finished", reason: "stop" } });
+    expect(agent(ID).transcript).toEqual([]);
+
+    // The late delta — a trailing chunk landing after a textless turn.
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: " world" } });
+    const a = agent(ID);
+    expect(a.streamingText).toBe("");
+    expect(a.transcript).toHaveLength(1);
+    const settled = a.transcript[0];
+    if (!settled || settled.kind !== "assistant") throw new Error("settled entry missing");
+    expect(settled.text).toBe(" world");
+    // Fresh entries are stamped by the helper itself (the batched store path
+    // bypasses applyAgentEvent's stamping) — pin the stamped-fresh shape, a
+    // merged entry would keep the flushed entry's original stamp.
+    expect(settled.entryId).toBeTruthy();
+    expect(settled.ts).toBeTruthy();
+    // The settle path skips the live token estimate while idle — no phantom
+    // count until the next turn.
+    expect(a.liveCompletionTokens).toBe(0);
+  });
+
+  it("regression (backlog 076f601e, review F1): a late text_delta after a turn ending on a tool card settles as a fresh entry after the card", () => {
+    // The production-realistic append-branch case: the turn's answer flushed
+    // ABOVE the tool card (the flush-before-structural contract), the card
+    // is the transcript tail when the turn ends, and the late chunk cannot
+    // merge into it — it must land as a fresh assistant entry AFTER the
+    // card, never resurrecting the plain streaming block, never dropped.
+    const dispatch = useAgentStore.getState().handleAgentEvent;
+    dispatch({ agent_id: ID, event: { kind: "started" } });
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: "Hello" } });
+    dispatch({ agent_id: ID, event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" } });
+    dispatch({ agent_id: ID, event: { kind: "finished", reason: "stop" } });
+    const flushed = agent(ID).transcript;
+    if (!flushed.length || flushed[flushed.length - 1].kind !== "tool") {
+      throw new Error("precondition: the turn must end on the tool card");
+    }
+
+    // The late delta — a trailing chunk landing after the tool-card turn.
+    dispatch({ agent_id: ID, event: { kind: "text_delta", text: " world" } });
+    const a = agent(ID);
+    expect(a.streamingText).toBe("");
+    const settled = a.transcript[a.transcript.length - 1];
+    if (!settled || settled.kind !== "assistant") throw new Error("settled entry missing");
+    expect(settled.text).toBe(" world");
+    expect(settled.entryId).toBeTruthy();
+    // The card stays directly above the settled tail; the earlier answer is
+    // untouched (no cross-entry merge).
+    const prev = a.transcript[a.transcript.length - 2];
+    if (!prev) throw new Error("tool card missing");
+    expect(prev.kind).toBe("tool");
+    const first = a.transcript[0];
+    if (!first || first.kind !== "assistant") throw new Error("flushed answer missing");
+    expect(first.text).toBe("Hello");
+    expect(a.liveCompletionTokens).toBe(0);
   });
 
   it("exited: removes the agent from all maps + falls back to main", () => {

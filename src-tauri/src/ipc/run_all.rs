@@ -2139,6 +2139,157 @@ mod tests {
     }
 
     #[test]
+    fn intervention_pending_steer_note_never_claims_a_requeue() {
+        // Regression (user report 2026-10-16, live: item 51f3be28; the
+        // steer spec — DECISION 581e39fa): the shared "returned to queue"
+        // suffix was stamped on a PRE-EXECUTION steer (the Pending arm) —
+        // factually false, the item never left the queue. The phrase is
+        // reserved for actual requeues — the drained-run recovery plus
+        // the two dead-run composers; plan abandonment has its OWN
+        // disposition (Failed, the "plan abandoned" note) and never
+        // uses the phrase. The arm records the truthful kind-neutral
+        // phrase
+        // ("before execution — still queued" — this fn also serves
+        // interrupts, so it must not name the intervention kind).
+        let body = fn_body(include_str!("run_all.rs"), "handle_user_intervention");
+        assert!(
+            !body.contains("format!(\"{}, returned to queue\", iv.reason)"),
+            "no intervention-led \", returned to queue\" suffix composer — a \
+             plain steer is a course correction, never a requeue (DECISION \
+             581e39fa); the phrase is reserved for actual requeues — the \
+             drained-run recovery plus the two dead-run composers \
+             (abandonment has its own Failed disposition and never uses \
+             the phrase)"
+        );
+        let pending_arm = body
+            .find("BacklogStatus::Pending => {")
+            .expect("the Pending arm must exist (pre-execution interventions \
+              record the reason)");
+        let tail = &body[pending_arm..];
+        let arm = match tail.find("_ =>") {
+            Some(end) => &tail[..end],
+            None => tail,
+        };
+        assert!(
+            arm.contains("before execution — still queued"),
+            "the Pending arm records the truthful pre-execution phrase — \
+             never \"returned to queue\" (item 51f3be28's false note)"
+        );
+        assert!(
+            arm.contains(".annotate("),
+            "the reason is still recorded in the note — no status change"
+        );
+    }
+
+    #[test]
+    fn intervention_drained_run_requeue_note_leads_with_the_exit_cause() {
+        // Regression (the same report): the drained-run requeue — the
+        // LEGITIMATE recovery (a main-agent exit drained the run, no
+        // pointer left) — must LEAD its note with the real cause,
+        // mirroring the other two requeue composers ("spawned/main agent
+        // exited while the run was active — returned to queue; …"): the
+        // intervention reason is trailing context, not the headline.
+        let body = fn_body(include_str!("run_all.rs"), "handle_user_intervention");
+        let drained_arm = body
+            .find("BacklogStatus::InFlight if from_run_all && !interrupted_run_active")
+            .expect("the drained-run requeue arm must exist (the queue is \
+              genuinely the only recovery — review round-1 LOW B)");
+        let pending_arm = body[drained_arm..]
+            .find("BacklogStatus::Pending => {")
+            .expect("the Pending arm follows");
+        let arm = &body[drained_arm..drained_arm + pending_arm];
+        let cause = arm
+            .find("main agent exited while the run was active")
+            .expect("the exit-cause phrase must be in the note");
+        let trailing = arm
+            .find("work kept in tree")
+            .expect("the trailing work-note must follow the cause");
+        assert!(
+            cause < trailing,
+            "the drained-run requeue note LEADS with the agent-exit cause — \
+             the intervention reason is trailing context, never the \
+             headline (the pre-fix failure mode was reason-leading)"
+        );
+        assert!(
+            arm.contains("store.transition(id, BacklogStatus::Pending"),
+            "the drained-run arm still requeues — the queue (+ auto-feed) is \
+             genuinely its only recovery (no pointer left)"
+        );
+    }
+
+    #[test]
+    fn steered_items_resolve_when_their_plan_completes() {
+        // Probe (memory c5feaec4 — a steered chat-driven item was observed
+        // staying InFlight after its plan completed): the spec keeps
+        // steered items in flight (a steer is a course correction,
+        // DECISION 581e39fa), so the completing turn owns their
+        // resolution. All three source dispositions must stay resolvable
+        // after a steer:
+        // (a) run-all — the steer arm keeps the run's current_item
+        //     pointer (InFlight ⇔ plan active, backlog b83e891f), so the
+        //     completing turn's run-all branch sees the item;
+        // (b) single-dispatch — the steer arm restores single_in_flight
+        //     (check-and-set, 96e2862a), so the completing turn's take
+        //     sees it (plan cace17a6);
+        // (c) chat-driven (pointer-less — the c5feaec4 case) — no pointer
+        //     exists for the steer to consume and the item↔plan linkage
+        //     is not a pointer, so resolve_linked_chat_item still
+        //     resolves the item by linkage when the plan loop closes
+        //     (backlog 9e859618, merged 2026-09-27 — the observed
+        //     stranding predates the linkage arm).
+        let steer = fn_body(include_str!("run_all.rs"), "handle_user_intervention");
+
+        // (a) run-all: the kept run is the completing turn's sight — the
+        // arm annotates, never transitions.
+        let run_all_arm = steer
+            .find("BacklogStatus::InFlight if from_run_all && interrupted_run_active")
+            .expect("the run-all keep arm exists (b83e891f)");
+        let span = &steer[run_all_arm..];
+        let drained = span
+            .find("!interrupted_run_active")
+            .expect("the drained guard follows");
+        let arm = &span[..drained];
+        assert!(
+            arm.contains(".annotate(") && !arm.contains(".transition("),
+            "the run-all keep arm keeps the item InFlight — the kept \
+             current_item pointer is what the completing turn resolves"
+        );
+
+        // (b) single-dispatch: the restored pointer is the completing
+        // turn's sight.
+        let single_arm = steer
+            .find("BacklogStatus::InFlight if !from_run_all")
+            .expect("the single-dispatch keep arm exists (cace17a6)");
+        let span = &steer[single_arm..];
+        let drained_arm = span
+            .find("BacklogStatus::InFlight if from_run_all && !interrupted_run_active")
+            .expect("the drained arm follows");
+        let arm = &span[..drained_arm];
+        assert!(
+            arm.contains("slot.is_none()"),
+            "the check-and-set restore keeps single_in_flight alive — the \
+             completing turn's take resolves the steered item"
+        );
+
+        // (c) chat-driven: the linkage arm must exist in the completing
+        // turn, and the steer handler must never touch the linkage — it
+        // is the completing turn's resolution key (backlog 9e859618),
+        // not a steer consumable.
+        let main = fn_body(include_str!("run_all.rs"), "on_main_turn_resolved");
+        assert!(
+            main.contains("resolve_linked_chat_item"),
+            "the pointer-less chat-driven item resolves by its plan linkage \
+             — the steer cannot blind this branch (no pointer to consume)"
+        );
+        assert!(
+            !steer.contains("plan_id"),
+            "the steer handler never touches the item↔plan linkage — the \
+             linkage is the completing turn's resolution key, never a \
+             steer consumable"
+        );
+    }
+
+    #[test]
     fn non_closure_resolution_keeps_the_run_armed() {
         // Regression (the amplifier, live 2027-01-07 twice — items a6a7727a
         // and 207dc316): the still-open arm ended a NATURALLY-running run
@@ -7145,7 +7296,6 @@ async fn handle_user_intervention(
             .find(|i| i.id == id)
             .map(|item| (item.status, item.note.clone()));
         if let Some((status, note)) = found {
-            let suffix = format!("{}, returned to queue", iv.reason);
             match status {
                 BacklogStatus::InFlight if from_run_all && interrupted_run_active => {
                     // Run-all item whose run still holds it: the plan is
@@ -7200,17 +7350,38 @@ async fn handle_user_intervention(
                     // main-agent exit ended it — review round-1 LOW B): the
                     // pointer is gone, so the queue (+ auto-feed) is the
                     // only recovery — requeue with the checkpoint sha
-                    // preserved.
+                    // preserved. The note LEADS with the real cause (the
+                    // agent exit — mirroring the other two requeue
+                    // composers: the spawned-agent and main-agent
+                    // dead-run recoveries); the intervention reason
+                    // rides as trailing context: a plain steer is a
+                    // course correction, never the requeue cause
+                    // (DECISION 581e39fa).
+                    let requeue_note = format!(
+                        "main agent exited while the run was active — \
+                         returned to queue; work kept in tree ({})",
+                        iv.reason
+                    );
                     let full = match note {
-                        Some(n) => format!("{n} | {suffix}"),
-                        None => suffix.clone(),
+                        Some(n) => format!("{n} | {requeue_note}"),
+                        None => requeue_note,
                     };
                     store.transition(id, BacklogStatus::Pending, Some(full));
                 }
                 BacklogStatus::Pending => {
                     // Pre-execution: the item never left the queue — record
-                    // the reason, no status change.
-                    store.annotate(id, &suffix);
+                    // the reason, no status change, and never claim a
+                    // requeue (DECISION 581e39fa): "returned to queue" is
+                    // reserved for actual requeues — the drained-run
+                    // recovery here plus the two dead-run composers; plan
+                    // abandonment has its OWN disposition (Failed, the
+                    // "plan abandoned" note) and never uses the phrase.
+                    // Kind-neutral phrasing — this fn serves steers AND
+                    // interrupts.
+                    store.annotate(
+                        id,
+                        &format!("{}, before execution — still queued", iv.reason),
+                    );
                 }
                 // Already terminal (e.g. the agent's backlog_status tool
                 // marked it, or a prior resolution resolved it): leave it

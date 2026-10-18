@@ -137,9 +137,9 @@ impl Tool for WebFetchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
-        let args: WebFetchArgs = match serde_json::from_value(args) {
+        let args: WebFetchArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
-            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(self.name(), &e)),
+            Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
         };
 
         // Validate the scheme BEFORE any network call. Only http/https — this

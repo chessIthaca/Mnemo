@@ -28,9 +28,20 @@ use crate::tool::agent::line_endings::{
 /// to the first N occurrences (default 1; required when the anchor matches
 /// more than once), `fuzzy_whitespace` enables whitespace-tolerant matching
 /// for THIS item (default: the array-level `fuzzy_whitespace`).
+///
+/// The read-reference form (backlog 3fdc605f, plan 5a21fc8f) is the
+/// alternative anchor: `from_read` cites the read-receipt id a prior
+/// read_files call minted and `lines` is `[start, end]` (1-indexed,
+/// inclusive) — the executor validates the CURRENT file bytes at those
+/// lines against the receipt server-side (drift hard-fails with a
+/// fresh-read steer), so the verbatim `old_string` never needs to live
+/// in the model's context. Exactly one form per item: `old_string` or
+/// `from_read` + `lines`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EditItem {
     /// The exact text to find (EOL-agnostic matching, as in single mode).
+    /// Empty in the read-reference form (`from_read` set).
+    #[serde(default)]
     pub old_string: String,
     /// The replacement text.
     pub new_string: String,
@@ -41,6 +52,15 @@ pub struct EditItem {
     /// `fuzzy_whitespace`).
     #[serde(default)]
     pub fuzzy_whitespace: Option<bool>,
+    /// The read-reference form (backlog 3fdc605f): the read-receipt id a
+    /// prior read_files call minted — mutually exclusive with
+    /// `old_string`.
+    #[serde(default)]
+    pub from_read: Option<String>,
+    /// The read-reference form's line range `[start, end]` (1-indexed,
+    /// inclusive) — required with `from_read`, ignored without it.
+    #[serde(default)]
+    pub lines: Option<Vec<usize>>,
 }
 
 /// Compute the unified diff between old and new content.
@@ -999,8 +1019,10 @@ pub(crate) fn parse_ops(values: &[serde_json::Value]) -> Result<Vec<EditOp>> {
             serde_json::Value::Object(_) => {
                 let item: EditItem = serde_json::from_value(value.clone()).map_err(|e| {
                     crate::error::Error::InvalidInput(format!(
-                        "ops[{idx}] is not a valid anchor item ({e}) — expected \
-                         {{old_string, new_string, count?, fuzzy_whitespace?}}"
+                    "ops[{idx}] is not a valid anchor item ({e}) — expected \
+                     {{old_string, new_string, count?, fuzzy_whitespace?}} \
+                     (verbatim anchor) or {{from_read, lines, new_string}} \
+                     (read-receipt cite, backlog 3fdc605f)"
                     ))
                 })?;
                 ops.push(EditOp::Anchor(item));
@@ -1009,7 +1031,7 @@ pub(crate) fn parse_ops(values: &[serde_json::Value]) -> Result<Vec<EditOp>> {
                 return Err(crate::error::Error::InvalidInput(format!(
                     "ops[{idx}] is not a valid op — expected a compact op string \
                      (e.g. 'd202-205', 'i101:text', 'r102:x') or an anchor object \
-                     {{old_string, new_string}}"
+                     ({{old_string, new_string}} or {{from_read, lines, new_string}})"
                 )))
             }
         }
@@ -1179,6 +1201,28 @@ fn parse_line_number(part: &str, idx: usize, raw: &str) -> Result<usize> {
 pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
     for (idx, op) in ops.iter().enumerate() {
         let EditOp::Anchor(item) = op else { continue };
+        let position = format!("edit {}/{}", idx + 1, ops.len());
+        if let Some(id) = &item.from_read {
+            // The read-reference form (backlog 3fdc605f): exactly one of the
+            // two anchor forms, and the cite needs its range.
+            if !item.old_string.is_empty() {
+                return Err(crate::error::Error::InvalidInput(format!(
+                    "{position} sets BOTH anchor forms — exactly one per item: \
+                     {{old_string, new_string}} (verbatim) or \
+                     {{from_read, lines, new_string}} (read-receipt cite)"
+                )));
+            }
+            match item.lines.as_deref() {
+                Some([start, end]) if *start >= 1 && *end >= *start => {}
+                _ => {
+                    return Err(crate::error::Error::InvalidInput(format!(
+                        "{position} cites from_read '{id}' but lines is not \
+                         [start, end] (1-indexed, inclusive, end >= start)"
+                    )))
+                }
+            }
+            continue;
+        }
         if item.old_string.is_empty() {
             return Err(crate::error::Error::InvalidInput(format!(
                 "edit {}/{} has an empty old_string — every batch item needs an \
@@ -1198,6 +1242,53 @@ pub(crate) fn validate_op_items(ops: &[EditOp]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the read-reference ops (`from_read` anchors, backlog 3fdc605f,
+/// plan 5a21fc8f) against the CURRENT file bytes and swap each for the
+/// concrete line-op it names. Runs in the prepare phase, where the
+/// content is already in scope: the receipt validation is server-side
+/// (path match + range-within-coverage + per-line hash), so ANY drift
+/// hard-fails here with the fresh-read steering — nothing is written.
+/// Verbatim anchors and compact line ops pass through untouched.
+pub(crate) fn resolve_read_anchors(
+    validated_path: &std::path::Path,
+    content: &str,
+    ops: Vec<EditOp>,
+) -> Result<Vec<EditOp>> {
+    let mut resolved = Vec::with_capacity(ops.len());
+    for op in ops {
+        let EditOp::Anchor(item) = op else {
+            resolved.push(op);
+            continue;
+        };
+        let Some(id) = item.from_read.clone() else {
+            resolved.push(EditOp::Anchor(item));
+            continue;
+        };
+        // validate_op_items already enforced the shape; stay defensive
+        // anyway — a mis-shaped cite never reaches the apply engine.
+        let Some(lines) = item.lines.as_deref() else {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "from_read '{id}' cites no lines [start, end]"
+            )));
+        };
+        if lines.len() != 2 || lines[0] == 0 || lines[1] < lines[0] {
+            return Err(crate::error::Error::InvalidInput(format!(
+                "from_read '{id}' needs lines [start, end] (1-indexed, inclusive, \
+                 end >= start) — got {lines:?}"
+            )));
+        }
+        super::read_registry::resolve(&id, validated_path, lines[0], lines[1], content)?;
+        resolved.push(EditOp::Line(LineOp {
+            raw: format!("from_read {id}"),
+            verb: LineVerb::Replace,
+            start: lines[0],
+            span: Span::Through(lines[1]),
+            payload: Some(item.new_string.clone()),
+        }));
+    }
+    Ok(resolved)
 }
 
 /// Apply every op IN ORDER to the in-memory content and return the combined
@@ -1581,8 +1672,14 @@ mod tests {
         let err = parse_ops(&[json!(7)]).unwrap_err().to_string();
         assert!(err.contains("ops[0]"), "{err}");
         assert!(err.contains("not a valid op"), "{err}");
-        let err = parse_ops(&[json!({"new_string": "b"})]).unwrap_err().to_string();
+        let err = parse_ops(&[json!({"old_string": 42})]).unwrap_err().to_string();
         assert!(err.contains("not a valid anchor item"), "{err}");
+        // Missing old_string now PARSES — old_string defaults so the
+        // read-receipt cite form (backlog 3fdc605f) needs none — and the
+        // empty-anchor rejection lives in validate_op_items.
+        let ops = parse_ops(&[json!({"new_string": "b"})]).unwrap();
+        let err = validate_op_items(&ops).unwrap_err().to_string();
+        assert!(err.contains("empty old_string"), "{err}");
     }
 
     #[test]

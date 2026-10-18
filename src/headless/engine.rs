@@ -50,10 +50,14 @@ impl HostNotifier for BusNotifier {
 /// A headless engine (§5.3 :295): the brain + the shared host core + the
 /// session event pump, started from explicit options.
 pub struct Engine {
-    /// The brain, held for the engine's lifetime so its Drop-managed
-    /// pieces (the CodeGraph file watcher) stay alive — and read by
-    /// `memory()`/`codegraph()` (3b.2 D2) for the store + graph handles.
-    brain: Brain,
+    /// The brain, held (shared) for the engine's lifetime so its
+    /// Drop-managed pieces (the CodeGraph file watcher) stay alive —
+    /// and read by `memory()`/`codegraph()` (3b.2 D2) for the store +
+    /// graph handles. Job 6 (§5.9.10 :747-753): an INJECTED brain (the
+    /// [`EngineBuilder::brain`] seam) is the SAME Arc the host app
+    /// holds — one brain, one store, one config Arc; a built brain is
+    /// wrapped here identically.
+    brain: Arc<Brain>,
     /// The shared state (host core + session registry + responder maps).
     inner: Arc<EngineInner>,
     /// The session event bus — `AgentSession::events()` subscribes.
@@ -82,6 +86,10 @@ pub struct EngineBuilder {
     provider: Option<Arc<dyn LlmClient>>,
     memory_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
     shared: Option<Arc<crate::host::brain::SharedResources>>,
+    /// Job 6 (§5.9.10 :747-753): the whole-brain injection seam —
+    /// exclusive with the three seams above (the brain carries its own
+    /// transport, store, and shared resources).
+    brain: Option<Arc<Brain>>,
 }
 
 impl EngineBuilder {
@@ -92,6 +100,7 @@ impl EngineBuilder {
             provider: None,
             memory_store: None,
             shared: None,
+            brain: None,
         }
     }
 
@@ -125,18 +134,56 @@ impl EngineBuilder {
         self
     }
 
+    /// Job 6 (§5.9.10 :747-753): inject the WHOLE brain — the app-share
+    /// seam. An engine over the host app's (GUI or console) ONE brain:
+    /// no second brain is built, no second store/embedder/watcher
+    /// starts, and the factory KEEPS its own provider + policy wiring —
+    /// the engine's sessions inherit the host app's semantics (the
+    /// built path's provider override + FreePolicyFactory assignment
+    /// are skipped, as is the config-readiness gate — the injected
+    /// factory carries its own transport). The `memory()`/`codegraph()`/
+    /// `trace()` accessors and `Setup::for_engine` read the SAME shared
+    /// handles. Exclusive with `.provider`/`.memory_store`/
+    /// `.shared_resources` — the injected brain carries its own
+    /// transport, store, and resources; `start` refuses a builder
+    /// combining them.
+    pub fn brain(mut self, brain: Arc<Brain>) -> Self {
+        self.brain = Some(brain);
+        self
+    }
+
     /// Build + start (identical to [`Engine::start`] plus the injections).
     pub async fn start(self) -> Result<Engine, EngineError> {
-        start_inner(self.opts, self.provider, self.memory_store, self.shared).await
+        // Job 6: the whole-brain seam is exclusive with the part seams —
+        // an injected brain already carries its transport, store, and
+        // shared resources, so combining them is ambiguous wiring.
+        if self.brain.is_some()
+            && (self.provider.is_some()
+                || self.memory_store.is_some()
+                || self.shared.is_some())
+        {
+            return Err(EngineError::start_failed(format!(
+                "brain injection is exclusive with provider/memory_store/shared_resources — the injected brain carries its own transport, store, and resources"
+            )));
+        }
+        start_inner(
+            self.opts,
+            self.provider,
+            self.memory_store,
+            self.shared,
+            self.brain,
+        )
+        .await
     }
 }
 
 impl Engine {
     /// The engine's brain (job 4 D4): `Setup::for_engine` Arc-clones
     /// the shared handles for the live-apply; the `memory()`/`codegraph()`
-    /// accessors read the same brain.
+    /// accessors read the same brain. Job 6: the field is the shared
+    /// `Arc<Brain>` — the same Arc an injected host app holds.
     pub(crate) fn brain(&self) -> &Brain {
-        &self.brain
+        &*self.brain
     }
     /// Start an engine on an EXPLICIT workspace + config (§5.3 :297).
     /// Never blocks and never shows a picker (§7 row 9): an unusable
@@ -444,6 +491,61 @@ impl Engine {
         CodegraphApi::from_parts(self.brain.factory.codegraph_handle())
     }
 
+    /// The engine's host core (job 6, §5.9.10) — the shared
+    /// manager/loops/factory/bookkeeping assembly every frontend holds
+    /// (`HostRuntime`'s own doc names the Engine a direct holder). The
+    /// console's drain-phase sweep (cancel every agent while the pump
+    /// stays alive for the Exited events) + the inactive-subagent
+    /// cleanup read the engine's manager through it — the engine-level
+    /// session surface serves the rest.
+    pub fn host(&self) -> &HostRuntime {
+        &self.inner.host
+    }
+
+    /// §5.9.10 (job 6, slice 2): the engine-level GLOBAL model swap — the
+    /// console REPL's `/model` + `/reasoning` surface (the documented
+    /// divergence: a REPL has no agent focus, so the swap keeps GLOBAL
+    /// semantics — the factory's provider slot + every live loop). The
+    /// engine builds the context manager from the new provider itself;
+    /// the resolution/validation/effort mapping stay with the caller
+    /// (the shared app-side resolver). Returns the ids of the agents
+    /// whose loops were swapped, so the caller can surface the change
+    /// through its own channel.
+    pub async fn swap_model(
+        &self,
+        provider: Arc<dyn crate::provider::LlmClient>,
+        display_effort: Option<String>,
+    ) -> Vec<crate::runtime::AgentId> {
+        let context_manager = self
+            .inner
+            .host
+            .factory
+            .context_manager_for(provider.as_ref());
+        self.inner.host.factory.set_provider(provider.clone());
+        // Keep the factory's default-effort record in sync (stamped onto
+        // every loop built from now on — backlog 51dab4da).
+        self.inner
+            .host
+            .factory
+            .set_default_display_effort(display_effort.clone());
+        // Swap into every live agent loop + clear the stale resolved
+        // model/provider/effort — the next request re-resolves (the
+        // per-request resolution, 2027-01-25), so a mid-run swap lands
+        // before the next call.
+        let agent_ids = {
+            let agent_loops = self.inner.host.agent_loops.lock().await;
+            for agent_loop in agent_loops.values() {
+                agent_loop.set_provider(provider.clone(), context_manager.clone());
+                agent_loop.set_resolved_model(None);
+                agent_loop.set_resolved_provider(None);
+                agent_loop.set_default_display_effort(display_effort.clone());
+                agent_loop.set_resolved_effort(None);
+            }
+            agent_loops.keys().copied().collect()
+        };
+        agent_ids
+    }
+
     /// §5.7's engine-wide stats pull — the store's project + savings
     /// aggregates plus the steering-effectiveness snapshot (the same
     /// counters the app's Trace tab reads). Errors `memory_disabled`
@@ -492,12 +594,14 @@ impl Engine {
 }
 
 /// The shared start body: the workspace gates, the config, the buses, the
-/// brain (with the optional provider injection), the host core, the pump.
+/// brain (built, or the whole-brain injection — job 6), the host core,
+/// the pump.
 async fn start_inner(
     opts: EngineOptions,
     provider: Option<Arc<dyn LlmClient>>,
     injected_store: Option<Arc<dyn crate::memory::MemoryStoreTrait>>,
     shared: Option<Arc<crate::host::brain::SharedResources>>,
+    injected_brain: Option<Arc<Brain>>,
 ) -> Result<Engine, EngineError> {
     // The workspace gates — row 9 + the §5.9.3 :664 require_git rule
     // (either the option or the workspace marker demands a repo).
@@ -529,8 +633,10 @@ async fn start_inner(
     // for a caller WITHOUT an injected provider (a standalone host).
     // An INJECTED provider (tests, hosts that bring their own transport)
     // IS the model transport, so the config's endpoint/key wiring is not
-    // load-bearing for it.
-    if provider.is_none() {
+    // load-bearing for it. Job 6 (§5.9.10): an injected BRAIN skips the
+    // gate for the same reason — its factory carries the host app's
+    // transport.
+    if provider.is_none() && injected_brain.is_none() {
         let status =
             crate::headless::setup::Setup::status_from_config(&config_dir, &config, None);
         if !status.ready_to_run {
@@ -564,47 +670,60 @@ async fn start_inner(
 
     // The brain — the SAME wiring tail the app uses, with the engine's
     // explicit inputs. A headless start is never "switched open".
-    let rt = tokio::runtime::Handle::current();
-    let workspace = Arc::new(opts.workspace.clone());
-    // 3b.1 (D1): the engine's memory/index decisions govern — a
-    // headless caller's explicit EngineOptions win over the config's
-    // defaults (the GUI passes the config values into EngineOptions at
-    // job 5).
-    let (memory_enabled, memory_path) = match opts.memory {
-        crate::headless::types::MemoryBackend::Sqlite { path } => (true, path),
-        crate::headless::types::MemoryBackend::Disabled => (false, None),
+    // Job 6 (§5.9.10 :747-753): an INJECTED brain replaces the build
+    // entirely — no second brain, no second store/embedder/watcher —
+    // and KEEPS its factory wiring (provider + policy): the engine's
+    // sessions inherit the host app's semantics, so the built path's
+    // provider override + FreePolicyFactory assignment are skipped.
+    let brain_is_injected = injected_brain.is_some();
+    let brain: Arc<Brain> = match injected_brain {
+        Some(brain) => brain,
+        None => {
+            let rt = tokio::runtime::Handle::current();
+            let workspace = Arc::new(opts.workspace.clone());
+            // 3b.1 (D1): the engine's memory/index decisions govern — a
+            // headless caller's explicit EngineOptions win over the config's
+            // defaults (the GUI passes the config values into EngineOptions at
+            // job 5).
+            let (memory_enabled, memory_path) = match opts.memory {
+                crate::headless::types::MemoryBackend::Sqlite { path } => (true, path),
+                crate::headless::types::MemoryBackend::Disabled => (false, None),
+            };
+            let brain = wire_brain(
+                config_dir.clone(),
+                config,
+                workspace,
+                false,
+                Some(notifier),
+                rt,
+                BrainMemoryOptions {
+                    memory_enabled,
+                    memory_path,
+                    index_codegraph: opts.index_codegraph,
+                    injected_store,
+                    shared,
+                },
+            )
+            .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
+
+            // The optional provider injection (the builder's test seam) — BEFORE
+            // the host core builds the main agent.
+            if let Some(provider) = provider {
+                brain.factory.set_provider(provider);
+            }
+
+            // 3a.5 (D5): the engine's agents are FREE agents — NoPolicy with the
+            // UNGATED dispatch gate (the workflow state never gates them; row
+            // 11's engine form). The app keeps its own policy wiring.
+            brain
+                .factory
+                .set_policy_factory(std::sync::Arc::new(
+                    crate::agent::policy::FreePolicyFactory,
+                ));
+
+            std::sync::Arc::new(brain)
+        }
     };
-    let brain = wire_brain(
-        config_dir.clone(),
-        config,
-        workspace,
-        false,
-        Some(notifier),
-        rt,
-        BrainMemoryOptions {
-            memory_enabled,
-            memory_path,
-            index_codegraph: opts.index_codegraph,
-            injected_store,
-            shared,
-        },
-    )
-    .map_err(|e| EngineError::start_failed(format!("brain build failed: {e}")))?;
-
-    // The optional provider injection (the builder's test seam) — BEFORE
-    // the host core builds the main agent.
-    if let Some(provider) = provider {
-        brain.factory.set_provider(provider);
-    }
-
-    // 3a.5 (D5): the engine's agents are FREE agents — NoPolicy with the
-    // UNGATED dispatch gate (the workflow state never gates them; row
-    // 11's engine form). The app keeps its own policy wiring.
-    brain
-        .factory
-        .set_policy_factory(std::sync::Arc::new(
-            crate::agent::policy::FreePolicyFactory,
-        ));
 
     // The shared host core — the same assembly the console delegates to.
     let mut host = HostRuntime::start(brain.factory.clone())
@@ -647,10 +766,15 @@ async fn start_inner(
     // The deferred bundled-model load: the brain's kernel twin of the
     // app's startup path (§5.6); each status transition forwards onto
     // the bus. No pending model / no store → the method no-ops.
-    let notify_load = notifier_events.clone();
-    brain.spawn_startup_embedder_load(&config_dir, move |s| {
-        notify_load.notify(HostEvent::EmbedderStatus(s));
-    });
+    // Job 6: an INJECTED brain skips it — the host app owns its embedder
+    // lifecycle (the GUI + console both run their own startup loads);
+    // a second load here would double the model work.
+    if !brain_is_injected {
+        let notify_load = notifier_events.clone();
+        brain.spawn_startup_embedder_load(&config_dir, move |s| {
+            notify_load.notify(HostEvent::EmbedderStatus(s));
+        });
+    }
     // (3b.3 note) The graph's startup index pass already runs inside
     // wire_brain (the graph construction spawns it with the shared
     // notifier), streaming HostEvent::IndexProgress onto this bus —
@@ -683,5 +807,156 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
         model: model.to_string(),
         reasoning_effort: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Job 6 (§5.9.10 :747-753) — the whole-brain injection seam.
+    //! Unit-level BY NECESSITY: only the in-crate tests can build a brain
+    //! via `wire_brain` and reach the Engine's private `brain` field for
+    //! the Arc-identity proof; the integration fixtures see only the
+    //! public API.
+
+    use crate::headless::types::MemoryBackend;
+    use crate::provider::{Capabilities, LlmEvent, Message, ProviderKind, ToolChoice, ToolSchema};
+    use crate::workspace::Workspace;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+
+    use super::*;
+
+    fn opts(root: &std::path::Path, config_dir: &std::path::Path) -> EngineOptions {
+        EngineOptions {
+            workspace: Workspace::new(root),
+            config_dir: Some(config_dir.to_path_buf()),
+            permissions: PermissionPolicy::OverridePermissions,
+            // Deliberately Sqlite: IF the seam ever rebuilt a brain from
+            // the options, the rebuilt brain would own a store and the
+            // memory() assertion below flips — the injected brain must
+            // govern instead.
+            memory: MemoryBackend::Sqlite { path: None },
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        }
+    }
+
+    /// The job-4 fixture idiom (tests/integration/headless_kernel.rs): a
+    /// READY config — an endpoint + key + default model; the dead
+    /// base_url is fine (start wires the provider, it never calls it).
+    /// Here it makes the SHARED brain's factory transport-wired — the
+    /// same shape the host app builds.
+    fn write_ready_config(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"test-model\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"openai\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"test-model\"]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("keys.toml"), "[test]\napi_key = \"sk-test\"\n").unwrap();
+    }
+
+    /// A real brain, built the way `start_inner`'s built path builds one —
+    /// but MEMORY-DISABLED with indexing off and no notifier: the lightest
+    /// brain the seam can share. The engine must mirror THIS brain's
+    /// state, not the options'.
+    fn shared_brain(root: &std::path::Path, config_dir: &std::path::Path) -> Arc<Brain> {
+        let config = Config::load(config_dir).unwrap();
+        let brain = wire_brain(
+            config_dir.to_path_buf(),
+            config,
+            Arc::new(Workspace::new(root)),
+            false,
+            None,
+            tokio::runtime::Handle::current(),
+            BrainMemoryOptions {
+                memory_enabled: false,
+                memory_path: None,
+                index_codegraph: false,
+                injected_store: None,
+                shared: None,
+            },
+        )
+        .unwrap();
+        Arc::new(brain)
+    }
+
+    #[tokio::test]
+    async fn injected_brain_is_shared_not_rebuilt() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let brain = shared_brain(ws.path(), cfg.path());
+        let engine = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .brain(brain.clone())
+            .start()
+            .await
+            .unwrap();
+        // THE seam's contract: the engine holds the SAME Arc — one
+        // brain, shared with the host app, never rebuilt.
+        assert!(Arc::ptr_eq(&engine.brain, &brain));
+        // The accessors mirror the INJECTED brain's state: it is
+        // memory-disabled, so `memory()` errors `memory_disabled` —
+        // a rebuilt brain (Sqlite options) would return a store.
+        // (let-else, not unwrap_err: MemoryApi is not Debug.)
+        let Err(err) = engine.memory() else {
+            panic!("the injected brain is memory-disabled — memory() must error");
+        };
+        assert_eq!(err.code(), "memory_disabled");
+    }
+
+    #[tokio::test]
+    async fn brain_injection_is_exclusive_with_the_other_seams() {
+        let ws = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        write_ready_config(cfg.path());
+        let brain = shared_brain(ws.path(), cfg.path());
+        // (let-else, not unwrap_err: Engine is not Debug.)
+        let Err(err) = EngineBuilder::new(opts(ws.path(), cfg.path()))
+            .brain(brain)
+            .provider(Arc::new(NeverProvider {
+                caps: Capabilities::openai(),
+            }))
+            .start()
+            .await
+        else {
+            panic!("brain + provider is ambiguous wiring — start must refuse");
+        };
+        assert_eq!(err.code(), "start_failed");
+        assert!(err.to_string().contains("exclusive"));
+    }
+
+    /// A provider that is never called — the exclusivity refusal fires at
+    /// `start`, before any transport runs. It exists only to make the
+    /// builder's `.provider` seam `Some`.
+    struct NeverProvider {
+        caps: Capabilities,
+    }
+
+    #[async_trait]
+    impl LlmClient for NeverProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "never"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<ToolChoice>,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            unimplemented!("the exclusivity refusal precedes any transport")
+        }
+    }
 }
 

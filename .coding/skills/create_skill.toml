@@ -17,13 +17,13 @@
 # The prompt below is injected into the system prompt EVERY turn the skill runs,
 # so it stays a terse checklist. Rationale lives here in comments (never
 # injected) — do not move it into the prompt; each rule encodes a real failure:
-# - LIVE tool names only. `file_read`/`file_append` are legacy redirect shims
-#   (src/agent/approval.rs: "folded into read_files / file_write"): the model
-#   calls `read_files`/`file_write`, so a shim entry in an allow-list is
-#   SILENTLY USELESS. That exact trap denied `read_files` inside merge_to_main
-#   (backlog 834ec126) — since closed wholesale: the Skill state grants the
-#   whole READ-ONLY surface (every Agent+AutoRun tool; trusted mcp__ ones
-#   excluded), so a skill's allow-list
+# - LIVE tool names only. `file_read`/`file_append` are RETIRED names: the
+#   unknown-tool error redirects them one-shot ("folded into read_files /
+#   file_write" — legacy_tool_redirect, src/tool/error_message.rs), so a
+#   shim entry in an allow-list is SILENTLY USELESS. That exact trap denied
+#   `read_files` inside merge_to_main (backlog 834ec126) — since closed
+#   wholesale: the Skill state grants the whole READ-ONLY surface (every
+#   Agent+AutoRun tool; trusted mcp__ ones excluded), so a skill's allow-list
 #   only needs the MUTATING tools; the read_files entries are belt-and-braces.
 #   The live-name rule still matters for the write side (file_write, not the
 #   file_append shim).
@@ -53,7 +53,7 @@ tools = [
 ]
 prompt = """\
 Author or revise a skill WITHOUT a plan. Steps:
-1. Author with the `skill_create` tool — it validates, writes `.coding/skills/<name>.toml` and hot-registers it (never hand-write the TOML with the file tools; never restart the app): `name` lowercase letters/digits/`_`/`-` matching the filename; `available_in`/`target_state` ∈ planning|executing|complete; `tools` = LIVE registry names for the MUTATING surface (file_write, file_edit, multi_edit, shell, git, ...) — the whole read-only surface (read_files, search, git_read, web_fetch, graph_*, ...) is always available inside a skill, so do not list it; NEVER the legacy shims (file_read/file_append — the model calls read_files/file_write); no memory tools, ask_user, current_plan, skill_reload or the exits (always available); `write_review_report` is refused. `prompt` = terse injected checklist; the rationale goes in the TOML header comment (never injected). Revising (`overwrite: true`) → refresh its header comment and its pinned test too. App-shipped skills are refused — edit those with the approval-gated file tools.
+1. Author with the `skill_create` tool — it validates, writes `.coding/skills/<name>.toml` and hot-registers it (never hand-write the TOML with the file tools; never restart the app): `name` lowercase letters/digits/`_`/`-` matching the filename; `available_in`/`target_state` ∈ planning|executing|complete; `tools` = LIVE registry names for the MUTATING surface (file_write, file_edit, multi_edit, shell, git, ...) — the whole read-only surface (read_files, search, git_read, web_fetch, graph_*, ...) is always available inside a skill, so do not list it; NEVER the retired names (file_read/file_append — un-dispatchable: the unknown-tool error redirects; the model calls read_files/file_write); no memory tools, ask_user, current_plan, skill_reload or the exits (always available); `write_review_report` is refused. `prompt` = terse injected checklist; the rationale goes in the TOML header comment (never injected). Revising (`overwrite: true`) → refresh its header comment and its pinned test too. App-shipped skills are refused — edit those with the approval-gated file tools.
 2. Validate: read the file back (`read_files`), confirm every allow-list name is a live tool, then `skill_reload` — the output must report the skill added/unchanged, never skipped (a malformed TOML is logged and dropped at load).
 3. Smoke it: `skill_end` first (no nesting), then `skill_start` with the skill's name, run its surface once, `skill_end`.
 4. Pin it with this project's own guard: in the Mnemo app repo that is the CARGO_MANIFEST_DIR repo-TOML test in `src/skill/mod.rs` (the load + the load-bearing prompt anchors), with `docs/FEATURES.md` updated when the flow narrative changed and `cargo test` run; in another project, whatever regression test its suite supports (or none). Then commit on the current `wt/*` branch with the `git` tool (approval-gated). NEVER commit to main — landing stays with merge_to_main.

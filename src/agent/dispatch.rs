@@ -214,16 +214,21 @@ impl AgentLoop {
 
         // Parse the arguments. A malformed-JSON failure is sanitized
         // (tool::error_message): the model gets a clean, instructive
-        // message naming the tool — never the raw serde text, never the
-        // raw arguments blob echoed back into the conversation.
+        // message naming the tool — never the raw serde text, and the raw
+        // arguments blob is never echoed in full, only the bounded
+        // received-tail diagnostic (byte offset, byte count, tail around
+        // the break) so a truncated payload is not blind-retryable.
         let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
                 return (
-                    ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
-                        &tc.name,
-                        &e,
-                    )),
+                    ToolResult::error(
+                        crate::tool::error_message::sanitize_arguments_json_error(
+                            &tc.name,
+                            &e,
+                            &tc.arguments,
+                        ),
+                    ),
                     Vec::new(),
                 );
             }
@@ -235,14 +240,21 @@ impl AgentLoop {
         let tool = match self.tools.get(&tc.name) {
             Some(t) => t,
             None => {
-                return (
-                    ToolResult::error(format!(
-                        "unknown tool '{}'. Available: {}",
-                        tc.name,
-                        self.available_tool_names()
-                    )),
-                    Vec::new(),
+                // A retired name gets the one-shot redirect sentence
+                // appended (backlog 6954f3e9) — the model recovers on the
+                // next call instead of dead-ending on "unknown tool".
+                let mut msg = format!(
+                    "unknown tool '{}'. Available: {}",
+                    tc.name,
+                    self.available_tool_names()
                 );
+                if let Some(redirect) =
+                    crate::tool::error_message::legacy_tool_redirect(&tc.name)
+                {
+                    msg.push_str(" — ");
+                    msg.push_str(redirect);
+                }
+                return (ToolResult::error(msg), Vec::new());
             }
         };
 

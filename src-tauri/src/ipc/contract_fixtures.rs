@@ -10,8 +10,11 @@
 //! fixture under `frontend/src/lib/ipc-fixtures/`. Missing fixtures are
 //! written (pretty-printed) and reported at the end; once committed, any
 //! shape change makes the test fail until the fixture is consciously updated.
-//! The frontend vitest contract suite imports the same fixtures, so a change
-//! is caught on the TS side too.
+//! The frontend vitest contract suite imports the same fixtures for the
+//! DTOs it consumes, so a change is caught on the TS side too; the
+//! Rust-side-only pins (e.g. `dto-engine-stats` — the `engine_status`
+//! command the frontend has not adopted yet) are caught here alone until
+//! the TS side adds its import.
 //!
 //! Fixtures are read via `env!("CARGO_MANIFEST_DIR")` (the app crate root =
 //! `src-tauri`), so the path is `../frontend/src/lib/ipc-fixtures/<name>.json`.
@@ -36,6 +39,7 @@ use mnemo::headless::{
     CodegraphGraph, CodegraphStatus, MemoryCounts, MemoryDebugOverview, MemoryDebugWire,
     MemoryIndexStatus, ScoredMemoryDebugWire,
 };
+use mnemo::headless::stats::EngineStats;
 use mnemo::memory::{
     CacheEfficiency, ModelBreakdown, ProjectStats, SavingsDayBreakdown, SavingsKindBreakdown,
     SavingsStats, SessionStats,
@@ -522,6 +526,23 @@ fn stats_memory_codegraph_ipc_unchanged() {
         ..Default::default()
     };
     assert_fixture("dto-project-stats", &project, &mut generated);
+
+    // ── job 6 (§5.9.10): the engine_status pull — the headless Engine's
+    // §5.7 aggregate over the SAME shared brain (the IpcState-held
+    // engine's proving consumer). Reuses the two store aggregates above;
+    // the steering half mirrors the get_steering_stats shape.
+    let engine_stats = EngineStats {
+        project_stats: project.clone(),
+        savings_stats: savings.clone(),
+        steering_snapshot: mnemo::SteeringStatsSnapshot {
+            fired: 2,
+            switched: 1,
+            by_marker: vec![],
+            file_tool_mutations: 3,
+            shell_mutations: 1,
+        },
+    };
+    assert_fixture("dto-engine-stats", &engine_stats, &mut generated);
 
     // ── the derived-index status behind memory_index_status ────────
     let index_status = MemoryIndexStatus {

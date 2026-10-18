@@ -1554,7 +1554,7 @@ mod tests {
         Capabilities, FinishReason, LlmClient, LlmEvent, ProviderKind, ToolSchema,
     };
     use crate::tool::agent::sandbox::Sandbox;
-    use crate::tool::agent::{file_read::FileReadTool, file_write::FileWriteTool};
+    use crate::tool::agent::{file_write::FileWriteTool, read_files::ReadFilesTool};
     use crate::tool::memory::{MemoryRecallTool, MemoryWriteTool};
     use crate::app::tool::workflow::plan::{CompleteStepTool, CreatePlanTool};
     use crate::tool::ToolRegistry;
@@ -1605,7 +1605,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -1762,7 +1762,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let agent_loop = Arc::new(AgentLoop::new(
             AgentLoopConfig {
@@ -1978,7 +1978,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2103,7 +2103,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let primary: Arc<dyn LlmClient> = Arc::new(FallbackTestProvider {
@@ -2224,7 +2224,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2354,7 +2354,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2486,7 +2486,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2565,7 +2565,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2693,7 +2693,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -2810,7 +2810,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3049,7 +3049,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_plan_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_plan_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3259,7 +3259,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let primary_default_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_default_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3462,7 +3462,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
 
         let pinned_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -3590,7 +3590,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
         let store: Arc<dyn crate::memory::MemoryStoreTrait> =
             Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
@@ -3667,7 +3667,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
         let store: Arc<dyn crate::memory::MemoryStoreTrait> =
             Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
@@ -3733,7 +3733,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -3878,7 +3878,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -3974,7 +3974,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4087,7 +4087,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4311,7 +4311,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4428,7 +4428,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4562,7 +4562,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4666,7 +4666,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4767,7 +4767,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4881,7 +4881,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -4966,7 +4966,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -5132,7 +5132,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -5231,7 +5231,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -5377,7 +5377,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -5520,7 +5520,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(FileWriteTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
@@ -6031,7 +6031,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
 
@@ -6118,7 +6118,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
         registry.register(Box::new(CompleteStepTool::new(workflow.clone())));
 
@@ -6236,7 +6236,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -6306,7 +6306,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
 
         let agent_loop = Arc::new(AgentLoop::new(
@@ -6423,7 +6423,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
 
         let provider = Arc::new(CompactResumeProvider {
@@ -6555,7 +6555,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
 
         let provider = Arc::new(CompactFailProvider {
@@ -6654,7 +6654,7 @@ mod tests {
         )));
         let mut registry = ToolRegistry::new();
         let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
-        registry.register(Box::new(FileReadTool::new((*sandbox).clone())));
+        registry.register(Box::new(ReadFilesTool::new((*sandbox).clone())));
         registry.register(Box::new(CreatePlanTool::new(workflow.clone())));
 
         // CompactResumeProvider's first call hangs, so the pre-queued

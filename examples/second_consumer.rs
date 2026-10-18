@@ -19,13 +19,20 @@
 //! * every session **event printed as JSON** (the same wire the Tauri
 //!   frontend sees).
 //!
-//! Running it needs a configured endpoint (set `MNEMO_HOME` to a config
-//! dir with `[general] default_model` + an endpoint, or rely on the
-//! engine's dummy provider warning). The CI run against a mock provider
-//! (§9 :924) is PENDING — backlog #c96a96ca: no workflow runs examples
-//! today, and wiring the round trip needs a provider seam the example
-//! can reach (review round 1, H1 — the earlier claim it ran was false
-//! and is corrected here).
+//! Running it has two modes, and CI runs the offline one (§9 :924 —
+//! wired in build.yml's `examples` job, backlog c96a96ca; the earlier
+//! round's false claim that it ran is corrected here, H1):
+//!
+//! * `MNEMO_HOME` set → the engine resolves the configured endpoint
+//!   exactly like a real deployment (the same `not_configured` gate
+//!   surfaces when the dir carries no config).
+//! * `MNEMO_HOME` unset → the engine gets the in-file scripted provider
+//!   through the public `Engine::builder(..).provider(..)` override
+//!   (the same injection the integration tests use), and the whole
+//!   host-tool round trip runs offline.
+
+use async_trait::async_trait;
+use futures::stream::{self, BoxStream};
 
 use mnemo::agent::policy::PermissionPolicy;
 use mnemo::agent::prompt::{ConstitutionMode, PromptSpec};
@@ -33,32 +40,144 @@ use mnemo::headless::{
     Engine, EngineOptions, Guardrails, HostToolSpec, MemoryBackend, SessionCommand,
     SessionLimits, SpawnOptions, ToolGroup, ToolSelection,
 };
+use mnemo::provider::{
+    Capabilities, FinishReason, LlmClient, LlmEvent, Message, ProviderKind, ToolChoice,
+    ToolSchema,
+};
 use mnemo::runtime::channels::SerializableAgentEvent;
 use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::workspace::Workspace;
 
+/// The opening leg: the model calls the example's own host tool so the
+/// kernel↔host round trip actually executes (`HostToolCall` → the host's
+/// `HostToolResult` command → the result reaches the model).
+fn tool_leg() -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: "call_1".into(),
+            name: "acme_ticket_lookup".into(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: r#"{"ticket": "42"}"#.into(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
+/// The closing leg: after the host answer lands, the model reports it
+/// and ends the turn (the phrase matches the CI greps — the same words
+/// the host's own `ToolResult` carries).
+fn text_leg() -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::TextDelta {
+            text: "Ticket #42 checked — the weather widget shows rain for Oslo and the ticket is still open.".into(),
+        },
+        LlmEvent::Finish { reason: FinishReason::Stop },
+    ]
+}
+
+/// A scripted provider the example owns in-file — the CI mock (§9 :924).
+/// Each `complete` pops the next leg; the demo has exactly two, so the
+/// host-tool round trip executes without any external endpoint. The
+/// shapes mirror the integration suite's `ScriptedLlm` (forbidden to an
+/// example — test support) but live here so the public-API contract is
+/// demonstrated on the public surface only.
+struct DemoLlm {
+    legs: std::sync::Mutex<std::collections::VecDeque<Vec<LlmEvent>>>,
+    calls: std::sync::atomic::AtomicUsize,
+    caps: Capabilities,
+}
+
+impl DemoLlm {
+    /// The demo script: the tool leg, then the closing text leg (the
+    /// agent loop re-calls the provider once the `HostToolResult`
+    /// lands, which is leg 2's trigger).
+    fn new() -> Self {
+        Self {
+            legs: std::sync::Mutex::new(vec![tool_leg(), text_leg()].into()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            caps: Capabilities::openai(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for DemoLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+    fn model(&self) -> &str {
+        "scripted"
+    }
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next = self
+            .legs
+            .lock()
+            .expect("script lock poisoned")
+            .pop_front()
+            .unwrap_or_default();
+        Ok(Box::pin(stream::iter(next)))
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // A scratch workspace (no git required) + the consumer's own config
-    // dir (MNEMO_HOME if set — never the mnemo app's default).
+    // A scratch workspace (no git required); the consumer's own config
+    // dir (MNEMO_HOME if set — never the mnemo app's default). Without
+    // MNEMO_HOME the CI path kicks in: the in-file scripted provider
+    // and the offline round trip.
     let root = std::env::temp_dir().join("second-consumer-demo");
     std::fs::create_dir_all(root.join(".coding")).expect("workspace state dir");
-    let engine = Engine::builder(EngineOptions {
+    let mnemo_home = std::env::var_os("MNEMO_HOME");
+    let scripted = mnemo_home.is_none();
+    // The offline CI path uses a BARE config dir (the same shape the
+    // integration suite's scripted engine uses) so the engine never
+    // touches a real machine config and never resolves a real endpoint —
+    // the scripted provider below carries the whole demo.
+    let config_dir = match &mnemo_home {
+        Some(home) => std::path::PathBuf::from(home),
+        None => {
+            let bare = root.join("config");
+            std::fs::create_dir_all(&bare).expect("bare config dir");
+            bare
+        }
+    };
+    let mut builder = Engine::builder(EngineOptions {
         workspace: Workspace {
             root: root.clone(),
             state_dir: root.join(".coding"),
             require_git: false,
         },
-        config_dir: std::env::var_os("MNEMO_HOME").map(std::path::PathBuf::from),
+        config_dir: Some(config_dir),
         permissions: PermissionPolicy::OverridePermissions,
         memory: MemoryBackend::Sqlite { path: None },
         index_codegraph: false,
         require_git: false,
         auto_install_embedder: false,
-    })
-    .start()
-    .await
-    .expect("the engine starts (set MNEMO_HOME to a configured dir)");
+    });
+    if scripted {
+        // The offline CI path: inject the scripted provider the way the
+        // integration tests do — through the public builder override.
+        builder = builder.provider(std::sync::Arc::new(DemoLlm::new()));
+    }
+    let engine = builder
+        .start()
+        .await
+        .expect("the engine starts — MNEMO_HOME unset (the scripted CI path), or a configured dir");
 
     let session = engine
         .spawn(SpawnOptions {
@@ -129,12 +248,37 @@ async fn main() {
             }
         }
     };
-    let (outcome, ()) = tokio::join!(
-        session.run_to_completion("Check ticket 42 and summarize it for the customer."),
-        host
-    );
-    match outcome {
+    // The turn drives the exit: the host loop polls the event bus, which
+    // outlives the turn (the session stays alive for further turns), so
+    // join!ing it would hang the process after the turn ends — the first
+    // real execution of this example exposed exactly that. select!
+    // completes on the turn's outcome; every event up to that point is
+    // already printed, and the losing host future is dropped.
+    let turn = tokio::select! {
+        out = session.run_to_completion("Check ticket 42 and summarize it for the customer.") => out,
+        _ = host => unreachable!("the host loop only ends when the session does"),
+    };
+    match turn {
         Ok(turn) => println!("turn finished: {}", turn.final_text),
-        Err(e) => eprintln!("turn failed ({}): {}", e.code(), e.message()),
+        Err(e) => {
+            eprintln!("turn failed ({}): {}", e.code(), e.message());
+            std::process::exit(1);
+        }
     }
+
+    // The host loop inside the select drains events up to the turn's
+    // completion, but the tail events (the tool result, the closing
+    // stream, the parked notice) can still sit in the buffer — dropping
+    // the losing future loses them. A short settle drain prints the
+    // rest; it ends on the window (the bus itself outlives the turn —
+    // the session stays alive for further turns).
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        async {
+            while let Ok(ev) = rx.recv().await {
+                println!("{}", serde_json::to_string(&ev).expect("event json"));
+            }
+        },
+    )
+    .await;
 }

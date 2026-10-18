@@ -207,10 +207,21 @@ src-tauri boundary, and the G1–G10 acceptance sweep. Branch `wt/mnemo`
   other `From<&str>` impls in scope — `.to_string()`).
 - Smoke run: with `MNEMO_HOME` set to a bare temp dir the engine gate
   surfaces CLEANLY — `not_configured` naming exactly what's missing.
-  The configured/mock run does NOT ride CI — [CORRECTED by review
-  round 1, H1: the original note here claimed it did; no workflow runs
-  examples, and wiring the round trip needs a provider seam the
-  example can reach — PENDING, backlog #c96a96ca].
+  The CI run is WIRED (2026-10-15, backlog #c96a96ca — closing review
+  round 1's H1): no env seam was needed — the public
+  `Engine::builder(..).provider(..)` override (engine.rs :110, job 3a)
+  carries the in-file scripted provider the example now injects
+  whenever `MNEMO_HOME` is absent, and `.github/workflows/build.yml`'s
+  `examples` job (ubuntu-latest) runs it under
+  `--no-default-features --features kernel,headless` with
+  `set -o pipefail` + tee, asserting the host-tool round trip (the
+  `acme_ticket_lookup` event, the host answer's phrase, and the
+  `turn finished:` marker) in the captured output. The red/green pair
+  recorded in plan a815249f: the bare-dir run panics at the gate
+  (`not_configured`), the scripted run prints the full event wire and
+  completes. [The original note here claimed the run rode CI before
+  any workflow ran examples — corrected by review round 1, H1, then
+  actually wired by the follow-up.]
 - Battery `cargo test --workspace` exit 0 (83 integration; the example
   is a default-features target too — it compiles against the full set).
 

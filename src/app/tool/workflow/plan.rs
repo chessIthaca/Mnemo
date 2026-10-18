@@ -669,6 +669,95 @@ impl CreatePlanTool {
     }
 }
 
+/// Repair a `steps` argument that arrived as a string containing JSON —
+/// the content-first flow primes pasting the drafted array as a
+/// stringified blob (backlog dab4b630: two consecutive create_plan
+/// rejections, each a full multi-KB re-emit, before the plan landed).
+/// The repair is never silent: when the string parses as a steps array it
+/// is substituted in place and the returned note rides the tool's output
+/// so the emitted-native-array habit gets corrected; a string that does
+/// not parse (or unwraps to a non-array within the bounded two passes)
+/// returns an `Err` naming `steps`, the expected shape, and a bounded
+/// echo of what arrived — the tool-level failure the generic sanitize
+/// layer cannot give, because from_value errors carry no property path
+/// (the invalid-type branch stays generic for every tool).
+fn normalize_stringified_steps(
+    args: &mut serde_json::Value,
+) -> Result<Option<String>, String> {
+    let received = match args.get("steps") {
+        Some(serde_json::Value::String(raw)) => raw.clone(),
+        // Absent, already a native array, or another shape the typed parse
+        // will reject with its own error — nothing to repair here.
+        _ => return Ok(None),
+    };
+    let snippet = bounded_received_echo(&received);
+    match serde_json::from_str::<serde_json::Value>(&received) {
+        Ok(serde_json::Value::Array(arr)) => {
+            let count = arr.len();
+            args["steps"] = serde_json::Value::Array(arr);
+            Ok(Some(format!(
+                "steps note: the steps argument arrived as a stringified JSON array; \
+                 parsed into the native array ({count} item(s)) — emit a native \
+                 array next time"
+            )))
+        }
+        // A double-encoded blob (a JSON string holding the array text — the
+        // transport's backslash-n lesson, backlog c19ec2ff): one defensive
+        // extra unwrap, then stop — never a third pass.
+        Ok(serde_json::Value::String(inner)) => {
+            match serde_json::from_str::<serde_json::Value>(&inner) {
+                Ok(serde_json::Value::Array(arr)) => {
+                    let count = arr.len();
+                    args["steps"] = serde_json::Value::Array(arr);
+                    Ok(Some(format!(
+                        "steps note: the steps argument arrived as a double-encoded \
+                         stringified JSON array; parsed into the native array ({count} \
+                         item(s)) — emit a native array next time"
+                    )))
+                }
+                Ok(_) => Err(format!(
+                    "steps must be a native JSON array (items are strings or \
+                     {{\"header\": …, \"body\": …}} objects) — the received string \
+                     parses but its content is not a steps array even after \
+                     unwrapping a double-encoded string; received (truncated): \
+                     `{snippet}`"
+                )),
+                Err(e) => Err(format!(
+                    "steps must be a native JSON array (items are strings or \
+                     {{\"header\": …, \"body\": …}} objects) — the received value is \
+                     a string whose content also does not parse ({e}); received \
+                     (truncated): `{snippet}`"
+                )),
+            }
+        }
+        Ok(_) => Err(format!(
+            "steps must be a native JSON array (items are strings or \
+             {{\"header\": …, \"body\": …}} objects) — the received string parses \
+             but is not a steps array; received (truncated): `{snippet}`"
+        )),
+        Err(e) => Err(format!(
+            "steps must be a native JSON array (items are strings or \
+             {{\"header\": …, \"body\": …}} objects), not a string containing \
+             JSON — the received value does not parse as one ({e}); received \
+             (truncated): `{snippet}`"
+        )),
+    }
+}
+
+/// A bounded echo of received text for tool-level errors — the first 120
+/// characters with an ellipsis marker when truncated (the same spirit as
+/// the sanitize layer's received-arguments echo, scoped to the field
+/// value here).
+fn bounded_received_echo(text: &str) -> String {
+    const MAX: usize = 120;
+    let out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        format!("{out}…")
+    } else {
+        out
+    }
+}
+
 #[async_trait]
 impl Tool for CreatePlanTool {
     fn name(&self) -> &str {
@@ -696,7 +785,7 @@ impl Tool for CreatePlanTool {
                 "properties": {
                     "title": {"type": "string", "description": "A short title for the plan. MUST be non-blank (whitespace-only is rejected) — write the full title/goal/steps content in your reply FIRST, then emit the call carrying it; the call body is never where content gets drafted."},
                     "goal": {"type": "string", "description": "What we're building. MUST be non-blank (whitespace-only is rejected)."},
-                    "context": {"type": ["string", "null"], "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands — and it carries FINDINGS, not assumptions. Any line claiming a symbol is callable/reachable (a dotted member call such as ext._evaluator.clashOf(), or the phrases 'exists at'/'is callable'/'callable from'/'is reachable'/'reachable from') must carry evidence — one of verified/probe/probed/observed/measured/confirmed/reproduced/checked, e.g. 'verified: typeof ext._evaluator -> undefined on /agent.html' — or be labelled an assumption (assumption/assumed/unverified/unproven/not verified/to verify/hypothesis)."},
+                    "context": {"type": ["string", "null"], "description": "Relevant findings from the planning phase. MUST be substantive (≥40 chars): symptom/root-cause, file anchors, verification commands — and it carries FINDINGS, not assumptions. Any line claiming a symbol is callable/reachable (a dotted member call such as ext._evaluator.clashOf(), or the phrases 'exists at'/'is callable'/'callable from'/'is reachable'/'reachable from') must carry evidence — one of verified/probe/probed/observed/measured/confirmed/reproduced/checked, e.g. 'verified: typeof ext._evaluator -> undefined on /agent.html' — or be labelled an assumption (assumption/assumed/unverified/unproven/not verified/to verify/hypothesis). The evidence word must appear on the SAME line as the claim — a documented read anchors it cleanly, e.g. 'verified (read src/tool/agent/search.rs:12-40): the engine choice…'."},
                     "steps": {
                         "type": "array",
                         "items": {
@@ -709,7 +798,7 @@ impl Tool for CreatePlanTool {
                                 {"type": "object", "properties": {"header": {"type": "string"}, "body": {"type": "string"}}, "required": ["header"]}
                             ]
                         },
-                        "description": "Ordered steps. Each is a plain string ('**bold header** — body') or an object {header, body}, normalized to that same form; an object's header is PLAIN text (** markers are stripped, leaving exactly one bold layer). The header is the one-liner shown in the executing toolbar. The body is a self-contained recipe a less-powerful model executes alone: explicit file paths (not 'the relevant file'), explicit actions (not 'handle the case'), and any context it needs — never assume it remembers an earlier step. Keep it to a few lines. Example: '**Add ask_user tool** — create src/tool/workflow/ask_user.rs with schema {question, options:[{label,description?}]}, SafetyLevel::AutoRun, category Workflow. Register it in factory.rs register_workflow_tools.' For kind=bug_fixing the locked skeleton is the checklist; provided steps persist as CHECKABLE '## Detailed steps' sub-items (tick each via complete_step detailed_step_index as it ships — the crash-resumption detail). Resumability gate: every step names file path(s) or a no-code marker."
+                        "description": "Ordered steps. IMPORTANT — steps MUST be a native JSON array — never a string containing JSON (the content-first flow primes pasting the drafted JSON as a stringified blob; the tool repairs that form with a note, but the native array is the contract). Each is a plain string ('**bold header** — body') or an object {header, body}, normalized to that same form; an object's header is PLAIN text (** markers are stripped, leaving exactly one bold layer). The header is the one-liner shown in the executing toolbar. The body is a self-contained recipe a less-powerful model executes alone: explicit file paths (not 'the relevant file'), explicit actions (not 'handle the case'), and any context it needs — never assume it remembers an earlier step. Keep it to a few lines. Example: '**Add ask_user tool** — create src/tool/workflow/ask_user.rs with schema {question, options:[{label,description?}]}, SafetyLevel::AutoRun, category Workflow. Register it in factory.rs register_workflow_tools.' For kind=bug_fixing the locked skeleton is the checklist; provided steps persist as CHECKABLE '## Detailed steps' sub-items (tick each via complete_step detailed_step_index as it ships — the crash-resumption detail). Resumability gate: every step names file path(s) or a no-code marker."
                     },
                     "kind": {
                         "type": ["string", "null"],
@@ -743,6 +832,14 @@ impl Tool for CreatePlanTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        // Repair a stringified `steps` BEFORE the typed parse: it is a
+        // tool-level failure the generic layer cannot give (from_value
+        // errors carry no property path) — see normalize_stringified_steps.
+        let mut args = args;
+        let stringified_note = match normalize_stringified_steps(&mut args) {
+            Ok(note) => note,
+            Err(message) => return ToolResult::error(message),
+        };
         let args: CreatePlanArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
@@ -979,6 +1076,9 @@ impl Tool for CreatePlanTool {
                 if let Some(note) = &branch_note {
                     output.push_str(&format!(" [{note}]"));
                 }
+                if let Some(note) = &stringified_note {
+                    output.push_str(&format!(" [{note}]"));
+                }
                 // Backlog 77ff8f45: state plainly what happened to the
                 // caller's steps — the plan file is the crash-resumption
                 // document, and the caller must not discover the step
@@ -1015,6 +1115,7 @@ impl Tool for CreatePlanTool {
                         "step_count": steps.len(),
                         "kind": args.kind,
                         "branch_note": branch_note,
+                        "stringified_steps": stringified_note,
                         "detailed_step_count": detailed_step_count,
                     })),
                 }
@@ -1113,7 +1214,7 @@ impl Tool for UpdatePlanTool {
                 "properties": {
                     "title": {"type": ["string", "null"], "description": "New title (omit or empty to keep current)."},
                     "goal": {"type": ["string", "null"], "description": "New goal (omit or empty to keep current)."},
-                    "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars), and the evidence rule (see create_plan's context) applies to the text you write here."},
+                    "context": {"type": ["string", "null"], "description": "New context (omit or empty to keep current); with append=true it is EXTENDED instead of replaced. The gate checks the effective post-update text (≥40 chars), and the evidence rule (see create_plan's context) applies to the text you write here. The phrasing: the evidence word must appear on the SAME line as the claim — e.g. 'verified (read src/tool/agent/search.rs:12-40): the engine choice…'."},
                     "regression_test": {"type": ["string", "null"], "description": "The regression test name recorded by a bug_fixing plan's verify step (finish is blocked without it; validated against the code graph)."},
                     "landed_design": {"type": "boolean", "description": "Set true when a bug_fixing fix turned out feature-scale (new pub types / cross-module surface) — the finish gate then requires a 'Landed design' context amendment (agent.md 'Documentation expectations')."},
                     "steps": {
@@ -1156,6 +1257,13 @@ impl Tool for UpdatePlanTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        // Repair a stringified `steps` BEFORE the typed parse (same as
+        // create_plan — the shared steps input gets the same repair).
+        let mut args = args;
+        let stringified_note = match normalize_stringified_steps(&mut args) {
+            Ok(note) => note,
+            Err(message) => return ToolResult::error(message),
+        };
         let args: UpdatePlanArgs = match serde_json::from_value(args.clone()) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(crate::tool::error_message::sanitize_arguments_error_with(self.name(), &e, &args)),
@@ -1304,6 +1412,9 @@ impl Tool for UpdatePlanTool {
                 }
                 if let Some(ld) = args.landed_design {
                     changes.push(format!("landed_design={ld}"));
+                }
+                if let Some(note) = stringified_note {
+                    changes.push(note);
                 }
                 // The id is echoed so the model always holds the current
                 // handle without an extra current_plan call.
@@ -4572,6 +4683,159 @@ mod tests {
         let plan = wf.plan().unwrap();
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].text, "**New step** — the recipe in src/widget.rs");
+    }
+
+    #[tokio::test]
+    async fn create_plan_accepts_stringified_native_array_with_note() {
+        // Backlog dab4b630: `steps` arriving as a JSON-encoded STRING (the
+        // content-first flow primes pasting the drafted array as a string)
+        // is repaired to the native array — with a NOTE in the output so the
+        // habit gets fixed, never silently.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let tool = CreatePlanTool::new(wf.clone());
+        let result = tool
+            .execute(json!({
+                "title": "T",
+                "goal": "G",
+                "context": GOOD_CTX,
+                "steps": r#"["**Stringified step** — the recipe in src/widget.rs"]"#.to_string()
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(
+            result.output.contains("stringified"),
+            "the repair is noted, not silent: {}",
+            result.output
+        );
+        let wf = wf.lock().await;
+        let plan = wf.plan().unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].text, "**Stringified step** — the recipe in src/widget.rs");
+        // The double-encoded variant (a string whose content is itself a
+        // JSON string holding the array) unwraps within the bounded two
+        // passes and succeeds the same way.
+        let dir2 = tempdir().unwrap();
+        let wf2 = make_workflow(dir2.path());
+        let tool2 = CreatePlanTool::new(wf2.clone());
+        let block = r#"["**Double-encoded step** — the recipe in src/widget.rs"]"#.to_string();
+        let result2 = tool2
+            .execute(json!({
+                "title": "T",
+                "goal": "G",
+                "context": GOOD_CTX,
+                "steps": serde_json::to_string(&serde_json::Value::String(block)).unwrap()
+            }))
+            .await;
+        assert!(result2.success, "output: {}", result2.output);
+    }
+
+    #[tokio::test]
+    async fn create_plan_stringified_steps_parse_failure_names_param() {
+        // Backlog dab4b630: a `steps` string that does NOT parse as a steps
+        // array must error naming `steps`, the expected shape, and a bounded
+        // echo of what arrived — never the generic type-error wording.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let tool = CreatePlanTool::new(wf.clone());
+        let result = tool
+            .execute(json!({
+                "title": "T",
+                "goal": "G",
+                "context": GOOD_CTX,
+                "steps": "[{\"header\": \"truncated"
+            }))
+            .await;
+        assert!(!result.success, "output: {}", result.output);
+        assert!(
+            result.output.contains("steps"),
+            "names the parameter: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("array"),
+            "states the expected shape: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("truncated"),
+            "echoes the bounded received snippet: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("an argument must be"),
+            "must not be the generic wording: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_accepts_stringified_native_array_with_note() {
+        // The same repair rides update_plan's shared steps input.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        CreatePlanTool::new(wf.clone())
+            .execute(json!({"title": "P", "goal": "G", "context": GOOD_CTX, "steps": ["edit src/widget.rs"]}))
+            .await;
+        let update = UpdatePlanTool::new(wf.clone());
+        let result = update
+            .execute(json!({
+                "steps": r#"[{"header": "Stringified", "body": "the recipe in src/widget.rs"}]"#.to_string()
+            }))
+            .await;
+        assert!(result.success, "output: {}", result.output);
+        assert!(
+            result.output.contains("stringified"),
+            "the repair is noted: {}",
+            result.output
+        );
+        let wf = wf.lock().await;
+        let plan = wf.plan().unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].text, "**Stringified** — the recipe in src/widget.rs");
+    }
+
+    #[test]
+    fn plan_tools_advertise_steps_shape_and_evidence_convention() {
+        // Backlog dab4b630: the schema text carries the operational
+        // instructions — steps are never a JSON-encoded string, and the
+        // evidence word must open the claim line (a read-anchored example).
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        let steps_desc = create.schema().parameters["properties"]["steps"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            steps_desc.contains("native JSON array"),
+            "create_plan steps doc warns against the string form: {steps_desc}"
+        );
+        assert!(
+            steps_desc.contains("never a string containing JSON"),
+            "create_plan steps doc names the trap: {steps_desc}"
+        );
+        let ctx_desc = create.schema().parameters["properties"]["context"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ctx_desc.contains("SAME line as the claim"),
+            "create_plan context doc carries the phrasing convention: {ctx_desc}"
+        );
+        assert!(
+            ctx_desc.contains("verified (read "),
+            "create_plan context doc carries the read-anchored example: {ctx_desc}"
+        );
+        let update = UpdatePlanTool::new(wf);
+        let upd_ctx = update.schema().parameters["properties"]["context"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            upd_ctx.contains("verified (read "),
+            "update_plan context doc mirrors the convention: {upd_ctx}"
+        );
     }
 
     #[tokio::test]

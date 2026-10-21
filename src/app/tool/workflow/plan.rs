@@ -1102,7 +1102,9 @@ impl Tool for UpdatePlanTool {
              appended to. Omit a field to leave it unchanged. Executing and Reviewing \
              (full field set in both for the main agent — the reviewer never sees this \
              tool; complete_step stays hidden mid-review, so appended steps stay \
-             unchecked through the exit). bug_fixing \
+             unchecked during the review — finish ticks them on the \
+             Reviewing → Complete transition, so a completed plan shows no open \
+             checkbox). bug_fixing \
              plans have a LOCKED skeleton (steps cannot be replaced; appends are allowed \
              only in the Reviewing state — follow-on fix work in the closing sequence) — record \
              the verify step's test name via regression_test, and landed_design=true when \
@@ -4801,6 +4803,81 @@ mod tests {
             wf.lock().await.state(),
             crate::app::workflow::WorkflowState::Complete
         );
+    }
+
+    #[tokio::test]
+    async fn finish_ticks_appended_review_fix_steps() {
+        // Regression (plan-frame bookkeeping, live case .coding/plans/8813e7ab.md):
+        // a plan grows review-fix steps during Reviewing via update_plan
+        // append=true — complete_step is hidden there, so nothing ticked them
+        // and the completed frame rendered open checkboxes (steps 8-13) even
+        // though the fix work shipped and the review passed. finish must tick
+        // every still-unchecked step (in memory + on disk) on the
+        // Reviewing -> Complete transition, preserving each step's TEXT.
+        let dir = tempdir().unwrap();
+        let wf = make_workflow(dir.path());
+        let create = CreatePlanTool::new(wf.clone());
+        let created = create
+            .execute(json!({
+                "title": "T", "goal": "G", "context": GOOD_CTX,
+                "steps": ["one src/a.rs", "two src/b.rs"]
+            }))
+            .await;
+        assert!(created.success, "{}", created.output);
+        let complete = CompleteStepTool::new(wf.clone());
+        assert!(complete.execute(json!({"step_index": 1})).await.success);
+        assert!(complete.execute(json!({"step_index": 2})).await.success);
+        assert_eq!(
+            wf.lock().await.state(),
+            crate::app::workflow::WorkflowState::Reviewing
+        );
+        let plan_id = wf.lock().await.plan_id().expect("a live plan").to_string();
+
+        // The review-fix window: append two follow-on steps while Reviewing.
+        let update = UpdatePlanTool::new(wf.clone());
+        let appended = update
+            .execute(json!({
+                "append": true,
+                "steps": [
+                    "Fix H1 — src/app/tool/workflow/plan.rs",
+                    "Fix H2 — src/app/workflow/plan_file.rs"
+                ]
+            }))
+            .await;
+        assert!(appended.success, "{}", appended.output);
+
+        let reviews_dir = dir.path().join("reviews");
+        std::fs::create_dir_all(&reviews_dir).unwrap();
+        let report = reviews_dir.join("review.md");
+        std::fs::write(&report, "## Verdict: PASS\nno findings").unwrap();
+
+        let finish = FinishTool::new(wf.clone(), reviews_dir);
+        let res = finish
+            .execute(json!({"review_report": report.to_string_lossy()}))
+            .await;
+        assert!(res.success, "{}", res.output);
+
+        // The completed frame must render NO open checkbox — the appended
+        // steps are done, never dropped (the frame is the crash-resumption
+        // document).
+        let plan_file = dir.path().join("plans").join(format!("{plan_id}.md"));
+        let text = std::fs::read_to_string(&plan_file).unwrap();
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("- [ ]")),
+            "a Complete plan must not render an open checkbox:\n{text}"
+        );
+        assert!(
+            text.contains("Fix H1 — src/app/tool/workflow/plan.rs"),
+            "the appended step text must survive:\n{text}"
+        );
+        assert!(
+            text.contains("Fix H2 — src/app/workflow/plan_file.rs"),
+            "the appended step text must survive:\n{text}"
+        );
+        // current_plan reads the in-memory frame — it must agree with the file.
+        let plan = wf.lock().await.plan().cloned().expect("the finished plan");
+        assert!(plan.is_complete(), "in-memory frame still has open steps");
+        assert_eq!(plan.completed_count(), 4);
     }
 
     /// One seeded spend row for the cost-report tests.

@@ -78,7 +78,8 @@ last resort.
 - REVIEWING: steps done + kind=implementation. Run the closing sequence (APP \
 RULES): reviewer subagent → fix findings → re-run tests → commit → finish. \
 finish is the only exit to Complete and is gated on a non-empty review \
-report.
+report; it also ticks any step appended during review, so a completed plan \
+shows no open checkbox.
 - COMPLETE: read tools + create_plan only — plan any follow-up change. \
 Skills (e.g. merge_to_main) may also start here.
 
@@ -969,9 +970,11 @@ mod tests {
         let head = build_stable_head(&constitution);
         // GOLDEN: frozen from the first run on the pre-change tree. The
         // single assertion below prints len + sha256 on any drift — fill
-        // GOLDEN_HEAD from that left side, then re-run green.
+        // GOLDEN_HEAD from that left side, then re-run green. Re-pinned for
+        // the intentional WORKFLOW_LIFECYCLE REVIEWING addition (finish ticks
+        // any step appended during review — plan 33a7341e).
         const GOLDEN_HEAD: &str =
-            "len=12351|sha256=7fda6b3b60375015ae2575e41fc3c952b76b7bd5be365f5a727a2e2f2499dfda";
+            "len=12442|sha256=fece68ce7f2317fd3cc376ff9249692123a01108f411db02cfa4881ef6423c82";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",

@@ -1118,8 +1118,9 @@ describe("argPathLines", () => {
 /**
  * The remaining argLabel branches — the git / read_files / git_read /
  * browser / backlog_add branches are covered by messageArgLabel.test.ts.
- * argLabel + displayName moved from Message.tsx to toolCardPaths.ts by
- * quality review LOW 2.
+ * argLabel moved from Message.tsx to toolCardPaths.ts by quality review LOW 2
+ * (the displayName helper that came along with it was removed in plan
+ * 8813e7ab's review round 1 — the collapsed card shows a human phrase now).
  */
 describe("argLabel — remaining branches", () => {
   it("shell: shows the purpose field", () => {

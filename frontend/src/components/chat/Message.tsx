@@ -12,7 +12,7 @@ import { UnifiedDiffView } from "./DiffView";
 import { openDiffInViewer, openFileInViewer } from "../../lib/openFile";
 import { noteLinkPress, takeLinkPress } from "../../lib/linkGesture";
 import { openChatLink } from "../../lib/openChatLink";
-import { argLabel, argPaths, browserResultInfo, buildPathChips, displayName, fileEditDiff, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
+import { argLabel, argPaths, browserResultInfo, buildPathChips, fileEditDiff, groupPhrase, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, prettyToolName, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchUrl, type ToolCardChip } from "../../lib/toolCardPaths";
 import { fmtToolDuration, fmtTs } from "../../lib/timeFormat";
 import { arePropsEqual, type MessageProps } from "../../lib/messageEquality";
 import { toolImagePaths, ToolImage } from "./ToolImage";
@@ -474,78 +474,6 @@ function ToolCard({
       ? (filterSteeringNote(toolErrorSummary(lastCall.result.output), hiddenSteeringNotes) ?? "")
       : "";
 
-  // Header chips: file-path chips come first (deduplicated across all calls so
-  // each file appears at most once — same file read in multiple grouped calls
-  // → one chip; first occurrence wins, keeping its link; DISTINCT files that
-  // share a basename get parent-dir-qualified display names, so no name ever
-  // prints twice), then per-call label
-  // chips for pathless calls (shell purpose, git subcommand, …). A file path
-  // gets a clickable link chip (opens that file in the Files viewer — except
-  // file_edit, whose chip opens the right-panel Diff tab at that file); a
-  // web_fetch label is the fetched URL and its chip opens it in the user's
-  // browser; any other label renders as plain text. Path chips are capped at
-  // 3 with a `+N` overflow chip — every visible name is the link it appears
-  // to be.
-  const chips: ToolCardChip[] = buildPathChips(calls, name);
-  // Literal-fallback notes from search/search_read results (a broken regex
-  // was matched literally) — surfaced under the header so the degraded
-  // semantics are visible without expanding the card.
-  const searchNotes: { key: string; text: string }[] = [];
-  for (const c of calls) {
-    const paths = argPaths(c.args, name);
-    if (paths.length === 0) {
-      const label = argLabel(c.args, name);
-      if (label !== null) {
-        // backlog_add labels carry the queued item's title — flag the chip
-        // so the render site renders it as inline markdown (plan 2026-12).
-        // web_fetch labels carry the fetched URL — attach the FULL url so
-        // the render site makes the chip a link that opens the page in the
-        // user's browser (null/invalid url → plain text).
-        chips.push({
-          key: c.id,
-          text: label,
-          path: null,
-          line: null,
-          md: name === "backlog_add",
-          url: webFetchUrl(name, c.args),
-        });
-      }
-    }
-    // Engine transparency for search/search_read: which engine served the
-    // query (index = FTS content index, walk = tree scan) + the match
-    // count, as a trailing chip on each completed call.
-    if (
-      (name === "search" || name === "search_read") &&
-      c.result !== null &&
-      c.result.success
-    ) {
-      const info = searchResultInfo(c.result.output);
-      if (info !== null) {
-        chips.push({
-          key: `${c.id}:engine`,
-          text: `${info.engine} · ${info.matches === 0 ? "no matches" : `${info.matches} match${info.matches === 1 ? "" : "es"}`}`,
-          path: null,
-          line: null,
-        });
-        const noteText =
-          info.note === null ? null : filterSteeringNote(info.note, hiddenSteeringNotes);
-        if (noteText !== null && noteText !== "") {
-          searchNotes.push({ key: `${c.id}:note`, text: noteText });
-        }
-      }
-    }
-    // Browser tools: a trailing chip summarizing WHAT happened (the landed
-    // URL for navigate, the page title for snapshot, the PNG filename for
-    // screenshot) so the card reads "browser_navigate → https://…"
-    // (user report 2026-09-09).
-    if (c.result !== null && c.result.success) {
-      const info = browserResultInfo(name, c.result.output);
-      if (info !== null) {
-        chips.push({ key: `${c.id}:browser`, text: info, path: null, line: null });
-      }
-    }
-  }
-
   // Header color by state: running (yellow), done-ok (slate), failed (red).
   const textColor = running
     ? "text-yellow-400"
@@ -559,9 +487,17 @@ function ToolCard({
   // the tail (the reducer clears it on tool_result), so a finished card can
   // never show a stale preview, and a chunk that lost the race against its own
   // result is dropped reducer-side. At most one call per card carries a tail
-  // in practice (only `shell` streams, and shell never merges — the reducer's
-  // neverGroups); the `find` keeps the render total regardless.
-  const liveOutput = calls.find((c) => c.result === null && c.liveOutput)?.liveOutput ?? "";
+  // in practice (only `shell` streams); the `find` keeps the render total
+  // regardless, and the block below is gated on THAT call's own name — a card
+  // may now bundle non-shell calls alongside it.
+  const liveCall = calls.find((c) => c.result === null && c.liveOutput);
+  const liveOutput = liveCall?.liveOutput ?? "";
+  // The reservation keys off the RUNNING SHELL call, not off a chunk having
+  // arrived: a running shell card must reserve the fixed-height block from the
+  // first paint (backlog 6f25fb7e). Scanning for a running call whose OWN name
+  // is shell (not just the first running call) keeps a parallel non-shell leg
+  // from suppressing it.
+  const shellRunningCall = calls.find((c) => c.result === null && c.name === "shell");
   // Only the newest lines reach the DOM (the reducer's 16 KiB window is what
   // makes a scroll-back possible; this bounds the node re-rendered per chunk).
   const liveTail = liveTailPreview(liveOutput);
@@ -576,17 +512,18 @@ function ToolCard({
 
   return (
     <div className="py-[0.125em]">
-      {/* span (role=button) instead of <button> so the nested file-link chips
-          (real <button>s) are valid HTML — a <button> cannot contain one. */}
+      {/* span (role=button) rather than <button>: the card hosts interactive
+          content in its expanded body (chips are real buttons), and a
+          role=button span keeps the toggle's semantics independent of them. */}
       <span
         role="button"
         tabIndex={0}
         onClick={() => setExpanded(!expanded)}
         onKeyDown={(e) => {
-          // Chip buttons (file links, the web_fetch URL chip) handle their
-          // own key activation — a keydown bubbling up from a focused chip
-          // must not toggle the expand (its preventDefault would also cancel
-          // the chip's own click activation).
+          // Defensive: any interactive element inside the card (the expanded
+          // chips are real buttons) handles its own key activation — a keydown
+          // bubbling up must not toggle the expand (its preventDefault would
+          // also cancel the child's click activation).
           if (e.target !== e.currentTarget) return;
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -596,92 +533,7 @@ function ToolCard({
         className={`flex cursor-pointer items-center gap-[0.25em] ${textColor}`}
       >
         {expanded ? <ChevronDown className="h-[1em] w-[1em]" /> : <ChevronRight className="h-[1em] w-[1em]" />}
-        <span className="font-medium">{displayName(name)}</span>
-        {chips.map((chip) => {
-          if (chip.path !== null) {
-            // file_edit / multi_edit chips deep-link into the Diff tab (user
-            // request) — every other tool opens the file in the Files tab as
-            // before.
-            const opensDiff = name === "file_edit" || name === "multi_edit";
-            return (
-              <button
-                key={chip.key}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  if (opensDiff) {
-                    openDiffInViewer(chip.path as string);
-                  } else {
-                    // read_files chips carry the line the read started at —
-                    // deep-link the Files viewer to it.
-                    openFileInViewer(chip.path as string, chip.line);
-                  }
-                }}
-                title={
-                  opensDiff
-                    ? `Open the diff of ${chip.path} in the Diff tab`
-                    : `Open ${chip.path} in the Files tab${chip.line !== null ? ` at line ${chip.line}` : ""}`
-                }
-                className="text-cyan-400 underline-offset-2 hover:underline"
-              >
-                {chip.text}
-              </button>
-            );
-          }
-          // A chip carrying an external url (web_fetch's fetched page) is a
-          // link that loads that page in the app's OWN Browser tab (user
-          // request 2027-01-16) — the production CSP blocks plain anchors, so
-          // the click routes through openChatLink, which falls back to the OS
-          // browser where the tab cannot exist. ctrl/cmd-click keeps the old
-          // OS-browser behavior. stopPropagation so the click doesn't toggle
-          // the card's expand, mirroring the file-link chips above; the Globe
-          // icon signals it opens INSIDE the app (unlike an OS-browser launch).
-          if (chip.url != null) {
-            const url = chip.url;
-            return (
-              <button
-                key={chip.key}
-                type="button"
-                onMouseDown={(e) => {
-                  // Sample the escape hatch at PRESS time (lib/linkGesture.ts):
-                  // the engine decides a ctrl/middle-click gesture itself and
-                  // can dispatch the click without the modifier (user report
-                  // 2026-10-01), so the press is the reliable signal.
-                  if (noteLinkPress(e)) e.preventDefault();
-                }}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void openChatLink(url, {
-                    osBrowser: takeLinkPress() || e.ctrlKey || e.metaKey,
-                  });
-                }}
-                onAuxClick={(e) => {
-                  // Middle-click never fires `click`, so drain the press it
-                  // recorded (the chip has no middle-click route of its own).
-                  if (e.button === 1) takeLinkPress();
-                }}
-                onKeyDown={(e) => {
-                  // Enter/Space activate the chip with no preceding press —
-                  // drain any record an aborted press left behind.
-                  if (e.key === "Enter" || e.key === " ") takeLinkPress();
-                }}
-                title={`Open ${url} in the Browser tab — ctrl-click for your browser`}
-                className="flex items-center gap-[0.15em] text-cyan-400 underline-offset-2 hover:underline"
-              >
-                {chip.text}
-                <Globe className="h-[0.75em] w-[0.75em] shrink-0" />
-              </button>
-            );
-          }
-          // Chips flagged `md` (backlog_add's argLabel chip, which carries
-          // the queued item's title) render as inline markdown (bold/code,
-          // truncation-safe) like the other read-only backlog surfaces
-          // (plan 2026-12). Every other pathless chip stays plain text.
-          return (
-            <span key={chip.key} className="text-slate-500">
-              {chip.md ? <InlineMarkdown text={chip.text} /> : chip.text}
-            </span>
-          );
-        })}
+        <span className="font-medium">{groupPhrase(calls) ?? `Using ${prettyToolName(name)}`}</span>
         {running ? (
           <span className="flex items-center gap-[0.3em] text-[0.75em] text-slate-500">
             <span className="thinking-dots">
@@ -720,11 +572,11 @@ function ToolCard({
           pre's text-[0.75em] makes every em below font-size element-relative),
           fitting the liveTailPreview window — whether empty or full, so
           streaming chunks can never change the card's height or jump the chat
-          column. Only `shell` emits ToolOutputDelta (the shell.rs sink), and
-          shell never merges (the reducer's neverGroups), so the reservation
-          is shell-only; the Chat-settings toggle turns the preview off
-          entirely. */}
-      {showShellPreview && name === "shell" && running && (
+          column. Only `shell` emits ToolOutputDelta (the shell.rs sink), so
+          the reservation is shell-only — gated on the streaming CALL's own
+          name (a card may bundle other tools alongside it); the Chat-settings
+          toggle turns the preview off entirely. */}
+      {showShellPreview && shellRunningCall !== undefined && running && (
         <pre
           ref={liveTailRef}
           aria-live="polite"
@@ -732,15 +584,6 @@ function ToolCard({
         >
           {liveTail}
         </pre>
-      )}
-      {searchNotes.length > 0 && (
-        <div className="mt-[0.15em] space-y-[0.15em]">
-          {searchNotes.map((n) => (
-            <div key={n.key} className="text-amber-400/80">
-              note: {n.text}
-            </div>
-          ))}
-        </div>
       )}
       {/* A simple one-line error description for a failed call — the first
           line of the result output, shown below the header so the user sees
@@ -759,7 +602,6 @@ function ToolCard({
               index={i}
               call={call}
               showIndex={calls.length > 1}
-              name={name}
             />
           ))}
         </div>
@@ -771,7 +613,7 @@ function ToolCard({
           image_ui_diff), or the captured PNG for the screenshot tools. */}
       {showToolImages && calls.length > 0 && (
         <div className="mt-[0.2em] flex flex-wrap gap-[0.5em]">
-          {calls.flatMap((call) => toolImagePaths(name, call.args, call.result)).map((p, i) => (
+          {calls.flatMap((call) => toolImagePaths(call.name, call.args, call.result)).map((p, i) => (
             <ToolImage key={`${p}:${i}`} path={p} />
           ))}
         </div>
@@ -784,12 +626,10 @@ function CallDetail({
   call,
   index,
   showIndex,
-  name,
 }: {
   call: ToolInvocation;
   index: number;
   showIndex: boolean;
-  name: string;
 }) {
   let prettyArgs = call.args;
   try {
@@ -810,8 +650,8 @@ function CallDetail({
   // multi_edit renders its ONE combined diff (every file the call changed)
   // the same way. Any other
   // tool keeps the generic pretty-JSON + raw-output rendering.
-  const shellArgs = name === "shell" ? shellCallFromArgs(call.args) : null;
-  const shellOut = call.result && name === "shell" ? parseShellOutput(call.result.output) : null;
+  const shellArgs = call.name === "shell" ? shellCallFromArgs(call.args) : null;
+  const shellOut = call.result && call.name === "shell" ? parseShellOutput(call.result.output) : null;
   // Steering notes ride the shell output too — the grep TIP and the
   // null-sink redirection warning are prepended by the tool (shell.rs) — and
   // this branch renders stdout/stderr directly, so it filters them here; the
@@ -822,27 +662,145 @@ function CallDetail({
       ? stripSteeringNotes(shellOut.stderr, hiddenSteeringNotes)
       : null;
   const editDiff =
-    name === "file_edit" || name === "multi_edit" ? fileEditDiff(call.result) : null;
+    call.name === "file_edit" || call.name === "multi_edit" ? fileEditDiff(call.result) : null;
   // A read_files result is a wall of numbered file content — the expanded
   // body instead shows just WHAT was read: one row per file with its actual
   // line range (parsed from the result's section headers), clickable to open
   // the file at the line the read started.
   const readSections =
-    name === "read_files" && call.result !== null
+    call.name === "read_files" && call.result !== null
       ? parseReadFilesSections(call.result.output)
       : [];
+  // Per-call chips: moved out of the collapsed header when the card became a
+  // ONE-headline summary (2026-10-18 decision) — every per-call affordance now
+  // lives behind the expand. The rules are unchanged, scoped to this call: its
+  // file paths link to the Files/Diff tab, a pathless label chip carries a
+  // shell purpose / git subcommand / backlog title (inline markdown) / the
+  // web_fetch URL (opens in the app's Browser tab), and a completed browser or
+  // search call appends its result summary.
+  const chips: ToolCardChip[] = buildPathChips([call]);
+  if (argPaths(call.args, call.name).length === 0) {
+    const label = argLabel(call.args, call.name);
+    if (label !== null) {
+      chips.push({
+        key: call.id,
+        text: label,
+        path: null,
+        line: null,
+        md: call.name === "backlog_add",
+        url: webFetchUrl(call.name, call.args),
+      });
+    }
+  }
+  // Engine transparency for search/search_read — which engine served the query
+  // (index = FTS content index, walk = tree scan) + the match count — and the
+  // literal-fallback note when a broken regex was matched literally.
+  let searchNote: string | null = null;
+  if (
+    (call.name === "search" || call.name === "search_read") &&
+    call.result !== null &&
+    call.result.success
+  ) {
+    const info = searchResultInfo(call.result.output);
+    if (info !== null) {
+      chips.push({
+        key: `${call.id}:engine`,
+        text: `${info.engine} · ${info.matches === 0 ? "no matches" : `${info.matches} match${info.matches === 1 ? "" : "es"}`}`,
+        path: null,
+        line: null,
+      });
+      const noteText =
+        info.note === null ? null : filterSteeringNote(info.note, hiddenSteeringNotes);
+      if (noteText !== null && noteText !== "") searchNote = noteText;
+    }
+  }
+  if (call.result !== null && call.result.success) {
+    const info = browserResultInfo(call.name, call.result.output);
+    if (info !== null) {
+      chips.push({ key: `${call.id}:browser`, text: info, path: null, line: null });
+    }
+  }
   return (
     <div className="space-y-[0.4em]">
-      {showIndex && (
-        <div className="text-[0.75em] text-slate-500">
-          #{index + 1} {argLabel(call.args, name) ? `— ${argLabel(call.args, name)}` : ""}
-          {/* Per-call timing (grouped cards): same order as the card header —
-              duration, then the call's wall-clock start. */}
-          {call.startedAt !== undefined &&
-            call.endedAt !== undefined &&
-            ` · ${fmtToolDuration(call.endedAt - call.startedAt)}`}
-          {call.startedAt !== undefined && ` · ${fmtTs(call.startedAt)}`}
+      <div className="flex flex-wrap items-baseline gap-[0.35em] text-[0.75em] text-slate-500">
+        {showIndex && <span>#{index + 1} ·</span>}
+        {/* The raw tool name lives ONLY here, on expand — the collapsed card
+            shows the run's human headline. Each call carries its own name
+            since one card may bundle calls to different tools (2026-10-18). */}
+        <span className="font-mono">{call.name}</span>
+        {call.startedAt !== undefined && call.endedAt !== undefined && (
+          <span>· {fmtToolDuration(call.endedAt - call.startedAt)}</span>
+        )}
+        {call.startedAt !== undefined && <span>· {fmtTs(call.startedAt)}</span>}
+      </div>
+      {chips.length > 0 && (
+        <div className="flex flex-wrap items-center gap-[0.4em] text-[0.75em]">
+          {chips.map((chip) => {
+            if (chip.path !== null) {
+              const opensDiff = chip.opensDiff === true;
+              return (
+                <button
+                  key={chip.key}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (opensDiff) {
+                      openDiffInViewer(chip.path as string);
+                    } else {
+                      openFileInViewer(chip.path as string, chip.line);
+                    }
+                  }}
+                  title={
+                    opensDiff
+                      ? `Open the diff of ${chip.path} in the Diff tab`
+                      : `Open ${chip.path} in the Files tab${chip.line !== null ? ` at line ${chip.line}` : ""}`
+                  }
+                  className="text-cyan-400 underline-offset-2 hover:underline"
+                >
+                  {chip.text}
+                </button>
+              );
+            }
+            if (chip.url != null) {
+              const url = chip.url;
+              return (
+                <button
+                  key={chip.key}
+                  type="button"
+                  onMouseDown={(e) => {
+                    // Sample the escape hatch at PRESS time (lib/linkGesture.ts):
+                    // the engine can dispatch the click without the modifier.
+                    if (noteLinkPress(e)) e.preventDefault();
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void openChatLink(url, {
+                      osBrowser: takeLinkPress() || e.ctrlKey || e.metaKey,
+                    });
+                  }}
+                  onAuxClick={(e) => {
+                    if (e.button === 1) takeLinkPress();
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") takeLinkPress();
+                  }}
+                  title={`Open ${url} in the Browser tab — ctrl-click for your browser`}
+                  className="flex items-center gap-[0.15em] text-cyan-400 underline-offset-2 hover:underline"
+                >
+                  {chip.text}
+                  <Globe className="h-[0.75em] w-[0.75em] shrink-0" />
+                </button>
+              );
+            }
+            return (
+              <span key={chip.key} className="text-slate-500">
+                {chip.md ? <InlineMarkdown text={chip.text} /> : chip.text}
+              </span>
+            );
+          })}
         </div>
+      )}
+      {searchNote !== null && (
+        <div className="text-[0.75em] text-amber-400/80">note: {searchNote}</div>
       )}
       {shellArgs ? (
         <div>

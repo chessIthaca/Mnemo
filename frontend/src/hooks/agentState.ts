@@ -650,14 +650,19 @@ export function isActivityEntry(entry: TranscriptEntry): boolean {
  *
  * `memory` entries cover BOTH memory tool calls (memory_search,
  * memory_write, …) and auto-recall entries (the `memory_recalled` event
- * pushes a `memory` entry named "auto-recall"). `tool` entries whose name
- * starts with `graph_` cover graph_search / graph_context / graph_impact /
- * graph_path.
+ * pushes a `memory` entry named "auto-recall"). `tool` entries qualify when
+ * ANY of their calls starts with `graph_` — graph_search / graph_context /
+ * graph_impact / graph_path — since a card may bundle the graph lookup with
+ * other tools' calls (2026-10-18 bundling).
  */
 export function isKnowledgeActivityEntry(entry: TranscriptEntry): boolean {
   return (
     entry.kind === "memory" ||
-    (entry.kind === "tool" && entry.name.startsWith("graph_"))
+    // Scan EVERY call: a graph lookup may ride a card bundled behind another
+    // tool (2026-10-18 bundling), and a graph-led card bundling noisy legs is
+    // still graph activity. The entry name is the run's first call only.
+    (entry.kind === "tool" &&
+      entry.calls.some((c) => (c.name ?? entry.name).startsWith("graph_")))
   );
 }
 

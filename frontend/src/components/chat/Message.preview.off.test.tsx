@@ -36,6 +36,7 @@ describe("live shell-output preview — toggle off (backlog 6f25fb7e)", () => {
     const call: ToolInvocation = {
       id: "c1",
       index: 0,
+      name: "shell",
       args: JSON.stringify({ command: "cargo test" }),
       result: null,
       liveOutput: "Compiling mnemo v0.1.0\n",

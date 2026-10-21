@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
-import { argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, dedupePaths, displayName, fileEditDiff, graphCallLabel, isBrowserToolName, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
+import { actionPhrase, argLabel, argPathLines, argPaths, basename, browserResultInfo, buildPathChips, dedupePaths, fileEditDiff, graphCallLabel, groupPhrase, isBrowserToolName, liveTailPreview, memorySearchLabel, parseReadFilesSections, parseShellOutput, prettyToolName, searchResultInfo, shellCallFromArgs, toolErrorSummary, webFetchLabel, webFetchUrl } from "./toolCardPaths";
 
 describe("basename", () => {
   it("returns the last path segment (forward + back slashes)", () => {
@@ -347,6 +347,13 @@ describe("dedupePaths", () => {
   });
 });
 
+/** Test helper: stamp one tool name onto every call. The production card
+ *  bundles calls to DIFFERENT tools (2026-10-18 bundling decision), so each
+ *  invocation carries its own `name`; these legacy fixtures share one tool. */
+function withTool(tool: string, calls: Array<{ id: string; args: string }>) {
+  return calls.map((c) => ({ ...c, name: tool }));
+}
+
 describe("buildPathChips", () => {
   it("shows each file once even when read in multiple grouped calls", () => {
     // The bug: same file read in two read_files calls → header showed the
@@ -355,7 +362,7 @@ describe("buildPathChips", () => {
       { id: "c1", args: JSON.stringify({ path: "src/main.rs" }) },
       { id: "c2", args: JSON.stringify({ path: "src/main.rs" }) },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips).toEqual([
       { key: expect.any(String), text: "main.rs", path: "src/main.rs", line: 1 },
     ]);
@@ -368,7 +375,7 @@ describe("buildPathChips", () => {
         args: JSON.stringify({ files: [{ path: "a.rs" }, { path: "a.rs" }, { path: "b.rs" }] }),
       },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips).toEqual([
       { key: expect.any(String), text: "a.rs", path: "a.rs", line: 1 },
       { key: expect.any(String), text: "b.rs", path: "b.rs", line: 1 },
@@ -391,7 +398,7 @@ describe("buildPathChips", () => {
         }),
       },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips).toEqual([
       { key: expect.any(String), text: "a.rs", path: "a.rs", line: 1 },
       { key: expect.any(String), text: "b.rs", path: "b.rs", line: 1 },
@@ -415,9 +422,9 @@ describe("buildPathChips", () => {
         }),
       },
     ];
-    expect(buildPathChips(calls, "multi_edit")).toEqual([
-      { key: expect.any(String), text: "a.rs", path: "src/a.rs", line: null },
-      { key: expect.any(String), text: "b.rs", path: "src/b.rs", line: null },
+    expect(buildPathChips(withTool("multi_edit", calls))).toEqual([
+      { key: expect.any(String), text: "a.rs", path: "src/a.rs", line: null, opensDiff: true },
+      { key: expect.any(String), text: "b.rs", path: "src/b.rs", line: null, opensDiff: true },
     ]);
   });
 
@@ -429,7 +436,7 @@ describe("buildPathChips", () => {
         args: JSON.stringify({ files: [{ path: "b.rs" }, { path: "c.rs" }, { path: "d.rs" }] }),
       },
     ];
-    const chips = buildPathChips(calls, "multi_edit");
+    const chips = buildPathChips(withTool("multi_edit", calls));
     expect(chips.map((c) => c.text)).toEqual(["a.rs", "b.rs", "c.rs", "+1"]);
     expect(chips[3].path).toBeNull();
   });
@@ -437,10 +444,12 @@ describe("buildPathChips", () => {
   it("returns no chips for label-only tools (git, shell)", () => {
     // git/shell carry no file path — buildPathChips yields nothing (the label
     // chip is rendered separately by the ToolCard).
-    expect(buildPathChips([{ id: "c1", args: '{"subcommand":"status"}' }], "git")).toEqual([]);
-    expect(buildPathChips([{ id: "c1", args: '{"purpose":"running tests"}' }], "shell")).toEqual(
+    expect(buildPathChips(withTool("git", [{ id: "c1", args: '{"subcommand":"status"}' }]))).toEqual(
       [],
     );
+    expect(
+      buildPathChips(withTool("shell", [{ id: "c1", args: '{"purpose":"running tests"}' }])),
+    ).toEqual([]);
   });
 });
 
@@ -459,7 +468,7 @@ describe("buildPathChips — unique display names", () => {
       { id: "c1", args: JSON.stringify({ path: "src/provider/openai.rs" }) },
       { id: "c2", args: JSON.stringify({ path: "src-tauri/src/openai.rs" }) },
     ];
-    const chips = buildPathChips(calls, "file_edit");
+    const chips = buildPathChips(withTool("file_edit", calls));
     expect(chips.map((c) => c.text)).toEqual(["provider/openai.rs", "src/openai.rs"]);
     // The links keep their original full paths.
     expect(chips.map((c) => c.path)).toEqual(["src/provider/openai.rs", "src-tauri/src/openai.rs"]);
@@ -472,7 +481,7 @@ describe("buildPathChips — unique display names", () => {
       { id: "c1", args: JSON.stringify({ files: [{ path: "x/y/main.rs" }] }) },
       { id: "c2", args: JSON.stringify({ files: [{ path: "z/y/main.rs" }] }) },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips.map((c) => c.text)).toEqual(["x/y/main.rs", "z/y/main.rs"]);
   });
 
@@ -485,7 +494,7 @@ describe("buildPathChips — unique display names", () => {
         }),
       },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips.map((c) => c.text)).toEqual(["readme.md", "src/util.ts", "app/util.ts"]);
   });
 
@@ -494,7 +503,7 @@ describe("buildPathChips — unique display names", () => {
       { id: "c1", args: JSON.stringify({ files: [{ path: "C:\\repo\\a\\m.rs" }] }) },
       { id: "c2", args: JSON.stringify({ files: [{ path: "D:\\other\\b\\m.rs" }] }) },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips.map((c) => c.text)).toEqual(["a/m.rs", "b/m.rs"]);
   });
 
@@ -507,7 +516,7 @@ describe("buildPathChips — unique display names", () => {
       { id: "c1", args: JSON.stringify({ path: "/src/main.rs" }) },
       { id: "c2", args: JSON.stringify({ path: "src/main.rs" }) },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips.map((c) => c.text)).toEqual(["/src/main.rs", "src/main.rs"]);
     expect(chips.map((c) => c.path)).toEqual(["/src/main.rs", "src/main.rs"]);
   });
@@ -517,7 +526,7 @@ describe("buildPathChips — unique display names", () => {
       { id: "c1", args: JSON.stringify({ path: "src//util.ts" }) },
       { id: "c2", args: JSON.stringify({ path: "src/util.ts" }) },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips.map((c) => c.text)).toEqual(["src//util.ts", "src/util.ts"]);
     expect(chips.map((c) => c.path)).toEqual(["src//util.ts", "src/util.ts"]);
   });
@@ -536,7 +545,7 @@ describe("buildPathChips — unique display names", () => {
         }),
       },
     ];
-    const chips = buildPathChips(calls, "read_files");
+    const chips = buildPathChips(withTool("read_files", calls));
     expect(chips).toEqual([
       { key: expect.any(String), text: "x/y/main.rs", path: "x/y/main.rs", line: 1 },
       { key: expect.any(String), text: "z/y/main.rs", path: "z/y/main.rs", line: 1 },
@@ -1170,22 +1179,6 @@ describe("argLabel — remaining branches", () => {
   });
 });
 
-describe("displayName", () => {
-  it("maps the known tool names to friendly labels", () => {
-    expect(displayName("spawn_agent")).toBe("Spawn Agent");
-    expect(displayName("graph_search")).toBe("Graph Search");
-    expect(displayName("graph_context")).toBe("Graph Context");
-    expect(displayName("graph_impact")).toBe("Graph Impact");
-    expect(displayName("graph_path")).toBe("Graph Path");
-    expect(displayName("multi_edit")).toBe("Multi Edit");
-  });
-
-  it("falls back to the raw name", () => {
-    expect(displayName("shell")).toBe("shell");
-    expect(displayName("read_files")).toBe("read_files");
-  });
-});
-
 /**
  * Source-contract tests for the live shell output tail (backlog 7e6385b3,
  * plan 0d2c1221): while a shell call is still running, its ToolCard shows the
@@ -1221,7 +1214,7 @@ describe("live shell output tail (backlog 7e6385b3)", () => {
     // (backlog 6f25fb7e): the block renders whether or not output has
     // arrived yet, gated by the Chat-settings toggle — streaming chunks can
     // never change the card's height or jump the chat column.
-    expect(src).toContain('{showShellPreview && name === "shell" && running && (');
+    expect(src).toContain('{showShellPreview && shellRunningCall !== undefined && running && (');
     expect(src).toContain("h-[10em]");
     expect(src).not.toContain("max-h-[12em]");
     // Follow the newest output (a chatty command prints far more than fits).
@@ -1251,5 +1244,236 @@ describe("live shell output tail (backlog 7e6385b3)", () => {
     // The buffers are drained on /clear like the other delta buffers, so a
     // stale chunk cannot repopulate a cleared conversation.
     expect(src).toContain("handle.outputBuffers.delete(id);");
+  });
+});
+
+/**
+ * `actionPhrase` — the human sentence a collapsed card shows instead of the
+ * tool name (2026-10-18 one-headline decision). Table-driven so a newly added
+ * tool cannot silently fall through to the `Using <pretty>` fallback.
+ */
+describe("actionPhrase — collapsed card headlines", () => {
+  const phrase = (name: string, args: Record<string, unknown> = {}) =>
+    actionPhrase(name, JSON.stringify(args));
+
+  it("covers every registered tool family (no family falls through)", () => {
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["search", { pattern: "x" }],
+      ["search_read", { pattern: "x", glob: "**/*.rs" }],
+      ["read_files", { files: [{ path: "a.rs" }, { path: "b.rs" }] }],
+      ["expand_result", {}],
+      ["file_edit", {}],
+      ["multi_edit", { files: [{ path: "a.rs" }, { path: "b.rs" }] }],
+      ["file_write", {}],
+      ["file_append", {}],
+      ["convert_line_endings", {}],
+      ["shell", { purpose: "running tests" }],
+      ["git", { subcommand: "commit" }],
+      ["git_read", { op: "log" }],
+      ["web_fetch", { url: "https://example.com" }],
+      ["browser_navigate", { url: "http://localhost:3000" }],
+      ["browser_click", { selector: "#go" }],
+      ["browser_type", { selector: "#q" }],
+      ["browser_eval", {}],
+      ["browser_screenshot", {}],
+      ["browser_snapshot", {}],
+      ["browser_console", {}],
+      ["offscreen_browser_switch_page", {}],
+      ["offscreen_browser_list_pages", {}],
+      ["offscreen_browser_close_page", {}],
+      ["graph_search", { query: "Engine" }],
+      ["graph_context", { name: "Engine" }],
+      ["graph_impact", { name: "Engine" }],
+      ["graph_path", { from: "a", to: "b" }],
+      ["memory_write", { title: "DECISION: x" }],
+      ["memory_search", {}],
+      ["memory_recall", {}],
+      ["memory_consolidate", {}],
+      ["memory_update", {}],
+      ["memory_supersede", {}],
+      ["memory_amend", {}],
+      ["memory_delete", {}],
+      ["spawn_agent", { name: "reviewer" }],
+      ["write_review_report", {}],
+      ["create_plan", {}],
+      ["update_plan", {}],
+      ["complete_step", {}],
+      ["abandon_plan", {}],
+      ["finish", {}],
+      ["backlog_add", {}],
+      ["backlog_status", {}],
+      ["backlog_list", {}],
+      ["skill_start", { skill: "merge_to_main" }],
+      ["skill_end", {}],
+      ["skill_reload", {}],
+      ["skill_create", { name: "x" }],
+      ["ask_user", {}],
+      ["list_models", {}],
+      ["load_tools", {}],
+      ["image_analysis", {}],
+      ["image_ui_diff", {}],
+    ];
+    for (const [name, args] of cases) {
+      expect(phrase(name, args), `${name} must yield a phrase`).not.toBeNull();
+    }
+  });
+
+  it("reads the key arg detail into the sentence", () => {
+    expect(phrase("search", { pattern: "WorkflowState" })).toBe('Searching for "WorkflowState"');
+    expect(phrase("search", { pattern: "foo", glob: "**/*.rs" })).toBe(
+      'Searching for "foo" in **/*.rs',
+    );
+    expect(phrase("read_files", { files: [{ path: "a.rs" }, { path: "b.rs" }] })).toBe(
+      "Reading 2 files",
+    );
+    expect(phrase("read_files", { path: "a.rs" })).toBe("Reading a file");
+    expect(phrase("multi_edit", { files: [{ path: "a.rs" }, { path: "b.rs" }] })).toBe(
+      "Editing 2 files",
+    );
+    // A shell purpose is already a gerund — it IS the sentence (no double verb).
+    expect(phrase("shell", { purpose: "running tests" })).toBe("Running tests");
+    expect(phrase("git", { subcommand: "commit" })).toBe("Committing");
+    expect(phrase("git_read", { op: "log" })).toBe("Reading the git log");
+    expect(phrase("web_fetch", { url: "https://example.com" })).toBe(
+      "Fetching https://example.com",
+    );
+    expect(phrase("graph_search", { query: "Engine" })).toBe(
+      'Searching the code graph for "Engine"',
+    );
+    expect(phrase("memory_write", { title: "DECISION: x" })).toBe("Recording a memory: DECISION: x");
+    expect(phrase("spawn_agent", { name: "reviewer" })).toBe("Spawning reviewer");
+  });
+
+  it("never names the raw tool in the phrase", () => {
+    // The raw name is the EXPANDED detail's job; the sentence must read human.
+    for (const name of ["search", "file_edit", "shell", "read_files", "git"]) {
+      expect(phrase(name)).not.toBe(name);
+    }
+  });
+
+  it("returns null for malformed args or an unknown tool (caller falls back)", () => {
+    expect(actionPhrase("search", "{not json")).toBeNull();
+    expect(actionPhrase("mcp__github__search", "{}")).toBeNull();
+    expect(actionPhrase("totally_new_tool", "{}")).toBeNull();
+  });
+});
+
+describe("prettyToolName — the fallback humanizer", () => {
+  it("drops the MCP prefix and humanizes separators", () => {
+    expect(prettyToolName("mcp__github__search")).toBe("Github search");
+    expect(prettyToolName("custom_tool")).toBe("Custom tool");
+    expect(prettyToolName("shell")).toBe("Shell");
+  });
+});
+
+describe("groupPhrase — ONE headline per run", () => {
+  const call = (name: string, args: Record<string, unknown> = {}) => ({
+    name,
+    args: JSON.stringify(args),
+  });
+
+  it("a single call returns its own phrase", () => {
+    expect(groupPhrase([call("search", { pattern: "foo" })])).toBe('Searching for "foo"');
+  });
+
+  it("a mixed run joins the phrases with and, repeats collapse with ×N", () => {
+    expect(
+      groupPhrase([
+        call("search", { pattern: "WorkflowState" }),
+        call("file_edit", {}),
+        call("file_edit", {}),
+      ]),
+    ).toBe('Searching for "WorkflowState" and editing files ×2');
+  });
+
+  it("three or more distinct legs read as a list ending in and", () => {
+    expect(
+      groupPhrase([
+        call("read_files", { path: "a.rs" }),
+        call("search", { pattern: "foo" }),
+        call("file_edit", {}),
+      ]),
+    ).toBe('Reading a file, searching for "foo" and editing files');
+  });
+
+  it("consecutive duplicate phrases collapse with a count", () => {
+    expect(
+      groupPhrase([call("read_files", { path: "a.rs" }), call("read_files", { path: "b.rs" })]),
+    ).toBe("Reading a file ×2");
+  });
+
+  it("an unknown tool joins as Using <pretty> instead of dropping the leg", () => {
+    expect(
+      groupPhrase([call("search", { pattern: "x" }), { name: "mcp__github__search", args: "{}" }]),
+    ).toBe('Searching for "x" and using Github search');
+  });
+
+  it("returns null for an empty run (the caller falls back to Using …)", () => {
+    expect(groupPhrase([])).toBeNull();
+  });
+
+  it("clamps a long run so the header cannot wrap forever", () => {
+    const many = Array.from({ length: 12 }, (_, i) =>
+      call("search", { pattern: `pattern-${i}-${"x".repeat(12)}` }),
+    );
+    const headline = groupPhrase(many);
+    expect(headline).not.toBeNull();
+    expect(headline!.length).toBeLessThanOrEqual(120);
+    expect(headline!.endsWith("…")).toBe(true);
+  });
+});
+
+describe("bundling — chips follow the call that produced them", () => {
+  it("a mixed card links read chips to Files and edit chips to the Diff tab", () => {
+    const chips = buildPathChips([
+      { id: "c1", name: "read_files", args: JSON.stringify({ path: "src/a.rs" }) },
+      { id: "c2", name: "file_edit", args: JSON.stringify({ path: "src/b.rs" }) },
+    ]);
+    expect(chips.find((c) => c.path === "src/a.rs")?.opensDiff).toBeUndefined();
+    expect(chips.find((c) => c.path === "src/b.rs")?.opensDiff).toBe(true);
+  });
+});
+
+/**
+ * Source contracts for the one-headline decision (2026-10-18): the COLLAPSED
+ * card carries the run's human headline only — the raw tool name and every
+ * chip live in the expanded per-call rows.
+ */
+describe("one-headline card — source contracts", () => {
+  const readSrc = (rel: string): string =>
+    readFileSync(new URL(rel, import.meta.url), "utf8");
+
+  it("the collapsed header renders groupPhrase, never the raw name", () => {
+    const src = readSrc("../components/chat/Message.tsx");
+    expect(src).toContain("{groupPhrase(calls) ?? `Using ${prettyToolName(name)}`}");
+    expect(src).not.toContain("displayName(name)");
+  });
+
+  it("the expanded row shows the raw tool name and the per-call chips", () => {
+    const src = readSrc("../components/chat/Message.tsx");
+    expect(src).toContain('<span className="font-mono">{call.name}</span>');
+    expect(src).toContain("const chips: ToolCardChip[] = buildPathChips([call]);");
+  });
+});
+
+/**
+ * H2 (review round 1): a conversation saved before the per-call `name` field
+ * existed must not crash the render. /load normalizes it, and these helpers
+ * degrade instead of throwing when a shape still slips through.
+ */
+describe("legacy calls without a name (pre-bundling saves)", () => {
+  it("actionPhrase and prettyToolName degrade instead of throwing", () => {
+    expect(actionPhrase(undefined as unknown as string, "{}")).toBeNull();
+    expect(prettyToolName(undefined as unknown as string)).toBe("tool");
+  });
+
+  it("groupPhrase joins an unnamed leg as Using tool", () => {
+    expect(groupPhrase([{ name: undefined as unknown as string, args: "{}" }])).toBe("Using tool");
+  });
+
+  it("buildPathChips still extracts the path", () => {
+    expect(
+      buildPathChips([{ id: "c1", name: undefined as unknown as string, args: '{"path":"a.rs"}' }]),
+    ).toEqual([expect.objectContaining({ path: "a.rs" })]);
   });
 });

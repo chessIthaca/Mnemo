@@ -103,11 +103,21 @@ describe("Conversation stable keys (mem-perf review HIGH 3)", () => {
 
 describe("isKnowledgeActivityEntry (the show_knowledge_activity predicate)", () => {
   it("graph_* tool calls are knowledge activity", () => {
+    // Classification scans the CALLS now (review round 1, H4): a card bundles
+    // different tools, so the entry name (the run's first call) cannot decide
+    // alone — each fixture carries its graph call explicitly.
+    const graphCall = (id: string, name: string) => ({
+      id,
+      index: 0,
+      name,
+      args: "{}",
+      result: null,
+    });
     const graphTools: TranscriptEntry[] = [
-      { kind: "tool", name: "graph_search", calls: [] },
-      { kind: "tool", name: "graph_context", calls: [] },
-      { kind: "tool", name: "graph_impact", calls: [] },
-      { kind: "tool", name: "graph_path", calls: [] },
+      { kind: "tool", name: "graph_search", calls: [graphCall("c1", "graph_search")] },
+      { kind: "tool", name: "graph_context", calls: [graphCall("c2", "graph_context")] },
+      { kind: "tool", name: "graph_impact", calls: [graphCall("c3", "graph_impact")] },
+      { kind: "tool", name: "graph_path", calls: [graphCall("c4", "graph_path")] },
     ];
     expect(graphTools.every(isKnowledgeActivityEntry)).toBe(true);
   });

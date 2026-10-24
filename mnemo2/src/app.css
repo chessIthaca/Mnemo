@@ -1,110 +1,99 @@
 :root {
-  font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
-  color: #242520;
-  background: #f7f7f4;
+  font-family: var(--font-ui);
+  color: var(--ink);
+  background: var(--canvas);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   color-scheme: light;
-  --paper: #f7f7f4;
+  --font-ui: "Inter Variable", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-prose: "Source Serif 4 Variable", "Source Serif 4", Georgia, serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --canvas: #f7f7f4;
   --surface: #ffffff;
-  --ink: #242520;
-  --muted: #71736b;
-  --line: #e5e5de;
-  --accent: #5d6f52;
+  --surface-soft: #f0f1eb;
+  --ink: #242620;
+  --ink-soft: #5e6258;
+  --muted: #83877b;
+  --line: #e4e5dd;
+  --line-strong: #d4d7cc;
+  --accent: #64795a;
+  --accent-strong: #465b3e;
+  --accent-soft: #e8eee3;
+  --warning: #94672f;
+  --warning-soft: #f2e9da;
+  --danger: #a24f47;
+  --shadow-soft: 0 12px 34px rgb(37 40 32 / 5%);
+  --shadow: 0 22px 60px rgb(37 40 32 / 12%);
 }
 
-* {
-  box-sizing: border-box;
-}
-
-html,
-body,
-#app {
-  min-width: 320px;
-  min-height: 100%;
-  margin: 0;
-}
-
-body {
-  min-height: 100vh;
-}
-
-button,
-input,
-textarea {
-  font: inherit;
-}
-
-button,
-a {
-  -webkit-tap-highlight-color: transparent;
-}
+* { box-sizing: border-box; }
+html, body, #app { width: 100%; height: 100%; min-width: 320px; margin: 0; }
+body { overflow: hidden; }
+button, input, textarea, select { font: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+button { color: inherit; }
+a { color: inherit; }
+::selection { background: #dce6d4; color: var(--ink); }
 
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
 
-.bootstrap-shell {
-  display: grid;
-  min-height: 100vh;
-  place-content: center;
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 48px 28px;
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 620;
+  text-decoration: none;
 }
 
-.bootstrap-mark {
-  display: grid;
-  width: 52px;
-  height: 52px;
-  margin-bottom: 32px;
+.button-quiet { border-color: var(--line); background: var(--surface); color: var(--ink-soft); }
+.button-quiet:hover { border-color: var(--line-strong); background: var(--surface-soft); color: var(--ink); }
+.button-primary { background: var(--ink); color: white; }
+.button-primary:hover { background: #363a31; }
+.button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.icon-button {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
   place-items: center;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 9px;
   background: var(--surface);
-  color: var(--accent);
-  font-family: "Source Serif 4 Variable", Georgia, serif;
-  font-size: 28px;
-  box-shadow: 0 12px 40px rgb(35 38 30 / 6%);
-}
-
-.eyebrow {
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.14em;
+  cursor: pointer;
+}
+.icon-button:hover { border-color: var(--line-strong); color: var(--ink); }
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
-h1 {
-  max-width: 650px;
-  margin: 12px 0 20px;
-  font-family: "Source Serif 4 Variable", Georgia, serif;
-  font-size: clamp(38px, 6vw, 64px);
-  font-weight: 500;
-  line-height: 1.04;
-  letter-spacing: -0.035em;
+* { scrollbar-color: #d2d5cb transparent; scrollbar-width: thin; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: #d2d5cb; background-clip: padding-box; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
 
-.bootstrap-copy {
-  max-width: 560px;
-  color: var(--muted);
-  font-size: 16px;
-  line-height: 1.7;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .bootstrap-shell {
-    animation: arrive 500ms ease-out both;
-  }
-
-  @keyframes arrive {
-    from {
-      opacity: 0;
-      transform: translateY(8px);
-    }
-  }
-}

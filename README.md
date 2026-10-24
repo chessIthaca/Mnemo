@@ -171,16 +171,21 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
-The Mnemo2 Phase 0b prototype is a separate Svelte 5 workspace (mock data only —
-no engine, IPC, or git operations). It is conversation-first: each task has its
-own lead-enforced workflow, and the lead/worker model identities are visible in
-the UI:
+The Mnemo2 Phase 1 workspace is a separate Svelte 5 cockpit. In its native Tauri
+host the lead conversation is real — one headless-engine session with streaming,
+cancellation, transcript restore, approvals, and a config-backed model picker;
+the browser-only Vite session remains a mock fallback. Workers and the team
+runtime are still mock data until Phase 2. The interface is conversation-first:
+each task has its own lead-enforced workflow, and lead/worker model identities
+are visible in the UI:
 
 ```bash
-npm run dev:mnemo2         # http://127.0.0.1:5180
+npm run dev:mnemo2         # http://127.0.0.1:5180 — browser mock fallback
+npm run dev:mnemo2:native  # Tauri host + real lead (run dev:mnemo2 first)
 npm run check:mnemo2       # svelte-check
-npm run test:mnemo2        # Vitest interaction + policy tests
+npm run test:mnemo2        # Vitest interaction + adapter + policy tests
 npm run build:mnemo2       # -> target/mnemo2-dist
+npm run build:mnemo2:native
 ```
 
 Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off by default for light builds; the app always selects both.

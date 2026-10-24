@@ -13,7 +13,7 @@
 <main class="start-screen">
   <header class="start-nav">
     <a class="brand" href="/" aria-label="Mnemo2 home"><span class="brand-mark">M</span><span>Mnemo2</span></a>
-    <span class="phase-label">PHASE 0B</span>
+    <span class="phase-label">PHASE 1</span>
   </header>
 
   <section class="start-main">

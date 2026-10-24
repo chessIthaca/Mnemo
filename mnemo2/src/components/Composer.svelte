@@ -1,13 +1,22 @@
 <script lang="ts">
-  import { ArrowUp } from "@lucide/svelte";
-  import { actions, currentProject } from "../lib/store";
-  import ModelBadge from "./ModelBadge.svelte";
+  import { ArrowUp, Square } from "@lucide/svelte";
+  import { actions, app } from "../lib/store";
+  import LeadModelPicker from "./LeadModelPicker.svelte";
 
   let draft = $state("");
+  const busy = $derived($app.leadRuntime.busy);
+  const connecting = $derived(
+    $app.leadRuntime.mode === "native" && $app.leadRuntime.status === "opening",
+  );
+  const canSend = $derived(
+    $app.leadRuntime.pending === null &&
+      ($app.leadRuntime.mode === "mock" ||
+        ($app.leadRuntime.status === "ready" && !busy)),
+  );
 
   function send() {
     const message = draft.trim();
-    if (!message) return;
+    if (!message || !canSend) return;
     actions.sendLeadMessage(message);
     draft = "";
   }
@@ -34,12 +43,36 @@
       aria-label="Message the lead"
       placeholder="Ask, plan, or redirect the team…"
     ></textarea>
-    <button class="send-button" type="submit" aria-label="Send message" disabled={!draft.trim()}>
-      <ArrowUp size={17} strokeWidth={2} />
-    </button>
+    {#if busy}
+      <button
+        class="send-button stop-button"
+        type="button"
+        aria-label="Stop the lead"
+        title="Stop the lead"
+        onclick={() => actions.interruptLead()}
+      >
+        <Square size={13} fill="currentColor" strokeWidth={1.5} />
+      </button>
+    {:else}
+      <button
+        class="send-button"
+        type="submit"
+        aria-label="Send message"
+        disabled={!draft.trim() || !canSend}
+      >
+        <ArrowUp size={17} strokeWidth={2} />
+      </button>
+    {/if}
   </div>
   <div class="composer-meta">
-    <ModelBadge model={$currentProject?.leadModel ?? "unconfigured"} role="lead" />
+    <LeadModelPicker compact />
+    <div class="composer-status" aria-live="polite">
+      {#if busy}
+        <span class="working"><span class="working-dot" aria-hidden="true"></span>Working</span>
+      {:else if connecting}
+        <span>Connecting</span>
+      {/if}
+    </div>
   </div>
 </form>
 
@@ -83,6 +116,12 @@
     cursor: pointer;
   }
   .send-button:disabled { background: var(--surface-soft); color: #adb0a6; cursor: default; }
-  .composer-meta { display: flex; align-items: center; min-height: 14px; padding: 8px 4px 0; }
+  .stop-button { border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); }
+  .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
+  .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
+  .composer-status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: 0.04em; }
+  .working { display: inline-flex; align-items: center; gap: 5px; }
+  .working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: composer-pulse 1.2s ease-in-out infinite; }
+  @keyframes composer-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
   @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

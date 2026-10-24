@@ -8,6 +8,9 @@
   import SpawnCard from "./SpawnCard.svelte";
 
   let scroller: HTMLDivElement;
+  const leadModel = $derived(
+    $app.leadRuntime.modelId ?? $currentProject?.leadModel ?? "unconfigured",
+  );
 
   $effect(() => {
     const entryCount = $app.leadEntries.length;
@@ -19,8 +22,42 @@
   <div class="lead-scroll" bind:this={scroller}>
     <div class="lead-content">
       <header class="lead-heading">
-        <div class="lead-title"><span class="lead-mark">M</span><h1>Lead</h1><ModelBadge model={$currentProject?.leadModel ?? "unconfigured"} role="lead" /></div>
+        <div class="lead-title"><span class="lead-mark">M</span><h1>Lead</h1><ModelBadge model={leadModel} role="lead" /></div>
       </header>
+
+      {#if $app.leadRuntime.status === "error" && $app.leadRuntime.error}
+        <article class="lead-notice lead-error" role="alert">
+          <p>{$app.leadRuntime.error}</p>
+          <div class="notice-actions">
+            <button class="button button-quiet" onclick={() => actions.retryLead()}>Retry</button>
+          </div>
+        </article>
+      {/if}
+
+      {#if $app.leadRuntime.pending}
+        {@const pending = $app.leadRuntime.pending}
+        <article class="lead-notice lead-pending" role="status">
+          {#if pending.kind === "approval"}
+            <div class="notice-label">APPROVAL REQUIRED</div>
+            <p>{pending.tool_name ? `${pending.tool_name} is waiting for approval.` : "A gated action is waiting for approval."}</p>
+            <div class="notice-actions">
+              <button class="button button-primary" disabled={!pending.request_id} onclick={() => pending.request_id && actions.approveLead(pending.request_id, "approve")}>Approve</button>
+              <button class="button button-quiet" disabled={!pending.request_id} onclick={() => pending.request_id && actions.approveLead(pending.request_id, "deny")}>Deny</button>
+            </div>
+          {:else if pending.kind === "question"}
+            <div class="notice-label">QUESTION</div>
+            <p>{pending.question ?? "The lead needs an answer."}</p>
+            <div class="notice-actions">
+              {#each pending.options ?? [] as option, index}
+                <button class="button button-quiet" disabled={!pending.question_id} onclick={() => pending.question_id && actions.answerLead(pending.question_id, { kind: "choice", index })}>{option.label}</button>
+              {/each}
+            </div>
+          {:else}
+            <div class="notice-label">WAITING FOR YOU</div>
+            <p>The lead needs input to continue.</p>
+          {/if}
+        </article>
+      {/if}
 
       <div class="lead-entries">
         {#each $app.leadEntries as entry (entry.id)}
@@ -91,6 +128,13 @@
   .team-card p { margin: 12px 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
   .team-card button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; }
   .review-card { background: #f4f2ed; }
+  .lead-notice { margin: 0 0 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+  .lead-notice p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
+  .lead-error { border-color: #e3c7c2; background: #fbf3f1; }
+  .lead-error p { color: var(--danger); }
+  .lead-pending { border-color: #ddd2bd; background: #f8f4ea; }
+  .notice-label { margin-bottom: 5px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; }
+  .notice-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
   .composer-dock { flex: 0 0 auto; padding: 12px 40px 16px; background: linear-gradient(transparent, var(--canvas) 18%); }
   @media (max-width: 760px) {
     .lead-content { padding: 20px; }

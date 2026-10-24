@@ -205,12 +205,113 @@ export interface ToastMessage {
   message: string;
 }
 
+/** One configured lead model, as returned by the native runtime. */
+export interface LeadModel {
+  endpoint: string;
+  model: string;
+  spec: string;
+  is_default: boolean;
+}
+
+/** The UI's answer to a native `ask_user` question. */
+export type LeadAnswerInput =
+  | { kind: "choice"; index: number }
+  | { kind: "freeform"; text: string };
+
+/** A pending interaction reported by the headless session snapshot. */
+export interface LeadPendingInteraction {
+  kind: "approval" | "question" | "host_tool_call" | "policy_hook" | (string & {});
+  request_id?: string;
+  question_id?: string;
+  tool_call_id?: string;
+  tool_name?: string;
+  question?: string;
+  options?: { label: string; description?: string | null }[];
+  [key: string]: unknown;
+}
+
+export interface LeadTranscriptMessage {
+  role: string;
+  content: unknown;
+  tool_calls?: unknown[];
+  tool_call_id?: string | null;
+  name?: string | null;
+}
+
+export interface LeadTranscript {
+  messages: LeadTranscriptMessage[];
+}
+
+/** The lead state returned by `lead_open`, `lead_snapshot`, and `lead_set_model`. */
+export interface LeadSnapshot {
+  generation: number;
+  model: string | null;
+  model_id: string | null;
+  models: LeadModel[];
+  default_model: string | null;
+  transcript: LeadTranscript;
+  used_tokens: number;
+  max_tokens: number;
+  pending: LeadPendingInteraction | null;
+  busy: boolean;
+}
+
+/** The serialized inner agent event. */
+export interface LeadAgentEvent {
+  kind: string;
+  text?: string;
+  model?: string;
+  message?: string;
+  error?: string;
+  retrying?: boolean;
+  tool_name?: string;
+  tool_call_id?: string;
+  call_id?: string;
+  question_id?: string;
+  question?: string;
+  options?: { label: string; description?: string | null }[];
+  [key: string]: unknown;
+}
+
+export interface LeadSessionEvent {
+  agent: number;
+  event: LeadAgentEvent;
+  rates?: unknown;
+}
+
+/** One event envelope emitted on `mnemo2://lead-event`. */
+export interface LeadEvent {
+  generation: number;
+  event: LeadSessionEvent;
+}
+
+export type LeadConnectionMode = "mock" | "native";
+export type LeadConnectionStatus = "idle" | "opening" | "ready" | "error";
+
+/** Frontend state for the real lead connection. */
+export interface LeadRuntimeInfo {
+  mode: LeadConnectionMode;
+  status: LeadConnectionStatus;
+  generation: number;
+  busy: boolean;
+  error: string | null;
+  model: string | null;
+  modelId: string | null;
+  models: LeadModel[];
+  defaultModel: string | null;
+  pending: LeadPendingInteraction | null;
+  usedTokens: number;
+  maxTokens: number;
+  streamingEntryId: string | null;
+}
+
 export interface AppState {
   route: Route;
   projectId: string | null;
   projects: Project[];
   workers: Worker[];
   leadEntries: LeadEntry[];
+  leadRuntime: LeadRuntimeInfo;
   selectedWorkerId: string | null;
   teamPeekOpen: boolean;
   teamFilter: TeamFilter;

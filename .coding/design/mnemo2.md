@@ -1,10 +1,12 @@
 # Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 0b conversation-first prototype. This is the design of record for
-the Mnemo2 frontend rebuild. It supersedes the earlier "spaces dashboard"
-sketch: Mnemo2 is a single-project cockpit for a lead agent and a team of
-worker subagents. The defining change in v0.2 is that the lead enforces a
-workflow **per task**, tasks run in parallel, and the interface is organized
+Status: Phase 1 implemented — the native host runs one real streaming lead session
+with a config-backed model registry. Phase 0b's conversation-first interface is
+unchanged; workers and the team runtime remain mock data for Phase 2. This is the
+design of record for the Mnemo2 frontend rebuild. It supersedes the earlier
+"spaces dashboard" sketch: Mnemo2 is a single-project cockpit for a lead agent and
+a team of worker subagents. The defining change in v0.2 is that the lead enforces
+a workflow **per task**, tasks run in parallel, and the interface is organized
 around conversations rather than a global run diagram. The companion policy
 change is in `agent.md` under **Mnemo2 team merge policy**.
 
@@ -304,16 +306,42 @@ A reusable Svelte 5 workspace with the start screen, lead chat, ten-worker
 Mission Control, review/merge records, workbench shell, mock data, and the
 conversation-first primitives. No engine, IPC, or git.
 
-### Phase 1 — Lead engine and model registry
+### Phase 1 — Lead engine and model registry (complete)
 
-- Wire one real lead session to the headless engine with streaming events,
-  Markdown, cancellation, and session restore.
-- Load models/endpoints from configuration; add the project's `leadModel` and a
-  model picker backed by the real endpoint list (`list_models`).
-- Replace mock lead messages and cards with engine events while preserving the
-  compact conversation contract.
+Shipped in the native host:
+
+- **Separate shell.** `src-tauri/mnemo2.conf.json`, `src-tauri/src/bin/mnemo2.rs`,
+  and `src-tauri/src/mnemo2/` add a minimal Tauri host without extending Mnemo1's
+  IPC surface. The host runs on Vite port 5180 and embeds
+  `target/mnemo2-dist`.
+- **Lead runtime.** `LeadRuntime` starts the headless `Engine`, registers
+  `WorkflowPolicyFactory` as `mnemo.workflow`, and spawns one lead session under
+  `ApproveViaApi` / `ApproveEachAction`. It forwards `SessionEvent`s, persists
+  the transcript and selected `endpoint/model` spec, restores them on reopen,
+  interrupts a running generation, and changes models only while idle.
+- **Model registry.** The picker loads the configured endpoint/model specs from
+  `Config::load` (the same `endpoints.toml` inventory), not a network probe. The
+  UI shows the actual serving model id reported by the session and keeps the
+  selected spec separate for resume.
+- **IPC and events.** Commands: `lead_open`, `lead_snapshot`, `lead_prompt`,
+  `lead_interrupt`, `lead_set_model`, `lead_approve`, `lead_answer`,
+  `lead_close`. One event channel, `mnemo2://lead-event`, carries
+  `{ generation, event }`; a model switch advances the generation and stale
+  events are ignored. App-owned state lives under the Tauri app-data directory
+  (`lead/lead.json`, `lead/workspace/`), never a tracked project file.
+- **UI.** The lead composer sends through the real session in native mode and
+  falls back to the Phase 0b mock reply in browser-only Vite. It exposes a
+  compact real-model picker (composer and project settings), a stop button while
+  working, inline error/retry, and inline approval/question cards. Workers, team
+  workflows, checks, diffs, and merge records remain mock data.
 - **Acceptance:** a real lead turn streams into the chat; the visible lead model
-  is the configured one; no worker/team runtime is required yet.
+  is the configured serving model; cancellation, restore, and model switching
+  are exercised by the runtime and store tests; no worker/team runtime is
+  required yet. Worker/team views remain unchanged.
+- **Known limitation:** native open still uses the Phase 0b seeded project paths.
+  A seed that does not exist on the current machine surfaces the runtime's inline
+  "project root does not exist" error; the native project registry/folder picker
+  is Phase 4. The browser fallback remains filesystem-free.
 
 ### Phase 2 — Parallel team runtime
 
@@ -358,6 +386,16 @@ conversation-first primitives. No engine, IPC, or git.
 - `src-tauri/src/ipc/spawn.rs` — the worktree-binding spawn pattern.
 - `src/config/projects.rs` — `ProjectRegistry` / `projects.toml`.
 - `src/agent/prompt.rs` — the compiled APP_RULES line (agent-facing gate).
+- `src-tauri/mnemo2.conf.json` + `src-tauri/src/bin/mnemo2.rs` — the separate
+  Mnemo2 native host.
+- `src-tauri/src/mnemo2/runtime.rs` — `LeadRuntime`: engine/policy/session,
+  event pump, persistence, interrupt, resume-based model changes.
+- `src-tauri/src/mnemo2/ipc.rs` — typed lead commands and the one
+  `mnemo2://lead-event` forwarder.
+- `mnemo2/src/lib/leadEngine.ts` — native transport + browser fallback.
+- `mnemo2/src/lib/leadState.ts` — snapshot restore and live event reducer.
+- `mnemo2/src/components/LeadModelPicker.svelte` — config-backed lead model
+  picker used by the composer and project settings.
 
 ## 13. Verification (this design lock)
 

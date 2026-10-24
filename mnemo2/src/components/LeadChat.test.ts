@@ -1,7 +1,21 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it } from "vitest";
-import { actions } from "../lib/store";
+import { actions, app } from "../lib/store";
+import { initialLeadRuntime } from "../lib/leadState";
 import LeadChat from "./LeadChat.svelte";
+
+function setRuntime(patch: Partial<ReturnType<typeof initialLeadRuntime>>) {
+  app.update((state) => ({
+    ...state,
+    leadRuntime: {
+      ...initialLeadRuntime(),
+      mode: "native",
+      status: "ready",
+      generation: 1,
+      ...patch,
+    },
+  }));
+}
 
 describe("LeadChat", () => {
   beforeEach(() => {
@@ -27,5 +41,43 @@ describe("LeadChat", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
     expect(await screen.findByText("Keep the review flow explicit.")).toBeTruthy();
     expect((input as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("shows an inline error with retry when the native lead fails", () => {
+    setRuntime({ status: "error", error: "Engine refused the request." });
+    render(LeadChat);
+    expect(screen.getByRole("alert").textContent).toContain("Engine refused the request.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
+  it("shows approval and question interactions inline", () => {
+    setRuntime({
+      pending: {
+        kind: "approval",
+        request_id: "req-1",
+        tool_name: "write_file",
+      },
+    });
+    render(LeadChat);
+    expect(screen.getByText("APPROVAL REQUIRED")).toBeTruthy();
+    const approve = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
+    expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+  });
+
+  it("shows question options inline", () => {
+    setRuntime({
+      pending: {
+        kind: "question",
+        question_id: "q-1",
+        question: "Which branch should I target?",
+        options: [{ label: "main" }, { label: "wt/mnemo" }],
+      },
+    });
+    render(LeadChat);
+    expect(screen.getByText("Which branch should I target?")).toBeTruthy();
+    const main = screen.getByRole("button", { name: "main" }) as HTMLButtonElement;
+    expect(main.disabled).toBe(false);
+    expect(screen.getByRole("button", { name: "wt/mnemo" })).toBeTruthy();
   });
 });

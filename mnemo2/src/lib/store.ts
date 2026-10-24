@@ -1,4 +1,4 @@
-import { derived, writable } from "svelte/store";
+import { derived, get, writable } from "svelte/store";
 import {
   createDiffFiles,
   createLeadEntries,
@@ -6,10 +6,20 @@ import {
   createProjects,
   createWorkers,
 } from "./mock";
+import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
+import {
+  applyLeadEvent,
+  applyLeadSnapshot,
+  initialLeadRuntime,
+  leadEventNeedsSnapshot,
+} from "./leadState";
 import { canMerge } from "./review";
 import type {
   AppState,
+  LeadAnswerInput,
+  LeadEvent,
   MergeRecord,
+  Project,
   TeamFilter,
   Worker,
   WorkbenchTab,
@@ -17,6 +27,99 @@ import type {
 
 let sequence = 0;
 const nextId = (prefix: string) => `${prefix}-${++sequence}`;
+
+let leadTransport: LeadTransport | null = null;
+let leadUnlisten: (() => void) | null = null;
+let leadSessionToken = 0;
+
+function leadError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function stopNativeLead(): Promise<void> {
+  const unlisten = leadUnlisten;
+  leadUnlisten = null;
+  unlisten?.();
+  const transport = leadTransport;
+  leadTransport = null;
+  if (transport) {
+    try {
+      await transport.close();
+    } catch {
+      // Closing a replaced lead is best effort; the next open owns the state.
+    }
+  }
+}
+
+async function refreshNativeLead(token: number): Promise<void> {
+  const transport = leadTransport;
+  if (!transport) return;
+  try {
+    const snapshot = await transport.snapshot();
+    if (token === leadSessionToken) {
+      app.update((state) => applyLeadSnapshot(state, snapshot));
+    }
+  } catch (error) {
+    if (token === leadSessionToken) {
+      app.update((state) => ({
+        ...state,
+        leadRuntime: { ...state.leadRuntime, error: leadError(error) },
+      }));
+    }
+  }
+}
+
+function handleNativeLeadEvent(token: number, event: LeadEvent): void {
+  if (token !== leadSessionToken) return;
+  app.update((state) => applyLeadEvent(state, event));
+  if (leadEventNeedsSnapshot(event)) {
+    setTimeout(() => {
+      if (token === leadSessionToken) void refreshNativeLead(token);
+    }, 25);
+  }
+}
+
+async function connectNativeLead(project: Project): Promise<void> {
+  const token = ++leadSessionToken;
+  const transport = createLeadTransport();
+  if (!transport) return;
+  const available = await transport.probe().catch(() => false);
+  if (!available || token !== leadSessionToken) return;
+  await stopNativeLead();
+  if (token !== leadSessionToken) return;
+  leadTransport = transport;
+  app.update((state) => ({
+    ...state,
+    leadRuntime: {
+      ...initialLeadRuntime(),
+      mode: "native",
+      status: "opening",
+    },
+  }));
+  try {
+    const unlisten = await transport.onEvent((event) =>
+      handleNativeLeadEvent(token, event),
+    );
+    if (token !== leadSessionToken) {
+      unlisten();
+      return;
+    }
+    leadUnlisten = unlisten;
+    const snapshot = await transport.open({ workspaceRoot: project.path });
+    if (token !== leadSessionToken) return;
+    app.update((state) => applyLeadSnapshot(state, snapshot));
+  } catch (error) {
+    if (token !== leadSessionToken) return;
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        status: "error",
+        error: leadError(error),
+      },
+    }));
+  }
+}
 
 export function createInitialState(): AppState {
   const workers = createWorkers();
@@ -26,6 +129,7 @@ export function createInitialState(): AppState {
     projects: createProjects(),
     workers,
     leadEntries: createLeadEntries(workers),
+    leadRuntime: initialLeadRuntime(),
     selectedWorkerId: "ana",
     teamPeekOpen: false,
     teamFilter: "all",
@@ -72,26 +176,33 @@ function updateWorker(
 }
 
 function openProject(projectId: string) {
-  app.update((state) => {
-    if (!state.projects.some((project) => project.id === projectId)) {
-      return withToast(state, "That mock project does not exist.");
-    }
-    return {
-      ...state,
-      route: "lead",
-      projectId,
-      teamPeekOpen: false,
-      workbenchOpen: false,
-      toast: null,
-    };
-  });
+  const project = get(app).projects.find((item) => item.id === projectId);
+  if (!project) {
+    app.update((state) => withToast(state, "That mock project does not exist."));
+    return;
+  }
+  leadSessionToken += 1;
+  void stopNativeLead();
+  app.update((state) => ({
+    ...state,
+    route: "lead",
+    projectId,
+    leadRuntime: initialLeadRuntime(),
+    teamPeekOpen: false,
+    workbenchOpen: false,
+    toast: null,
+  }));
+  void connectNativeLead(project);
 }
 
 function closeProject() {
+  leadSessionToken += 1;
+  void stopNativeLead();
   app.update((state) => ({
     ...state,
     route: "start",
     projectId: null,
+    leadRuntime: initialLeadRuntime(),
     teamPeekOpen: false,
     workbenchOpen: false,
   }));
@@ -176,13 +287,66 @@ function navigateBrowser(url: string) {
   app.update((state) => ({ ...state, browserUrl, workbenchOpen: true }));
 }
 
-function sendLeadMessage(body: string) {
-  const message = body.trim();
-  if (!message) return;
+async function sendNativeLeadMessage(message: string): Promise<void> {
+  const transport = leadTransport;
+  if (!transport) return;
+  const token = leadSessionToken;
   app.update((state) => ({
     ...state,
     leadEntries: [
       ...state.leadEntries,
+      {
+        id: nextId("user"),
+        kind: "message",
+        author: "user",
+        body: message,
+        time: "now",
+      },
+    ],
+    leadRuntime: {
+      ...state.leadRuntime,
+      busy: true,
+      error: null,
+      streamingEntryId: null,
+    },
+  }));
+  try {
+    await transport.prompt(message);
+  } catch (error) {
+    if (token === leadSessionToken) {
+      app.update((state) => ({
+        ...state,
+        leadRuntime: {
+          ...state.leadRuntime,
+          busy: false,
+          error: leadError(error),
+        },
+      }));
+    }
+  }
+}
+
+function sendLeadMessage(body: string) {
+  const message = body.trim();
+  if (!message) return;
+  const state = get(app);
+  if (state.leadRuntime.mode === "native") {
+    if (!leadTransport) {
+      app.update((current) => withToast(current, "The native lead is not connected."));
+      return;
+    }
+    if (state.leadRuntime.status !== "ready") {
+      app.update((current) => withToast(current, "The lead is still connecting."));
+      return;
+    }
+    if (state.leadRuntime.busy) return;
+    void sendNativeLeadMessage(message);
+    return;
+  }
+  app.update((current) => ({
+    ...current,
+    leadEntries: [
+      ...current.leadEntries,
       {
         id: nextId("user"),
         kind: "message",
@@ -199,6 +363,79 @@ function sendLeadMessage(body: string) {
       },
     ],
   }));
+}
+
+function interruptLead() {
+  const transport = leadTransport;
+  if (!transport) return;
+  const token = leadSessionToken;
+  void transport.interrupt().catch((error) => {
+    if (token === leadSessionToken) {
+      app.update((state) => withToast(state, leadError(error)));
+    }
+  });
+}
+
+function approveLead(requestId: string, decision: LeadApprovalDecision) {
+  const transport = leadTransport;
+  if (!transport) return;
+  const token = leadSessionToken;
+  void transport
+    .approve(requestId, decision)
+    .then(() => refreshNativeLead(token))
+    .catch((error) => {
+      if (token === leadSessionToken) {
+        app.update((state) => withToast(state, leadError(error)));
+      }
+    });
+}
+
+function answerLead(questionId: string, answer: LeadAnswerInput) {
+  const transport = leadTransport;
+  if (!transport) return;
+  const token = leadSessionToken;
+  void transport
+    .answer(questionId, answer)
+    .then(() => refreshNativeLead(token))
+    .catch((error) => {
+      if (token === leadSessionToken) {
+        app.update((state) => withToast(state, leadError(error)));
+      }
+    });
+}
+
+function setLeadModel(spec: string) {
+  const transport = leadTransport;
+  if (!transport) return;
+  const state = get(app);
+  if (state.leadRuntime.busy) {
+    app.update((current) =>
+      withToast(current, "Stop the current turn before changing models."),
+    );
+    return;
+  }
+  const token = leadSessionToken;
+  void transport
+    .setModel(spec)
+    .then((snapshot) => {
+      if (token === leadSessionToken) {
+        app.update((current) => applyLeadSnapshot(current, snapshot));
+      }
+    })
+    .catch((error) => {
+      if (token === leadSessionToken) {
+        app.update((current) => withToast(current, leadError(error)));
+      }
+    });
+}
+
+function retryLead() {
+  const state = get(app);
+  const project = state.projects.find((item) => item.id === state.projectId);
+  if (!project) return;
+  leadSessionToken += 1;
+  void stopNativeLead();
+  void connectNativeLead(project);
 }
 
 function replyWorker(workerId: string, body: string) {
@@ -478,6 +715,8 @@ function dismissToast() {
 }
 
 function resetDemo() {
+  leadSessionToken += 1;
+  void stopNativeLead();
   app.set(createInitialState());
 }
 
@@ -496,6 +735,11 @@ export const actions = {
   openBrowser,
   navigateBrowser,
   sendLeadMessage,
+  interruptLead,
+  approveLead,
+  answerLead,
+  setLeadModel,
+  retryLead,
   replyWorker,
   steerWorker,
   stopWorker,

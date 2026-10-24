@@ -1177,3 +1177,39 @@ async fn classifier_setup_flip_reaches_the_live_config_before_the_guard() {
         "the disable wins the race — the Arc flips back immediately"
     );
 }
+
+#[tokio::test]
+async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let engine = Engine::builder(opts)
+        .provider(std::sync::Arc::new(ScriptedLlm::new(vec![
+            tool_turn("file_write", r#"{"path":"probe.txt","content":"worker"}"#),
+            text_turn(&["done"]),
+        ])))
+        .start()
+        .await
+        .expect("starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            worktree: Some(worktree.path().to_path_buf()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("the worktree-bound spawn");
+    session
+        .run_to_completion("write the probe")
+        .await
+        .expect("the turn completes");
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("probe.txt")).unwrap(),
+        "worker",
+        "the file tool wrote inside the worker's worktree"
+    );
+    assert!(
+        !root.path().join("probe.txt").exists(),
+        "the lead root stays untouched"
+    );
+}

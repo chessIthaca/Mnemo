@@ -101,6 +101,83 @@ pub fn item_branch(item_id: &str) -> String {
     format!("wt/runall-{}", item_short_id(item_id))
 }
 
+/// The 8-char agent-id prefix for a Mnemo2 team worker. Unique per worker
+/// in practice (UUID prefixes), and a collision fails loudly at provision.
+pub fn agent_short_id(agent_id: &str) -> String {
+    agent_id.chars().take(8).collect()
+}
+
+/// The branch for one Mnemo2 team worker: `wt/agent-<id8>`, forked from the
+/// lead's current branch tip (not from `main`) so the worker starts from the
+/// work the lead is building on.
+pub fn agent_branch(agent_id: &str) -> String {
+    format!("wt/agent-{}", agent_short_id(agent_id))
+}
+
+/// Provision a linked worktree for one Mnemo2 team worker, on its own branch
+/// forked from `base_ref` (the lead branch tip). Returns
+/// `(worktree_root, branch)` at `<main_root>/.worktrees/agent-<id8>`.
+///
+/// Runs the blocking git subprocess on the blocking thread pool (see the
+/// module doc). Owns its arguments so the closure is `'static + Send`.
+pub async fn provision_agent_worktree(
+    main_root: PathBuf,
+    agent_id: String,
+    base_ref: String,
+) -> Result<(PathBuf, String), String> {
+    tokio::task::spawn_blocking(move || {
+        provision_agent_worktree_impl(&main_root, &agent_id, &base_ref)
+    })
+    .await
+    .map_err(|e| format!("worktree provision task failed: {e}"))?
+}
+
+/// The synchronous core of [`provision_agent_worktree`].
+fn provision_agent_worktree_impl(
+    main_root: &Path,
+    agent_id: &str,
+    base_ref: &str,
+) -> Result<(PathBuf, String), String> {
+    let short = agent_short_id(agent_id);
+    let branch = agent_branch(agent_id);
+    let worktree =
+        provision_worktree_impl(main_root, &format!("agent-{short}"), &branch, base_ref)?;
+    Ok((worktree, branch))
+}
+
+/// Shared worktree provisioning: create `<main_root>/.worktrees/<dir_name>`
+/// on a new `branch` forked from `base_ref`. `-b` refuses an existing branch
+/// name, so two agents can never share a branch.
+fn provision_worktree_impl(
+    main_root: &Path,
+    dir_name: &str,
+    branch: &str,
+    base_ref: &str,
+) -> Result<PathBuf, String> {
+    if base_ref.trim().is_empty() {
+        return Err("worktree base ref is empty".to_string());
+    }
+    // Fail before creating the worktree when the base ref is unknown — the
+    // caller gets a clear base-ref error instead of a half-provisioned tree.
+    git_raw(
+        main_root,
+        &["rev-parse", "--verify", &format!("{base_ref}^{{commit}}")],
+    )?;
+    let worktree = worktrees_dir(main_root).join(dir_name);
+    git_raw(
+        main_root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            worktree.to_str().ok_or("non-UTF-8 worktree path")?,
+            base_ref,
+        ],
+    )?;
+    Ok(worktree)
+}
+
 /// Provision a linked worktree for one dispatched run-all item, on its
 /// own branch forked from `main`.
 ///
@@ -128,20 +205,7 @@ fn provision_item_worktree_impl(
 ) -> Result<(PathBuf, String), String> {
     let short = item_short_id(item_id);
     let branch = item_branch(item_id);
-    let worktree = worktrees_dir(main_root).join(format!("runall-{short}"));
-    // `-b` forks the branch from `main` at provision time and refuses an
-    // existing branch name — two agents can never share a branch.
-    git_raw(
-        main_root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            worktree.to_str().ok_or("non-UTF-8 worktree path")?,
-            "main",
-        ],
-    )?;
+    let worktree = provision_worktree_impl(main_root, &format!("runall-{short}"), &branch, "main")?;
     Ok((worktree, branch))
 }
 
@@ -181,13 +245,19 @@ pub async fn remove_item_worktree(
 /// ([`sweep_merged_runall_branches`], backlog 64662ef2); until then a
 /// stale branch only blocks re-dispatch of a Done item, which never
 /// re-dispatches.
-pub async fn remove_worktree_only(
-    main_root: PathBuf,
-    worktree: PathBuf,
-) -> Result<(), String> {
+pub async fn remove_worktree_only(main_root: PathBuf, worktree: PathBuf) -> Result<(), String> {
     tokio::task::spawn_blocking(move || remove_worktree_only_impl(&main_root, &worktree))
         .await
         .map_err(|e| format!("worktree remove task failed: {e}"))?
+}
+
+/// Remove a Mnemo2 worker's worktree but KEEP its `wt/agent-*` branch: the
+/// branch is the audit trail of what the worker did (and, once Phase 3
+/// lands, the PR/merge head the lead reviews). Reuses
+/// [`remove_worktree_only`] so the branch survives cleanup.
+pub async fn remove_agent_worktree(main_root: PathBuf, agent_id: String) -> Result<(), String> {
+    let worktree = worktrees_dir(&main_root).join(format!("agent-{}", agent_short_id(&agent_id)));
+    remove_worktree_only(main_root, worktree).await
 }
 
 /// The synchronous core of [`remove_worktree_only`] — shared with
@@ -1168,11 +1238,80 @@ mod tests {
                 .is_empty(),
             "the conflicted branch is kept"
         );
-        // main does NOT contain the item's change (the merge was
-        // aborted).
         assert_eq!(
             git_raw(repo.path(), &["show", "main:a.txt"]).unwrap(),
             "main change\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_agent_worktree_forks_from_the_supplied_base() {
+        let repo = init_repo();
+        git_raw(repo.path(), &["checkout", "-b", "wt/lead"]).unwrap();
+        std::fs::write(repo.path().join("lead.txt"), "lead\n").unwrap();
+        git_raw(repo.path(), &["add", "-A"]).unwrap();
+        git_raw(repo.path(), &["commit", "-m", "lead work"]).unwrap();
+
+        let (worktree, branch) = provision_agent_worktree(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "wt/lead".to_string(),
+        )
+        .await
+        .expect("provision");
+        assert_eq!(branch, "wt/agent-abcdef12");
+        let lead = std::fs::read_to_string(worktree.join("lead.txt")).unwrap();
+        assert_eq!(
+            lead.trim_end(),
+            "lead",
+            "the worker forks from the lead tip, not main"
+        );
+        assert!(
+            git_raw(repo.path(), &["show", "main:lead.txt"]).is_err(),
+            "the lead commit is not on main"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_agent_worktree_refuses_a_duplicate_branch() {
+        let repo = init_repo();
+        provision_agent_worktree(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("first provision");
+        let err = provision_agent_worktree(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect_err("a duplicate branch must fail");
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_agent_worktree_keeps_the_branch() {
+        let repo = init_repo();
+        let (worktree, branch) = provision_agent_worktree(
+            repo.path().to_path_buf(),
+            "abcdef123456".to_string(),
+            "main".to_string(),
+        )
+        .await
+        .expect("provision");
+        remove_agent_worktree(repo.path().to_path_buf(), "abcdef123456".to_string())
+            .await
+            .expect("cleanup");
+        assert!(!worktree.exists(), "the worker checkout is gone");
+        assert!(
+            !git_raw(repo.path(), &["branch", "--list", &branch])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the worker branch is kept for audit"
         );
     }
 }

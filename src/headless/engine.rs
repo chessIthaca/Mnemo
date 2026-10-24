@@ -29,7 +29,9 @@ use crate::headless::codegraph_api::CodegraphApi;
 use crate::headless::memory_api::MemoryApi;
 use crate::host::brain::{wire_brain, Brain, BrainMemoryOptions};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
-use crate::host::runtime::{spawn_agent_shared, HostRuntime, SessionOptions, SpawnHost};
+use crate::host::runtime::{
+    spawn_agent_shared, HostRuntime, SessionOptions, SpawnHost, WorktreeBinding,
+};
 use crate::provider::LlmClient;
 
 /// The fan-out notifier: every host event lands on the engine's broadcast
@@ -129,6 +131,25 @@ impl EngineBuilder {
     pub async fn start(self) -> Result<Engine, EngineError> {
         start_inner(self.opts, self.provider, self.memory_store, self.shared).await
     }
+}
+
+/// Build the root binding for a worktree-bound session: the canonical
+/// worktree checkout plus its own code graph. A missing worktree is a spawn
+/// error (never a silent fallback to the engine's root, which would let two
+/// workers edit one tree).
+fn worktree_binding(root: std::path::PathBuf) -> Result<WorktreeBinding, EngineError> {
+    let worktree = std::fs::canonicalize(&root)
+        .map_err(|e| EngineError::spawn_failed(format!("worktree '{}': {e}", root.display())))?;
+    let coding_dir = worktree.join(".coding");
+    let _ = std::fs::create_dir_all(&coding_dir);
+    let codegraph =
+        crate::codegraph::CodeGraph::open(worktree.clone(), &coding_dir.join("codegraph.db"))
+            .ok()
+            .map(Arc::new);
+    Ok(WorktreeBinding {
+        worktree,
+        codegraph,
+    })
 }
 
 impl Engine {
@@ -264,6 +285,14 @@ impl Engine {
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
+        // A worktree-bound session (a Mnemo2 worker / run-all agent) runs
+        // entirely inside its own checkout: the sandbox, project root, plans
+        // dir, and code graph all resolve there, so concurrent workers never
+        // share a working tree.
+        let worktree = match opts.worktree {
+            Some(root) => Some(worktree_binding(root)?),
+            None => None,
+        };
         // 3c/G2 (§5.9.2): the session's host tools — engine-registered
         // Rust tools plus the per-spawn spec shims. Duplicate names within
         // the combined list refuse the spawn; a name colliding with a
@@ -312,8 +341,9 @@ impl Engine {
                 role: None, // no role
                 // own plans dir (a parentless session agent)
                 own_plans_dir: true,
-                // no worktree binding (the option wires with 3c)
-                worktree: None,
+                // 3c: a worktree-bound session gets its own sandbox, root,
+                // plans dir, and graph (Mnemo2 workers / run-all agents).
+                worktree,
                 permission: Some(permission),
                 // 3a.6 (G5): the resume seed — the transcript's messages
                 // become the initial conversation (§5.9.5 :693-695).
@@ -685,3 +715,32 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::worktree_binding;
+
+    #[test]
+    fn worktree_binding_uses_the_worktree_checkout() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let binding = worktree_binding(dir.path().to_path_buf()).expect("binding");
+        assert_eq!(
+            binding.worktree,
+            std::fs::canonicalize(dir.path()).expect("canonical")
+        );
+        assert!(
+            binding.codegraph.is_some(),
+            "the worktree gets its own code graph"
+        );
+    }
+
+    #[test]
+    fn worktree_binding_rejects_a_missing_worktree() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let err = match worktree_binding(dir.path().join("missing")) {
+            Ok(_) => panic!("a missing worktree must fail the spawn"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "spawn_failed");
+        assert!(err.to_string().contains("worktree"), "{err}");
+    }
+}

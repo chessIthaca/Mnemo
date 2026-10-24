@@ -1,6 +1,6 @@
 # Mnemo2 — Lead + Team (design v0.1)
 
-Status: planning. No product code yet. This is the design of record for the
+Status: Phase 0 visual prototype. This is the design of record for the
 Mnemo2 frontend rebuild. It supersedes the earlier "spaces dashboard" sketch:
 Mnemo2 is a single-project cockpit for a lead agent and a team of worker
 subagents. The companion policy change is in `agent.md` under **Mnemo2 team
@@ -37,8 +37,9 @@ the **full toolbox**:
 - `spawn_agent`, `message_agent`, `team_status`, `review_fix`;
 - the TeamManager's merge action (auto-merge after its review).
 
-The lead's own edits are capped by the **tiny-work rule**: at most 20 changed
-lines in one file, no new files, no schema/API/dependency/test changes, and no
+The lead's own edits are capped by the **tiny-work rule**: either up to five
+files with at most 10 changed lines per file, or one file with a larger edit.
+Both paths exclude new files, schema/API/dependency/test changes, and any
 cross-module refactor. The cap is enforced by an app-level external policy hook
 on `file_edit` / `file_write` / `shell`; over-cap calls are denied with a
 delegation nudge. Direct edits are logged as small cards in the lead chat and
@@ -47,7 +48,7 @@ research without a cap; the cap is about where implementation happens, not
 about investigation.
 
 Delegation is economic, not a hard lockout: do tiny/review/debug work directly;
-delegate anything that needs exploration or touches more than one file; never
+delegate anything that needs exploration or exceeds the tiny-work cap; never
 spawn a worker just to read or answer; batch related tiny fixes; choose the
 cheapest capable model.
 
@@ -88,9 +89,11 @@ the worker ran, and the relevant plan steps. It writes findings. It must not
 merge while any finding is `open`. A `wontfix` is allowed only with a written
 justification (the same rule the Mnemo reviewer protocol uses).
 
-**Tiny findings — the lead fixes them.** A tiny finding is ≤20 changed lines in
-one file, with no schema/API/dependency/test change. The lead calls the
-`review_fix` host tool with a worker id, file path, and edit. The TeamManager
+**Tiny findings — the lead fixes them.** A tiny finding uses the same
+tiny-work cap: up to five files with at most 10 changed lines each, or one
+larger single-file edit, with no new file or schema/API/dependency/test change.
+The lead calls the `review_fix` host tool with a worker id and the scoped
+edit(s). The TeamManager
 applies the edit in the **worker's worktree**, commits it on the worker branch
 with a review message, and returns the sha. The lead then closes the finding.
 This is the only path that lets the lead edit a worker's branch; the lead's
@@ -142,8 +145,10 @@ policy (see `agent.md`).
 
 The team is budget-gated, not per-action-gated.
 
-- **Caps**: max concurrent workers (default 3), max spawns per lead turn
-  (default 5), per-worker turns/wall-clock/cost, and a per-project budget.
+- **Caps**: max concurrent workers (a per-project setting, with no fixed
+  three-worker ceiling), max spawns per lead turn (default 5), per-worker
+  turns/wall-clock/cost, and a per-project budget. Worker concurrency is
+  separate from budget and rate limits.
   Hitting a cap pauses the team and moves the item to **Needs you**; nothing
   runs away silently.
 - **Spawn approvals**: the kernel's spawn approval is auto-answered by the
@@ -174,6 +179,8 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
   worker chat, its timeline, branch/worktree, diff stats, review findings, and
   actions (Reply, Open, Steer, Stop, Diff, Review, Merge record, Revert).
 - The lead is not a row; it is the chat. The activity badge counts workers.
+- The board is designed for 8+ workers: grouped, filterable, scrollable rows and
+  avatar overflow instead of squeezing every worker into the top bar.
 - The merge card is a record with Review/Revert, not an approval prompt.
 - The lead chat shows spawn cards, team-message cards (escalations), review
   summaries, and merge records; worker tool logs stay in the worker thread.
@@ -217,9 +224,8 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 
 ## 10. Open decisions
 
-- Default budget and caps (concurrent workers, spawns per turn, per-worker
-  cost, project budget).
-- The exact tiny-edit cap (20 lines? 30?) and whether `review_fix` shares it.
+- Default budget and per-project starting values (worker slots, spawns per turn,
+  per-worker cost, project budget).
 - Fixer default: re-task the original worker vs spawn a fresh fixer.
 - Reviewer pre-pass threshold (diff size/files/risk).
 - Whether workers may message the user directly or only the lead.
@@ -228,8 +234,9 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 
 ## 11. Phases
 
-0. **Visual prototype** — start screen, lead chat, Team board, budget chip,
-   merge records, worker detail, browser shell; mock team. No core wiring.
+0. **Visual prototype** — start screen, lead chat, Team board with a 10-worker
+   mock team and per-project worker slots, budget chip, merge records, worker
+   detail, browser shell; mock team. No core wiring.
 1. **Real team** — TeamManager, worktree-aware spawner, live board, serialized
    auto-merge queue.
 2. **Conversation** — `message_agent` / `message_parent` / `team_status` /

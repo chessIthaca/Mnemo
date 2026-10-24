@@ -12,11 +12,12 @@ dist-ssr/
 *.tsbuildinfo
 
 # This repo is an npm workspace (root package.json declares "workspaces":
-# ["frontend"]). The root package-lock.json is the single source of truth.
-# A second lockfile inside frontend/ is a leftover from a standalone install
-# and silently desyncs from the workspace lockfile — it caused
-# @radix-ui/react-dialog to go missing. Ignore it so it can't sneak back.
+# ["frontend", "mnemo2"]). The root package-lock.json is the single source of
+# truth. A second lockfile inside a workspace is a leftover from a standalone
+# install and silently desyncs from the workspace lockfile — it caused
+# @radix-ui/react-dialog to go missing. Ignore workspace-local lockfiles.
 frontend/package-lock.json
+mnemo2/package-lock.json
 
 # Logs
 logs/

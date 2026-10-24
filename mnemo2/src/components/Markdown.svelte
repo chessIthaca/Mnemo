@@ -50,6 +50,9 @@
 
 <style>
   .markdown {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
     color: var(--ink);
     font-family: var(--font-prose);
     font-size: 16px;

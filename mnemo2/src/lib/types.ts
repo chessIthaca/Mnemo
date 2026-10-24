@@ -35,11 +35,29 @@ export interface TimelineStep {
   time?: string;
 }
 
+export type TaskWorkflowStepId = "brief" | "implement" | "verify" | "review" | "merge";
+export type TaskWorkflowStepStatus = "done" | "active" | "pending" | "blocked";
+export type TaskWorkflowState = "active" | "blocked" | "done" | "cancelled";
+
+export interface TaskWorkflowStep {
+  id: TaskWorkflowStepId;
+  label: string;
+  status: TaskWorkflowStepStatus;
+  detail: string;
+}
+
+export interface TaskWorkflow {
+  current: TaskWorkflowStepId;
+  state: TaskWorkflowState;
+  steps: TaskWorkflowStep[];
+}
+
 export interface Project {
   id: string;
   name: string;
   path: string;
   branch: string;
+  leadModel: string;
   description: string;
   lastSession: string;
   workerSlots: number;
@@ -193,8 +211,6 @@ export interface AppState {
   projects: Project[];
   workers: Worker[];
   leadEntries: LeadEntry[];
-  leadTimeline: TimelineStep[];
-  activityExpanded: boolean;
   selectedWorkerId: string | null;
   teamPeekOpen: boolean;
   teamFilter: TeamFilter;

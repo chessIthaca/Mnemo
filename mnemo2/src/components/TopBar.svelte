@@ -61,8 +61,8 @@
     <div><strong>Worker slots</strong><small>Maximum concurrent workers for this project.</small></div>
     <input aria-label="Project worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
   </div>
-  <div class="settings-row"><div><strong>Team model</strong><small>Workers default to a cheaper model than the lead.</small></div><span class="settings-value">Spark Mini</span></div>
-  <div class="settings-row"><div><strong>Lead model</strong><small>Planning, review, and merge decisions.</small></div><span class="settings-value">Atlas Core</span></div>
+          <div class="settings-row"><div><strong>Lead model</strong><small>Planning and review</small></div><span class="settings-value">{$currentProject?.leadModel ?? "—"}</span></div>
+          <div class="settings-row"><div><strong>Team default</strong><small>Per-task overrides</small></div><span class="settings-value">glm-5.3-flash</span></div>
   <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
   <div class="settings-actions">
     <button class="button button-quiet" onclick={() => { settingsOpen = false; actions.resetDemo(); }}>Replay prototype</button>

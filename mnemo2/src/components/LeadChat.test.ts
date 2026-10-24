@@ -9,10 +9,15 @@ describe("LeadChat", () => {
     actions.openProject("mnemo");
   });
 
-  it("expands the connected run summary into readable steps", async () => {
+  it("renders no global run strip", () => {
     render(LeadChat);
-    await fireEvent.click(screen.getByRole("button", { name: /Run 04/ }));
-    expect(await screen.findByText("Ana has 2 open findings")).toBeTruthy();
+    expect(screen.queryByText(/Run 04/)).toBeNull();
+  });
+
+  it("shows the configured lead model", () => {
+    render(LeadChat);
+    expect(screen.getAllByText("claude-opus-5-5").length).toBeGreaterThan(0);
+    expect(screen.queryByText("ATLAS CORE")).toBeNull();
   });
 
   it("sends a message from the composer into the lead conversation", async () => {

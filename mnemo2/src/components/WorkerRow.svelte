@@ -1,6 +1,7 @@
 <script lang="ts">
   import { AlertCircle, ChevronRight } from "@lucide/svelte";
   import { workerStatusLabel, type Worker } from "../lib/types";
+  import ModelBadge from "./ModelBadge.svelte";
 
   let {
     worker,
@@ -26,7 +27,7 @@
 >
   <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
   <span class="worker-copy">
-    <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}<small>{worker.model}</small></span>
+    <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}<ModelBadge model={worker.model} /></span>
     <span class="worker-task">{worker.task}</span>
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
   </span>
@@ -47,7 +48,7 @@
   .worker-name { display: flex; align-items: center; gap: 5px; }
   .worker-name strong { font-size: 10px; font-weight: 670; }
   .worker-name :global(svg) { color: var(--warning); }
-  .worker-name small { margin-left: auto; color: var(--muted); font-size: 7px; font-weight: 450; }
+  .worker-name :global(.model-badge) { max-width: 130px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
   .worker-task { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
@@ -59,6 +60,6 @@
   .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }
   .status-label[data-status="working"], .status-label[data-status="fixing"] { background: #e9edf3; color: #536c89; }
   .worker-row :global(.row-chevron) { flex: 0 0 auto; color: var(--line-strong); }
-  .worker-row.compact .worker-name small, .worker-row.compact .worker-meta small { display: none; }
-  @media (max-width: 1100px) { .worker-meta small { display: none; } .worker-name small { display: none; } }
+  .worker-row.compact .worker-meta small { display: none; }
+  @media (max-width: 1100px) { .worker-meta small { display: none; } }
 </style>

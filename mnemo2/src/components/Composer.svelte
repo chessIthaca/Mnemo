@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { ArrowUp, Sparkles } from "@lucide/svelte";
-  import { actions } from "../lib/store";
+  import { ArrowUp } from "@lucide/svelte";
+  import { actions, currentProject } from "../lib/store";
+  import ModelBadge from "./ModelBadge.svelte";
 
   let draft = $state("");
 
@@ -38,8 +39,7 @@
     </button>
   </div>
   <div class="composer-meta">
-    <span><Sparkles size={12} /> Lead · Atlas Core</span>
-    <span>Enter to send · Shift + Enter for a new line</span>
+    <ModelBadge model={$currentProject?.leadModel ?? "unconfigured"} role="lead" />
   </div>
 </form>
 
@@ -83,7 +83,6 @@
     cursor: pointer;
   }
   .send-button:disabled { background: var(--surface-soft); color: #adb0a6; cursor: default; }
-  .composer-meta { display: flex; justify-content: space-between; gap: 12px; padding: 8px 4px 0; color: var(--muted); font-size: 9px; }
-  .composer-meta span:first-child { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-soft); }
-  @media (max-width: 560px) { .composer-meta span:last-child { display: none; } }
+  .composer-meta { display: flex; align-items: center; min-height: 14px; padding: 8px 4px 0; }
+  @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

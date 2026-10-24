@@ -1,10 +1,12 @@
-# Mnemo2 — Lead + Team (design v0.1)
+# Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 0 visual prototype. This is the design of record for the
-Mnemo2 frontend rebuild. It supersedes the earlier "spaces dashboard" sketch:
-Mnemo2 is a single-project cockpit for a lead agent and a team of worker
-subagents. The companion policy change is in `agent.md` under **Mnemo2 team
-merge policy**.
+Status: Phase 0b conversation-first prototype. This is the design of record for
+the Mnemo2 frontend rebuild. It supersedes the earlier "spaces dashboard"
+sketch: Mnemo2 is a single-project cockpit for a lead agent and a team of
+worker subagents. The defining change in v0.2 is that the lead enforces a
+workflow **per task**, tasks run in parallel, and the interface is organized
+around conversations rather than a global run diagram. The companion policy
+change is in `agent.md` under **Mnemo2 team merge policy**.
 
 ## 1. Product shape
 
@@ -14,14 +16,69 @@ projects means two instances (later: two windows).
 
 - **Start screen** — recent projects from `projects.toml`, open folder, create
   project. Shows the branch, last session, and unfinished worker branches from
-  a previous run with Resume / Review / Clean.
+  a previous run with Resume / Review / Clean. The project picker is a compact
+  list, not a marketing page.
 - **Lead chat** — the main conversation: planning, guidance, research, review,
-  and merge records. The lead never streams worker tool logs into this chat.
+  and merge records. It is task-oriented: delegation and status appear as
+  compact cards tied to specific tasks. The lead never streams worker tool logs
+  into this chat and there is no global run timeline.
 - **Team board** — the per-project Mission Control: peek sheet + control room.
-- **Worker thread** — a real conversation with one worker: its timeline, its
-  messages to the lead, the lead's replies, its branch, diff, and review.
+  It is a conversation-first task list, not a phase dashboard. Every row shows
+  the task's model and its own workflow state.
+- **Worker thread** — the primary view of one task: the real conversation with
+  that worker, its branch/diff/review, its model, and its own workflow. Worker
+  tool logs stay here.
 - **Workbench** — Browser, Diff, and Plan tabs. The browser is a native child
   webview on Windows (macOS fallback), not an iframe.
+
+### 1.1 UI principles
+
+1. **Conversation first.** The lead and worker threads are the product. Cards
+   exist only to summarize a decision, a delegation, a review, or a merge in a
+   few lines; the full reasoning lives in the conversation.
+2. **Per-task workflow.** Each delegated task carries its own workflow, owned
+   and enforced by the lead. There is no project-wide pipeline or "Run 04"
+   diagram.
+3. **Parallel by default.** Tasks advance independently. The team view groups
+   and filters tasks by their own state; it never implies that every task must
+   move through the same global phase at the same time.
+4. **Progressive disclosure.** Show the current state and the one action that
+   matters. Put timeline, checks, findings, and history behind a tab or a
+   disclosure, not in the first screenful.
+5. **Model identity is primary.** The lead's model and every worker's model are
+   visible wherever that agent appears: task rows, conversation headers,
+   delegation cards, and merge records. Choosing a model is a product decision,
+   not hidden telemetry.
+6. **Minimal explanatory copy.** Do not explain the metaphor in the UI. Labels,
+   state, and the conversation carry the meaning. Empty space and quiet type are
+   preferable to helper paragraphs.
+
+### 1.2 Task workflow contract
+
+The workflow belongs to the task, not to the application. The lead creates it
+when it delegates, may revise it when scope changes, and is the only agent that
+can advance Review or Merge.
+
+```
+Brief → Implement → Verify → Review → Merge
+```
+
+- **Brief** — the lead writes a self-contained brief: plan excerpt, paths,
+  acceptance criteria, scope limit, model choice, and check scope.
+- **Implement** — the worker edits in its worktree and commits. It may message
+  the lead for a decision, but it does not replan.
+- **Verify** — the check scope runs on the branch tip. A fix commit invalidates
+  the previous result; the affected scope must pass again.
+- **Review** — the lead reviews the delta and records findings. Every finding
+  must be fixed or `wontfix` with a written justification before Merge.
+- **Merge** — when review is closed, checks pass on the tip, and the lead is
+  idle with a clean tree, the TeamManager serializes the merge. A conflict
+  halts and routes the task back; it is never auto-resolved.
+
+Tasks are independent. One task may be in Review while another is implementing
+and a third is waiting on a check. Mission Control must show that reality
+directly. The workflow UI is derived per task from its status, checks,
+findings, and merge record; it is never a single shared step index.
 
 ## 2. Roles and tool belts
 
@@ -156,6 +213,10 @@ The team is budget-gated, not per-action-gated.
   stays pending and surfaces in Mission Control.
 - **Model routing**: strong lead, cheap/default workers, configured reviewer;
   the lead can pick a cheaper model for mechanical work via `list_models`.
+- **Model identity**: the project stores the lead model; every task stores its
+  worker model. Both render as a compact badge in conversation headers, task
+  rows, delegation cards, and merge records, so the human can see the model
+  mix at a glance without opening telemetry.
 - **Executor workers**: one plan of record (the lead's), not one per worker.
 - **Self-contained briefs**: the lead attaches the plan excerpt, paths,
   acceptance criteria, and scope limit; workers do not rediscover the repo.
@@ -167,18 +228,21 @@ The team is budget-gated, not per-action-gated.
 
 ## 6. Mission Control
 
-Mission Control is per project, not cross-project. It is an
-exceptions-and-budget board, not an approval queue.
+Mission Control is per project, not cross-project. It is a conversation-first
+task list plus an exceptions-and-budget board, not a phase dashboard or an
+approval queue. Each row is one task with its own workflow and model.
 
 States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 **Merged**, **Conflict**, **Failed**, **Cancelled**.
 
 - **Peek** (380px, over the chat side): Needs you (conflict/failed/over-budget),
   In review, Working, plus the budget chip.
-- **Control room** (a route): grouped board + detail pane. The detail shows the
-  worker chat, its timeline, branch/worktree, diff stats, review findings, and
-  actions (Reply, Open, Steer, Stop, Diff, Review, Merge record, Revert).
-- The lead is not a row; it is the chat. The activity badge counts workers.
+- **Control room** (a route): grouped task board + conversation detail. The
+  detail opens on the worker **Thread**; Review (checks, findings, merge) is a
+  secondary tab. The header shows task, model, branch/worktree, and the task's
+  own workflow.
+- The lead is not a row; it is the chat. The team badge counts active tasks,
+  not a global phase.
 - The board is designed for 8+ workers: grouped, filterable, scrollable rows and
   avatar overflow instead of squeezing every worker into the top bar.
 - The merge card is a record with Review/Revert, not an approval prompt.
@@ -234,17 +298,53 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 
 ## 11. Phases
 
-0. **Visual prototype** — start screen, lead chat, Team board with a 10-worker
-   mock team and per-project worker slots, budget chip, merge records, worker
-   detail, browser shell; mock team. No core wiring.
-1. **Real team** — TeamManager, worktree-aware spawner, live board, serialized
-   auto-merge queue.
-2. **Conversation** — `message_agent` / `message_parent` / `team_status` /
-   `review_fix` host tools, worker chat, steer/answer/prompt delivery, lead
-   tiny-work policy hook, cost telemetry.
-3. **Review quality** — optional reviewer, conflict handling, revert, budget
-   enforcement, finding records.
-4. **Browser/workbench + settings + persistence polish.**
+### Phase 0 — Visual prototype (complete)
+
+A reusable Svelte 5 workspace with the start screen, lead chat, ten-worker
+Mission Control, review/merge records, workbench shell, mock data, and the
+conversation-first primitives. No engine, IPC, or git.
+
+### Phase 1 — Lead engine and model registry
+
+- Wire one real lead session to the headless engine with streaming events,
+  Markdown, cancellation, and session restore.
+- Load models/endpoints from configuration; add the project's `leadModel` and a
+  model picker backed by the real endpoint list (`list_models`).
+- Replace mock lead messages and cards with engine events while preserving the
+  compact conversation contract.
+- **Acceptance:** a real lead turn streams into the chat; the visible lead model
+  is the configured one; no worker/team runtime is required yet.
+
+### Phase 2 — Parallel team runtime
+
+- Implement TeamManager: per-task records, briefs, model choice, worktrees from
+  the lead branch tip, spawn limits, and independent task workflows.
+- Add `message_agent`, `message_parent`, `team_status`, and `review_fix` host
+  tools. Worker threads use real session events; tool logs stay in the worker
+  thread.
+- Parallel scheduling with configurable worker slots, budget/rate caps,
+  pause/stop, and restart recovery.
+- **Acceptance:** at least two tasks run concurrently, each with its own
+  workflow and model; messages route both ways; no global run timeline exists.
+
+### Phase 3 — Review, merge, recovery, cost
+
+- Lead review records with findings; tiny-work `review_fix`; fixer routing;
+  branch-tip check binding; optional read-only reviewer.
+- Serialized TeamManager merge into the local lead branch, conflict
+  halt/route-back, revert before landing, merge records.
+- Budget enforcement, per-task telemetry, pause/stop-all, crash recovery.
+- **Acceptance:** no merge with an open finding or stale check; parallel tasks
+  can be in different states; recovery leaves a clean tree.
+
+### Phase 4 — Native shell, workbench, persistence
+
+- Tauri shell integration, native WebView2 Browser pane, diff/plan tabs,
+  settings, project registry/`projects.toml`, persistence.
+- Start-screen resume/cleanup, notifications, multi-instance/window handling,
+  accessibility, and narrow-layout polish.
+- **Acceptance:** a real project opens, sessions survive restart, the browser is
+  a native pane, and no mock data path remains.
 
 ## 12. References
 

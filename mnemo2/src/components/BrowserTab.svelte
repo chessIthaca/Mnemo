@@ -57,8 +57,8 @@
             <input aria-label="Settings worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
           </div>
           <div class="setting-row">
-            <div><strong>Default worker model</strong><small>Cheaper workers, strong lead.</small></div>
-            <span class="setting-value">Spark Mini</span>
+            <div><strong>Team default</strong><small>Per-task overrides</small></div>
+            <span class="setting-value">glm-5.3-flash</span>
           </div>
           <div class="setting-row">
             <div><strong>Merge policy</strong><small>Serialized into the lead’s local branch after checks and review close.</small></div>

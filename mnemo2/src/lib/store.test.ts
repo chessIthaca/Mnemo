@@ -31,7 +31,6 @@ describe("Mnemo2 mock workflow", () => {
     expect(entries).toHaveLength(count + 2);
     expect(entries.at(-2)).toMatchObject({ kind: "message", author: "user" });
     expect(entries.at(-1)).toMatchObject({ kind: "message", author: "lead" });
-    expect(state().activityExpanded).toBe(true);
   });
 
   it("blocks merge while Ana has an open finding", () => {

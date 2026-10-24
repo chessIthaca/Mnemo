@@ -26,8 +26,26 @@ describe("Mission Control", () => {
     expect(workerRows()).toHaveLength(10);
   });
 
+  it("opens a task on its thread with its model and workflow", () => {
+    render(ControlRoom);
+    expect(screen.getByRole("button", { name: /^Thread/ }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getAllByText("kimi-k3.1-pro").length).toBeGreaterThan(0);
+    expect(screen.getByRole("list", { name: /Task workflow:/ })).toBeTruthy();
+  });
+
+  it("resets the worker detail to Thread when switching tasks", async () => {
+    render(ControlRoom);
+    await fireEvent.click(screen.getByRole("button", { name: /^Review/ }));
+    expect(screen.getByRole("button", { name: /^Review/ }).getAttribute("aria-pressed")).toBe("true");
+
+    await fireEvent.click(screen.getByRole("button", { name: /Open Theo worker thread/ }));
+    expect(screen.getByRole("button", { name: /^Thread/ }).getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByRole("button", { name: /^Review/ }).getAttribute("aria-pressed")).toBe("false");
+  });
+
   it("drives finding resolution through to an enabled merge and record", async () => {
     render(ControlRoom);
+    await fireEvent.click(screen.getByRole("button", { name: /^Review/ }));
     expect((screen.getByRole("button", { name: "Merge reviewed branch" }) as HTMLButtonElement).disabled).toBe(true);
 
     await fireEvent.click(screen.getByRole("button", { name: "Fix tiny finding: Give the merge action an accessible name" }));

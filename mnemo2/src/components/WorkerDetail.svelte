@@ -11,19 +11,25 @@
   import { canMerge } from "../lib/review";
   import { actions, currentProject } from "../lib/store";
   import { workerStatusLabel, type Worker } from "../lib/types";
+  import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
+  import ModelBadge from "./ModelBadge.svelte";
+  import TaskWorkflow from "./TaskWorkflow.svelte";
 
   let { worker }: { worker: Worker } = $props();
-  let tab = $state<"review" | "thread" | "timeline">("review");
+  let tab = $state<"review" | "thread" | "timeline">("thread");
   let reply = $state("");
+  let lastWorkerId = "";
 
   const eligibility = $derived(canMerge(worker));
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
+  const workflow = $derived(deriveTaskWorkflow(worker));
 
   $effect(() => {
-    worker.id;
-    worker.findings.length;
-    tab = worker.findings.length > 0 ? "review" : "thread";
+    const id = worker.id;
+    if (id === lastWorkerId) return;
+    lastWorkerId = id;
+    tab = "thread";
     reply = "";
   });
 
@@ -45,10 +51,13 @@
   <header class="worker-hero">
     <div class="worker-identity">
       <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
-      <div>
-        <p>WORKER / {worker.branch}</p>
-        <h2>{worker.name}<span data-status={worker.status}>{workerStatusLabel[worker.status]}</span></h2>
+      <div class="worker-heading">
+        <div class="worker-title">
+          <h2>{worker.name}<span data-status={worker.status}>{workerStatusLabel[worker.status]}</span></h2>
+          <ModelBadge model={worker.model} />
+        </div>
         <h3>{worker.task}</h3>
+        <TaskWorkflow {workflow} />
       </div>
     </div>
     <div class="worker-actions">
@@ -57,20 +66,11 @@
     </div>
   </header>
 
-  <p class="worker-summary">{worker.summary}</p>
-  <div class="worker-metrics">
-    <span><small>MODEL</small><strong>{worker.model}</strong></span>
-    <span><small>COST</small><strong>${worker.cost.toFixed(2)}</strong></span>
-    <span><small>TOKENS</small><strong>{worker.tokens.toLocaleString()}</strong></span>
-    <span><small>ELAPSED</small><strong>{worker.elapsed}</strong></span>
-    <span><small>DIFF</small><strong><i>+{worker.diff.additions}</i> <b>−{worker.diff.deletions}</b></strong></span>
-  </div>
-  <div class="worker-progress"><span style={`width: ${worker.progress}%`}></span></div>
-  <div class="file-areas"><GitBranch size={12} /><code>{worker.branch}</code>{#each worker.files as file}<span>{file}</span>{/each}</div>
+  <div class="file-areas"><GitBranch size={12} /><code>{worker.branch}</code><span>{worker.files.length} files</span></div>
 
   <nav class="detail-tabs" aria-label="Worker detail sections">
-    <button class:active={tab === "review"} aria-pressed={tab === "review"} onclick={() => { tab = "review"; }}>Review {#if openFindings > 0}<span>{openFindings}</span>{/if}</button>
     <button class:active={tab === "thread"} aria-pressed={tab === "thread"} onclick={() => { tab = "thread"; }}>Thread <span>{worker.messages.length}</span></button>
+    <button class:active={tab === "review"} aria-pressed={tab === "review"} onclick={() => { tab = "review"; }}>Review {#if openFindings > 0}<span>{openFindings}</span>{/if}</button>
     <button class:active={tab === "timeline"} aria-pressed={tab === "timeline"} onclick={() => { tab = "timeline"; }}>Timeline</button>
   </nav>
 
@@ -113,10 +113,9 @@
           {/each}
         </div>
         <div class="thread-composer">
-          <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Guide ${worker.name} without opening the tool log…`}></textarea>
+          <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`}></textarea>
           <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim()} onclick={sendReply}><Send size={14} /></button>
         </div>
-        <p class="thread-note">Questions route through the lead. Workers never interrupt you directly.</p>
       </section>
     {:else}
       <section class="timeline-panel" aria-label={`${worker.name} timeline`}>
@@ -136,22 +135,15 @@
   .worker-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
   .worker-identity { display: flex; gap: 12px; min-width: 0; }
   .avatar { display: grid; flex: 0 0 auto; width: 44px; height: 44px; place-items: center; border-radius: 13px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: 12px; font-weight: 750; }
-  .worker-identity p { margin: 0 0 4px; overflow: hidden; color: var(--muted); font-family: var(--font-mono); font-size: 7px; letter-spacing: 0.06em; text-overflow: ellipsis; white-space: nowrap; }
+  .worker-heading { min-width: 0; }
+  .worker-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
   .worker-identity h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-family: var(--font-prose); font-size: 26px; font-weight: 550; }
   .worker-identity h2 span { padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; }
   .worker-identity h2 span[data-status="in_review"], .worker-identity h2 span[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
   .worker-identity h3 { margin: 4px 0 0; color: var(--ink-soft); font-size: 10px; font-weight: 500; }
+  .worker-title :global(.model-badge) { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+  .worker-heading :global(.task-workflow) { margin-top: 7px; max-width: 470px; }
   .worker-actions { display: flex; gap: 7px; }
-  .worker-summary { margin: 18px 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: 14px; line-height: 1.6; }
-  .worker-metrics { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .worker-metrics small, .worker-metrics strong { display: block; }
-  .worker-metrics small { margin-bottom: 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
-  .worker-metrics strong { font-size: 10px; font-weight: 600; }
-  .worker-metrics i, .worker-metrics b { font-style: normal; font-weight: 600; }
-  .worker-metrics i { color: #4f7d48; } .worker-metrics b { color: #a15b53; }
-  .worker-progress { height: 2px; margin-top: 10px; background: var(--line); }
-  .worker-progress span { display: block; height: 100%; background: var(--accent); }
-  .file-areas { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 12px 0 18px; color: var(--muted); }
   .file-areas code { margin-right: 4px; color: var(--ink-soft); font-family: var(--font-mono); font-size: 8px; }
   .file-areas span { padding: 4px 6px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: 7px; }
   .detail-tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); }
@@ -186,7 +178,6 @@
   .thread-message.from-lead p { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
   .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
   .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: 10px; }
-  .thread-note { color: var(--muted); font-size: 8px; text-align: center; }
   .timeline-step { display: grid; grid-template-columns: 20px 1fr; gap: 8px; min-height: 76px; }
   .timeline-marker { display: flex; justify-content: center; border-left: 1px solid var(--line); margin-left: 6px; }
   .timeline-marker > span { width: 8px; height: 8px; margin: 5px 0 0 -4.5px; border-radius: 50%; background: var(--line-strong); }
@@ -196,6 +187,6 @@
   .timeline-step time { margin-left: 8px; color: var(--muted); font-size: 8px; }
   .timeline-step p { margin: 4px 0; color: var(--muted); font-size: 9px; }
   .timeline-step div > span { color: var(--muted); font-size: 7px; text-transform: uppercase; }
-  @media (max-width: 1100px) { .worker-metrics { grid-template-columns: repeat(3, 1fr); } .merge-decision { align-items: flex-start; flex-direction: column; } }
-  @media (max-width: 620px) { .worker-detail { padding: 16px; } .worker-hero { flex-direction: column; } .worker-metrics { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 1100px) { .merge-decision { align-items: flex-start; flex-direction: column; } }
+  @media (max-width: 620px) { .worker-detail { padding: 16px; } .worker-hero { flex-direction: column; } }
 </style>

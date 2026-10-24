@@ -171,8 +171,10 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
-The Mnemo2 Phase 0 prototype is a separate Svelte 5 workspace (mock data only —
-no engine, IPC, or git operations):
+The Mnemo2 Phase 0b prototype is a separate Svelte 5 workspace (mock data only —
+no engine, IPC, or git operations). It is conversation-first: each task has its
+own lead-enforced workflow, and the lead/worker model identities are visible in
+the UI:
 
 ```bash
 npm run dev:mnemo2         # http://127.0.0.1:5180

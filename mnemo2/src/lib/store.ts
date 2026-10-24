@@ -2,7 +2,6 @@ import { derived, writable } from "svelte/store";
 import {
   createDiffFiles,
   createLeadEntries,
-  createLeadTimeline,
   createPlanItems,
   createProjects,
   createWorkers,
@@ -27,8 +26,6 @@ export function createInitialState(): AppState {
     projects: createProjects(),
     workers,
     leadEntries: createLeadEntries(workers),
-    leadTimeline: createLeadTimeline(),
-    activityExpanded: false,
     selectedWorkerId: "ana",
     teamPeekOpen: false,
     teamFilter: "all",
@@ -179,10 +176,6 @@ function navigateBrowser(url: string) {
   app.update((state) => ({ ...state, browserUrl, workbenchOpen: true }));
 }
 
-function toggleActivity() {
-  app.update((state) => ({ ...state, activityExpanded: !state.activityExpanded }));
-}
-
 function sendLeadMessage(body: string) {
   const message = body.trim();
   if (!message) return;
@@ -205,7 +198,6 @@ function sendLeadMessage(body: string) {
         time: "now",
       },
     ],
-    activityExpanded: true,
   }));
 }
 
@@ -503,7 +495,6 @@ export const actions = {
   setWorkbenchWidth,
   openBrowser,
   navigateBrowser,
-  toggleActivity,
   sendLeadMessage,
   replyWorker,
   steerWorker,

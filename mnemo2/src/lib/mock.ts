@@ -51,7 +51,7 @@ function makeWorker(input: WorkerInput): Worker {
     task,
     summary,
     status,
-    model: "Spark Mini",
+    model: "glm-5.3-flash",
     branch: `wt/agent-${id}`,
     worktree: `.worktrees/agent-${id}`,
     files: [],
@@ -78,6 +78,7 @@ export function createProjects(): Project[] {
       name: "Mnemo",
       path: "C:/AgenticCoder/AgenticCoder",
       branch: "wt/mnemo",
+      leadModel: "claude-opus-5-5",
       description: "Agentic coding harness · Mnemo2 cockpit",
       lastSession: "12 min ago",
       workerSlots: 8,
@@ -89,6 +90,7 @@ export function createProjects(): Project[] {
       name: "Garden game",
       path: "C:/Games/Garden",
       branch: "wt/prototype",
+      leadModel: "claude-opus-5-5",
       description: "Godot experiment · local multiplayer",
       lastSession: "Yesterday",
       workerSlots: 4,
@@ -100,6 +102,7 @@ export function createProjects(): Project[] {
       name: "Field notes",
       path: "C:/Writing/FieldNotes",
       branch: "main",
+      leadModel: "gemini-3-flash-preview",
       description: "Research notes · static site",
       lastSession: "Monday",
       workerSlots: 2,
@@ -118,7 +121,7 @@ export function createWorkers(): Worker[] {
       task: "Team state and review flow",
       summary: "The review flow is ready. Two findings need a lead decision before merge.",
       status: "in_review",
-      model: "Atlas Core",
+      model: "kimi-k3.1-pro",
       files: ["mnemo2/src/lib/store.ts", "mnemo2/src/lib/review.ts"],
       tokens: 18420,
       cost: 1.84,
@@ -162,6 +165,7 @@ export function createWorkers(): Worker[] {
       task: "Markdown renderer and code blocks",
       summary: "Tables and fenced code are rendering; I’m checking link sanitization now.",
       status: "working",
+      model: "gemini-3-flash-preview",
       files: ["mnemo2/src/lib/markdown.ts", "mnemo2/src/components/Markdown.svelte"],
       tokens: 12040,
       cost: 0.92,
@@ -178,6 +182,7 @@ export function createWorkers(): Worker[] {
       task: "Design tokens and responsive shell",
       summary: "The light theme is in place. I’m tuning the narrow-screen workbench transition.",
       status: "working",
+      model: "glm-5.3",
       files: ["mnemo2/src/app.css", "mnemo2/src/App.svelte"],
       tokens: 10680,
       cost: 1.12,
@@ -195,6 +200,7 @@ export function createWorkers(): Worker[] {
       summary: "The fixer is adding focus restoration after the review found a keyboard trap.",
       status: "fixing",
       fixerFindingId: "milo-focus",
+      model: "deepseek-flash",
       files: ["mnemo2/src/components/Workbench.svelte"],
       tokens: 14220,
       cost: 1.06,
@@ -235,6 +241,7 @@ export function createWorkers(): Worker[] {
       task: "Plan persistence adapter",
       summary: "Merge stopped cleanly: the plan adapter conflicts with the lead branch. No files were auto-resolved.",
       status: "conflict",
+      model: "kimi-k3.1-pro-highspeed",
       needsYou: true,
       files: ["mnemo2/src/lib/persistence.ts"],
       tokens: 15600,
@@ -315,7 +322,7 @@ export function createWorkers(): Worker[] {
         deletions: 20,
         checks: ["cargo test --workspace"],
         reviewSummary: "2 findings · 1 fixed · 1 wontfix",
-        model: "Spark Mini",
+        model: "glm-5.3-flash",
         cost: 0.76,
         time: "09:26",
       },
@@ -327,6 +334,7 @@ export function createWorkers(): Worker[] {
       task: "Budget telemetry formatting",
       summary: "The check run failed on a locale-sensitive cost assertion. I need a lead decision on the expected format.",
       status: "failed",
+      model: "deepseek-flash",
       needsYou: true,
       tokens: 7280,
       cost: 0.61,
@@ -419,16 +427,6 @@ export function createLeadEntries(workers: Worker[]): LeadEntry[] {
   }
 
   return entries;
-}
-
-export function createLeadTimeline(): TimelineStep[] {
-  return [
-    { id: "lead-plan", label: "Plan", detail: "One plan of record", status: "done", time: "09:11" },
-    { id: "lead-map", label: "Map", detail: "Paths and acceptance criteria", status: "done", time: "09:12" },
-    { id: "lead-dispatch", label: "Dispatch", detail: "10 self-contained briefs", status: "done", time: "09:12" },
-    { id: "lead-review", label: "Review", detail: "Ana has 2 open findings", status: "active" },
-    { id: "lead-merge", label: "Merge", detail: "Serialized after checks", status: "queued" },
-  ];
 }
 
 export function createPlanItems(): PlanItem[] {

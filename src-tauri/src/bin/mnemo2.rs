@@ -6,8 +6,8 @@
 
 //! Mnemo2's desktop entry point.
 //!
-//! Run with `cargo run -p mnemo-app --bin mnemo2` while the Mnemo2 Vite
-//! server is listening on port 5180.
+//! Run with `cargo run -p mnemo-app --features mnemo2 --bin mnemo2` while the
+//! Mnemo2 Vite server is listening on port 5180.
 
 fn main() {
     mnemo_app::mnemo2::run();

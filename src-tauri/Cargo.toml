@@ -34,6 +34,15 @@ sha2 = "0.11"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# The Mnemo2 host is a separate shell. Gating it keeps its
+# `generate_context!` out of the Mnemo1 main-bin link unit, which would
+# otherwise double-embed `_EMBED_INFO_PLIST` in macOS dev/test builds.
+mnemo2 = []
+
+[[bin]]
+name = "mnemo2"
+path = "src/bin/mnemo2.rs"
+required-features = ["mnemo2"]
 
 [dev-dependencies]
 tempfile = "3"

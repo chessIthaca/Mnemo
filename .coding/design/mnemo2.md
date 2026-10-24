@@ -310,10 +310,11 @@ conversation-first primitives. No engine, IPC, or git.
 
 Shipped in the native host:
 
-- **Separate shell.** `src-tauri/mnemo2.conf.json`, `src-tauri/src/bin/mnemo2.rs`,
+- **Separate shell.** `src-tauri/mnemo2-app/tauri.conf.json`, `src-tauri/src/bin/mnemo2.rs`,
   and `src-tauri/src/mnemo2/` add a minimal Tauri host without extending Mnemo1's
   IPC surface. The host runs on Vite port 5180 and embeds
-  `target/mnemo2-dist`.
+  `target/mnemo2-dist`. The host is gated by the `mnemo2` Cargo feature so the
+  Mnemo1 main binary never links its Tauri context.
 - **Lead runtime.** `LeadRuntime` starts the headless `Engine`, registers
   `WorkflowPolicyFactory` as `mnemo.workflow`, and spawns one lead session under
   `ApproveViaApi` / `ApproveEachAction`. It forwards `SessionEvent`s, persists
@@ -386,7 +387,7 @@ Shipped in the native host:
 - `src-tauri/src/ipc/spawn.rs` — the worktree-binding spawn pattern.
 - `src/config/projects.rs` — `ProjectRegistry` / `projects.toml`.
 - `src/agent/prompt.rs` — the compiled APP_RULES line (agent-facing gate).
-- `src-tauri/mnemo2.conf.json` + `src-tauri/src/bin/mnemo2.rs` — the separate
+- `src-tauri/mnemo2-app/tauri.conf.json` + `src-tauri/src/bin/mnemo2.rs` — the separate
   Mnemo2 native host.
 - `src-tauri/src/mnemo2/runtime.rs` — `LeadRuntime`: engine/policy/session,
   event pump, persistence, interrupt, resume-based model changes.

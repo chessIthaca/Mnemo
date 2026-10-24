@@ -11,5 +11,7 @@
 //! Mnemo1's larger IPC surface into the Mnemo2 binary.
 
 /// The Mnemo2 desktop host: a minimal Tauri shell around the headless
-/// engine's lead session.
+/// engine's lead session. Gated by the `mnemo2` feature so the Mnemo1 main
+/// binary does not link its Tauri context.
+#[cfg(feature = "mnemo2")]
 pub mod mnemo2;

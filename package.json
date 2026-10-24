@@ -13,9 +13,10 @@
     "build": "npm run build --workspace frontend",
     "dev:mnemo2": "npm run dev --workspace mnemo2",
     "build:mnemo2": "npm run build --workspace mnemo2",
-    "dev:mnemo2:native": "cargo run --manifest-path src-tauri/Cargo.toml --bin mnemo2",
-    "build:mnemo2:native": "npm run build:mnemo2 && cargo build --manifest-path src-tauri/Cargo.toml --bin mnemo2 --features custom-protocol --release",
+    "dev:mnemo2:native": "cargo run --manifest-path src-tauri/Cargo.toml --features mnemo2 --bin mnemo2",
+    "build:mnemo2:native": "npm run build:mnemo2 && cargo build --manifest-path src-tauri/Cargo.toml --features mnemo2,custom-protocol --bin mnemo2 --release",
     "test:mnemo2": "npm test --workspace mnemo2",
+    "test:mnemo2:native": "cargo test --manifest-path src-tauri/Cargo.toml -p mnemo-app --features mnemo2 --lib",
     "check:mnemo2": "npm run check --workspace mnemo2"
   },
   "allowScripts": {

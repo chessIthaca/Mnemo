@@ -32,8 +32,13 @@ npm run build:mnemo2:native
 
 `mnemo2` is a separate npm workspace (`mnemo2/`). Vite uses port **5180** and
 outputs to `target/mnemo2-dist`, distinct from the Mnemo1 frontend on 5179. The
-native host uses its own `src-tauri/mnemo2.conf.json` and binary; it does not
-replace or extend Mnemo1's IPC surface.
+native host uses its own `src-tauri/mnemo2-app/tauri.conf.json` and binary; it does not
+replace or extend Mnemo1's IPC surface. It also clears inherited
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, so it never reuses Mnemo1's CDP port 9222.
+
+The native host is the `mnemo2` Cargo feature. The default `cargo test
+--workspace` compiles Mnemo1 alone; `npm run test:mnemo2:native` runs the
+feature-enabled Mnemo2 lib tests.
 
 ## Native lead
 

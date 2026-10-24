@@ -1,9 +1,22 @@
 <script lang="ts">
-  import { ChevronDown, MessageSquare, UsersRound, Wallet } from "@lucide/svelte";
+  import { ChevronDown, MessageSquare, PanelsTopLeft, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
+  import AvatarStack from "./AvatarStack.svelte";
+  import Sheet from "./Sheet.svelte";
 
-  const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)).slice(0, 4));
+  const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)));
   const activeCount = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing", "merging"].includes(worker.status)).length);
+  let settingsOpen = $state(false);
+
+  function handleTeam() {
+    if ($app.route === "lead") actions.toggleTeamPeek();
+    else actions.openTeam();
+  }
+
+  function setSlots(event: Event) {
+    const slots = (event.currentTarget as HTMLInputElement).valueAsNumber;
+    if (Number.isFinite(slots)) actions.setWorkerSlots(slots);
+  }
 </script>
 
 <header class="topbar">
@@ -17,22 +30,45 @@
   </div>
 
   <nav class="primary-nav" aria-label="Workspace">
-    <button class:active={$app.route === "lead"} onclick={actions.openLead}><MessageSquare size={14} /> Lead</button>
-    <button class:active={$app.route === "team"} onclick={actions.openTeam}><UsersRound size={14} /> Team
+    <button class:active={$app.route === "lead"} aria-pressed={$app.route === "lead"} onclick={actions.openLead}><MessageSquare size={14} /> Lead</button>
+    <button class:active={$app.route === "team"} aria-expanded={$app.route === "lead" ? $app.teamPeekOpen : undefined} onclick={handleTeam}><UsersRound size={14} /> Team
       {#if $needsYouCount > 0}<span class="nav-badge">{$needsYouCount}</span>{/if}
     </button>
   </nav>
 
   <div class="topbar-right">
-    <button class="team-stack" onclick={actions.openTeam} title="Open Mission Control">
-      <span class="stack-avatars">
-        {#each visibleWorkers as worker (worker.id)}<span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>{/each}
-      </span>
+    <button class="team-stack" onclick={handleTeam} title="Peek at the team or open Mission Control">
+      <AvatarStack workers={visibleWorkers} max={4} />
       <span>{activeCount} active</span>
     </button>
-    <span class="budget-chip"><Wallet size={13} /><span>${$currentProject?.budgetSpent.toFixed(2) ?? "0.00"}</span><small>/ ${$currentProject?.budgetLimit ?? 0}</small></span>
+    {#if $app.route === "lead"}
+      <button
+        class="icon-button"
+        aria-label={$app.workbenchOpen ? "Close workbench" : "Open workbench"}
+        aria-pressed={$app.workbenchOpen}
+        onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
+      ><PanelsTopLeft size={15} /></button>
+    {/if}
+    <button class="budget-chip" aria-label="Open project settings" onclick={() => (settingsOpen = true)}>
+      <Wallet size={13} /><span>${$currentProject?.budgetSpent.toFixed(2) ?? "0.00"}</span><small>/ ${$currentProject?.budgetLimit ?? 0}</small>
+    </button>
   </div>
 </header>
+
+<Sheet open={settingsOpen} title="Project settings" eyebrow="PER-PROJECT" onclose={() => (settingsOpen = false)}>
+  <p class="settings-copy">Worker concurrency is a per-project setting. Budget and rate limits are separate concerns; the board is designed for larger teams as well as a solo lead.</p>
+  <div class="settings-row">
+    <div><strong>Worker slots</strong><small>Maximum concurrent workers for this project.</small></div>
+    <input aria-label="Project worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
+  </div>
+  <div class="settings-row"><div><strong>Team model</strong><small>Workers default to a cheaper model than the lead.</small></div><span class="settings-value">Spark Mini</span></div>
+  <div class="settings-row"><div><strong>Lead model</strong><small>Planning, review, and merge decisions.</small></div><span class="settings-value">Atlas Core</span></div>
+  <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
+  <div class="settings-actions">
+    <button class="button button-quiet" onclick={() => { settingsOpen = false; actions.resetDemo(); }}>Replay prototype</button>
+    <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
+  </div>
+</Sheet>
 
 <style>
   .topbar { position: relative; z-index: 20; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; min-height: 64px; padding: 0 22px; border-bottom: 1px solid var(--line); background: rgb(247 247 244 / 88%); backdrop-filter: blur(18px); }
@@ -48,9 +84,17 @@
   .primary-nav button.active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 4px rgb(35 38 30 / 8%); }
   .nav-badge { display: grid; min-width: 15px; height: 15px; place-items: center; border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-size: 8px; }
   .team-stack { display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 9px; }
-  .stack-avatars { display: flex; padding-left: 8px; }
-  .avatar { display: grid; width: 25px; height: 25px; margin-left: -8px; place-items: center; border: 2px solid var(--canvas); border-radius: 50%; background: hsl(var(--hue) 32% 85%); color: hsl(var(--hue) 30% 32%); font-size: 7px; font-weight: 750; }
-  .budget-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: 9px; }
+  .budget-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: 9px; }
+  .budget-chip:hover { border-color: var(--line-strong); }
   .budget-chip small { color: var(--muted); }
+  .settings-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
+  .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-top: 1px solid var(--line); }
+  .settings-row strong, .settings-row small { display: block; }
+  .settings-row strong { font-size: 10px; font-weight: 650; }
+  .settings-row small { max-width: 300px; margin-top: 3px; color: var(--muted); font-size: 8px; line-height: 1.45; }
+  .settings-row input { width: 54px; padding: 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); font-size: 10px; text-align: center; }
+  .settings-value { flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 8px; }
+  .settings-ok { color: var(--accent-strong); }
+  .settings-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
   @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } .budget-chip small { display: none; } }
 </style>

@@ -66,7 +66,7 @@
 </main>
 
 <style>
-  .start-screen { min-height: 100vh; overflow-y: auto; background: radial-gradient(circle at 85% 12%, #ecefe6 0, transparent 34%), var(--canvas); }
+  .start-screen { min-height: 100vh; min-height: 100dvh; overflow-y: auto; background: radial-gradient(circle at 85% 12%, #ecefe6 0, transparent 34%), var(--canvas); }
   .start-nav { display: flex; align-items: center; justify-content: space-between; max-width: 1240px; margin: 0 auto; padding: 28px 42px; }
   .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--ink); font-size: 13px; font-weight: 680; text-decoration: none; }
   .brand-mark { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: var(--accent-strong); font-family: var(--font-prose); font-size: 18px; }

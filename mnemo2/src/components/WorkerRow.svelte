@@ -1,0 +1,64 @@
+<script lang="ts">
+  import { AlertCircle, ChevronRight } from "@lucide/svelte";
+  import { workerStatusLabel, type Worker } from "../lib/types";
+
+  let {
+    worker,
+    selected = false,
+    compact = false,
+    onSelect,
+  }: {
+    worker: Worker;
+    selected?: boolean;
+    compact?: boolean;
+    onSelect: (workerId: string) => void;
+  } = $props();
+</script>
+
+<button
+  class="worker-row"
+  class:selected
+  class:compact
+  data-status={worker.status}
+  aria-label={`Open ${worker.name} worker thread`}
+  aria-current={selected ? "true" : undefined}
+  onclick={() => onSelect(worker.id)}
+>
+  <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
+  <span class="worker-copy">
+    <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}<small>{worker.model}</small></span>
+    <span class="worker-task">{worker.task}</span>
+    {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
+  </span>
+  <span class="worker-meta">
+    <span class="status-label" data-status={worker.status}>{workerStatusLabel[worker.status]}</span>
+    <small>${worker.cost.toFixed(2)} · {worker.elapsed}</small>
+  </span>
+  <ChevronRight class="row-chevron" size={13} />
+</button>
+
+<style>
+  .worker-row { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 66px; padding: 10px 11px; border: 1px solid transparent; border-radius: 11px; background: transparent; color: var(--ink); cursor: pointer; text-align: left; }
+  .worker-row:hover { background: var(--surface-soft); }
+  .worker-row.selected { border-color: #d7ded1; background: var(--accent-soft); }
+  .worker-row.compact { min-height: 56px; padding: 8px 7px; }
+  .avatar { display: grid; flex: 0 0 auto; width: 32px; height: 32px; place-items: center; border-radius: 10px; background: hsl(var(--hue) 32% 87%); color: hsl(var(--hue) 30% 32%); font-size: 9px; font-weight: 750; }
+  .worker-copy { flex: 1; min-width: 0; }
+  .worker-name { display: flex; align-items: center; gap: 5px; }
+  .worker-name strong { font-size: 10px; font-weight: 670; }
+  .worker-name :global(svg) { color: var(--warning); }
+  .worker-name small { margin-left: auto; color: var(--muted); font-size: 7px; font-weight: 450; }
+  .worker-task { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+  .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
+  .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+  .worker-meta { flex: 0 0 auto; text-align: right; }
+  .worker-meta small { display: block; margin-top: 4px; color: var(--muted); font-size: 7px; white-space: nowrap; }
+  .status-label { display: inline-flex; padding: 3px 6px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 7px; font-weight: 650; white-space: nowrap; }
+  .status-label[data-status="in_review"], .status-label[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
+  .status-label[data-status="failed"] { background: #f4e4e1; color: var(--danger); }
+  .status-label[data-status="merged"] { background: var(--accent-soft); color: var(--accent-strong); }
+  .status-label[data-status="working"], .status-label[data-status="fixing"] { background: #e9edf3; color: #536c89; }
+  .worker-row :global(.row-chevron) { flex: 0 0 auto; color: var(--line-strong); }
+  .worker-row.compact .worker-name small, .worker-row.compact .worker-meta small { display: none; }
+  @media (max-width: 1100px) { .worker-meta small { display: none; } .worker-name small { display: none; } }
+</style>

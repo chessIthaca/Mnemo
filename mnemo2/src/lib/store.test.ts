@@ -82,4 +82,33 @@ describe("Mnemo2 mock workflow", () => {
     actions.stopWorker("theo");
     expect(worker("theo").status).toBe("cancelled");
   });
+
+  it("only completes the fixer's targeted finding", () => {
+    actions.spawnFixer("ana", "ana-copy");
+    expect(worker("ana").status).toBe("fixing");
+    expect(worker("ana").fixerFindingId).toBe("ana-copy");
+
+    actions.completeFixer("ana", "ana-merge");
+    expect(worker("ana").status).toBe("fixing");
+    expect(worker("ana").findings.find((finding) => finding.id === "ana-merge")?.status).toBe("open");
+
+    actions.completeFixer("ana", "ana-copy");
+    expect(worker("ana").status).toBe("in_review");
+    expect(worker("ana").fixerFindingId).toBeUndefined();
+    expect(worker("ana").findings.find((finding) => finding.id === "ana-copy")?.status).toBe("fixed");
+  });
+
+  it("keeps a dispatched fixer target through a steer reply", () => {
+    actions.spawnFixer("ana", "ana-copy");
+    actions.replyWorker("ana", "Keep going with the fix.");
+    expect(worker("ana").status).toBe("fixing");
+    expect(worker("ana").fixerFindingId).toBe("ana-copy");
+
+    actions.completeFixer("ana", "ana-copy");
+    expect(worker("ana").status).toBe("in_review");
+  });
+
+  it("ships Milo with a completable fixer target", () => {
+    expect(worker("milo").fixerFindingId).toBe("milo-focus");
+  });
 });

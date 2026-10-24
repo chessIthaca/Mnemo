@@ -171,6 +171,16 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
+The Mnemo2 Phase 0 prototype is a separate Svelte 5 workspace (mock data only —
+no engine, IPC, or git operations):
+
+```bash
+npm run dev:mnemo2         # http://127.0.0.1:5180
+npm run check:mnemo2       # svelte-check
+npm run test:mnemo2        # Vitest interaction + policy tests
+npm run build:mnemo2       # -> target/mnemo2-dist
+```
+
 Two heavyweight optional cargo features exist on the library — `browser` (headless-browser tooling) and `embeddings` (local ONNX memory search) — plus a dev-only `test-support` feature for cross-crate test factories. The two heavyweight ones are off by default for light builds; the app always selects both.
 
 ## A few configs you should check right away

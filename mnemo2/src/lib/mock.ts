@@ -194,6 +194,7 @@ export function createWorkers(): Worker[] {
       task: "Workbench keyboard navigation",
       summary: "The fixer is adding focus restoration after the review found a keyboard trap.",
       status: "fixing",
+      fixerFindingId: "milo-focus",
       files: ["mnemo2/src/components/Workbench.svelte"],
       tokens: 14220,
       cost: 1.06,

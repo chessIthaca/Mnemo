@@ -114,6 +114,7 @@ export interface Worker {
   progress: number;
   lastActivity: string;
   needsYou: boolean;
+  fixerFindingId?: string;
   checks: Check[];
   findings: Finding[];
   messages: WorkerMessage[];

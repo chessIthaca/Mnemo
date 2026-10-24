@@ -139,7 +139,13 @@ function setTeamFilter(teamFilter: TeamFilter) {
 }
 
 function openWorkbench(workbenchTab: WorkbenchTab = "browser") {
-  app.update((state) => ({ ...state, workbenchOpen: true, workbenchTab }));
+  app.update((state) => ({
+    ...state,
+    route: state.projectId ? "lead" : state.route,
+    teamPeekOpen: false,
+    workbenchOpen: true,
+    workbenchTab,
+  }));
 }
 
 function closeWorkbench() {
@@ -244,6 +250,7 @@ function stopWorker(workerId: string) {
         ...item,
         status: "cancelled",
         needsYou: false,
+        fixerFindingId: undefined,
         lastActivity: "now",
       })),
       `${worker.name} stopped. No branch changes were made in this prototype.`,
@@ -289,6 +296,7 @@ function spawnFixer(workerId: string, findingId: string) {
         ...item,
         status: "fixing",
         needsYou: false,
+        fixerFindingId: findingId,
         lastActivity: "now",
         checks: [{ name: "cargo test --workspace", status: "running", detail: "Fixer branch tip" }],
         timeline: [
@@ -321,7 +329,7 @@ function completeFixer(workerId: string, findingId: string) {
   app.update((state) => {
     const worker = state.workers.find((item) => item.id === workerId);
     const finding = worker?.findings.find((item) => item.id === findingId);
-    if (!worker || !finding || finding.status !== "open" || worker.status !== "fixing") {
+    if (!worker || !finding || finding.status !== "open" || worker.status !== "fixing" || worker.fixerFindingId !== findingId) {
       return state;
     }
 
@@ -329,6 +337,7 @@ function completeFixer(workerId: string, findingId: string) {
       ...item,
       status: "in_review",
       needsYou: true,
+      fixerFindingId: undefined,
       lastActivity: "now",
       checks: [{ name: "cargo test --workspace", status: "passed", detail: "Fixer tip · 41s" }],
       findings: item.findings.map((entry) =>

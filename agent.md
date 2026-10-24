@@ -19,7 +19,7 @@ command.
   `shell` tool.
 - The project root is `C:\AgenticCoder\AgenticCoder`.
 - Never commit to `main` — commit to the current feature branch.
-- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). `git` core operations (`merge`/`push`) MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way. The skill also writes its landing records BEFORE the final commit — never after the push (see the record-phrasing rule in Branch policy).
+- `merge_to_main` (the only sanctioned way anything reaches `main`) syncs `main` with `origin` first (`git fetch` + `git pull --no-rebase` — on `shell`, the `git` tool having no fetch/pull subcommand), then merges the branch — on repos WITHOUT a main-protection ruleset. Since 2026-09-21 this repo's `main` is protected by ruleset 23755694 (pull_request, required_approving_review_count: 1): the skill detects it up-front (`gh api .../rulesets`), pushes the working branch, opens a PR against `main`, reports the URL, and STOPS — the human approves and merges (the author cannot self-approve); never bypass (no force-push/admin/ruleset edits). The **Mnemo1 agent workflow** keeps the hard gate: `git` core operations (`merge`/`push`) performed by the agent MUST go through the approval-gated `git` tool, and a shell-invoked `git merge`/`push` is gated identically (`GitTool::never_auto_for` covers the tool path; since 2027-01-11 `ShellTool::never_auto_for` matches a `git` executable in a command position) — no unprompted run in Autonomous mode either way. **Mnemo2** is an application-level integration queue, not an Mnemo1 agent workflow; its scoped merge policy is in **Mnemo2 team merge policy** under Branch policy. The skill also writes its landing records BEFORE the final commit — never after the push (see the record-phrasing rule in Branch policy).
 - **Do not pipe a command through a cmdlet and then trust the reported exit
   code** — it's the *pipe's* code, not the command's, and can read `1` even
   when the command succeeded. To check whether a command actually failed,
@@ -131,6 +131,16 @@ command.
   Spawned items' reviewer reports land
   in the main tree's `.coding/reviews/` (shared by design); they are not
   carried by the item's branch merge.
+
+### Mnemo2 team merge policy (supervisor/worker app)
+
+Mnemo2 is a separate application built on the headless engine, not an Mnemo1 agent workflow. Its **TeamManager** may auto-merge a completed worker branch into the lead's **local working branch** only after all of the following hold:
+
+- the worker's turn finished successfully and its checks passed **on the branch tip being merged** — after any `review_fix` or fixer commit, the affected check scope (for this repo `cargo test --workspace`) is re-run and passes;
+- the lead reviewed the branch and **every finding is closed** (fixed) or explicitly marked `wontfix` with a written justification;
+- the lead's working tree is clean and the lead is idle; the merge is serialized (one branch at a time).
+
+It halts on conflicts, never pushes, and never merges into `main`. Landing to `main` remains the repository's protected-PR path (ruleset 23755694; the human approves the PR). Worker branches are per-agent `wt/agent-*` worktrees forked from the lead's working-branch tip at dispatch; a base that goes stale while a worker runs is never auto-rebased — the conflict-halt and route-back rule handles it. The TeamManager performs the merge, not the agent's `git` tool. The compiled agent git gate still applies to the agent's own `git merge`/`git push` calls.
 
 ## Review expectations
 

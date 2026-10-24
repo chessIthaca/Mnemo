@@ -114,6 +114,18 @@ pub fn agent_branch(agent_id: &str) -> String {
     format!("wt/agent-{}", agent_short_id(agent_id))
 }
 
+/// The current branch of `main_root` — the lead's working-branch tip that a
+/// new worker forks from. A detached HEAD is refused: a worker must have a
+/// branch to fork and to land back onto.
+pub fn current_branch(main_root: &Path) -> Result<String, String> {
+    let branch = git_raw(main_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = branch.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("the project is on a detached HEAD; check out a branch first".to_string());
+    }
+    Ok(branch)
+}
+
 /// Provision a linked worktree for one Mnemo2 team worker, on its own branch
 /// forked from `base_ref` (the lead branch tip). Returns
 /// `(worktree_root, branch)` at `<main_root>/.worktrees/agent-<id8>`.

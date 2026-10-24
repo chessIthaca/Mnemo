@@ -430,7 +430,7 @@ impl Engine {
     /// Shut the engine down (§5.3 :301): cancel every live session,
     /// deregister, stop the pump. (The session-end consolidation rides
     /// the kernel's existing shutdown path when the loops' tasks end.)
-    pub async fn shutdown(self) -> Result<(), EngineError> {
+    pub async fn shutdown(&self) -> Result<(), EngineError> {
         let agents: Vec<crate::runtime::AgentId> = self
             .inner
             .sessions

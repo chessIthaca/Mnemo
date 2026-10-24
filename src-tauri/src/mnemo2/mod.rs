@@ -13,6 +13,9 @@
 /// The headless-engine-backed lead conversation.
 pub mod runtime;
 
+/// The real Phase 2 worker team runtime.
+pub mod team;
+
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
 

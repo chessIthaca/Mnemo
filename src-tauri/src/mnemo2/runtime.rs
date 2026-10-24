@@ -159,7 +159,7 @@ impl LiveLead {
 
 /// The one live lead conversation.
 pub struct LeadRuntime {
-    engine: Arc<Mutex<Option<Engine>>>,
+    engine: Arc<Mutex<Option<Arc<Engine>>>>,
     live: Mutex<Option<LiveLead>>,
     generation: Arc<AtomicU64>,
     events: broadcast::Sender<LeadEvent>,
@@ -185,7 +185,7 @@ impl LeadRuntime {
         Self::open_inner_with_policy(options, provider, Some("mnemo.workflow".to_string())).await
     }
 
-    async fn open_inner_with_policy(
+    pub(crate) async fn open_inner_with_policy(
         options: LeadRuntimeOptions,
         provider: Option<Arc<dyn LlmClient>>,
         policy: Option<String>,
@@ -251,6 +251,21 @@ impl LeadRuntime {
     /// The configured default model spec.
     pub fn default_model(&self) -> Option<String> {
         self.default_model.clone()
+    }
+
+    /// The shared engine handle (the team runtime spawns workers on the same
+    /// engine as the lead — never a second engine).
+    pub(crate) async fn engine_handle(&self) -> Result<Arc<Engine>, String> {
+        self.engine
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "the headless engine is not running".to_string())
+    }
+
+    /// The selected project root (for worker worktree provisioning).
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// The current lead state.
@@ -456,7 +471,7 @@ impl LeadRuntime {
             .await
             .map_err(|err| format!("could not start the headless engine: {err}"))?;
         engine.register_policy("mnemo.workflow", Arc::new(WorkflowPolicyFactory::default()));
-        *self.engine.lock().await = Some(engine);
+        *self.engine.lock().await = Some(Arc::new(engine));
         Ok(())
     }
 
@@ -467,13 +482,14 @@ impl LeadRuntime {
         spawn_model: Option<String>,
         resume: Transcript,
     ) -> Result<LiveLead, String> {
-        let session = {
-            let engine = self.engine.lock().await;
-            let engine = engine
-                .as_ref()
-                .ok_or_else(|| "the headless engine is not running".to_string())?;
-            engine
-                .spawn(SpawnOptions {
+        let engine = self
+            .engine
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "the headless engine is not running".to_string())?;
+        let session = engine
+            .spawn(SpawnOptions {
                     name: Some("Lead".to_string()),
                     model: spawn_model.clone(),
                     worktree: None,
@@ -486,8 +502,7 @@ impl LeadRuntime {
                     guardrails: None,
                 })
                 .await
-                .map_err(|err| format!("could not spawn the lead session: {err}"))?
-        };
+                .map_err(|err| format!("could not spawn the lead session: {err}"))?;
         let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
         let observed_model = Arc::new(Mutex::new(
@@ -522,7 +537,7 @@ impl LeadRuntime {
 
 async fn pump_events(
     generation: u64,
-    engine: Arc<Mutex<Option<Engine>>>,
+    engine: Arc<Mutex<Option<Arc<Engine>>>>,
     session_id: SessionId,
     mut receiver: EventReceiver<SessionEvent>,
     events: broadcast::Sender<LeadEvent>,
@@ -572,12 +587,10 @@ async fn pump_events(
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let handle = {
-                    let engine = engine.lock().await;
-                    match engine.as_ref() {
-                        Some(engine) => engine.session(&session_id).await,
-                        None => None,
-                    }
+                let engine = engine.lock().await.clone();
+                let handle = match engine {
+                    Some(engine) => engine.session(&session_id).await,
+                    None => None,
                 };
                 if let Some(handle) = handle {
                     if let Ok(history) = handle.history().await {
@@ -1109,5 +1122,251 @@ mod tests {
         )));
         assert!(!runtime.snapshot().await.expect("snapshot").busy);
         runtime.shutdown().await;
+    }
+
+    fn init_git(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Mnemo2 Test"]);
+        std::fs::write(root.join("README.md"), "seed\n").expect("seed file");
+        run(&["add", "."]);
+        run(&["commit", "-m", "seed"]);
+    }
+
+    #[tokio::test]
+    async fn team_runs_two_workers_concurrently_without_cross_talk() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_config(config.path(), &["scripted-a", "scripted-b"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["first worker done"]),
+            text_turn(&["second worker done"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("the shared engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 2,
+            max_spawns_per_turn: 2,
+        })
+        .await
+        .expect("the team opens");
+        let mut rx = team.subscribe();
+        let first = team
+            .dispatch("first task".to_string(), None)
+            .await
+            .expect("the first worker dispatches");
+        let second = team
+            .dispatch("second task".to_string(), None)
+            .await
+            .expect("the second worker dispatches");
+        let expected = [first.id.clone(), second.id.clone()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let mut finished = std::collections::HashSet::new();
+        let mut texts = std::collections::HashMap::<String, String>::new();
+        for _ in 0..100 {
+            let event = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(event)) => event,
+                other => {
+                    let snapshot = team.snapshot().await;
+                    panic!(
+                        "a team event arrives: {other:?}; llm_calls={}; snapshot={snapshot:#?}",
+                        llm.calls()
+                    );
+                }
+            };
+            assert!(
+                expected.contains(&event.worker_id),
+                "unexpected worker id {}",
+                event.worker_id
+            );
+            match &event.event.event {
+                SerializableAgentEvent::TextDelta { text } => {
+                    texts.entry(event.worker_id.clone()).or_default().push_str(text);
+                }
+                SerializableAgentEvent::Finished { .. } | SerializableAgentEvent::Exited => {
+                    finished.insert(event.worker_id.clone());
+                    if finished.len() == expected.len() {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(finished, expected, "both workers finish");
+        assert_eq!(llm.calls(), 2, "each worker made its own LLM call");
+        let mut text_values = texts.values().cloned().collect::<Vec<_>>();
+        text_values.sort();
+        assert_eq!(
+            text_values,
+            vec!["first worker done".to_string(), "second worker done".to_string()],
+            "each worker kept its own response"
+        );
+
+        let mut snapshot = team.snapshot().await;
+        for _ in 0..100 {
+            let ready = snapshot.workers.len() == 2
+                && snapshot.workers.iter().all(|worker| {
+                    worker.status == WorkerStatus::Completed
+                        && !worker.transcript.messages.is_empty()
+                });
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            snapshot = team.snapshot().await;
+        }
+        assert_eq!(snapshot.workers.len(), 2);
+        assert_eq!(snapshot.active, 2, "both worker sessions are live");
+        for worker in &snapshot.workers {
+            assert_eq!(worker.status, WorkerStatus::Completed, "{}", worker.id);
+            assert!(
+                !worker.transcript.messages.is_empty(),
+                "{} has its own transcript",
+                worker.id
+            );
+            assert!(worker.branch.starts_with("wt/agent-"), "{}", worker.branch);
+            assert!(worker.worktree.starts_with(root.path().join(".worktrees")));
+        }
+        assert_eq!(first.model, None);
+        assert_eq!(second.model, None);
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("the shared engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 2,
+            max_spawns_per_turn: 2,
+        })
+        .await
+        .expect("the team ledger reopens");
+        let recovered = reopened.snapshot().await;
+        assert_eq!(recovered.workers.len(), 2);
+        assert!(recovered
+            .workers
+            .iter()
+            .all(|worker| worker.status == WorkerStatus::Completed));
+
+        team.shutdown().await;
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_preserves_distinct_model_specs_on_dispatch() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_config(config.path(), &["scripted-a", "scripted-b"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("the lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("the shared engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 2,
+            max_spawns_per_turn: 2,
+        })
+        .await
+        .expect("the team opens");
+        let first = team
+            .dispatch(
+                "first task".to_string(),
+                Some("test/scripted-a".to_string()),
+            )
+            .await
+            .expect("the first worker dispatches");
+        let second = team
+            .dispatch(
+                "second task".to_string(),
+                Some("test/scripted-b".to_string()),
+            )
+            .await
+            .expect("the second worker dispatches");
+        assert_eq!(first.model.as_deref(), Some("test/scripted-a"));
+        assert_eq!(second.model.as_deref(), Some("test/scripted-b"));
+        assert_ne!(first.branch, second.branch);
+        assert_ne!(first.worktree, second.worktree);
+        let _ = team.stop(&first.id).await;
+        let _ = team.stop(&second.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn team_enforces_limits_and_resumes_a_stopped_worker() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]))),
+        )
+        .await
+        .expect("the lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("the shared engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+        })
+        .await
+        .expect("the team opens");
+
+        let first = team
+            .dispatch("first task".to_string(), None)
+            .await
+            .expect("the first worker dispatches");
+        let cap = team
+            .dispatch("second task".to_string(), None)
+            .await
+            .expect_err("the per-turn cap refuses the second delegation");
+        assert!(cap.contains("already delegated"), "{cap}");
+        team.begin_lead_turn();
+        let full = team
+            .dispatch("second task".to_string(), None)
+            .await
+            .expect_err("the slot cap refuses the second delegation");
+        assert!(full.contains("slots are busy"), "{full}");
+
+        let stopped = team.stop(&first.id).await.expect("stop");
+        assert_eq!(stopped.status, WorkerStatus::Stopped);
+        let resumed = team.resume(&first.id).await.expect("resume");
+        assert_eq!(resumed.status, WorkerStatus::Idle);
+        let _ = team.stop(&first.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
     }
 }

@@ -153,6 +153,13 @@ export interface Worker {
   merge?: MergeRecord;
 }
 
+/** The displayable result of one real tool call. */
+export interface LeadToolResult {
+  success: boolean;
+  output: string;
+  data?: unknown;
+}
+
 export type LeadEntry =
   | {
       id: string;
@@ -160,6 +167,20 @@ export type LeadEntry =
       time: string;
       author: "lead" | "user";
       body: string;
+    }
+  | {
+      id: string;
+      kind: "tool";
+      time: string;
+      toolCallId: string;
+      toolName: string;
+      /** The streamed JSON argument string, shown verbatim as text. */
+      arguments: string;
+      /** Live output kept from a running tool (tail-bounded by the reducer). */
+      liveOutput: string;
+      /** The provider's stream index, used to route argument fragments. */
+      streamIndex?: number;
+      result: LeadToolResult | null;
     }
   | {
       id: string;
@@ -242,12 +263,20 @@ export interface LeadPendingInteraction {
   [key: string]: unknown;
 }
 
+export interface LeadTranscriptToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
 export interface LeadTranscriptMessage {
   role: string;
   content: unknown;
-  tool_calls?: unknown[];
+  tool_calls?: LeadTranscriptToolCall[];
   tool_call_id?: string | null;
   name?: string | null;
+  /** Whether the tool message reports a failed call (absent on old history). */
+  tool_is_error?: boolean;
 }
 
 export interface LeadTranscript {
@@ -279,6 +308,14 @@ export interface LeadAgentEvent {
   tool_name?: string;
   tool_call_id?: string;
   call_id?: string;
+  id?: string;
+  name?: string;
+  request_id?: string;
+  index?: number;
+  fragment?: string;
+  args?: unknown;
+  stream?: string;
+  result?: { success?: boolean; output?: unknown; data?: unknown; [key: string]: unknown };
   question_id?: string;
   question?: string;
   options?: { label: string; description?: string | null }[];

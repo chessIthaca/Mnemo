@@ -1,24 +1,72 @@
+<script module lang="ts">
+  let markdownModule: Promise<typeof import("../lib/markdown")> | null = null;
+
+  function loadMarkdown(): Promise<typeof import("../lib/markdown")> {
+    markdownModule ??= import("../lib/markdown").catch((error) => {
+      markdownModule = null;
+      throw error;
+    });
+    return markdownModule;
+  }
+</script>
+
 <script lang="ts">
   import { onMount } from "svelte";
 
   let { source, onOpenLink }: { source: string; onOpenLink?: (url: string) => void } = $props();
   let html = $state("");
+  let hasRendered = $state(false);
   let container: HTMLDivElement;
   let renderVersion = 0;
+  let latestSource = "";
+  let fallbackSource = $state("");
+  let fallbackCaptured = false;
+  let frame: number | null = null;
+  let destroyed = false;
 
   onMount(() => {
     container.addEventListener("click", handleClick);
-    return () => container.removeEventListener("click", handleClick);
+    return () => {
+      container.removeEventListener("click", handleClick);
+      destroyed = true;
+      renderVersion += 1;
+      if (frame !== null) {
+        cancelAnimationFrame(frame);
+        frame = null;
+      }
+    };
   });
 
   $effect(() => {
-    const text = source;
-    const version = ++renderVersion;
-    html = "";
-    void import("../lib/markdown").then(({ renderMarkdown }) => {
-      if (version === renderVersion) html = renderMarkdown(text);
-    });
+    if (!fallbackCaptured) {
+      fallbackSource = source;
+      fallbackCaptured = true;
+    }
+    latestSource = source;
+    renderVersion += 1;
+    scheduleRender();
   });
+
+  function scheduleRender() {
+    if (destroyed || frame !== null) return;
+    frame = requestAnimationFrame(renderFrame);
+  }
+
+  function renderFrame() {
+    frame = null;
+    if (destroyed) return;
+    const version = renderVersion;
+    const text = latestSource;
+    void loadMarkdown()
+      .then(({ renderMarkdown }) => {
+        if (destroyed || version !== renderVersion) return;
+        html = renderMarkdown(text);
+        hasRendered = true;
+      })
+      .catch(() => {
+        // Keep the previous frame (or the initial source fallback) on failure.
+      });
+  }
 
   function handleClick(event: MouseEvent) {
     const origin = event.target instanceof Element ? event.target : null;
@@ -41,10 +89,10 @@
 </script>
 
 <div class="markdown" bind:this={container}>
-  {#if html}
+  {#if hasRendered}
     {@html html}
   {:else}
-    <p class="markdown-loading">{source}</p>
+    <p class="markdown-loading">{fallbackSource}</p>
   {/if}
 </div>
 

@@ -1,29 +1,71 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
   import { actions, app, currentProject } from "../lib/store";
   import Composer from "./Composer.svelte";
   import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
   import MergeCard from "./MergeCard.svelte";
+  import ToolActivity from "./ToolActivity.svelte";
+
+  const STICK_TO_BOTTOM_PX = 48;
 
   let scroller: HTMLDivElement;
+  let content: HTMLDivElement;
+  let nearBottom = true;
+  let scrollFrame: number | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+
   const leadModel = $derived(
     $app.leadRuntime.modelId ?? $currentProject?.leadModel ?? "unconfigured",
   );
 
-  $effect(() => {
-    const entryCount = $app.leadEntries.length;
-    if (scroller && entryCount > 0) scroller.scrollTop = scroller.scrollHeight;
+  onMount(() => {
+    if (typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(() => scheduleScroll());
+      if (content) resizeObserver.observe(content);
+    }
+    scheduleScroll();
+    return () => {
+      resizeObserver?.disconnect();
+      resizeObserver = null;
+      if (scrollFrame !== null) {
+        cancelAnimationFrame(scrollFrame);
+        scrollFrame = null;
+      }
+    };
   });
+
+  $effect(() => {
+    $app.leadEntries.length;
+    $app.leadRuntime.pending;
+    scheduleScroll();
+  });
+
+  function handleScroll() {
+    if (!scroller) return;
+    const distance = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    nearBottom = distance <= STICK_TO_BOTTOM_PX;
+  }
+
+  function scheduleScroll() {
+    if (!scroller || scrollFrame !== null) return;
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = null;
+      if (!scroller || !nearBottom) return;
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+  }
 </script>
 
 <section class="lead-workspace" aria-label="Lead conversation">
-  <div class="lead-scroll" bind:this={scroller}>
+  <div class="lead-scroll" bind:this={scroller} onscroll={handleScroll}>
     <div class="lead-content">
       <header class="lead-heading">
         <div class="lead-title"><span class="lead-mark">M</span><h1>Lead</h1><ModelBadge model={leadModel} role="lead" /></div>
       </header>
 
+      <div class="lead-stream" bind:this={content}>
       {#if $app.leadRuntime.status === "error" && $app.leadRuntime.error}
         <article class="lead-notice lead-error" role="alert">
           <p>{$app.leadRuntime.error}</p>
@@ -51,6 +93,9 @@
                 <button class="button button-quiet" disabled={!pending.question_id} onclick={() => pending.question_id && actions.answerLead(pending.question_id, { kind: "choice", index })}>{option.label}</button>
               {/each}
             </div>
+          {:else if pending.kind === "host_tool_call"}
+            <div class="notice-label">TEAM WORK IN PROGRESS</div>
+            <p>The team runtime is executing {pending.tool_name ?? "a host tool"}. No approval response is required.</p>
           {:else}
             <div class="notice-label">WAITING FOR YOU</div>
             <p>The lead needs input to continue.</p>
@@ -70,6 +115,8 @@
                 <div class="user-meta">YOU · {entry.time}</div>
               {/if}
             </article>
+          {:else if entry.kind === "tool"}
+            <ToolActivity {entry} />
           {:else if entry.kind === "team-message"}
             {@const worker = $app.workers.find((item) => item.id === entry.workerId)}
             <article class="team-card">
@@ -95,6 +142,7 @@
           {/if}
         {/each}
       </div>
+      </div>
     </div>
   </div>
   <footer class="composer-dock"><Composer /></footer>
@@ -104,6 +152,7 @@
   .lead-workspace { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; background: var(--canvas); }
   .lead-scroll { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
   .lead-content { width: min(100%, 860px); min-width: 0; margin: 0 auto; padding: 28px 40px 24px; }
+  .lead-stream { display: flow-root; min-width: 0; }
   .lead-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
   .lead-title { display: flex; align-items: center; gap: 9px; }
   .lead-heading h1 { margin: 0; font-family: var(--font-prose); font-size: 30px; font-weight: 500; letter-spacing: -0.03em; }

@@ -252,6 +252,17 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 - The merge card is a record with Review/Revert, not an approval prompt.
 - The lead chat shows spawn cards, team-message cards (escalations), review
   summaries, and merge records; worker tool logs stay in the worker thread.
+- The lead chat also shows the lead's own real tool calls as compact cards:
+  the JSON arguments, a bounded live output tail while the call runs, and the
+  final result or error. Live `SessionEvent` call starts/deltas/results and
+  persisted transcript tool calls both feed the same reducer; a host-tool call
+  renders as team work in progress, not as an approval decision, and no tool
+  activity is synthesized.
+- Markdown retains the last committed frame while the newest source is rendered
+  on one coalesced animation frame, so streaming never flashes an empty block.
+  The thread follows new content only while the user is within 48px of the
+  bottom; a user scroll-up is respected, and a `ResizeObserver` follows
+  asynchronous Markdown/content growth while sticky.
 
 ## 7. Start screen and project lifecycle
 

@@ -69,13 +69,14 @@
       </div>
     </div>
     <div class="worker-actions">
-      <button class="button button-quiet" onclick={() => actions.steerWorker(worker.id)}>Steer</button>
+      <button class="button button-quiet" onclick={() => actions.openWorkerDiff(worker.id)}>Diff</button>
+      <button class="button button-quiet" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>
       {#if worker.status === "working" || worker.status === "dispatching"}
         <button class="button button-quiet" onclick={() => actions.pauseWorker(worker.id)}><Pause size={11} /> Pause</button>
       {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
         <button class="button button-quiet" onclick={() => actions.resumeWorker(worker.id)}><Play size={11} /> Resume</button>
       {/if}
-      <button class="button button-quiet" disabled={["stopped", "merging", "merged"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
+      <button class="button button-quiet" disabled={["stopped", "merging", "merged", "cancelled"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
     </div>
   </header>
 
@@ -139,9 +140,19 @@
             </div>
           {/each}
         </div>
+        {#if worker.screenshots.length > 0}
+          <div class="screenshot-links" aria-label="Worker screenshots">
+            <span>SCREENSHOTS</span>
+            <div>
+              {#each worker.screenshots as path (path)}
+                <button class="button button-quiet" title={`Open ${path}`} onclick={() => actions.openScreenshot(worker.id, path)}>{path.split("/").pop()}</button>
+              {/each}
+            </div>
+          </div>
+        {/if}
         <div class="thread-composer">
-          <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`}></textarea>
-          <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim()} onclick={sendReply}><Send size={14} /></button>
+          <textarea bind:value={reply} onkeydown={replyKeydown} rows="2" aria-label={`Reply to ${worker.name}`} placeholder={`Message ${worker.name}`} disabled={worker.status === "cancelled"}></textarea>
+          <button class="icon-button" aria-label={`Send reply to ${worker.name}`} disabled={!reply.trim() || worker.status === "cancelled"} onclick={sendReply}><Send size={14} /></button>
         </div>
       </section>
     {:else}
@@ -170,9 +181,12 @@
   .worker-identity h3 { margin: 4px 0 0; color: var(--ink-soft); font-size: 10px; font-weight: 500; }
   .worker-title :global(.model-badge) { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
   .worker-heading :global(.task-workflow) { margin-top: 7px; max-width: 470px; }
-  .worker-actions { display: flex; gap: 7px; }
-  .file-areas code { margin-right: 4px; color: var(--ink-soft); font-family: var(--font-mono); font-size: 8px; }
-  .file-areas span { padding: 4px 6px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: 7px; }
+  .worker-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+  .file-areas { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+  .file-areas code { min-width: 0; color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; overflow-wrap: anywhere; }
+  .file-areas span { padding: 4px 6px; border-radius: 5px; background: var(--surface-soft); font-family: var(--font-mono); font-size: 9px; }
+  .checks-heading { flex-wrap: wrap; }
+  .checks-heading code { flex: 1 1 160px; min-width: 0; font-size: 9px; white-space: normal; overflow-wrap: anywhere; }
   .detail-tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); }
   .detail-tabs button { display: inline-flex; align-items: center; gap: 5px; padding: 0 0 10px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); cursor: pointer; font-size: 10px; font-weight: 600; }
   .detail-tabs button.active { border-color: var(--accent); color: var(--ink); }
@@ -202,6 +216,9 @@
   .thread-message.from-lead { margin-left: auto; }
   .thread-message.from-lead > span { display: block; text-align: right; }
   .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
+  .screenshot-links { display: grid; gap: 7px; margin-top: 16px; }
+  .screenshot-links > span { color: var(--muted); font-size: 8px; letter-spacing: 0.08em; }
+  .screenshot-links > div { display: flex; flex-wrap: wrap; gap: 6px; }
   .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
   .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: 10px; }
   .timeline-step { display: grid; grid-template-columns: 20px 1fr; gap: 8px; min-height: 76px; }

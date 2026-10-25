@@ -18,8 +18,8 @@ use std::sync::Arc;
 use mnemo::app::policy_factory::WorkflowPolicyFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::headless::{
-    AgentSession, Engine, EngineOptions, EventReceiver, MemoryBackend, PendingInteraction,
-    SessionCommand, SessionEvent, SessionId, SpawnOptions, Transcript,
+    AgentPlan, AgentSession, Engine, EngineOptions, EventReceiver, MemoryBackend,
+    PendingInteraction, SessionCommand, SessionEvent, SessionId, SpawnOptions, Transcript,
 };
 use mnemo::provider::LlmClient;
 use mnemo::tool::ToolResult;
@@ -29,9 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::mnemo2::team::{
-    TeamRuntime, TeamRuntimeOptions, DEFAULT_SLOTS, DEFAULT_SPAWNS_PER_TURN,
-};
+use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, DEFAULT_SPAWNS_PER_TURN};
 
 /// The Tauri event channel name used by the IPC layer.
 pub const LEAD_EVENT_CHANNEL: &str = "mnemo2://lead-event";
@@ -85,6 +83,8 @@ pub struct LeadSnapshot {
     pub default_model: Option<String>,
     /// The conversation so far.
     pub transcript: Transcript,
+    /// This lead session's active plan, if it has one.
+    pub plan: Option<AgentPlan>,
     /// Approximate prompt-token usage.
     pub used_tokens: u32,
     /// The context window.
@@ -104,46 +104,57 @@ pub struct LeadEvent {
     pub event: SessionEvent,
 }
 
-/// A saved lead conversation, restored on the next launch.
+/// A saved lead conversation, restored only for the same canonical project.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedLead {
     model: Option<String>,
     transcript: Transcript,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    updated_at_ms: u128,
 }
 
-/// The small, atomic-ish state file for the lead transcript.
+/// The backup-recoverable, project-scoped lead transcript store.
 #[derive(Clone, Debug)]
 struct LeadPersistence {
     path: PathBuf,
+    workspace_root: String,
 }
 
 impl LeadPersistence {
-    fn new(state_dir: &Path) -> Self {
+    fn new(state_dir: &Path, workspace_root: &Path) -> Self {
+        let identity = std::fs::canonicalize(workspace_root)
+            .unwrap_or_else(|_| workspace_root.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
         Self {
             path: state_dir.join(LEAD_STATE_FILE),
+            workspace_root: identity,
         }
     }
 
-    fn load(&self) -> Option<PersistedLead> {
-        let bytes = std::fs::read(&self.path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+    fn load(&self) -> Result<PersistedLead, String> {
+        let Some(lead) = crate::mnemo2::project::read_json::<PersistedLead>(&self.path)? else {
+            return Ok(PersistedLead::default());
+        };
+        if lead.workspace_root.as_deref() != Some(self.workspace_root.as_str()) {
+            return Err(
+                "saved lead state belongs to another project or lacks a project identity"
+                    .to_string(),
+            );
+        }
+        Ok(lead)
     }
 
-    fn save(&self, lead: &PersistedLead) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("could not create Mnemo2 state dir: {err}"))?;
-        }
-        let bytes = serde_json::to_vec_pretty(lead)
-            .map_err(|err| format!("could not encode the lead transcript: {err}"))?;
-        let temp = self.path.with_extension("json.tmp");
-        std::fs::write(&temp, bytes)
-            .map_err(|err| format!("could not write the lead transcript: {err}"))?;
-        if self.path.exists() {
-            let _ = std::fs::remove_file(&self.path);
-        }
-        std::fs::rename(&temp, &self.path)
-            .map_err(|err| format!("could not replace the lead transcript: {err}"))
+    fn save(&self, model: Option<String>, transcript: Transcript) -> Result<(), String> {
+        let lead = PersistedLead {
+            model,
+            transcript,
+            workspace_root: Some(self.workspace_root.clone()),
+            updated_at_ms: crate::mnemo2::phase3::now_ms(),
+        };
+        crate::mnemo2::project::write_json(&self.path, &lead)
     }
 }
 
@@ -204,8 +215,8 @@ impl LeadRuntime {
         }
         let config_dir = mnemo::config::resolve_config_dir(options.config_dir.clone());
         let (models, configured_default) = load_models(&config_dir)?;
-        let persistence = LeadPersistence::new(&options.state_dir);
-        let persisted = persistence.load().unwrap_or_default();
+        let persistence = LeadPersistence::new(&options.state_dir, &options.workspace_root);
+        let persisted = persistence.load()?;
         let persisted_model = persisted
             .model
             .clone()
@@ -242,7 +253,7 @@ impl LeadRuntime {
             engine: runtime.engine_handle().await?,
             workspace_root: runtime.workspace_root.clone(),
             state_dir: runtime.state_dir.clone(),
-            slots: DEFAULT_SLOTS,
+            slots: None,
             max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
             pricing: runtime.pricing()?,
         })
@@ -332,6 +343,11 @@ impl LeadRuntime {
             models: self.models.clone(),
             default_model: self.default_model.clone(),
             transcript: snapshot.transcript,
+            plan: live
+                .session
+                .plan()
+                .await
+                .map_err(|err| format!("could not read the lead plan: {err}"))?,
             used_tokens: snapshot.used_tokens,
             max_tokens: snapshot.max_tokens,
             pending: snapshot.pending,
@@ -454,10 +470,10 @@ impl LeadRuntime {
                 return Err(err);
             }
         };
-        if let Err(err) = self.persistence.save(&PersistedLead {
-            model: Some(spec),
-            transcript: snapshot.transcript,
-        }) {
+        if let Err(err) = self
+            .persistence
+            .save(Some(spec), snapshot.transcript)
+        {
             live.abort();
             let _ = live.session.send(SessionCommand::Interrupt).await;
             *self.live.lock().await = Some(old);
@@ -687,10 +703,7 @@ async fn pump_events(
                 if let Some(handle) = handle {
                     if let Ok(history) = handle.history().await {
                         let model = model.lock().await.clone();
-                        let _ = persistence.save(&PersistedLead {
-                            model,
-                            transcript: history,
-                        });
+                        let _ = persistence.save(model, history);
                     }
                 }
             });
@@ -959,7 +972,7 @@ mod tests {
                 engine: lead.engine_handle().await.expect("engine"),
                 workspace_root: root.path().to_path_buf(),
                 state_dir: state.path().to_path_buf(),
-                slots: 1,
+                slots: Some(1),
                 max_spawns_per_turn: 1,
                 pricing,
             })
@@ -1351,7 +1364,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 2,
+            slots: Some(2),
             max_spawns_per_turn: 2,
             pricing: Vec::new(),
         })
@@ -1448,7 +1461,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 2,
+            slots: Some(2),
             max_spawns_per_turn: 2,
             pricing: Vec::new(),
         })
@@ -1485,7 +1498,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 2,
+            slots: Some(2),
             max_spawns_per_turn: 2,
             pricing: Vec::new(),
         })
@@ -1534,7 +1547,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -1584,7 +1597,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -1622,7 +1635,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -1639,7 +1652,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -1678,7 +1691,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -1796,7 +1809,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2011,7 +2024,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2069,7 +2082,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2122,7 +2135,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2269,7 +2282,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2306,7 +2319,7 @@ mod tests {
             engine: lead.engine_handle().await.expect("the shared engine"),
             workspace_root: root.path().to_path_buf(),
             state_dir: state.path().to_path_buf(),
-            slots: 1,
+            slots: Some(1),
             max_spawns_per_turn: 1,
             pricing: Vec::new(),
         })
@@ -2332,6 +2345,80 @@ mod tests {
             "the host-tool result drove a follow-up turn"
         );
         let _ = team.stop(&worker.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[test]
+    fn lead_state_rejects_a_different_project_identity() {
+        let first = tempfile::tempdir().expect("first project");
+        let second = tempfile::tempdir().expect("second project");
+        let state = tempfile::tempdir().expect("state");
+        LeadPersistence::new(state.path(), first.path())
+            .save(Some("test/model".to_string()), Transcript::default())
+            .expect("save lead");
+        assert!(LeadPersistence::new(state.path(), second.path()).load().is_err());
+    }
+
+    #[tokio::test]
+    async fn slots_restore_from_the_ledger_without_an_explicit_override() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
+        team.set_slots(5).await.expect("set slots");
+        assert_eq!(team.snapshot().await.slots, 5);
+        team.shutdown().await;
+        let restored = crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: None,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("restore slots");
+        assert_eq!(restored.snapshot().await.slots, 5);
+        restored.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cleaned_branch_can_be_reviewed_but_not_merged() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])])),
+        )
+        .await;
+        let worker = team.dispatch("small retained task".to_string(), None).await.expect("dispatch");
+        commit_worker_file(&worker, "retained.txt", "retained work\n", "retained change");
+        let worker_tip = crate::mnemo2::phase3::tip(&worker.worktree).await.expect("worker tip");
+        team.stop(&worker.id).await.expect("stop worker");
+        let report = team.cleanup()
+            .await
+            .expect("clean checkout");
+        assert!(!worker.worktree.exists(), "cleanup did not remove the checkout: {report:?}");
+        let reviewed = team
+            .review(&worker.id, "reviewed retained branch".to_string(), Vec::new())
+            .await
+            .expect("review retained branch");
+        assert_eq!(reviewed.status, crate::mnemo2::team::WorkerStatus::Cancelled);
+        assert_eq!(reviewed.review.as_ref().expect("review").tip, worker_tip);
+        let checked = team
+            .record_check(&worker.id, "workspace tests".to_string(), "passed".to_string(), None)
+            .await
+            .expect("check retained branch");
+        assert_eq!(checked.status, crate::mnemo2::team::WorkerStatus::Cancelled);
+        assert_eq!(checked.checks[0].tip, worker_tip);
+        let lead_tip = crate::mnemo2::phase3::tip(root.path()).await.expect("lead tip");
+        assert!(team.merge(&worker.id).await.is_err());
+        assert_eq!(crate::mnemo2::phase3::tip(root.path()).await.expect("unchanged lead"), lead_tip);
         team.shutdown().await;
         lead.shutdown().await;
     }

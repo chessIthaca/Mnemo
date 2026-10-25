@@ -18,6 +18,18 @@ vi.mock("./teamEngine", () => ({
 vi.mock("./leadEngine", () => ({
   createLeadTransport: () => null,
 }));
+vi.mock("./projectEngine", () => ({
+  createProjectTransport: () => ({
+    attach: async () => ({ conflict_pid: null, conflict_started_at: null }),
+    preferences: async () => ({
+      workbench_open: false,
+      workbench_tab: "browser",
+      workbench_width: 480,
+      browser_url: "about:blank",
+      diff_worker_id: null,
+    }),
+  }),
+}));
 vi.mock("./runtime", () => ({
   isTauriRuntime: () => true,
   probeMnemo2Host: async () => true,
@@ -123,6 +135,7 @@ function makeTransport(initial: TeamWorkerRecord) {
       return current;
     }),
     stopAll: vi.fn(async () => {}),
+    setSlots: vi.fn(async () => ({ workers: [current], slots: 3, active: 1 })),
     setTokenBudget: vi.fn(async (_workerId, tokenBudget) => {
       current = { ...current, token_budget: tokenBudget };
       return current;

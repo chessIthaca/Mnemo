@@ -20,11 +20,11 @@ use mnemo::tool::agent::sandbox::Sandbox;
 use tauri::{Emitter, Manager, PhysicalPosition, WebviewBuilder, WebviewUrl, WindowBuilder};
 
 mod console;
-mod instance_marker;
 mod ipc;
 mod startup;
 mod watchdog;
-mod webview_udf;
+
+use mnemo_app::{instance_marker, webview_udf};
 
 use ipc::IpcState;
 use ipc::PendingApprovals;

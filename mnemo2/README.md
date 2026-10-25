@@ -56,11 +56,13 @@ feature-enabled Mnemo2 lib tests.
   generations.
 - **Commands.** `lead_open`, `lead_snapshot`, `lead_prompt`, `lead_interrupt`,
   `lead_set_model`, `lead_approve`, `lead_answer`, `lead_close`.
-- **State.** The app-owned state lives under the Tauri app-data directory for
-  `com.mnemo.mnemo2`: `lead/lead.json` holds the model spec and transcript;
-  `lead/workspace/` is the engine workspace state. It is not a tracked project
-  file. Endpoints and models come from the normal Mnemo config directory
-  (`$MNEMO_HOME` or `~/.mnemo`).
+- **State.** App-owned state lives under the Tauri app-data directory for
+  `com.mnemo.mnemo2`, in `projects/<sha256-of-canonical-project-path>/`.
+  `lead.json` holds the model spec, project identity, transcript, and save time;
+  `team.json` holds the worker ledger and live-session cap; `preferences.json`
+  holds workbench preferences. `workspace/` contains the per-session plan
+  directory. These are not tracked project files. Endpoints and models come
+  from the normal Mnemo config directory (`$MNEMO_HOME` or `~/.mnemo`).
 - **Models.** The picker lists the configured `endpoints.toml` model specs for
   the selected project. The lead header, composer, and project settings show
   the actual serving model id reported by the session. A model change is allowed
@@ -94,13 +96,46 @@ feature-enabled Mnemo2 lib tests.
   `team_interrupt`, `team_stop`, `team_resume`, `team_review`,
   `team_record_check`, `team_resolve_finding`, `team_review_fix`,
   `team_route_fix`, `team_merge`, `team_revert_merge`, `team_stop_all`,
-  `team_set_token_budget`, and `team_messages`.
+  `team_set_slots`, `team_set_token_budget`, and `team_messages`.
 - **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
   `team_review`, `team_check`, `team_resolve_finding`, `review_fix`,
   `team_route_fix`, `team_merge`, and `team_revert_merge`. Generic `spawn_agent`
   is removed from the advertised lead registry and denied as a fallback. Workers
   get `message_parent`, whose messages land in the lead conversation.
-- **State.** `team.json` in the app-data dir is the worker ledger.
+- **State.** `team.json` in the project's app-owned state directory is the
+  worker ledger and stores the live-worker cap across restarts.
+
+## Native workbench and project lifecycle
+
+- **Diff** reads the selected worker's real Git delta, including working-tree
+  and untracked changes. Merged workers use the recorded merge parent and
+  reviewed tip; cleaned branches remain reviewable. Binary, sensitive, and
+  truncated content is explicitly labelled. Worker-to-Diff navigation uses the
+  same selected worker, never a hardcoded branch.
+- **Plan** shows the active lead plan's real title, goal, and checklist from the
+  current session's plans directory. It does not read a global plan stack or
+  invent worker assignments.
+- **Browser** is a native WebView2 child on Windows, with address navigation,
+  real back/forward/reload, URL/title synchronization, and modal/resize
+  visibility handling. There is no iframe or CDP browser path. Other platforms
+  offer an external-open fallback. Worker screenshot chips open actual sandbox
+  PNG previews, and chat links open the Browser pane.
+- **Persistence** isolates state by a hash of the canonical project path.
+  Transcripts carry project identity and timestamps; worker slots and
+  workbench preferences survive restart with backup recovery. The older shared
+  `lead/` directory is left untouched. Its records have no project identity,
+  so ambiguous legacy state is not automatically assigned to another project.
+- **Lifecycle** includes real Git/session metadata, New project, Resume,
+  Review, and Clean. Opening a second live instance on one project requires
+  confirmation. Closing active work asks before stopping it. Cleanup removes
+  only explicitly confirmed inactive clean worktrees; branches and dirty or
+  conflicting work remain available for review. Cleaned workers are review-only.
+- **Notifications** use the official Tauri notification plugin for real worker
+  completion, review/input requests, failures, and conflicts when unfocused.
+  Duplicate transitions are suppressed, and nothing is emitted from fixtures.
+- **Accessibility** includes modal focus management, keyboard resizing,
+  readable small text, narrow-layout spacing, and a full-height workbench
+  overlay with a back button.
 
 ## Tour
 
@@ -141,7 +176,7 @@ feature-enabled Mnemo2 lib tests.
 - The lead is the reviewer of record. An independent reviewer is never a
   substitute PASS gate.
 
-## What is real vs. later phases
+## What is real
 
 - **Real (native lead):** streaming, model identity and picker, cancellation,
   transcript persistence/restore, and approvals/questions.
@@ -168,8 +203,11 @@ feature-enabled Mnemo2 lib tests.
   verified clean; a completed merge is recovered only when its second parent
   proves the reviewed worker tip. Stale `MERGE_HEAD` state is cleared only after
   a clean-tree check. Ambiguous recovery routes back for inspection.
-- **Browser tab.** Still a labelled stand-in; the native WebView2 pane is
-  Phase 4. Do not launch a separate Chrome/WebView instance for UI checks.
+- **Native workbench and lifecycle:** actual lead plans, worker Git deltas,
+  a native WebView2 Browser with real navigation/title events, sandboxed image
+  previews, per-project state and preferences, guarded cleanup, instance
+  warnings, close confirmation, and real worker notifications. No stand-in
+  browser, plan, project, worker, or merge-success path remains.
 
 ## Layout notes
 
@@ -182,10 +220,11 @@ feature-enabled Mnemo2 lib tests.
 - Every lead/worker surface shows a model badge; native lead surfaces use the
   real configured model picker.
 - Workbench lives beside the lead chat only; opening Mission Control hides it,
-  mirroring the native-webview overlay rule.
+  mirroring the native-webview overlay rule. On narrow layouts it becomes a
+  full-height overlay, with bottom navigation space reserved.
 - The team peek is anchored over the chat side.
 
-## Next phases
+## Roadmap status
 
 See `.coding/design/mnemo2.md` for the full design and acceptance criteria:
 
@@ -196,6 +235,7 @@ See `.coding/design/mnemo2.md` for the full design and acceptance criteria:
 3. **Review, merge, recovery, cost** — complete: durable findings, tiny-work
    fixes, tracked fixer routing, exact-tip checks, serialized local merge/revert,
    conflict and crash recovery, cumulative token budgets, and pricing-aware cost.
-4. **Native shell + workbench + persistence** — remaining: native WebView2 browser pane,
-   sessions that survive restart, accessibility and narrow layouts. (The project
-   registry/`projects.toml` and the folder picker landed early, in Phase 2.)
+4. **Native shell + workbench + persistence** — complete: real Diff/Plan tabs,
+   native browser, isolated per-project state and preferences, safe recovery,
+   notifications, accessibility, and narrow layouts. Remaining product choices
+   are recorded in the design's open-decisions section.

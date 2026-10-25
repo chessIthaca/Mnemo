@@ -1,0 +1,16 @@
+{
+  "$schema": "../../gen/schemas/desktop-schema.json",
+  "identifier": "mnemo2",
+  "description": "Mnemo2's native shell, folder picker, and worker notifications",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "dialog:default",
+    "notification:default",
+    "core:window:allow-set-title",
+    "core:window:allow-set-badge-count"
+  ]
+}

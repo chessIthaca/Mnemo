@@ -37,5 +37,6 @@
   .workspace-shell { display: flex; height: 100vh; height: 100dvh; min-height: 0; flex-direction: column; }
   .workspace-main { display: flex; flex: 1; min-height: 0; }
   .lead-column { position: relative; display: flex; flex: 1; min-width: 0; min-height: 0; }
+  @media (max-width: 760px) { .workspace-main { padding-bottom: 64px; } }
 </style>
 

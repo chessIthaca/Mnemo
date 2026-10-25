@@ -298,6 +298,19 @@ pub struct Transcript {
     pub messages: Vec<crate::provider::Message>,
 }
 
+/// The active plan of record for one session, read from its own plans directory.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentPlan {
+    /// The active plan frame's identifier.
+    pub id: String,
+    /// The plan's display title.
+    pub title: String,
+    /// The plan's goal.
+    pub goal: String,
+    /// The actual checklist steps, including completion state.
+    pub steps: Vec<crate::memory::plan_format::Step>,
+}
+
 /// A session's snapshot (§5.9.5): the transcript + the model + the
 /// context usage + the pending interaction. The turn stats land with
 /// 3b's spend accounting.

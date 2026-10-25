@@ -73,8 +73,11 @@ export interface Project {
   description: string;
   lastSession: string;
   workerSlots: number;
-  budgetSpent: number;
-  budgetLimit: number;
+  available?: boolean;
+  unfinishedWorkers?: number;
+  reviewWorkers?: number;
+  budgetSpent?: number;
+  budgetLimit?: number;
 }
 
 export interface Check {
@@ -159,6 +162,7 @@ export interface Worker {
   findings: Finding[];
   review?: ReviewRecord;
   messages: WorkerMessage[];
+  screenshots: string[];
   timeline: TimelineStep[];
   diff: DiffStats;
   merge?: MergeRecord;
@@ -235,13 +239,33 @@ export interface PlanItem {
 export interface DiffLine {
   type: "add" | "remove" | "context" | "hunk";
   text: string;
+  old_line?: number | null;
+  new_line?: number | null;
 }
 
 export interface DiffFile {
   path: string;
+  old_path?: string | null;
   additions: number;
   deletions: number;
   lines: DiffLine[];
+  binary?: boolean;
+  truncated?: boolean;
+  sensitive?: boolean;
+}
+
+/** A real Git delta, including totals for content outside the bounded preview. */
+export interface DiffSnapshot {
+  worker_id: string;
+  branch: string;
+  target: string;
+  base: string;
+  tip: string;
+  files: DiffFile[];
+  total_files: number;
+  total_additions: number;
+  total_deletions: number;
+  truncated: boolean;
 }
 
 export interface ToastMessage {
@@ -294,6 +318,21 @@ export interface LeadTranscript {
   messages: LeadTranscriptMessage[];
 }
 
+export interface LeadPlanStep {
+  index: number;
+  text: string;
+  header?: string | null;
+  done: boolean;
+}
+
+/** The active plan from this lead session's own plans directory. */
+export interface LeadPlan {
+  id: string;
+  title: string;
+  goal: string;
+  steps: LeadPlanStep[];
+}
+
 /** The lead state returned by `lead_open`, `lead_snapshot`, and `lead_set_model`. */
 export interface LeadSnapshot {
   generation: number;
@@ -302,6 +341,7 @@ export interface LeadSnapshot {
   models: LeadModel[];
   default_model: string | null;
   transcript: LeadTranscript;
+  plan?: LeadPlan | null;
   used_tokens: number;
   max_tokens: number;
   pending: LeadPendingInteraction | null;
@@ -365,6 +405,12 @@ export interface LeadRuntimeInfo {
   streamingEntryId: string | null;
 }
 
+export interface ProjectConflict {
+  projectId: string;
+  pid: number;
+  startedAt: number | null;
+}
+
 export interface AppState {
   route: Route;
   projectId: string | null;
@@ -383,7 +429,23 @@ export interface AppState {
   workbenchTab: WorkbenchTab;
   workbenchWidth: number;
   browserUrl: string;
+  browserTitle: string;
+  browserLoading: boolean;
+  browserSupported: boolean | null;
+  browserError: string | null;
+  browserImage: { dataUrl: string; label: string } | null;
+  plan: LeadPlan | null;
   planItems: PlanItem[];
+  diff: DiffSnapshot | null;
   diffFiles: DiffFile[];
+  diffWorkerId: string | null;
+  diffLoading: boolean;
+  diffError: string | null;
+  projectConflict: ProjectConflict | null;
+  cleanupProjectId: string | null;
+  cleanupBusy: boolean;
+  closeProjectPending: boolean;
+  newProjectParent: string | null;
+  creatingProject: boolean;
   toast: ToastMessage | null;
 }

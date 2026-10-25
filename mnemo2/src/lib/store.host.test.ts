@@ -37,6 +37,14 @@ vi.mock("./projectEngine", () => ({
       }
       return "C:/picked";
     },
+    attach: async () => ({ conflict_pid: null, conflict_started_at: null }),
+    preferences: async () => ({
+      workbench_open: false,
+      workbench_tab: "browser",
+      workbench_width: 480,
+      browser_url: "about:blank",
+      diff_worker_id: null,
+    }),
   }),
 }));
 
@@ -95,12 +103,12 @@ describe("project and team commands need the Mnemo2 host, not just any Tauri Web
     await actions.loadProjects();
 
     host.handshake = false;
-    actions.openProject("C:/picked");
+    await actions.openProject("C:/picked");
     await settle();
     expect(host.teamSubscriptions).toBe(0);
 
     host.handshake = true;
-    actions.openProject("C:/picked");
+    await actions.openProject("C:/picked");
     await settle();
     expect(host.teamSubscriptions).toBe(1);
   });

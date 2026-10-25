@@ -16,9 +16,9 @@ describe("Mnemo2 store production state", () => {
     expect(initial.selectedWorkerId).toBeNull();
   });
 
-  it("never fabricates a lead reply without the native shell", () => {
+  it("never fabricates a lead reply without the native shell", async () => {
     app.set(fixtureState());
-    actions.openProject("mnemo");
+    await actions.openProject("mnemo");
     const before = state().leadEntries.length;
     actions.sendLeadMessage("Keep the review flow quiet and explicit.");
     expect(state().leadEntries).toHaveLength(before + 1);
@@ -36,7 +36,7 @@ describe("Mnemo2 store production state", () => {
 
   it("requires the native runtime for every Phase 3 action without simulating success", async () => {
     app.set(fixtureState());
-    actions.openProject("mnemo");
+    await actions.openProject("mnemo");
     const before = state().workers.map((worker) => worker.status);
 
     await actions.reviewWorker("ana", "review", []);
@@ -55,9 +55,9 @@ describe("Mnemo2 store production state", () => {
     expect("completeFixer" in actions).toBe(false);
   });
 
-  it("keeps the conversation-first navigation", () => {
+  it("keeps the conversation-first navigation", async () => {
     app.set(fixtureState());
-    actions.openProject("mnemo");
+    await actions.openProject("mnemo");
     actions.openWorkbench("diff");
     actions.openTeam();
     expect(state().route).toBe("team");
@@ -65,10 +65,10 @@ describe("Mnemo2 store production state", () => {
     expect(state().leadEntries).toEqual([]);
   });
 
-  it("closes a project back to the empty start route", () => {
+  it("closes a project back to the empty start route", async () => {
     app.set(fixtureState());
-    actions.openProject("mnemo");
-    actions.closeProject();
+    await actions.openProject("mnemo");
+    await actions.closeProject();
     expect(state().route).toBe("start");
     expect(state().projectId).toBeNull();
     expect(state().workers).toEqual([]);

@@ -53,6 +53,9 @@ export function isLeadTinyEdit(scope: LeadEditScope): boolean {
 
 /** Check the durable review and exact-tip evidence required before merge. */
 export function canMerge(worker: Worker): MergeEligibility {
+  if (worker.status === "cancelled") {
+    return { ok: false, reason: "Checkout was cleaned; the retained branch is review-only." };
+  }
   if (worker.status === "merged") return { ok: false, reason: "Already merged." };
   if (worker.status !== "in_review") {
     return { ok: false, reason: `Worker is ${worker.status.replace("_", " ")}.` };

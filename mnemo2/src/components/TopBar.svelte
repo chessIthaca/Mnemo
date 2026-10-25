@@ -37,7 +37,7 @@
     <span class="brand-mark">M</span>
     <button class="project-switch" onclick={actions.closeProject} title="Return to recent projects">
       <strong>{$currentProject?.name ?? "Mnemo2"}</strong>
-      <span>{$currentProject?.branch ?? "No project"}</span>
+      <span>{$currentProject ? ($currentProject.branch || "Not a Git checkout") : "No project"}</span>
       <ChevronDown size={12} />
     </button>
   </div>
@@ -69,16 +69,23 @@
 </header>
 
 <Sheet open={settingsOpen} title="Project settings" eyebrow="PER-PROJECT" onclose={() => (settingsOpen = false)}>
-  <p class="settings-copy">Worker concurrency is a per-project setting. Budget and rate limits are separate concerns; the board is designed for larger teams as well as a solo lead.</p>
+  <p class="settings-copy">Worker slots persist per project. Token budgets and live sessions remain separate.</p>
   <div class="settings-row">
     <div><strong>Worker slots</strong><small>Maximum concurrent workers for this project.</small></div>
-    <input aria-label="Project worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
+    <input aria-label="Project worker slots" type="number" min="1" max="32" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
   </div>
-          <div class="settings-row"><div><strong>Lead model</strong><small>Planning and review</small></div><LeadModelPicker compact /></div>
-          <div class="settings-row"><div><strong>Team default</strong><small>Per-task overrides</small></div><span class="settings-value">glm-5.3-flash</span></div>
+  <div class="settings-row"><div><strong>Lead model</strong><small>Planning and review</small></div><LeadModelPicker compact /></div>
   <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
   <div class="settings-actions">
     <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
+  </div>
+</Sheet>
+
+<Sheet open={$app.closeProjectPending} title="Close project and stop the team?" eyebrow="ACTIVE SESSIONS" onclose={actions.cancelCloseProject}>
+  <p class="settings-copy">The lead and any live workers will stop. Branches, worktrees, and transcripts remain available for review.</p>
+  <div class="settings-actions">
+    <button class="button button-quiet" onclick={actions.cancelCloseProject}>Keep working</button>
+    <button class="button button-primary" onclick={actions.confirmCloseProject}>Stop and close</button>
   </div>
 </Sheet>
 

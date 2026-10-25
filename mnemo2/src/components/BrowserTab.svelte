@@ -1,122 +1,165 @@
 <script lang="ts">
-  import { ArrowLeft, ArrowRight, Globe, Lock, RotateCw, ShieldCheck } from "@lucide/svelte";
-  import { actions, app, currentProject } from "../lib/store";
+  import { ArrowLeft, ArrowRight, ExternalLink, Globe, RotateCw, X } from "@lucide/svelte";
+  import { onMount } from "svelte";
+  import { actions, app } from "../lib/store";
 
+  let { obscured = false }: { obscured?: boolean } = $props();
+  let surface = $state<HTMLDivElement | null>(null);
   let address = $state("");
+  let lastBrowserUrl = "";
+  let lastVisibilityKey = "";
+  let frame: number | null = null;
+
+  const hasPage = $derived(/^https?:\/\//i.test($app.browserUrl));
+  const nativeVisible = $derived(
+    !obscured &&
+      $app.browserSupported === true &&
+      hasPage &&
+      !$app.browserImage &&
+      $app.workbenchOpen &&
+      $app.workbenchTab === "browser",
+  );
 
   $effect(() => {
-    address = $app.browserUrl;
+    const url = $app.browserUrl;
+    if (url !== lastBrowserUrl) {
+      lastBrowserUrl = url;
+      address = url;
+    }
   });
 
-  const isLocal = $derived(
-    /^https?:\/\/(localhost|127\.0\.0\.1):5180/i.test($app.browserUrl),
-  );
+  $effect(() => {
+    const key = `${$app.browserSupported}|${nativeVisible}|${$app.browserUrl}`;
+    if (key === lastVisibilityKey) return;
+    lastVisibilityKey = key;
+    const visible = nativeVisible;
+    if ($app.browserSupported === true) void actions.setBrowserVisible(visible);
+    if (visible) void ensurePane();
+  });
+
+  onMount(() => {
+    let active = true;
+    void actions.connectBrowser().then((transport) => {
+      if (!active) return;
+      if (!transport) {
+        app.update((state) => ({
+          ...state,
+          browserSupported: false,
+          browserError: "The native Mnemo2 shell is required for embedded browsing.",
+        }));
+        return;
+      }
+    });
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleRect);
+    if (surface) observer?.observe(surface);
+    window.addEventListener("resize", scheduleRect);
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener("resize", scheduleRect);
+      if (frame !== null) cancelAnimationFrame(frame);
+      void actions.setBrowserVisible(false);
+    };
+  });
+
+  function scheduleRect() {
+    if (frame !== null) return;
+    frame = requestAnimationFrame(() => {
+      frame = null;
+      if (!surface || !nativeVisible) return;
+      const bounds = surface.getBoundingClientRect();
+      if (bounds.width < 1 || bounds.height < 1) return;
+      const scale = window.devicePixelRatio || 1;
+      void actions.setBrowserRect({
+        x: Math.round(bounds.x * scale),
+        y: Math.round(bounds.y * scale),
+        width: Math.max(1, Math.round(bounds.width * scale)),
+        height: Math.max(1, Math.round(bounds.height * scale)),
+      });
+    });
+  }
+
+  async function ensurePane(): Promise<void> {
+    if (!surface || !nativeVisible) return;
+    const bounds = surface.getBoundingClientRect();
+    if (bounds.width < 1 || bounds.height < 1) return;
+    const scale = window.devicePixelRatio || 1;
+    await actions.ensureBrowser({
+      x: Math.round(bounds.x * scale),
+      y: Math.round(bounds.y * scale),
+      width: Math.max(1, Math.round(bounds.width * scale)),
+      height: Math.max(1, Math.round(bounds.height * scale)),
+    }, $app.browserUrl);
+  }
 
   function navigate(event: SubmitEvent) {
     event.preventDefault();
-    actions.navigateBrowser(address);
-  }
-
-  function setSlots(event: Event) {
-    actions.setWorkerSlots(Number((event.currentTarget as HTMLInputElement).value));
+    void actions.navigateBrowser(address);
   }
 </script>
 
-<section class="browser-tab" aria-label="Mock browser">
+<section class="browser-tab" aria-label="Browser">
   <div class="browser-chrome">
     <div class="chrome-buttons">
-      <button class="chrome-button" aria-label="Back" title="Mock history · Phase 0" disabled><ArrowLeft size={13} /></button>
-      <button class="chrome-button" aria-label="Forward" title="Mock history · Phase 0" disabled><ArrowRight size={13} /></button>
-      <button class="chrome-button" aria-label="Reload" title="Mock reload · Phase 0" disabled><RotateCw size={12} /></button>
+      <button class="chrome-button" aria-label="Back" title="Back" disabled={!hasPage} onclick={actions.browserBack}><ArrowLeft size={14} /></button>
+      <button class="chrome-button" aria-label="Forward" title="Forward" disabled={!hasPage} onclick={actions.browserForward}><ArrowRight size={14} /></button>
+      <button class="chrome-button" aria-label="Reload" title="Reload" disabled={!hasPage} onclick={actions.browserReload}><RotateCw size={13} /></button>
     </div>
     <form class="address-form" onsubmit={navigate}>
-      <span class="address-lock">{#if isLocal}<Lock size={11} />{:else}<Globe size={11} />{/if}</span>
-      <input aria-label="Address" bind:value={address} spellcheck="false" />
+      <Globe size={12} />
+      <input aria-label="Address" bind:value={address} spellcheck="false" placeholder="https:// or localhost:3000" />
       <button type="submit" class="go-button">Go</button>
     </form>
-    <span class="mock-chip">MOCK</span>
+    <button class="chrome-button" aria-label="Open in system browser" title="Open in system browser" disabled={!hasPage} onclick={actions.openExternalBrowser}><ExternalLink size={13} /></button>
   </div>
+  {#if $app.browserTitle}<div class="page-title">{$app.browserTitle}{#if $app.browserLoading && !$app.browserImage}<span>Loading…</span>{/if}</div>{/if}
+  {#if $app.browserError}<div class="browser-error" role="alert">{$app.browserError}</div>{/if}
 
-  <div class="browser-page">
-    {#if isLocal}
-      <div class="page-nav"><span class="page-mark">M</span><span>Mnemo2</span><span class="page-nav-note">PROJECT SETTINGS · MOCK PREVIEW</span></div>
-      <div class="page-layout">
-        <aside class="page-aside">
-          <span class="aside-active">Project</span>
-          <span>Team</span>
-          <span>Models</span>
-          <span>Merge policy</span>
-        </aside>
-        <main class="page-main">
-          <p class="page-eyebrow">PROJECT / SETTINGS</p>
-          <h2>{$currentProject?.name ?? "Project"}</h2>
-          <p class="page-copy">A single-project instance. Worker concurrency is set per project; budget and rate limits stay separate.</p>
-
-          <div class="setting-row">
-            <div><strong>Worker slots</strong><small>Maximum concurrent workers in this project.</small></div>
-            <input aria-label="Settings worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
-          </div>
-          <div class="setting-row">
-            <div><strong>Team default</strong><small>Per-task overrides</small></div>
-            <span class="setting-value">glm-5.3-flash</span>
-          </div>
-          <div class="setting-row">
-            <div><strong>Merge policy</strong><small>Serialized into the lead’s local branch after checks and review close.</small></div>
-            <span class="setting-value setting-ok"><ShieldCheck size={12} /> Guarded</span>
-          </div>
-          <div class="setting-row">
-            <div><strong>Budget</strong><small>${$currentProject?.budgetSpent.toFixed(2)} of ${$currentProject?.budgetLimit} used this project.</small></div>
-            <span class="setting-value">${$currentProject?.budgetSpent.toFixed(2)} / ${$currentProject?.budgetLimit}</span>
-          </div>
-          <p class="page-footnote">This is a styled stand-in. Phase 4 embeds the native WebView2 pane over this slot; an iframe would not be a real browser.</p>
-        </main>
+  <div class="browser-content">
+    <div class:page-hidden={!nativeVisible} class="native-page" bind:this={surface} aria-label="Native browser page"></div>
+    {#if $app.browserImage}
+      <div class="screenshot-page">
+        <header><strong>{$app.browserImage.label}</strong><button class="button button-quiet" onclick={actions.closeScreenshot}><X size={12} /> Close preview</button></header>
+        {#if $app.browserImage.dataUrl}
+          <img src={$app.browserImage.dataUrl} alt={$app.browserImage.label} />
+        {:else}
+          <p role="status">Reading the worker screenshot…</p>
+        {/if}
       </div>
-    {:else}
-      <div class="external-page">
-        <span class="external-icon"><Globe size={22} /></span>
-        <p class="page-eyebrow">EXTERNAL PAGE</p>
-        <h2>{$app.browserUrl.replace(/^https?:\/\//, "").split("/")[0]}</h2>
-        <code>{$app.browserUrl}</code>
-        <p class="page-copy">A link from the lead chat opened this address. Phase 0 shows a stand-in page; the native browser pane arrives with the Mnemo2 shell.</p>
-        <button class="button button-quiet" onclick={() => actions.navigateBrowser("http://localhost:5180/settings")}><Lock size={12} /> Back to project settings</button>
-      </div>
+    {:else if !hasPage}
+      <div class="browser-empty"><Globe size={24} /><h2>Open a page</h2><p>Enter an HTTP(S) address above, or choose a link in the conversation.</p></div>
+    {:else if $app.browserSupported === false}
+      <div class="browser-empty"><Globe size={24} /><h2>Open this page externally</h2><p>The embedded native pane is unavailable in this environment. Your system browser can open the same address.</p><button class="button button-primary" onclick={actions.openExternalBrowser}><ExternalLink size={13} /> Open in system browser</button></div>
+    {:else if $app.browserSupported === null}
+      <p class="browser-status" role="status">Connecting to the native browser…</p>
     {/if}
   </div>
 </section>
 
 <style>
   .browser-tab { display: flex; height: 100%; min-height: 0; flex-direction: column; }
-  .browser-chrome { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--surface-soft); }
+  .browser-chrome { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--surface-soft); }
   .chrome-buttons { display: flex; gap: 2px; }
-  .chrome-button { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
-  .chrome-button:disabled { opacity: 0.5; }
-  .address-form { display: flex; flex: 1; min-width: 0; align-items: center; gap: 4px; padding: 3px 3px 3px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
-  .address-lock { display: inline-flex; color: var(--muted); }
-  .address-form input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink-soft); font-family: var(--font-mono); font-size: 8px; }
-  .go-button { padding: 4px 7px; border: 0; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); cursor: pointer; font-size: 8px; }
-  .mock-chip { padding: 3px 5px; border-radius: 4px; background: var(--warning-soft); color: var(--warning); font-size: 6px; font-weight: 750; letter-spacing: 0.08em; }
-  .browser-page { flex: 1; overflow-y: auto; background: #fbfbf9; }
-  .page-nav { display: flex; align-items: center; gap: 8px; padding: 13px 22px; border-bottom: 1px solid #eceded; background: white; color: var(--ink); font-size: 10px; font-weight: 650; }
-  .page-mark { display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid var(--line); border-radius: 6px; font-family: var(--font-prose); font-size: 13px; }
-  .page-nav-note { margin-left: auto; color: var(--muted); font-size: 6px; letter-spacing: 0.1em; }
-  .page-layout { display: grid; grid-template-columns: 120px 1fr; }
-  .page-aside { display: grid; align-content: start; gap: 2px; padding: 20px 10px; border-right: 1px solid #eceee9; color: #858a7f; font-size: 8px; }
-  .page-aside span { padding: 7px 9px; border-radius: 6px; }
-  .page-aside .aside-active { background: #eef1e9; color: var(--accent-strong); font-weight: 650; }
-  .page-main { padding: 26px 24px; }
-  .page-eyebrow { margin: 0 0 5px; color: var(--muted); font-size: 6px; letter-spacing: 0.11em; }
-  .page-main h2, .external-page h2 { margin: 0 0 8px; font-family: var(--font-prose); font-size: 25px; font-weight: 550; }
-  .page-copy { max-width: 360px; margin: 0 0 22px; color: #757a6f; font-family: var(--font-prose); font-size: 12px; line-height: 1.55; }
-  .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-top: 1px solid #eceee9; }
-  .setting-row strong, .setting-row small { display: block; }
-  .setting-row strong { font-size: 9px; font-weight: 650; }
-  .setting-row small { margin-top: 3px; max-width: 260px; color: var(--muted); font-size: 7px; line-height: 1.4; }
-  .setting-row input { width: 48px; padding: 5px; border: 1px solid var(--line); border-radius: 6px; background: white; color: var(--ink); font-size: 9px; text-align: center; }
-  .setting-value { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; padding: 4px 7px; border-radius: 5px; background: #f1f2ee; color: #5f6459; font-size: 7px; }
-  .setting-ok { color: var(--accent-strong); }
-  .page-footnote { margin-top: 22px; color: #94998e; font-size: 7px; line-height: 1.5; }
-  .external-page { display: grid; justify-items: center; padding: 60px 28px; text-align: center; }
-  .external-icon { display: grid; width: 52px; height: 52px; margin-bottom: 18px; place-items: center; border: 1px solid var(--line); border-radius: 15px; background: white; color: var(--accent-strong); }
-  .external-page code { margin: 0 0 18px; color: var(--muted); font-family: var(--font-mono); font-size: 8px; }
-  @media (max-width: 560px) { .page-layout { grid-template-columns: 1fr; } .page-aside { display: none; } .page-main { padding: 20px 18px; } }
+  .chrome-button { display: grid; width: 27px; height: 27px; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+  .chrome-button:hover:not(:disabled) { background: var(--surface); color: var(--ink); }
+  .chrome-button:disabled { opacity: 0.4; cursor: default; }
+  .address-form { display: flex; flex: 1; min-width: 0; align-items: center; gap: 6px; padding: 3px 3px 3px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); }
+  .address-form input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink-soft); font-family: var(--font-mono); font-size: 11px; }
+  .go-button { padding: 5px 8px; border: 0; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); cursor: pointer; font-size: 10px; }
+  .page-title { display: flex; justify-content: space-between; gap: 12px; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--ink-soft); font-size: 11px; }
+  .page-title span { color: var(--muted); font-size: 10px; }
+  .browser-error { padding: 8px 12px; border-bottom: 1px solid #e3c7c0; background: #fbf0ee; color: #8d4d46; font-size: 11px; line-height: 1.5; }
+  .browser-content { position: relative; flex: 1; min-height: 0; overflow: hidden; background: white; }
+  .native-page { position: absolute; inset: 0; }
+  .page-hidden { visibility: hidden; pointer-events: none; }
+  .browser-empty { display: grid; height: 100%; align-content: center; justify-items: center; padding: 28px; color: var(--muted); text-align: center; }
+  .browser-empty h2 { margin: 16px 0 8px; color: var(--ink); font-family: var(--font-prose); font-size: 25px; font-weight: 550; }
+  .browser-empty p { max-width: 340px; margin: 0 0 20px; font-size: 12px; line-height: 1.65; }
+  .browser-status { padding: 24px; color: var(--muted); font-size: 12px; }
+  .screenshot-page { display: flex; height: 100%; min-height: 0; flex-direction: column; background: var(--surface-soft); }
+  .screenshot-page header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 11px; }
+  .screenshot-page header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .screenshot-page img { flex: 1; min-height: 0; object-fit: contain; }
+  .screenshot-page p { padding: 20px; color: var(--muted); font-size: 12px; }
+  @media (max-width: 480px) { .browser-chrome { gap: 4px; padding: 7px; } .chrome-button { width: 25px; } .address-form input { font-size: 10px; } }
 </style>

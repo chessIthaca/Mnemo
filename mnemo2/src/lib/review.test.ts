@@ -65,6 +65,19 @@ describe("merge eligibility", () => {
     }).ok).toBe(false);
   });
 
+  it("does not merge a cleaned branch without its checkout", () => {
+    const ready = createWorkers().find((worker) => worker.id === "ana")!;
+    ready.findings = ready.findings.map((finding) => ({
+      ...finding,
+      status: "fixed" as const,
+      evidence: "verified on the fix commit",
+    }));
+    expect(canMerge({ ...ready, status: "cancelled" })).toEqual({
+      ok: false,
+      reason: "Checkout was cleaned; the retained branch is review-only.",
+    });
+  });
+
   it("requires written justification for every wontfix finding", () => {
     const ana = createWorkers().find((worker) => worker.id === "ana")!;
     const ready = {

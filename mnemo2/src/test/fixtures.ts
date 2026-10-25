@@ -69,6 +69,7 @@ function makeWorker(input: WorkerInput): Worker {
     checks: passingChecks(),
     findings: [],
     messages: [{ id: `${id}-note`, from: "worker", body: summary, time: "09:42" }],
+    screenshots: [],
     timeline: defaultTimeline(id),
     diff: { files: 3, additions: 84, deletions: 12 },
     ...overrides,

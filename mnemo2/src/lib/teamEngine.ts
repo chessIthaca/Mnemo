@@ -51,6 +51,7 @@ export interface TeamTransport {
   merge(workerId: string): Promise<TeamWorkerRecord>;
   revertMerge(workerId: string): Promise<TeamWorkerRecord>;
   stopAll(): Promise<void>;
+  setSlots(slots: number): Promise<TeamSnapshot>;
   setTokenBudget(workerId: string, tokenBudget: number): Promise<TeamWorkerRecord>;
   messages(): Promise<TeamMessage[]>;
   onEvent(handler: (event: TeamEvent) => void): Promise<UnlistenFn>;
@@ -109,6 +110,7 @@ export function createTauriTeamTransport(
     revertMerge: (workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_revert_merge", { workerId }),
     stopAll: () => bindings.invoke<void>("team_stop_all"),
+    setSlots: (slots) => bindings.invoke<TeamSnapshot>("team_set_slots", { slots }),
     setTokenBudget: (workerId, tokenBudget) =>
       bindings.invoke<TeamWorkerRecord>("team_set_token_budget", { workerId, tokenBudget }),
     messages: () => bindings.invoke<TeamMessage[]>("team_messages"),

@@ -49,34 +49,7 @@ pub(crate) fn window_title(needs_project: bool, root: &std::path::Path) -> Strin
 /// existence probe (PROCESS_QUERY_LIMITED_INFORMATION needs no special
 /// rights); elsewhere a `ps -p` check, so the app needs no libc dependency
 /// on either platform.
-pub(crate) fn instance_pid_alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        // SAFETY: fixed flags, no handle inheritance.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() {
-            return false;
-        }
-        // SAFETY: the handle was just opened and is no longer used.
-        unsafe { CloseHandle(handle) };
-        true
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("ps")
-            .arg("-p")
-            .arg(pid.to_string())
-            .output()
-            .ok()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-}
+pub(crate) use mnemo_app::instance_marker::pid_alive as instance_pid_alive;
 
 #[cfg(test)]
 mod tests {

@@ -171,11 +171,13 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
-The Mnemo2 Phase 3 workspace is a separate Svelte 5 cockpit. In its native Tauri
+The Mnemo2 Phase 4 workspace is a separate Svelte 5 cockpit. In its native Tauri
 host the lead conversation and the worker team are real — one shared
 headless-engine `Engine` backs one streaming lead session and every worker
 session, each worker gets its own `wt/agent-*` branch and linked git worktree,
-and messages route both ways. The browser-only Vite session has no engine behind
+and messages route both ways. The workbench shows actual lead plans, real Git
+diffs, and a native WebView2 browser; state and preferences are isolated per
+project. The browser-only Vite session has no engine behind
 it and says so instead of simulating. The interface is conversation-first: each
 task has its own lead-enforced workflow, and lead/worker model identities are
 visible in the UI. Durable reviews, exact-tip checks, finding resolution, local

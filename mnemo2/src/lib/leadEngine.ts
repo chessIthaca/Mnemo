@@ -16,6 +16,7 @@ export interface LeadOpenOptions {
   workspaceRoot: string;
   configDir?: string | null;
   model?: string | null;
+  allowInstanceConflict?: boolean;
 }
 
 export type LeadApprovalDecision = "approve" | "deny" | "deny_all";
@@ -53,6 +54,9 @@ export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadT
         workspaceRoot: options.workspaceRoot,
         configDir: options.configDir ?? null,
         model: options.model ?? null,
+        ...(options.allowInstanceConflict === undefined
+          ? {}
+          : { allowInstanceConflict: options.allowInstanceConflict }),
       }),
     snapshot: () => bindings.invoke<LeadSnapshot>("lead_snapshot"),
     prompt: (text) => bindings.invoke<void>("lead_prompt", { text }),

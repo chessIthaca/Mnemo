@@ -304,6 +304,23 @@ function withProjectModel(state: AppState, model: string | null): AppState {
 
 /** Apply an authoritative native snapshot. */
 export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppState {
+  let foundActive = false;
+  const planItems = (snapshot.plan?.steps ?? []).map((step) => {
+    const active = !step.done && !foundActive;
+    if (active) foundActive = true;
+    const header = step.header?.trim();
+    const marker = header ? `**${header}**` : "";
+    const detail = marker && step.text.startsWith(marker)
+      ? step.text.slice(marker.length).replace(/^\s*(?:—|–|-|:)?\s*/, "")
+      : step.text;
+    return {
+      id: `${snapshot.plan?.id ?? "plan"}-${step.index}`,
+      title: header || `Step ${step.index + 1}`,
+      detail,
+      owner: "lead",
+      status: step.done ? "done" as const : active ? "active" as const : "queued" as const,
+    };
+  });
   const displayedModel = snapshot.model_id ?? snapshot.model;
   const currentPending = state.leadRuntime.pending;
   const snapshotKind = snapshot.pending?.kind;
@@ -318,6 +335,8 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
   const next = withProjectModel(
     {
       ...state,
+      plan: snapshot.plan ?? null,
+      planItems,
       leadEntries: leadEntriesFromTranscript(snapshot.transcript),
       leadRuntime: {
         ...state.leadRuntime,

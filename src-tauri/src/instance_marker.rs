@@ -67,6 +67,36 @@ impl InstanceMarker {
     }
 }
 
+/// Whether a marker's process still exists, without a platform-specific libc dependency.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed flags, no handle inheritance; the handle is closed immediately.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle was returned by OpenProcess and is no longer used.
+        unsafe { CloseHandle(handle) };
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
 /// The marker file: `<dir>/.coding/instance.json`.
 fn marker_path(dir: &Path) -> std::path::PathBuf {
     dir.join(CODING_DIR_NAME).join("instance.json")

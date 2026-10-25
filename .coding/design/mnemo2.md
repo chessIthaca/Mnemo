@@ -1,11 +1,13 @@
 # Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 3 implemented — the native host runs one real streaming lead session
-and a real parallel worker team on one shared headless engine, with per-worker
-branches and linked worktrees, durable reviews/findings, exact-tip checks,
-serialized local merge/revert, and cumulative telemetry/token budgets. Phase 0b's
-conversation-first interface is unchanged; production carries no mock
-project/worker data. Phase 4's native workbench remains. This is the
+Status: Phase 4 implemented — the native host runs one real streaming lead
+session and a real parallel worker team on one shared headless engine, with
+per-worker branches and linked worktrees, durable reviews/findings, exact-tip
+checks, serialized local merge/revert, and cumulative telemetry/token budgets.
+The workbench now shows actual lead plans and worker Git deltas, a native
+WebView2 Browser pane, per-project state and preferences, safe recovery, and
+notifications. Phase 0b's conversation-first interface is unchanged; production
+carries no mock project/worker data. This is the
 design of record for the Mnemo2 frontend rebuild. It supersedes the earlier
 "spaces dashboard" sketch: Mnemo2 is a single-project cockpit for a lead agent and
 a team of worker subagents. The defining change in v0.2 is that the lead enforces
@@ -287,16 +289,17 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
   (`~/.mnemo`); project state is per project.
 - Multiple projects = multiple Mnemo2 instances; the start screen makes this
   natural. A later "open in new window" can reuse the same engine manager.
-- Second-instance WebView2 user-data-dir guard is a build item (the existing
-  Mnemo app has the fix to port).
+- Per-instance WebView2 profiles and same-project markers are shared with
+  Mnemo1. A second live instance on the same project requires an explicit
+  confirmation; cleanup refuses active projects and preserves newer markers.
 
 ## 8. Workbench and browser
 
 - Resizable workbench on the right, tabbed: **Browser**, **Diff**, **Plan**.
   Tabs are opened by content and remembered per project.
 - Browser: native child webview on Windows, with URL/title sync, back/forward/
-  reload, and an address bar; macOS falls back to a placeholder/external open
-  (the existing Browser tab is Windows-only by design and gated).
+  reload, and an address bar. Other platforms offer external open in the system
+  browser; no embedded pane is simulated.
 - Agent browser tools run headless; screenshots land as chips in the worker
   thread. Clicking a screenshot or a chat link can open the Browser tab.
 - Under ~900px the workbench becomes a full-height overlay with a back button.
@@ -318,7 +321,7 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 
 ## 10. Open decisions
 
-- Per-project monetary budgets and persistence of custom worker-slot defaults.
+- Per-project monetary budgets. Custom worker-slot defaults are persisted.
 - Whether a fresh fixer subagent is ever preferable to the current original-worker
   re-tasking path.
 - Reviewer pre-pass threshold (diff size/files/risk).
@@ -435,12 +438,36 @@ Shipped in the native host:
   operation lock; conflict recovery leaves a clean tree; and committed crash
   recovery never invents a merge result.
 
-### Phase 4 — Native shell, workbench, persistence (remaining)
+### Phase 4 — Native shell, workbench, persistence (implemented)
 
-- Tauri shell integration, native WebView2 Browser pane, diff/plan tabs,
-  settings, project registry/`projects.toml`, persistence.
-- Start-screen resume/cleanup, notifications, multi-instance/window handling,
-  accessibility, and narrow-layout polish.
+- **Real workbench:** `AgentSession::plan()` reads the active plan from that
+  session's own plans directory. `workbench_diff` reads the selected worker's
+  actual Git base/tip and checkout, including untracked files; merged workers
+  use the merge's first parent and reviewed worker tip. Cleaned branches stay
+  reviewable without a checkout. Binary, sensitive, oversized, and truncated
+  content is labelled rather than silently completed.
+- **Native Browser:** a child WebView2 on Windows with real history, reload,
+  address navigation, URL/title events, physical-pixel resize, and overlay
+  hiding. No iframe or CDP path exists. Other platforms offer external open.
+  Worker screenshots are read only from the sandbox screenshot directory and
+  shown as actual image previews; chat links open the same Browser pane.
+- **Per-project persistence:** `projects/<sha256-of-canonical-path>/` holds
+  `lead.json`, `team.json`, `preferences.json`, and the engine workspace.
+  Lead transcripts carry project identity and save time. Worker slots and
+  workbench preferences survive restart, with backup recovery. Legacy shared
+  `lead/` state is left untouched; older records without a project identity
+  are not assigned automatically to a possibly different project.
+- **Lifecycle:** real Git/session metadata, new-project creation, Resume /
+  Review / Clean, same-instance warnings, close confirmation, and conservative
+  cleanup of only inactive clean worktrees. Every branch is retained;
+  cancelled workers are review-only. The official notification plugin reports
+  deduplicated worker completion, input requests, failures, and conflicts when
+  the app is unfocused.
+- **Shell and accessibility:** the bare window is created after installing the
+  per-instance profile. Its child browser respects tabs, dialogs, drag resize,
+  and narrow layouts. Library tests link the Tauri COMCTL32 v6 manifest, fixing
+  the `TaskDialogIndirect` startup regression. Modal focus management and
+  narrow-layout spacing keep the native pane from covering controls.
 - **Acceptance:** a real project opens, sessions survive restart, the browser is
   a native pane, and no mock data path remains.
 
@@ -465,8 +492,18 @@ Shipped in the native host:
 - `src-tauri/src/mnemo2/team.rs` — `TeamRuntime`: worker records, worktree
   dispatch, per-worker event pumps, executor guardrails, slots/limits,
   pause/interrupt/stop/resume, and `team.json` recovery.
-- `src-tauri/src/mnemo2/project.rs` — real `projects.toml` list/add plus folder
-  validation and name derivation.
+- `src-tauri/src/mnemo2/project.rs` — registry, canonical project identity,
+  per-project state/preferences, creation, and instance attachment.
+- `src-tauri/src/mnemo2/browser.rs` — native child-WebView2 navigation, URL/title
+  events, real history, visibility, rect coalescing, and external-open fallback.
+- `src-tauri/src/mnemo2/workbench.rs` — read-only worker deltas and guarded
+  screenshot reads; no agent-tool calls or external text conversion.
+- `src/headless/session.rs` — `AgentSession::plan()`, the exact per-session
+  active-plan snapshot used by the lead runtime.
+- `src-tauri/build.rs` — test-target Tauri resource linking for the COMCTL32 v6
+  manifest required by native dialog APIs.
+- `src-tauri/capabilities/mnemo2.json` — the shell, dialog, window, and
+  notification permissions for Mnemo2's own application identity.
 - `src-tauri/src/mnemo2/ipc.rs` — typed lead/team/project commands and the
   `mnemo2://lead-event` + `mnemo2://team-event` forwarders.
 - `mnemo2/src/lib/leadEngine.ts` — native lead transport.
@@ -486,14 +523,33 @@ Shipped in the native host:
 - `mnemo2/src/components/LeadModelPicker.svelte` — config-backed lead model
   picker used by the composer and project settings.
 
-## 13. Verification (this design lock)
+## 13. Verification (Phase 4)
 
-- Docs/policy only: `agent.md` (the Mnemo1-scoped git gate at line 22, plus the
-  new **Mnemo2 team merge policy** at lines 135-143) and this design doc. No
-  `src/**` files were touched.
-- No test run: no code path changed, so the workspace test gate is not
-  applicable to this docs-only plan.
-- `git status --short` shows only `agent.md` and the new `.coding/design/` file
-  beyond the pre-existing `.coding` edits (`backlog.jsonl`,
-  `plans/33a7341e.md`, and the two untracked knowledge files).
-- Round-1 review (`.coding/reviews/2026-10-24-b4b6a536-mnemo2-design-lock-review.md`) raised three low findings — check binding to the merge-time tip, the worker fork base, and the `git_diff` naming. All three are closed in §2-§4 and `agent.md:139-143`.
+- Full-delta self-review closed the COMCTL32 test-host manifest, browser
+  snapshot/address races, async lifecycle cleanup, retained-branch review
+  refresh, and sensitive-file preview/counting issues. Large raw patches keep
+  their real Git totals while returned lines and files remain bounded. This was
+  a self-review; no independent reviewer is claimed.
+- `npm --prefix mnemo2 test`: 25 test files, 106 tests passed.
+  `npm --prefix mnemo2 run check`: zero errors and warnings.
+  `npm --prefix mnemo2 run build`: passed, including the production no-mock
+  import check.
+- `cargo test -p mnemo-app --features mnemo2 --lib`: 56 tests passed.
+  `cargo build -p mnemo-app --features mnemo2 --bin mnemo2`: passed.
+  `cargo test --workspace`: all workspace tests passed. `git diff --check`
+  passed. The workbench file was formatted individually; no workspace-wide
+  formatter was run.
+- Windows native smoke used an isolated local, keyless configuration and a
+  real registered test project. The real engine opened, the native WebView2
+  displayed a local page with its actual title and body, dialogs hid the child
+  surface, and the narrow workbench became a full-pane overlay. Worker slots
+  and Browser preferences survived restart, a second instance showed the
+  incumbent PID and required confirmation, and clean exits released the
+  project marker. No prompt or worker dispatch was sent, so this was not a
+  live-provider turn or a live-notification test.
+- Legacy shared `lead/` state is preserved but not auto-migrated: its records
+  have no project identity, so assigning them to a current project would be
+  unsafe. New state is read only from the canonical project's own directory.
+- The unrelated existing edits in `.coding/backlog.jsonl` and
+  `.coding/plans/e3fcd987.md` are preserved and excluded from the Phase 4
+  commit. No push or merge into `main` is part of this verification.

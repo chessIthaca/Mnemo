@@ -2,6 +2,7 @@
   import { X } from "@lucide/svelte";
   import { onDestroy, tick } from "svelte";
   import type { Snippet } from "svelte";
+  import { actions } from "../lib/store";
 
   let {
     open,
@@ -38,14 +39,15 @@
 
   $effect(() => {
     if (open) {
+      actions.browserOverlay(true);
       returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setBackgroundInert(true);
       void tick().then(() => closeButton?.focus());
-    } else {
-      setBackgroundInert(false);
-      returnFocus?.focus();
-      returnFocus = null;
+      return () => actions.browserOverlay(false);
     }
+    setBackgroundInert(false);
+    returnFocus?.focus();
+    returnFocus = null;
   });
 
   onDestroy(() => {

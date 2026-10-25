@@ -12,12 +12,12 @@
 //! worker lifecycle is testable against a scripted LLM.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use mnemo::app::worktrees::{
-    agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
+    agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
 use mnemo::headless::{
     AgentSession, Engine, EventReceiver, Guardrails, HostToolSpec, PendingInteraction,
@@ -94,6 +94,8 @@ pub enum WorkerStatus {
     Merged,
     /// A conflict stopped integration and routed the task back for review.
     Conflict,
+    /// Its inactive checkout was cleaned; the retained branch is review-only.
+    Cancelled,
 }
 
 /// A real check result bound to the worker commit on which it ran.
@@ -232,8 +234,8 @@ pub struct TeamRuntimeOptions {
     pub workspace_root: PathBuf,
     /// Mnemo2's app-owned state directory (the `team.json` ledger).
     pub state_dir: PathBuf,
-    /// The live-session cap.
-    pub slots: usize,
+    /// Explicit cap override; `None` restores the saved cap or the default.
+    pub slots: Option<usize>,
     /// The per-lead-turn delegation cap.
     pub max_spawns_per_turn: usize,
     /// Configured per-model prices used to estimate real worker cost.
@@ -244,18 +246,22 @@ pub struct TeamRuntimeOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PersistedTeam {
     workers: Vec<WorkerRecord>,
+    #[serde(default)]
+    slots: Option<usize>,
 }
 
 /// The backup-recoverable `team.json` store.
 #[derive(Clone, Debug)]
 struct TeamPersistence {
     path: PathBuf,
+    slots: Arc<AtomicUsize>,
 }
 
 impl TeamPersistence {
     fn new(state_dir: &std::path::Path) -> Self {
         Self {
             path: state_dir.join(TEAM_STATE_FILE),
+            slots: Arc::new(AtomicUsize::new(DEFAULT_SLOTS)),
         }
     }
 
@@ -352,16 +358,25 @@ pub struct TeamRuntime {
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     max_spawns_per_turn: usize,
-    slots: usize,
     default_token_budget: u32,
     persistence: TeamPersistence,
 }
+
+/// Upper bound for concurrently live worker sessions in one project.
+pub const MAX_WORKER_SLOTS: usize = 32;
 
 impl TeamRuntime {
     /// Open the team ledger, recover interrupted workers, and prepare to spawn.
     pub async fn open(options: TeamRuntimeOptions) -> Result<Self, String> {
         let persistence = TeamPersistence::new(&options.state_dir);
-        let mut workers = persistence.load()?.unwrap_or_default().workers;
+        let persisted = persistence.load()?;
+        let slots = options
+            .slots
+            .or_else(|| persisted.as_ref().and_then(|team| team.slots))
+            .unwrap_or(DEFAULT_SLOTS)
+            .clamp(1, MAX_WORKER_SLOTS);
+        persistence.slots.store(slots, Ordering::SeqCst);
+        let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
         for worker in &mut workers {
             recover_worker(&options.workspace_root, worker).await?;
         }
@@ -380,7 +395,6 @@ impl TeamRuntime {
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             max_spawns_per_turn: options.max_spawns_per_turn.max(1),
-            slots: options.slots.max(1),
             default_token_budget: DEFAULT_WORKER_TOKEN_BUDGET,
             persistence,
         };
@@ -394,7 +408,7 @@ impl TeamRuntime {
             engine: lead.engine_handle().await?,
             workspace_root: lead.workspace_root().to_path_buf(),
             state_dir,
-            slots: DEFAULT_SLOTS,
+            slots: None,
             max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
             pricing: lead.pricing()?,
         })
@@ -423,13 +437,55 @@ impl TeamRuntime {
         self.lead_busy.store(busy, Ordering::SeqCst);
     }
 
+    /// Persist a new live-session cap without dropping active workers.
+    pub async fn set_slots(&self, slots: usize) -> Result<TeamSnapshot, String> {
+        if !(1..=MAX_WORKER_SLOTS).contains(&slots) {
+            return Err(format!(
+                "worker slots must be between 1 and {MAX_WORKER_SLOTS}"
+            ));
+        }
+        let _operation = self.merge_lock.lock().await;
+        let active = self.live.lock().await.len();
+        if slots < active {
+            return Err(format!(
+                "stop {} worker(s) before reducing slots to {slots}",
+                active - slots
+            ));
+        }
+        let previous = self.persistence.slots.swap(slots, Ordering::SeqCst);
+        if let Err(error) = self.persist().await {
+            self.persistence.slots.store(previous, Ordering::SeqCst);
+            let _ = self.persist().await;
+            return Err(error);
+        }
+        Ok(self.snapshot().await)
+    }
+
+    /// Clean inactive clean checkouts and refresh this runtime's worker records.
+    pub async fn cleanup(&self) -> Result<CleanupReport, String> {
+        let _operation = self.merge_lock.lock().await;
+        if !self.live.lock().await.is_empty() {
+            return Err("stop all workers before cleaning their worktrees".to_string());
+        }
+        let state_dir = self
+            .persistence
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "the team ledger has no parent directory".to_string())?;
+        let report = cleanup_workspace(&self.workspace_root, &state_dir).await?;
+        let restored = self.persistence.load()?.unwrap_or_default();
+        *self.records.lock().await = restored.workers;
+        Ok(report)
+    }
+
     /// The current team state.
     pub async fn snapshot(&self) -> TeamSnapshot {
         let workers = self.records.lock().await.clone();
         let active = self.live.lock().await.len();
         TeamSnapshot {
             workers,
-            slots: self.slots,
+            slots: self.persistence.slots.load(Ordering::SeqCst),
             active,
         }
     }
@@ -673,8 +729,8 @@ impl TeamRuntime {
             return Err("the worker brief is empty".to_string());
         }
         let active = self.live.lock().await.len();
-        if active >= self.slots {
-            return Err(format!("all {} worker slots are busy", self.slots));
+        if active >= self.persistence.slots.load(Ordering::SeqCst) {
+            return Err(format!("all {} worker slots are busy", self.persistence.slots.load(Ordering::SeqCst)));
         }
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
             format!(
@@ -835,6 +891,9 @@ impl TeamRuntime {
             return Err("the worker message is empty".to_string());
         }
         let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Cancelled {
+            return Err("a cleaned worker cannot accept new work; review its retained branch".to_string());
+        }
         if record.total_tokens >= record.token_budget as u64 {
             return Err("increase the worker token budget before continuing".to_string());
         }
@@ -930,6 +989,9 @@ impl TeamRuntime {
 
     async fn stop_inner(&self, worker_id: &str) -> Result<WorkerRecord, String> {
         let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Cancelled {
+            return Err("a cleaned worker has no checkout to stop".to_string());
+        }
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be stopped".to_string());
         }
@@ -960,6 +1022,9 @@ impl TeamRuntime {
             return Err(format!("worker '{worker_id}' is already running"));
         }
         let record = self.worker(worker_id).await?;
+        if record.status == WorkerStatus::Cancelled {
+            return Err("a cleaned worker cannot be resumed; review its retained branch".to_string());
+        }
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be resumed".to_string());
         }
@@ -1016,6 +1081,23 @@ impl TeamRuntime {
         self.worker(worker_id).await
     }
 
+    async fn worker_tip(&self, worker: &WorkerRecord) -> Result<String, String> {
+        if worker.status == WorkerStatus::Cancelled && worker.worktree.as_os_str().is_empty() {
+            if worker.branch != agent_branch(&worker.id)
+                || worker.id.is_empty()
+                || !worker.id.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                return Err("the worker ledger has an invalid branch identity".to_string());
+            }
+            return phase3::git_value(
+                &self.workspace_root,
+                &["rev-parse", &format!("refs/heads/{}^{{commit}}", worker.branch)],
+            )
+            .await;
+        }
+        phase3::tip(&worker.worktree).await
+    }
+
     /// Persist a lead review against the current worker commit.
     pub async fn review(
         &self,
@@ -1038,9 +1120,14 @@ impl TeamRuntime {
         if self.worker_is_busy(worker_id).await {
             return Err("the worker must be idle before review".to_string());
         }
-        let tip = phase3::tip(&worker.worktree).await?;
+        let tip = self.worker_tip(&worker).await?;
+        let was_cancelled = worker.status == WorkerStatus::Cancelled;
         self.update_worker(worker_id, |worker| {
-            worker.status = WorkerStatus::InReview;
+            worker.status = if was_cancelled {
+                WorkerStatus::Cancelled
+            } else {
+                WorkerStatus::InReview
+            };
             worker.review = Some(ReviewRecord {
                 summary,
                 tip,
@@ -1071,7 +1158,7 @@ impl TeamRuntime {
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("checks cannot be added during or after merge".to_string());
         }
-        let tip = phase3::tip(&worker.worktree).await?;
+        let tip = self.worker_tip(&worker).await?;
         self.update_worker(worker_id, |worker| {
             worker.checks.retain(|check| check.name != name);
             worker.checks.push(WorkerCheck {
@@ -1146,7 +1233,7 @@ impl TeamRuntime {
             return Err(format!("unknown finding '{finding_id}'"));
         }
         let fix_commit = if status == "fixed" {
-            Some(phase3::tip(&worker.worktree).await?)
+            Some(self.worker_tip(&worker).await?)
         } else {
             None
         };
@@ -1992,7 +2079,103 @@ async fn save_workers(
     persistence: &TeamPersistence,
 ) -> Result<(), String> {
     let workers = records.lock().await.clone();
-    persistence.save(&PersistedTeam { workers })
+    persistence.save(&PersistedTeam {
+        workers,
+        slots: Some(persistence.slots.load(Ordering::SeqCst)),
+    })
+}
+
+/// Outcome of conservative start-screen cleanup.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CleanupReport {
+    /// Clean worktrees actually removed.
+    pub removed: Vec<String>,
+    /// Branches/worktrees retained, with the reason for each.
+    pub skipped: Vec<String>,
+}
+
+/// Clean only inactive, clean worker checkouts; retain every worker branch.
+pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupReport, String> {
+    current_branch(root)?;
+    let persistence = TeamPersistence::new(state_dir);
+    let Some(mut ledger) = persistence.load()? else {
+        return Ok(CleanupReport::default());
+    };
+    let mut report = CleanupReport::default();
+    for index in 0..ledger.workers.len() {
+        let worker = &mut ledger.workers[index];
+        if worker.merge.is_some()
+            || worker.worktree.as_os_str().is_empty()
+            || matches!(
+                worker.status,
+                WorkerStatus::Dispatching
+                    | WorkerStatus::Working
+                    | WorkerStatus::NeedsYou
+                    | WorkerStatus::Fixing
+                    | WorkerStatus::Merging
+                    | WorkerStatus::Conflict
+            )
+        {
+            continue;
+        }
+        let id = worker.id.clone();
+        let branch = worker.branch.clone();
+        if branch != agent_branch(&id) || id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+            report.skipped.push(format!("{branch}: invalid worker identity"));
+            continue;
+        }
+        let checkout = root
+            .join(".worktrees")
+            .join(format!("agent-{}", agent_short_id(&id)));
+        let recorded = match dunce::canonicalize(&worker.worktree) {
+            Ok(path) => path,
+            Err(_) if !worker.worktree.exists() => checkout.clone(),
+            Err(error) => {
+                report.skipped.push(format!("{branch}: {error}"));
+                continue;
+            }
+        };
+        let expected = if checkout.exists() {
+            dunce::canonicalize(&checkout).map_err(|err| err.to_string())?
+        } else {
+            checkout.clone()
+        };
+        if recorded != expected {
+            report.skipped.push(format!("{branch}: checkout is outside its registered worktree"));
+            continue;
+        }
+        let revision = format!("refs/heads/{branch}^{{commit}}");
+        if let Err(error) = phase3::git_value(root, &["rev-parse", "--verify", &revision]).await {
+            report.skipped.push(format!("{branch}: retained checkout because the branch cannot be verified: {error}"));
+            continue;
+        }
+        if checkout.exists() {
+            match phase3::git_value(&checkout, &["status", "--porcelain", "-uall"]).await {
+                Ok(status) if status.trim().is_empty() => {}
+                Ok(_) => {
+                    report.skipped.push(format!("{branch}: uncommitted work is retained for review"));
+                    continue;
+                }
+                Err(error) => {
+                    report.skipped.push(format!("{branch}: cleanliness could not be verified: {error}"));
+                    continue;
+                }
+            }
+            if let Err(error) = remove_agent_worktree(root.to_path_buf(), id).await {
+                report.skipped.push(format!("{branch}: cleanup failed: {error}"));
+                continue;
+            }
+            report.removed.push(branch.clone());
+        } else {
+            report.skipped.push(format!("{branch}: checkout was already absent; branch retained"));
+        }
+        worker.status = WorkerStatus::Cancelled;
+        worker.pending = None;
+        worker.worktree = PathBuf::new();
+        worker.error = Some("inactive checkout cleaned; the branch is retained for review".to_string());
+        persistence.save(&ledger)?;
+    }
+    Ok(report)
 }
 
 fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolResult {
@@ -2143,6 +2326,89 @@ mod tests {
             persistence.load().is_err(),
             "corruption must not become an empty team"
         );
+    }
+
+    fn lifecycle_git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git process");
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    fn cleanup_worker(id: &str, branch: &str, worktree: &Path, status: WorkerStatus) -> WorkerRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": format!("Worker {id}"),
+            "brief": "Implement a scoped change",
+            "model": null,
+            "model_id": "test-model",
+            "branch": branch,
+            "worktree": worktree,
+            "status": status,
+            "generation": 1,
+            "transcript": { "messages": [] },
+            "pending": null,
+            "used_tokens": 0,
+            "max_tokens": 1000,
+            "checks": [],
+            "error": null,
+        })).expect("worker fixture")
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_branches_and_dirty_work_but_removes_clean_checkouts() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = tempfile::tempdir().expect("state");
+        let root = repo.path();
+        lifecycle_git(root, &["init", "-b", "wt/test"]);
+        lifecycle_git(root, &["config", "user.name", "Test"]);
+        lifecycle_git(root, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(root.join("file.txt"), "base\n").expect("base");
+        lifecycle_git(root, &["add", "file.txt"]);
+        lifecycle_git(root, &["commit", "-m", "base"]);
+        let (clean_path, clean_branch) = provision_agent_worktree(
+            root.to_path_buf(),
+            "clean001".to_string(),
+            "wt/test".to_string(),
+        ).await.expect("clean worktree");
+        let (dirty_path, dirty_branch) = provision_agent_worktree(
+            root.to_path_buf(),
+            "dirty002".to_string(),
+            "wt/test".to_string(),
+        ).await.expect("dirty worktree");
+        std::fs::write(clean_path.join("file.txt"), "worker\n").expect("clean edit");
+        lifecycle_git(&clean_path, &["add", "file.txt"]);
+        lifecycle_git(&clean_path, &["commit", "-m", "clean change"]);
+        std::fs::write(dirty_path.join("uncommitted.txt"), "keep me\n").expect("dirty edit");
+        let clean = cleanup_worker("clean001", &clean_branch, &clean_path, WorkerStatus::Stopped);
+        let dirty = cleanup_worker("dirty002", &dirty_branch, &dirty_path, WorkerStatus::InReview);
+        let persistence = TeamPersistence::new(state.path());
+        persistence.save(&PersistedTeam {
+            workers: vec![clean.clone(), dirty.clone()],
+            slots: Some(4),
+        }).expect("ledger");
+
+        let report = cleanup_workspace(root, state.path()).await.expect("cleanup");
+        assert_eq!(report.removed, vec![clean_branch.clone()]);
+        assert!(report.skipped.iter().any(|reason| reason.contains("uncommitted")));
+        assert!(!clean_path.exists());
+        assert!(dirty_path.join("uncommitted.txt").exists());
+        let restored = persistence.load().expect("ledger").expect("saved team");
+        assert_eq!(restored.slots, Some(4));
+        let cleaned = restored.workers.iter().find(|worker| worker.id == clean.id).expect("clean record");
+        assert_eq!(cleaned.status, WorkerStatus::Cancelled);
+        assert!(cleaned.worktree.as_os_str().is_empty());
+        let dirty_after = restored.workers.iter().find(|worker| worker.id == dirty.id).expect("dirty record");
+        assert_eq!(dirty_after.status, WorkerStatus::InReview);
+        assert!(dirty_after.worktree.exists());
+        let diff = crate::mnemo2::workbench::worker_diff(root, cleaned)
+            .await
+            .expect("the cleaned branch remains reviewable");
+        assert_eq!(diff.total_files, 1);
+        assert!(phase3::git_value(root, &["rev-parse", &clean_branch]).await.is_ok());
+        assert!(phase3::git_value(root, &["rev-parse", &dirty_branch]).await.is_ok());
     }
 
     #[test]

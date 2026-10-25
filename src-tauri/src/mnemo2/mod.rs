@@ -25,6 +25,12 @@ pub mod ipc;
 /// Real project registry access and folder picking.
 pub mod project;
 
+/// Read-only worker diffs and screenshot artifacts for the workbench.
+pub mod workbench;
+
+/// The native child-WebView2 Browser pane and its non-Windows fallback.
+pub mod browser;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -33,21 +39,53 @@ fn mnemo2_host_ping() -> &'static str {
     "pong"
 }
 
+fn install_shell(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::{PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder};
+
+    let window = WindowBuilder::new(app, "main")
+        .title("Mnemo2")
+        .inner_size(1440.0, 900.0)
+        .min_inner_size(360.0, 540.0)
+        .center()
+        .build()?;
+    crate::webview_udf::install_default_data_dir(app, std::process::id());
+    let shell = window.add_child(
+        crate::webview_udf::apply(
+            WebviewBuilder::new("mnemo2-shell", WebviewUrl::App("index.html".into())),
+            "mnemo2-shell",
+        ),
+        PhysicalPosition::new(0, 0),
+        window.inner_size()?,
+    )?;
+    shell.show()?;
+    let resize_sink = shell.clone();
+    let resize_worker = mnemo::thread_util::spawn_latest_wins(move |size: PhysicalSize<u32>| {
+        let _ = resize_sink.set_size(size);
+    });
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Resized(size) = event {
+            resize_worker.submit(*size);
+        }
+    });
+    Ok(())
+}
+
 /// Build and run the Mnemo2 desktop host.
 ///
-/// The window is declared in `mnemo2-app/tauri.conf.json`; the frontend is
-/// served by Vite on port 5180 during development and embedded from
-/// `target/mnemo2-dist` for a production build.
+/// The bare window and its shell child are created explicitly so per-instance
+/// WebView2 data directories are selected before either child exists.
 pub fn run() {
-    // Mnemo1 exports WebView2 browser arguments (including CDP port 9222) into
-    // the environment inherited by tools it launches. Mnemo2 is a separate
-    // desktop app and must not share that debug port or its WebView2 command
-    // line, so drop inherited arguments before Tauri creates a webview.
     std::env::remove_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
     mnemo::app::install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(ipc::Mnemo2State::default())
+        .manage(browser::BrowserController::default())
+        .setup(|app| {
+            install_shell(app.handle())?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             mnemo2_host_ping,
             ipc::lead_open,
@@ -73,14 +111,47 @@ pub fn run() {
             ipc::team_merge,
             ipc::team_revert_merge,
             ipc::team_stop_all,
+            ipc::team_set_slots,
             ipc::team_set_token_budget,
             ipc::team_messages,
             ipc::project_list,
             ipc::project_add,
+            ipc::project_create,
             ipc::project_pick_folder,
+            ipc::project_attach,
+            ipc::project_cleanup,
+            ipc::workbench_diff,
+            ipc::workbench_screenshot,
+            ipc::workbench_preferences,
+            ipc::workbench_preferences_set,
+            browser::browser_supported,
+            browser::browser_snapshot,
+            browser::browser_ensure,
+            browser::browser_navigate,
+            browser::browser_history,
+            browser::browser_reload,
+            browser::browser_set_rect,
+            browser::browser_set_visible,
+            browser::browser_overlay,
+            browser::browser_close,
+            browser::browser_open_external,
         ])
-        .run(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
-        .expect("failed to run the Mnemo2 desktop host");
+        .build(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
+        .expect("failed to build the Mnemo2 desktop host")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager as _;
+                let state = app.state::<ipc::Mnemo2State>();
+                let browser = app.state::<browser::BrowserController>();
+                let _ = tauri::async_runtime::block_on(async {
+                    if let Ok(app_data) = app.path().app_data_dir() {
+                        let _ = state.save_cached_preferences(&app_data).await;
+                    }
+                    state.shutdown().await;
+                    let _ = browser.close().await;
+                });
+            }
+        });
 }
 
 #[cfg(test)]
@@ -90,10 +161,16 @@ mod tests {
     /// deadlocks the second process before its webview initializes.
     #[test]
     fn context_uses_mnemo2_identifier() {
-        // Tauri loads `tauri.conf.json` from the path's parent directory; the
-        // path must point at the Mnemo2 config directory, not a custom filename.
         let context: tauri::Context<tauri::Wry> =
             tauri::generate_context!("mnemo2-app/tauri.conf.json", test = true);
         assert_eq!(context.config().identifier, "com.mnemo.mnemo2");
+    }
+
+    /// Library tests need the same COMCTL32 v6 manifest as desktop binaries.
+    #[test]
+    fn library_tests_link_tauri_resource_manifest() {
+        let build_script = include_str!("../../build.rs");
+        assert!(build_script.contains("cargo:rustc-link-arg-tests="));
+        assert!(build_script.contains("resource.lib"));
     }
 }

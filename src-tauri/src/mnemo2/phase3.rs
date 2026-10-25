@@ -100,9 +100,14 @@ pub fn now_ms() -> u128 {
 
 /// Run Git without a shell in one repository and preserve diagnostics.
 pub async fn git(root: &Path, args: &[&str]) -> Result<Output, String> {
-    tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
+    let mut command = tokio::process::Command::new("git");
+    command.args(args).current_dir(root);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
         .output()
         .await
         .map_err(|err| format!("could not run git in {}: {err}", root.display()))

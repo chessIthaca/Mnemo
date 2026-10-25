@@ -97,9 +97,12 @@ describe("Mission Control", () => {
     expect(screen.queryByText(/\*\*Implemented\*\*/)).toBeNull();
   });
 
-  it("does not expose Diff as a per-worker action", async () => {
+  it("opens the selected worker's real Diff view", async () => {
     render(ControlRoom);
     await fireEvent.click(screen.getByRole("button", { name: /Open Theo worker thread/ }));
-    expect(screen.queryByRole("button", { name: "Diff" })).toBeNull();
+    await fireEvent.click(screen.getByRole("button", { name: "Diff" }));
+    expect(get(app).workbenchTab).toBe("diff");
+    expect(get(app).diffWorkerId).toBe("theo");
+    expect(get(app).route).toBe("lead");
   });
 });

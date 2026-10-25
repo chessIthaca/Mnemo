@@ -8,18 +8,9 @@
     "devUrl": "http://localhost:5180"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "Mnemo2",
-        "width": 1440,
-        "height": 900,
-        "minWidth": 900,
-        "minHeight": 640,
-        "center": true
-      }
-    ],
+    "windows": [],
     "security": {
+      "capabilities": ["mnemo2"],
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'",
       "devCsp": "default-src 'self' http://localhost:5180; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://localhost:5180; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://localhost:5180; font-src 'self' data:; connect-src 'self' http://localhost:5180 ws://localhost:5180 ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'"
     }

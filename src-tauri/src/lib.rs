@@ -10,6 +10,18 @@
 //! library exposes the intentionally separate Mnemo2 host without pulling
 //! Mnemo1's larger IPC surface into the Mnemo2 binary.
 
+// Tauri supplies resource.lib to binaries but not to a library's unit-test
+// target. Link the manifest here too so TaskDialogIndirect resolves to COMCTL32 v6.
+#[cfg(all(windows, test, feature = "mnemo2"))]
+#[link(name = "resource", kind = "static")]
+extern "C" {}
+
+/// Per-instance WebView2 user-data-dir arbitration shared by both shells.
+pub mod webview_udf;
+
+/// Same-project instance markers shared by both shells.
+pub mod instance_marker;
+
 /// The Mnemo2 desktop host: a minimal Tauri shell around the headless
 /// engine's lead session. Gated by the `mnemo2` feature so the Mnemo1 main
 /// binary does not link its Tauri context.

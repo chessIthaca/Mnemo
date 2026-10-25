@@ -27,6 +27,36 @@ function textEvent(generation: number, text: string): LeadEvent {
 }
 
 describe("lead event reducer", () => {
+  it("restores the actual lead plan and marks only its first open step active", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      plan: {
+        id: "plan-1",
+        title: "Actual plan",
+        goal: "Read real state",
+        steps: [
+          { index: 0, text: "**Read** — src/a.rs", header: "Read", done: true },
+          { index: 1, text: "**Build** — src/b.rs", header: "Build", done: false },
+          { index: 2, text: "Verify src/c.rs", done: false },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    };
+    const next = applyLeadSnapshot(nativeState(), snapshot);
+    expect(next.plan?.title).toBe("Actual plan");
+    expect(next.planItems.map((step) => step.status)).toEqual(["done", "active", "queued"]);
+    expect(next.planItems[0].detail).toBe("src/a.rs");
+    expect(next.planItems.every((step) => step.owner === "lead")).toBe(true);
+  });
+
   it("accumulates streamed deltas into one lead entry", () => {
     const first = applyLeadEvent(nativeState(3), textEvent(3, "Hello "));
     const second = applyLeadEvent(first, textEvent(3, "world"));

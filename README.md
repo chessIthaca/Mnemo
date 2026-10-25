@@ -171,19 +171,20 @@ npx tsc --noEmit           # type check (vitest hides type defects)
 npm test                   # frontend unit tests
 ```
 
-The Mnemo2 Phase 1 workspace is a separate Svelte 5 cockpit. In its native Tauri
-host the lead conversation is real — one headless-engine session with streaming,
-cancellation, transcript restore, approvals, and a config-backed model picker;
-the browser-only Vite session remains a mock fallback. Workers and the team
-runtime are still mock data until Phase 2. The interface is conversation-first:
-each task has its own lead-enforced workflow, and lead/worker model identities
-are visible in the UI:
+The Mnemo2 Phase 2 workspace is a separate Svelte 5 cockpit. In its native Tauri
+host the lead conversation and the worker team are real — one shared
+headless-engine `Engine` backs one streaming lead session and every worker
+session, each worker gets its own `wt/agent-*` branch and linked git worktree,
+and messages route both ways. The browser-only Vite session has no engine behind
+it and says so instead of simulating. The interface is conversation-first: each
+task has its own lead-enforced workflow, and lead/worker model identities are
+visible in the UI. Review and merge stay disabled until Phase 3:
 
 ```bash
-npm run dev:mnemo2         # http://127.0.0.1:5180 — browser mock fallback
-npm run dev:mnemo2:native  # Tauri host + real lead (run dev:mnemo2 first)
+npm run dev:mnemo2         # http://127.0.0.1:5180 — browser (no engine)
+npm run dev:mnemo2:native  # Tauri host + real lead and team (run dev:mnemo2 first)
 npm run check:mnemo2       # svelte-check
-npm run test:mnemo2        # Vitest interaction + adapter + policy tests
+npm run test:mnemo2        # Vitest interaction + adapter + reducer tests
 npm run build:mnemo2       # -> target/mnemo2-dist
 npm run build:mnemo2:native
 ```

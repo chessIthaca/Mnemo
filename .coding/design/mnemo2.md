@@ -1,8 +1,10 @@
 # Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 1 implemented — the native host runs one real streaming lead session
-with a config-backed model registry. Phase 0b's conversation-first interface is
-unchanged; workers and the team runtime remain mock data for Phase 2. This is the
+Status: Phase 2 implemented — the native host runs one real streaming lead session
+and a real parallel worker team on one shared headless engine, with per-worker
+branches and linked worktrees. Phase 0b's conversation-first interface is
+unchanged; production carries no mock project/worker data. Phase 3 (review and
+merge) is explicitly disabled rather than simulated. This is the
 design of record for the Mnemo2 frontend rebuild. It supersedes the earlier
 "spaces dashboard" sketch: Mnemo2 is a single-project cockpit for a lead agent and
 a team of worker subagents. The defining change in v0.2 is that the lead enforces
@@ -344,17 +346,41 @@ Shipped in the native host:
   "project root does not exist" error; the native project registry/folder picker
   is Phase 4. The browser fallback remains filesystem-free.
 
-### Phase 2 — Parallel team runtime
+### Phase 2 — Parallel team runtime (implemented)
 
-- Implement TeamManager: per-task records, briefs, model choice, worktrees from
-  the lead branch tip, spawn limits, and independent task workflows.
-- Add `message_agent`, `message_parent`, `team_status`, and `review_fix` host
-  tools. Worker threads use real session events; tool logs stay in the worker
-  thread.
-- Parallel scheduling with configurable worker slots, budget/rate caps,
-  pause/stop, and restart recovery.
-- **Acceptance:** at least two tasks run concurrently, each with its own
-  workflow and model; messages route both ways; no global run timeline exists.
+- **Landed:** `TeamRuntime` (`src-tauri/src/mnemo2/team.rs`) spawns workers on the
+  lead's shared `Arc<Engine>`. Each worker gets a durable record (brief, model
+  spec, observed model id, branch, worktree, status, generation, transcript,
+  pending interaction, token usage, checks) persisted to `team.json`.
+- **Worktrees:** `src/app/worktrees.rs` now has `agent_branch` /
+  `provision_agent_worktree` / `remove_agent_worktree` alongside the runall
+  helpers. Workers fork from the lead's current branch tip (never `main`) onto
+  `wt/agent-<id8>` at `<project>/.worktrees/agent-<id8>`; `-b` makes a duplicate
+  branch fail loudly. `Engine::spawn` maps `SpawnOptions.worktree` into a
+  `WorktreeBinding`, so the worker's sandbox, project root, plans dir, and code
+  graph all resolve inside its own checkout.
+- **Executor surface:** `ToolSelection::all()` minus `create_plan`,
+  `update_plan`, `finish`, `spawn_agent`, and `ask_user`, plus hard turn and
+  wall-clock limits. Planning and review stay the lead's job.
+- **Messaging:** the lead gets `team_dispatch` / `team_message` / `team_status`
+  host tools; workers get `message_parent`, whose messages land in a lead inbox
+  and render in the lead conversation. A worker's direct `spawn_agent` is denied
+  by a `WorkflowPolicy::with_blocked_tools` veto, so every worker must be tracked
+  by the team runtime. (The plan sketched `message_agent`/`review_fix`; the
+  landed lead-side tools are `team_message` and `team_status`, with
+  `review_fix` deferred to Phase 3 along with review itself.)
+- **Scheduling:** configurable live-session slots (`DEFAULT_SLOTS = 3`) and a
+  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`). Pause,
+  interrupt, stop, and resume drive real `SessionCommand`s.
+- **Recovery:** on open, `dispatching`/`working`/`needs_you` records downgrade to
+  `interrupted` (or stay `needs_you` when a pending interaction survived);
+  `team_resume` reattaches the saved transcript against the worker's worktree.
+- **Projects:** the project registry/`projects.toml` and folder picker landed
+  early (pulled out of Phase 4) so no seeded path survives.
+- **Acceptance met:** two workers run concurrently with independent models,
+  statuses, branches, worktrees, and transcripts, and no event cross-talk; the
+  lead and workers exchange messages both ways; no global run timeline exists.
+  Phase 3 review/merge controls are disabled rather than simulated.
 
 ### Phase 3 — Review, merge, recovery, cost
 
@@ -382,19 +408,35 @@ Shipped in the native host:
   `host_tools`, `guardrails`, `SessionCommand`, `SessionEvent`.
 - `src/tool/agent/spawn_agent.rs` — parent-aware spawn, approval.
 - `src/runtime/mod.rs` — `ParentAwareSpawner`, `DescendantTracker`.
-- `src/app/worktrees.rs` — provision/remove worktree helpers (item-shaped;
-  generalize for agent ids/base ref).
+- `src/app/worktrees.rs` — provision/remove worktree helpers, including the
+  agent-shaped `agent_branch` / `provision_agent_worktree` /
+  `remove_agent_worktree` (base-ref forked, branch kept on cleanup).
 - `src-tauri/src/ipc/spawn.rs` — the worktree-binding spawn pattern.
 - `src/config/projects.rs` — `ProjectRegistry` / `projects.toml`.
 - `src/agent/prompt.rs` — the compiled APP_RULES line (agent-facing gate).
 - `src-tauri/mnemo2-app/tauri.conf.json` + `src-tauri/src/bin/mnemo2.rs` — the separate
   Mnemo2 native host.
 - `src-tauri/src/mnemo2/runtime.rs` — `LeadRuntime`: engine/policy/session,
-  event pump, persistence, interrupt, resume-based model changes.
-- `src-tauri/src/mnemo2/ipc.rs` — typed lead commands and the one
-  `mnemo2://lead-event` forwarder.
-- `mnemo2/src/lib/leadEngine.ts` — native transport + browser fallback.
+  event pump, persistence, interrupt, resume-based model changes, and the
+  lead-side team host-tool bridge.
+- `src-tauri/src/mnemo2/team.rs` — `TeamRuntime`: worker records, worktree
+  dispatch, per-worker event pumps, executor guardrails, slots/limits,
+  pause/interrupt/stop/resume, and `team.json` recovery.
+- `src-tauri/src/mnemo2/project.rs` — real `projects.toml` list/add plus folder
+  validation and name derivation.
+- `src-tauri/src/mnemo2/ipc.rs` — typed lead/team/project commands and the
+  `mnemo2://lead-event` + `mnemo2://team-event` forwarders.
+- `mnemo2/src/lib/leadEngine.ts` — native lead transport.
 - `mnemo2/src/lib/leadState.ts` — snapshot restore and live event reducer.
+- `mnemo2/src/lib/teamEngine.ts` — native team transport.
+- `mnemo2/src/lib/teamState.ts` — team snapshot restore, generation-tagged event
+  reduction, stale-event rejection.
+- `mnemo2/src/lib/projectEngine.ts` — native project registry/folder-picker
+  transport.
+- `mnemo2/src/lib/runtime.ts` — shared `isTauriRuntime` detection (kept separate
+  so mocking one transport cannot break another).
+- `mnemo2/src/test/fixtures.ts` — test-only fixture data; production imports none
+  of it.
 - `mnemo2/src/components/LeadModelPicker.svelte` — config-backed lead model
   picker used by the composer and project settings.
 

@@ -73,4 +73,31 @@ describe("deriveTaskWorkflow", () => {
     expect(deriveTaskWorkflow(worker("ren")).state).toBe("done");
     expect(deriveTaskWorkflow(worker("ren")).steps.every((item) => item.status === "done")).toBe(true);
   });
+
+  it("maps real Phase 2 runtime statuses without faking review or merge", () => {
+    const base = worker("ren");
+
+    const needsYou = deriveTaskWorkflow({ ...base, status: "needs_you", needsYou: true });
+    expect(needsYou.state).toBe("blocked");
+    expect(step(needsYou, "implement")?.status).toBe("active");
+
+    const idle = deriveTaskWorkflow({ ...base, status: "idle" });
+    expect(idle.state).toBe("active");
+
+    const paused = deriveTaskWorkflow({ ...base, status: "paused" });
+    expect(paused.state).toBe("blocked");
+
+    const interrupted = deriveTaskWorkflow({ ...base, status: "interrupted" });
+    expect(interrupted.state).toBe("blocked");
+
+    const completed = deriveTaskWorkflow({ ...base, status: "completed" });
+    expect(completed.current).toBe("verify");
+    expect(step(completed, "implement")?.status).toBe("done");
+    // Review and merge stay queued for Phase 3 — never reported as done.
+    expect(step(completed, "review")?.status).not.toBe("done");
+    expect(step(completed, "merge")?.status).not.toBe("done");
+
+    const stopped = deriveTaskWorkflow({ ...base, status: "stopped" });
+    expect(stopped.state).toBe("blocked");
+  });
 });

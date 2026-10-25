@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run check && vite build",
+    "build": "npm run check && npm run check:no-mock && vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:no-mock": "node scripts/assert-no-production-mock.mjs",
     "test": "vitest run"
   },
   "dependencies": {

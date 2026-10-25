@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { ArrowRight, FolderOpen, GitBranch, Plus } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
   import ModelBadge from "./ModelBadge.svelte";
@@ -8,12 +9,16 @@
   function shellOnly(feature: string) {
     notice = `${feature} needs the native shell.`;
   }
+
+  onMount(() => {
+    void actions.loadProjects();
+  });
 </script>
 
 <main class="start-screen">
   <header class="start-nav">
     <a class="brand" href="/" aria-label="Mnemo2 home"><span class="brand-mark">M</span><span>Mnemo2</span></a>
-    <span class="phase-label">PHASE 1</span>
+    <span class="phase-label">PHASE 2</span>
   </header>
 
   <section class="start-main">
@@ -32,17 +37,20 @@
             <span class="project-path">{project.path}</span>
           </span>
           <span class="project-meta">
-            <span><GitBranch size={11} />{project.branch}</span>
-            <ModelBadge model={project.leadModel} role="lead" />
-            <small>{project.lastSession}</small>
+            {#if project.branch}<span><GitBranch size={11} />{project.branch}</span>{/if}
+            {#if project.leadModel}<ModelBadge model={project.leadModel} role="lead" />{/if}
+            {#if project.lastSession}<small>{project.lastSession}</small>{/if}
           </span>
           <ArrowRight class="project-arrow" size={17} />
         </button>
       {/each}
+      {#if $app.projects.length === 0}
+        <p class="empty-projects">No projects registered. Open a folder to begin.</p>
+      {/if}
     </div>
 
     <div class="start-actions">
-      <button class="button button-quiet" onclick={() => shellOnly("The folder picker")}><FolderOpen size={14} /> Open folder</button>
+      <button class="button button-quiet" onclick={() => actions.openFolder()}><FolderOpen size={14} /> Open folder</button>
       <button class="button button-quiet" onclick={() => shellOnly("Project creation")}><Plus size={14} /> New project</button>
     </div>
     {#if notice}<p class="shell-notice" role="status">{notice}</p>{/if}

@@ -39,6 +39,7 @@ use crate::mnemo2::runtime::{
 use crate::mnemo2::team::{
     TeamMessage, TeamRuntime, TeamSnapshot, WorkerRecord, TEAM_EVENT_CHANNEL,
 };
+use crate::mnemo2::project::{self, ProjectRecord};
 
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
@@ -106,6 +107,37 @@ async fn current(state: &Mnemo2State) -> Result<Arc<LeadRuntime>, String> {
 
 async fn current_team(state: &Mnemo2State) -> Result<Arc<TeamRuntime>, String> {
     current(state).await?.team_handle().await
+}
+
+/// List the real projects from `projects.toml`.
+#[tauri::command]
+pub async fn project_list(config_dir: Option<String>) -> Result<Vec<ProjectRecord>, String> {
+    project::list(config_dir.map(PathBuf::from))
+}
+
+/// Register a real folder, deriving its display name and canonical path.
+#[tauri::command]
+pub async fn project_add(
+    config_dir: Option<String>,
+    path: String,
+) -> Result<ProjectRecord, String> {
+    project::add(config_dir.map(PathBuf::from), std::path::Path::new(&path))
+}
+
+/// Open the native folder picker and return the chosen folder, if any.
+#[tauri::command]
+pub async fn project_pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |folder| {
+        let picked = folder
+            .and_then(|path| path.into_path().ok())
+            .map(|path| path.to_string_lossy().to_string());
+        let _ = tx.send(picked);
+    });
+    rx.await
+        .map_err(|_| "the folder picker closed unexpectedly".to_string())
 }
 
 /// Open (or replace) the lead conversation on a project.

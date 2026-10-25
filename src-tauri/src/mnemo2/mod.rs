@@ -19,6 +19,9 @@ pub mod team;
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
 
+/// Real project registry access and folder picking.
+pub mod project;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -40,6 +43,7 @@ pub fn run() {
     std::env::remove_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
     mnemo::app::install_panic_hook();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(ipc::Mnemo2State::default())
         .invoke_handler(tauri::generate_handler![
             mnemo2_host_ping,
@@ -59,6 +63,9 @@ pub fn run() {
             ipc::team_stop,
             ipc::team_resume,
             ipc::team_messages,
+            ipc::project_list,
+            ipc::project_add,
+            ipc::project_pick_folder,
         ])
         .run(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to run the Mnemo2 desktop host");

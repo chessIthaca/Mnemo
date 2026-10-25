@@ -7,6 +7,7 @@ import {
   createWorkers,
 } from "./mock";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
+import { createProjectTransport, type ProjectRecord } from "./projectEngine";
 import {
   applyLeadEvent,
   applyLeadSnapshot,
@@ -175,10 +176,25 @@ function updateWorker(
   };
 }
 
+function projectFromRecord(record: ProjectRecord): Project {
+  return {
+    id: record.path,
+    name: record.name,
+    path: record.path,
+    branch: "",
+    leadModel: "",
+    description: "",
+    lastSession: "",
+    workerSlots: 3,
+    budgetSpent: 0,
+    budgetLimit: 0,
+  };
+}
+
 function openProject(projectId: string) {
   const project = get(app).projects.find((item) => item.id === projectId);
   if (!project) {
-    app.update((state) => withToast(state, "That mock project does not exist."));
+    app.update((state) => withToast(state, "That project is not registered."));
     return;
   }
   leadSessionToken += 1;
@@ -193,6 +209,37 @@ function openProject(projectId: string) {
     toast: null,
   }));
   void connectNativeLead(project);
+}
+
+async function loadProjects(): Promise<void> {
+  const transport = createProjectTransport();
+  if (!transport) return;
+  try {
+    const records = await transport.list();
+    app.update((state) => ({
+      ...state,
+      projects: records.map(projectFromRecord),
+    }));
+  } catch (error) {
+    app.update((state) => withToast(state, `Could not load projects: ${leadError(error)}`));
+  }
+}
+
+async function openFolder(): Promise<void> {
+  const transport = createProjectTransport();
+  if (!transport) {
+    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    return;
+  }
+  try {
+    const folder = await transport.pickFolder();
+    if (!folder) return;
+    const record = await transport.add(folder);
+    await loadProjects();
+    openProject(record.path);
+  } catch (error) {
+    app.update((state) => withToast(state, `Could not open the folder: ${leadError(error)}`));
+  }
 }
 
 function closeProject() {
@@ -722,6 +769,8 @@ function resetDemo() {
 
 export const actions = {
   openProject,
+  loadProjects,
+  openFolder,
   closeProject,
   openLead,
   openTeam,

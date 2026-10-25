@@ -4,12 +4,13 @@
     GitBranch,
     GitMerge,
     LoaderCircle,
+    Pause,
+    Play,
     Send,
     Square,
     XCircle,
   } from "@lucide/svelte";
-  import { canMerge } from "../lib/review";
-  import { actions, currentProject } from "../lib/store";
+  import { actions } from "../lib/store";
   import { workerStatusLabel, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
@@ -21,7 +22,6 @@
   let reply = $state("");
   let lastWorkerId = "";
 
-  const eligibility = $derived(canMerge(worker));
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
   const workflow = $derived(deriveTaskWorkflow(worker));
 
@@ -62,7 +62,12 @@
     </div>
     <div class="worker-actions">
       <button class="button button-quiet" onclick={() => actions.steerWorker(worker.id)}>Steer</button>
-      <button class="button button-quiet" disabled={worker.status === "merged" || worker.status === "cancelled"} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
+      {#if worker.status === "working" || worker.status === "dispatching"}
+        <button class="button button-quiet" onclick={() => actions.pauseWorker(worker.id)}><Pause size={11} /> Pause</button>
+      {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
+        <button class="button button-quiet" onclick={() => actions.resumeWorker(worker.id)}><Play size={11} /> Resume</button>
+      {/if}
+      <button class="button button-quiet" disabled={worker.status === "stopped"} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
     </div>
   </header>
 
@@ -89,18 +94,14 @@
       <FindingsPanel {worker} />
 
       <section class="merge-panel">
-        {#if worker.merge}
-          {@const record = worker.merge}
-          <div class="merge-record">
-            <span class="merge-record-icon"><GitMerge size={18} /></span>
-            <div><p>MERGE RECORD</p><h3>Merged into {record.target}</h3><code>{record.commit} · {record.branch}</code><span>{record.reviewSummary} · {record.checks.length} check passed · ${record.cost.toFixed(2)}</span></div>
+        <div class="merge-decision">
+          <div>
+            <p>TEAMMANAGER · SERIALIZED MERGE</p>
+            <h3>Merge into the lead branch</h3>
+            <span>Phase 3 adds the real review gate, branch-tip checks, and the serialized merge. Nothing merges until then.</span>
           </div>
-        {:else}
-          <div class="merge-decision">
-            <div><p>TEAMMANAGER · SERIALIZED MERGE</p><h3>Merge into {$currentProject?.branch ?? "wt/mnemo"}</h3><span>{#if eligibility.ok}Review closed and checks passed on this tip. The lead is idle; the tree is clean.{:else}{eligibility.reason}{/if}</span></div>
-            <button class="button button-primary" aria-label="Merge reviewed branch" disabled={!eligibility.ok} onclick={() => actions.mergeWorker(worker.id)}><GitMerge size={14} /> Merge reviewed branch</button>
-          </div>
-        {/if}
+          <button class="button button-primary" aria-label="Merge reviewed branch" disabled={true} onclick={() => actions.mergeWorker(worker.id)}><GitMerge size={14} /> Merge reviewed branch</button>
+        </div>
       </section>
     {:else if tab === "thread"}
       <section class="thread-panel" aria-label={`${worker.name} worker conversation`}>
@@ -159,19 +160,13 @@
   .check-row div { flex: 1; }
   .check-row strong, .check-row small { display: block; }
   .check-row strong { font-size: 10px; font-weight: 600; }
-  .check-row small { margin-top: 3px; color: var(--muted); font-size: 8px; }
-  .check-row > span { color: var(--muted); font-size: 8px; }
+  .thread-message > span { color: var(--muted); font-size: 7px; letter-spacing: 0.07em; }
+
   .merge-decision { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-  .merge-decision p, .merge-record p { margin: 0 0 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.09em; }
-  .merge-decision h3, .merge-record h3 { margin: 0 0 4px; font-size: 12px; font-weight: 650; }
+  .merge-decision p { margin: 0 0 4px; color: var(--muted); font-size: 7px; letter-spacing: 0.09em; }
+  .merge-decision h3 { margin: 0 0 4px; font-size: 12px; font-weight: 650; }
   .merge-decision div > span { display: block; max-width: 360px; color: var(--muted); font-size: 8px; line-height: 1.45; }
   .merge-decision button { flex: 0 0 auto; }
-  .merge-record { display: flex; align-items: center; gap: 12px; }
-  .merge-record-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 11px; background: var(--accent-soft); color: var(--accent-strong); }
-  .merge-record code, .merge-record div > span { display: block; margin-top: 3px; color: var(--muted); font-family: var(--font-mono); font-size: 8px; }
-  .thread-messages { display: grid; gap: 12px; max-height: 330px; overflow-y: auto; padding: 4px; }
-  .thread-message { max-width: 88%; }
-  .thread-message > span { color: var(--muted); font-size: 7px; letter-spacing: 0.07em; }
   .thread-message p { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-prose); font-size: 13px; line-height: 1.5; }
   .thread-message.from-lead { margin-left: auto; }
   .thread-message.from-lead > span { display: block; text-align: right; }
@@ -187,6 +182,5 @@
   .timeline-step time { margin-left: 8px; color: var(--muted); font-size: 8px; }
   .timeline-step p { margin: 4px 0; color: var(--muted); font-size: 9px; }
   .timeline-step div > span { color: var(--muted); font-size: 7px; text-transform: uppercase; }
-  @media (max-width: 1100px) { .merge-decision { align-items: flex-start; flex-direction: column; } }
   @media (max-width: 620px) { .worker-detail { padding: 16px; } .worker-hero { flex-direction: column; } }
 </style>

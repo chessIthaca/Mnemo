@@ -327,6 +327,10 @@ export interface AppState {
   selectedWorkerId: string | null;
   teamPeekOpen: boolean;
   teamFilter: TeamFilter;
+  /** Real live-worker cap reported by the native team runtime. */
+  teamSlots: number;
+  /** Real count of live worker sessions. */
+  teamActive: number;
   workbenchOpen: boolean;
   workbenchTab: WorkbenchTab;
   workbenchWidth: number;

@@ -13,6 +13,7 @@ import type {
   AppState,
   Check,
   LeadAnswerInput,
+  LeadEntry,
   LeadEvent,
   Project,
   TeamFilter,
@@ -133,6 +134,8 @@ export function createInitialState(): AppState {
     selectedWorkerId: null,
     teamPeekOpen: false,
     teamFilter: "all",
+    teamSlots: 0,
+    teamActive: 0,
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
@@ -626,6 +629,28 @@ function workerFromRecord(
   };
 }
 
+function mergeTeamMessages(
+  entries: LeadEntry[],
+  messages: TeamMessage[],
+  workers: TeamWorkerRecord[],
+): LeadEntry[] {
+  const known = new Set(entries.map((entry) => entry.id));
+  const additions: LeadEntry[] = [];
+  for (const message of messages) {
+    const id = `team-${message.worker_id}-${message.at_ms}`;
+    if (known.has(id)) continue;
+    const worker = workers.find((item) => item.id === message.worker_id);
+    additions.push({
+      id,
+      kind: "team-message",
+      workerId: message.worker_id,
+      body: message.text,
+      time: worker?.name ?? new Date(message.at_ms).toLocaleTimeString(),
+    });
+  }
+  return additions.length > 0 ? [...entries, ...additions] : entries;
+}
+
 async function syncTeam(): Promise<void> {
   const transport = teamTransport;
   if (!transport) return;
@@ -641,6 +666,9 @@ async function syncTeam(): Promise<void> {
       workers: snapshot.workers.map((record, index) =>
         workerFromRecord(record, index, messages),
       ),
+      leadEntries: mergeTeamMessages(state.leadEntries, messages, snapshot.workers),
+      teamSlots: snapshot.slots,
+      teamActive: snapshot.active,
       selectedWorkerId:
         state.selectedWorkerId ?? snapshot.workers[0]?.id ?? null,
     }));

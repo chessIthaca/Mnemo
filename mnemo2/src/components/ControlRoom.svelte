@@ -1,23 +1,48 @@
 <script lang="ts">
   import { ListFilter, UsersRound } from "@lucide/svelte";
-  import { actions, app, currentProject, selectedWorker } from "../lib/store";
+  import { actions, app, selectedWorker } from "../lib/store";
   import type { Worker, WorkerStatus } from "../lib/types";
   import AvatarStack from "./AvatarStack.svelte";
   import WorkerDetail from "./WorkerDetail.svelte";
   import WorkerRow from "./WorkerRow.svelte";
 
   type WorkerGroup = { label: string; workers: Worker[] };
-  const activeStatuses: WorkerStatus[] = ["dispatching", "working", "in_review", "fixing", "merging"];
+  const activeStatuses: WorkerStatus[] = [
+    "dispatching",
+    "working",
+    "idle",
+    "paused",
+    "interrupted",
+    "in_review",
+    "fixing",
+    "merging",
+  ];
+  const doneStatuses: WorkerStatus[] = ["completed", "merged", "stopped", "cancelled"];
   const needsCount = $derived($app.workers.filter((worker) => worker.needsYou).length);
   const activeCount = $derived($app.workers.filter((worker) => activeStatuses.includes(worker.status)).length);
-  const doneCount = $derived($app.workers.filter((worker) => ["merged", "cancelled"].includes(worker.status)).length);
+  const doneCount = $derived($app.workers.filter((worker) => doneStatuses.includes(worker.status)).length);
+
+  let brief = $state("");
+  let dispatching = $state(false);
+
+  async function dispatch(event: SubmitEvent) {
+    event.preventDefault();
+    if (!brief.trim() || dispatching) return;
+    dispatching = true;
+    try {
+      await actions.dispatchWorker(brief);
+      brief = "";
+    } finally {
+      dispatching = false;
+    }
+  }
 
   const groups = $derived.by((): WorkerGroup[] => {
     const filter = $app.teamFilter;
     const filtered = $app.workers.filter((worker) => {
       if (filter === "needs") return worker.needsYou;
       if (filter === "active") return activeStatuses.includes(worker.status);
-      if (filter === "done") return ["merged", "cancelled"].includes(worker.status);
+      if (filter === "done") return doneStatuses.includes(worker.status);
       return true;
     });
     if (filter !== "all") {
@@ -26,30 +51,45 @@
     }
     return [
       { label: "Needs you", workers: filtered.filter((worker) => worker.needsYou) },
-      { label: "Working", workers: filtered.filter((worker) => ["dispatching", "working", "fixing", "merging"].includes(worker.status) && !worker.needsYou) },
-      { label: "In review", workers: filtered.filter((worker) => worker.status === "in_review" && !worker.needsYou) },
-      { label: "Done", workers: filtered.filter((worker) => ["merged", "cancelled"].includes(worker.status) && !worker.needsYou) },
+      {
+        label: "Active",
+        workers: filtered.filter(
+          (worker) => activeStatuses.includes(worker.status) && !worker.needsYou,
+        ),
+      },
+      {
+        label: "Done",
+        workers: filtered.filter(
+          (worker) => doneStatuses.includes(worker.status) && !worker.needsYou,
+        ),
+      },
     ].filter((group) => group.workers.length > 0);
   });
-
-  function updateSlots(event: Event) {
-    actions.setWorkerSlots((event.currentTarget as HTMLInputElement).valueAsNumber);
-  }
 </script>
 
 <section class="control-room" aria-label="Mission Control">
   <header class="control-header">
     <h1>Mission Control</h1>
     <div class="team-settings">
-      <label><span>Worker slots</span><input aria-label="Worker slots" type="number" min="1" step="1" value={$currentProject?.workerSlots ?? 1} onchange={updateSlots} /><small>per project</small></label>
-      <div class="room-budget"><span>Project budget <strong>${$currentProject?.budgetSpent.toFixed(2)} / ${$currentProject?.budgetLimit}</strong></span><div><span style={`width: ${(($currentProject?.budgetSpent ?? 0) / ($currentProject?.budgetLimit ?? 1)) * 100}%`}></span></div></div>
+      <span class="slot-pill">{$app.teamActive} live / {$app.teamSlots} slots</span>
     </div>
   </header>
+
+  <form class="dispatch-bar" onsubmit={dispatch}>
+    <input
+      bind:value={brief}
+      aria-label="New worker brief"
+      placeholder="Delegate a task - the worker gets its own branch and worktree"
+    />
+    <button class="button button-primary" type="submit" disabled={!brief.trim() || dispatching}>
+      {dispatching ? "Dispatching..." : "Dispatch"}
+    </button>
+  </form>
 
   <div class="control-summary">
     <AvatarStack workers={$app.workers} max={6} />
     <strong>{$app.workers.length} workers</strong>
-    <span>·</span><span>{$currentProject?.workerSlots} slots</span>
+    <span>·</span><span>{$app.teamActive} live · {$app.teamSlots} slots</span>
   </div>
 
   <div class="control-layout">
@@ -84,14 +124,10 @@
   .control-header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 24px 12px; }
   .control-header h1 { margin: 0; font-family: var(--font-prose); font-size: 28px; font-weight: 500; letter-spacing: -0.03em; }
   .team-settings { display: flex; align-items: center; gap: 18px; }
-  .team-settings label { display: grid; grid-template-columns: auto 58px; align-items: center; gap: 3px 8px; color: var(--ink-soft); font-size: 9px; }
-  .team-settings label small { grid-column: 1 / 3; color: var(--muted); font-size: 7px; text-align: right; }
-  .team-settings input { width: 58px; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: 10px; text-align: center; }
-  .room-budget { width: 160px; color: var(--muted); font-size: 8px; }
-  .room-budget > span { display: flex; justify-content: space-between; }
-  .room-budget strong { color: var(--ink-soft); font-weight: 550; }
-  .room-budget > div { height: 3px; margin-top: 7px; overflow: hidden; border-radius: 3px; background: var(--line); }
-  .room-budget > div span { display: block; height: 100%; background: var(--accent); }
+  .slot-pill { padding: 5px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: 9px; font-weight: 600; }
+  .dispatch-bar { display: flex; gap: 8px; padding: 0 24px 12px; }
+  .dispatch-bar input { flex: 1; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: 10px; }
+  .dispatch-bar button { flex: 0 0 auto; }
   .control-summary { display: flex; align-items: center; gap: 8px; padding: 0 24px 12px; color: var(--muted); font-size: 8px; }
   .control-summary strong { color: var(--ink-soft); font-size: 9px; font-weight: 600; }
   .control-layout { display: grid; flex: 1; min-height: 0; grid-template-columns: minmax(340px, 0.88fr) minmax(430px, 1.12fr); border-top: 1px solid var(--line); }
@@ -112,11 +148,10 @@
   .empty-detail { height: 100%; align-content: center; }
   .empty-detail h2 { margin: 12px 0 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: 22px; font-weight: 500; }
   @media (max-width: 980px) {
-    .control-header { align-items: flex-start; }
-    .room-budget { display: none; }
     .control-layout { grid-template-columns: minmax(290px, 0.8fr) minmax(360px, 1.2fr); }
     .control-summary > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   }
+
   @media (max-width: 760px) {
     .control-header { padding: 16px; }
     .control-header h1 { font-size: 26px; }

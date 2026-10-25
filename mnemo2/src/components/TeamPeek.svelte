@@ -1,29 +1,39 @@
 <script lang="ts">
   import { ArrowRight, X } from "@lucide/svelte";
-  import { actions, app, currentProject } from "../lib/store";
+  import { actions, app } from "../lib/store";
   import WorkerRow from "./WorkerRow.svelte";
 
   const needsYou = $derived($app.workers.filter((worker) => worker.needsYou));
-  const reviewing = $derived($app.workers.filter((worker) => worker.status === "in_review" && !worker.needsYou));
-  const working = $derived($app.workers.filter((worker) => ["working", "fixing", "merging", "dispatching"].includes(worker.status)));
+  const working = $derived(
+    $app.workers.filter((worker) =>
+      ["dispatching", "working", "idle"].includes(worker.status) && !worker.needsYou,
+    ),
+  );
+  const done = $derived(
+    $app.workers.filter((worker) =>
+      ["completed", "stopped", "cancelled", "merged"].includes(worker.status),
+    ),
+  );
 </script>
 
 <div class="peek-layer">
   <button class="peek-backdrop" aria-label="Close team peek" onclick={actions.toggleTeamPeek}></button>
   <aside class="team-peek" aria-label="Team peek">
     <header><div><p>THIS PROJECT</p><h2>Team</h2></div><button class="icon-button" aria-label="Close team peek" onclick={actions.toggleTeamPeek}><X size={15} /></button></header>
-    <div class="peek-budget"><span>Budget</span><strong>${$currentProject?.budgetSpent.toFixed(2)} <small>/ ${$currentProject?.budgetLimit}</small></strong><div><span style={`width: ${(($currentProject?.budgetSpent ?? 0) / ($currentProject?.budgetLimit ?? 1)) * 100}%`}></span></div></div>
+    <div class="peek-budget"><span>Live sessions</span><strong>{$app.teamActive} <small>/ {$app.teamSlots} slots</small></strong></div>
 
     <div class="peek-scroll">
       {#if needsYou.length > 0}
         <section><h3>Needs you <span>{needsYou.length}</span></h3>{#each needsYou as worker (worker.id)}<WorkerRow {worker} compact onSelect={actions.selectWorker} />{/each}</section>
       {/if}
-      {#if reviewing.length > 0}
-        <section><h3>In review <span>{reviewing.length}</span></h3>{#each reviewing as worker (worker.id)}<WorkerRow {worker} compact onSelect={actions.selectWorker} />{/each}</section>
+      {#if working.length > 0}
+        <section><h3>Active <span>{working.length}</span></h3>{#each working.slice(0, 5) as worker (worker.id)}<WorkerRow {worker} compact onSelect={actions.selectWorker} />{/each}</section>
       {/if}
-      <section><h3>Working <span>{working.length}</span></h3>{#each working.slice(0, 5) as worker (worker.id)}<WorkerRow {worker} compact onSelect={actions.selectWorker} />{/each}</section>
+      {#if done.length > 0}
+        <section><h3>Done <span>{done.length}</span></h3>{#each done.slice(0, 5) as worker (worker.id)}<WorkerRow {worker} compact onSelect={actions.selectWorker} />{/each}</section>
+      {/if}
     </div>
-    <footer><span>{$app.workers.length} workers · {$currentProject?.workerSlots} slots</span><button onclick={actions.openTeam}>Control room <ArrowRight size={13} /></button></footer>
+    <footer><span>{$app.workers.length} workers · {$app.teamActive} live / {$app.teamSlots} slots</span><button onclick={actions.openTeam}>Control room <ArrowRight size={13} /></button></footer>
   </aside>
 </div>
 
@@ -37,8 +47,6 @@
   .peek-budget { margin: 0 18px 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); color: var(--muted); font-size: 9px; }
   .peek-budget > strong { float: right; color: var(--ink-soft); font-weight: 550; }
   .peek-budget small { color: var(--muted); font-weight: 400; }
-  .peek-budget > div { height: 3px; margin-top: 9px; overflow: hidden; border-radius: 3px; background: var(--line); }
-  .peek-budget > div span { display: block; height: 100%; background: var(--accent); }
   .peek-scroll { flex: 1; overflow-y: auto; padding: 0 10px 10px; }
   section { margin-top: 12px; }
   section h3 { display: flex; justify-content: space-between; margin: 0 8px 5px; color: var(--muted); font-size: 8px; font-weight: 650; letter-spacing: 0.08em; text-transform: uppercase; }

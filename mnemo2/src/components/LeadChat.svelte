@@ -5,7 +5,6 @@
   import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
   import MergeCard from "./MergeCard.svelte";
-  import SpawnCard from "./SpawnCard.svelte";
 
   let scroller: HTMLDivElement;
   const leadModel = $derived(
@@ -71,8 +70,6 @@
                 <div class="user-meta">YOU · {entry.time}</div>
               {/if}
             </article>
-          {:else if entry.kind === "spawn"}
-            <SpawnCard {entry} />
           {:else if entry.kind === "team-message"}
             {@const worker = $app.workers.find((item) => item.id === entry.workerId)}
             <article class="team-card">

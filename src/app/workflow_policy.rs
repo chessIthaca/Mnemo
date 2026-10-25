@@ -30,6 +30,9 @@ pub struct WorkflowPolicy {
     /// the attach, or after the loop is dropped) reads as not-a-subagent,
     /// matching the flag's default.
     loop_ref: std::sync::OnceLock<std::sync::Weak<crate::agent::AgentLoop>>,
+    /// Tool names this policy must refuse outright (Mnemo2 blocks
+    /// `spawn_agent` so the lead cannot create untracked workers).
+    blocked_tools: Vec<String>,
 }
 
 impl WorkflowPolicy {
@@ -40,7 +43,15 @@ impl WorkflowPolicy {
         Self {
             workflow,
             loop_ref: std::sync::OnceLock::new(),
+            blocked_tools: Vec::new(),
         }
+    }
+
+    /// Add outright tool vetoes (Mnemo2 uses this to block `spawn_agent` so
+    /// the lead can only delegate through the tracked team runtime).
+    pub fn with_blocked_tools(mut self, blocked: Vec<String>) -> Self {
+        self.blocked_tools = blocked;
+        self
     }
     /// Attach the owning agent loop (2a.6). Idempotent: the first attach
     /// wins.
@@ -145,7 +156,14 @@ impl AgentPolicy for WorkflowPolicy {
             gate: Some(wf.allowed_tools()),
         }
     }
-    async fn gate_call(&self, _name: &str, _args: &Value) -> GateVerdict {
+    async fn gate_call(&self, name: &str, _args: &Value) -> GateVerdict {
+        if self.blocked_tools.iter().any(|blocked| blocked == name) {
+            return GateVerdict::Deny {
+                message: format!(
+                    "'{name}' is disabled in Mnemo2; use team_dispatch to delegate a tracked worker"
+                ),
+            };
+        }
         // 2a: Allow — the surface filter above does all of today's
         // enforcement work; the plan-mutation gate and the research-write
         // verdict keep their tool-side homes in dispatch.rs until 2b/2c

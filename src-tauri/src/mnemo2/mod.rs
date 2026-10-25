@@ -51,6 +51,14 @@ pub fn run() {
             ipc::lead_approve,
             ipc::lead_answer,
             ipc::lead_close,
+            ipc::team_snapshot,
+            ipc::team_dispatch,
+            ipc::team_message,
+            ipc::team_pause,
+            ipc::team_interrupt,
+            ipc::team_stop,
+            ipc::team_resume,
+            ipc::team_messages,
         ])
         .run(tauri::generate_context!("mnemo2-app/tauri.conf.json"))
         .expect("failed to run the Mnemo2 desktop host");

@@ -54,6 +54,8 @@ pub struct WorkflowPolicyFactory {
     codegraph: Option<Arc<crate::codegraph::CodeGraph>>,
     reviews_dir: std::path::PathBuf,
     skills: Option<Arc<crate::app::skill::SkillLibrary>>,
+    /// Tools the lead must refuse outright (Mnemo2 blocks `spawn_agent`).
+    blocked_tools: Vec<String>,
 }
 
 impl WorkflowPolicyFactory {
@@ -71,7 +73,14 @@ impl WorkflowPolicyFactory {
             codegraph,
             reviews_dir,
             skills,
+            blocked_tools: Vec::new(),
         }
+    }
+
+    /// Add outright tool vetoes for every policy this factory builds.
+    pub fn with_blocked_tools(mut self, blocked: Vec<String>) -> Self {
+        self.blocked_tools = blocked;
+        self
     }
 
     /// Wire in the shared backlog store that backs the `backlog_add` tool.
@@ -170,7 +179,9 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // The concrete policy stays app-side; the tail attach rides the
         // returned closure (the 2a.6 loop back-ref — idempotent OnceLock,
         // the first attach wins).
-        let policy = Arc::new(WorkflowPolicy::new(workflow));
+        let policy = Arc::new(
+            WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone()),
+        );
         let concrete: Arc<WorkflowPolicy> = Arc::clone(&policy);
         Ok(PolicyBuildResult {
             policy,

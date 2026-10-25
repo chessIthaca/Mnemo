@@ -20,12 +20,14 @@ use mnemo::app::worktrees::{
     agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
 use mnemo::headless::{
-    AgentSession, Engine, EventReceiver, Guardrails, PendingInteraction, QuestionPolicy,
-    SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions, ToolSelection,
-    Transcript, TurnEndPolicy,
+    AgentSession, Engine, EventReceiver, Guardrails, HostToolSpec, PendingInteraction,
+    QuestionPolicy, SessionCommand, SessionEvent, SessionId, SessionLimits, SpawnOptions,
+    ToolSelection, Transcript, TurnEndPolicy,
 };
+use mnemo::tool::{SafetyLevel, ToolResult};
 use mnemo::{PermissionPolicy, SerializableAgentEvent};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
@@ -147,6 +149,17 @@ pub struct TeamEvent {
     pub event: SessionEvent,
 }
 
+/// A worker-to-lead message routed through the `message_parent` host tool.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TeamMessage {
+    /// The worker that sent it.
+    pub worker_id: String,
+    /// The message text.
+    pub text: String,
+    /// Unix epoch milliseconds.
+    pub at_ms: u128,
+}
+
 /// Team startup options. The engine is the lead's shared handle.
 #[derive(Clone)]
 pub struct TeamRuntimeOptions {
@@ -222,6 +235,7 @@ pub struct TeamRuntime {
     workspace_root: PathBuf,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     live: Mutex<HashMap<String, LiveWorker>>,
+    messages: Arc<Mutex<Vec<TeamMessage>>>,
     events: broadcast::Sender<TeamEvent>,
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
@@ -254,6 +268,7 @@ impl TeamRuntime {
             workspace_root: options.workspace_root,
             records: Arc::new(Mutex::new(workers)),
             live: Mutex::new(HashMap::new()),
+            messages: Arc::new(Mutex::new(Vec::new())),
             events,
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
@@ -308,6 +323,126 @@ impl TeamRuntime {
             .find(|worker| worker.id == worker_id)
             .cloned()
             .ok_or_else(|| format!("unknown worker '{worker_id}'"))
+    }
+
+    /// Worker-to-lead messages received through `message_parent`.
+    pub async fn messages(&self) -> Vec<TeamMessage> {
+        self.messages.lock().await.clone()
+    }
+
+    /// The lead's team delegation/status host tools.
+    pub fn lead_host_tools(&self) -> Vec<HostToolSpec> {
+        vec![
+            HostToolSpec {
+                name: "team_dispatch".to_string(),
+                description: "Delegate a real coding task to a worker on its own branch and worktree."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "brief": {"type": "string"},
+                        "model": {"type": "string"}
+                    },
+                    "required": ["brief"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_message".to_string(),
+                description: "Send a message to a worker; a busy worker receives it as a steer."
+                    .to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "worker_id": {"type": "string"},
+                        "text": {"type": "string"}
+                    },
+                    "required": ["worker_id", "text"]
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_status".to_string(),
+                description: "Read the team snapshot, or one worker by id.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"worker_id": {"type": "string"}}
+                }),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+        ]
+    }
+
+    /// The worker's host tool for reporting back to the lead.
+    pub fn worker_host_tools(&self) -> Vec<HostToolSpec> {
+        vec![HostToolSpec {
+            name: "message_parent".to_string(),
+            description: "Send a short status or question to the lead.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            }),
+            safety: SafetyLevel::AutoRun,
+            timeout_ms: Some(10_000),
+        }]
+    }
+
+    /// Execute a lead host-tool call.
+    pub async fn handle_lead_host_tool(&self, name: &str, args: Value) -> ToolResult {
+        match name {
+            "team_dispatch" => {
+                let Some(brief) = args.get("brief").and_then(Value::as_str) else {
+                    return ToolResult::error("team_dispatch requires a 'brief' string");
+                };
+                let model = args.get("model").and_then(Value::as_str).map(str::to_string);
+                match self.dispatch(brief.to_string(), model).await {
+                    Ok(worker) => {
+                        let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
+                        ToolResult::success(format!(
+                            "dispatched {} on {}",
+                            worker.name, worker.branch
+                        ))
+                        .with_data(data)
+                    }
+                    Err(err) => ToolResult::error(err),
+                }
+            }
+            "team_message" => {
+                let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                    return ToolResult::error("team_message requires a 'worker_id' string");
+                };
+                let Some(text) = args.get("text").and_then(Value::as_str) else {
+                    return ToolResult::error("team_message requires a 'text' string");
+                };
+                match self.message(worker_id, text.to_string()).await {
+                    Ok(worker) => {
+                        let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
+                        ToolResult::success(format!("message sent to {}", worker.id)).with_data(data)
+                    }
+                    Err(err) => ToolResult::error(err),
+                }
+            }
+            "team_status" => match args.get("worker_id").and_then(Value::as_str) {
+                Some(worker_id) => match self.worker(worker_id).await {
+                    Ok(worker) => {
+                        let data = serde_json::to_value(&worker).unwrap_or(Value::Null);
+                        ToolResult::success(format!("worker {}", worker.id)).with_data(data)
+                    }
+                    Err(err) => ToolResult::error(err),
+                },
+                None => {
+                    let snapshot = self.snapshot().await;
+                    let data = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
+                    ToolResult::success(format!("{} worker(s)", snapshot.workers.len()))
+                        .with_data(data)
+                }
+            },
+            _ => ToolResult::error(format!("unknown team host tool '{name}'")),
+        }
     }
 
     async fn update_worker<F>(&self, worker_id: &str, update: F)
@@ -414,6 +549,7 @@ impl TeamRuntime {
             receiver,
             self.events.clone(),
             busy.clone(),
+            self.messages.clone(),
             self.records.clone(),
             self.persistence.clone(),
             self.generation.clone(),
@@ -467,7 +603,7 @@ impl TeamRuntime {
                 policy: None,
                 resume,
                 limits: None,
-                host_tools: Vec::new(),
+                host_tools: self.worker_host_tools(),
                 external_policy: None,
                 guardrails: Some(executor_guardrails()),
             })
@@ -618,6 +754,7 @@ impl TeamRuntime {
             receiver,
             self.events.clone(),
             busy.clone(),
+            self.messages.clone(),
             self.records.clone(),
             self.persistence.clone(),
             self.generation.clone(),
@@ -656,6 +793,49 @@ impl TeamRuntime {
     }
 }
 
+/// Handle a worker's host-tool call (`message_parent`) and return its result.
+async fn worker_host_tool_result(
+    messages: &Arc<Mutex<Vec<TeamMessage>>>,
+    worker_id: &str,
+    name: &str,
+    args: &Value,
+) -> ToolResult {
+    if name != "message_parent" {
+        return ToolResult::error(format!("unknown worker host tool '{name}'"));
+    }
+    let Some(text) = args.get("text").and_then(Value::as_str) else {
+        return ToolResult::error("message_parent requires a 'text' string");
+    };
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    messages.lock().await.push(TeamMessage {
+        worker_id: worker_id.to_string(),
+        text: text.to_string(),
+        at_ms,
+    });
+    ToolResult::success("message sent to the lead")
+}
+
+/// Send a host-tool result back to the worker session.
+async fn send_worker_host_result(
+    engine: &Arc<Engine>,
+    session_id: SessionId,
+    call_id: String,
+    result: ToolResult,
+) {
+    if let Some(session) = engine.session(&session_id).await {
+        let _ = session
+            .send(SessionCommand::HostToolResult {
+                call_id,
+                result: Some(result),
+                error: None,
+            })
+            .await;
+    }
+}
+
 /// Forward one worker session's events, update its durable record, and refresh
 /// the transcript when the turn ends.
 async fn pump_worker(
@@ -666,11 +846,16 @@ async fn pump_worker(
     mut receiver: EventReceiver<SessionEvent>,
     events: broadcast::Sender<TeamEvent>,
     busy: Arc<AtomicBool>,
+    messages: Arc<Mutex<Vec<TeamMessage>>>,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
     persistence: TeamPersistence,
     active_generation: Arc<AtomicU64>,
 ) {
     while let Ok(event) = receiver.recv().await {
+        if let SerializableAgentEvent::HostToolCall { call_id, name, args } = &event.event {
+            let result = worker_host_tool_result(&messages, &worker_id, name, args).await;
+            send_worker_host_result(&engine, session_id, call_id.clone(), result).await;
+        }
         let mut terminal = false;
         let mut changed = false;
         {
@@ -807,7 +992,7 @@ fn executor_limits() -> SessionLimits {
 /// The executor surface: a real coding agent that cannot plan, finish, spawn
 /// more agents, or ask the user — those are the lead's jobs.
 fn executor_guardrails() -> Guardrails {
-    let mut tools = ToolSelection::free_default();
+    let mut tools = ToolSelection::all();
     tools.exclude = vec![
         "create_plan".to_string(),
         "update_plan".to_string(),

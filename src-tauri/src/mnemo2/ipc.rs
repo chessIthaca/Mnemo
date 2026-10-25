@@ -36,12 +36,16 @@ use mnemo::{Approval, UserAnswer};
 use crate::mnemo2::runtime::{
     LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL,
 };
+use crate::mnemo2::team::{
+    TeamMessage, TeamRuntime, TeamSnapshot, WorkerRecord, TEAM_EVENT_CHANNEL,
+};
 
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
 pub struct Mnemo2State {
     runtime: Mutex<Option<Arc<LeadRuntime>>>,
     forwarder: Mutex<Option<JoinHandle<()>>>,
+    team_forwarder: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// The UI's approval decision on the wire.
@@ -100,6 +104,10 @@ async fn current(state: &Mnemo2State) -> Result<Arc<LeadRuntime>, String> {
         .ok_or_else(|| "Mnemo2 has no open lead; call lead_open first".to_string())
 }
 
+async fn current_team(state: &Mnemo2State) -> Result<Arc<TeamRuntime>, String> {
+    current(state).await?.team_handle().await
+}
+
 /// Open (or replace) the lead conversation on a project.
 #[tauri::command]
 pub async fn lead_open(
@@ -110,6 +118,9 @@ pub async fn lead_open(
     model: Option<String>,
 ) -> Result<LeadSnapshot, String> {
     if let Some(forwarder) = state.forwarder.lock().await.take() {
+        forwarder.abort();
+    }
+    if let Some(forwarder) = state.team_forwarder.lock().await.take() {
         forwarder.abort();
     }
     if let Some(old) = state.runtime.lock().await.take() {
@@ -142,8 +153,23 @@ pub async fn lead_open(
             }
         }
     });
+    let team = runtime.team_handle().await?;
+    let mut team_events = team.subscribe();
+    let team_app = app.clone();
+    let team_forwarder = tauri::async_runtime::spawn(async move {
+        loop {
+            match team_events.recv().await {
+                Ok(event) => {
+                    let _ = team_app.emit(TEAM_EVENT_CHANNEL, &event);
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     *state.runtime.lock().await = Some(runtime);
     *state.forwarder.lock().await = Some(forwarder);
+    *state.team_forwarder.lock().await = Some(team_forwarder);
     Ok(snapshot)
 }
 
@@ -200,10 +226,84 @@ pub async fn lead_answer(
         .await
 }
 
+/// Read the real team snapshot.
+#[tauri::command]
+pub async fn team_snapshot(state: State<'_, Mnemo2State>) -> Result<TeamSnapshot, String> {
+    Ok(current_team(&state).await?.snapshot().await)
+}
+
+/// Delegate a real task to a worker.
+#[tauri::command]
+pub async fn team_dispatch(
+    state: State<'_, Mnemo2State>,
+    brief: String,
+    model: Option<String>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.dispatch(brief, model).await
+}
+
+/// Send a lead message to a worker.
+#[tauri::command]
+pub async fn team_message(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    text: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .message(&worker_id, text)
+        .await
+}
+
+/// Pause a worker's current turn.
+#[tauri::command]
+pub async fn team_pause(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.pause(&worker_id).await
+}
+
+/// Interrupt a worker's current turn.
+#[tauri::command]
+pub async fn team_interrupt(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.interrupt(&worker_id).await
+}
+
+/// Stop a worker and keep its branch/worktree for audit.
+#[tauri::command]
+pub async fn team_stop(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.stop(&worker_id).await
+}
+
+/// Resume a stopped/interrupted worker from its transcript.
+#[tauri::command]
+pub async fn team_resume(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.resume(&worker_id).await
+}
+
+/// Read worker-to-lead messages.
+#[tauri::command]
+pub async fn team_messages(state: State<'_, Mnemo2State>) -> Result<Vec<TeamMessage>, String> {
+    Ok(current_team(&state).await?.messages().await)
+}
+
 /// Close the lead session and stop its event forwarder.
 #[tauri::command]
 pub async fn lead_close(state: State<'_, Mnemo2State>) -> Result<(), String> {
     if let Some(forwarder) = state.forwarder.lock().await.take() {
+        forwarder.abort();
+    }
+    if let Some(forwarder) = state.team_forwarder.lock().await.take() {
         forwarder.abort();
     }
     let runtime = state.runtime.lock().await.take();

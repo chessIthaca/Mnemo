@@ -21,12 +21,17 @@ use mnemo::headless::{
     SessionCommand, SessionEvent, SessionId, SpawnOptions, Transcript,
 };
 use mnemo::provider::LlmClient;
+use mnemo::tool::ToolResult;
 use mnemo::workspace::Workspace;
 use mnemo::app::policy_factory::WorkflowPolicyFactory;
 use mnemo::{Approval, PermissionPolicy, SerializableAgentEvent, UserAnswer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
+
+use crate::mnemo2::team::{
+    TeamRuntime, TeamRuntimeOptions, DEFAULT_SLOTS, DEFAULT_SPAWNS_PER_TURN,
+};
 
 /// The Tauri event channel name used by the IPC layer.
 pub const LEAD_EVENT_CHANNEL: &str = "mnemo2://lead-event";
@@ -170,6 +175,7 @@ pub struct LeadRuntime {
     models: Vec<LeadModel>,
     default_model: Option<String>,
     policy: Option<String>,
+    team: Mutex<Option<Arc<TeamRuntime>>>,
 }
 
 impl LeadRuntime {
@@ -229,8 +235,18 @@ impl LeadRuntime {
             models,
             default_model: configured_default,
             policy,
+            team: Mutex::new(None),
         };
         runtime.start_engine(provider).await?;
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: runtime.engine_handle().await?,
+            workspace_root: runtime.workspace_root.clone(),
+            state_dir: runtime.state_dir.clone(),
+            slots: DEFAULT_SLOTS,
+            max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
+        })
+        .await?;
+        *runtime.team.lock().await = Some(Arc::new(team));
         let live = runtime
             .spawn_live(1, selected, spawn_model, persisted.transcript)
             .await?;
@@ -266,6 +282,15 @@ impl LeadRuntime {
     /// The selected project root (for worker worktree provisioning).
     pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// The shared team runtime for this lead.
+    pub(crate) async fn team_handle(&self) -> Result<Arc<TeamRuntime>, String> {
+        self.team
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "the team runtime is not open".to_string())
     }
 
     /// The current lead state.
@@ -310,6 +335,9 @@ impl LeadRuntime {
     pub async fn send_prompt(&self, text: String) -> Result<(), String> {
         if text.trim().is_empty() {
             return Err("the prompt is empty".to_string());
+        }
+        if let Some(team) = self.team.lock().await.clone() {
+            team.begin_lead_turn();
         }
         let live = self.live.lock().await;
         let live = live
@@ -436,6 +464,9 @@ impl LeadRuntime {
 
     /// Stop the session and discard the engine handles.
     pub async fn shutdown(&self) {
+        if let Some(team) = self.team.lock().await.take() {
+            team.shutdown().await;
+        }
         let live = self.live.lock().await.take();
         if let Some(live) = live {
             live.abort();
@@ -470,7 +501,13 @@ impl LeadRuntime {
             .start()
             .await
             .map_err(|err| format!("could not start the headless engine: {err}"))?;
-        engine.register_policy("mnemo.workflow", Arc::new(WorkflowPolicyFactory::default()));
+        engine.register_policy(
+            "mnemo.workflow",
+            Arc::new(
+                WorkflowPolicyFactory::default()
+                    .with_blocked_tools(vec!["spawn_agent".to_string()]),
+            ),
+        );
         *self.engine.lock().await = Some(Arc::new(engine));
         Ok(())
     }
@@ -488,6 +525,11 @@ impl LeadRuntime {
             .await
             .clone()
             .ok_or_else(|| "the headless engine is not running".to_string())?;
+        let team = self.team.lock().await.clone();
+        let host_tools = team
+            .as_ref()
+            .map(|team| team.lead_host_tools())
+            .unwrap_or_default();
         let session = engine
             .spawn(SpawnOptions {
                     name: Some("Lead".to_string()),
@@ -497,7 +539,7 @@ impl LeadRuntime {
                     policy: self.policy.clone(),
                     resume: Some(resume),
                     limits: None,
-                    host_tools: Vec::new(),
+                    host_tools,
                     external_policy: None,
                     guardrails: None,
                 })
@@ -523,6 +565,7 @@ impl LeadRuntime {
             model.clone(),
             observed_model.clone(),
             self.generation.clone(),
+            team,
         ));
         Ok(LiveLead {
             generation,
@@ -532,6 +575,27 @@ impl LeadRuntime {
             observed_model,
             pump,
         })
+    }
+}
+
+/// Answer a lead host-tool call with its result.
+async fn send_lead_host_result(
+    engine: &Arc<Mutex<Option<Arc<Engine>>>>,
+    session_id: SessionId,
+    call_id: String,
+    result: ToolResult,
+) {
+    let engine = engine.lock().await.clone();
+    if let Some(engine) = engine {
+        if let Some(session) = engine.session(&session_id).await {
+            let _ = session
+                .send(SessionCommand::HostToolResult {
+                    call_id,
+                    result: Some(result),
+                    error: None,
+                })
+                .await;
+        }
     }
 }
 
@@ -546,8 +610,16 @@ async fn pump_events(
     model: Arc<Mutex<Option<String>>>,
     observed_model: Arc<Mutex<Option<String>>>,
     active_generation: Arc<AtomicU64>,
+    team: Option<Arc<TeamRuntime>>,
 ) {
     while let Ok(event) = receiver.recv().await {
+        if let SerializableAgentEvent::HostToolCall { call_id, name, args } = &event.event {
+            let result = match &team {
+                Some(team) => team.handle_lead_host_tool(name, args.clone()).await,
+                None => ToolResult::error("the team runtime is not available"),
+            };
+            send_lead_host_result(&engine, session_id, call_id.clone(), result).await;
+        }
         let terminal = match &event.event {
             SerializableAgentEvent::Started => {
                 busy.store(true, Ordering::SeqCst);
@@ -1366,6 +1438,55 @@ mod tests {
         let resumed = team.resume(&first.id).await.expect("resume");
         assert_eq!(resumed.status, WorkerStatus::Idle);
         let _ = team.stop(&first.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_message_parent_round_trips_to_the_lead_inbox() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_turn("message_parent", r#"{"text":"need the API key"}"#),
+            text_turn(&["done"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("the shared engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+        })
+        .await
+        .expect("the team opens");
+        let worker = team
+            .dispatch("ask for the key".to_string(), None)
+            .await
+            .expect("the worker dispatches");
+        let mut delivered = None;
+        for _ in 0..100 {
+            if let Some(message) = team.messages().await.into_iter().next() {
+                delivered = Some(message);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let message = delivered.expect("the worker message reaches the lead inbox");
+        assert_eq!(message.worker_id, worker.id);
+        assert_eq!(message.text, "need the API key");
+        assert!(
+            llm.calls() >= 2,
+            "the host-tool result drove a follow-up turn"
+        );
+        let _ = team.stop(&worker.id).await;
         team.shutdown().await;
         lead.shutdown().await;
     }

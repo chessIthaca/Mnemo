@@ -1,28 +1,23 @@
 import { derived, get, writable } from "svelte/store";
-import {
-  createDiffFiles,
-  createLeadEntries,
-  createPlanItems,
-  createProjects,
-  createWorkers,
-} from "./mock";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectRecord } from "./projectEngine";
+import { createTeamTransport, type TeamTransport } from "./teamEngine";
+import type { TeamMessage, TeamWorkerRecord } from "./teamState";
 import {
   applyLeadEvent,
   applyLeadSnapshot,
   initialLeadRuntime,
   leadEventNeedsSnapshot,
 } from "./leadState";
-import { canMerge } from "./review";
 import type {
   AppState,
+  Check,
   LeadAnswerInput,
   LeadEvent,
-  MergeRecord,
   Project,
   TeamFilter,
   Worker,
+  WorkerStatus,
   WorkbenchTab,
 } from "./types";
 
@@ -32,6 +27,11 @@ const nextId = (prefix: string) => `${prefix}-${++sequence}`;
 let leadTransport: LeadTransport | null = null;
 let leadUnlisten: (() => void) | null = null;
 let leadSessionToken = 0;
+
+let teamTransport: TeamTransport | null = null;
+let teamUnlisten: (() => void) | null = null;
+let teamToken = 0;
+let teamSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
 function leadError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -123,23 +123,22 @@ async function connectNativeLead(project: Project): Promise<void> {
 }
 
 export function createInitialState(): AppState {
-  const workers = createWorkers();
   return {
     route: "start",
     projectId: null,
-    projects: createProjects(),
-    workers,
-    leadEntries: createLeadEntries(workers),
+    projects: [],
+    workers: [],
+    leadEntries: [],
     leadRuntime: initialLeadRuntime(),
-    selectedWorkerId: "ana",
+    selectedWorkerId: null,
     teamPeekOpen: false,
     teamFilter: "all",
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
     browserUrl: "http://localhost:5180/settings",
-    planItems: createPlanItems(),
-    diffFiles: createDiffFiles(),
+    planItems: [],
+    diffFiles: [],
     toast: null,
   };
 }
@@ -199,16 +198,20 @@ function openProject(projectId: string) {
   }
   leadSessionToken += 1;
   void stopNativeLead();
+  void disconnectTeam();
   app.update((state) => ({
     ...state,
     route: "lead",
     projectId,
     leadRuntime: initialLeadRuntime(),
+    workers: [],
+    selectedWorkerId: null,
     teamPeekOpen: false,
     workbenchOpen: false,
     toast: null,
   }));
   void connectNativeLead(project);
+  void connectTeam();
 }
 
 async function loadProjects(): Promise<void> {
@@ -245,11 +248,14 @@ async function openFolder(): Promise<void> {
 function closeProject() {
   leadSessionToken += 1;
   void stopNativeLead();
+  void disconnectTeam();
   app.update((state) => ({
     ...state,
     route: "start",
     projectId: null,
     leadRuntime: initialLeadRuntime(),
+    workers: [],
+    selectedWorkerId: null,
     teamPeekOpen: false,
     workbenchOpen: false,
   }));
@@ -390,24 +396,16 @@ function sendLeadMessage(body: string) {
     void sendNativeLeadMessage(message);
     return;
   }
+  // Browser-only Vite sessions have no engine behind them. Keep the typed
+  // message, but never fabricate a lead reply.
   app.update((current) => ({
-    ...current,
+    ...withToast(
+      current,
+      "This build has no native shell; open Mnemo2's desktop app to run the lead.",
+    ),
     leadEntries: [
       ...current.leadEntries,
-      {
-        id: nextId("user"),
-        kind: "message",
-        author: "user",
-        body: message,
-        time: "now",
-      },
-      {
-        id: nextId("lead"),
-        kind: "message",
-        author: "lead",
-        body: "Understood — I’ll keep that in the **plan of record**. For this clickable phase, open **Team → Ana** to resolve the two findings and produce a new merge record.",
-        time: "now",
-      },
+      { id: nextId("user"), kind: "message", author: "user", body: message, time: "now" },
     ],
   }));
 }
@@ -485,27 +483,27 @@ function retryLead() {
   void connectNativeLead(project);
 }
 
+function requireTeam(): TeamTransport | null {
+  if (!teamTransport) {
+    app.update((state) => withToast(state, "The native team runtime is not connected."));
+    return null;
+  }
+  return teamTransport;
+}
+
+function noteTeamError(error: unknown): void {
+  app.update((state) => withToast(state, leadError(error)));
+}
+
 function replyWorker(workerId: string, body: string) {
   const message = body.trim();
   if (!message) return;
-  app.update((state) =>
-    updateWorker(state, workerId, (worker) => ({
-      ...worker,
-      status: worker.status === "failed" || worker.status === "conflict" ? "working" : worker.status,
-      needsYou: false,
-      lastActivity: "now",
-      messages: [
-        ...worker.messages,
-        { id: nextId("lead-reply"), from: "lead", body: message, time: "now" },
-        {
-          id: nextId("worker-ack"),
-          from: "worker",
-          body: "Got it — I’ll fold that into the current branch and report back with checks.",
-          time: "now",
-        },
-      ],
-    })),
-  );
+  const transport = requireTeam();
+  if (!transport) return;
+  void transport
+    .message(workerId, message)
+    .then(() => syncTeam())
+    .catch(noteTeamError);
 }
 
 function steerWorker(workerId: string) {
@@ -513,236 +511,183 @@ function steerWorker(workerId: string) {
     workerId,
     "Steer: keep the current scope, avoid unrelated edits, and surface any conflict before continuing.",
   );
-  app.update((state) => withToast(state, "Steering note added to the worker thread."));
+}
+
+async function dispatchWorker(brief: string, model?: string | null): Promise<void> {
+  const transport = requireTeam();
+  if (!transport) return;
+  const task = brief.trim();
+  if (!task) return;
+  try {
+    await transport.dispatch(task, model ?? null);
+    await syncTeam();
+  } catch (error) {
+    noteTeamError(error);
+  }
 }
 
 function stopWorker(workerId: string) {
-  app.update((state) => {
-    const worker = state.workers.find((item) => item.id === workerId);
-    if (!worker) return state;
-    if (worker.status === "merged") return withToast(state, "A merged worker cannot be stopped.");
-    return withToast(
-      updateWorker(state, workerId, (item) => ({
-        ...item,
-        status: "cancelled",
-        needsYou: false,
-        fixerFindingId: undefined,
-        lastActivity: "now",
-      })),
-      `${worker.name} stopped. No branch changes were made in this prototype.`,
-    );
-  });
+  const transport = requireTeam();
+  if (!transport) return;
+  void transport
+    .stop(workerId)
+    .then(() => syncTeam())
+    .catch(noteTeamError);
 }
 
-function fixFinding(workerId: string, findingId: string) {
-  app.update((state) => {
-    const worker = state.workers.find((item) => item.id === workerId);
-    const finding = worker?.findings.find((item) => item.id === findingId);
-    if (!worker || !finding || finding.status !== "open") return state;
-
-    return withToast(
-      updateWorker(state, workerId, (item) => ({
-        ...item,
-        status: "in_review",
-        checks: [{ name: "cargo test --workspace", status: "passed", detail: "review_fix tip · 38s" }],
-        findings: item.findings.map((entry) =>
-          entry.id === findingId
-            ? {
-                ...entry,
-                status: "fixed",
-                fixCommit: `review-${findingId}`,
-                evidence: "Lead review_fix · affected checks re-run",
-              }
-            : entry,
-        ),
-      })),
-      "Tiny review fix applied and the merge-time checks passed again.",
-    );
-  });
+function pauseWorker(workerId: string) {
+  const transport = requireTeam();
+  if (!transport) return;
+  void transport
+    .pause(workerId)
+    .then(() => syncTeam())
+    .catch(noteTeamError);
 }
 
-function spawnFixer(workerId: string, findingId: string) {
-  app.update((state) => {
-    const worker = state.workers.find((item) => item.id === workerId);
-    const finding = worker?.findings.find((item) => item.id === findingId);
-    if (!worker || !finding || finding.status !== "open") return state;
-
-    return withToast(
-      updateWorker(state, workerId, (item) => ({
-        ...item,
-        status: "fixing",
-        needsYou: false,
-        fixerFindingId: findingId,
-        lastActivity: "now",
-        checks: [{ name: "cargo test --workspace", status: "running", detail: "Fixer branch tip" }],
-        timeline: [
-          ...item.timeline.map((step) =>
-            step.status === "active" ? { ...step, status: "done" as const } : step,
-          ),
-          {
-            id: nextId("fixer-step"),
-            label: "Fixer applying review delta",
-            detail: finding.title,
-            status: "active",
-          },
-        ],
-        messages: [
-          ...item.messages,
-          {
-            id: nextId("fixer-message"),
-            from: "lead",
-            body: `Fixer brief: ${finding.title}. Stay on ${item.branch}; re-run the affected checks.`,
-            time: "now",
-          },
-        ],
-      })),
-      `Fixer dispatched on ${worker.branch}.`,
-    );
-  });
+function resumeWorker(workerId: string) {
+  const transport = requireTeam();
+  if (!transport) return;
+  void transport
+    .resume(workerId)
+    .then(() => syncTeam())
+    .catch(noteTeamError);
 }
 
-function completeFixer(workerId: string, findingId: string) {
-  app.update((state) => {
-    const worker = state.workers.find((item) => item.id === workerId);
-    const finding = worker?.findings.find((item) => item.id === findingId);
-    if (!worker || !finding || finding.status !== "open" || worker.status !== "fixing" || worker.fixerFindingId !== findingId) {
-      return state;
-    }
+function phaseThree(action: string) {
+  app.update((state) =>
+    withToast(state, `${action} lands with the real review/merge runtime in Phase 3.`),
+  );
+}
 
-    const next = updateWorker(state, workerId, (item) => ({
-      ...item,
-      status: "in_review",
-      needsYou: true,
-      fixerFindingId: undefined,
-      lastActivity: "now",
-      checks: [{ name: "cargo test --workspace", status: "passed", detail: "Fixer tip · 41s" }],
-      findings: item.findings.map((entry) =>
-        entry.id === findingId
-          ? {
-              ...entry,
-              status: "fixed",
-              fixCommit: `fixer-${findingId}`,
-              evidence: "Fixer delta reviewed · affected checks re-run",
-            }
-          : entry,
+function fixFinding(_workerId: string, _findingId: string) {
+  phaseThree("Applying a review fix");
+}
+
+function spawnFixer(_workerId: string, _findingId: string) {
+  phaseThree("Dispatching a fixer");
+}
+
+function completeFixer(_workerId: string, _findingId: string) {
+  phaseThree("Completing a fixer round");
+}
+
+function wontfixFinding(_workerId: string, _findingId: string, _justification: string) {
+  phaseThree("Marking a finding wontfix");
+}
+
+function mergeWorker(_workerId: string) {
+  phaseThree("Merging a worker branch");
+}
+
+function workerFromRecord(
+  record: TeamWorkerRecord,
+  index: number,
+  messages: TeamMessage[],
+): Worker {
+  const status = record.status as WorkerStatus;
+  return {
+    id: record.id,
+    name: record.name,
+    initials: record.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "W",
+    hue: (index * 47 + 12) % 360,
+    task: record.brief,
+    summary: record.error ?? "",
+    status,
+    model: record.model_id ?? record.model ?? "",
+    branch: record.branch,
+    worktree: record.worktree,
+    files: [],
+    tokens: record.used_tokens,
+    cost: 0,
+    elapsed: "",
+    turns: 0,
+    progress: status === "completed" ? 100 : 0,
+    lastActivity: "now",
+    needsYou: record.status === "needs_you" || record.pending != null,
+    checks: record.checks.map((check) => ({
+      name: check.name,
+      status:
+        check.status === "passed" || check.status === "failed"
+          ? (check.status as Check["status"])
+          : "running",
+      detail: check.detail ?? "",
+    })),
+    findings: [],
+    messages: messages
+      .filter((message) => message.worker_id === record.id)
+      .map((message) => ({
+        id: `team-${message.worker_id}-${message.at_ms}`,
+        from: "worker",
+        body: message.text,
+        time: "now",
+      })),
+    timeline: [],
+    diff: { files: 0, additions: 0, deletions: 0 },
+  };
+}
+
+async function syncTeam(): Promise<void> {
+  const transport = teamTransport;
+  if (!transport) return;
+  const token = teamToken;
+  try {
+    const [snapshot, messages] = await Promise.all([
+      transport.snapshot(),
+      transport.messages(),
+    ]);
+    if (token !== teamToken) return;
+    app.update((state) => ({
+      ...state,
+      workers: snapshot.workers.map((record, index) =>
+        workerFromRecord(record, index, messages),
       ),
-      timeline: [
-        ...item.timeline.map((step) =>
-          step.status === "active" ? { ...step, status: "done" as const } : step,
-        ),
-        {
-          id: nextId("review-step"),
-          label: "Lead re-review",
-          detail: "Delta verified; ready for merge decision",
-          status: "active",
-        },
-      ],
+      selectedWorkerId:
+        state.selectedWorkerId ?? snapshot.workers[0]?.id ?? null,
     }));
-
-    return withToast(
-      {
-        ...next,
-        leadEntries: [
-          ...state.leadEntries,
-          {
-            id: nextId("review"),
-            kind: "review",
-            workerId,
-            title: `Fixer delta verified · ${worker.name}`,
-            body: finding.title,
-            time: "now",
-          },
-        ],
-      },
-      "Fixer commit verified. The worker is ready for the lead merge decision.",
-    );
-  });
+  } catch (error) {
+    if (token === teamToken) noteTeamError(error);
+  }
 }
 
-function wontfixFinding(workerId: string, findingId: string, justification: string) {
-  const reason = justification.trim();
-  app.update((state) => {
-    if (!reason) return withToast(state, "A written justification is required for wontfix.");
-    const worker = state.workers.find((item) => item.id === workerId);
-    const finding = worker?.findings.find((item) => item.id === findingId);
-    if (!worker || !finding || finding.status !== "open") return state;
-
-    return withToast(
-      updateWorker(state, workerId, (item) => ({
-        ...item,
-        status: "in_review",
-        findings: item.findings.map((entry) =>
-          entry.id === findingId ? { ...entry, status: "wontfix", justification: reason } : entry,
-        ),
-      })),
-      "Finding marked wontfix with a written justification.",
-    );
-  });
+function scheduleTeamSync(): void {
+  if (teamSyncTimer) return;
+  teamSyncTimer = setTimeout(() => {
+    teamSyncTimer = null;
+    void syncTeam();
+  }, 120);
 }
 
-function reviewSummary(worker: Worker): string {
-  if (worker.findings.length === 0) return "No findings";
-  const fixed = worker.findings.filter((finding) => finding.status === "fixed").length;
-  const wontfix = worker.findings.filter((finding) => finding.status === "wontfix").length;
-  return `${worker.findings.length} findings · ${fixed} fixed · ${wontfix} wontfix`;
+async function disconnectTeam(): Promise<void> {
+  teamToken += 1;
+  if (teamSyncTimer) {
+    clearTimeout(teamSyncTimer);
+    teamSyncTimer = null;
+  }
+  const unlisten = teamUnlisten;
+  teamUnlisten = null;
+  unlisten?.();
+  teamTransport = null;
 }
 
-function mergeWorker(workerId: string) {
-  app.update((state) => {
-    const worker = state.workers.find((item) => item.id === workerId);
-    if (!worker) return state;
-    const eligibility = canMerge(worker);
-    if (!eligibility.ok) return withToast(state, eligibility.reason);
-
-    const project = state.projects.find((item) => item.id === state.projectId);
-    const record: MergeRecord = {
-      id: nextId("merge"),
-      workerId,
-      commit: `demo-${workerId}-merge`,
-      branch: worker.branch,
-      target: project?.branch ?? "wt/mnemo",
-      files: worker.diff.files,
-      additions: worker.diff.additions,
-      deletions: worker.diff.deletions,
-      checks: worker.checks.map((check) => check.name),
-      reviewSummary: reviewSummary(worker),
-      model: worker.model,
-      cost: worker.cost,
-      time: "now",
-    };
-
-    const next = updateWorker(state, workerId, (item) => ({
-      ...item,
-      status: "merged",
-      needsYou: false,
-      progress: 100,
-      lastActivity: "now",
-      merge: record,
-      timeline: [
-        ...item.timeline.map((step) =>
-          step.status === "active" ? { ...step, status: "done" as const } : step,
-        ),
-        {
-          id: nextId("merge-step"),
-          label: "Merged by TeamManager",
-          detail: `${item.branch} → ${record.target}`,
-          status: "done",
-          time: "now",
-        },
-      ],
-    }));
-
-    return withToast(
-      {
-        ...next,
-        leadEntries: [
-          ...state.leadEntries,
-          { id: nextId("entry-merge"), kind: "merge", workerId, record, time: "now" },
-        ],
-      },
-      `Merged into ${record.target}. The record is now in the lead chat.`,
-    );
-  });
+async function connectTeam(): Promise<void> {
+  const transport = createTeamTransport();
+  if (!transport) return;
+  await disconnectTeam();
+  const token = teamToken;
+  teamTransport = transport;
+  try {
+    const unlisten = await transport.onEvent(() => {
+      if (token === teamToken) scheduleTeamSync();
+    });
+    if (token !== teamToken) {
+      unlisten();
+      return;
+    }
+    teamUnlisten = unlisten;
+    await syncTeam();
+  } catch (error) {
+    if (token === teamToken) noteTeamError(error);
+  }
 }
 
 function setWorkerSlots(workerSlots: number) {
@@ -764,6 +709,7 @@ function dismissToast() {
 function resetDemo() {
   leadSessionToken += 1;
   void stopNativeLead();
+  void disconnectTeam();
   app.set(createInitialState());
 }
 
@@ -789,9 +735,13 @@ export const actions = {
   answerLead,
   setLeadModel,
   retryLead,
+  dispatchWorker,
   replyWorker,
   steerWorker,
   stopWorker,
+  pauseWorker,
+  resumeWorker,
+  syncTeam,
   fixFinding,
   spawnFixer,
   completeFixer,

@@ -5,6 +5,12 @@ export type TeamFilter = "all" | "needs" | "active" | "done";
 export type WorkerStatus =
   | "dispatching"
   | "working"
+  | "needs_you"
+  | "idle"
+  | "paused"
+  | "interrupted"
+  | "completed"
+  | "stopped"
   | "in_review"
   | "fixing"
   | "merging"
@@ -16,6 +22,12 @@ export type WorkerStatus =
 export const workerStatusLabel: Record<WorkerStatus, string> = {
   dispatching: "Dispatching",
   working: "Working",
+  needs_you: "Needs you",
+  idle: "Idle",
+  paused: "Paused",
+  interrupted: "Interrupted",
+  completed: "Completed",
+  stopped: "Stopped",
   in_review: "In review",
   fixing: "Fixing",
   merging: "Merging",

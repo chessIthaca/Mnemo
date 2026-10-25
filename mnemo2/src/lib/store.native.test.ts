@@ -12,6 +12,7 @@ vi.mock("./leadEngine", () => ({
 }));
 
 import { actions, app } from "./store";
+import { fixtureState } from "../test/fixtures";
 
 function snapshot(generation = 1): LeadSnapshot {
   return {
@@ -79,7 +80,7 @@ function makeTransport(initial: LeadSnapshot) {
 describe("native lead store path", () => {
   beforeEach(() => {
     mockState.transport = null;
-    actions.resetDemo();
+    app.set(fixtureState());
   });
 
   it("opens, streams, interrupts, and changes models through the transport", async () => {
@@ -126,13 +127,16 @@ describe("native lead store path", () => {
     expect(get(app).leadRuntime.generation).toBe(2);
   });
 
-  it("keeps the browser mock when no native transport exists", async () => {
+  it("never fabricates a lead reply when no native transport exists", async () => {
     actions.openProject("mnemo");
     await Promise.resolve();
     expect(get(app).leadRuntime.mode).toBe("mock");
     const before = get(app).leadEntries.length;
     actions.sendLeadMessage("hello");
-    expect(get(app).leadEntries.length).toBe(before + 2);
+    // The user's message is kept; no simulated lead answer is invented.
+    expect(get(app).leadEntries.length).toBe(before + 1);
+    expect(get(app).leadEntries.at(-1)).toMatchObject({ author: "user", body: "hello" });
+    expect(get(app).toast?.message).toMatch(/native shell/i);
   });
 
   it("stays in mock mode when another Tauri host does not answer the handshake", async () => {

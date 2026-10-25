@@ -1,113 +1,71 @@
 import { get } from "svelte/store";
 import { beforeEach, describe, expect, it } from "vitest";
-import { actions, app } from "./store";
+import { actions, app, createInitialState } from "./store";
+import { fixtureState } from "../test/fixtures";
 
 const state = () => get(app);
-const worker = (id: string) => state().workers.find((item) => item.id === id)!;
 
-describe("Mnemo2 mock workflow", () => {
-  beforeEach(() => {
-    actions.resetDemo();
-    actions.openProject("mnemo");
+describe("Mnemo2 store production state", () => {
+  it("starts empty — no seeded projects, workers, or activity", () => {
+    const initial = createInitialState();
+    expect(initial.projects).toEqual([]);
+    expect(initial.workers).toEqual([]);
+    expect(initial.leadEntries).toEqual([]);
+    expect(initial.planItems).toEqual([]);
+    expect(initial.diffFiles).toEqual([]);
+    expect(initial.selectedWorkerId).toBeNull();
   });
 
-  it("starts with ten workers and configurable project worker slots", () => {
-    expect(state().workers).toHaveLength(10);
-    expect(state().workers.some((item) => item.name === "Lead")).toBe(false);
+  it("never fabricates a lead reply without the native shell", () => {
+    app.set(fixtureState());
+    actions.openProject("mnemo");
+    const before = state().leadEntries.length;
+    actions.sendLeadMessage("Keep the review flow quiet and explicit.");
+    expect(state().leadEntries).toHaveLength(before + 1);
+    expect(state().leadEntries.at(-1)).toMatchObject({ author: "user" });
+    expect(state().toast?.message).toMatch(/native shell/i);
+  });
 
-    actions.setWorkerSlots(12);
-    expect(state().projects.find((project) => project.id === "mnemo")?.workerSlots).toBe(12);
+  it("refuses team actions when the native team runtime is absent", () => {
+    app.set(fixtureState());
+    const before = state().workers.length;
+    actions.replyWorker("ana", "status?");
+    expect(state().workers).toHaveLength(before);
+    expect(state().toast?.message).toMatch(/team runtime/i);
+  });
 
+  it("does not simulate Phase 3 review, fixer, or merge work", () => {
+    app.set(fixtureState());
+    actions.openProject("mnemo");
+    const before = state().workers.map((worker) => worker.status);
+
+    actions.fixFinding("ana", "ana-copy");
+    actions.spawnFixer("ana", "ana-copy");
+    actions.completeFixer("ana", "ana-copy");
+    actions.wontfixFinding("ana", "ana-merge", "separate ticket");
+    actions.mergeWorker("ana");
+
+    expect(state().workers.map((worker) => worker.status)).toEqual(before);
+    expect(state().workers.find((worker) => worker.id === "ana")?.merge).toBeUndefined();
+    expect(state().toast?.message).toMatch(/Phase 3/);
+  });
+
+  it("keeps the conversation-first navigation", () => {
+    app.set(fixtureState());
+    actions.openProject("mnemo");
     actions.openWorkbench("diff");
     actions.openTeam();
     expect(state().route).toBe("team");
     expect(state().workbenchOpen).toBe(false);
+    expect(state().leadEntries.length).toBeGreaterThan(0);
   });
 
-  it("adds a user message and a concise lead response", () => {
-    const count = state().leadEntries.length;
-    actions.sendLeadMessage("Keep the review flow quiet and explicit.");
-    const entries = state().leadEntries;
-    expect(entries).toHaveLength(count + 2);
-    expect(entries.at(-2)).toMatchObject({ kind: "message", author: "user" });
-    expect(entries.at(-1)).toMatchObject({ kind: "message", author: "lead" });
-  });
-
-  it("blocks merge while Ana has an open finding", () => {
-    const count = state().leadEntries.length;
-    actions.mergeWorker("ana");
-    expect(worker("ana").status).toBe("in_review");
-    expect(worker("ana").merge).toBeUndefined();
-    expect(state().leadEntries).toHaveLength(count);
-    expect(state().toast?.message).toContain("open");
-  });
-
-  it("walks tiny fix, fixer delta, re-review, and merge record", () => {
-    actions.fixFinding("ana", "ana-copy");
-    expect(worker("ana").findings.find((finding) => finding.id === "ana-copy")?.status).toBe("fixed");
-
-    actions.spawnFixer("ana", "ana-merge");
-    expect(worker("ana").status).toBe("fixing");
-    actions.mergeWorker("ana");
-    expect(worker("ana").merge).toBeUndefined();
-
-    actions.completeFixer("ana", "ana-merge");
-    expect(worker("ana").status).toBe("in_review");
-    expect(worker("ana").checks[0].status).toBe("passed");
-
-    actions.mergeWorker("ana");
-    expect(worker("ana").status).toBe("merged");
-    expect(worker("ana").merge?.reviewSummary).toBe("2 findings · 2 fixed · 0 wontfix");
-    expect(state().leadEntries.at(-1)).toMatchObject({ kind: "merge", workerId: "ana" });
-  });
-
-  it("requires justification for wontfix but then permits merge", () => {
-    actions.fixFinding("ana", "ana-copy");
-    actions.wontfixFinding("ana", "ana-merge", "   ");
-    expect(worker("ana").findings.find((finding) => finding.id === "ana-merge")?.status).toBe("open");
-
-    actions.wontfixFinding("ana", "ana-merge", "Tracked separately; this mock only demonstrates the guard.");
-    actions.mergeWorker("ana");
-    expect(worker("ana").status).toBe("merged");
-    expect(worker("ana").merge?.reviewSummary).toContain("1 wontfix");
-  });
-
-  it("routes a conflicted worker back to work and supports stop", () => {
-    const count = worker("theo").messages.length;
-    actions.replyWorker("theo", "Keep the lead version and reapply only the adapter delta.");
-    expect(worker("theo").status).toBe("working");
-    expect(worker("theo").messages).toHaveLength(count + 2);
-
-    actions.stopWorker("theo");
-    expect(worker("theo").status).toBe("cancelled");
-  });
-
-  it("only completes the fixer's targeted finding", () => {
-    actions.spawnFixer("ana", "ana-copy");
-    expect(worker("ana").status).toBe("fixing");
-    expect(worker("ana").fixerFindingId).toBe("ana-copy");
-
-    actions.completeFixer("ana", "ana-merge");
-    expect(worker("ana").status).toBe("fixing");
-    expect(worker("ana").findings.find((finding) => finding.id === "ana-merge")?.status).toBe("open");
-
-    actions.completeFixer("ana", "ana-copy");
-    expect(worker("ana").status).toBe("in_review");
-    expect(worker("ana").fixerFindingId).toBeUndefined();
-    expect(worker("ana").findings.find((finding) => finding.id === "ana-copy")?.status).toBe("fixed");
-  });
-
-  it("keeps a dispatched fixer target through a steer reply", () => {
-    actions.spawnFixer("ana", "ana-copy");
-    actions.replyWorker("ana", "Keep going with the fix.");
-    expect(worker("ana").status).toBe("fixing");
-    expect(worker("ana").fixerFindingId).toBe("ana-copy");
-
-    actions.completeFixer("ana", "ana-copy");
-    expect(worker("ana").status).toBe("in_review");
-  });
-
-  it("ships Milo with a completable fixer target", () => {
-    expect(worker("milo").fixerFindingId).toBe("milo-focus");
+  it("closes a project back to the empty start route", () => {
+    app.set(fixtureState());
+    actions.openProject("mnemo");
+    actions.closeProject();
+    expect(state().route).toBe("start");
+    expect(state().projectId).toBeNull();
+    expect(state().workers).toEqual([]);
   });
 });

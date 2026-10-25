@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createWorkers } from "./mock";
+import { createWorkers } from "../test/fixtures";
 import { canMerge, isLeadTinyEdit, leadEditViolation } from "./review";
 
 const files = (count: number, changedLines = 10) =>

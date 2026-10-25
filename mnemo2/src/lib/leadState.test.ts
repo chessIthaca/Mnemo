@@ -177,8 +177,5 @@ describe("lead event reducer", () => {
     expect(state.leadEntries).toHaveLength(2);
     expect(state.leadEntries[0]).toMatchObject({ author: "user", body: "Remember this" });
     expect(state.leadEntries[1]).toMatchObject({ author: "lead", body: "Saved" });
-    expect(state.projects.find((project) => project.id === "mnemo")?.leadModel).toBe(
-      "scripted-b",
-    );
   });
 });

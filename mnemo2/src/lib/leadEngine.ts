@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { isTauriRuntime } from "./runtime";
 import type {
   LeadAnswerInput,
   LeadEvent,
   LeadSnapshot,
 } from "./types";
+
+export { isTauriRuntime };
 
 /** The one event channel emitted by the Mnemo2 host. */
 export const LEAD_EVENT_CHANNEL = "mnemo2://lead-event";
@@ -36,11 +39,7 @@ export interface LeadTransportBindings {
   listen: typeof listen;
 }
 
-/** Whether the page is running inside a Tauri WebView. */
-export function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
+/** Build the native transport from the real Tauri bindings. */
 /** Build the native transport from the real Tauri bindings. */
 export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadTransport {
   return {

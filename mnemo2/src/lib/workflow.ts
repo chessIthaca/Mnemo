@@ -139,5 +139,34 @@ export function deriveTaskWorkflow(worker: Worker): TaskWorkflow {
       steps.review = { status: "done", detail: "Review closed" };
       steps.merge = { status: "done", detail: `Merged into ${worker.merge?.target ?? "the lead branch"}` };
       return build(worker, steps, "merge", "done");
+
+    // Real Phase 2 runtime states. Review and merge stay queued: their real
+    // gates land with Phase 3, so nothing here pretends they happened.
+    case "needs_you":
+      steps.implement = { status: "active", detail: "Waiting on a lead answer" };
+      return build(worker, steps, "implement", "blocked");
+
+    case "idle":
+      steps.implement = { status: "active", detail: "Session live, waiting for a message" };
+      return build(worker, steps, "implement", "active");
+
+    case "paused":
+      steps.implement = { status: "active", detail: "Paused by the lead" };
+      return build(worker, steps, "implement", "blocked");
+
+    case "interrupted":
+      steps.implement = { status: "active", detail: "Turn interrupted" };
+      return build(worker, steps, "implement", "blocked");
+
+    case "completed":
+      steps.implement = { status: "done", detail: "Worker turn finished" };
+      steps.verify = verifyState(worker);
+      steps.review = { status: "pending", detail: "Phase 3 review gate" };
+      steps.merge = { status: "pending", detail: "Phase 3 merge gate" };
+      return build(worker, steps, "verify", "active");
+
+    case "stopped":
+      steps.implement = { status: "blocked", detail: "Stopped by the lead; branch kept" };
+      return build(worker, steps, "implement", "blocked");
   }
 }

@@ -66,7 +66,6 @@
           <div class="settings-row"><div><strong>Team default</strong><small>Per-task overrides</small></div><span class="settings-value">glm-5.3-flash</span></div>
   <div class="settings-row"><div><strong>Merge policy</strong><small>Checks and review must close on the merge-time tip; merges are serialized into this project’s working branch.</small></div><span class="settings-value settings-ok">Guarded</span></div>
   <div class="settings-actions">
-    <button class="button button-quiet" onclick={() => { settingsOpen = false; actions.resetDemo(); }}>Replay prototype</button>
     <button class="button button-primary" onclick={() => (settingsOpen = false)}>Done</button>
   </div>
 </Sheet>

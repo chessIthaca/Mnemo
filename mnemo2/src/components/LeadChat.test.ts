@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it } from "vitest";
 import { actions, app } from "../lib/store";
+import { fixtureState } from "../test/fixtures";
 import { initialLeadRuntime } from "../lib/leadState";
 import LeadChat from "./LeadChat.svelte";
 
@@ -19,7 +20,7 @@ function setRuntime(patch: Partial<ReturnType<typeof initialLeadRuntime>>) {
 
 describe("LeadChat", () => {
   beforeEach(() => {
-    actions.resetDemo();
+    app.set(fixtureState());
     actions.openProject("mnemo");
   });
 

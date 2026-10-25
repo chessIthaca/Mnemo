@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createWorkers } from "./mock";
+import { createWorkers } from "../test/fixtures";
 import { deriveTaskWorkflow } from "./workflow";
 import type { Worker } from "./types";
 

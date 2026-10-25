@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
+import { fixtureState } from "../test/fixtures";
 import { initialLeadRuntime } from "../lib/leadState";
 import Composer from "./Composer.svelte";
 
@@ -30,7 +31,7 @@ function setLead(busy: boolean, status: "ready" | "opening" = "ready") {
 
 describe("Composer", () => {
   beforeEach(() => {
-    actions.resetDemo();
+    app.set(fixtureState());
   });
 
   afterEach(() => {

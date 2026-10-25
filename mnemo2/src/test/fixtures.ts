@@ -1,4 +1,5 @@
 import type {
+  AppState,
   Check,
   DiffFile,
   LeadEntry,
@@ -6,7 +7,8 @@ import type {
   Project,
   TimelineStep,
   Worker,
-} from "./types";
+} from "../lib/types";
+import { createInitialState } from "../lib/store";
 
 const passingChecks = (): Check[] => [
   {
@@ -522,4 +524,23 @@ export function createDiffFiles(): DiffFile[] {
       ],
     },
   ];
+}
+/**
+ * A complete, already-opened fixture state for tests only; production starts
+ * empty. Component tests render straight from this (no `openProject`, which
+ * correctly clears workers until the real team sync repopulates them).
+ */
+export function fixtureState(): AppState {
+  const workers = createWorkers();
+  return {
+    ...createInitialState(),
+    route: "lead",
+    projectId: "mnemo",
+    projects: createProjects(),
+    workers,
+    leadEntries: createLeadEntries(workers),
+    selectedWorkerId: "ana",
+    planItems: createPlanItems(),
+    diffFiles: createDiffFiles(),
+  };
 }

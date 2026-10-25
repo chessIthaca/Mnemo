@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { isTauriRuntime } from "./leadEngine";
+import { isTauriRuntime } from "./runtime";
 
 /** One real project from the shared `projects.toml` registry. */
 export interface ProjectRecord {

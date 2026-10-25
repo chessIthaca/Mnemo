@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
+import { fixtureState } from "../test/fixtures";
 import { initialLeadRuntime } from "../lib/leadState";
 import LeadModelPicker from "./LeadModelPicker.svelte";
 
@@ -36,7 +37,7 @@ function nativeState(busy = false) {
 
 describe("LeadModelPicker", () => {
   beforeEach(() => {
-    actions.resetDemo();
+    app.set(fixtureState());
   });
 
   afterEach(() => {

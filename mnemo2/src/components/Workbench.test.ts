@@ -2,13 +2,14 @@ import { fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
 import { beforeEach, describe, expect, it } from "vitest";
 import { actions, app } from "../lib/store";
+import { fixtureState } from "../test/fixtures";
 import Workbench from "./Workbench.svelte";
 
 const state = () => get(app);
 
 describe("Workbench", () => {
   beforeEach(() => {
-    actions.resetDemo();
+    app.set(fixtureState());
     actions.openProject("mnemo");
     actions.openWorkbench("diff");
   });

@@ -282,6 +282,43 @@ describe("LeadChat", () => {
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
   });
 
+  it("renders inline team updates and reviews as Markdown", async () => {
+    setLeadEntries([
+      {
+        id: "team-markdown",
+        kind: "team-message",
+        time: "now",
+        workerId: "ana",
+        body: "Worker **update**",
+      },
+      {
+        id: "review-markdown",
+        kind: "review",
+        time: "now",
+        workerId: "ana",
+        title: "Review complete",
+        body: "Finding `F-1` is **closed**.",
+      },
+    ]);
+    render(LeadChat);
+    flushFrame();
+    await act();
+
+    expect((await screen.findByText("update")).tagName).toBe("STRONG");
+    expect((await screen.findByText("closed")).tagName).toBe("STRONG");
+    expect(screen.getByText("F-1").tagName).toBe("CODE");
+  });
+
+  it("uses the available lead width instead of a centered fixed column", () => {
+    const { container } = render(LeadChat);
+    const content = container.querySelector(".lead-content");
+    expect(content).not.toBeNull();
+    const style = getComputedStyle(content!);
+    expect(style.width).toBe("100%");
+    expect(style.marginLeft).toBe("0px");
+    expect(style.marginRight).toBe("0px");
+  });
+
   it("does not follow new activity after the user scrolls up", async () => {
     setRuntime({ busy: true });
     setLeadEntries([toolEntry()]);

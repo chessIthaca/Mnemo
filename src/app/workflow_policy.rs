@@ -15,13 +15,15 @@ use crate::agent::policy::{
     AgentPolicy, Continuation, GateVerdict, KernelPromptBlocks, PolicyBuildCtx, PromptHook,
     RoleSpec, RouteKey, SpendTags, ToolSurface,
 };
+use crate::app::workflow::{Workflow, WorkflowState};
 use crate::project::Constitution;
 use crate::provider::Capabilities;
 use crate::tool::{ToolRegistry, ToolResult};
-use crate::app::workflow::{Workflow, WorkflowState};
 
-/// The workflow agent's policy — byte-identical behavior to the pre-2a
-/// direct reads (acceptance :785-788).
+const MNEMO2_TEAM_APPEND: &str = "\n\nMNEMO2 TEAM RULES:\n- Generic spawn_agent is unavailable. Delegate implementation only through team_dispatch; coordinate tracked workers with team_message and team_status.\n- Record reviews with team_review and only checks you actually ran with team_check. Close findings with evidence or a written wontfix justification. Every fix commit requires affected checks and a fresh delta review.\n- Use review_fix only for one-file, non-test source edits; route larger findings with team_route_fix.\n- Call team_merge only after exact-tip checks pass and every finding closes. TeamManager performs the app-level merge into the non-main lead branch; never call git merge or git push yourself. team_revert_merge is available only before landing.\n";
+
+/// The workflow agent's policy — pre-2a direct-read behavior, with scoped
+/// Mnemo2 tool vetoes and team guidance.
 pub struct WorkflowPolicy {
     pub(crate) workflow: Arc<Mutex<Workflow>>,
     /// The owning agent loop, attached by the factory once the loop is
@@ -134,7 +136,11 @@ pub fn build_route_key(
 #[async_trait]
 impl AgentPolicy for WorkflowPolicy {
     fn stable_head(&self, k: &KernelPromptBlocks, c: &Constitution) -> String {
-        crate::agent::policy::assemble_stable_head(k, c)
+        let mut head = crate::agent::policy::assemble_stable_head(k, c);
+        if self.blocked_tools.iter().any(|name| name == "spawn_agent") {
+            head.push_str(MNEMO2_TEAM_APPEND);
+        }
+        head
     }
     fn register_tools(&self, _reg: &mut ToolRegistry, _ctx: &PolicyBuildCtx) {
         // D5: registration stays kernel-called in 2a (factory fns run as today).
@@ -203,8 +209,7 @@ impl AgentPolicy for WorkflowPolicy {
         // Some SETS the flag outright). tail_rewrite stays None in 2a —
         // the plan nudge is kernel-side same-turn (turn.rs :3524); it
         // rides this hook in later phases.
-        let unattended =
-            Some(text.starts_with(crate::runtime::channels::UNATTENDED_PROMPT_PREFIX));
+        let unattended = Some(text.starts_with(crate::runtime::channels::UNATTENDED_PROMPT_PREFIX));
         PromptHook {
             unattended,
             tail_rewrite: None,
@@ -218,10 +223,8 @@ impl AgentPolicy for WorkflowPolicy {
         // the synthetic-continue message kernel-side.
         let wf = self.workflow.lock().await;
         let state = wf.state();
-        if matches!(
-            state,
-            WorkflowState::Executing | WorkflowState::Reviewing
-        ) || (t.unattended && state == WorkflowState::Planning)
+        if matches!(state, WorkflowState::Executing | WorkflowState::Reviewing)
+            || (t.unattended && state == WorkflowState::Planning)
         {
             Continuation::Continue { note: None }
         } else {
@@ -482,7 +485,10 @@ pub(crate) fn workflow_section(workflow: &Workflow) -> String {
             if let Some(plan) = workflow.plan() {
                 let parents = workflow.parent_titles();
                 if parents.is_empty() {
-                    s.push_str(&format!("PARENT PLAN (read-only context): {}\n", plan.title));
+                    s.push_str(&format!(
+                        "PARENT PLAN (read-only context): {}\n",
+                        plan.title
+                    ));
                 } else {
                     s.push_str(&format!(
                         "PARENT PLAN (read-only context, depth {}): {} ▸ {}\n",
@@ -503,4 +509,30 @@ pub(crate) fn workflow_section(workflow: &Workflow) -> String {
     }
 
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mnemo2_prompt_append_is_scoped_to_the_blocked_spawn_policy() {
+        let dir = tempfile::tempdir().expect("workflow dir");
+        let policy = WorkflowPolicy::new(Arc::new(Mutex::new(Workflow::new(
+            dir.path().to_path_buf(),
+        ))))
+        .with_blocked_tools(vec!["spawn_agent".to_string()]);
+        let head = policy.stable_head(&KernelPromptBlocks::workflow(), &Constitution::default());
+        assert!(head.contains("MNEMO2 TEAM RULES"));
+        assert!(head.contains("Generic spawn_agent is unavailable"));
+        assert!(head.contains("team_merge"));
+        assert!(head.contains("never call git merge or git push"));
+
+        let ordinary = WorkflowPolicy::new(Arc::new(Mutex::new(Workflow::new(
+            dir.path().to_path_buf(),
+        ))));
+        let ordinary_head =
+            ordinary.stable_head(&KernelPromptBlocks::workflow(), &Constitution::default());
+        assert!(!ordinary_head.contains("MNEMO2 TEAM RULES"));
+    }
 }

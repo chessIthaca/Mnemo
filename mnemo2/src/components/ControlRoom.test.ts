@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import ControlRoom from "./ControlRoom.svelte";
@@ -44,7 +44,7 @@ describe("Mission Control", () => {
     expect(screen.getByRole("button", { name: /^Review/ }).getAttribute("aria-pressed")).toBe("false");
   });
 
-  it("keeps review and merge disabled until the Phase 3 runtime exists", async () => {
+  it("gates merge on real evidence without simulating review actions", async () => {
     render(ControlRoom);
     await fireEvent.click(screen.getByRole("button", { name: /^Review/ }));
     const merge = screen.getByRole("button", { name: "Merge reviewed branch" }) as HTMLButtonElement;
@@ -53,8 +53,48 @@ describe("Mission Control", () => {
     await fireEvent.click(
       screen.getByRole("button", { name: "Fix tiny finding: Give the merge action an accessible name" }),
     );
-    expect(screen.queryByText("MERGE RECORD")).toBeNull();
-    expect(get(app).toast?.message).toMatch(/Phase 3/);
+    expect(screen.getByLabelText("Existing text")).toBeTruthy();
+    expect(screen.getByLabelText("Replacement")).toBeTruthy();
+    expect(screen.queryByText(/mock fixer/i)).toBeNull();
+
+    app.update((state) => ({
+      ...state,
+      workers: state.workers.map((worker) =>
+        worker.id === "ana"
+          ? {
+              ...worker,
+              findings: worker.findings.map((finding) => ({
+                ...finding,
+                status: "fixed" as const,
+                evidence: "verified on the fix commit",
+              })),
+            }
+          : worker,
+      ),
+    }));
+    await vi.waitFor(() => expect(merge.disabled).toBe(false));
+    await fireEvent.click(merge);
+    expect(get(app).toast?.message).toMatch(/team runtime/i);
+    expect(get(app).workers.find((worker) => worker.id === "ana")?.merge).toBeUndefined();
+  });
+
+  it("renders worker thread messages as sanitized Markdown", async () => {
+    const workers = fixtureState().workers;
+    workers[0].messages = [{
+      id: "markdown-worker",
+      from: "worker",
+      body: "**Implemented** with `team_dispatch`.",
+      time: "now",
+    }];
+    app.set(fixtureState());
+    app.update((state) => ({ ...state, workers }));
+    actions.openTeam();
+
+    render(ControlRoom);
+    const strong = await screen.findByText("Implemented");
+    expect(strong.tagName).toBe("STRONG");
+    expect(screen.getByText("team_dispatch").tagName).toBe("CODE");
+    expect(screen.queryByText(/\*\*Implemented\*\*/)).toBeNull();
   });
 
   it("does not expose Diff as a per-worker action", async () => {

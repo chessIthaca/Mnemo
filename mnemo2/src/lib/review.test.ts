@@ -45,7 +45,11 @@ describe("merge eligibility", () => {
 
     const ready = {
       ...ana,
-      findings: ana.findings.map((finding) => ({ ...finding, status: "fixed" as const })),
+      findings: ana.findings.map((finding) => ({
+        ...finding,
+        status: "fixed" as const,
+        evidence: "verified on the fix commit",
+      })),
     };
     expect(canMerge(ready)).toEqual({ ok: true });
 
@@ -54,6 +58,11 @@ describe("merge eligibility", () => {
       checks: [{ name: "workspace tests", status: "running" as const, detail: "running" }],
     };
     expect(canMerge(stale).ok).toBe(false);
+    expect(canMerge({ ...ready, checks: [] }).ok).toBe(false);
+    expect(canMerge({
+      ...ready,
+      checks: ready.checks.map((check) => ({ ...check, tip: "older-tip" })),
+    }).ok).toBe(false);
   });
 
   it("requires written justification for every wontfix finding", () => {

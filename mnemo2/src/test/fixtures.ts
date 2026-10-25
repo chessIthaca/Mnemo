@@ -10,11 +10,12 @@ import type {
 } from "../lib/types";
 import { createInitialState } from "../lib/store";
 
-const passingChecks = (): Check[] => [
+const passingChecks = (tip?: string): Check[] => [
   {
     name: "cargo test --workspace",
     status: "passed",
     detail: "Merge-time tip · 38s",
+    tip,
   },
 ];
 
@@ -58,6 +59,7 @@ function makeWorker(input: WorkerInput): Worker {
     worktree: `.worktrees/agent-${id}`,
     files: [],
     tokens: 8400,
+    tokenBudget: 200_000,
     cost: 0.48,
     elapsed: "9m",
     turns: 3,
@@ -133,6 +135,12 @@ export function createWorkers(): Worker[] {
       lastActivity: "4m ago",
       needsYou: true,
       diff: { files: 5, additions: 184, deletions: 32 },
+      checks: passingChecks("tip-ana"),
+      review: {
+        summary: "Two findings need resolution before merge.",
+        tip: "tip-ana",
+        reviewedAtMs: 1_787_400_000_000,
+      },
       findings: [
         {
           id: "ana-copy",
@@ -325,6 +333,7 @@ export function createWorkers(): Worker[] {
         checks: ["cargo test --workspace"],
         reviewSummary: "2 findings · 1 fixed · 1 wontfix",
         model: "glm-5.3-flash",
+        tokens: 9840,
         cost: 0.76,
         time: "09:26",
       },

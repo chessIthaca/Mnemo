@@ -1,25 +1,57 @@
 <script lang="ts">
   import { Check, CircleAlert, Wrench, X } from "@lucide/svelte";
   import { actions } from "../lib/store";
-  import type { Worker } from "../lib/types";
+  import type { Finding, Worker } from "../lib/types";
 
   let { worker }: { worker: Worker } = $props();
-  let wontfixId = $state<string | null>(null);
+  type FormKind = "tiny" | "evidence" | "wontfix";
+  let findingId = $state<string | null>(null);
+  let formKind = $state<FormKind | null>(null);
+  let oldString = $state("");
+  let newString = $state("");
   let reason = $state("");
 
   $effect(() => {
     worker.id;
-    wontfixId = null;
+    findingId = null;
+    formKind = null;
+    oldString = "";
+    newString = "";
     reason = "";
   });
 
-  function submitWontfix() {
-    if (!wontfixId) return;
-    actions.wontfixFinding(worker.id, wontfixId, reason);
-    if (reason.trim()) {
-      wontfixId = null;
-      reason = "";
-    }
+  function openForm(id: string, kind: FormKind) {
+    findingId = id;
+    formKind = kind;
+    oldString = "";
+    newString = "";
+    reason = "";
+  }
+
+  function closeForm() {
+    findingId = null;
+    formKind = null;
+    oldString = "";
+    newString = "";
+    reason = "";
+  }
+
+  async function submitTiny(finding: Finding) {
+    if (!oldString || oldString === newString) return;
+    await actions.fixFinding(worker.id, finding.id, oldString, newString);
+    closeForm();
+  }
+
+  async function submitFixed(finding: Finding) {
+    if (!reason.trim()) return;
+    await actions.resolveFinding(worker.id, finding.id, "fixed", reason, null);
+    closeForm();
+  }
+
+  async function submitWontfix(finding: Finding) {
+    if (!reason.trim()) return;
+    await actions.wontfixFinding(worker.id, finding.id, reason);
+    closeForm();
   }
 </script>
 
@@ -39,27 +71,40 @@
       <p>{finding.detail}</p>
 
       {#if finding.status === "fixed"}
-        <div class="resolution"><Check size={12} /><span>Fixed · <code>{finding.fixCommit}</code>{finding.evidence ? ` · ${finding.evidence}` : ""}</span></div>
+        <div class="resolution"><Check size={12} /><span>Fixed{#if finding.fixCommit} · <code>{finding.fixCommit}</code>{/if}{finding.evidence ? ` · ${finding.evidence}` : ""}</span></div>
       {:else if finding.status === "wontfix"}
         <div class="resolution"><X size={12} /><span>Wontfix · {finding.justification}</span></div>
       {:else if worker.status === "fixing" && worker.fixerFindingId === finding.id}
-        <div class="finding-actions">
-          <button class="button button-primary" aria-label={`Apply mock fixer result: ${finding.title}`} onclick={() => actions.completeFixer(worker.id, finding.id)}><Wrench size={13} /> Apply mock fixer result</button>
-          <span>Simulates the fixer commit, affected checks, and lead delta review.</span>
-        </div>
+        <div class="finding-actions"><span>The tracked worker is fixing this finding. Verify its commit, record the affected checks, and close it with evidence after delta review.</span></div>
       {:else if worker.status === "fixing"}
-        <div class="finding-actions"><span>Fixer is working another finding; this one waits for the next pass.</span></div>
+        <div class="finding-actions"><span>The worker is fixing another finding; this one waits for the next pass.</span></div>
       {:else}
         <div class="finding-actions">
-          <button class="button button-quiet" aria-label={`Fix tiny finding: ${finding.title}`} title="Lead review_fix · up to 5 files × 10 lines, or one larger single-file edit" onclick={() => actions.fixFinding(worker.id, finding.id)}><Wrench size={13} /> Fix tiny</button>
-          <button class="button button-quiet" aria-label={`Spawn fixer: ${finding.title}`} onclick={() => actions.spawnFixer(worker.id, finding.id)}>Spawn fixer</button>
-          <button class="text-action" onclick={() => { wontfixId = wontfixId === finding.id ? null : finding.id; reason = ""; }}>Wontfix</button>
+          <button class="button button-quiet" aria-label={`Fix tiny finding: ${finding.title}`} title="One existing non-test source file; no schema, API, or dependency changes" onclick={() => openForm(finding.id, "tiny")}><Wrench size={13} /> Fix tiny</button>
+          <button class="button button-quiet" aria-label={`Spawn fixer: ${finding.title}`} onclick={() => actions.spawnFixer(worker.id, finding.id)}>Route to worker</button>
+          <button class="text-action" onclick={() => openForm(finding.id, "evidence")}>Close with evidence</button>
+          <button class="text-action" onclick={() => openForm(finding.id, "wontfix")}>Wontfix</button>
         </div>
-        {#if wontfixId === finding.id}
-          <div class="wontfix-form">
+        {#if findingId === finding.id && formKind === "tiny"}
+          <div class="finding-form">
+            <code>{finding.file}</code>
+            <label for={`old-${finding.id}`}>Existing text</label>
+            <textarea id={`old-${finding.id}`} bind:value={oldString} rows="3"></textarea>
+            <label for={`new-${finding.id}`}>Replacement</label>
+            <textarea id={`new-${finding.id}`} bind:value={newString} rows="3"></textarea>
+            <div><button class="button button-quiet" onclick={closeForm}>Cancel</button><button class="button button-primary" disabled={!oldString || oldString === newString} onclick={() => submitTiny(finding)}>Apply review_fix</button></div>
+          </div>
+        {:else if findingId === finding.id && formKind === "evidence"}
+          <div class="finding-form">
+            <label for={`evidence-${finding.id}`}>Verification evidence</label>
+            <textarea id={`evidence-${finding.id}`} bind:value={reason} rows="3" placeholder="Commit and checks that prove this finding is fixed"></textarea>
+            <div><button class="button button-quiet" onclick={closeForm}>Cancel</button><button class="button button-primary" disabled={!reason.trim()} onclick={() => submitFixed(finding)}>Close fixed</button></div>
+          </div>
+        {:else if findingId === finding.id && formKind === "wontfix"}
+          <div class="finding-form">
             <label for={`reason-${finding.id}`}>Written justification</label>
             <textarea id={`reason-${finding.id}`} bind:value={reason} rows="2" placeholder="Why is this finding intentionally not being fixed?"></textarea>
-            <div><button class="button button-quiet" onclick={() => { wontfixId = null; reason = ""; }}>Cancel</button><button class="button button-primary" onclick={submitWontfix}>Confirm wontfix</button></div>
+            <div><button class="button button-quiet" onclick={closeForm}>Cancel</button><button class="button button-primary" disabled={!reason.trim()} onclick={() => submitWontfix(finding)}>Confirm wontfix</button></div>
           </div>
         {/if}
       {/if}
@@ -92,10 +137,11 @@
   .resolution { display: flex; align-items: flex-start; gap: 6px; margin-top: 10px; color: var(--accent-strong); font-size: 8px; line-height: 1.5; }
   .resolution :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .resolution code { font-family: var(--font-mono); }
-  .wontfix-form { margin-top: 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); }
-  .wontfix-form label { display: block; margin-bottom: 6px; color: var(--ink-soft); font-size: 9px; font-weight: 600; }
-  .wontfix-form textarea { width: 100%; resize: vertical; padding: 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-size: 10px; }
-  .wontfix-form > div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 8px; }
+  .finding-form { margin-top: 12px; padding: 12px; border-radius: 10px; background: var(--surface-soft); }
+  .finding-form > code { display: block; margin-bottom: 8px; color: var(--muted); font-family: var(--font-mono); font-size: 8px; }
+  .finding-form label { display: block; margin: 8px 0 6px; color: var(--ink-soft); font-size: 9px; font-weight: 600; }
+  .finding-form textarea { width: 100%; resize: vertical; padding: 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-family: var(--font-mono); font-size: 10px; }
+  .finding-form > div { display: flex; justify-content: flex-end; gap: 7px; margin-top: 8px; }
   .empty-findings { display: flex; align-items: center; gap: 8px; padding: 18px 0; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; }
   .review-closed { display: flex; align-items: center; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--accent-strong); font-size: 9px; }
 </style>

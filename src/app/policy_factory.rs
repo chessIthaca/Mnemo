@@ -10,24 +10,22 @@
 //! the kernel never names the app's wiring types at the trait (master-spec
 //! :255-258; the D5 register pattern: kernel-called, app-owned).
 
-use tokio::sync::Mutex;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::agent::policy::{
-    AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult,
-    PolicyFactoryCtx,
+    AgentPolicyFactory, KernelError, PolicyBuildCtx, PolicyBuildResult, PolicyFactoryCtx,
 };
 use crate::app::backlog::BacklogStore;
 use crate::app::tool::workflow::ask_user::AskUserTool;
 use crate::app::tool::workflow::backlog::{BacklogAddTool, BacklogListTool, BacklogStatusTool};
-use crate::app::workflow::Workflow;
 use crate::app::tool::workflow::plan::{
-    AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool,
-    UpdatePlanTool,
+    AbandonPlanTool, CompleteStepTool, CreatePlanTool, CurrentPlanTool, FinishTool, UpdatePlanTool,
 };
 use crate::app::tool::workflow::skill::{
     AbandonSkillTool, SkillCreateTool, SkillEndTool, SkillReloadTool, SkillStartTool,
 };
+use crate::app::workflow::Workflow;
 use crate::app::workflow_policy::WorkflowPolicy;
 use crate::tool::ToolRegistry;
 
@@ -154,10 +152,7 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         Arc::new(Arc::new(tokio::sync::Mutex::new(workflow)))
     }
 
-    fn build_policy(
-        &self,
-        ctx: &PolicyFactoryCtx,
-    ) -> Result<PolicyBuildResult, KernelError> {
+    fn build_policy(&self, ctx: &PolicyFactoryCtx) -> Result<PolicyBuildResult, KernelError> {
         // The kernel hands the loop's workflow handle back through the
         // neutral trait (2b.3); the app factory recovers its concrete
         // lockable Arc via as_any_arc — an app→app cast, the legal
@@ -170,7 +165,9 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
             any_arc
                 .downcast_ref::<Arc<Arc<Mutex<Workflow>>>>()
                 .is_some(),
-            any_arc.downcast_ref::<crate::agent::workflow_handle::UnwiredWorkflow>().is_some(),
+            any_arc
+                .downcast_ref::<crate::agent::workflow_handle::UnwiredWorkflow>()
+                .is_some(),
         );
         let workflow = any_arc
             .downcast_ref::<Arc<Mutex<Workflow>>>()
@@ -179,9 +176,8 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // The concrete policy stays app-side; the tail attach rides the
         // returned closure (the 2a.6 loop back-ref — idempotent OnceLock,
         // the first attach wins).
-        let policy = Arc::new(
-            WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone()),
-        );
+        let policy =
+            Arc::new(WorkflowPolicy::new(workflow).with_blocked_tools(self.blocked_tools.clone()));
         let concrete: Arc<WorkflowPolicy> = Arc::clone(&policy);
         Ok(PolicyBuildResult {
             policy,
@@ -277,20 +273,20 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
         // Backlog tab updates live. Omitted entirely when no store is
         // wired (tests / NeedsProject).
         if let Some(wiring) = self.backlog.read().expect("backlog lock poisoned").as_ref() {
-            registry.register(Box::new(
-                BacklogAddTool::new(Arc::clone(&wiring.store), wiring.on_changed.clone()),
-            ));
+            registry.register(Box::new(BacklogAddTool::new(
+                Arc::clone(&wiring.store),
+                wiring.on_changed.clone(),
+            )));
             // backlog_status — same wiring; changes status through the same
             // guarded transition table the harness uses (see the tool docs).
-            registry.register(Box::new(
-                BacklogStatusTool::new(Arc::clone(&wiring.store), wiring.on_changed.clone()),
-            ));
+            registry.register(Box::new(BacklogStatusTool::new(
+                Arc::clone(&wiring.store),
+                wiring.on_changed.clone(),
+            )));
             // backlog_list — read-only query; needs no notifier (it never
             // mutates). Safe for read-only reviewers (their strict allow-list
             // names it): querying the backlog is allowed, modifying it is not.
-            registry.register(Box::new(
-                BacklogListTool::new(Arc::clone(&wiring.store)),
-            ));
+            registry.register(Box::new(BacklogListTool::new(Arc::clone(&wiring.store))));
         }
         // The skill tools (2b.3: moved from the kernel factory). The
         // authoring tool gets the AGENT's sandbox (a root-spec agent gets
@@ -311,6 +307,12 @@ impl AgentPolicyFactory for WorkflowPolicyFactory {
                 Arc::clone(skills),
                 ctx.sandbox.clone(),
             )));
+        }
+    }
+
+    fn finalize_tools(&self, registry: &mut ToolRegistry) {
+        for name in &self.blocked_tools {
+            registry.unregister(name);
         }
     }
 }

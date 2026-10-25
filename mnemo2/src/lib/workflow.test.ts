@@ -93,7 +93,7 @@ describe("deriveTaskWorkflow", () => {
     const completed = deriveTaskWorkflow({ ...base, status: "completed" });
     expect(completed.current).toBe("verify");
     expect(step(completed, "implement")?.status).toBe("done");
-    // Review and merge stay queued for Phase 3 — never reported as done.
+    // A completed turn still needs lead review and merge evidence.
     expect(step(completed, "review")?.status).not.toBe("done");
     expect(step(completed, "merge")?.status).not.toBe("done");
 

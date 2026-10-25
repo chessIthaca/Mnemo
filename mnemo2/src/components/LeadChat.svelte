@@ -124,7 +124,7 @@
                 <span class="team-card-icon"><MessageSquareText size={15} /></span>
                 <div><strong>{worker?.name ?? "Worker"} sent an update</strong><span>TEAM MESSAGE · {entry.time}</span></div>
               </div>
-              <p>{entry.body}</p>
+              <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               <button onclick={() => actions.selectWorker(entry.workerId)}>Open worker thread <ArrowUpRight size={13} /></button>
             </article>
           {:else if entry.kind === "review"}
@@ -134,7 +134,7 @@
                 <span class="team-card-icon"><ClipboardCheck size={15} /></span>
                 <div><strong>{entry.title}</strong><span>LEAD REVIEW · {entry.time}</span></div>
               </div>
-              <p>{entry.body}</p>
+              <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               <button onclick={() => actions.selectWorker(entry.workerId)}>Review {worker?.name ?? "worker"}’s delta <ArrowUpRight size={13} /></button>
             </article>
           {:else if entry.kind === "merge"}
@@ -151,7 +151,7 @@
 <style>
   .lead-workspace { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; background: var(--canvas); }
   .lead-scroll { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
-  .lead-content { width: min(100%, 860px); min-width: 0; margin: 0 auto; padding: 28px 40px 24px; }
+  .lead-content { width: 100%; min-width: 0; margin: 0; padding: 28px 40px 24px; }
   .lead-stream { display: flow-root; min-width: 0; }
   .lead-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
   .lead-title { display: flex; align-items: center; gap: 9px; }
@@ -171,7 +171,7 @@
   .team-card-heading strong, .team-card-heading span { display: block; }
   .team-card-heading strong { font-size: 11px; font-weight: 650; }
   .team-card-heading div > span { margin-top: 3px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
-  .team-card p { margin: 12px 0; color: var(--ink-soft); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
+  .team-card :global(.markdown) { margin: 12px 0; color: var(--ink-soft); font-size: 14px; line-height: 1.55; }
   .team-card button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; }
   .review-card { background: #f4f2ed; }
   .lead-notice { margin: 0 0 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }

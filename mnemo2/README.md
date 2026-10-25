@@ -1,17 +1,18 @@
-# Mnemo2 — Phase 2 real parallel team
+# Mnemo2 — real lead, review, and team integration
 
 A standalone Svelte 5 workspace for the Mnemo2 **lead + team** cockpit. In the
-native Tauri host the lead conversation *and* the worker team are real: one
-shared headless-engine `Engine` backs the lead session and every worker
-session, each worker gets its own `wt/agent-*` branch and linked git worktree,
-and messages route both ways. The browser-only Vite session has no engine
-behind it, so it shows an explicit native-shell-required state instead of
-simulating anything.
+native Tauri host the lead conversation and worker team are real: one shared
+headless-engine `Engine` backs every session, each worker gets its own
+`wt/agent-*` branch and linked git worktree, and messages route both ways. The
+browser-only Vite session has no engine behind it, so it shows an explicit
+native-shell-required state instead of simulating anything.
 
 The product shape is unchanged from Phase 0b: the lead owns a workflow for each
-task, tasks are independent, and the lead and worker models are visible wherever
-an agent appears. Review, merge, and fixer routing are Phase 3; those controls
-are visibly disabled rather than faked.
+task, tasks are independent, and lead and worker models are visible wherever an
+agent appears. Native Phase 3 adds durable reviews/findings, exact-tip checks,
+tiny review fixes and tracked fixer routing, serialized local merge/revert, and
+cumulative worker telemetry and token budgets. No review or merge result is
+simulated.
 
 ## Run
 
@@ -90,10 +91,15 @@ feature-enabled Mnemo2 lib tests.
 - **Events.** Worker events are forwarded on `mnemo2://team-event` as
   `{ worker_id, generation, event }`. The frontend ignores stale generations.
 - **Commands.** `team_snapshot`, `team_dispatch`, `team_message`, `team_pause`,
-  `team_interrupt`, `team_stop`, `team_resume`, `team_messages`.
-- **Host tools.** The lead gets `team_dispatch`, `team_message`, and
-  `team_status`; workers get `message_parent`, whose messages land in the lead's
-  inbox and render in the lead conversation.
+  `team_interrupt`, `team_stop`, `team_resume`, `team_review`,
+  `team_record_check`, `team_resolve_finding`, `team_review_fix`,
+  `team_route_fix`, `team_merge`, `team_revert_merge`, `team_stop_all`,
+  `team_set_token_budget`, and `team_messages`.
+- **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
+  `team_review`, `team_check`, `team_resolve_finding`, `review_fix`,
+  `team_route_fix`, `team_merge`, and `team_revert_merge`. Generic `spawn_agent`
+  is removed from the advertised lead registry and denied as a fallback. Workers
+  get `message_parent`, whose messages land in the lead conversation.
 - **State.** `team.json` in the app-data dir is the worker ledger.
 
 ## Tour
@@ -109,16 +115,21 @@ feature-enabled Mnemo2 lib tests.
    worker gets its real branch, worktree, model, and workflow state; tasks
    advance independently. Filter **Needs you / Active / Done**; the header shows
    live sessions against the configured slots.
-6. Open a worker. The conversation opens first; **Thread** sends a real message
-   (a steer while the worker is busy). **Pause**, **Resume**, and **Stop** drive
-   the real session. **Review** shows the Phase 3 gate, disabled.
-7. Open the workbench from the top bar, then switch to **Diff**. Use **Browser /
+6. Open a worker. **Thread** sends a real message (a steer while busy).
+   **Review** shows exact-tip checks, findings, review/merge records, and real
+   usage. Apply a one-file `review_fix` with exact text, route larger findings
+   back to the worker, and close findings with evidence or a written `wontfix`.
+7. Once every finding is closed and checks pass on the reviewed tip, merge into
+   the local non-`main` lead branch. **Revert** is available before landing.
+   **Stop all** closes live worker sessions; **Worker token budget** raises a
+   worker's cumulative cap above its actual usage.
+8. Open the workbench from the top bar, then switch to **Diff**. Use **Browser /
    Diff / Plan**; the pane is resizable on desktop and full-screen on narrow
    layouts.
 
-## Phase 3 policy (not yet enforced)
+## Review and merge policy
 
-`src/lib/review.ts` holds the rules the Phase 3 runtime will enforce:
+`src/lib/review.ts` mirrors the native merge-eligibility gate:
 
 - **Lead tiny-work cap** — either up to **5 files × 10 changed lines**, or a
   **single file with a larger edit**. Both exclude new files, schema/API/
@@ -130,47 +141,35 @@ feature-enabled Mnemo2 lib tests.
 - The lead is the reviewer of record. An independent reviewer is never a
   substitute PASS gate.
 
-Until that runtime exists, the UI keeps these controls disabled and says so
-rather than simulating a review or a merge.
+## What is real vs. later phases
 
-## What is real vs. Phase 3
-
-- **Real (native host):** the lead session, streaming, model identity and
-  picker, cancellation, transcript persistence/restore, approvals/questions.
-- **Real (Phase 2 team):** worker sessions on the same engine, per-worker
-  `wt/agent-*` branch + linked worktree, brief, model spec, status, transcript,
-  token usage, and pending interaction. Dispatch, message/steer, pause,
-  interrupt, stop, and resume all drive real `SessionCommand`s. The lead
-  delegates through the `team_dispatch` host tool; its direct `spawn_agent` call
-  is denied so no untracked worker can exist.
-- **Real limits:** live-session slots (`DEFAULT_SLOTS = 3`) and a per-lead-turn
-  delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`).
-- **Real recovery:** `team.json` under the app-data dir is the worker ledger. On
-  restart, running workers become `interrupted` (or stay `needs_you` when a
-  pending interaction survived); `team_resume` reattaches the saved transcript.
-- **Phase 3 (disabled, not faked):** review findings, tiny-work fixes, fixer
-  routing, branch-tip checks, and the serialized merge. Their buttons are
-  disabled and the store reports "lands with the real review/merge runtime in
-  Phase 3".
-- **No git operations yet.** Stopping a worker removes nothing: its worktree and
-  `wt/agent-*` branch stay for audit. Nothing merges into the lead branch until
-  Phase 3.
+- **Real (native lead):** streaming, model identity and picker, cancellation,
+  transcript persistence/restore, and approvals/questions.
+- **Real (native team):** worker sessions on the same engine, per-worker branch,
+  worktree, brief, model, status, transcript, checks, findings, review/merge
+  records, and pending interaction. Every control drives the native runtime;
+  generic spawning is unavailable so no untracked worker can exist.
+- **Real review and integration:** findings close only with fixed evidence or a
+  written `wontfix`; checks and review bind to the exact worker tip. `review_fix`
+  edits one existing non-test source file through a canonical, symlink-free path,
+  commits only that scoped change, and invalidates old evidence. Larger fixes
+  return to the tracked worker. Merge is
+  serialized into the local non-`main` lead branch, aborts conflicts without
+  auto-resolution, never pushes, and supports guarded revert before landing.
+  Successful merge closes the worker session, removes the worktree, and keeps
+  the branch for audit.
+- **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`), a
+  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`), and cumulative
+  per-worker token budgets (default 200,000). Requests, prompt/completion/cached
+  tokens, turns, and elapsed time come from real events. Cost is shown only when
+  model pricing is configured; token usage is always available.
+- **Real recovery:** running workers reopen as interrupted, and `team.json` has
+  a backup-recoverable replacement path. An unfinished conflict is aborted and
+  verified clean; a completed merge is recovered only when its second parent
+  proves the reviewed worker tip. Stale `MERGE_HEAD` state is cleared only after
+  a clean-tree check. Ambiguous recovery routes back for inspection.
 - **Browser tab.** Still a labelled stand-in; the native WebView2 pane is
   Phase 4. Do not launch a separate Chrome/WebView instance for UI checks.
-
-## Policy encoded in the prototype
-
-The policy module still enforces the product rules, in `src/lib/review.ts`:
-
-- **Lead tiny-work cap** — either up to **5 files × 10 changed lines**, or a
-  **single file with a larger edit**. Both exclude new files, schema/API/
-  dependency/test changes, and cross-module refactors.
-- **Merge eligibility** — the worker must be in review, every finding must be
-  fixed or `wontfix` with a written justification, and every branch-tip check
-  must have passed. A fix or fixer commit replaces the check result and must be
-  re-run before merge.
-- The lead is the reviewer of record. An independent reviewer is never a
-  substitute PASS gate.
 
 ## Layout notes
 
@@ -194,8 +193,9 @@ See `.coding/design/mnemo2.md` for the full design and acceptance criteria:
    config-backed model picker, project lead model.
 2. **Parallel team runtime** — complete: shared engine, per-task
    branches/worktrees/briefs/models, worker messaging, slots, restart recovery.
-3. **Review, merge, recovery, cost** — findings, tiny-work fixes, branch-tip
-   checks, serialized local merge, conflict routing, budget enforcement.
-4. **Native shell + workbench + persistence** — native WebView2 browser pane,
+3. **Review, merge, recovery, cost** — complete: durable findings, tiny-work
+   fixes, tracked fixer routing, exact-tip checks, serialized local merge/revert,
+   conflict and crash recovery, cumulative token budgets, and pricing-aware cost.
+4. **Native shell + workbench + persistence** — remaining: native WebView2 browser pane,
    sessions that survive restart, accessibility and narrow layouts. (The project
    registry/`projects.toml` and the folder picker landed early, in Phase 2.)

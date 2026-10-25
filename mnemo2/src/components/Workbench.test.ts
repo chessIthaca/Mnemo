@@ -10,7 +10,6 @@ const state = () => get(app);
 describe("Workbench", () => {
   beforeEach(() => {
     app.set(fixtureState());
-    actions.openProject("mnemo");
     actions.openWorkbench("diff");
   });
 

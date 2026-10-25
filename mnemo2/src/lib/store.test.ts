@@ -34,20 +34,25 @@ describe("Mnemo2 store production state", () => {
     expect(state().toast?.message).toMatch(/team runtime/i);
   });
 
-  it("does not simulate Phase 3 review, fixer, or merge work", () => {
+  it("requires the native runtime for every Phase 3 action without simulating success", async () => {
     app.set(fixtureState());
     actions.openProject("mnemo");
     const before = state().workers.map((worker) => worker.status);
 
-    actions.fixFinding("ana", "ana-copy");
-    actions.spawnFixer("ana", "ana-copy");
-    actions.completeFixer("ana", "ana-copy");
-    actions.wontfixFinding("ana", "ana-merge", "separate ticket");
-    actions.mergeWorker("ana");
+    await actions.reviewWorker("ana", "review", []);
+    await actions.recordWorkerCheck("ana", "workspace tests", "passed");
+    await actions.fixFinding("ana", "ana-copy", "old", "new");
+    await actions.spawnFixer("ana", "ana-copy");
+    await actions.resolveFinding("ana", "ana-copy", "fixed", "verified");
+    await actions.wontfixFinding("ana", "ana-merge", "separate ticket");
+    await actions.mergeWorker("ana");
+    await actions.revertMerge("ana");
+    await actions.stopAll();
 
     expect(state().workers.map((worker) => worker.status)).toEqual(before);
     expect(state().workers.find((worker) => worker.id === "ana")?.merge).toBeUndefined();
-    expect(state().toast?.message).toMatch(/Phase 3/);
+    expect(state().toast?.message).toMatch(/team runtime/i);
+    expect("completeFixer" in actions).toBe(false);
   });
 
   it("keeps the conversation-first navigation", () => {
@@ -57,7 +62,7 @@ describe("Mnemo2 store production state", () => {
     actions.openTeam();
     expect(state().route).toBe("team");
     expect(state().workbenchOpen).toBe(false);
-    expect(state().leadEntries.length).toBeGreaterThan(0);
+    expect(state().leadEntries).toEqual([]);
   });
 
   it("closes a project back to the empty start route", () => {

@@ -285,6 +285,10 @@ pub trait AgentPolicyFactory: Send + Sync {
     /// trio); the plan/skill registrations stay kernel-side until 2b.3
     /// carries their workflow/skill dependencies across the seam.
     fn register_tools(&self, reg: &mut ToolRegistry, ctx: &PolicyBuildCtx);
+
+    /// Apply policy vetoes after every kernel and app registration, before
+    /// deferred tool schemas are captured.
+    fn finalize_tools(&self, _reg: &mut ToolRegistry) {}
 }
 
 /// The kernel-default policy factory: builds [`NoPolicy`] policies and

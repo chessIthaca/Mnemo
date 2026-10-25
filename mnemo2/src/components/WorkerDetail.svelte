@@ -11,9 +11,11 @@
     XCircle,
   } from "@lucide/svelte";
   import { actions } from "../lib/store";
+  import { canMerge } from "../lib/review";
   import { workerStatusLabel, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
+  import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
 
@@ -24,6 +26,7 @@
 
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
   const workflow = $derived(deriveTaskWorkflow(worker));
+  const mergeEligibility = $derived(canMerge(worker));
 
   $effect(() => {
     const id = worker.id;
@@ -44,6 +47,11 @@
       event.preventDefault();
       sendReply();
     }
+  }
+
+  function setBudget(event: Event) {
+    const tokenBudget = (event.currentTarget as HTMLInputElement).valueAsNumber;
+    if (Number.isFinite(tokenBudget)) actions.setWorkerBudget(worker.id, Math.floor(tokenBudget));
   }
 </script>
 
@@ -67,7 +75,7 @@
       {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
         <button class="button button-quiet" onclick={() => actions.resumeWorker(worker.id)}><Play size={11} /> Resume</button>
       {/if}
-      <button class="button button-quiet" disabled={worker.status === "stopped"} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
+      <button class="button button-quiet" disabled={["stopped", "merging", "merged"].includes(worker.status)} onclick={() => actions.stopWorker(worker.id)}><Square size={11} /> Stop</button>
     </div>
   </header>
 
@@ -82,7 +90,8 @@
   <div class="detail-body">
     {#if tab === "review"}
       <section class="checks-panel">
-        <div class="checks-heading"><span>BRANCH-TIP CHECKS</span><code>{worker.worktree}</code></div>
+        <div class="checks-heading"><span>BRANCH-TIP CHECKS</span><code>{worker.worktree}</code><label class="budget-editor">Token budget <input aria-label="Worker token budget" type="number" min="1" step="1000" value={worker.tokenBudget} onchange={setBudget} /></label></div>
+        <div class="usage-line">{worker.tokens} cumulative tokens · {worker.turns} completed turns · {worker.elapsed || "—"}</div>
         {#each worker.checks as check (check.name)}
           <div class="check-row">
             {#if check.status === "passed"}<CheckCircle2 size={15} />{:else if check.status === "running"}<LoaderCircle size={15} />{:else}<XCircle size={15} />{/if}
@@ -95,12 +104,29 @@
 
       <section class="merge-panel">
         <div class="merge-decision">
-          <div>
-            <p>TEAMMANAGER · SERIALIZED MERGE</p>
-            <h3>Merge into the lead branch</h3>
-            <span>Phase 3 adds the real review gate, branch-tip checks, and the serialized merge. Nothing merges until then.</span>
-          </div>
-          <button class="button button-primary" aria-label="Merge reviewed branch" disabled={true} onclick={() => actions.mergeWorker(worker.id)}><GitMerge size={14} /> Merge reviewed branch</button>
+          {#if worker.merge}
+            <div>
+              <p>MERGE RECORD · {worker.merge.target}</p>
+              <h3><code>{worker.merge.commit}</code></h3>
+              <span>{worker.merge.files} files · +{worker.merge.additions} −{worker.merge.deletions} · {worker.merge.reviewSummary}</span>
+            </div>
+            {#if worker.merge.revertCommit}
+              <span class="merge-reverted">Reverted · <code>{worker.merge.revertCommit}</code></span>
+            {:else}
+              <button class="button button-quiet" aria-label="Revert merged branch" onclick={() => actions.revertMerge(worker.id)}>Revert</button>
+            {/if}
+          {:else}
+            <div>
+              <p>TEAMMANAGER · SERIALIZED MERGE</p>
+              <h3>Merge into the lead branch</h3>
+              {#if mergeEligibility.ok}
+                <span>{worker.review?.summary ?? "Review closed"} · checks passed on the reviewed tip.</span>
+              {:else}
+                <span>{mergeEligibility.reason}</span>
+              {/if}
+            </div>
+            <button class="button button-primary" aria-label="Merge reviewed branch" disabled={!mergeEligibility.ok || worker.status === "merging"} onclick={() => actions.mergeWorker(worker.id)}><GitMerge size={14} /> Merge reviewed branch</button>
+          {/if}
         </div>
       </section>
     {:else if tab === "thread"}
@@ -109,7 +135,7 @@
           {#each worker.messages as message (message.id)}
             <div class="thread-message" class:from-lead={message.from === "lead"}>
               <span>{message.from === "lead" ? "LEAD" : worker.name.toUpperCase()} · {message.time}</span>
-              <p>{message.body}</p>
+              <div class="thread-message-body"><Markdown source={message.body} onOpenLink={actions.openBrowser} /></div>
             </div>
           {/each}
         </div>
@@ -155,6 +181,9 @@
   .checks-panel, .merge-panel { padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
   .checks-heading { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
   .checks-heading code { overflow: hidden; font-family: var(--font-mono); font-size: 7px; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
+  .budget-editor { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; letter-spacing: 0; }
+  .budget-editor input { width: 76px; padding: 4px 5px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font-size: 8px; }
+  .usage-line { margin: -3px 0 10px; color: var(--muted); font-size: 8px; }
   .check-row { display: flex; align-items: center; gap: 9px; }
   .check-row > :global(svg) { color: var(--accent); }
   .check-row div { flex: 1; }
@@ -167,10 +196,12 @@
   .merge-decision h3 { margin: 0 0 4px; font-size: 12px; font-weight: 650; }
   .merge-decision div > span { display: block; max-width: 360px; color: var(--muted); font-size: 8px; line-height: 1.45; }
   .merge-decision button { flex: 0 0 auto; }
-  .thread-message p { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-prose); font-size: 13px; line-height: 1.5; }
+  .thread-message-body { margin: 5px 0 0; padding: 10px 12px; border-radius: 4px 12px 12px 12px; background: var(--surface-soft); color: var(--ink-soft); }
+  .thread-message-body :global(.markdown) { font-size: 13px; line-height: 1.55; }
+  .thread-message-body :global(p) { margin-bottom: 10px; }
   .thread-message.from-lead { margin-left: auto; }
   .thread-message.from-lead > span { display: block; text-align: right; }
-  .thread-message.from-lead p { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
+  .thread-message.from-lead .thread-message-body { border-radius: 12px 12px 4px 12px; background: var(--accent-soft); }
   .thread-composer { display: flex; align-items: flex-end; gap: 8px; margin-top: 16px; padding: 9px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); }
   .thread-composer textarea { flex: 1; resize: none; border: 0; outline: 0; color: var(--ink); font-size: 10px; }
   .timeline-step { display: grid; grid-template-columns: 20px 1fr; gap: 8px; min-height: 76px; }

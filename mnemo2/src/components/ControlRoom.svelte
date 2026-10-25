@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ListFilter, UsersRound } from "@lucide/svelte";
+  import { ListFilter, Square, UsersRound } from "@lucide/svelte";
   import { actions, app, selectedWorker } from "../lib/store";
   import type { Worker, WorkerStatus } from "../lib/types";
   import AvatarStack from "./AvatarStack.svelte";
@@ -72,6 +72,7 @@
     <h1>Mission Control</h1>
     <div class="team-settings">
       <span class="slot-pill">{$app.teamActive} live / {$app.teamSlots} slots</span>
+      <button class="button button-quiet" disabled={$app.teamActive === 0} onclick={() => actions.stopAll()}><Square size={11} /> Stop all</button>
     </div>
   </header>
 

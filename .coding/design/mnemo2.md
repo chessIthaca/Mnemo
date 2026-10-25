@@ -1,10 +1,11 @@
 # Mnemo2 — Lead + Team (design v0.2)
 
-Status: Phase 2 implemented — the native host runs one real streaming lead session
+Status: Phase 3 implemented — the native host runs one real streaming lead session
 and a real parallel worker team on one shared headless engine, with per-worker
-branches and linked worktrees. Phase 0b's conversation-first interface is
-unchanged; production carries no mock project/worker data. Phase 3 (review and
-merge) is explicitly disabled rather than simulated. This is the
+branches and linked worktrees, durable reviews/findings, exact-tip checks,
+serialized local merge/revert, and cumulative telemetry/token budgets. Phase 0b's
+conversation-first interface is unchanged; production carries no mock
+project/worker data. Phase 4's native workbench remains. This is the
 design of record for the Mnemo2 frontend rebuild. It supersedes the earlier
 "spaces dashboard" sketch: Mnemo2 is a single-project cockpit for a lead agent and
 a team of worker subagents. The defining change in v0.2 is that the lead enforces
@@ -95,18 +96,21 @@ the **full toolbox**:
 - `create_plan` / `update_plan` / `complete_step` / `finish`;
 - file tools and shell for debugging with the user;
 - `git_read` (diff/log/show/status ops) and commits;
-- `spawn_agent`, `message_agent`, `team_status`, `review_fix`;
-- the TeamManager's merge action (auto-merge after its review).
+- `team_dispatch`, `team_message`, `team_status`, `team_review`, `team_check`,
+  `team_resolve_finding`, `review_fix`, `team_route_fix`, `team_merge`, and
+  `team_revert_merge`. Generic `spawn_agent` is removed from the advertised
+  registry and denied as a fallback;
+- the TeamManager's app-level merge action after its review.
 
-The lead's own edits are capped by the **tiny-work rule**: either up to five
-files with at most 10 changed lines per file, or one file with a larger edit.
-Both paths exclude new files, schema/API/dependency/test changes, and any
-cross-module refactor. The cap is enforced by an app-level external policy hook
-on `file_edit` / `file_write` / `shell`; over-cap calls are denied with a
-delegation nudge. Direct edits are logged as small cards in the lead chat and
-counted in the cost meter. The lead may debug, run tests, read logs, and
-research without a cap; the cap is about where implementation happens, not
-about investigation.
+The lead's own edit policy is the **tiny-work rule**: either up to five files
+with at most 10 changed lines per file, or one file with a larger edit. Both
+paths exclude new files, schema/API/dependency/test changes, and cross-module
+refactors. Phase 3 enforces the review-specific form through `review_fix`: one
+existing non-test source file, a clean worker, an exact unique replacement of at
+most 100 combined old/new lines, and a commit containing only that scoped edit.
+Larger fixes return to the tracked worker. The broader direct-edit external
+policy hook and direct-edit cost cards are not part of the landed Phase 3
+surface. The lead may debug, run tests, read logs, and research without a cap.
 
 Delegation is economic, not a hard lockout: do tiny/review/debug work directly;
 delegate anything that needs exploration or exceeds the tiny-work cap; never
@@ -150,51 +154,58 @@ the worker ran, and the relevant plan steps. It writes findings. It must not
 merge while any finding is `open`. A `wontfix` is allowed only with a written
 justification (the same rule the Mnemo reviewer protocol uses).
 
-**Tiny findings — the lead fixes them.** A tiny finding uses the same
-tiny-work cap: up to five files with at most 10 changed lines each, or one
-larger single-file edit, with no new file or schema/API/dependency/test change.
-The lead calls the `review_fix` host tool with a worker id and the scoped
-edit(s). The TeamManager
-applies the edit in the **worker's worktree**, commits it on the worker branch
-with a review message, and returns the sha. The lead then closes the finding.
-This is the only path that lets the lead edit a worker's branch; the lead's
-own file tools remain bound to the main tree.
+**Tiny findings — the lead fixes them.** Phase 3 constrains this to one
+existing non-test source file and an exact unique replacement of at most 100
+combined old/new lines, with no new file or schema/API/dependency/test change.
+The lead calls `review_fix` with the worker id, finding id, and scoped strings.
+The worker checkout must be clean. TeamManager applies the edit in the worker's
+worktree, commits only that file on the worker branch, stores the sha and
+evidence, and invalidates the prior review/checks. This is the only path that
+lets the lead edit a worker's branch; the lead's own file tools remain bound to
+the main tree.
 
-**Big findings — spawn a fixer.** The lead spawns a fixer subagent bound to the
-same worktree/branch (or re-tasks the original worker when its context is warm
-and it is within budget). The fixer gets the finding, the relevant paths, the
-acceptance criteria, and the scope limit. It commits the fix and reports.
+**Big findings — route to the tracked worker.** Phase 3 re-tasks the original
+worker on the same worktree/branch. The worker gets the finding, relevant path,
+acceptance criteria, and scope limit, then commits and reports. A fresh fixer
+subagent remains an optional later refinement.
 
 **Re-review.** The lead re-reviews the delta, not the whole branch, and closes
-the finding. The merge card shows `Review: N findings · X fixed · Y wontfix`.
-Any open finding blocks the merge and keeps the worker in **In review** /
-**Fixing**.
+each finding with fixed evidence or a written `wontfix` justification. The merge
+card shows `Review: N findings · X fixed · Y wontfix`. Any open or unevidenced
+finding blocks merge and keeps the worker in **In review** / **Fixing**.
 
 The lead's review is itself a cost center. For a large diff it may spawn a
 read-only reviewer to pre-read and return findings (cheaper than pulling the
 whole diff into the lead's long context), then triage and fix; for small diffs
 it reviews directly.
 
-**Check binding.** The checks precondition binds to the **branch tip being merged**. After a `review_fix` commit (the TeamManager runs the affected check scope in the worker worktree) or a fixer commit (the fixer runs it as part of its report), the checks are re-run and must pass before the merge card becomes mergeable. For this repository the check scope is `cargo test --workspace`.
+**Check binding.** The checks precondition binds to the **branch tip being merged**. After a `review_fix` or worker fix commit, the lead runs the affected scope in the worker worktree and records real outcomes through `team_check`; TeamManager stamps the server-observed current tip. The affected checks must pass and receive a fresh delta review before the merge card becomes mergeable. For this repository the check scope is `cargo test --workspace`.
 
 ## 4. Auto-merge
 
 When the review is closed and the worker's checks pass, the TeamManager merges
 the worker branch into the lead's **local working branch**:
 
-- The lead is idle and its working tree is clean; merges are serialized (one at
-  a time). If the lead is busy, the merge queues.
-- The merge target is never `main`. If the project is on `main`, the
-  TeamManager first creates/uses a `wt/*` working branch.
+- The lead and worker are idle and both working trees are clean. Review,
+  checks, dispatch, messaging, stop/resume, and merge/revert share one operation
+  lock, so exact-tip evidence cannot change after validation. A busy lead or
+  worker is rejected with an actionable error rather than silently queued.
+- The merge target is never `main`. If the project is on `main`, merge refuses
+  until a `wt/*` working branch exists.
 - Worker branches fork from the lead's working-branch tip at dispatch. A
   base that goes stale while the worker runs is not auto-rebased; the
   conflict-halt + route-back rule is the handling.
 - A conflict aborts the merge (`git merge --abort`), marks the worker
   **Conflict**, and routes it back to the worker/lead. No auto-resolution.
 - The merge record stores: commit, files, `+x −y`, checks, review verdict,
-  worker model/cost, and the worktree/branch. `Revert` is available before the
-  branch lands.
-- The worktree is removed after the merge; the branch is kept for audit.
+  worker model, cumulative tokens, and pricing-derived cost when available.
+  `Revert` requires the original non-`main` lead branch, the merge in current
+  history, and no evidence that it already landed on `main`.
+- The worker session is closed before its worktree is removed; the branch is
+  kept for audit. A merged worker cannot be resumed.
+- Recovery aborts an in-progress conflict and verifies a clean lead. A merge
+  already committed before a crash is reconstructed only when the lead commit's
+  second parent proves the reviewed worker tip; ambiguous cases route back.
 - No push and no `main` merge. Landing the lead branch to `main` remains the
   repository's protected PR path (ruleset 23755694); the human approves it.
 
@@ -206,15 +217,16 @@ policy (see `agent.md`).
 
 The team is budget-gated, not per-action-gated.
 
-- **Caps**: max concurrent workers (a per-project setting, with no fixed
-  three-worker ceiling), max spawns per lead turn (default 5), per-worker
-  turns/wall-clock/cost, and a per-project budget. Worker concurrency is
-  separate from budget and rate limits.
-  Hitting a cap pauses the team and moves the item to **Needs you**; nothing
-  runs away silently.
-- **Spawn approvals**: the kernel's spawn approval is auto-answered by the
-  TeamManager when the spawn fits the budget; when it does not, the approval
-  stays pending and surfaces in Mission Control.
+- **Caps**: `DEFAULT_SLOTS = 3` live worker sessions,
+  `DEFAULT_SPAWNS_PER_TURN = 4` delegations per lead turn, 64 worker turns and
+  30 minutes per session, and a default cumulative 200,000-token budget per
+  worker. The startup default is configurable, and an exhausted worker's budget
+  can be raised only above its real cumulative usage. Hitting the token cap
+  pauses the worker in **Needs you** and blocks continuation until it is raised.
+  Per-project monetary budgets remain an open decision.
+- **Tracked dispatch**: `team_dispatch` runs only when slots and the per-turn
+  delegation cap allow it. Generic spawning is unavailable, so no approval path
+  can create an untracked worker.
 - **Model routing**: strong lead, cheap/default workers, configured reviewer;
   the lead can pick a cheaper model for mechanical work via `list_models`.
 - **Model identity**: the project stores the lead model; every task stores its
@@ -226,9 +238,11 @@ The team is budget-gated, not per-action-gated.
   acceptance criteria, and scope limit; workers do not rediscover the repo.
 - **Review economics**: review small diffs directly; pre-read large diffs with
   an optional reviewer; never spawn a worker for a read or an answer.
-- **Telemetry**: per-worker model, tokens, cost, elapsed, turns; a budget chip
-  in the top bar; a "Pause team" / "Stop all" control; a cost line for the
-  lead's direct edits.
+- **Telemetry**: per-worker model, cumulative prompt/completion/cached tokens,
+  requests, elapsed time, and completed turns, all persisted across sessions.
+  Cost is derived only from configured model pricing; unknown cost is never
+  shown as zero. A worker budget editor and aggregate usage/cost chip sit beside
+  **Stop all**; individual workers also support pause/resume.
 
 ## 6. Mission Control
 
@@ -293,22 +307,22 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
   workflows** and adds the Mnemo2 TeamManager policy (reviewed worker branches
   only; no push; no `main`; PR landing).
 - The compiled APP_RULES still say the agent's own `git merge`/`push` is
-  approval-gated. That is correct for the lead's own tool calls; the TeamManager
-  merge is app-level. The lead needs a small Mnemo2 prompt append explaining
-  that the TeamManager performs the merge after review and that the lead must
-  not call `git merge`/`push` itself. This is a build item.
+  approval-gated. That is correct for the lead's own tool calls; TeamManager's
+  merge is app-level. `WorkflowPolicy::stable_head` now appends
+  `MNEMO2_TEAM_RULES` when generic spawning is blocked, explaining tracked
+  delegation, exact-tip review/checks, tiny-fix scope, and why the lead must not
+  call `git merge` or `git push` itself.
 - The tool-level gate (`GitTool::never_auto_for`,
   `ShellTool::never_auto_for`) remains for the agent; the TeamManager uses
   app-level git operations, not the agent's git tool.
 
 ## 10. Open decisions
 
-- Default budget and per-project starting values (worker slots, spawns per turn,
-  per-worker cost, project budget).
-- Fixer default: re-task the original worker vs spawn a fresh fixer.
+- Per-project monetary budgets and persistence of custom worker-slot defaults.
+- Whether a fresh fixer subagent is ever preferable to the current original-worker
+  re-tasking path.
 - Reviewer pre-pass threshold (diff size/files/risk).
 - Whether workers may message the user directly or only the lead.
-- Team-state persistence path (app data vs project `.coding`).
 - Main landing UX (PR button vs the existing `merge_to_main` skill).
 
 ## 11. Phases
@@ -391,19 +405,37 @@ Shipped in the native host:
 - **Acceptance met:** two workers run concurrently with independent models,
   statuses, branches, worktrees, and transcripts, and no event cross-talk; the
   lead and workers exchange messages both ways; no global run timeline exists.
-  Phase 3 review/merge controls are disabled rather than simulated.
+  At the Phase 2 boundary, review/merge controls were disabled rather than
+  simulated; the placeholders are removed in Phase 3.
 
-### Phase 3 — Review, merge, recovery, cost
+### Phase 3 — Review, merge, recovery, cost (implemented)
 
-- Lead review records with findings; tiny-work `review_fix`; fixer routing;
-  branch-tip check binding; optional read-only reviewer.
-- Serialized TeamManager merge into the local lead branch, conflict
-  halt/route-back, revert before landing, merge records.
-- Budget enforcement, per-task telemetry, pause/stop-all, crash recovery.
-- **Acceptance:** no merge with an open finding or stale check; parallel tasks
-  can be in different states; recovery leaves a clean tree.
+- **Review and fixes:** durable lead review summaries/findings and exact-tip
+  checks, fixed evidence and written `wontfix`, constrained one-file
+  `review_fix` over canonical, symlink-free source paths, and larger-finding
+  routing back to the tracked worker. Every fix invalidates stale review/check
+  evidence and requires delta review.
+- **Integration:** one operation lock covers dispatch, review/check/fix,
+  messaging, stop/resume, and merge/revert. Merge requires an idle clean lead and
+  worker, a non-`main` target, exact-tip passing checks, and closed findings.
+  Conflicts abort with diagnostics and route back; guarded revert works only
+  before landing. Merge records include diff stats, model, tokens, and cost when
+  priced. Sessions close before worktree cleanup; branches remain for audit.
+- **Budget and recovery:** cumulative real usage, turns, activity, elapsed time,
+  configurable per-worker token budgets, pricing-derived cost, stop-all, and
+  restart downgrade. `team.json` uses a backup-recoverable replacement path.
+  Interrupted conflicts abort cleanly; committed merges are reconstructed only
+  from verifiable Git parent evidence, with stale `MERGE_HEAD` state cleared
+  only after a clean-tree check.
+- **Native/UI:** typed review/fix/check/merge/revert/stop-all/budget commands and
+  real worker/inline lead cards. Generic `spawn_agent` is hidden, Markdown is
+  retained across streaming, and no placeholder success path remains.
+- **Acceptance met:** no merge with an open/unevidenced finding or stale check;
+  parallel tasks keep independent states; exact-tip evidence cannot race the
+  operation lock; conflict recovery leaves a clean tree; and committed crash
+  recovery never invents a merge result.
 
-### Phase 4 — Native shell, workbench, persistence
+### Phase 4 — Native shell, workbench, persistence (remaining)
 
 - Tauri shell integration, native WebView2 Browser pane, diff/plan tabs,
   settings, project registry/`projects.toml`, persistence.

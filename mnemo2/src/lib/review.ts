@@ -51,12 +51,14 @@ export function isLeadTinyEdit(scope: LeadEditScope): boolean {
   return leadEditViolation(scope) === null;
 }
 
-/** Check the review and branch-tip conditions required before a mock merge. */
+/** Check the durable review and exact-tip evidence required before merge. */
 export function canMerge(worker: Worker): MergeEligibility {
   if (worker.status === "merged") return { ok: false, reason: "Already merged." };
   if (worker.status !== "in_review") {
     return { ok: false, reason: `Worker is ${worker.status.replace("_", " ")}.` };
   }
+  const review = worker.review;
+  if (!review) return { ok: false, reason: "The current worker tip has not been reviewed." };
 
   const openFindings = worker.findings.filter((finding) => finding.status === "open");
   if (openFindings.length > 0) {
@@ -72,8 +74,19 @@ export function canMerge(worker: Worker): MergeEligibility {
   if (unjustified) {
     return { ok: false, reason: `Finding ${unjustified.id} needs a written justification.` };
   }
+  const unevidenced = worker.findings.find(
+    (finding) => finding.status === "fixed" && !finding.evidence?.trim(),
+  );
+  if (unevidenced) {
+    return { ok: false, reason: `Finding ${unevidenced.id} needs fixed evidence.` };
+  }
 
-  const incompleteCheck = worker.checks.find((check) => check.status !== "passed");
+  if (worker.checks.length === 0) {
+    return { ok: false, reason: "No checks have passed on the merge-time tip." };
+  }
+  const incompleteCheck = worker.checks.find(
+    (check) => check.status !== "passed" || check.tip !== review.tip,
+  );
   if (incompleteCheck) {
     return { ok: false, reason: `${incompleteCheck.name} has not passed on the merge-time tip.` };
   }

@@ -33,13 +33,12 @@ use tokio::sync::{broadcast, Mutex};
 
 use mnemo::{Approval, UserAnswer};
 
-use crate::mnemo2::runtime::{
-    LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL,
-};
+use crate::mnemo2::phase3::Finding;
+use crate::mnemo2::project::{self, ProjectRecord};
+use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
     TeamMessage, TeamRuntime, TeamSnapshot, WorkerRecord, TEAM_EVENT_CHANNEL,
 };
-use crate::mnemo2::project::{self, ProjectRecord};
 
 /// The shared Mnemo2 app state: one live lead and its event forwarder.
 #[derive(Default)]
@@ -281,10 +280,7 @@ pub async fn team_message(
     worker_id: String,
     text: String,
 ) -> Result<WorkerRecord, String> {
-    current_team(&state)
-        .await?
-        .message(&worker_id, text)
-        .await
+    current_team(&state).await?.message(&worker_id, text).await
 }
 
 /// Pause a worker's current turn.
@@ -321,6 +317,117 @@ pub async fn team_resume(
     worker_id: String,
 ) -> Result<WorkerRecord, String> {
     current_team(&state).await?.resume(&worker_id).await
+}
+
+/// Persist the lead's review and complete finding list.
+#[tauri::command]
+pub async fn team_review(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    summary: String,
+    findings: Vec<Finding>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .review(&worker_id, summary, findings)
+        .await
+}
+
+/// Record a real check on the current worker tip.
+#[tauri::command]
+pub async fn team_record_check(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    name: String,
+    status: String,
+    detail: Option<String>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .record_check(&worker_id, name, status, detail)
+        .await
+}
+
+/// Close a finding with fixed evidence or a wontfix justification.
+#[tauri::command]
+pub async fn team_resolve_finding(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    finding_id: String,
+    status: String,
+    evidence: Option<String>,
+    justification: Option<String>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .resolve_finding(&worker_id, &finding_id, &status, evidence, justification)
+        .await
+}
+
+/// Apply a constrained tiny review fix on the worker branch.
+#[tauri::command]
+pub async fn team_review_fix(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    finding_id: String,
+    path: String,
+    old_string: String,
+    new_string: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .review_fix(&worker_id, &finding_id, &path, &old_string, &new_string)
+        .await
+}
+
+/// Route a larger finding back to the tracked worker.
+#[tauri::command]
+pub async fn team_route_fix(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    finding_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .route_fix(&worker_id, &finding_id)
+        .await
+}
+
+/// Merge one reviewed worker through the serialized local integration queue.
+#[tauri::command]
+pub async fn team_merge(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.merge(&worker_id).await
+}
+
+/// Revert a worker's earlier local merge before landing.
+#[tauri::command]
+pub async fn team_revert_merge(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.revert_merge(&worker_id).await
+}
+
+/// Stop all live workers without discarding their branches or records.
+#[tauri::command]
+pub async fn team_stop_all(state: State<'_, Mnemo2State>) -> Result<(), String> {
+    current_team(&state).await?.stop_all().await
+}
+
+/// Raise a worker's cumulative token budget above its real usage.
+#[tauri::command]
+pub async fn team_set_token_budget(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    token_budget: u32,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .set_token_budget(&worker_id, token_budget)
+        .await
 }
 
 /// Read worker-to-lead messages.

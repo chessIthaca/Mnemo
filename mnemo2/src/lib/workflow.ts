@@ -59,6 +59,7 @@ function verifyState(worker: Worker): StepState {
 function reviewState(worker: Worker): StepState {
   const open = worker.findings.filter((finding) => finding.status === "open");
   if (!checksPassed(worker)) return { status: "pending", detail: "Review waits for checks" };
+  if (!worker.review) return { status: "active", detail: "Delta review required on the current tip" };
   if (open.length > 0) return { status: "active", detail: `${open.length} finding${open.length === 1 ? "" : "s"} open` };
   return { status: "done", detail: "Review closed" };
 }
@@ -122,7 +123,7 @@ export function deriveTaskWorkflow(worker: Worker): TaskWorkflow {
       if (!checksPassed(worker)) {
         return build(worker, steps, "verify", checksFailed(worker) ? "blocked" : "active");
       }
-      if (worker.findings.some((finding) => finding.status === "open")) {
+      if (!worker.review || worker.findings.some((finding) => finding.status === "open")) {
         return build(worker, steps, "review", "active");
       }
       steps.merge = { status: "active", detail: "Ready to merge" };
@@ -140,8 +141,7 @@ export function deriveTaskWorkflow(worker: Worker): TaskWorkflow {
       steps.merge = { status: "done", detail: `Merged into ${worker.merge?.target ?? "the lead branch"}` };
       return build(worker, steps, "merge", "done");
 
-    // Real Phase 2 runtime states. Review and merge stay queued: their real
-    // gates land with Phase 3, so nothing here pretends they happened.
+    // Other live lifecycle states stay on the task's own implementation lane.
     case "needs_you":
       steps.implement = { status: "active", detail: "Waiting on a lead answer" };
       return build(worker, steps, "implement", "blocked");
@@ -161,8 +161,8 @@ export function deriveTaskWorkflow(worker: Worker): TaskWorkflow {
     case "completed":
       steps.implement = { status: "done", detail: "Worker turn finished" };
       steps.verify = verifyState(worker);
-      steps.review = { status: "pending", detail: "Phase 3 review gate" };
-      steps.merge = { status: "pending", detail: "Phase 3 merge gate" };
+      steps.review = { status: "pending", detail: "Lead review required" };
+      steps.merge = { status: "pending", detail: "Merge follows review" };
       return build(worker, steps, "verify", "active");
 
     case "stopped":

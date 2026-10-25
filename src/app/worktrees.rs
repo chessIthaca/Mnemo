@@ -264,9 +264,9 @@ pub async fn remove_worktree_only(main_root: PathBuf, worktree: PathBuf) -> Resu
 }
 
 /// Remove a Mnemo2 worker's worktree but KEEP its `wt/agent-*` branch: the
-/// branch is the audit trail of what the worker did (and, once Phase 3
-/// lands, the PR/merge head the lead reviews). Reuses
-/// [`remove_worktree_only`] so the branch survives cleanup.
+/// branch is the audit trail of what the worker did and the head the lead
+/// reviewed or merged. Reuses [`remove_worktree_only`] so the branch survives
+/// cleanup after integration.
 pub async fn remove_agent_worktree(main_root: PathBuf, agent_id: String) -> Result<(), String> {
     let worktree = worktrees_dir(&main_root).join(format!("agent-{}", agent_short_id(&agent_id)));
     remove_worktree_only(main_root, worktree).await

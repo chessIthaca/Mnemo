@@ -81,6 +81,7 @@ export interface Check {
   name: string;
   status: "passed" | "running" | "failed";
   detail: string;
+  tip?: string;
 }
 
 export interface Finding {
@@ -94,6 +95,12 @@ export interface Finding {
   fixCommit?: string;
   evidence?: string;
   justification?: string;
+}
+
+export interface ReviewRecord {
+  summary: string;
+  tip: string;
+  reviewedAtMs: number;
 }
 
 export interface WorkerMessage {
@@ -121,8 +128,10 @@ export interface MergeRecord {
   checks: string[];
   reviewSummary: string;
   model: string;
-  cost: number;
+  tokens: number;
+  cost: number | null;
   time: string;
+  revertCommit?: string;
 }
 
 export interface Worker {
@@ -138,7 +147,8 @@ export interface Worker {
   worktree: string;
   files: string[];
   tokens: number;
-  cost: number;
+  tokenBudget: number;
+  cost: number | null;
   elapsed: string;
   turns: number;
   progress: number;
@@ -147,6 +157,7 @@ export interface Worker {
   fixerFindingId?: string;
   checks: Check[];
   findings: Finding[];
+  review?: ReviewRecord;
   messages: WorkerMessage[];
   timeline: TimelineStep[];
   diff: DiffStats;

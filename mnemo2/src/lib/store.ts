@@ -3,19 +3,28 @@ import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } fr
 import { createProjectTransport, type ProjectRecord } from "./projectEngine";
 import { probeMnemo2Host } from "./runtime";
 import { createTeamTransport, type TeamTransport } from "./teamEngine";
-import type { TeamMessage, TeamWorkerRecord } from "./teamState";
+import {
+  findingFromWire,
+  findingToWire,
+  type TeamMergeRecord,
+  type TeamMessage,
+  type TeamWorkerRecord,
+} from "./teamState";
 import {
   applyLeadEvent,
   applyLeadSnapshot,
   initialLeadRuntime,
   leadEventNeedsSnapshot,
+  messageText,
 } from "./leadState";
 import type {
   AppState,
   Check,
+  Finding,
   LeadAnswerInput,
   LeadEntry,
   LeadEvent,
+  MergeRecord,
   Project,
   TeamFilter,
   Worker,
@@ -209,8 +218,13 @@ function openProject(projectId: string) {
     projectId,
     leadRuntime: initialLeadRuntime(),
     workers: [],
+    leadEntries: [],
+    planItems: [],
+    diffFiles: [],
     selectedWorkerId: null,
     teamPeekOpen: false,
+    teamSlots: 0,
+    teamActive: 0,
     workbenchOpen: false,
     toast: null,
   }));
@@ -567,30 +581,159 @@ function resumeWorker(workerId: string) {
     .catch(noteTeamError);
 }
 
-function phaseThree(action: string) {
-  app.update((state) =>
-    withToast(state, `${action} lands with the real review/merge runtime in Phase 3.`),
+async function performTeam(
+  operation: (transport: TeamTransport) => Promise<unknown>,
+): Promise<void> {
+  const transport = requireTeam();
+  if (!transport) return;
+  try {
+    await operation(transport);
+    await syncTeam();
+  } catch (error) {
+    noteTeamError(error);
+  }
+}
+
+async function reviewWorker(workerId: string, summary: string, findings: Finding[]): Promise<void> {
+  await performTeam((transport) =>
+    transport.review(workerId, summary, findings.map(findingToWire)),
   );
 }
 
-function fixFinding(_workerId: string, _findingId: string) {
-  phaseThree("Applying a review fix");
+async function recordWorkerCheck(
+  workerId: string,
+  name: string,
+  status: "passed" | "failed",
+  detail?: string | null,
+): Promise<void> {
+  await performTeam((transport) =>
+    transport.recordCheck(workerId, name, status, detail ?? null),
+  );
 }
 
-function spawnFixer(_workerId: string, _findingId: string) {
-  phaseThree("Dispatching a fixer");
+async function resolveFinding(
+  workerId: string,
+  findingId: string,
+  status: "fixed" | "wontfix",
+  evidence?: string | null,
+  justification?: string | null,
+): Promise<void> {
+  await performTeam((transport) =>
+    transport.resolveFinding(
+      workerId,
+      findingId,
+      status,
+      evidence ?? null,
+      justification ?? null,
+    ),
+  );
 }
 
-function completeFixer(_workerId: string, _findingId: string) {
-  phaseThree("Completing a fixer round");
+async function fixFinding(
+  workerId: string,
+  findingId: string,
+  oldString: string,
+  newString: string,
+): Promise<void> {
+  const finding = get(app).workers
+    .find((worker) => worker.id === workerId)
+    ?.findings.find((item) => item.id === findingId);
+  if (!finding) {
+    app.update((state) => withToast(state, `Unknown finding '${findingId}'.`));
+    return;
+  }
+  await performTeam((transport) =>
+    transport.reviewFix(workerId, findingId, finding.file, oldString, newString),
+  );
 }
 
-function wontfixFinding(_workerId: string, _findingId: string, _justification: string) {
-  phaseThree("Marking a finding wontfix");
+async function spawnFixer(workerId: string, findingId: string): Promise<void> {
+  await performTeam((transport) => transport.routeFix(workerId, findingId));
 }
 
-function mergeWorker(_workerId: string) {
-  phaseThree("Merging a worker branch");
+async function wontfixFinding(
+  workerId: string,
+  findingId: string,
+  justification: string,
+): Promise<void> {
+  await resolveFinding(workerId, findingId, "wontfix", null, justification);
+}
+
+async function mergeWorker(workerId: string): Promise<void> {
+  await performTeam((transport) => transport.merge(workerId));
+}
+
+async function revertMerge(workerId: string): Promise<void> {
+  await performTeam((transport) => transport.revertMerge(workerId));
+}
+
+async function stopAll(): Promise<void> {
+  await performTeam((transport) => transport.stopAll());
+}
+
+async function setWorkerBudget(workerId: string, tokenBudget: number): Promise<void> {
+  if (!Number.isInteger(tokenBudget) || tokenBudget < 1) return;
+  await performTeam((transport) => transport.setTokenBudget(workerId, tokenBudget));
+}
+
+function timeFromMs(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "unknown";
+  return new Date(milliseconds).toLocaleTimeString();
+}
+
+function elapsedFromMs(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return "—";
+  const seconds = Math.floor(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+function mergeFromRecord(worker: TeamWorkerRecord, merge: TeamMergeRecord): MergeRecord {
+  return {
+    id: `merge-${worker.id}-${merge.commit}`,
+    workerId: worker.id,
+    commit: merge.commit,
+    branch: merge.branch,
+    target: merge.target,
+    files: merge.files,
+    additions: merge.additions,
+    deletions: merge.deletions,
+    checks: merge.checks,
+    reviewSummary: merge.review_summary,
+    model: merge.worker_model ?? worker.model_id ?? worker.model ?? "",
+    tokens: merge.worker_tokens,
+    cost: merge.cost_micros == null ? null : merge.cost_micros / 1_000_000,
+    time: timeFromMs(merge.merged_at_ms),
+    revertCommit: merge.revert_commit ?? undefined,
+  };
+}
+
+function workerMessages(record: TeamWorkerRecord, messages: TeamMessage[]): Worker["messages"] {
+  const transcript: Worker["messages"] = [];
+  record.transcript.messages.forEach((message, index) => {
+    if (message.role !== "user" && message.role !== "assistant") return;
+    const body = messageText(message.content).trim();
+    if (!body) return;
+    transcript.push({
+      id: `worker-${record.id}-${record.generation}-${index}`,
+      from: message.role === "user" ? "lead" : "worker",
+      body,
+      time: "restored",
+    });
+  });
+  const inbox = messages
+    .filter((message) => message.worker_id === record.id)
+    .map((message) => ({
+      id: `team-${message.worker_id}-${message.at_ms}`,
+      from: "worker" as const,
+      body: message.text,
+      time: timeFromMs(message.at_ms),
+    }));
+  return [...transcript, ...inbox];
 }
 
 function workerFromRecord(
@@ -599,6 +742,23 @@ function workerFromRecord(
   messages: TeamMessage[],
 ): Worker {
   const status = record.status as WorkerStatus;
+  const progress: Record<WorkerStatus, number> = {
+    dispatching: 10,
+    working: 45,
+    needs_you: 45,
+    idle: 50,
+    paused: 45,
+    interrupted: 45,
+    completed: 70,
+    stopped: 70,
+    in_review: 85,
+    fixing: 75,
+    merging: 95,
+    merged: 100,
+    conflict: 85,
+    failed: 70,
+    cancelled: 0,
+  };
   return {
     id: record.id,
     name: record.name,
@@ -611,13 +771,16 @@ function workerFromRecord(
     branch: record.branch,
     worktree: record.worktree,
     files: [],
-    tokens: record.used_tokens,
-    cost: 0,
-    elapsed: "",
-    turns: 0,
-    progress: status === "completed" ? 100 : 0,
-    lastActivity: "now",
-    needsYou: record.status === "needs_you" || record.pending != null,
+    tokens: record.total_tokens,
+    tokenBudget: record.token_budget,
+    cost: record.cost_micros == null ? null : record.cost_micros / 1_000_000,
+    elapsed: elapsedFromMs(record.elapsed_ms),
+    turns: record.turns,
+    progress: progress[status],
+    lastActivity: timeFromMs(record.last_activity_ms),
+    needsYou:
+      record.pending != null || ["needs_you", "conflict", "failed"].includes(record.status),
+    fixerFindingId: record.fixer_finding_id ?? undefined,
     checks: record.checks.map((check) => ({
       name: check.name,
       status:
@@ -625,41 +788,72 @@ function workerFromRecord(
           ? (check.status as Check["status"])
           : "running",
       detail: check.detail ?? "",
+      tip: check.tip,
     })),
-    findings: [],
-    messages: messages
-      .filter((message) => message.worker_id === record.id)
-      .map((message) => ({
-        id: `team-${message.worker_id}-${message.at_ms}`,
-        from: "worker",
-        body: message.text,
-        time: "now",
-      })),
+    findings: record.findings.map(findingFromWire),
+    review: record.review
+      ? {
+          summary: record.review.summary,
+          tip: record.review.tip,
+          reviewedAtMs: record.review.reviewed_at_ms,
+        }
+      : undefined,
+    messages: workerMessages(record, messages),
     timeline: [],
-    diff: { files: 0, additions: 0, deletions: 0 },
+    diff: record.merge
+      ? {
+          files: record.merge.files,
+          additions: record.merge.additions,
+          deletions: record.merge.deletions,
+        }
+      : { files: 0, additions: 0, deletions: 0 },
+    merge: record.merge ? mergeFromRecord(record, record.merge) : undefined,
   };
 }
 
-function mergeTeamMessages(
+function mergeTeamActivity(
   entries: LeadEntry[],
   messages: TeamMessage[],
   workers: TeamWorkerRecord[],
 ): LeadEntry[] {
-  const known = new Set(entries.map((entry) => entry.id));
-  const additions: LeadEntry[] = [];
+  const next = entries.slice();
+  const upsert = (entry: LeadEntry) => {
+    const index = next.findIndex((candidate) => candidate.id === entry.id);
+    if (index === -1) next.push(entry);
+    else next[index] = entry;
+  };
   for (const message of messages) {
-    const id = `team-${message.worker_id}-${message.at_ms}`;
-    if (known.has(id)) continue;
-    const worker = workers.find((item) => item.id === message.worker_id);
-    additions.push({
-      id,
+    upsert({
+      id: `team-${message.worker_id}-${message.at_ms}`,
       kind: "team-message",
       workerId: message.worker_id,
       body: message.text,
-      time: worker?.name ?? new Date(message.at_ms).toLocaleTimeString(),
+      time: timeFromMs(message.at_ms),
     });
   }
-  return additions.length > 0 ? [...entries, ...additions] : entries;
+  for (const worker of workers) {
+    if (worker.review) {
+      upsert({
+        id: `review-${worker.id}-${worker.review.reviewed_at_ms}`,
+        kind: "review",
+        workerId: worker.id,
+        title: "Lead review recorded",
+        body: worker.review.summary,
+        time: timeFromMs(worker.review.reviewed_at_ms),
+      });
+    }
+    if (worker.merge) {
+      const record = mergeFromRecord(worker, worker.merge);
+      upsert({
+        id: record.id,
+        kind: "merge",
+        workerId: worker.id,
+        record,
+        time: record.time,
+      });
+    }
+  }
+  return next;
 }
 
 async function syncTeam(): Promise<void> {
@@ -677,7 +871,7 @@ async function syncTeam(): Promise<void> {
       workers: snapshot.workers.map((record, index) =>
         workerFromRecord(record, index, messages),
       ),
-      leadEntries: mergeTeamMessages(state.leadEntries, messages, snapshot.workers),
+      leadEntries: mergeTeamActivity(state.leadEntries, messages, snapshot.workers),
       teamSlots: snapshot.slots,
       teamActive: snapshot.active,
       selectedWorkerId:
@@ -784,11 +978,16 @@ export const actions = {
   pauseWorker,
   resumeWorker,
   syncTeam,
+  reviewWorker,
+  recordWorkerCheck,
+  resolveFinding,
   fixFinding,
   spawnFixer,
-  completeFixer,
   wontfixFinding,
   mergeWorker,
+  revertMerge,
+  stopAll,
+  setWorkerBudget,
   setWorkerSlots,
   dismissToast,
   resetDemo,

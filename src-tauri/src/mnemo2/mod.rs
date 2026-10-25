@@ -13,7 +13,10 @@
 /// The headless-engine-backed lead conversation.
 pub mod runtime;
 
-/// The real Phase 2 worker team runtime.
+/// Durable Phase 3 review and merge records.
+pub mod phase3;
+
+/// The real worker team runtime.
 pub mod team;
 
 /// The typed Tauri command surface for the lead conversation.
@@ -62,6 +65,15 @@ pub fn run() {
             ipc::team_interrupt,
             ipc::team_stop,
             ipc::team_resume,
+            ipc::team_review,
+            ipc::team_record_check,
+            ipc::team_resolve_finding,
+            ipc::team_review_fix,
+            ipc::team_route_fix,
+            ipc::team_merge,
+            ipc::team_revert_merge,
+            ipc::team_stop_all,
+            ipc::team_set_token_budget,
             ipc::team_messages,
             ipc::project_list,
             ipc::project_add,

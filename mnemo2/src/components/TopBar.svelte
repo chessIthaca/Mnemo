@@ -7,6 +7,18 @@
 
   const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)));
   const activeCount = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing", "merging"].includes(worker.status)).length);
+  const tokenUsage = $derived($app.workers.reduce((total, worker) => total + worker.tokens, 0));
+  const tokenBudget = $derived($app.workers.reduce((total, worker) => total + worker.tokenBudget, 0));
+  const teamCost = $derived.by(() => {
+    let total = 0;
+    let hasPricing = false;
+    for (const worker of $app.workers) {
+      if (worker.cost == null) continue;
+      hasPricing = true;
+      total += worker.cost;
+    }
+    return hasPricing ? total : null;
+  });
   let settingsOpen = $state(false);
 
   function handleTeam() {
@@ -50,8 +62,8 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
-    <button class="budget-chip" aria-label="Open project settings" onclick={() => (settingsOpen = true)}>
-      <Wallet size={13} /><span>${$currentProject?.budgetSpent.toFixed(2) ?? "0.00"}</span><small>/ ${$currentProject?.budgetLimit ?? 0}</small>
+    <button class="budget-chip" aria-label="Open project settings" title="Cumulative worker usage and token budgets" onclick={() => (settingsOpen = true)}>
+      <Wallet size={13} /><span>{#if teamCost != null}${teamCost.toFixed(2)}{:else}{tokenUsage} tokens{/if}</span><small>/ {tokenBudget} tokens</small>
     </button>
   </div>
 </header>

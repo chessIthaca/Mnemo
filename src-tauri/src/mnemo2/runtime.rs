@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use mnemo::app::policy_factory::WorkflowPolicyFactory;
 use mnemo::config::{Config, SafetyMode};
 use mnemo::headless::{
     AgentSession, Engine, EngineOptions, EventReceiver, MemoryBackend, PendingInteraction,
@@ -23,7 +24,6 @@ use mnemo::headless::{
 use mnemo::provider::LlmClient;
 use mnemo::tool::ToolResult;
 use mnemo::workspace::Workspace;
-use mnemo::app::policy_factory::WorkflowPolicyFactory;
 use mnemo::{Approval, PermissionPolicy, SerializableAgentEvent, UserAnswer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
@@ -244,6 +244,7 @@ impl LeadRuntime {
             state_dir: runtime.state_dir.clone(),
             slots: DEFAULT_SLOTS,
             max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
+            pricing: runtime.pricing()?,
         })
         .await?;
         *runtime.team.lock().await = Some(Arc::new(team));
@@ -282,6 +283,13 @@ impl LeadRuntime {
     /// The selected project root (for worker worktree provisioning).
     pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Load configured model prices for team telemetry.
+    pub(crate) fn pricing(&self) -> Result<Vec<mnemo::config::PricingEntry>, String> {
+        Config::load(&self.config_dir)
+            .map(|config| config.pricing)
+            .map_err(|err| format!("could not load model pricing: {err}"))
     }
 
     /// The shared team runtime for this lead.
@@ -532,19 +540,19 @@ impl LeadRuntime {
             .unwrap_or_default();
         let session = engine
             .spawn(SpawnOptions {
-                    name: Some("Lead".to_string()),
-                    model: spawn_model.clone(),
-                    worktree: None,
-                    permissions: None,
-                    policy: self.policy.clone(),
-                    resume: Some(resume),
-                    limits: None,
-                    host_tools,
-                    external_policy: None,
-                    guardrails: None,
-                })
-                .await
-                .map_err(|err| format!("could not spawn the lead session: {err}"))?;
+                name: Some("Lead".to_string()),
+                model: spawn_model.clone(),
+                worktree: None,
+                permissions: None,
+                policy: self.policy.clone(),
+                resume: Some(resume),
+                limits: None,
+                host_tools,
+                external_policy: None,
+                guardrails: None,
+            })
+            .await
+            .map_err(|err| format!("could not spawn the lead session: {err}"))?;
         let session_id = session.id();
         let busy = Arc::new(AtomicBool::new(false));
         let observed_model = Arc::new(Mutex::new(
@@ -613,7 +621,12 @@ async fn pump_events(
     team: Option<Arc<TeamRuntime>>,
 ) {
     while let Ok(event) = receiver.recv().await {
-        if let SerializableAgentEvent::HostToolCall { call_id, name, args } = &event.event {
+        if let SerializableAgentEvent::HostToolCall {
+            call_id,
+            name,
+            args,
+        } = &event.event
+        {
             let result = match &team {
                 Some(team) => team.handle_lead_host_tool(name, args.clone()).await,
                 None => ToolResult::error("the team runtime is not available"),
@@ -623,23 +636,30 @@ async fn pump_events(
         let terminal = match &event.event {
             SerializableAgentEvent::Started => {
                 busy.store(true, Ordering::SeqCst);
+                if let Some(team) = &team {
+                    team.set_lead_busy(true);
+                }
                 false
             }
             SerializableAgentEvent::Finished { .. }
             | SerializableAgentEvent::Exited
             | SerializableAgentEvent::Parked { .. } => {
                 busy.store(false, Ordering::SeqCst);
+                if let Some(team) = &team {
+                    team.set_lead_busy(false);
+                }
                 true
             }
             SerializableAgentEvent::Error { retrying, .. } => {
                 if !retrying {
                     busy.store(false, Ordering::SeqCst);
+                    if let Some(team) = &team {
+                        team.set_lead_busy(false);
+                    }
                 }
                 false
             }
-            SerializableAgentEvent::ModelChanged {
-                model: changed, ..
-            } => {
+            SerializableAgentEvent::ModelChanged { model: changed, .. } => {
                 *observed_model.lock().await = Some(changed.clone());
                 false
             }
@@ -812,7 +832,12 @@ mod tests {
         ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
             Ok(Box::pin(futures::stream::unfold(0u8, |step| async move {
                 match step {
-                    0 => Some((LlmEvent::TextDelta { text: "slow".into() }, 1)),
+                    0 => Some((
+                        LlmEvent::TextDelta {
+                            text: "slow".into(),
+                        },
+                        1,
+                    )),
                     1 => {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         Some((
@@ -839,6 +864,22 @@ mod tests {
             reason: FinishReason::Stop,
         });
         events
+    }
+
+    fn usage_turn(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Vec<LlmEvent> {
+        vec![
+            LlmEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens: 0,
+                cached_tokens,
+                ttft_ms: None,
+                generation_ms: None,
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ]
     }
 
     fn tool_turn(name: &str, args: &str) -> Vec<LlmEvent> {
@@ -889,6 +930,73 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             model: None,
         }
+    }
+
+    async fn open_git_team(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        llm: Arc<dyn LlmClient>,
+    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+        open_git_team_with_pricing(root, config, state, llm, Vec::new()).await
+    }
+
+    async fn open_git_team_with_pricing(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        llm: Arc<dyn LlmClient>,
+        pricing: Vec<mnemo::config::PricingEntry>,
+    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(options(root, config, state), Some(llm))
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                slots: 1,
+                max_spawns_per_turn: 1,
+                pricing,
+            })
+            .await
+            .expect("team opens");
+        (lead, team)
+    }
+
+    fn commit_worker_file(
+        worker: &crate::mnemo2::team::WorkerRecord,
+        relative: &str,
+        contents: &str,
+        message: &str,
+    ) {
+        let path = worker.worktree.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("worker file directory");
+        }
+        std::fs::write(path, contents).expect("worker file");
+        run_git(&worker.worktree, &["add", "--", relative]);
+        run_git(&worker.worktree, &["commit", "-m", message]);
+    }
+
+    async fn wait_for_worker_status(
+        team: &crate::mnemo2::team::TeamRuntime,
+        worker_id: &str,
+        status: crate::mnemo2::team::WorkerStatus,
+    ) -> crate::mnemo2::team::WorkerRecord {
+        for _ in 0..100 {
+            let worker = team.worker(worker_id).await.expect("worker record");
+            if worker.status == status {
+                return worker;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = team.worker(worker_id).await.expect("worker record");
+        panic!("worker did not reach {status:?}: {worker:?}");
     }
 
     async fn next_event(rx: &mut broadcast::Receiver<LeadEvent>) -> LeadEvent {
@@ -1196,25 +1304,31 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn init_git(root: &std::path::Path) {
-        let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .expect("git runs");
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&["init", "-b", "main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Mnemo2 Test"]);
+        run_git(root, &["init", "-b", "main"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Mnemo2 Test"]);
         std::fs::write(root.join("README.md"), "seed\n").expect("seed file");
-        run(&["add", "."]);
-        run(&["commit", "-m", "seed"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            ".worktrees/\n.coding/memory.db*\n.coding/codegraph.db*\n.coding/logs/\n.coding/plans/stack.json\n.coding/instance.json\n.coding/tmp/\n",
+        )
+        .expect("worktree ignore");
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "seed"]);
     }
 
     #[tokio::test]
@@ -1239,6 +1353,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: 2,
             max_spawns_per_turn: 2,
+            pricing: Vec::new(),
         })
         .await
         .expect("the team opens");
@@ -1274,7 +1389,10 @@ mod tests {
             );
             match &event.event.event {
                 SerializableAgentEvent::TextDelta { text } => {
-                    texts.entry(event.worker_id.clone()).or_default().push_str(text);
+                    texts
+                        .entry(event.worker_id.clone())
+                        .or_default()
+                        .push_str(text);
                 }
                 SerializableAgentEvent::Finished { .. } | SerializableAgentEvent::Exited => {
                     finished.insert(event.worker_id.clone());
@@ -1291,7 +1409,10 @@ mod tests {
         text_values.sort();
         assert_eq!(
             text_values,
-            vec!["first worker done".to_string(), "second worker done".to_string()],
+            vec![
+                "first worker done".to_string(),
+                "second worker done".to_string()
+            ],
             "each worker kept its own response"
         );
 
@@ -1329,6 +1450,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: 2,
             max_spawns_per_turn: 2,
+            pricing: Vec::new(),
         })
         .await
         .expect("the team ledger reopens");
@@ -1365,6 +1487,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: 2,
             max_spawns_per_turn: 2,
+            pricing: Vec::new(),
         })
         .await
         .expect("the team opens");
@@ -1413,6 +1536,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: 1,
             max_spawns_per_turn: 1,
+            pricing: Vec::new(),
         })
         .await
         .expect("the team opens");
@@ -1443,6 +1567,726 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_git_project_explains_how_to_enable_tracked_dispatch() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("the lead opens without Git");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let host_tools = team.lead_host_tools();
+        assert!(host_tools.iter().any(|tool| tool.name == "team_dispatch"));
+        assert!(host_tools.iter().all(|tool| tool.name != "spawn_agent"));
+        let error = team
+            .dispatch("task".into(), None)
+            .await
+            .expect_err("non-Git dispatch fails safely");
+        assert!(error.contains("folder containing .git"), "{error}");
+        assert!(team.snapshot().await.workers.is_empty());
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_downgrades_a_live_worker_to_interrupted() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(SlowLlm::new())),
+        )
+        .await
+        .expect("lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let worker = team
+            .dispatch("slow task".into(), None)
+            .await
+            .expect("dispatch");
+        assert_eq!(worker.status, WorkerStatus::Working);
+        team.shutdown().await;
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team reopens");
+        let recovered = reopened.worker(&worker.id).await.expect("recovered worker");
+        assert_eq!(recovered.status, WorkerStatus::Interrupted);
+        assert_eq!(recovered.branch, worker.branch);
+        assert_eq!(
+            recovered.transcript.messages.len(),
+            worker.transcript.messages.len()
+        );
+
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn review_fix_preserves_scope_evidence_and_requires_delta_review() {
+        use crate::mnemo2::phase3::Finding;
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]))),
+        )
+        .await
+        .expect("lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        team.stop(&worker.id).await.expect("stop");
+        std::fs::create_dir_all(worker.worktree.join("src")).expect("source dir");
+        std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn old() {}\n").expect("source");
+        run_git(&worker.worktree, &["add", "src/lib.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "implementation"]);
+        let finding = Finding {
+            id: "F-1".into(),
+            severity: "low".into(),
+            title: "Rename the function".into(),
+            detail: "The public name should describe the new behavior".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            status: "open".into(),
+            fix_commit: None,
+            evidence: None,
+            justification: None,
+        };
+        team.review(&worker.id, "initial review".into(), vec![finding])
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("old-tip check");
+        let evidence = team
+            .resolve_finding(&worker.id, "F-1", "fixed", None, None)
+            .await
+            .expect_err("fixed findings need evidence");
+        assert!(evidence.contains("evidence"), "{evidence}");
+
+        std::fs::write(
+            worker.worktree.join("unrelated.rs"),
+            "pub fn unrelated() {}\n",
+        )
+        .expect("unrelated source");
+        run_git(&worker.worktree, &["add", "unrelated.rs"]);
+        let dirty = team
+            .review_fix(&worker.id, "F-1", "src/lib.rs", "old", "new")
+            .await
+            .expect_err("a dirty worker cannot be review-fixed");
+        assert!(dirty.contains("clean"), "{dirty}");
+        run_git(&worker.worktree, &["reset", "--", "unrelated.rs"]);
+        std::fs::remove_file(worker.worktree.join("unrelated.rs")).expect("remove fixture");
+
+        let fixed = team
+            .review_fix(&worker.id, "F-1", "src/lib.rs", "old", "new")
+            .await
+            .expect("review fix");
+        let fix_tip = crate::mnemo2::phase3::tip(&worker.worktree)
+            .await
+            .expect("fix tip");
+        assert_eq!(fixed.findings[0].status, "fixed");
+        assert_eq!(
+            fixed.findings[0].fix_commit.as_deref(),
+            Some(fix_tip.as_str())
+        );
+        assert!(fixed.findings[0].evidence.is_some());
+        assert!(fixed.review.is_none());
+        assert!(fixed.checks.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(worker.worktree.join("src/lib.rs")).expect("fixed source"),
+            "pub fn new() {}\n"
+        );
+        assert!(!worker.worktree.join("unrelated.rs").exists());
+        let second = team
+            .review_fix(&worker.id, "F-1", "src/lib.rs", "new", "other")
+            .await
+            .expect_err("a second fix needs delta review");
+        assert!(second.contains("fresh delta review"), "{second}");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("new-tip check");
+        let stale = team
+            .merge(&worker.id)
+            .await
+            .expect_err("merge needs delta review");
+        assert!(stale.contains("has not been reviewed"), "{stale}");
+        team.review(&worker.id, "delta review".into(), fixed.findings.clone())
+            .await
+            .expect("delta review");
+        let merged = team.merge(&worker.id).await.expect("reviewed merge");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn larger_findings_route_to_the_tracked_worker_for_delta_review() {
+        use crate::mnemo2::phase3::Finding;
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["implementation done"]),
+            text_turn(&["fix done"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        for _ in 0..100 {
+            if team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::create_dir_all(worker.worktree.join("src")).expect("source dir");
+        std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn old() {}\n").expect("source");
+        run_git(&worker.worktree, &["add", "src/lib.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "implementation"]);
+        let finding = Finding {
+            id: "F-large".into(),
+            severity: "high".into(),
+            title: "Rework the implementation".into(),
+            detail: "The change exceeds the tiny review-fix scope".into(),
+            file: "src/lib.rs".into(),
+            line: 1,
+            status: "open".into(),
+            fix_commit: None,
+            evidence: None,
+            justification: None,
+        };
+        team.review(&worker.id, "initial review".into(), vec![finding])
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        let routed = team
+            .route_fix(&worker.id, "F-large")
+            .await
+            .expect("route fixer");
+        assert_eq!(routed.fixer_finding_id.as_deref(), Some("F-large"));
+        assert!(routed.review.is_none());
+        assert!(routed.checks.is_empty());
+        for _ in 0..100 {
+            if llm.calls() >= 2
+                && team.worker(&worker.id).await.expect("worker").status == WorkerStatus::Completed
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(llm.calls(), 2, "the tracked worker received the fix brief");
+        std::fs::write(worker.worktree.join("src/lib.rs"), "pub fn new() {}\n")
+            .expect("fixed source");
+        run_git(&worker.worktree, &["add", "src/lib.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "fix review finding"]);
+        let resolved = team
+            .resolve_finding(
+                &worker.id,
+                "F-large",
+                "fixed",
+                Some("worker commit and affected checks verified".into()),
+                None,
+            )
+            .await
+            .expect("close with evidence");
+        let fix_tip = crate::mnemo2::phase3::tip(&worker.worktree)
+            .await
+            .expect("tip");
+        assert_eq!(
+            resolved.findings[0].fix_commit.as_deref(),
+            Some(fix_tip.as_str())
+        );
+        let reviewed = team
+            .review(&worker.id, "delta review".into(), resolved.findings.clone())
+            .await
+            .expect("delta review");
+        assert_eq!(reviewed.review.expect("review record").tip, fix_tip);
+
+        let _ = team.stop(&worker.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    fn mark_merge_interrupted_for_test(state: &TempDir) {
+        let path = state.path().join("team.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("team ledger"))
+                .expect("team ledger JSON");
+        ledger["workers"][0]["status"] = serde_json::json!("merging");
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&ledger).expect("ledger JSON"),
+        )
+        .expect("interrupted ledger");
+    }
+
+    #[tokio::test]
+    async fn merge_requires_an_idle_worker() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(&root, &config, &state, Arc::new(SlowLlm::new())).await;
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        team.stop(&worker.id).await.expect("stop initial turn");
+        commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
+        team.review(&worker.id, "reviewed".into(), Vec::new())
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        team.resume(&worker.id).await.expect("resume");
+        team.message(&worker.id, "continue working".into())
+            .await
+            .expect("new turn");
+
+        let error = team
+            .merge(&worker.id)
+            .await
+            .expect_err("busy worker cannot merge");
+        assert!(error.contains("worker must be idle"), "{error}");
+
+        let _ = team.stop(&worker.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_detaches_the_live_session_before_worktree_cleanup() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]));
+        let (lead, team) = open_git_team(&root, &config, &state, llm).await;
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
+        team.review(&worker.id, "reviewed".into(), Vec::new())
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        assert_eq!(team.snapshot().await.active, 1);
+
+        let merged = team.merge(&worker.id).await.expect("merge");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        assert_eq!(team.snapshot().await.active, 0);
+        assert!(!worker.worktree.exists());
+        assert!(
+            team.resume(&worker.id).await.is_err(),
+            "merged workers stay closed"
+        );
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_a_completed_merge_from_git_evidence() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]));
+        let (lead, team) = open_git_team(&root, &config, &state, llm).await;
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
+        team.review(&worker.id, "reviewed".into(), Vec::new())
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        team.shutdown().await;
+        run_git(
+            root.path(),
+            &[
+                "merge",
+                "--no-ff",
+                &worker.branch,
+                "-m",
+                "completed before crash",
+            ],
+        );
+        let worker_tip = crate::mnemo2::phase3::tip(&worker.worktree)
+            .await
+            .expect("worker tip");
+        std::fs::write(
+            root.path().join(".git/MERGE_HEAD"),
+            format!("{worker_tip}\n"),
+        )
+        .expect("stale merge head");
+        mark_merge_interrupted_for_test(&state);
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team reopens");
+        let recovered = reopened.worker(&worker.id).await.expect("recovered worker");
+        let lead_tip = crate::mnemo2::phase3::tip(root.path())
+            .await
+            .expect("lead tip");
+        assert_eq!(recovered.status, WorkerStatus::Merged);
+        assert_eq!(recovered.merge.expect("merge record").commit, lead_tip);
+        assert!(!worker.worktree.exists());
+        crate::mnemo2::phase3::require_clean(root.path(), "lead")
+            .await
+            .expect("clean lead");
+
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_aborts_an_interrupted_conflict_and_keeps_the_branch() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]));
+        let (lead, team) = open_git_team(&root, &config, &state, llm).await;
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        commit_worker_file(&worker, "README.md", "worker\n", "worker edit");
+        std::fs::write(root.path().join("README.md"), "lead\n").expect("lead edit");
+        run_git(root.path(), &["add", "README.md"]);
+        run_git(root.path(), &["commit", "-m", "lead edit"]);
+        team.review(&worker.id, "reviewed".into(), Vec::new())
+            .await
+            .expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        team.shutdown().await;
+        let conflict = std::process::Command::new("git")
+            .args(["merge", "--no-ff", &worker.branch])
+            .current_dir(root.path())
+            .output()
+            .expect("conflicting merge");
+        assert!(!conflict.status.success());
+        mark_merge_interrupted_for_test(&state);
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team reopens");
+        let recovered = reopened.worker(&worker.id).await.expect("recovered worker");
+        assert_eq!(recovered.status, WorkerStatus::Conflict);
+        assert!(recovered.review.is_none());
+        assert!(recovered.checks.is_empty());
+        assert!(recovered.error.is_some());
+        assert!(worker.worktree.exists());
+        run_git(
+            root.path(),
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worker.branch),
+            ],
+        );
+        crate::mnemo2::phase3::require_clean(root.path(), "lead")
+            .await
+            .expect("clean lead");
+        let merge_head =
+            crate::mnemo2::phase3::git(root.path(), &["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+                .await
+                .expect("merge-head probe");
+        assert!(!merge_head.status.success());
+
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn merge_requires_tip_checks_and_supports_local_revert() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])]))),
+        )
+        .await
+        .expect("lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let worker = team
+            .dispatch("implement".into(), None)
+            .await
+            .expect("dispatch");
+        team.stop(&worker.id).await.expect("stop");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+        team.review(&worker.id, "reviewed".into(), Vec::new())
+            .await
+            .expect("review");
+        let empty = team
+            .merge(&worker.id)
+            .await
+            .expect_err("empty checks refuse merge");
+        assert!(empty.contains("no checks"), "{empty}");
+        team.record_check(
+            &worker.id,
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("check");
+        let merged = team.merge(&worker.id).await.expect("merge");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        let record = merged.merge.as_ref().expect("merge record");
+        assert_eq!(record.target, "wt/lead");
+        assert_eq!(
+            (record.files, record.additions, record.deletions),
+            (1, 1, 0)
+        );
+        assert!(
+            !worker.worktree.exists(),
+            "successful merge removes the worktree: {:?}",
+            merged.error
+        );
+        let merged_source = std::fs::read_to_string(root.path().join("feature.rs"))
+            .expect("merged source")
+            .replace("\r\n", "\n");
+        assert_eq!(merged_source, "pub fn feature() {}\n");
+        run_git(
+            root.path(),
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", worker.branch),
+            ],
+        );
+        let main_tip = crate::mnemo2::phase3::git_value(root.path(), &["rev-parse", "main"])
+            .await
+            .expect("main tip");
+        run_git(root.path(), &["branch", "-f", "main", &record.commit]);
+        let landed = team
+            .revert_merge(&worker.id)
+            .await
+            .expect_err("landed merge cannot revert");
+        assert!(landed.contains("already landed"), "{landed}");
+        run_git(root.path(), &["branch", "-f", "main", &main_tip]);
+        let reverted = team.revert_merge(&worker.id).await.expect("revert");
+        assert!(reverted
+            .merge
+            .is_some_and(|record| record.revert_commit.is_some()));
+        assert!(
+            !root.path().join("feature.rs").exists(),
+            "revert restores the lead tree"
+        );
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn token_budget_pause_raise_stop_all_and_restart_use_real_usage() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let pricing = vec![mnemo::config::PricingEntry {
+            model: "scripted-a".into(),
+            input_per_1m: 2.0,
+            output_per_1m: 10.0,
+            cached_per_1m: 1.0,
+        }];
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            usage_turn(80, 20, 10),
+            usage_turn(30, 20, 5),
+            text_turn(&["continued"]),
+        ]));
+        let (lead, team) = open_git_team_with_pricing(&root, &config, &state, llm, pricing).await;
+        let team = team.with_worker_token_budget(150);
+        let worker = team
+            .dispatch("usage task".into(), None)
+            .await
+            .expect("dispatch");
+        let first = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        assert_eq!(first.total_tokens, 100);
+        assert_eq!(first.cost_micros, Some(350));
+        team.message(&worker.id, "second usage turn".into())
+            .await
+            .expect("second turn");
+        let exhausted = wait_for_worker_status(&team, &worker.id, WorkerStatus::NeedsYou).await;
+        assert_eq!(exhausted.total_tokens, 150);
+        assert_eq!(exhausted.prompt_tokens, 110);
+        assert_eq!(exhausted.completion_tokens, 40);
+        assert_eq!(exhausted.cached_tokens, 15);
+        assert_eq!(exhausted.requests, 2);
+        assert_eq!(exhausted.cost_micros, Some(605));
+        assert!(exhausted
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("increase the budget")));
+        let blocked = team
+            .message(&worker.id, "continue".into())
+            .await
+            .expect_err("budget blocks continuation");
+        assert!(
+            blocked.contains("increase the worker token budget"),
+            "{blocked}"
+        );
+
+        let raised = team
+            .set_token_budget(&worker.id, 160)
+            .await
+            .expect("raise budget");
+        assert_eq!(raised.token_budget, 160);
+        assert!(raised.error.is_none());
+        team.message(&worker.id, "continue".into())
+            .await
+            .expect("continue after raise");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        team.stop_all().await.expect("stop all");
+        let stopped = team.snapshot().await;
+        assert_eq!(stopped.active, 0);
+        assert_eq!(stopped.workers[0].status, WorkerStatus::Stopped);
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: 1,
+            max_spawns_per_turn: 1,
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("reopen");
+        let restored = reopened.worker(&worker.id).await.expect("restored worker");
+        assert_eq!(restored.total_tokens, 150);
+        assert_eq!(restored.requests, 2);
+        assert_eq!(restored.cost_micros, Some(605));
+        assert_eq!(restored.token_budget, 160);
+
+        team.shutdown().await;
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn worker_message_parent_round_trips_to_the_lead_inbox() {
         use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions};
 
@@ -1464,6 +2308,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: 1,
             max_spawns_per_turn: 1,
+            pricing: Vec::new(),
         })
         .await
         .expect("the team opens");

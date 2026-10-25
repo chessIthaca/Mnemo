@@ -22,8 +22,15 @@
     <span>{entry.record.reviewSummary}</span>
   </div>
   <div class="merge-footer">
-    <span>{entry.record.checks.length} check passed · {entry.record.model} · ${entry.record.cost.toFixed(2)}</span>
-    <button onclick={() => actions.selectWorker(entry.workerId)}>View worker <ArrowUpRight size={13} /></button>
+    <span>{entry.record.checks.length} check{entry.record.checks.length === 1 ? "" : "s"} passed · {entry.record.model} · {entry.record.tokens} tokens{#if entry.record.cost != null} · ${entry.record.cost.toFixed(2)}{/if}</span>
+    <div class="merge-actions">
+      <button onclick={() => actions.selectWorker(entry.workerId)}>View worker <ArrowUpRight size={13} /></button>
+      {#if entry.record.revertCommit}
+        <span>Reverted · <code>{entry.record.revertCommit}</code></span>
+      {:else}
+        <button aria-label={`Revert merge for ${worker?.name ?? "worker"}`} onclick={() => actions.revertMerge(entry.workerId)}>Revert</button>
+      {/if}
+    </div>
   </div>
 </article>
 
@@ -42,6 +49,7 @@
   .additions { color: #4f7d48; }
   .deletions { color: #a15b53; }
   .merge-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; border-top: 1px solid #dfe6d9; color: var(--muted); font-size: 9px; }
+  .merge-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
   .merge-footer button { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 10px; font-weight: 650; }
   @media (max-width: 560px) { .merge-card { margin-left: 0; } .merge-footer { align-items: flex-start; flex-direction: column; } }
 </style>

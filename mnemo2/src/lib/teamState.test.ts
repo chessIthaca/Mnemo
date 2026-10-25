@@ -23,7 +23,33 @@ const worker: TeamWorkerRecord = {
   pending: null,
   used_tokens: 10,
   max_tokens: 100,
-  checks: [],
+  token_budget: 200_000,
+  total_tokens: 10,
+  prompt_tokens: 8,
+  completion_tokens: 2,
+  cached_tokens: 3,
+  requests: 2,
+  cost_micros: 500_000,
+  created_at_ms: 1_787_399_996_000,
+  elapsed_ms: 4000,
+  turns: 2,
+  last_activity_ms: 1_787_400_000_000,
+  checks: [{ name: "workspace tests", status: "passed", detail: "ok", tip: "tip-1" }],
+  findings: [{
+    id: "F-1",
+    severity: "low",
+    title: "Example",
+    detail: "Detail",
+    file: "src/lib.rs",
+    line: 1,
+    status: "open",
+    fix_commit: null,
+    evidence: null,
+    justification: null,
+  }],
+  review: { summary: "reviewed", tip: "tip-1", reviewed_at_ms: 1_787_400_000_000 },
+  fixer_finding_id: null,
+  merge: null,
   error: null,
 };
 
@@ -44,6 +70,63 @@ describe("teamState", () => {
       usedTokens: 10,
     });
     expect(state.active).toBe(1);
+    expect(state.workers[0].tokenBudget).toBe(200_000);
+    expect(state.workers[0].totalTokens).toBe(10);
+    expect(state.workers[0].costMicros).toBe(500_000);
+    expect(state.workers[0].elapsedMs).toBe(4000);
+    expect(state.workers[0].turns).toBe(2);
+    expect(state.workers[0].review?.tip).toBe("tip-1");
+    expect(state.workers[0].findings).toHaveLength(1);
+  });
+
+  it("restores durable merge telemetry and revert state", () => {
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        status: "merged",
+        merge: {
+          commit: "merge-1",
+          worker_tip: "tip-1",
+          branch: "wt/agent-w1",
+          target: "wt/lead",
+          checks: ["workspace tests"],
+          review_summary: "reviewed",
+          files: 1,
+          additions: 4,
+          deletions: 2,
+          worker_model: "scripted-a",
+          worker_tokens: 10,
+          cost_micros: 500_000,
+          merged_at_ms: 1_787_400_000_000,
+          revert_commit: "revert-1",
+        },
+      }],
+      slots: 1,
+      active: 0,
+    });
+    expect(state.workers[0].merge).toMatchObject({
+      commit: "merge-1",
+      files: 1,
+      additions: 4,
+      deletions: 2,
+      cost_micros: 500_000,
+      revert_commit: "revert-1",
+    });
+  });
+
+  it("accumulates real usage into cumulative telemetry", () => {
+    const state = applyTeamEvent(
+      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 }),
+      event("usage", { prompt_tokens: 80, completion_tokens: 20, cached_tokens: 10 }),
+    );
+    expect(state.workers[0]).toMatchObject({
+      totalTokens: 110,
+      promptTokens: 88,
+      completionTokens: 22,
+      cachedTokens: 13,
+      requests: 3,
+      usedTokens: 80,
+    });
   });
 
   it("accumulates streamed deltas for only the tagged worker", () => {

@@ -1445,6 +1445,9 @@ impl AgentLoopFactory {
                 registry.unregister(name);
             }
         }
+        if let Some(factory) = self.policy_factory.get() {
+            factory.finalize_tools(&mut registry);
+        }
         // The static deferred tools' schemas render in the reveal response —
         // snapshot them (Arc clones) before LoadToolsTool registers; static
         // tools never change at runtime.
@@ -3812,6 +3815,27 @@ mod tests {
             count,
             expected,
             "free surface minus the carved tool and the (unrequired) git pair"
+        );
+    }
+
+    #[test]
+    fn policy_factory_blocked_tools_are_pruned_after_spawn_registration() {
+        let dir = tempdir().unwrap();
+        let factory = make_factory(dir.path());
+        factory.set_policy_factory(Arc::new(
+            crate::app::policy_factory::WorkflowPolicyFactory::default()
+                .with_blocked_tools(vec!["spawn_agent".to_string()]),
+        ));
+        factory.set_spawner(Arc::new(MockSpawner));
+
+        let registry = registry_for_factory(&factory, &dir);
+        assert!(
+            registry.get("spawn_agent").is_none(),
+            "the final advertised registry must honor policy-factory vetoes"
+        );
+        assert!(
+            registry.get("ask_user").is_some(),
+            "unrelated app tools remain registered"
         );
     }
 

@@ -33,7 +33,7 @@
   </span>
   <span class="worker-meta">
     <span class="status-label" data-status={worker.status}>{workerStatusLabel[worker.status]}</span>
-    <small>${worker.cost.toFixed(2)} · {worker.elapsed}</small>
+    <small>{#if worker.cost != null}${worker.cost.toFixed(2)}{:else}{worker.tokens} tokens{/if} · {worker.elapsed || "—"}</small>
   </span>
   <ChevronRight class="row-chevron" size={13} />
 </button>

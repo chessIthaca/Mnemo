@@ -58,8 +58,11 @@ pub struct Engine {
     brain: Brain,
     /// The shared state (host core + session registry + responder maps).
     inner: Arc<EngineInner>,
-    /// The session event bus — `AgentSession::events()` subscribes.
-    bus: broadcast::Sender<SessionEvent>,
+    /// The session event bus — `AgentSession::events()` subscribes. Behind a
+    /// lock so `shutdown(&self)` can DROP the engine's sender: a shared
+    /// `Arc<Engine>` that is shut down must still let the bus close, or a
+    /// subscriber's `recv` would wait forever (§7 row 15).
+    bus: std::sync::Mutex<Option<broadcast::Sender<SessionEvent>>>,
     /// The host-event bus — `host_events()` subscribes.
     host_events_tx: broadcast::Sender<HostEvent>,
     /// The default permission policy for spawned sessions (§5.4); a
@@ -222,6 +225,12 @@ impl Engine {
     /// `SpawnOptions::permissions` override, else the engine default
     /// (§5.4's engine exposure).
     pub async fn spawn(&self, opts: SpawnOptions) -> Result<AgentSession, EngineError> {
+        // Fail fast on a shut-down engine (review round-1 F2): the bus check
+        // must precede any host work or session registration, or a rejected
+        // spawn leaves a registered-but-unusable idle agent behind.
+        let bus = self
+            .session_bus()
+            .ok_or_else(|| EngineError::session_closed("the engine is shut down"))?;
         // 3c/G6 tiers 1 + 2 (D4, §5.9.6): the named-policy resolution
         // and the declarative guardrails. A named policy (tier 1) IS
         // the policy — exclusive with a non-default guardrails spec
@@ -401,7 +410,7 @@ impl Engine {
             id,
             agent,
             inner: self.inner.clone(),
-            bus: self.bus.clone(),
+            bus,
         })
     }
 
@@ -412,15 +421,30 @@ impl Engine {
     /// F1/F3).
     pub async fn session(&self, id: &SessionId) -> Option<AgentSession> {
         let agent = *self.inner.sessions.lock().await.get(id)?;
+        let bus = self.session_bus()?;
         Some(AgentSession {
             id: *id,
             agent,
             inner: self.inner.clone(),
-            bus: self.bus.clone(),
+            bus,
         })
     }
 
+    /// The session-bus sender, or `None` once the engine shut down. A
+    /// shut-down engine has no bus: the sender is dropped so every
+    /// subscriber's `recv` observes `Closed` (§7 row 15) even though
+    /// `shutdown` borrows `&self` (a shared `Arc<Engine>` cannot move).
+    fn session_bus(&self) -> Option<broadcast::Sender<SessionEvent>> {
+        self.bus.lock().expect("session bus lock poisoned").clone()
+    }
+
     /// The engine's host-event bus (§5.3 :300).
+    ///
+    /// Unlike the session bus (§7 row 15), this one closes on engine *drop*,
+    /// not on `shutdown()`: the brain's notifier holds a sender clone for the
+    /// engine's lifetime, so a shared `Arc<Engine>` cannot close it inside
+    /// `shutdown(&self)` (review round-1 F1 — latent; no production code
+    /// subscribes host events on a shared engine today).
     pub fn host_events(&self) -> EventReceiver<HostEvent> {
         EventReceiver {
             rx: self.host_events_tx.subscribe(),
@@ -445,6 +469,11 @@ impl Engine {
         }
         self.inner.sessions.lock().await.clear();
         self.pump.abort();
+        // Drop the engine's bus sender LAST: every subscriber's `recv` then
+        // observes `Closed`. `shutdown` borrows `&self` so a shared
+        // `Arc<Engine>` can shut down, which means the sender must be
+        // takeable rather than left alive with the struct (§7 row 15).
+        let _ = self.bus.lock().expect("session bus lock poisoned").take();
         Ok(())
     }
 
@@ -694,7 +723,7 @@ async fn start_inner(
     Ok(Engine {
         brain,
         inner,
-        bus,
+        bus: std::sync::Mutex::new(Some(bus)),
         host_events_tx,
         default_permissions: opts.permissions,
         configured_embedding_model,

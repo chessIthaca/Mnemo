@@ -19,7 +19,7 @@ From the repository root:
 
 ```bash
 npm install
-npm run dev:mnemo2       # http://127.0.0.1:5180 — browser mock fallback
+npm run dev:mnemo2       # http://127.0.0.1:5180 — browser-only preview (needs the native shell)
 npm run check:mnemo2     # svelte-check (0 errors / 0 warnings expected)
 npm run test:mnemo2      # Vitest interaction, adapter, reducer, and policy tests
 npm run build:mnemo2     # -> target/mnemo2-dist
@@ -160,7 +160,7 @@ rather than simulating a review or a merge.
 
 ## Policy encoded in the prototype
 
-The mock still enforces the product rules, in `src/lib/review.ts`:
+The policy module still enforces the product rules, in `src/lib/review.ts`:
 
 - **Lead tiny-work cap** — either up to **5 files × 10 changed lines**, or a
   **single file with a larger edit**. Both exclude new files, schema/API/

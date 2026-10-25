@@ -1,6 +1,7 @@
 import { derived, get, writable } from "svelte/store";
 import { createLeadTransport, type LeadApprovalDecision, type LeadTransport } from "./leadEngine";
 import { createProjectTransport, type ProjectRecord } from "./projectEngine";
+import { probeMnemo2Host } from "./runtime";
 import { createTeamTransport, type TeamTransport } from "./teamEngine";
 import type { TeamMessage, TeamWorkerRecord } from "./teamState";
 import {
@@ -220,6 +221,9 @@ function openProject(projectId: string) {
 async function loadProjects(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) return;
+  // Only the real Mnemo2 host answers the handshake; Mnemo1's Browser tab is
+  // a Tauri WebView too and its IPC never registered these commands.
+  if (!(await probeMnemo2Host())) return;
   try {
     const records = await transport.list();
     app.update((state) => ({
@@ -234,6 +238,13 @@ async function loadProjects(): Promise<void> {
 async function openFolder(): Promise<void> {
   const transport = createProjectTransport();
   if (!transport) {
+    app.update((state) => withToast(state, "Opening a folder needs the native shell."));
+    return;
+  }
+  // A Tauri WebView is not necessarily the Mnemo2 host: Mnemo1's Browser tab
+  // has one too, and its IPC never registered this command (Tauri answers
+  // "not allowed by ACL"). Confirm the handshake before invoking anything.
+  if (!(await probeMnemo2Host())) {
     app.update((state) => withToast(state, "Opening a folder needs the native shell."));
     return;
   }
@@ -700,6 +711,9 @@ async function disconnectTeam(): Promise<void> {
 async function connectTeam(): Promise<void> {
   const transport = createTeamTransport();
   if (!transport) return;
+  // Same foreign-host guard as the project path: only the real Mnemo2 host
+  // answers the handshake.
+  if (!(await probeMnemo2Host())) return;
   await disconnectTeam();
   const token = teamToken;
   teamTransport = transport;

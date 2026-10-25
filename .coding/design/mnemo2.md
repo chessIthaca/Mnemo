@@ -433,8 +433,11 @@ Shipped in the native host:
   reduction, stale-event rejection.
 - `mnemo2/src/lib/projectEngine.ts` — native project registry/folder-picker
   transport.
-- `mnemo2/src/lib/runtime.ts` — shared `isTauriRuntime` detection (kept separate
-  so mocking one transport cannot break another).
+- `mnemo2/src/lib/runtime.ts` — shared `isTauriRuntime` detection plus the
+  `probeMnemo2Host` handshake (`mnemo2_host_ping`), which distinguishes the real
+  Mnemo2 host from any other Tauri WebView (Mnemo1's Browser tab is one, and its
+  IPC never registered these commands — Tauri answers `not allowed by ACL`).
+  Kept separate so mocking one transport cannot break another.
 - `mnemo2/src/test/fixtures.ts` — test-only fixture data; production imports none
   of it.
 - `mnemo2/src/components/LeadModelPicker.svelte` — config-backed lead model

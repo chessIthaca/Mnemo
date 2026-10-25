@@ -605,6 +605,43 @@ async fn shutdown_leaves_no_tasks() {
     }
 }
 
+/// §7 row 15, shared-handle form: a shut-down engine behind an `Arc` (the
+/// Mnemo2 lead/team runtime holds one) must STILL close the session bus —
+/// `shutdown(&self)` cannot drop the whole engine, so it must take the
+/// sender out. Regression: leaving the sender alive made `recv` wait
+/// forever (the integration suite hung on `shutdown_leaves_no_tasks`).
+#[tokio::test]
+async fn shutdown_through_a_shared_arc_closes_the_bus() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(ScriptedLlm::new(vec![]));
+    let engine = std::sync::Arc::new(
+        Engine::builder(opts)
+            .provider(llm)
+            .start()
+            .await
+            .expect("the scripted engine starts"),
+    );
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    engine.shutdown().await.expect("shutdown");
+    drop(session);
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+    match closed {
+        Ok(Err(RecvError::Closed)) => {}
+        Ok(other) => panic!("the bus must close after shutdown: {:?}", other.is_ok()),
+        Err(_) => panic!("recv hung: a shared-arc shutdown left the bus open"),
+    }
+    // A shut-down engine refuses new sessions rather than resurrect a
+    // bus nobody can observe.
+    let err = match engine.spawn(SpawnOptions::default()).await {
+        Ok(_) => panic!("a shut-down engine rejects spawns"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), "session_closed", "{err}");
+}
+
 /// §5.3 :350-354 (row 14): a question with ZERO subscribers gets the
 /// immediate constant Freeform answer — the turn never blocks (the second
 /// LLM call happens without any subscriber).

@@ -17,6 +17,7 @@ export function initialLeadRuntime(): LeadRuntimeInfo {
     generation: 0,
     busy: false,
     error: null,
+    errorRetrying: false,
     model: null,
     modelId: null,
     models: [],
@@ -24,6 +25,7 @@ export function initialLeadRuntime(): LeadRuntimeInfo {
     pending: null,
     usedTokens: 0,
     maxTokens: 0,
+    turnStartedAtMs: null,
     streamingEntryId: null,
   };
 }
@@ -137,6 +139,7 @@ function startToolEntry(
       ...entry,
       toolName: call.name || entry.toolName,
       arguments: call.argumentsText ?? entry.arguments,
+      startedAtMs: entry.startedAtMs ?? Date.now(),
       ...(call.streamIndex !== undefined ? { streamIndex: call.streamIndex } : {}),
     };
   });
@@ -149,6 +152,7 @@ function startToolEntry(
       toolName: call.name || "tool",
       arguments: call.argumentsText ?? "",
       liveOutput: "",
+      startedAtMs: Date.now(),
       ...(call.streamIndex !== undefined ? { streamIndex: call.streamIndex } : {}),
       result: null,
     });
@@ -200,7 +204,12 @@ function finishToolEntry(
   const leadEntries = state.leadEntries.map((entry) => {
     if (entry.kind !== "tool" || entry.toolCallId !== callId) return entry;
     found = true;
-    return { ...entry, result, liveOutput: "" };
+    return {
+      ...entry,
+      result,
+      liveOutput: "",
+      endedAtMs: entry.endedAtMs ?? Date.now(),
+    };
   });
   if (!found) {
     leadEntries.push({
@@ -226,8 +235,16 @@ function finishToolEntry(
 }
 
 /** Map a persisted transcript to the lead conversation entries. */
-export function leadEntriesFromTranscript(transcript: LeadTranscript): LeadEntry[] {
+export function leadEntriesFromTranscript(
+  transcript: LeadTranscript,
+  previousEntries: LeadEntry[] = [],
+): LeadEntry[] {
   const entries: LeadEntry[] = [];
+  const previousTools = new Map(
+    previousEntries.flatMap((entry) =>
+      entry.kind === "tool" ? [[entry.toolCallId, entry] as const] : [],
+    ),
+  );
   const toolIndex = new Map<string, number>();
   transcript.messages.forEach((message, index) => {
     if (message.role === "user" || message.role === "assistant") {
@@ -247,6 +264,7 @@ export function leadEntriesFromTranscript(transcript: LeadTranscript): LeadEntry
           typeof call?.id === "string" && call.id
             ? call.id
             : `history-call-${index}-${callIndex}`;
+        const previous = previousTools.get(callId);
         const entry: LeadEntry = {
           id: `history-tool-${index}-${callIndex}`,
           kind: "tool",
@@ -256,6 +274,7 @@ export function leadEntriesFromTranscript(transcript: LeadTranscript): LeadEntry
             typeof call?.name === "string" && call.name ? call.name : "tool",
           arguments: typeof call?.arguments === "string" ? call.arguments : "",
           liveOutput: "",
+          startedAtMs: previous?.startedAtMs,
           result: null,
         };
         entries.push(entry);
@@ -270,11 +289,17 @@ export function leadEntriesFromTranscript(transcript: LeadTranscript): LeadEntry
       messageText(message.content),
       message.tool_is_error !== true,
     );
+    const previous = previousTools.get(callId);
     const existingIndex = callId ? toolIndex.get(callId) : undefined;
     if (existingIndex !== undefined) {
       const existing = entries[existingIndex];
       if (existing?.kind === "tool") {
-        entries[existingIndex] = { ...existing, result, liveOutput: "" };
+        entries[existingIndex] = {
+          ...existing,
+          result,
+          liveOutput: "",
+          endedAtMs: previous?.endedAtMs,
+        };
       }
       return;
     }
@@ -286,6 +311,8 @@ export function leadEntriesFromTranscript(transcript: LeadTranscript): LeadEntry
       toolName: typeof message.name === "string" && message.name ? message.name : "tool",
       arguments: "",
       liveOutput: "",
+      startedAtMs: previous?.startedAtMs,
+      endedAtMs: previous?.endedAtMs,
       result,
     });
   });
@@ -337,14 +364,24 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
       ...state,
       plan: snapshot.plan ?? null,
       planItems,
-      leadEntries: leadEntriesFromTranscript(snapshot.transcript),
+      leadEntries: leadEntriesFromTranscript(snapshot.transcript, state.leadEntries),
       leadRuntime: {
         ...state.leadRuntime,
         mode: "native",
-        status: "ready",
+        status:
+          state.leadRuntime.status === "error" && snapshot.generation === state.leadRuntime.generation
+            ? "error"
+            : "ready",
         generation: snapshot.generation,
         busy: snapshot.busy,
-        error: null,
+        error:
+          snapshot.generation === state.leadRuntime.generation
+            ? state.leadRuntime.error
+            : null,
+        errorRetrying:
+          snapshot.busy && snapshot.generation === state.leadRuntime.generation
+            ? state.leadRuntime.errorRetrying
+            : false,
         model: snapshot.model,
         modelId: snapshot.model_id,
         models: snapshot.models,
@@ -352,6 +389,7 @@ export function applyLeadSnapshot(state: AppState, snapshot: LeadSnapshot): AppS
         pending,
         usedTokens: snapshot.used_tokens,
         maxTokens: snapshot.max_tokens,
+        turnStartedAtMs: snapshot.busy ? state.leadRuntime.turnStartedAtMs : null,
         streamingEntryId: null,
       } satisfies LeadRuntimeInfo,
     },
@@ -390,10 +428,18 @@ function appendLeadText(state: AppState, generation: number, text: string): AppS
 
 /** Apply one live native event, ignoring stale generations. */
 export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
-  const runtime = state.leadRuntime;
-  if (runtime.mode !== "native" || event.generation !== runtime.generation) return state;
+  if (state.leadRuntime.mode !== "native" || event.generation !== state.leadRuntime.generation) {
+    return state;
+  }
   const inner = event.event?.event;
   if (!inner) return state;
+  const runtime = state.leadRuntime.errorRetrying &&
+    !["error", "finished", "exited", "parked"].includes(inner.kind)
+    ? { ...state.leadRuntime, error: null, errorRetrying: false }
+    : state.leadRuntime;
+  if (runtime !== state.leadRuntime) {
+    state = { ...state, leadRuntime: runtime };
+  }
 
   switch (inner.kind) {
     case "started":
@@ -406,8 +452,11 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
         ),
         leadRuntime: {
           ...runtime,
+          status: "ready",
           busy: true,
           error: null,
+          errorRetrying: false,
+          turnStartedAtMs: runtime.turnStartedAtMs ?? Date.now(),
           pending: null,
           streamingEntryId: null,
         },
@@ -540,6 +589,8 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
         leadRuntime: {
           ...runtime,
           busy: false,
+          errorRetrying: false,
+          turnStartedAtMs: null,
           pending: null,
           streamingEntryId: null,
         },
@@ -554,6 +605,7 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
           busy: inner.retrying === true ? runtime.busy : false,
           error:
             inner.error ?? inner.message ?? "The lead stopped with an error.",
+          errorRetrying: inner.retrying === true,
           streamingEntryId: inner.retrying === true ? runtime.streamingEntryId : null,
         },
       };

@@ -943,8 +943,11 @@ async function sendNativeLeadMessage(message: string): Promise<void> {
     ],
     leadRuntime: {
       ...state.leadRuntime,
+      status: "ready",
       busy: true,
       error: null,
+      errorRetrying: false,
+      turnStartedAtMs: Date.now(),
       streamingEntryId: null,
     },
   }));
@@ -956,8 +959,10 @@ async function sendNativeLeadMessage(message: string): Promise<void> {
         ...state,
         leadRuntime: {
           ...state.leadRuntime,
+          status: "error",
           busy: false,
           error: leadError(error),
+          errorRetrying: false,
         },
       }));
     }
@@ -995,15 +1000,22 @@ function sendLeadMessage(body: string) {
   }));
 }
 
-function interruptLead() {
+async function interruptLead(): Promise<void> {
   const transport = leadTransport;
-  if (!transport) return;
+  if (!transport) {
+    const error = new Error("The native lead is not connected, so it cannot be interrupted.");
+    app.update((state) => withToast(state, error.message));
+    throw error;
+  }
   const token = leadSessionToken;
-  void transport.interrupt().catch((error) => {
+  try {
+    await transport.interrupt();
+  } catch (error) {
     if (token === leadSessionToken) {
       app.update((state) => withToast(state, leadError(error)));
     }
-  });
+    throw error;
+  }
 }
 
 function approveLead(requestId: string, decision: LeadApprovalDecision) {

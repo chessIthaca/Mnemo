@@ -195,6 +195,10 @@ export type LeadEntry =
       liveOutput: string;
       /** The provider's stream index, used to route argument fragments. */
       streamIndex?: number;
+      /** Observed tool-start time in Unix epoch milliseconds. */
+      startedAtMs?: number;
+      /** Observed result time in Unix epoch milliseconds. */
+      endedAtMs?: number;
       result: LeadToolResult | null;
     }
   | {
@@ -395,6 +399,8 @@ export interface LeadRuntimeInfo {
   generation: number;
   busy: boolean;
   error: string | null;
+  /** Whether the provider is automatically retrying the current error. */
+  errorRetrying: boolean;
   model: string | null;
   modelId: string | null;
   models: LeadModel[];
@@ -402,6 +408,8 @@ export interface LeadRuntimeInfo {
   pending: LeadPendingInteraction | null;
   usedTokens: number;
   maxTokens: number;
+  /** Observed start of the active turn; null while idle or unknown on restore. */
+  turnStartedAtMs: number | null;
   streamingEntryId: string | null;
 }
 

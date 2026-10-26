@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyLeadEvent,
   applyLeadSnapshot,
@@ -649,5 +649,111 @@ describe("lead event reducer", () => {
       arguments: '{"new":2}',
       result: { success: true, output: "new done" },
     });
+  });
+
+  it("tracks actual tool durations and preserves them across snapshots", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    expect(state.leadRuntime.turnStartedAtMs).toBe(1000);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "timed", name: "shell" },
+      },
+    });
+    expect(state.leadEntries[0]).toMatchObject({ startedAtMs: 1000 });
+    now.mockReturnValue(4500);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "timed",
+          result: { success: true, output: "done" },
+        },
+      },
+    });
+    expect(state.leadEntries[0]).toMatchObject({
+      startedAtMs: 1000,
+      endedAtMs: 4500,
+    });
+
+    const restored = applyLeadSnapshot(state, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: "timed", name: "shell", arguments: "{}" }],
+          },
+          { role: "tool", content: "done", tool_call_id: "timed", name: "shell" },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+    expect(restored.leadEntries[0]).toMatchObject({
+      startedAtMs: 1000,
+      endedAtMs: 4500,
+    });
+    expect(restored.leadRuntime.turnStartedAtMs).toBeNull();
+    now.mockRestore();
+  });
+
+  it("keeps LLM errors visible across snapshots and clears transient retries on progress", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: true,
+    };
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "error", error: "HTTP 429 overloaded", retrying: true },
+      },
+    });
+    expect(state.leadRuntime.errorRetrying).toBe(true);
+    state = applyLeadSnapshot(state, snapshot);
+    expect(state.leadRuntime.error).toBe("HTTP 429 overloaded");
+    expect(state.leadRuntime.errorRetrying).toBe(true);
+
+    state = applyLeadEvent(state, textEvent(3, "Recovered"));
+    expect(state.leadRuntime.error).toBeNull();
+    expect(state.leadRuntime.errorRetrying).toBe(false);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "error", error: "provider failed", retrying: false },
+      },
+    });
+    state = applyLeadSnapshot(state, { ...snapshot, busy: false });
+    expect(state.leadRuntime.status).toBe("error");
+    expect(state.leadRuntime.error).toBe("provider failed");
+    expect(state.leadRuntime.errorRetrying).toBe(false);
+
+    const replaced = applyLeadSnapshot(state, { ...snapshot, generation: 4, busy: false });
+    expect(replaced.leadRuntime.error).toBeNull();
+    expect(replaced.leadRuntime.errorRetrying).toBe(false);
   });
 });

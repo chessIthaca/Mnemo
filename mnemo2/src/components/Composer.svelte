@@ -4,15 +4,36 @@
   import LeadModelPicker from "./LeadModelPicker.svelte";
 
   let draft = $state("");
+  let stopping = $state(false);
   const busy = $derived($app.leadRuntime.busy);
   const connecting = $derived(
     $app.leadRuntime.mode === "native" && $app.leadRuntime.status === "opening",
+  );
+  const canInterrupt = $derived(
+    $app.leadRuntime.mode === "native" &&
+      $app.leadRuntime.status === "ready" &&
+      ($app.leadRuntime.busy || $app.leadRuntime.pending !== null),
   );
   const canSend = $derived(
     $app.leadRuntime.pending === null &&
       ($app.leadRuntime.mode === "mock" ||
         ($app.leadRuntime.status === "ready" && !busy)),
   );
+
+  $effect(() => {
+    if (!canInterrupt) stopping = false;
+  });
+
+  async function stop() {
+    if (stopping) return;
+    stopping = true;
+    try {
+      await actions.interruptLead();
+    } catch {
+      // The store surfaces the actual interruption failure.
+      stopping = false;
+    }
+  }
 
   function send() {
     const message = draft.trim();
@@ -43,15 +64,17 @@
       aria-label="Message the lead"
       placeholder="Ask, plan, or redirect the team…"
     ></textarea>
-    {#if busy}
+    {#if canInterrupt || stopping}
       <button
         class="send-button stop-button"
         type="button"
-        aria-label="Stop the lead"
-        title="Stop the lead"
-        onclick={() => actions.interruptLead()}
+        aria-label={stopping ? "Stopping the lead" : "Stop the lead"}
+        title={stopping ? "Stopping the lead" : "Stop the lead"}
+        disabled={stopping}
+        onclick={stop}
       >
-        <Square size={13} fill="currentColor" strokeWidth={1.5} />
+        <Square size={12} fill="currentColor" strokeWidth={1.5} />
+        <span>{stopping ? "Stopping…" : "Stop"}</span>
       </button>
     {:else}
       <button
@@ -67,11 +90,7 @@
   <div class="composer-meta">
     <LeadModelPicker compact />
     <div class="composer-status" aria-live="polite">
-      {#if busy}
-        <span class="working"><span class="working-dot" aria-hidden="true"></span>Working</span>
-      {:else if connecting}
-        <span>Connecting</span>
-      {/if}
+      {#if connecting}<span>Connecting</span>{/if}
     </div>
   </div>
 </form>
@@ -116,12 +135,10 @@
     cursor: pointer;
   }
   .send-button:disabled { background: var(--surface-soft); color: #adb0a6; cursor: default; }
-  .stop-button { border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); }
+  .stop-button { display: inline-flex; width: auto; min-width: 64px; gap: 6px; padding: 0 10px; border: 1px solid var(--line); background: var(--surface-soft); color: var(--ink); font-size: 11px; font-weight: 600; }
   .stop-button:hover { border-color: var(--line-strong); background: var(--line); }
+  .stop-button:disabled { cursor: wait; }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
   .composer-status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: 0.04em; }
-  .working { display: inline-flex; align-items: center; gap: 5px; }
-  .working-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: composer-pulse 1.2s ease-in-out infinite; }
-  @keyframes composer-pulse { 0%, 100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1); } }
   @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

@@ -127,6 +127,19 @@ describe("native lead store path", () => {
     expect(get(app).leadRuntime.generation).toBe(2);
   });
 
+  it("surfaces interruption failures instead of hiding them", async () => {
+    const harness = makeTransport(snapshot());
+    harness.transport.interrupt = vi.fn(async () => {
+      throw new Error("stop failed");
+    });
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    await expect(actions.interruptLead()).rejects.toThrow("stop failed");
+    expect(get(app).toast?.message).toContain("stop failed");
+  });
+
   it("never fabricates a lead reply when no native transport exists", async () => {
     actions.openProject("mnemo");
     await Promise.resolve();

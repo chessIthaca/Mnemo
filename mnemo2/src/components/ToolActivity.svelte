@@ -3,6 +3,7 @@
   import { liveTailPreview, toolErrorSummary } from "../../../frontend/src/lib/toolCardPaths";
   import { toolSummary } from "../lib/toolSummary";
   import type { LeadEntry } from "../lib/types";
+  import ElapsedTime from "./ElapsedTime.svelte";
 
   type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
@@ -41,7 +42,9 @@
         {/if}
       </span>
       <span class="tool-copy"><strong title={summary}>{summary}</strong></span>
-      <span class="tool-status" data-status={status}>{statusLabel}<time> · {entry.time}</time></span>
+      <span class="tool-status" data-status={status}>
+        {statusLabel}{#if entry.startedAtMs !== undefined}<ElapsedTime startedAtMs={entry.startedAtMs} endedAtMs={entry.endedAtMs} />{/if}
+      </span>
       <ChevronRight class="tool-chevron" size={12} aria-hidden="true" />
     </summary>
 
@@ -79,7 +82,7 @@
 </article>
 
 <style>
-  .tool-card { min-width: 0; padding: 7px 0; }
+  .tool-card { min-width: 0; padding: 3px 0; }
   .tool-disclosure { min-width: 0; }
   .tool-heading { display: flex; min-width: 0; align-items: center; gap: 8px; border-radius: 4px; cursor: pointer; list-style: none; }
   .tool-heading::-webkit-details-marker { display: none; }
@@ -93,22 +96,21 @@
   .tool-status { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
   .tool-status[data-status="running"] { color: var(--accent-strong); }
   .tool-status[data-status="failed"] { color: var(--danger); }
-  .tool-status time { color: var(--muted); }
+  .tool-status :global(.elapsed-time) { color: var(--muted); }
   .tool-heading :global(.tool-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }
   .tool-disclosure[open] .tool-heading :global(.tool-chevron) { transform: rotate(90deg); }
-  .tool-details { margin: 8px 0 4px 26px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .tool-details { margin: 6px 0 2px 26px; padding-top: 6px; border-top: 1px solid var(--line); }
   .tool-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: 9px; }
   .tool-identity code { color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; }
-  .tool-detail-section { margin-top: 10px; }
+  .tool-detail-section { margin-top: 8px; }
   .tool-detail-section h4 { margin: 0 0 5px; color: var(--muted); font-size: 9px; font-weight: 600; }
   .tool-detail-section pre, .tool-live { max-height: 240px; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
   .tool-detail-section pre { padding: 10px 12px; }
-  .tool-live { margin: 6px 0 4px 26px; padding: 8px 10px; }
+  .tool-live { margin: 4px 0 2px 26px; padding: 6px 10px; }
   .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: 11px; line-height: 1.5; }
   .tool-spinner { display: grid; place-items: center; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 560px) {
-    .tool-status time { display: none; }
     .tool-copy strong { font-size: 11px; }
   }
 </style>

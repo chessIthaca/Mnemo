@@ -275,7 +275,14 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
   collapsed summary. Live `SessionEvent` call starts/deltas/results and
   persisted transcript tool calls both feed the same reducer; a host-tool call
   renders as team work in progress, not as an approval decision, and no tool
-  activity is synthesized.
+  activity is synthesized. Tool rows use observed start/result times for real
+  elapsed durations, not a placeholder `now`. While the lead is busy and no
+  tool is running, an inline Thinking indicator with a live turn timer occupies
+  the next conversation position; the next tool call replaces it. Stop remains
+  available while the lead is busy or waiting for input, and reports interruption
+  failures without claiming an unconfirmed stop. Provider errors, including
+  automatic retries, stay visible at the conversation tail across same-session
+  snapshots; terminal errors offer Retry and later progress clears retry warnings.
 - Human messages remain left-aligned and inline in actual exchange order.
   The transcript uses the available width, caps prose at 100 characters while
   leaving code/tool details unconstrained, and avoids oversized card spacing.

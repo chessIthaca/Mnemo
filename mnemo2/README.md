@@ -218,6 +218,10 @@ feature-enabled Mnemo2 lib tests.
   left-aligned and inline in exchange order. Prose is capped at 100 characters;
   code and tool details use the available width. Tool calls show compact human
   summaries with expandable real details and dotted consecutive-run connectors.
+  Tool rows show real elapsed durations. Thinking with a live turn timer appears
+  inline until the next tool call, and Stop stays available while busy or awaiting
+  input. LLM errors and automatic retries stay visible at the conversation tail;
+  terminal failures offer Retry and successful progress clears retry warnings.
 - No project-wide run pipeline or phase diagram. Each task derives its own
   workflow from status, checks, findings, and merge state.
 - Every lead/worker surface shows a model badge; native lead surfaces use the

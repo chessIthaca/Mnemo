@@ -107,6 +107,7 @@ describe("LeadChat", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("renders no global run strip", () => {
@@ -131,9 +132,22 @@ describe("LeadChat", () => {
 
   it("shows an inline error with retry when the native lead fails", () => {
     setRuntime({ status: "error", error: "Engine refused the request." });
-    render(LeadChat);
+    const { container } = render(LeadChat);
     expect(screen.getByRole("alert").textContent).toContain("Engine refused the request.");
     expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(container.querySelector(".lead-stream")?.lastElementChild?.classList.contains("lead-error")).toBe(true);
+  });
+
+  it("shows automatic provider retries and terminal LLM errors at the conversation tail", async () => {
+    setRuntime({ busy: true, status: "ready", error: "HTTP 429 overloaded", errorRetrying: true });
+    const { container } = render(LeadChat);
+    expect(screen.getByRole("alert").textContent).toContain("HTTP 429 overloaded");
+    expect(screen.getByText("RETRYING")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    setRuntime({ busy: false, status: "error", error: "HTTP 429 overloaded", errorRetrying: false });
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(container.querySelector(".lead-stream")?.lastElementChild?.classList.contains("lead-error")).toBe(true);
   });
 
   it("shows approval and question interactions inline", () => {
@@ -144,11 +158,13 @@ describe("LeadChat", () => {
         tool_name: "write_file",
       },
     });
-    render(LeadChat);
+    const { container } = render(LeadChat);
     expect(screen.getByText("APPROVAL REQUIRED")).toBeTruthy();
     const approve = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
     expect(approve.disabled).toBe(false);
     expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop the lead" })).toBeTruthy();
+    expect(container.querySelector(".lead-stream")?.lastElementChild?.classList.contains("lead-pending")).toBe(true);
   });
 
   it("shows question options inline", () => {
@@ -168,6 +184,7 @@ describe("LeadChat", () => {
   });
 
   it("renders human tool headlines and reveals the real details on expansion", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(10_000);
     const entries: LeadEntry[] = [
       {
         id: "tool-running",
@@ -178,6 +195,7 @@ describe("LeadChat", () => {
         arguments: '{"command":"cargo test"}',
         liveOutput: "running tests",
         result: null,
+        startedAtMs: 7000,
       },
       {
         id: "tool-done",
@@ -188,6 +206,8 @@ describe("LeadChat", () => {
         arguments: '{"files":["README.md"]}',
         liveOutput: "",
         result: { success: true, output: "read 42 lines" },
+        startedAtMs: 1000,
+        endedAtMs: 5000,
       },
       {
         id: "tool-failed",
@@ -206,7 +226,9 @@ describe("LeadChat", () => {
 
     const shellSummary = screen.getByText("Running a command").closest("summary")!;
     expect(shellSummary.textContent).not.toContain("shell");
-    expect(screen.getByText("Reading a file")).toBeTruthy();
+    expect(shellSummary.textContent).toContain("0:03");
+    expect(shellSummary.textContent).not.toContain("now");
+    expect(screen.getByText("Reading a file").closest("summary")?.textContent).toContain("0:04");
     expect(screen.getByText("Writing files")).toBeTruthy();
     expect(screen.getByText("Running")).toBeTruthy();
     expect(screen.getByText("Completed")).toBeTruthy();
@@ -227,6 +249,36 @@ describe("LeadChat", () => {
     expect(await screen.findByText("read 42 lines")).toBeTruthy();
     await fireEvent.click(screen.getByText("Writing files"));
     expect(await screen.findByText("write_file")).toBeTruthy();
+  });
+
+  it("shows inline thinking with elapsed time and yields to the next tool", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    setRuntime({ busy: true, turnStartedAtMs: 4000 });
+    setLeadEntries([
+      toolEntry({
+        result: { success: true, output: "done" },
+        liveOutput: "",
+        startedAtMs: 1000,
+        endedAtMs: 5000,
+      }),
+    ]);
+    const { container } = render(LeadChat);
+    const thinking = container.querySelector(".thinking-status");
+    expect(thinking?.textContent).toContain("Thinking…");
+    expect(thinking?.textContent).toContain("0:06");
+    expect(thinking?.previousElementSibling?.classList.contains("tool-activity-row")).toBe(true);
+    expect(screen.queryByText("Working")).toBeNull();
+
+    setLeadEntries([toolEntry()]);
+    await vi.waitFor(() => expect(container.querySelector(".thinking-status")).toBeNull());
+    now.mockRestore();
+  });
+
+  it("does not let an unfinished tool from an older turn suppress thinking", () => {
+    setRuntime({ busy: true, turnStartedAtMs: 4000 });
+    setLeadEntries([toolEntry({ startedAtMs: 1000, result: null })]);
+    const { container } = render(LeadChat);
+    expect(container.querySelector(".thinking-status")).not.toBeNull();
   });
 
   it("connects only consecutive tool entries with an activity-run line", () => {

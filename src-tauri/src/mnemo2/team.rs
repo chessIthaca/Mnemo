@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use mnemo::headless::{ConstitutionMode, PromptBlock, PromptSpec};
 use mnemo::app::worktrees::{
     agent_branch, agent_short_id, current_branch, provision_agent_worktree, remove_agent_worktree,
 };
@@ -846,7 +847,7 @@ impl TeamRuntime {
         self.worker(&id).await
     }
 
-    async fn spawn_worker_session(
+    pub(crate) async fn spawn_worker_session(
         &self,
         name: String,
         model: Option<String>,
@@ -2233,6 +2234,24 @@ fn executor_limits() -> SessionLimits {
     }
 }
 
+/// The Mnemo2 executor identity, distinct from Mnemo's read-only reviewer workflow.
+pub(crate) fn executor_prompt() -> PromptSpec {
+    PromptSpec {
+        identity: concat!(
+            "You are a Mnemo2 executor worker. Implement only the lead's scoped brief ",
+            "in your assigned worktree. The lead reviews your work on its main thread; ",
+            "you do not act as a reviewer. File editing, shell commands, tests, and Git ",
+            "commits are available and expected when needed. ",
+            "Do not create or modify plans, spawn agents, or ask the user. Run relevant ",
+            "checks, commit on the assigned worker branch, and report the actual commit and checks."
+        )
+        .to_string(),
+        blocks: vec![PromptBlock::FileToolRules],
+        extra_stable: None,
+        constitution: ConstitutionMode::Both,
+    }
+}
+
 /// The executor surface: a real coding agent that cannot plan, finish, spawn
 /// more agents, or ask the user — those are the lead's jobs.
 fn executor_guardrails() -> Guardrails {
@@ -2245,7 +2264,7 @@ fn executor_guardrails() -> Guardrails {
         "ask_user".to_string(),
     ];
     Guardrails {
-        prompt: None,
+        prompt: Some(executor_prompt()),
         tools,
         route: vec!["free".to_string()],
         limits: Some(executor_limits()),

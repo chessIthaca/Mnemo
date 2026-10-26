@@ -86,10 +86,11 @@ feature-enabled Mnemo2 lib tests.
   `<project>/.worktrees/agent-<id8>`, forked from the lead's current branch tip
   (not `main`). The branch name is unique per worker; provisioning fails loudly
   on a collision.
-- **Executor surface.** Workers run with `ToolSelection::all()` minus
-  `create_plan`, `update_plan`, `finish`, `spawn_agent`, and `ask_user`; planning
-  and review stay the lead's job. Worker sessions get hard turn and wall-clock
-  limits.
+- **Executor surface.** Workers use a dedicated Mnemo2 executor prompt, not the
+  original Mnemo workflow's read-only reviewer profile. They run with
+  `ToolSelection::all()` minus `create_plan`, `update_plan`, `finish`,
+  `spawn_agent`, and `ask_user`; planning and review stay on the lead's main
+  thread. Worker sessions get hard turn and wall-clock limits.
 - **Events.** Worker events are forwarded on `mnemo2://team-event` as
   `{ worker_id, generation, event }`. The frontend ignores stale generations.
 - **Commands.** `team_snapshot`, `team_dispatch`, `team_message`, `team_pause`,

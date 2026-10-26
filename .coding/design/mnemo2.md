@@ -133,6 +133,10 @@ branch, with an **executor profile**:
   limit) so it does not rediscover the repository;
 - commits its work and reports the commit + checks it ran.
 
+Worker prompts use a dedicated Mnemo2 executor identity rather than inheriting
+the original Mnemo workflow's read-only reviewer profile. File editing, shell
+checks, and Git commits remain available for implementation tasks.
+
 The lead's plan is the plan of record. This is the biggest cost lever: one
 planning loop, not one per worker.
 

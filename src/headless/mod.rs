@@ -32,6 +32,8 @@ pub use host_tools::{HostTool, HostToolSpec, HOST_TOOL_DEFAULT_TIMEOUT_MS};
 /// kernel consumers see them).
 pub use crate::agent::factory::{ToolGroup, ToolSelection};
 pub use crate::agent::policy::{GateRule, Guardrails, QuestionPolicy, TurnEndPolicy};
+pub use crate::agent::prompt::{assemble_spec_head, ConstitutionMode, PromptBlock, PromptSpec};
+pub use crate::project::Constitution;
 pub use memory_api::{
     MemoryApi, MemoryCounts, MemoryDebugOverview, MemoryDebugWire, MemoryIndexStatus,
     ScoredMemoryDebugWire,

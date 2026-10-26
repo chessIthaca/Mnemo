@@ -2422,4 +2422,36 @@ mod tests {
         team.shutdown().await;
         lead.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn executor_profile_uses_mnemo2_tools_not_mnemo_workflow_reviewer() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
+        let session = team
+            .spawn_worker_session("Executor test".to_string(), None, root.path().to_path_buf(), None)
+            .await
+            .expect("spawn executor");
+        let tools = session.tool_names().await.expect("registered tool names");
+        for name in ["file_edit", "file_write", "shell", "git", "git_read"] {
+            assert!(tools.iter().any(|tool| tool == name), "missing coding tool {name}");
+        }
+        for name in ["create_plan", "update_plan", "finish", "spawn_agent", "ask_user"] {
+            assert!(!tools.iter().any(|tool| tool == name), "unexpected workflow tool {name}");
+        }
+        assert!(tools.iter().any(|tool| tool == "message_parent"));
+
+        let head = mnemo::headless::assemble_spec_head(
+            &crate::mnemo2::team::executor_prompt(),
+            &mnemo::headless::Constitution::default(),
+        );
+        assert!(head.contains("Mnemo2 executor worker"));
+        assert!(head.to_ascii_lowercase().contains("file editing"));
+        assert!(head.contains("Git commits"));
+        assert!(head.contains("lead reviews your work on its main thread"));
+        assert!(!head.contains("spawn_agent"));
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
 }

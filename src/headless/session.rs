@@ -355,6 +355,24 @@ impl AgentSession {
         })
     }
 
+    /// Read the session's registered tool names for diagnostics.
+    pub async fn tool_names(&self) -> Result<Vec<String>, EngineError> {
+        let agent = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&self.agent)
+            .cloned()
+            .ok_or_else(|| EngineError::session_closed("the agent task has ended"))?;
+        Ok(agent
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect())
+    }
+
     /// Read this session's active plan from its exact plans directory.
     pub async fn plan(&self) -> Result<Option<AgentPlan>, EngineError> {
         let plans_dir = self

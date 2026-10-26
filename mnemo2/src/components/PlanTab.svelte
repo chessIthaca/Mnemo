@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Check, Circle, LoaderCircle } from "@lucide/svelte";
-  import { app } from "../lib/store";
+  import { actions, app } from "../lib/store";
   import Markdown from "./Markdown.svelte";
 </script>
 
@@ -9,7 +9,7 @@
     <header class="plan-header">
       <p>LEAD PLAN · {$app.plan.id}</p>
       <h2>{$app.plan.title}</h2>
-      <Markdown source={$app.plan.goal} />
+      <Markdown source={$app.plan.goal} onOpenLink={actions.openBrowser} />
     </header>
 
     <div class="plan-list">
@@ -20,7 +20,7 @@
             {:else if item.status === "active"}<LoaderCircle size={11} />
             {:else}<Circle size={11} />{/if}
           </span>
-          <div><h3>{item.title}</h3><Markdown source={item.detail} /><span>OWNER · LEAD</span></div>
+          <div><h3>{item.title}</h3><Markdown source={item.detail} onOpenLink={actions.openBrowser} /><span>OWNER · LEAD</span></div>
           <span class="plan-status">{item.status}</span>
         </article>
       {:else}

@@ -167,7 +167,7 @@ describe("LeadChat", () => {
     expect(screen.getByRole("button", { name: "wt/mnemo" })).toBeTruthy();
   });
 
-  it("renders real tool calls with their arguments, live output, and results", () => {
+  it("renders human tool headlines and reveals the real details on expansion", async () => {
     const entries: LeadEntry[] = [
       {
         id: "tool-running",
@@ -204,16 +204,44 @@ describe("LeadChat", () => {
     setLeadEntries(entries);
     render(LeadChat);
 
-    expect(screen.getByText("shell")).toBeTruthy();
-    expect(screen.getByText("read_files")).toBeTruthy();
-    expect(screen.getByText("write_file")).toBeTruthy();
+    const shellSummary = screen.getByText("Running a command").closest("summary")!;
+    expect(shellSummary.textContent).not.toContain("shell");
+    expect(screen.getByText("Reading a file")).toBeTruthy();
+    expect(screen.getByText("Writing files")).toBeTruthy();
     expect(screen.getByText("Running")).toBeTruthy();
     expect(screen.getByText("Completed")).toBeTruthy();
     expect(screen.getByText("Failed")).toBeTruthy();
-    expect(screen.getByText('{"command":"cargo test"}')).toBeTruthy();
     expect(screen.getByText("running tests")).toBeTruthy();
-    expect(screen.getByText("read 42 lines")).toBeTruthy();
     expect(screen.getByText("permission denied")).toBeTruthy();
+    expect(screen.queryByText("read 42 lines")).toBeNull();
+
+    await fireEvent.click(screen.getByText("Running a command"));
+    const shellCard = screen.getByLabelText("Running a command — Running");
+    expect(shellCard.querySelector("details")?.open).toBe(true);
+    expect(await within(shellCard).findByText("shell")).toBeTruthy();
+    expect(shellCard.textContent).toContain('"command": "cargo test"');
+    expect(within(shellCard).getByText("running tests")).toBeTruthy();
+
+    await fireEvent.click(screen.getByText("Reading a file"));
+    expect(await screen.findByText("read_files")).toBeTruthy();
+    expect(await screen.findByText("read 42 lines")).toBeTruthy();
+    await fireEvent.click(screen.getByText("Writing files"));
+    expect(await screen.findByText("write_file")).toBeTruthy();
+  });
+
+  it("connects only consecutive tool entries with an activity-run line", () => {
+    setLeadEntries([
+      toolEntry({ id: "tool-one", toolCallId: "one" }),
+      toolEntry({ id: "tool-two", toolCallId: "two" }),
+      { id: "between", kind: "message", time: "now", author: "lead", body: "Between tools" },
+      toolEntry({ id: "tool-three", toolCallId: "three" }),
+    ]);
+    const { container } = render(LeadChat);
+    const rows = container.querySelectorAll(".tool-activity-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].classList.contains("tool-connected")).toBe(true);
+    expect(rows[1].classList.contains("tool-connected")).toBe(false);
+    expect(rows[2].classList.contains("tool-connected")).toBe(false);
   });
 
   it("does not open a result disclosure when the output is empty", () => {
@@ -243,11 +271,11 @@ describe("LeadChat", () => {
     setLeadEntries(entries);
     render(LeadChat);
 
-    const completed = screen.getByLabelText("noop — Completed");
+    const completed = screen.getByLabelText("Using Noop — Completed");
     expect(within(completed).getByText("Completed")).toBeTruthy();
     expect(within(completed).queryByText("Result")).toBeNull();
 
-    const failed = screen.getByLabelText("guard — Failed");
+    const failed = screen.getByLabelText("Using Guard — Failed");
     expect(within(failed).getByText("Failed")).toBeTruthy();
     expect(within(failed).queryByText("Error")).toBeNull();
   });
@@ -317,6 +345,24 @@ describe("LeadChat", () => {
     expect(style.width).toBe("100%");
     expect(style.marginLeft).toBe("0px");
     expect(style.marginRight).toBe("0px");
+  });
+
+  it("keeps human messages inline in exchange order and caps prose at 100 characters", () => {
+    setLeadEntries([
+      { id: "human", kind: "message", time: "now", author: "user", body: "Review this change" },
+      toolEntry(),
+      { id: "answer", kind: "message", time: "now", author: "lead", body: "I will inspect it." },
+    ]);
+    const { container } = render(LeadChat);
+    const user = container.querySelector(".user-entry")!;
+    const tool = container.querySelector(".tool-activity-row")!;
+    const assistant = container.querySelector(".chat-entry:not(.user-entry)")!;
+
+    expect(user.compareDocumentPosition(tool) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(tool.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(getComputedStyle(user).marginLeft).toBe("0px");
+    expect(getComputedStyle(user).maxWidth).toBe("800px");
+    expect(getComputedStyle(assistant.querySelector(".markdown p")!).maxWidth).toBe("800px");
   });
 
   it("does not follow new activity after the user scrolls up", async () => {

@@ -110,16 +110,30 @@
   .markdown-loading { white-space: pre-wrap; }
   .markdown :global(p) { margin: 0 0 16px; }
   .markdown :global(p:last-child) { margin-bottom: 0; }
-  .markdown :global(h1), .markdown :global(h2), .markdown :global(h3) {
+  .markdown :global(h1), .markdown :global(h2), .markdown :global(h3),
+  .markdown :global(h4), .markdown :global(h5), .markdown :global(h6) {
     margin: 28px 0 12px;
     font-family: var(--font-ui);
-    font-size: 15px;
     font-weight: 680;
     letter-spacing: -0.01em;
+    line-height: 1.35;
   }
-  .markdown :global(h1:first-child), .markdown :global(h2:first-child), .markdown :global(h3:first-child) { margin-top: 0; }
+  .markdown :global(h1) { font-size: 22px; }
+  .markdown :global(h2) { font-size: 19px; }
+  .markdown :global(h3) { font-size: 17px; }
+  .markdown :global(h4) { font-size: 16px; }
+  .markdown :global(h5) { font-size: 15px; }
+  .markdown :global(h6) { font-size: 14px; color: var(--ink-soft); }
+  .markdown :global(h1:first-child), .markdown :global(h2:first-child), .markdown :global(h3:first-child),
+  .markdown :global(h4:first-child), .markdown :global(h5:first-child), .markdown :global(h6:first-child) { margin-top: 0; }
   .markdown :global(ul), .markdown :global(ol) { margin: 0 0 18px; padding-left: 22px; }
   .markdown :global(li) { margin: 5px 0; padding-left: 3px; }
+  .markdown :global(li > ul), .markdown :global(li > ol) { margin: 5px 0; }
+  .markdown :global(li.task-list-item) { list-style: none; }
+  .markdown :global(input.task-list-item-checkbox) { margin: 0 7px 0 0; accent-color: var(--accent-strong); vertical-align: -0.08em; }
+  .markdown :global(blockquote) { margin: 0 0 16px; padding: 2px 0 2px 14px; border-left: 3px solid var(--line-strong); color: var(--ink-soft); }
+  .markdown :global(blockquote p:last-child) { margin-bottom: 0; }
+  .markdown :global(hr) { margin: 24px 0; border: 0; border-top: 1px solid var(--line-strong); }
   .markdown :global(a) { color: var(--accent-strong); text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
   .markdown :global(strong) { font-weight: 650; }
   .markdown :global(code) {

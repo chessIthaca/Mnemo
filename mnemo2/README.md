@@ -141,7 +141,7 @@ feature-enabled Mnemo2 lib tests.
 
 1. Pick a registered project, or **Open folder** to register a real one.
 2. Send a message to the lead. Responses stream into the conversation and render
-   sanitized Markdown with tables and code.
+   sanitized CommonMark/GFM with task lists, tables, and highlighted code.
 3. Choose the lead model from the composer or **Project settings**. The picker
    is disabled while a turn is running.
 4. If the lead asks for approval or asks a question, resolve it inline. Use the
@@ -214,7 +214,10 @@ feature-enabled Mnemo2 lib tests.
 - Warm-white tokens, Inter UI, Source Serif 4 prose; prefers-reduced-motion is
   respected.
 - Conversation-first: the lead chat and worker **Thread** are primary; review,
-  checks, timeline, and merge are secondary disclosures.
+  checks, timeline, and merge are secondary disclosures. Human messages stay
+  left-aligned and inline in exchange order. Prose is capped at 100 characters;
+  code and tool details use the available width. Tool calls show compact human
+  summaries with expandable real details and dotted consecutive-run connectors.
 - No project-wide run pipeline or phase diagram. Each task derives its own
   workflow from status, checks, findings, and merge state.
 - Every lead/worker surface shows a model badge; native lead surfaces use the

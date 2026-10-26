@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import { get } from "svelte/store";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import Workbench from "./Workbench.svelte";
@@ -49,4 +49,30 @@ describe("Workbench", () => {
     await fireEvent.submit(address.closest("form")!);
     await vi.waitFor(() => expect(state().browserUrl).toBe("https://example.com/notes"));
   });
+
+  it("routes plan-goal links through the workbench browser", async () => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
+      window.setTimeout(callback, 0));
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => window.clearTimeout(id));
+    const current = fixtureState();
+    current.plan = {
+      id: "contract",
+      title: "Plan",
+      goal: "Read [Docs](https://example.com/docs)",
+      steps: [],
+    };
+    current.planItems = [];
+    app.set(current);
+    actions.openWorkbench("plan");
+    render(Workbench);
+
+    const link = await screen.findByRole("link", { name: "Docs" }, { timeout: 3000 });
+    await fireEvent.click(link);
+    expect(state().workbenchTab).toBe("browser");
+    expect(state().browserUrl).toBe("https://example.com/docs");
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });

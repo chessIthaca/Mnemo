@@ -268,13 +268,21 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 - The merge card is a record with Review/Revert, not an approval prompt.
 - The lead chat shows spawn cards, team-message cards (escalations), review
   summaries, and merge records; worker tool logs stay in the worker thread.
-- The lead chat also shows the lead's own real tool calls as compact cards:
-  the JSON arguments, a bounded live output tail while the call runs, and the
-  final result or error. Live `SessionEvent` call starts/deltas/results and
+- The lead chat also shows the lead's own real tool calls as compact,
+  human-readable activity rows, with dotted connectors across consecutive
+  calls. A native disclosure reveals the raw tool name, formatted arguments,
+  bounded live tail, and final result or error; failed calls retain a short
+  collapsed summary. Live `SessionEvent` call starts/deltas/results and
   persisted transcript tool calls both feed the same reducer; a host-tool call
   renders as team work in progress, not as an approval decision, and no tool
   activity is synthesized.
-- Markdown retains the last committed frame while the newest source is rendered
+- Human messages remain left-aligned and inline in actual exchange order.
+  The transcript uses the available width, caps prose at 100 characters while
+  leaving code/tool details unconstrained, and avoids oversized card spacing.
+- Markdown renders sanitized CommonMark/GFM, including task-list checkboxes,
+  tables, strikethrough, and autolinks. It preserves literal punctuation,
+  styles every heading level plus quotes/rules, and routes Plan links into the
+  Browser pane. The last committed frame stays while the newest source renders
   on one coalesced animation frame, so streaming never flashes an empty block.
   The thread follows new content only while the user is within 48px of the
   bottom; a user scroll-up is respected, and a `ResizeObserver` follows

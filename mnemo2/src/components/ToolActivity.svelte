@@ -1,75 +1,114 @@
 <script lang="ts">
-  import { CheckCircle2, LoaderCircle, XCircle } from "@lucide/svelte";
+  import { CheckCircle2, ChevronRight, LoaderCircle, XCircle } from "@lucide/svelte";
+  import { liveTailPreview, toolErrorSummary } from "../../../frontend/src/lib/toolCardPaths";
+  import { toolSummary } from "../lib/toolSummary";
   import type { LeadEntry } from "../lib/types";
 
   type ToolEntry = Extract<LeadEntry, { kind: "tool" }>;
 
   let { entry }: { entry: ToolEntry } = $props();
+  let expanded = $state(false);
   const status = $derived(
     entry.result === null ? "running" : entry.result.success ? "completed" : "failed",
   );
   const statusLabel = $derived(
     status === "running" ? "Running" : status === "completed" ? "Completed" : "Failed",
   );
+  const summary = $derived(toolSummary(entry.toolName, entry.arguments));
+  const errorSummary = $derived(
+    entry.result && !entry.result.success ? toolErrorSummary(entry.result.output) : "",
+  );
+  const livePreview = $derived(liveTailPreview(entry.liveOutput));
+  const argumentsPreview = $derived.by(() => {
+    try {
+      return JSON.stringify(JSON.parse(entry.arguments), null, 2);
+    } catch {
+      return entry.arguments;
+    }
+  });
 </script>
 
-<article class="tool-card" data-status={status} aria-label={`${entry.toolName} — ${statusLabel}`}>
-  <div class="tool-heading">
-    <span class="tool-icon" data-status={status}>
-      {#if status === "running"}
-        <span class="tool-spinner"><LoaderCircle size={14} aria-hidden="true" /></span>
-      {:else if status === "completed"}
-        <CheckCircle2 size={14} aria-hidden="true" />
-      {:else}
-        <XCircle size={14} aria-hidden="true" />
-      {/if}
-    </span>
-    <div class="tool-copy">
-      <strong>{entry.toolName}</strong>
-      <span>TOOL CALL · {entry.time}</span>
-    </div>
-    <span class="tool-status" data-status={status}>{statusLabel}</span>
-  </div>
+<article class="tool-card" data-status={status} aria-label={`${summary} — ${statusLabel}`}>
+  <details class="tool-disclosure" bind:open={expanded}>
+    <summary class="tool-heading">
+      <span class="tool-icon" data-status={status}>
+        {#if status === "running"}
+          <span class="tool-spinner"><LoaderCircle size={11} aria-hidden="true" /></span>
+        {:else if status === "completed"}
+          <CheckCircle2 size={11} aria-hidden="true" />
+        {:else}
+          <XCircle size={11} aria-hidden="true" />
+        {/if}
+      </span>
+      <span class="tool-copy"><strong title={summary}>{summary}</strong></span>
+      <span class="tool-status" data-status={status}>{statusLabel}<time> · {entry.time}</time></span>
+      <ChevronRight class="tool-chevron" size={12} aria-hidden="true" />
+    </summary>
 
-  {#if entry.arguments}
-    <details class="tool-detail">
-      <summary>Arguments</summary>
-      <pre>{entry.arguments}</pre>
-    </details>
+    {#if expanded}
+      <div class="tool-details">
+        <div class="tool-identity"><code>{entry.toolName}</code></div>
+        {#if entry.arguments}
+          <section class="tool-detail-section">
+            <h4>Arguments</h4>
+            <pre>{argumentsPreview}</pre>
+          </section>
+        {/if}
+        {#if entry.result === null && entry.liveOutput}
+          <section class="tool-detail-section">
+            <h4>Live output</h4>
+            <pre>{entry.liveOutput}</pre>
+          </section>
+        {/if}
+        {#if entry.result && entry.result.output}
+          <section class="tool-detail-section">
+            <h4>{entry.result.success ? "Result" : "Error"}</h4>
+            <pre>{entry.result.output}</pre>
+          </section>
+        {/if}
+      </div>
+    {/if}
+  </details>
+
+  {#if !expanded && status === "running" && entry.liveOutput}
+    <pre class="tool-live" aria-live="polite">{livePreview}</pre>
   {/if}
-
-  {#if entry.result === null && entry.liveOutput}
-    <details class="tool-detail" open>
-      <summary>Live output</summary>
-      <pre>{entry.liveOutput}</pre>
-    </details>
-  {/if}
-
-  {#if entry.result && entry.result.output}
-    <details class="tool-detail">
-      <summary>{entry.result.success ? "Result" : "Error"}</summary>
-      <pre>{entry.result.output}</pre>
-    </details>
+  {#if !expanded && errorSummary}
+    <p class="tool-error">{errorSummary}</p>
   {/if}
 </article>
 
 <style>
-  .tool-card { margin: 12px 0 16px 30px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-soft); }
-  .tool-heading { display: flex; align-items: center; gap: 9px; }
-  .tool-icon { display: grid; width: 25px; height: 25px; flex: 0 0 auto; place-items: center; border-radius: 7px; background: var(--surface); color: var(--muted); }
-  .tool-icon[data-status="running"] { color: var(--accent-strong); }
-  .tool-icon[data-status="completed"] { color: var(--accent-strong); }
+  .tool-card { min-width: 0; padding: 7px 0; }
+  .tool-disclosure { min-width: 0; }
+  .tool-heading { display: flex; min-width: 0; align-items: center; gap: 8px; border-radius: 4px; cursor: pointer; list-style: none; }
+  .tool-heading::-webkit-details-marker { display: none; }
+  .tool-heading:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .tool-icon { display: grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--canvas); color: var(--muted); }
+  .tool-icon[data-status="running"], .tool-icon[data-status="completed"] { color: var(--accent-strong); }
   .tool-icon[data-status="failed"] { color: var(--danger); }
-  .tool-copy { flex: 1; min-width: 0; }
-  .tool-copy strong { display: block; overflow: hidden; font-family: var(--font-mono, monospace); font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-  .tool-copy span { display: block; margin-top: 3px; color: var(--muted); font-size: 7px; letter-spacing: 0.07em; }
-  .tool-status { flex: 0 0 auto; color: var(--muted); font-size: 8px; font-weight: 650; }
+  .tool-copy { flex: 0 1 auto; min-width: 0; }
+  .tool-copy strong { display: block; overflow: hidden; color: var(--ink-soft); font-size: 12px; font-weight: 560; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+  .tool-heading:hover .tool-copy strong { color: var(--accent-strong); }
+  .tool-status { flex: 0 0 auto; color: var(--muted); font-size: 9px; }
   .tool-status[data-status="running"] { color: var(--accent-strong); }
   .tool-status[data-status="failed"] { color: var(--danger); }
-  .tool-detail { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 7px; }
-  .tool-detail summary { color: var(--muted); cursor: pointer; font-size: 8px; font-weight: 650; letter-spacing: 0.05em; }
-  .tool-detail pre { max-height: 180px; margin: 7px 0 0; overflow: auto; color: var(--ink-soft); font-family: var(--font-mono, monospace); font-size: 9px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+  .tool-status time { color: var(--muted); }
+  .tool-heading :global(.tool-chevron) { flex: 0 0 auto; margin-left: auto; color: var(--muted); transition: transform 120ms ease; }
+  .tool-disclosure[open] .tool-heading :global(.tool-chevron) { transform: rotate(90deg); }
+  .tool-details { margin: 8px 0 4px 26px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .tool-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: 9px; }
+  .tool-identity code { color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; }
+  .tool-detail-section { margin-top: 10px; }
+  .tool-detail-section h4 { margin: 0 0 5px; color: var(--muted); font-size: 9px; font-weight: 600; }
+  .tool-detail-section pre, .tool-live { max-height: 240px; margin: 0; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; }
+  .tool-detail-section pre { padding: 10px 12px; }
+  .tool-live { margin: 6px 0 4px 26px; padding: 8px 10px; }
+  .tool-error { margin: 4px 0 4px 26px; color: var(--danger); font-size: 11px; line-height: 1.5; }
   .tool-spinner { display: grid; place-items: center; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 560px) { .tool-card { margin-left: 0; } }
+  @media (max-width: 560px) {
+    .tool-status time { display: none; }
+    .tool-copy strong { font-size: 11px; }
+  }
 </style>

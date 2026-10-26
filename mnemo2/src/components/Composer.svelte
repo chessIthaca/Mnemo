@@ -77,7 +77,7 @@
 </form>
 
 <style>
-  .composer { width: min(100%, 820px); margin: 0 auto; }
+  .composer { width: 100%; margin: 0; }
   .composer-input {
     display: flex;
     align-items: flex-end;

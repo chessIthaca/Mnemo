@@ -81,7 +81,8 @@ export interface TeamWorkerRecord {
   pending: LeadPendingInteraction | null;
   used_tokens: number;
   max_tokens: number;
-  token_budget: number;
+  brief_sent?: boolean;
+  compacting?: boolean;
   total_tokens: number;
   prompt_tokens: number;
   completion_tokens: number;
@@ -138,7 +139,7 @@ export interface TeamWorkerView {
   text: string;
   usedTokens: number;
   maxTokens: number;
-  tokenBudget: number;
+  compacting: boolean;
   totalTokens: number;
   promptTokens: number;
   completionTokens: number;
@@ -211,7 +212,7 @@ function toView(record: TeamWorkerRecord): TeamWorkerView {
     text: transcriptText(record.transcript),
     usedTokens: record.used_tokens,
     maxTokens: record.max_tokens,
-    tokenBudget: record.token_budget,
+    compacting: record.compacting === true,
     totalTokens: record.total_tokens,
     promptTokens: record.prompt_tokens,
     completionTokens: record.completion_tokens,
@@ -272,11 +273,29 @@ export function applyTeamEvent(state: TeamViewState, event: TeamEvent): TeamView
     next.status = "working";
     next.needsYou = false;
     next.pending = null;
+    next.compacting = false;
   }
   const payload = event.event.event;
   switch (payload.kind) {
     case "started":
+      if (!["paused", "interrupted", "stopped", "failed", "merged", "cancelled"].includes(next.status)) {
+        next.status = "working";
+        next.compacting = false;
+      }
+      break;
+    case "compact_started":
       next.status = "working";
+      next.compacting = true;
+      next.needsYou = false;
+      next.error = null;
+      break;
+    case "compacted":
+      if (next.compacting) {
+        next.compacting = false;
+        next.status = next.pending ? "needs_you" : "idle";
+        next.needsYou = next.pending != null;
+        next.error = null;
+      }
       break;
     case "text_delta":
       next.text += payload.text ?? "";
@@ -288,21 +307,36 @@ export function applyTeamEvent(state: TeamViewState, event: TeamEvent): TeamView
       next.needsYou = true;
       break;
     case "finished":
-    case "exited": {
-      const budgetPaused = next.status === "needs_you" && next.error?.includes("token budget");
-      next.status = budgetPaused ? "needs_you" : "completed";
-      next.needsYou = budgetPaused === true;
+      if (!["completed", "paused", "interrupted", "stopped", "failed", "merged", "cancelled"].includes(next.status)) {
+        next.status = "completed";
+      }
+      next.needsYou = false;
       next.pending = null;
+      next.compacting = false;
       break;
-    }
+    case "exited":
+      if (!["completed", "idle", "needs_you", "paused", "interrupted", "stopped", "failed", "merged", "cancelled"].includes(next.status)) {
+        next.status = "interrupted";
+        next.error = "the worker session exited before completing its turn";
+      }
+      next.needsYou = next.status === "needs_you" || next.pending != null;
+      next.pending = null;
+      next.compacting = false;
+      break;
     case "parked":
+      next.compacting = false;
       if (!terminal(next.status)) {
         next.status = "needs_you";
         next.needsYou = true;
       }
       break;
     case "error":
-      if (!payload.retrying) {
+      if (next.compacting) {
+        next.compacting = false;
+        next.status = next.pending ? "needs_you" : "idle";
+        next.needsYou = next.pending != null;
+        next.error = payload.retrying ? null : (payload.error ?? payload.message ?? "compaction failed");
+      } else if (!payload.retrying) {
         next.status = "failed";
         next.error = payload.error ?? payload.message ?? "worker failed";
       }

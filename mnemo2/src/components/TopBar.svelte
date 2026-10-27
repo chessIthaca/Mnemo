@@ -8,7 +8,6 @@
   const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)));
   const activeCount = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing", "merging"].includes(worker.status)).length);
   const tokenUsage = $derived($app.workers.reduce((total, worker) => total + worker.tokens, 0));
-  const tokenBudget = $derived($app.workers.reduce((total, worker) => total + worker.tokenBudget, 0));
   const teamCost = $derived.by(() => {
     let total = 0;
     let hasPricing = false;
@@ -62,14 +61,14 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
-    <button class="budget-chip" aria-label="Open project settings" title="Cumulative worker usage and token budgets" onclick={() => (settingsOpen = true)}>
-      <Wallet size={13} /><span>{#if teamCost != null}${teamCost.toFixed(2)}{:else}{tokenUsage} tokens{/if}</span><small>/ {tokenBudget} tokens</small>
+    <button class="budget-chip" aria-label="Open project settings" title="Cumulative worker usage and project settings" onclick={() => (settingsOpen = true)}>
+      <Wallet size={13} /><span>{#if teamCost != null}${teamCost.toFixed(2)}{:else}{tokenUsage} tokens{/if}</span>
     </button>
   </div>
 </header>
 
 <Sheet open={settingsOpen} title="Project settings" eyebrow="PER-PROJECT" onclose={() => (settingsOpen = false)}>
-  <p class="settings-copy">Worker slots persist per project. Token budgets and live sessions remain separate.</p>
+  <p class="settings-copy">Worker slots persist per project. Usage is telemetry, not a spending limit.</p>
   <div class="settings-row">
     <div><strong>Worker slots</strong><small>Maximum concurrent workers for this project.</small></div>
     <input aria-label="Project worker slots" type="number" min="1" max="32" step="1" value={$currentProject?.workerSlots ?? 1} onchange={setSlots} />
@@ -105,7 +104,6 @@
   .team-stack { display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 9px; }
   .budget-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: 9px; }
   .budget-chip:hover { border-color: var(--line-strong); }
-  .budget-chip small { color: var(--muted); }
   .settings-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
   .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-top: 1px solid var(--line); }
   .settings-row strong, .settings-row small { display: block; }
@@ -115,5 +113,5 @@
   .settings-value { flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-size: 8px; }
   .settings-ok { color: var(--accent-strong); }
   .settings-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
-  @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } .budget-chip small { display: none; } }
+  @media (max-width: 760px) { .topbar { grid-template-columns: 1fr auto; padding: 0 14px; } .primary-nav { position: fixed; right: 14px; bottom: 14px; left: 14px; z-index: 40; justify-content: center; box-shadow: var(--shadow); } .primary-nav button { flex: 1; justify-content: center; } .team-stack { display: none; } }
 </style>

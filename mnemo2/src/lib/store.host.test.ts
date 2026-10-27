@@ -63,6 +63,7 @@ vi.mock("./teamEngine", () => ({
     stop: async () => {},
     pause: async () => {},
     resume: async () => {},
+    compact: async () => {},
   }),
 }));
 

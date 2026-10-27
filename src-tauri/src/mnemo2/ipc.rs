@@ -500,8 +500,12 @@ pub async fn team_dispatch(
     state: State<'_, Mnemo2State>,
     brief: String,
     model: Option<String>,
+    worker_id: Option<String>,
 ) -> Result<WorkerRecord, String> {
-    current_team(&state).await?.dispatch(brief, model).await
+    current_team(&state)
+        .await?
+        .dispatch_with_id(brief, model, worker_id)
+        .await
 }
 
 /// Send a lead message to a worker.
@@ -548,6 +552,15 @@ pub async fn team_resume(
     worker_id: String,
 ) -> Result<WorkerRecord, String> {
     current_team(&state).await?.resume(&worker_id).await
+}
+
+/// Compact an idle worker, resuming a blocked/stopped session when needed.
+#[tauri::command]
+pub async fn team_compact(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+) -> Result<WorkerRecord, String> {
+    current_team(&state).await?.compact(&worker_id).await
 }
 
 /// Persist the lead's review and complete finding list.
@@ -655,19 +668,6 @@ pub async fn team_set_slots(
     slots: usize,
 ) -> Result<TeamSnapshot, String> {
     current_team(&state).await?.set_slots(slots).await
-}
-
-/// Raise a worker's cumulative token budget above its real usage.
-#[tauri::command]
-pub async fn team_set_token_budget(
-    state: State<'_, Mnemo2State>,
-    worker_id: String,
-    token_budget: u32,
-) -> Result<WorkerRecord, String> {
-    current_team(&state)
-        .await?
-        .set_token_budget(&worker_id, token_budget)
-        .await
 }
 
 /// Read the current project's durable workbench preferences.

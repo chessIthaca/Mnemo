@@ -23,7 +23,6 @@ const worker: TeamWorkerRecord = {
   pending: null,
   used_tokens: 10,
   max_tokens: 100,
-  token_budget: 200_000,
   total_tokens: 10,
   prompt_tokens: 8,
   completion_tokens: 2,
@@ -70,7 +69,6 @@ describe("teamState", () => {
       usedTokens: 10,
     });
     expect(state.active).toBe(1);
-    expect(state.workers[0].tokenBudget).toBe(200_000);
     expect(state.workers[0].totalTokens).toBe(10);
     expect(state.workers[0].costMicros).toBe(500_000);
     expect(state.workers[0].elapsedMs).toBe(4000);
@@ -151,6 +149,39 @@ describe("teamState", () => {
     state = applyTeamEvent(state, event("finished"));
     expect(state.workers[0].needsYou).toBe(false);
     expect(state.workers[0].status).toBe("completed");
+  });
+
+  it("tracks compaction completion and failure without a synthetic budget pause", () => {
+    let state = applyTeamSnapshot({ workers: [worker], slots: 1, active: 1 });
+    state = applyTeamEvent(state, event("compact_started"));
+    expect(state.workers[0]).toMatchObject({ compacting: true, status: "working" });
+    state = applyTeamEvent(state, event("compacted", { before: 100, after: 60 }));
+    expect(state.workers[0]).toMatchObject({ compacting: false, status: "idle", error: null });
+    state = applyTeamEvent(state, event("compact_started"));
+    state = applyTeamEvent(state, event("error", { error: "summarizer unavailable", retrying: false }));
+    expect(state.workers[0]).toMatchObject({
+      compacting: false,
+      status: "idle",
+      error: "summarizer unavailable",
+    });
+  });
+
+  it("does not turn stopped, idle, or interrupted sessions into phantom completions", () => {
+    let stopped = applyTeamSnapshot({ workers: [{ ...worker, status: "stopped" }], slots: 1, active: 0 });
+    stopped = applyTeamEvent(stopped, event("finished"));
+    stopped = applyTeamEvent(stopped, event("exited"));
+    expect(stopped.workers[0].status).toBe("stopped");
+    let idle = applyTeamSnapshot({ workers: [{ ...worker, status: "idle" }], slots: 1, active: 1 });
+    idle = applyTeamEvent(idle, event("exited"));
+    expect(idle.workers[0].status).toBe("idle");
+    const interrupted = applyTeamEvent(
+      applyTeamSnapshot({ workers: [worker], slots: 1, active: 1 }),
+      event("exited"),
+    );
+    expect(interrupted.workers[0]).toMatchObject({
+      status: "interrupted",
+      error: "the worker session exited before completing its turn",
+    });
   });
 
   it("starts empty", () => {

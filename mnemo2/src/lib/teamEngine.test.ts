@@ -8,10 +8,11 @@ describe("teamEngine", () => {
       invoke: invoke as never,
       listen: vi.fn(async () => () => {}) as never,
     });
-    await transport.dispatch("do it", "test/scripted-a");
+    await transport.dispatch("do it", "test/scripted-a", "worker0001");
     expect(invoke).toHaveBeenCalledWith("team_dispatch", {
       brief: "do it",
       model: "test/scripted-a",
+      workerId: "worker0001",
     });
   });
 
@@ -54,7 +55,7 @@ describe("teamEngine", () => {
     await transport.merge("w1");
     await transport.revertMerge("w1");
     await transport.stopAll();
-    await transport.setTokenBudget("w1", 250_000);
+    await transport.compact("w1");
 
     expect(invoke).toHaveBeenNthCalledWith(1, "team_review", {
       workerId: "w1",
@@ -88,10 +89,7 @@ describe("teamEngine", () => {
     expect(invoke).toHaveBeenNthCalledWith(6, "team_merge", { workerId: "w1" });
     expect(invoke).toHaveBeenNthCalledWith(7, "team_revert_merge", { workerId: "w1" });
     expect(invoke).toHaveBeenNthCalledWith(8, "team_stop_all");
-    expect(invoke).toHaveBeenNthCalledWith(9, "team_set_token_budget", {
-      workerId: "w1",
-      tokenBudget: 250_000,
-    });
+    expect(invoke).toHaveBeenNthCalledWith(9, "team_compact", { workerId: "w1" });
   });
 
   it("subscribes to the team event channel", async () => {

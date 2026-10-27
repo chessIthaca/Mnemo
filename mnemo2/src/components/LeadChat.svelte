@@ -1,10 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
-  import { actions, app, currentProject } from "../lib/store";
+  import { actions, app } from "../lib/store";
   import Composer from "./Composer.svelte";
   import Markdown from "./Markdown.svelte";
-  import ModelBadge from "./ModelBadge.svelte";
   import MergeCard from "./MergeCard.svelte";
   import ToolActivity from "./ToolActivity.svelte";
   import ElapsedTime from "./ElapsedTime.svelte";
@@ -29,10 +28,6 @@
   let nearBottom = true;
   let scrollFrame: number | null = null;
   let resizeObserver: ResizeObserver | null = null;
-
-  const leadModel = $derived(
-    $app.leadRuntime.modelId ?? $currentProject?.leadModel ?? "unconfigured",
-  );
 
   onMount(() => {
     if (typeof ResizeObserver !== "undefined") {
@@ -75,17 +70,13 @@
 <section class="lead-workspace" aria-label="Lead conversation">
   <div class="lead-scroll" bind:this={scroller} onscroll={handleScroll}>
     <div class="lead-content">
-      <header class="lead-heading">
-        <div class="lead-title"><span class="lead-mark">M</span><h1>Lead</h1><ModelBadge model={leadModel} role="lead" /></div>
-      </header>
-
       <div class="lead-stream" bind:this={content}>
       <div class="lead-entries">
         {#each $app.leadEntries as entry, index (entry.id)}
           {#if entry.kind === "message"}
             <article class:user-entry={entry.author === "user"} class="chat-entry">
               {#if entry.author === "lead"}
-                <div class="entry-label"><span class="lead-mark">M</span> LEAD</div>
+                <div class="entry-label">LEAD</div>
                 <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               {:else}
                 <p>{entry.body}</p>
@@ -183,11 +174,6 @@
   .lead-scroll { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; }
   .lead-content { width: 100%; min-width: 0; margin: 0; padding: 22px 32px 18px; }
   .lead-stream { display: flow-root; min-width: 0; }
-  .lead-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
-  .lead-title { display: flex; align-items: center; gap: 9px; }
-  .lead-heading h1 { margin: 0; font-family: var(--font-prose); font-size: 30px; font-weight: 500; letter-spacing: -0.03em; }
-  .lead-title :global(.model-badge) { margin-top: 3px; }
-  .lead-entries { margin-top: 14px; }
   .chat-entry { margin: 0 0 16px; }
   .chat-entry:not(.user-entry) { margin-left: 14px; }
   .chat-entry :global(.markdown p), .chat-entry :global(.markdown li), .chat-entry :global(.markdown blockquote) { max-width: 100ch; }
@@ -195,7 +181,6 @@
   .thinking-status { display: flex; align-items: center; gap: 6px; margin: 6px 0 12px 30px; color: var(--muted); font-size: 10px; }
   .thinking-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: thinking-pulse 1.2s ease-in-out infinite; }
   @keyframes thinking-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
-  .lead-mark { display: grid; width: 20px; height: 20px; place-items: center; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--accent-strong); font-family: var(--font-prose); font-size: 12px; }
   .user-entry { max-width: 100ch; margin: 20px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line-strong); }
   .user-entry p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
   .user-meta { margin-top: 4px; color: var(--muted); font-size: 8px; letter-spacing: 0.08em; text-align: left; }
@@ -224,7 +209,6 @@
     .composer-dock { padding: 10px 16px 72px; }
   }
   @media (max-width: 560px) {
-    .lead-heading h1 { font-size: 27px; }
     .chat-entry:not(.user-entry), .tool-activity-row, .team-card { margin-left: 0; }
   }
 </style>

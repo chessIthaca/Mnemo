@@ -1150,6 +1150,10 @@ function resumeWorker(workerId: string) {
     .catch(noteTeamError);
 }
 
+async function compactWorker(workerId: string): Promise<void> {
+  await performTeam((transport) => transport.compact(workerId));
+}
+
 async function performTeam(
   operation: (transport: TeamTransport) => Promise<unknown>,
 ): Promise<void> {
@@ -1238,11 +1242,6 @@ async function revertMerge(workerId: string): Promise<void> {
 
 async function stopAll(): Promise<void> {
   await performTeam((transport) => transport.stopAll());
-}
-
-async function setWorkerBudget(workerId: string, tokenBudget: number): Promise<void> {
-  if (!Number.isInteger(tokenBudget) || tokenBudget < 1) return;
-  await performTeam((transport) => transport.setTokenBudget(workerId, tokenBudget));
 }
 
 function timeFromMs(milliseconds: number): string {
@@ -1413,10 +1412,10 @@ function workerFromRecord(
     worktree: record.worktree,
     files: [],
     tokens: record.total_tokens,
-    tokenBudget: record.token_budget,
     cost: record.cost_micros == null ? null : record.cost_micros / 1_000_000,
     elapsed: elapsedFromMs(record.elapsed_ms),
     turns: record.turns,
+    compacting: record.compacting === true,
     progress: progress[status],
     lastActivity: timeFromMs(record.last_activity_ms),
     needsYou:
@@ -1465,8 +1464,19 @@ function mergeTeamActivity(
     else next[index] = entry;
   };
   for (const message of messages) {
+    const id = `team-${message.worker_id}-${message.at_ms}`;
+    const attributed = next.some((entry) =>
+      entry.id !== id && entry.kind === "team-message" &&
+      entry.workerId === message.worker_id && message.text.trim().length > 0 &&
+      entry.body.includes(message.text),
+    );
+    if (attributed) {
+      const duplicate = next.findIndex((entry) => entry.id === id);
+      if (duplicate !== -1) next.splice(duplicate, 1);
+      continue;
+    }
     upsert({
-      id: `team-${message.worker_id}-${message.at_ms}`,
+      id,
       kind: "team-message",
       workerId: message.worker_id,
       body: message.text,
@@ -1669,6 +1679,7 @@ export const actions = {
   stopWorker,
   pauseWorker,
   resumeWorker,
+  compactWorker,
   syncTeam,
   reviewWorker,
   recordWorkerCheck,
@@ -1679,7 +1690,6 @@ export const actions = {
   mergeWorker,
   revertMerge,
   stopAll,
-  setWorkerBudget,
   setWorkerSlots,
   dismissToast,
   resetDemo,

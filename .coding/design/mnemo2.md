@@ -3,7 +3,8 @@
 Status: Phase 4 implemented — the native host runs one real streaming lead
 session and a real parallel worker team on one shared headless engine, with
 per-worker branches and linked worktrees, durable reviews/findings, exact-tip
-checks, serialized local merge/revert, and cumulative telemetry/token budgets.
+checks, serialized local merge/revert, and cumulative telemetry without token
+or cost budgets.
 The workbench now shows actual lead plans and worker Git deltas, a native
 WebView2 Browser pane, per-project state and preferences, safe recovery, and
 notifications. Phase 0b's conversation-first interface is unchanged; production
@@ -219,48 +220,58 @@ The agent-facing git gate still applies to the agent's own `git merge`/`push`
 calls; the TeamManager's merge is an application operation with its own
 policy (see `agent.md`).
 
-## 5. Budget and cost
+## 5. Session limits and cost
 
-The team is budget-gated, not per-action-gated.
+The team has operational session limits, not per-agent spending budgets.
 
-- **Caps**: `DEFAULT_SLOTS = 3` live worker sessions,
+- **Operational limits**: `DEFAULT_SLOTS = 3` live worker sessions,
   `DEFAULT_SPAWNS_PER_TURN = 4` delegations per lead turn, 64 worker turns and
-  30 minutes per session, and a default cumulative 200,000-token budget per
-  worker. The startup default is configurable, and an exhausted worker's budget
-  can be raised only above its real cumulative usage. Hitting the token cap
-  pauses the worker in **Needs you** and blocks continuation until it is raised.
-  Per-project monetary budgets remain an open decision.
-- **Tracked dispatch**: `team_dispatch` runs only when slots and the per-turn
-  delegation cap allow it. Generic spawning is unavailable, so no approval path
-  can create an untracked worker.
+  30 minutes per session. There is no cumulative worker token or cost budget and
+  no budget-increase flow. Prompt, completion, cached, and context-window usage
+  never pause a worker or block a message/resume. Provider context limits and
+  parked sessions remain actual lifecycle outcomes, not spending limits.
+- **Tracked, idempotent dispatch**: the lead chooses a stable worker ID for each
+  logical task and retains the returned JSON receipt and authoritative status.
+  Reusing that ID with the same brief/model returns the existing worker rather
+  than consuming another spawn or creating another session/worktree; a changed
+  brief/model conflicts. An unknown explicit model is rejected before any
+  record, branch, or worktree is created. Generic spawning is unavailable.
+- **API authority**: TeamManager records and `team_status` are the only worker
+  lifecycle/ID authority. The lead never infers lifecycle from Git/files or
+  edits `team.json`; TeamManager owns its ledger and Git operations internally.
 - **Model routing**: strong lead, cheap/default workers, configured reviewer;
   the lead can pick a cheaper model for mechanical work via `list_models`.
 - **Model identity**: the project stores the lead model; every task stores its
-  worker model. Both render as a compact badge in conversation headers, task
-  rows, delegation cards, and merge records, so the human can see the model
-  mix at a glance without opening telemetry.
+  worker model. The composer/settings show the lead model and compact badges
+  identify worker models in task rows, delegation cards, and merge records.
 - **Executor workers**: one plan of record (the lead's), not one per worker.
 - **Self-contained briefs**: the lead attaches the plan excerpt, paths,
   acceptance criteria, and scope limit; workers do not rediscover the repo.
 - **Review economics**: review small diffs directly; pre-read large diffs with
   an optional reviewer; never spawn a worker for a read or an answer.
+- **Blocked workers**: worker messages and blocked/failure transitions send a
+  deduplicated, attributed notice to the actual lead session. The lead uses
+  `team_message`, `team_stop`, `team_resume`, and `team_compact` with exact
+  returned IDs. Compaction is a real session command whose requested and actual
+  completed/failed states remain distinct; it never creates a duplicate session.
 - **Telemetry**: per-worker model, cumulative prompt/completion/cached tokens,
   requests, elapsed time, and completed turns, all persisted across sessions.
   Cost is derived only from configured model pricing; unknown cost is never
-  shown as zero. A worker budget editor and aggregate usage/cost chip sit beside
-  **Stop all**; individual workers also support pause/resume.
+  shown as zero. The aggregate chip reports actual usage/cost without a token
+  denominator. Workers support pause/resume/stop and real context compaction.
 
 ## 6. Mission Control
 
 Mission Control is per project, not cross-project. It is a conversation-first
-task list plus an exceptions-and-budget board, not a phase dashboard or an
+task list plus an exceptions-and-usage board, not a phase dashboard or an
 approval queue. Each row is one task with its own workflow and model.
 
-States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
-**Merged**, **Conflict**, **Failed**, **Cancelled**.
+States: **Dispatching**, **Working**, **Needs you**, **Idle**, **Paused**,
+**Interrupted**, **Completed**, **Stopped**, **Failed**, **In review**, **Fixing**,
+**Merging**, **Merged**, **Conflict**, **Cancelled**.
 
-- **Peek** (380px, over the chat side): Needs you (conflict/failed/over-budget),
-  In review, Working, plus the budget chip.
+- **Peek** (380px, over the chat side): Needs you (conflict/failed/blocked),
+  In review, Working, plus the actual usage/cost chip.
 - **Control room** (a route): grouped task board + conversation detail. The
   detail opens on the worker **Thread**; Review (checks, findings, merge) is a
   secondary tab. The header shows task, model, branch/worktree, and the task's
@@ -340,7 +351,7 @@ States: **Dispatching**, **Working**, **In review**, **Fixing**, **Merging**,
 
 ## 10. Open decisions
 
-- Per-project monetary budgets. Custom worker-slot defaults are persisted.
+- Custom worker-slot defaults are persisted.
 - Whether a fresh fixer subagent is ever preferable to the current original-worker
   re-tasking path.
 - Reviewer pre-pass threshold (diff size/files/risk).
@@ -438,24 +449,28 @@ Shipped in the native host:
   routing back to the tracked worker. Every fix invalidates stale review/check
   evidence and requires delta review.
 - **Integration:** one operation lock covers dispatch, review/check/fix,
-  messaging, stop/resume, and merge/revert. Merge requires an idle clean lead and
-  worker, a non-`main` target, exact-tip passing checks, and closed findings.
-  Conflicts abort with diagnostics and route back; guarded revert works only
-  before landing. Merge records include diff stats, model, tokens, and cost when
-  priced. Sessions close before worktree cleanup; branches remain for audit.
-- **Budget and recovery:** cumulative real usage, turns, activity, elapsed time,
-  configurable per-worker token budgets, pricing-derived cost, stop-all, and
-  restart downgrade. `team.json` uses a backup-recoverable replacement path.
-  Interrupted conflicts abort cleanly; committed merges are reconstructed only
-  from verifiable Git parent evidence, with stale `MERGE_HEAD` state cleared
-  only after a clean-tree check.
-- **Native/UI:** typed review/fix/check/merge/revert/stop-all/budget commands and
-  real worker/inline lead cards. Generic `spawn_agent` is hidden, Markdown is
+  messaging, stop/resume/compact, and merge/revert. Merge requires an idle clean
+  lead and worker, a non-`main` target, exact-tip passing checks, and closed
+  findings. Verified conflict-only merges abort with diagnostics and route back;
+  unrelated lead changes block automatic recovery and are preserved. Guarded
+  revert works only before landing. Merge records include diff stats, model,
+  tokens, and cost when priced. Sessions close before verified-clean worktree
+  cleanup; branches and dirty work remain for audit.
+- **Lifecycle and recovery:** caller-stable dispatch IDs, structured worker
+  receipts, model validation before provisioning, real usage/turn/activity/
+  elapsed telemetry without token or cost budgets, pricing-derived cost,
+  stop-all, blocked-worker lead notices, real context compaction, and restart
+  downgrade. `team.json` uses a backup-recoverable replacement path. Dispatch
+  rollback preserves advanced/dirty work; committed merges are reconstructed
+  only from verifiable Git parent evidence.
+- **Native/UI:** typed review/fix/check/merge/revert/stop/resume/compact commands
+  and real worker/inline lead cards. Generic `spawn_agent` is hidden, Markdown is
   retained across streaming, and no placeholder success path remains.
 - **Acceptance met:** no merge with an open/unevidenced finding or stale check;
   parallel tasks keep independent states; exact-tip evidence cannot race the
-  operation lock; conflict recovery leaves a clean tree; and committed crash
-  recovery never invents a merge result.
+  operation lock; conflict-only recovery leaves a clean tree while unrelated
+  changes survive; committed crash recovery never invents a merge result; and
+  retrying a logical dispatch cannot duplicate a worker.
 
 ### Phase 4 — Native shell, workbench, persistence (implemented)
 

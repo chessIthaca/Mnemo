@@ -110,9 +110,11 @@ describe("LeadChat", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders no global run strip", () => {
-    render(LeadChat);
+  it("renders no global run strip or redundant lead heading", () => {
+    const { container } = render(LeadChat);
     expect(screen.queryByText(/Run 04/)).toBeNull();
+    expect(container.querySelector(".lead-mark")).toBeNull();
+    expect(container.querySelector(".lead-heading")).toBeNull();
   });
 
   it("shows the configured lead model", () => {

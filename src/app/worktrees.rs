@@ -272,6 +272,48 @@ pub async fn remove_agent_worktree(main_root: PathBuf, agent_id: String) -> Resu
     remove_worktree_only(main_root, worktree).await
 }
 
+/// Roll back only a newly provisioned, untouched Mnemo2 worker checkout.
+/// The caller must have created this exact worker ID during this dispatch.
+pub async fn rollback_agent_worktree(
+    main_root: PathBuf,
+    agent_id: String,
+    base_tip: String,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        if agent_id.is_empty()
+            || !agent_id.chars().all(|character| character.is_ascii_alphanumeric())
+        {
+            return Err("invalid worker identity; branch retained".to_string());
+        }
+        let branch = agent_branch(&agent_id);
+        let worktree = worktrees_dir(&main_root).join(format!("agent-{}", agent_short_id(&agent_id)));
+        if current_branch(&worktree)? != branch {
+            return Err("worker checkout is on an unexpected branch; branch retained".to_string());
+        }
+        let dirty = git_raw(&worktree, &["status", "--porcelain", "-uall"])?;
+        if !dirty.trim().is_empty() {
+            return Err("worker checkout has uncommitted work; branch retained".to_string());
+        }
+        let revision = format!("refs/heads/{branch}^{{commit}}");
+        let tip = git_raw(&main_root, &["rev-parse", "--verify", &revision])?;
+        if tip.trim() != base_tip {
+            return Err("worker branch advanced after dispatch; branch retained".to_string());
+        }
+        remove_worktree_only_impl(&main_root, &worktree)?;
+        let tip = git_raw(&main_root, &["rev-parse", "--verify", &revision])?;
+        if tip.trim() != base_tip {
+            return Err("worker branch advanced during rollback; branch retained".to_string());
+        }
+        git_raw(
+            &main_root,
+            &["update-ref", "-d", &format!("refs/heads/{branch}"), &base_tip],
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("worker rollback task failed: {error}"))?
+}
+
 /// The synchronous core of [`remove_worktree_only`] — shared with
 /// [`remove_item_worktree`] (which adds the branch delete). Prunes
 /// stale worktree metadata first (review R3-L2): a worktree whose

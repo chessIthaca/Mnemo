@@ -59,7 +59,6 @@ function makeWorker(input: WorkerInput): Worker {
     worktree: `.worktrees/agent-${id}`,
     files: [],
     tokens: 8400,
-    tokenBudget: 200_000,
     cost: 0.48,
     elapsed: "9m",
     turns: 3,

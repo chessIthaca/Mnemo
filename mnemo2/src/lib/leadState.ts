@@ -9,6 +9,8 @@ import type {
   LeadTranscript,
 } from "./types";
 
+export const TEAM_NOTICE_PREFIX = "[TeamManager notice — not the human] worker_id=";
+
 /** The idle browser-mode lead state. */
 export function initialLeadRuntime(): LeadRuntimeInfo {
   return {
@@ -249,6 +251,18 @@ export function leadEntriesFromTranscript(
   transcript.messages.forEach((message, index) => {
     if (message.role === "user" || message.role === "assistant") {
       const body = messageText(message.content).trim();
+      if (message.role === "user" && body.startsWith(TEAM_NOTICE_PREFIX)) {
+        const firstLine = body.indexOf("\n");
+        const workerId = body.slice(TEAM_NOTICE_PREFIX.length, firstLine === -1 ? body.length : firstLine);
+        entries.push({
+          id: `history-team-${index}`,
+          kind: "team-message",
+          workerId,
+          body: firstLine === -1 ? "" : body.slice(firstLine + 1),
+          time: "restored",
+        });
+        return;
+      }
       if (body) {
         entries.push({
           id: `history-${index}`,

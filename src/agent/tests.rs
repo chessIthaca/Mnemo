@@ -1663,6 +1663,93 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
     }
 }
 
+struct DomainFailureTool;
+
+#[async_trait]
+impl crate::tool::Tool for DomainFailureTool {
+    fn name(&self) -> &str {
+        "team_domain"
+    }
+
+    fn category(&self) -> crate::tool::ToolCategory {
+        crate::tool::ToolCategory::Agent
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().to_string(),
+            description: "A valid TeamManager call that returns a domain failure".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            strict: None,
+        }
+    }
+
+    fn safety(&self) -> crate::tool::SafetyLevel {
+        crate::tool::SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> crate::tool::ToolResult {
+        crate::tool::ToolResult::error("unknown worker 'missing'").with_data(
+            serde_json::json!({"error_kind": "domain"}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn domain_errors_do_not_trigger_malformed_call_correction() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = make_registry((*sandbox).clone(), workflow.clone());
+    Arc::get_mut(&mut registry)
+        .expect("unique test registry")
+        .register(Box::new(DomainFailureTool));
+    let call = |index: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("domain_{index}"),
+                name: "team_domain".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: "{}".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        call(1),
+        call(2),
+        vec![
+            LlmEvent::TextDelta { text: "done".into() },
+            LlmEvent::Finish { reason: FinishReason::Stop },
+        ],
+    ]));
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("check the worker")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(messages.iter().filter(|message| message.role == Role::Tool).count(), 2);
+    assert!(messages.iter().all(|message| {
+        !message.content.as_text().contains("[harness tool-call correction")
+            && !message.content.as_text().contains("malformed")
+    }));
+    assert_eq!(messages.last().map(|message| message.content.as_text()).as_deref(), Some("done"));
+}
+
 #[tokio::test]
 async fn correction_schema_matches_the_advertised_strict_schema() {
     // Plan 21118961 consistency: on a strict-capable endpoint the

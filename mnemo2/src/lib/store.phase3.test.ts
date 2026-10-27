@@ -88,7 +88,6 @@ function nativeWorker(): TeamWorkerRecord {
     pending: null,
     used_tokens: 123,
     max_tokens: 1000,
-    token_budget: 200_000,
     total_tokens: 123,
     prompt_tokens: 100,
     completion_tokens: 23,
@@ -136,10 +135,7 @@ function makeTransport(initial: TeamWorkerRecord) {
     }),
     stopAll: vi.fn(async () => {}),
     setSlots: vi.fn(async () => ({ workers: [current], slots: 3, active: 1 })),
-    setTokenBudget: vi.fn(async (_workerId, tokenBudget) => {
-      current = { ...current, token_budget: tokenBudget };
-      return current;
-    }),
+    compact: vi.fn(async () => current),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async () => () => {}),
   };
@@ -170,7 +166,6 @@ describe("native Phase 3 store integration", () => {
     const ana = get(app).workers[0];
     expect(ana).toMatchObject({
       tokens: 123,
-      tokenBudget: 200_000,
       cost: 0.5,
       elapsed: "1m",
       turns: 4,
@@ -219,10 +214,9 @@ describe("native Phase 3 store integration", () => {
     await actions.spawnFixer("ana", "F-1");
     await actions.resolveFinding("ana", "F-1", "fixed", "verified");
     await actions.wontfixFinding("ana", "F-1", "justified separately");
-    await actions.setWorkerBudget("ana", 250_000);
+    await actions.compactWorker("ana");
 
-    expect(transport.setTokenBudget).toHaveBeenCalledWith("ana", 250_000);
-    expect(get(app).workers[0].tokenBudget).toBe(250_000);
+    expect(transport.compact).toHaveBeenCalledWith("ana");
     expect(transport.review).toHaveBeenCalledWith("ana", "delta review", [finding]);
     expect(transport.recordCheck).toHaveBeenCalledWith(
       "ana",

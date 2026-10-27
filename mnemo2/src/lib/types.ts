@@ -150,10 +150,10 @@ export interface Worker {
   worktree: string;
   files: string[];
   tokens: number;
-  tokenBudget: number;
   cost: number | null;
   elapsed: string;
   turns: number;
+  compacting?: boolean;
   progress: number;
   lastActivity: string;
   needsYou: boolean;

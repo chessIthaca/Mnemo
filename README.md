@@ -181,8 +181,9 @@ project. The browser-only Vite session has no engine behind
 it and says so instead of simulating. The interface is conversation-first: each
 task has its own lead-enforced workflow, and lead/worker model identities are
 visible in the UI. Durable reviews, exact-tip checks, finding resolution, local
-merge/revert, and cumulative worker token budgets are enforced in the native
-host; nothing pushes or merges into `main`:
+merge/revert, idempotent worker dispatch, and cumulative usage telemetry are
+enforced in the native host; workers have no cumulative token/cost budget, and
+nothing pushes or merges into `main`:
 
 ```bash
 npm run dev:mnemo2         # http://127.0.0.1:5180 — browser (no engine)

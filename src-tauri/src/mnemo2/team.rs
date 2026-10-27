@@ -50,18 +50,11 @@ const WORKER_MAX_TURNS: u64 = 64;
 /// The executor session's wall-clock cap.
 const WORKER_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
 
-/// Default cumulative prompt + completion token budget for one worker.
-pub const DEFAULT_WORKER_TOKEN_BUDGET: u32 = 200_000;
-
 /// The default number of concurrently live worker sessions.
 pub const DEFAULT_SLOTS: usize = 3;
 
-/// The default delegation cap for one lead turn.
+/// The default delegation limit for one lead turn.
 pub const DEFAULT_SPAWNS_PER_TURN: usize = 4;
-
-fn default_token_budget() -> u32 {
-    DEFAULT_WORKER_TOKEN_BUDGET
-}
 
 /// The real lifecycle state of one worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,9 +135,12 @@ pub struct WorkerRecord {
     pub used_tokens: u32,
     /// The context window.
     pub max_tokens: u32,
-    /// Maximum cumulative prompt + completion tokens before the worker pauses.
-    #[serde(default = "default_token_budget")]
-    pub token_budget: u32,
+    /// Whether the initial brief was accepted by a live session.
+    #[serde(default)]
+    pub brief_sent: bool,
+    /// A real compaction command is running in this session.
+    #[serde(default)]
+    pub compacting: bool,
     /// Cumulative prompt + completion tokens across every worker session.
     #[serde(default)]
     pub total_tokens: u64,
@@ -237,8 +233,10 @@ pub struct TeamRuntimeOptions {
     pub state_dir: PathBuf,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
-    /// The per-lead-turn delegation cap.
+    /// The per-lead-turn delegation limit.
     pub max_spawns_per_turn: usize,
+    /// Explicit worker models must belong to this configured inventory.
+    pub model_specs: Vec<String>,
     /// Configured per-model prices used to estimate real worker cost.
     pub pricing: Vec<mnemo::config::PricingEntry>,
 }
@@ -356,10 +354,11 @@ pub struct TeamRuntime {
     next_worker: AtomicU64,
     spawns_this_turn: AtomicUsize,
     lead_busy: AtomicBool,
+    lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     max_spawns_per_turn: usize,
-    default_token_budget: u32,
+    model_specs: Vec<String>,
     persistence: TeamPersistence,
 }
 
@@ -393,10 +392,11 @@ impl TeamRuntime {
             next_worker: AtomicU64::new(1),
             spawns_this_turn: AtomicUsize::new(0),
             lead_busy: AtomicBool::new(false),
+            lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
             max_spawns_per_turn: options.max_spawns_per_turn.max(1),
-            default_token_budget: DEFAULT_WORKER_TOKEN_BUDGET,
+            model_specs: options.model_specs,
             persistence,
         };
         runtime.persist().await?;
@@ -411,6 +411,7 @@ impl TeamRuntime {
             state_dir,
             slots: None,
             max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: lead.pricing()?,
         })
         .await
@@ -421,13 +422,7 @@ impl TeamRuntime {
         self.events.subscribe()
     }
 
-    /// Set the default cumulative token budget for newly dispatched workers.
-    pub fn with_worker_token_budget(mut self, token_budget: u32) -> Self {
-        self.default_token_budget = token_budget.max(1);
-        self
-    }
-
-    /// Reset the per-turn delegation budget and mark the lead non-idle.
+    /// Reset the per-turn delegation limit and mark the lead non-idle.
     pub fn begin_lead_turn(&self) {
         self.spawns_this_turn.store(0, Ordering::SeqCst);
         self.lead_busy.store(true, Ordering::SeqCst);
@@ -436,6 +431,18 @@ impl TeamRuntime {
     /// Mirror the lead session's busy state into the merge gate.
     pub fn set_lead_busy(&self, busy: bool) {
         self.lead_busy.store(busy, Ordering::SeqCst);
+    }
+
+    pub(crate) fn lead_is_busy(&self) -> bool {
+        self.lead_busy.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn attach_lead(&self, session_id: SessionId) {
+        *self.lead_session.lock().await = Some(session_id);
+    }
+
+    pub(crate) async fn lead_is_current(&self, session_id: SessionId) -> bool {
+        *self.lead_session.lock().await == Some(session_id)
     }
 
     /// Persist a new live-session cap without dropping active workers.
@@ -513,8 +520,8 @@ impl TeamRuntime {
         vec![
             HostToolSpec {
                 name: "team_dispatch".to_string(),
-                description: "Delegate a real coding task to a tracked worker on its own Git branch and worktree. Never use generic agent spawning.".to_string(),
-                parameters: json!({"type":"object","properties":{"brief":{"type":"string"},"model":{"type":"string"}},"required":["brief"]}),
+                description: "Delegate one implementation task through TeamManager. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"brief":{"type":"string"},"model":{"type":"string"}},"required":["worker_id","brief"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -527,8 +534,29 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_status".to_string(),
-                description: "Read the team snapshot, or one worker by id.".to_string(),
+                description: "Read authoritative TeamManager state for every worker or one exact returned worker_id. This is the only worker lifecycle/ID authority; never infer status from Git, worktrees, timestamps, or files.".to_string(),
                 parameters: json!({"type":"object","properties":worker_arg}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_stop".to_string(),
+                description: "Cancel a worker's live session through TeamManager while retaining its record, branch, worktree, and commits. Use the exact ID returned by dispatch or team_status.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_resume".to_string(),
+                description: "Resume a stopped/interrupted worker from its saved transcript through TeamManager. Returns the same worker ID with a new session generation.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
+                name: "team_compact".to_string(),
+                description: "Request real context compaction for a quiescent worker. A blocked or stopped session is detached and resumed once first. A returned working status means requested, not completed; use team_status and compaction events for the outcome.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"}},"required":["worker_id"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -597,24 +625,33 @@ impl TeamRuntime {
 
     /// Execute a lead host-tool call.
     pub async fn handle_lead_host_tool(&self, name: &str, args: Value) -> ToolResult {
+        if name == "team_dispatch" {
+            let (Some(brief), Some(worker_id)) = (
+                args.get("brief").and_then(Value::as_str),
+                args.get("worker_id").and_then(Value::as_str),
+            ) else {
+                return ToolResult::error(
+                    "team_dispatch requires 'brief' and a caller-chosen stable 'worker_id'",
+                );
+            };
+            let model = args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let result = self
+                .dispatch_request(brief.to_string(), model, Some(worker_id.to_string()))
+                .await
+                .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
+            return worker_result(result, "team_dispatch");
+        }
         if name == "team_status" {
             let result = match args.get("worker_id").and_then(Value::as_str) {
                 Some(id) => self.worker(id).await,
-                None => return worker_result(Ok(self.snapshot().await.workers), "listed workers"),
+                None => return worker_result(Ok(self.snapshot().await.workers), "team_status"),
             };
-            return worker_result(result.map(|worker| vec![worker]), "read worker");
+            return worker_result(result.map(|worker| vec![worker]), "team_status");
         }
         let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
-            if name == "team_dispatch" {
-                let Some(brief) = args.get("brief").and_then(Value::as_str) else {
-                    return ToolResult::error("team_dispatch requires a 'brief' string");
-                };
-                let model = args
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                return worker_result(self.dispatch(brief.to_string(), model).await, "dispatched");
-            }
             return ToolResult::error(format!("{name} requires a 'worker_id' string"));
         };
         let result = match name {
@@ -622,6 +659,9 @@ impl TeamRuntime {
                 Some(text) => self.message(worker_id, text.to_string()).await,
                 None => Err("team_message requires a 'text' string".to_string()),
             },
+            "team_stop" => self.stop(worker_id).await,
+            "team_resume" => self.resume(worker_id).await,
+            "team_compact" => self.compact(worker_id).await,
             "team_review" => {
                 let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
                 match serde_json::from_value::<Vec<Finding>>(
@@ -705,7 +745,66 @@ impl TeamRuntime {
         brief: String,
         model: Option<String>,
     ) -> Result<WorkerRecord, String> {
+        self.dispatch_with_id(brief, model, None).await
+    }
+
+    /// Dispatch or recover one logical task, keyed by its actual worker ID.
+    pub async fn dispatch_with_id(
+        &self,
+        brief: String,
+        model: Option<String>,
+        worker_id: Option<String>,
+    ) -> Result<WorkerRecord, String> {
+        self.dispatch_request(brief, model, worker_id)
+            .await
+            .map(|(worker, _)| worker)
+    }
+
+    async fn dispatch_request(
+        &self,
+        brief: String,
+        model: Option<String>,
+        worker_id: Option<String>,
+    ) -> Result<(WorkerRecord, bool), String> {
         let _guard = self.merge_lock.lock().await;
+        if brief.trim().is_empty() {
+            return Err("the worker brief is empty".to_string());
+        }
+        if let Some(id) = worker_id.as_deref() {
+            validate_worker_id(id)?;
+            let existing = {
+                let records = self.records.lock().await;
+                records.iter().find(|worker| worker.id == id).cloned()
+            };
+            if let Some(existing) = existing {
+                if existing.brief != brief || existing.model != model {
+                    return Err(format!(
+                        "worker '{id}' already exists with a different brief or model; use team_status instead of guessing a new ID"
+                    ));
+                }
+                if existing.branch != agent_branch(id) {
+                    return Err(format!("worker '{id}' has an invalid branch identity"));
+                }
+                self.validate_model(&existing.model)?;
+                if !existing.brief_sent
+                    && !self.live.lock().await.contains_key(id)
+                    && matches!(existing.status, WorkerStatus::Dispatching | WorkerStatus::Failed | WorkerStatus::Interrupted)
+                {
+                    if !existing.worktree.is_dir() {
+                        return Err(format!("worker '{id}' has no recoverable worktree"));
+                    }
+                    return self.start_worker(existing).await.map(|worker| (worker, true));
+                }
+                return Ok((existing, true));
+            }
+        }
+        self.validate_model(&model)?;
+        if let Some(id) = worker_id.as_deref() {
+            let branch = agent_branch(id);
+            if self.records.lock().await.iter().any(|worker| worker.branch == branch) {
+                return Err(format!("worker ID prefix collides with an existing {branch}"));
+            }
+        }
         let used = self.spawns_this_turn.fetch_add(1, Ordering::SeqCst);
         if used >= self.max_spawns_per_turn {
             self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
@@ -714,45 +813,59 @@ impl TeamRuntime {
                 self.max_spawns_per_turn
             ));
         }
-        let result = self.dispatch_inner(brief, model).await;
+        let active = self.live.lock().await.len();
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!("all {slots} worker slots are busy"));
+        }
+        let result = self.provision_worker(brief, model, worker_id).await;
         if result.is_err() {
             self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
         }
-        result
+        result.map(|worker| (worker, false))
     }
 
-    async fn dispatch_inner(
+    fn validate_model(&self, model: &Option<String>) -> Result<(), String> {
+        if let Some(spec) = model {
+            if !self.model_specs.iter().any(|configured| configured == spec) {
+                return Err(format!(
+                    "'{spec}' is not a configured model; choose a model returned by list_models"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn provision_worker(
         &self,
         brief: String,
         model: Option<String>,
+        worker_id: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        if brief.trim().is_empty() {
-            return Err("the worker brief is empty".to_string());
-        }
-        let active = self.live.lock().await.len();
-        if active >= self.persistence.slots.load(Ordering::SeqCst) {
-            return Err(format!("all {} worker slots are busy", self.persistence.slots.load(Ordering::SeqCst)));
-        }
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
             format!(
                 "cannot dispatch a tracked worker: the selected project is not a usable Git checkout. Open the repository root (the folder containing .git), then retry. Git reported: {err}"
             )
         })?;
-        let seq = self.next_worker.fetch_add(1, Ordering::SeqCst);
-        let millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0);
-        let id = format!("{seq:08x}{millis:012x}");
+        let id = match worker_id {
+            Some(id) => id,
+            None => {
+                let seq = self.next_worker.fetch_add(1, Ordering::SeqCst);
+                let millis = phase3::now_ms();
+                format!("{seq:08x}{millis:012x}")
+            }
+        };
+        let millis = phase3::now_ms();
         let name = format!("Worker {}", agent_short_id(&id));
         let (worktree, branch) =
             provision_agent_worktree(self.workspace_root.clone(), id.clone(), base_ref).await?;
-        let worker_worktree = worktree.clone();
+        let base_tip = phase3::tip(&worktree).await?;
         let record = WorkerRecord {
             id: id.clone(),
-            name: name.clone(),
-            brief: brief.clone(),
-            model: model.clone(),
+            name,
+            brief,
+            model,
             model_id: None,
             branch,
             worktree,
@@ -762,7 +875,8 @@ impl TeamRuntime {
             pending: None,
             used_tokens: 0,
             max_tokens: 0,
-            token_budget: self.default_token_budget,
+            brief_sent: false,
+            compacting: false,
             total_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -780,22 +894,65 @@ impl TeamRuntime {
             merge: None,
             error: None,
         };
-        self.records.lock().await.push(record);
+        self.records.lock().await.push(record.clone());
         if let Err(err) = self.persist().await {
             self.records.lock().await.retain(|worker| worker.id != id);
-            let _ = remove_agent_worktree(self.workspace_root.clone(), id.clone()).await;
-            return Err(err);
+            let rollback = mnemo::app::worktrees::rollback_agent_worktree(
+                self.workspace_root.clone(),
+                id.clone(),
+                base_tip,
+            )
+            .await;
+            return Err(match rollback {
+                Ok(()) => err,
+                Err(rollback) => {
+                    let error = format!(
+                        "{err}; worker '{id}' retains its checkout because rollback was refused: {rollback}"
+                    );
+                    self.records.lock().await.push(WorkerRecord {
+                        status: WorkerStatus::Failed,
+                        error: Some(error.clone()),
+                        ..record
+                    });
+                    let _ = self.persist().await;
+                    error
+                }
+            });
         }
+        self.start_worker(record).await
+    }
+
+    async fn start_worker(&self, record: WorkerRecord) -> Result<WorkerRecord, String> {
+        let active = self.live.lock().await.len();
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            return Err(format!("all {slots} worker slots are busy"));
+        }
+        let id = record.id.clone();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.update_worker(&id, |worker| {
+            worker.generation = generation;
+            worker.status = WorkerStatus::Dispatching;
+            worker.pending = None;
+            worker.error = None;
+            worker.compacting = false;
+        })
+        .await;
+        self.persist().await?;
         let session = match self
-            .spawn_worker_session(name, model, worker_worktree, None)
+            .spawn_worker_session(
+                record.name.clone(),
+                record.model.clone(),
+                record.worktree.clone(),
+                Some(record.transcript.clone()),
+            )
             .await
         {
             Ok(session) => session,
             Err(err) => {
-                self.fail_worker(&id, err.clone()).await;
-                let _ = remove_agent_worktree(self.workspace_root.clone(), id.clone()).await;
-                return Err(err);
+                let error = format!("{err}; worker '{id}' retains its checkout; retry with the same worker ID");
+                self.fail_worker(&id, error.clone()).await;
+                return Err(error);
             }
         };
         let session_id = session.id();
@@ -816,16 +973,16 @@ impl TeamRuntime {
         ));
         if let Err(err) = session
             .send(SessionCommand::Prompt {
-                text: brief,
+                text: record.brief.clone(),
                 images: Vec::new(),
             })
             .await
         {
             pump.abort();
-            self.fail_worker(&id, format!("could not send the brief: {err}"))
-                .await;
-            let _ = remove_agent_worktree(self.workspace_root.clone(), id.clone()).await;
-            return Err(format!("could not send the brief: {err}"));
+            let _ = session.close().await;
+            let error = format!("could not send the brief to worker '{id}': {err}; retry with the same worker ID");
+            self.fail_worker(&id, error.clone()).await;
+            return Err(error);
         }
         self.live.lock().await.insert(
             id.clone(),
@@ -838,11 +995,15 @@ impl TeamRuntime {
         self.update_worker(&id, |worker| {
             worker.status = WorkerStatus::Working;
             worker.generation = generation;
+            worker.brief_sent = true;
+            worker.error = None;
         })
         .await;
         if let Err(err) = self.persist().await {
-            let _ = self.stop(&id).await;
-            return Err(err);
+            let _ = self.stop_inner(&id).await;
+            return Err(format!(
+                "worker '{id}' accepted the brief but its ledger update failed: {err}; use the same worker ID and inspect team_status"
+            ));
         }
         self.worker(&id).await
     }
@@ -895,8 +1056,8 @@ impl TeamRuntime {
         if record.status == WorkerStatus::Cancelled {
             return Err("a cleaned worker cannot accept new work; review its retained branch".to_string());
         }
-        if record.total_tokens >= record.token_budget as u64 {
-            return Err("increase the worker token budget before continuing".to_string());
+        if record.compacting {
+            return Err("wait for the worker's compaction to finish before messaging it".to_string());
         }
         let (busy, idle, sent) = {
             let live = self.live.lock().await;
@@ -996,17 +1157,36 @@ impl TeamRuntime {
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be stopped".to_string());
         }
-        let live = self.live.lock().await.remove(worker_id);
-        if let Some(live) = live {
-            live.abort();
-            let _ = live.session.close().await;
-        }
         self.update_worker(worker_id, |worker| {
             worker.status = WorkerStatus::Stopped;
             worker.pending = None;
             worker.fixer_finding_id = None;
+            worker.compacting = false;
         })
         .await;
+        let live = self.live.lock().await.remove(worker_id);
+        if let Some(live) = live {
+            let snapshot = live.session.snapshot().await.ok();
+            live.abort();
+            if let Some(snapshot) = snapshot {
+                self.update_worker(worker_id, |worker| {
+                    if !snapshot.transcript.messages.is_empty() {
+                        worker.transcript = snapshot.transcript.clone();
+                        worker.used_tokens = snapshot.used_tokens;
+                        worker.max_tokens = snapshot.max_tokens;
+                        if worker.model_id.is_none() {
+                            worker.model_id = snapshot_model(&snapshot);
+                        }
+                    } else if worker.transcript.messages.is_empty() && worker.brief_sent {
+                        worker.transcript = Transcript {
+                            messages: vec![mnemo::provider::Message::user_text(worker.brief.clone())],
+                        };
+                    }
+                })
+                .await;
+            }
+            let _ = live.session.close().await;
+        }
         self.persist().await?;
         self.worker(worker_id).await
     }
@@ -1022,15 +1202,17 @@ impl TeamRuntime {
         if self.live.lock().await.contains_key(worker_id) {
             return Err(format!("worker '{worker_id}' is already running"));
         }
+        let active = self.live.lock().await.len();
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            return Err(format!("all {slots} worker slots are busy"));
+        }
         let record = self.worker(worker_id).await?;
         if record.status == WorkerStatus::Cancelled {
             return Err("a cleaned worker cannot be resumed; review its retained branch".to_string());
         }
         if matches!(record.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be resumed".to_string());
-        }
-        if record.total_tokens >= record.token_budget as u64 {
-            return Err("increase the worker token budget before resuming".to_string());
         }
         if !record.worktree.is_dir() {
             return Err(format!(
@@ -1076,9 +1258,81 @@ impl TeamRuntime {
             worker.generation = generation;
             worker.pending = None;
             worker.error = None;
+            worker.compacting = false;
         })
         .await;
         self.persist().await?;
+        self.worker(worker_id).await
+    }
+
+    /// Compact a quiescent worker. Blocked or stopped sessions are resumed once.
+    pub async fn compact(&self, worker_id: &str) -> Result<WorkerRecord, String> {
+        let _guard = self.merge_lock.lock().await;
+        let mut record = self.worker(worker_id).await?;
+        if record.compacting {
+            return Err(format!("worker '{worker_id}' is already compacting"));
+        }
+        if record.status == WorkerStatus::NeedsYou && self.live.lock().await.contains_key(worker_id) {
+            self.stop_inner(worker_id).await?;
+            record = self.worker(worker_id).await?;
+        }
+        if !self.live.lock().await.contains_key(worker_id) {
+            if !matches!(
+                record.status,
+                WorkerStatus::Stopped
+                    | WorkerStatus::Interrupted
+                    | WorkerStatus::Paused
+                    | WorkerStatus::Completed
+                    | WorkerStatus::Failed
+                    | WorkerStatus::NeedsYou
+                    | WorkerStatus::Idle
+            ) {
+                return Err(format!("worker '{worker_id}' cannot be compacted in its current state"));
+            }
+            record = self.resume_inner(worker_id).await?;
+        }
+        let busy = {
+            let live = self.live.lock().await;
+            let live = live
+                .get(worker_id)
+                .ok_or_else(|| format!("worker '{worker_id}' is not running"))?;
+            if live.busy.swap(true, Ordering::SeqCst) {
+                return Err(format!("worker '{worker_id}' is busy; compact it when it becomes idle"));
+            }
+            live.busy.clone()
+        };
+        let previous = record;
+        self.update_worker(worker_id, |worker| {
+            worker.compacting = true;
+            worker.status = WorkerStatus::Working;
+            worker.error = None;
+        })
+        .await;
+        if let Err(error) = self.persist().await {
+            busy.store(false, Ordering::SeqCst);
+            self.update_worker(worker_id, |worker| *worker = previous.clone()).await;
+            let _ = self.persist().await;
+            return Err(error);
+        }
+        let sent = {
+            let live = self.live.lock().await;
+            match live.get(worker_id) {
+                Some(live) => Some(live.session.send(SessionCommand::Compact).await),
+                None => None,
+            }
+        };
+        let Some(sent) = sent else {
+            busy.store(false, Ordering::SeqCst);
+            self.update_worker(worker_id, |worker| *worker = previous.clone()).await;
+            self.persist().await?;
+            return Err(format!("worker '{worker_id}' stopped before compaction"));
+        };
+        if let Err(error) = sent {
+            busy.store(false, Ordering::SeqCst);
+            self.update_worker(worker_id, |worker| *worker = previous).await;
+            self.persist().await?;
+            return Err(format!("could not compact the worker: {error}"));
+        }
         self.worker(worker_id).await
     }
 
@@ -1168,35 +1422,6 @@ impl TeamRuntime {
                 detail,
                 tip,
             });
-        })
-        .await;
-        self.persist().await?;
-        self.worker(worker_id).await
-    }
-
-    /// Raise one worker's cumulative token budget above its real usage.
-    pub async fn set_token_budget(
-        &self,
-        worker_id: &str,
-        token_budget: u32,
-    ) -> Result<WorkerRecord, String> {
-        let _guard = self.merge_lock.lock().await;
-        let worker = self.worker(worker_id).await?;
-        if token_budget == 0 || token_budget as u64 <= worker.total_tokens {
-            return Err(format!(
-                "the new budget must exceed the worker's cumulative usage of {} tokens",
-                worker.total_tokens
-            ));
-        }
-        let budget_error = worker
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("token budget"));
-        self.update_worker(worker_id, |worker| {
-            worker.token_budget = token_budget;
-            if budget_error {
-                worker.error = None;
-            }
         })
         .await;
         self.persist().await?;
@@ -1612,6 +1837,7 @@ impl TeamRuntime {
     /// Stop every live worker. The shared engine is owned by the lead and is
     /// not shut down here.
     pub async fn shutdown(&self) {
+        *self.lead_session.lock().await = None;
         let live = {
             let mut map = self.live.lock().await;
             std::mem::take(&mut *map)
@@ -1625,11 +1851,19 @@ impl TeamRuntime {
 }
 
 async fn cleanup_agent_worktree(root: &std::path::Path, worker_id: &str) -> Result<(), String> {
+    validate_worker_id(worker_id)?;
     let worktree = root
         .join(".worktrees")
         .join(format!("agent-{}", agent_short_id(worker_id)));
+    if !worktree.exists() {
+        return Ok(());
+    }
+    if current_branch(&worktree)? != agent_branch(worker_id) {
+        return Err("worker checkout is on an unexpected branch; checkout retained".to_string());
+    }
     let mut last_error = String::new();
     for _ in 0..12 {
+        phase3::require_clean(&worktree, "worker before worktree cleanup").await?;
         match remove_agent_worktree(root.to_path_buf(), worker_id.to_string()).await {
             Ok(()) => return Ok(()),
             Err(_) if !worktree.exists() => return Ok(()),
@@ -1673,7 +1907,23 @@ async fn merge_record_from_git(
     })
 }
 
+async fn merge_conflicts_only(root: &Path) -> Result<bool, String> {
+    let status = phase3::git_value(root, &["status", "--porcelain", "-uall"]).await?;
+    let mut conflicts = false;
+    for line in status.lines().filter(|line| !line.is_empty()) {
+        if line.len() < 3
+            || !matches!(&line[..2], "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU")
+        {
+            return Ok(false);
+        }
+        conflicts = true;
+    }
+    Ok(conflicts)
+}
+
 async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Result<(), String> {
+    worker.brief_sent = true;
+    worker.compacting = false;
     if worker.total_tokens == 0 && worker.used_tokens > 0 {
         worker.total_tokens = worker.used_tokens as u64;
         worker.prompt_tokens = worker.used_tokens as u64;
@@ -1715,6 +1965,14 @@ async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Re
         }
 
         if merge_head.status.success() {
+            if !merge_conflicts_only(root).await? {
+                worker.status = WorkerStatus::Conflict;
+                worker.error = Some(
+                    "the interrupted merge is retained because the lead has unrelated changes or no verifiable conflict-only state; inspect it before recovery"
+                        .to_string(),
+                );
+                return Ok(());
+            }
             let abort = phase3::git(root, &["merge", "--abort"]).await?;
             if !abort.status.success() {
                 return Err(phase3::git_error(&["merge", "--abort"], &abort));
@@ -1845,6 +2103,7 @@ async fn pump_worker(
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     persistence: TeamPersistence,
 ) {
+    let mut turn_active = false;
     while let Ok(event) = receiver.recv().await {
         if let SerializableAgentEvent::HostToolCall {
             call_id,
@@ -1868,11 +2127,14 @@ async fn pump_worker(
             None
         };
         let mut terminal = false;
+        let mut refresh = false;
         let mut changed = false;
-        let mut stop_for_budget = false;
         {
             let mut records = records.lock().await;
-            if let Some(worker) = records.iter_mut().find(|worker| worker.id == worker_id) {
+            if let Some(worker) = records.iter_mut().find(|worker| {
+                worker.id == worker_id
+                    && (worker.generation == 0 || worker.generation == generation)
+            }) {
                 let activity_ms = phase3::now_ms();
                 worker.last_activity_ms = activity_ms;
                 if worker.created_at_ms > 0 {
@@ -1880,13 +2142,24 @@ async fn pump_worker(
                 }
                 match &event.event {
                     SerializableAgentEvent::Started => {
-                        busy.store(true, Ordering::SeqCst);
-                        worker.status = if worker.fixer_finding_id.is_some() {
-                            WorkerStatus::Fixing
-                        } else {
-                            WorkerStatus::Working
-                        };
-                        changed = true;
+                        if !matches!(
+                            worker.status,
+                            WorkerStatus::Paused
+                                | WorkerStatus::Interrupted
+                                | WorkerStatus::Stopped
+                                | WorkerStatus::Failed
+                                | WorkerStatus::Merged
+                                | WorkerStatus::Cancelled
+                        ) {
+                            turn_active = true;
+                            busy.store(true, Ordering::SeqCst);
+                            worker.status = if worker.fixer_finding_id.is_some() {
+                                WorkerStatus::Fixing
+                            } else {
+                                WorkerStatus::Working
+                            };
+                            changed = true;
+                        }
                     }
                     SerializableAgentEvent::ModelChanged { model, .. } => {
                         worker.model_id = Some(model.clone());
@@ -1951,21 +2224,76 @@ async fn pump_worker(
                         worker.status = WorkerStatus::NeedsYou;
                         changed = true;
                     }
-                    SerializableAgentEvent::Finished { .. } | SerializableAgentEvent::Exited => {
+                    SerializableAgentEvent::CompactStarted => {
+                        worker.compacting = true;
+                        busy.store(true, Ordering::SeqCst);
+                        worker.status = WorkerStatus::Working;
+                        worker.error = None;
+                        changed = true;
+                    }
+                    SerializableAgentEvent::Compacted { .. } => {
+                        if worker.compacting {
+                            worker.compacting = false;
+                            busy.store(false, Ordering::SeqCst);
+                            if !matches!(worker.status, WorkerStatus::Paused | WorkerStatus::Interrupted | WorkerStatus::Stopped) {
+                                worker.status = if worker.pending.is_some() {
+                                    WorkerStatus::NeedsYou
+                                } else {
+                                    WorkerStatus::Idle
+                                };
+                            }
+                            worker.error = None;
+                            changed = true;
+                        }
+                        refresh = true;
+                    }
+                    SerializableAgentEvent::Finished { .. } => {
+                        let completed_turn = turn_active;
+                        turn_active = false;
+                        worker.compacting = false;
                         busy.store(false, Ordering::SeqCst);
                         worker.pending = None;
-                        let budget_paused = worker.status == WorkerStatus::NeedsYou
-                            && worker
-                                .error
-                                .as_deref()
-                                .is_some_and(|error| error.contains("token budget"));
-                        if !budget_paused {
+                        if completed_turn
+                            && !matches!(
+                                worker.status,
+                                WorkerStatus::Completed
+                                    | WorkerStatus::Paused
+                                    | WorkerStatus::Interrupted
+                                    | WorkerStatus::Stopped
+                                    | WorkerStatus::Failed
+                                    | WorkerStatus::Merged
+                                    | WorkerStatus::Cancelled
+                            )
+                        {
                             worker.status = WorkerStatus::Completed;
+                            worker.turns = worker.turns.saturating_add(1);
                         }
-                        worker.turns = worker.turns.saturating_add(1);
+                        terminal = true;
+                    }
+                    SerializableAgentEvent::Exited => {
+                        turn_active = false;
+                        worker.compacting = false;
+                        busy.store(false, Ordering::SeqCst);
+                        worker.pending = None;
+                        if !matches!(
+                            worker.status,
+                            WorkerStatus::Completed
+                                | WorkerStatus::Idle
+                                | WorkerStatus::NeedsYou
+                                | WorkerStatus::Paused
+                                | WorkerStatus::Interrupted
+                                | WorkerStatus::Stopped
+                                | WorkerStatus::Failed
+                                | WorkerStatus::Merged
+                                | WorkerStatus::Cancelled
+                        ) {
+                            worker.status = WorkerStatus::Interrupted;
+                            worker.error = Some("the worker session exited before completing its turn".to_string());
+                        }
                         terminal = true;
                     }
                     SerializableAgentEvent::Parked { .. } => {
+                        turn_active = false;
                         busy.store(false, Ordering::SeqCst);
                         if !matches!(
                             worker.status,
@@ -1980,35 +2308,32 @@ async fn pump_worker(
                         }
                         terminal = true;
                     }
-                    SerializableAgentEvent::Error { error, retrying } if !retrying => {
-                        busy.store(false, Ordering::SeqCst);
-                        worker.status = WorkerStatus::Failed;
-                        worker.error = Some(error.clone());
-                        terminal = true;
+                    SerializableAgentEvent::Error { error, retrying } => {
+                        if !retrying {
+                            turn_active = false;
+                        }
+                        if worker.compacting {
+                            worker.compacting = false;
+                            busy.store(false, Ordering::SeqCst);
+                            if !matches!(worker.status, WorkerStatus::Paused | WorkerStatus::Interrupted | WorkerStatus::Stopped) {
+                                worker.status = if worker.pending.is_some() {
+                                    WorkerStatus::NeedsYou
+                                } else {
+                                    WorkerStatus::Idle
+                                };
+                            }
+                            worker.error = (!retrying).then(|| error.clone());
+                            refresh = true;
+                            changed = true;
+                        } else if !retrying {
+                            busy.store(false, Ordering::SeqCst);
+                            worker.status = WorkerStatus::Failed;
+                            worker.error = Some(error.clone());
+                            terminal = true;
+                        }
                     }
                     _ => {}
                 }
-                if worker.total_tokens >= worker.token_budget as u64
-                    && !matches!(
-                        worker.status,
-                        WorkerStatus::Completed | WorkerStatus::Merged | WorkerStatus::Stopped
-                    )
-                {
-                    busy.store(false, Ordering::SeqCst);
-                    worker.status = WorkerStatus::NeedsYou;
-                    worker.error = Some(format!(
-                        "worker token budget of {} was exhausted; increase the budget before continuing",
-                        worker.token_budget
-                    ));
-                    terminal = true;
-                    changed = true;
-                    stop_for_budget = true;
-                }
-            }
-        }
-        if stop_for_budget {
-            if let Some(session) = engine.session(&session_id).await {
-                let _ = session.send(SessionCommand::Interrupt).await;
             }
         }
         let _ = events.send(TeamEvent {
@@ -2019,7 +2344,7 @@ async fn pump_worker(
         if terminal || changed {
             let _ = save_workers(&records, &persistence).await;
         }
-        if terminal {
+        if terminal || refresh {
             let engine = engine.clone();
             let records = records.clone();
             let persistence = persistence.clone();
@@ -2179,13 +2504,49 @@ pub async fn cleanup_workspace(root: &Path, state_dir: &Path) -> Result<CleanupR
     Ok(report)
 }
 
+fn validate_worker_id(worker_id: &str) -> Result<(), String> {
+    if !(8..=64).contains(&worker_id.len())
+        || !worker_id.chars().all(|character| character.is_ascii_alphanumeric())
+    {
+        return Err(
+            "worker_id must contain 8-64 ASCII letters or digits; reuse the ID returned by team_dispatch"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn without_transcripts(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("transcript");
+            for nested in object.values_mut() {
+                without_transcripts(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                without_transcripts(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolResult {
     match result {
         Ok(value) => {
             let data = serde_json::to_value(value).unwrap_or(Value::Null);
-            ToolResult::success(action).with_data(data)
+            let mut output = data.clone();
+            without_transcripts(&mut output);
+            let output = serde_json::to_string(&json!({"action": action, "result": output}))
+                .unwrap_or_else(|_| action.to_string());
+            ToolResult::success(output).with_data(data)
         }
-        Err(err) => ToolResult::error(err),
+        Err(err) => ToolResult::error(err.clone()).with_data(json!({
+            "error_kind": "domain",
+            "message": err,
+        })),
     }
 }
 
@@ -2242,7 +2603,9 @@ pub(crate) fn executor_prompt() -> PromptSpec {
             "in your assigned worktree. The lead reviews your work on its main thread; ",
             "you do not act as a reviewer. File editing, shell commands, tests, and Git ",
             "commits are available and expected when needed. ",
-            "Do not create or modify plans, spawn agents, or ask the user. Run relevant ",
+            "Do not create or modify plans, spawn agents, or ask the user. When blocked, ",
+            "use message_parent with the precise issue and wait for the lead; never modify ",
+            "TeamManager state or use Git/files as worker lifecycle status. Run relevant ",
             "checks, commit on the assigned worker branch, and report the actual commit and checks."
         )
         .to_string(),
@@ -2295,6 +2658,7 @@ mod tests {
                 "pending": null,
                 "used_tokens": 120,
                 "max_tokens": 128000,
+                "token_budget": 200000,
                 "checks": [{
                     "name": "cargo test --workspace",
                     "status": "passed",
@@ -2306,7 +2670,10 @@ mod tests {
 
         let mut persisted: PersistedTeam = serde_json::from_value(legacy).expect("legacy ledger");
         let worker = &persisted.workers[0];
-        assert_eq!(worker.token_budget, DEFAULT_WORKER_TOKEN_BUDGET);
+        assert!(serde_json::to_value(worker)
+            .expect("worker JSON")
+            .get("token_budget")
+            .is_none());
         assert_eq!(worker.turns, 0);
         assert_eq!(worker.last_activity_ms, 0);
         assert!(worker.findings.is_empty());

@@ -3,6 +3,7 @@ import {
   applyLeadEvent,
   applyLeadSnapshot,
   initialLeadRuntime,
+  leadEntriesFromTranscript,
 } from "./leadState";
 import { createInitialState } from "./store";
 import type { AppState, LeadEvent, LeadSnapshot } from "./types";
@@ -212,6 +213,24 @@ describe("lead event reducer", () => {
       toolCallId: "",
       toolName: "tool",
       result: { success: true, output: "ignored" },
+    });
+  });
+
+  it("renders worker notices as team activity rather than human input", () => {
+    const entries = leadEntriesFromTranscript({
+      messages: [
+        { role: "user", content: "human request" },
+        {
+          role: "user",
+          content: "[TeamManager notice — not the human] worker_id=worker0001\nWorker worker00 is blocked.\nUse team_status.",
+        },
+      ],
+    });
+    expect(entries[0]).toMatchObject({ kind: "message", author: "user", body: "human request" });
+    expect(entries[1]).toMatchObject({
+      kind: "team-message",
+      workerId: "worker0001",
+      body: "Worker worker00 is blocked.\nUse team_status.",
     });
   });
 

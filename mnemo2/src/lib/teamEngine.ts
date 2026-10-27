@@ -20,12 +20,13 @@ export interface TeamTransportBindings {
 /** The frontend's typed view of the native team commands. */
 export interface TeamTransport {
   snapshot(): Promise<TeamSnapshot>;
-  dispatch(brief: string, model?: string | null): Promise<TeamWorkerRecord>;
+  dispatch(brief: string, model?: string | null, workerId?: string | null): Promise<TeamWorkerRecord>;
   message(workerId: string, text: string): Promise<TeamWorkerRecord>;
   pause(workerId: string): Promise<TeamWorkerRecord>;
   interrupt(workerId: string): Promise<TeamWorkerRecord>;
   stop(workerId: string): Promise<TeamWorkerRecord>;
   resume(workerId: string): Promise<TeamWorkerRecord>;
+  compact(workerId: string): Promise<TeamWorkerRecord>;
   review(workerId: string, summary: string, findings: TeamFinding[]): Promise<TeamWorkerRecord>;
   recordCheck(
     workerId: string,
@@ -52,7 +53,6 @@ export interface TeamTransport {
   revertMerge(workerId: string): Promise<TeamWorkerRecord>;
   stopAll(): Promise<void>;
   setSlots(slots: number): Promise<TeamSnapshot>;
-  setTokenBudget(workerId: string, tokenBudget: number): Promise<TeamWorkerRecord>;
   messages(): Promise<TeamMessage[]>;
   onEvent(handler: (event: TeamEvent) => void): Promise<UnlistenFn>;
 }
@@ -63,10 +63,11 @@ export function createTauriTeamTransport(
 ): TeamTransport {
   return {
     snapshot: () => bindings.invoke<TeamSnapshot>("team_snapshot"),
-    dispatch: (brief, model) =>
+    dispatch: (brief, model, workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_dispatch", {
         brief,
         model: model ?? null,
+        workerId: workerId ?? null,
       }),
     message: (workerId, text) =>
       bindings.invoke<TeamWorkerRecord>("team_message", { workerId, text }),
@@ -78,6 +79,8 @@ export function createTauriTeamTransport(
       bindings.invoke<TeamWorkerRecord>("team_stop", { workerId }),
     resume: (workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_resume", { workerId }),
+    compact: (workerId) =>
+      bindings.invoke<TeamWorkerRecord>("team_compact", { workerId }),
     review: (workerId, summary, findings) =>
       bindings.invoke<TeamWorkerRecord>("team_review", { workerId, summary, findings }),
     recordCheck: (workerId, name, status, detail) =>
@@ -111,8 +114,6 @@ export function createTauriTeamTransport(
       bindings.invoke<TeamWorkerRecord>("team_revert_merge", { workerId }),
     stopAll: () => bindings.invoke<void>("team_stop_all"),
     setSlots: (slots) => bindings.invoke<TeamSnapshot>("team_set_slots", { slots }),
-    setTokenBudget: (workerId, tokenBudget) =>
-      bindings.invoke<TeamWorkerRecord>("team_set_token_budget", { workerId, tokenBudget }),
     messages: () => bindings.invoke<TeamMessage[]>("team_messages"),
     onEvent: (handler) =>
       bindings.listen<TeamEvent>(TEAM_EVENT_CHANNEL, (event) =>

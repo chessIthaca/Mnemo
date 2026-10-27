@@ -11,8 +11,8 @@ The product shape is unchanged from Phase 0b: the lead owns a workflow for each
 task, tasks are independent, and lead and worker models are visible wherever an
 agent appears. Native Phase 3 adds durable reviews/findings, exact-tip checks,
 tiny review fixes and tracked fixer routing, serialized local merge/revert, and
-cumulative worker telemetry and token budgets. No review or merge result is
-simulated.
+cumulative worker telemetry without per-agent token or cost budgets. No review
+or merge result is simulated.
 
 ## Run
 
@@ -94,17 +94,24 @@ feature-enabled Mnemo2 lib tests.
 - **Events.** Worker events are forwarded on `mnemo2://team-event` as
   `{ worker_id, generation, event }`. The frontend ignores stale generations.
 - **Commands.** `team_snapshot`, `team_dispatch`, `team_message`, `team_pause`,
-  `team_interrupt`, `team_stop`, `team_resume`, `team_review`,
+  `team_interrupt`, `team_stop`, `team_resume`, `team_compact`, `team_review`,
   `team_record_check`, `team_resolve_finding`, `team_review_fix`,
   `team_route_fix`, `team_merge`, `team_revert_merge`, `team_stop_all`,
-  `team_set_slots`, `team_set_token_budget`, and `team_messages`.
+  `team_set_slots`, and `team_messages`.
 - **Host tools.** The lead gets `team_dispatch`, `team_message`, `team_status`,
-  `team_review`, `team_check`, `team_resolve_finding`, `review_fix`,
-  `team_route_fix`, `team_merge`, and `team_revert_merge`. Generic `spawn_agent`
-  is removed from the advertised lead registry and denied as a fallback. Workers
-  get `message_parent`, whose messages land in the lead conversation.
+  `team_stop`, `team_resume`, `team_compact`, `team_review`, `team_check`,
+  `team_resolve_finding`, `review_fix`, `team_route_fix`, `team_merge`, and
+  `team_revert_merge`. Dispatch accepts a caller-stable worker ID and returns a
+  model-facing JSON receipt with its real ID/status. Retrying that ID with the
+  same brief/model cannot duplicate the worker. Unknown explicit models are
+  rejected before provisioning. TeamManager state is authoritative; the lead
+  must not infer lifecycle from Git/files or edit `team.json`. Generic
+  `spawn_agent` is removed from the advertised lead registry and denied as a
+  fallback. Workers get `message_parent`, whose messages land in the lead
+  conversation and are forwarded as attributed lead notices.
 - **State.** `team.json` in the project's app-owned state directory is the
-  worker ledger and stores the live-worker cap across restarts.
+  app-owned worker ledger and stores the live-worker cap across restarts. Only
+  TeamManager mutates that state.
 
 ## Native workbench and project lifecycle
 
@@ -133,7 +140,9 @@ feature-enabled Mnemo2 lib tests.
   conflicting work remain available for review. Cleaned workers are review-only.
 - **Notifications** use the official Tauri notification plugin for real worker
   completion, review/input requests, failures, and conflicts when unfocused.
-  Duplicate transitions are suppressed, and nothing is emitted from fixtures.
+  Blocked-worker messages and failures also send deduplicated TeamManager
+  notices to the actual lead session; they render as team activity, not human
+  input. Duplicate transitions are suppressed, and nothing comes from fixtures.
 - **Accessibility** includes modal focus management, keyboard resizing,
   readable small text, narrow-layout spacing, and a full-height workbench
   overlay with a back button.
@@ -149,16 +158,19 @@ feature-enabled Mnemo2 lib tests.
    stop button to cancel a running generation.
 5. Open **Team** and dispatch a task (or let the lead call `team_dispatch`). Each
    worker gets its real branch, worktree, model, and workflow state; tasks
-   advance independently. Filter **Needs you / Active / Done**; the header shows
-   live sessions against the configured slots.
+   advance independently. The lead uses a stable worker ID so an uncertain
+   dispatch can be retried without duplication. Filter **Needs you / Active /
+   Done**; the header shows live sessions against the configured slots.
 6. Open a worker. **Thread** sends a real message (a steer while busy).
    **Review** shows exact-tip checks, findings, review/merge records, and real
    usage. Apply a one-file `review_fix` with exact text, route larger findings
    back to the worker, and close findings with evidence or a written `wontfix`.
+   **Compact** compacts an idle worker or resumes a stopped/interrupted worker
+   before compacting; the actual completion or error arrives from the session.
 7. Once every finding is closed and checks pass on the reviewed tip, merge into
    the local non-`main` lead branch. **Revert** is available before landing.
-   **Stop all** closes live worker sessions; **Worker token budget** raises a
-   worker's cumulative cap above its actual usage.
+   **Stop all** closes live worker sessions while retaining their work. Token
+   and cost figures are telemetry; there is no agent token or cost budget.
 8. Open the workbench from the top bar, then switch to **Diff**. Use **Browser /
    Diff / Plan**; the pane is resizable on desktop and full-screen on narrow
    layouts.
@@ -190,20 +202,22 @@ feature-enabled Mnemo2 lib tests.
   edits one existing non-test source file through a canonical, symlink-free path,
   commits only that scoped change, and invalidates old evidence. Larger fixes
   return to the tracked worker. Merge is
-  serialized into the local non-`main` lead branch, aborts conflicts without
-  auto-resolution, never pushes, and supports guarded revert before landing.
-  Successful merge closes the worker session, removes the worktree, and keeps
-  the branch for audit.
+  serialized into the local non-`main` lead branch, aborts verified conflict-only
+  merges without auto-resolution, never pushes, and supports guarded revert
+  before landing. Successful merge closes the worker session, removes a verified
+  clean worktree, and keeps the branch for audit; new dirty work is retained.
 - **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`), a
-  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`), and cumulative
-  per-worker token budgets (default 200,000). Requests, prompt/completion/cached
-  tokens, turns, and elapsed time come from real events. Cost is shown only when
-  model pricing is configured; token usage is always available.
+  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`), and worker
+  turn/wall-clock limits. There is no cumulative worker token or cost budget.
+  Requests, prompt/completion/cached tokens, turns, and elapsed time come from
+  real events and never trigger a budget pause. Cost is shown only when model
+  pricing is configured; unknown cost remains unknown, and usage is always shown.
 - **Real recovery:** running workers reopen as interrupted, and `team.json` has
-  a backup-recoverable replacement path. An unfinished conflict is aborted and
-  verified clean; a completed merge is recovered only when its second parent
-  proves the reviewed worker tip. Stale `MERGE_HEAD` state is cleared only after
-  a clean-tree check. Ambiguous recovery routes back for inspection.
+  a backup-recoverable replacement path. Conflict-only recovery can abort and
+  verify clean; unrelated lead changes prevent automatic abort and remain in
+  place for inspection. A completed merge is recovered only when its second
+  parent proves the reviewed worker tip. Dispatch rollback deletes only a clean,
+  newly provisioned branch whose tip still equals the dispatch base.
 - **Native workbench and lifecycle:** actual lead plans, worker Git deltas,
   a native WebView2 Browser with real navigation/title events, sandboxed image
   previews, per-project state and preferences, guarded cleanup, instance
@@ -225,8 +239,9 @@ feature-enabled Mnemo2 lib tests.
   terminal failures offer Retry and successful progress clears retry warnings.
 - No project-wide run pipeline or phase diagram. Each task derives its own
   workflow from status, checks, findings, and merge state.
-- Every lead/worker surface shows a model badge; native lead surfaces use the
-  real configured model picker.
+- Worker surfaces show a model badge; native lead surfaces keep the real
+  configured model picker in the composer/settings without a redundant lead
+  heading or lead-mark icons.
 - Workbench lives beside the lead chat only; opening Mission Control hides it,
   mirroring the native-webview overlay rule. On narrow layouts it becomes a
   full-height overlay, with bottom navigation space reserved.
@@ -242,7 +257,8 @@ See `.coding/design/mnemo2.md` for the full design and acceptance criteria:
    branches/worktrees/briefs/models, worker messaging, slots, restart recovery.
 3. **Review, merge, recovery, cost** — complete: durable findings, tiny-work
    fixes, tracked fixer routing, exact-tip checks, serialized local merge/revert,
-   conflict and crash recovery, cumulative token budgets, and pricing-aware cost.
+   conflict and crash recovery, idempotent lifecycle controls, real compaction,
+   cumulative usage telemetry, and pricing-aware cost.
 4. **Native shell + workbench + persistence** — complete: real Diff/Plan tabs,
    native browser, isolated per-project state and preferences, safe recovery,
    notifications, accessibility, and narrow layouts. Remaining product choices

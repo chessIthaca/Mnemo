@@ -49,10 +49,6 @@
     }
   }
 
-  function setBudget(event: Event) {
-    const tokenBudget = (event.currentTarget as HTMLInputElement).valueAsNumber;
-    if (Number.isFinite(tokenBudget)) actions.setWorkerBudget(worker.id, Math.floor(tokenBudget));
-  }
 </script>
 
 <article class="worker-detail">
@@ -71,6 +67,7 @@
     <div class="worker-actions">
       <button class="button button-quiet" onclick={() => actions.openWorkerDiff(worker.id)}>Diff</button>
       <button class="button button-quiet" disabled={worker.status === "cancelled"} onclick={() => actions.steerWorker(worker.id)}>Steer</button>
+      <button class="button button-quiet" disabled={worker.compacting || !["completed", "idle", "needs_you", "paused", "stopped", "interrupted", "failed"].includes(worker.status)} onclick={() => actions.compactWorker(worker.id)}>Compact</button>
       {#if worker.status === "working" || worker.status === "dispatching"}
         <button class="button button-quiet" onclick={() => actions.pauseWorker(worker.id)}><Pause size={11} /> Pause</button>
       {:else if worker.status === "paused" || worker.status === "stopped" || worker.status === "interrupted"}
@@ -91,7 +88,7 @@
   <div class="detail-body">
     {#if tab === "review"}
       <section class="checks-panel">
-        <div class="checks-heading"><span>BRANCH-TIP CHECKS</span><code>{worker.worktree}</code><label class="budget-editor">Token budget <input aria-label="Worker token budget" type="number" min="1" step="1000" value={worker.tokenBudget} onchange={setBudget} /></label></div>
+        <div class="checks-heading"><span>BRANCH-TIP CHECKS</span><code>{worker.worktree}</code></div>
         <div class="usage-line">{worker.tokens} cumulative tokens · {worker.turns} completed turns · {worker.elapsed || "—"}</div>
         {#each worker.checks as check (check.name)}
           <div class="check-row">
@@ -195,8 +192,6 @@
   .checks-panel, .merge-panel { padding: 14px 16px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
   .checks-heading { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; color: var(--muted); font-size: 7px; letter-spacing: 0.08em; }
   .checks-heading code { overflow: hidden; font-family: var(--font-mono); font-size: 7px; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
-  .budget-editor { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; letter-spacing: 0; }
-  .budget-editor input { width: 76px; padding: 4px 5px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font-size: 8px; }
   .usage-line { margin: -3px 0 10px; color: var(--muted); font-size: 8px; }
   .check-row { display: flex; align-items: center; gap: 9px; }
   .check-row > :global(svg) { color: var(--accent); }

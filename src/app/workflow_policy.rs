@@ -20,7 +20,16 @@ use crate::project::Constitution;
 use crate::provider::Capabilities;
 use crate::tool::{ToolRegistry, ToolResult};
 
-const MNEMO2_TEAM_APPEND: &str = "\n\nMNEMO2 TEAM RULES:\n- Generic spawn_agent is unavailable. Delegate implementation only through team_dispatch; coordinate tracked workers with team_message and team_status.\n- Record reviews with team_review and only checks you actually ran with team_check. Close findings with evidence or a written wontfix justification. Every fix commit requires affected checks and a fresh delta review.\n- Use review_fix only for one-file, non-test source edits; route larger findings with team_route_fix.\n- Call team_merge only after exact-tip checks pass and every finding closes. TeamManager performs the app-level merge into the non-main lead branch; never call git merge or git push yourself. team_revert_merge is available only before landing.\n";
+const MNEMO2_TEAM_APPEND: &str = concat!(
+    "\n\nMNEMO2 TEAM RULES:\n",
+    "- Generic spawn_agent is unavailable. Delegate implementation through team_dispatch. For each logical task, choose a unique worker_id of 8-64 ASCII letters/digits and retain the returned record. After a timeout or uncertain host result, retry with the SAME worker_id, brief, and model, or inspect it with team_status; never guess a replacement ID or create a second worker for that task.\n",
+    "- TeamManager records and team_status are the ONLY worker lifecycle and ID authority. Never infer worker status from Git branches, worktree timestamps, files, or directories, and never read or edit team.json. Use Git only to review or implement source changes; TeamManager owns worker state, worktrees, branches, and merges.\n",
+    "- Workers implement in their assigned worktrees while you review on the main lead thread. Coordinate with team_message using exact returned IDs. A blocked-worker notice requires an actual status check and a reply, team_stop, or team_compact as appropriate; never edit TeamManager's backing state.\n",
+    "- There is no cumulative worker token or cost budget. Prompt, completion, cached, and context tokens are telemetry, never a reason to pause a worker, invent a limit, or request a budget increase. Operational slot/session failures and provider context limits are reported explicitly and are not spending budgets.\n",
+    "- A valid call returning a domain error is not malformed JSON. Stop repeating the same call: correct the named precondition or inspect TeamManager state. Host/domain errors never justify editing the ledger or probing worker files for status.\n",
+    "- Record reviews with team_review and only checks you actually ran with team_check. Close findings with evidence or a written wontfix justification. Every fix commit requires affected checks and a fresh delta review. Use review_fix only for one-file, non-test source edits; route larger findings with team_route_fix.\n",
+    "- Call team_merge only after exact-tip checks pass and every finding closes. TeamManager performs the app-level merge into the non-main lead branch; never call git merge or git push yourself. team_revert_merge is available only before landing.\n",
+);
 
 /// The workflow agent's policy — pre-2a direct-read behavior, with scoped
 /// Mnemo2 tool vetoes and team guidance.
@@ -527,6 +536,11 @@ mod tests {
         assert!(head.contains("Generic spawn_agent is unavailable"));
         assert!(head.contains("team_merge"));
         assert!(head.contains("never call git merge or git push"));
+        assert!(head.contains("never read or edit team.json"));
+        assert!(head.contains("SAME worker_id"));
+        assert!(head.contains("no cumulative worker token or cost budget"));
+        assert!(head.contains("team_compact"));
+        assert!(!head.contains("increase the worker token budget"));
 
         let ordinary = WorkflowPolicy::new(Arc::new(Mutex::new(Workflow::new(
             dir.path().to_path_buf(),

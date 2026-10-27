@@ -34,6 +34,9 @@ use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, DEFAULT_SPAWNS_PER_TU
 /// The Tauri event channel name used by the IPC layer.
 pub const LEAD_EVENT_CHANNEL: &str = "mnemo2://lead-event";
 
+/// Attribution shared with the lead transcript renderer for worker-originated notices.
+pub(crate) const TEAM_NOTICE_PREFIX: &str = "[TeamManager notice — not the human]";
+
 /// The persisted lead file inside the runtime's state directory.
 const LEAD_STATE_FILE: &str = "lead.json";
 
@@ -255,6 +258,7 @@ impl LeadRuntime {
             state_dir: runtime.state_dir.clone(),
             slots: None,
             max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
+            model_specs: runtime.models.iter().map(|model| model.spec.clone()).collect(),
             pricing: runtime.pricing()?,
         })
         .await?;
@@ -434,6 +438,7 @@ impl LeadRuntime {
         if !self.models.iter().any(|model| model.spec == spec) {
             return Err(format!("'{spec}' is not a configured model"));
         }
+        let team = self.team_handle().await?;
         let old = {
             let mut guard = self.live.lock().await;
             let live = guard
@@ -476,7 +481,9 @@ impl LeadRuntime {
         {
             live.abort();
             let _ = live.session.send(SessionCommand::Interrupt).await;
+            let previous_session = old.session.id();
             *self.live.lock().await = Some(old);
+            team.attach_lead(previous_session).await;
             return Err(err);
         }
         self.generation.store(generation, Ordering::SeqCst);
@@ -589,8 +596,17 @@ impl LeadRuntime {
             model.clone(),
             observed_model.clone(),
             self.generation.clone(),
-            team,
+            team.clone(),
         ));
+        if let Some(team) = team {
+            team.attach_lead(session_id).await;
+            tokio::spawn(pump_team_notifications(
+                self.engine.clone(),
+                session_id,
+                Arc::downgrade(&team),
+                team.subscribe(),
+            ));
+        }
         Ok(LiveLead {
             generation,
             session,
@@ -619,6 +635,107 @@ async fn send_lead_host_result(
                     error: None,
                 })
                 .await;
+        }
+    }
+}
+
+async fn pump_team_notifications(
+    engine: Arc<Mutex<Option<Arc<Engine>>>>,
+    session_id: SessionId,
+    team: std::sync::Weak<TeamRuntime>,
+    mut receiver: broadcast::Receiver<crate::mnemo2::team::TeamEvent>,
+) {
+    let mut notified = std::collections::HashSet::new();
+    while let Ok(event) = receiver.recv().await {
+        let Some(team) = team.upgrade() else {
+            return;
+        };
+        if !team.lead_is_current(session_id).await {
+            return;
+        }
+        let Ok(worker) = team.worker(&event.worker_id).await else {
+            continue;
+        };
+        let (key, detail) = match &event.event.event {
+            SerializableAgentEvent::HostToolCall { call_id, name, args }
+                if name == "message_parent" =>
+            {
+                let text = args
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("sent an update");
+                (
+                    format!("{}:{}:message:{call_id}", worker.id, event.generation),
+                    format!("{} reports: {text}", worker.name),
+                )
+            }
+            SerializableAgentEvent::ApprovalRequest { tool_call_id, .. }
+                if worker.status == crate::mnemo2::team::WorkerStatus::NeedsYou =>
+            {
+                (
+                    format!("{}:{}:approval:{tool_call_id}", worker.id, event.generation),
+                    format!("{} is blocked waiting for an approval.", worker.name),
+                )
+            }
+            SerializableAgentEvent::UserQuestion { question_id, .. }
+                if worker.status == crate::mnemo2::team::WorkerStatus::NeedsYou =>
+            {
+                (
+                    format!("{}:{}:question:{question_id}", worker.id, event.generation),
+                    format!("{} is blocked waiting for an answer.", worker.name),
+                )
+            }
+            SerializableAgentEvent::Parked { .. }
+                if worker.status == crate::mnemo2::team::WorkerStatus::NeedsYou =>
+            {
+                (
+                    format!("{}:{}:parked:{}", worker.id, event.generation, worker.last_activity_ms),
+                    format!("{} is blocked by an execution limit; review its actual state.", worker.name),
+                )
+            }
+            SerializableAgentEvent::Error { error, retrying: false }
+                if worker.status == crate::mnemo2::team::WorkerStatus::Failed =>
+            {
+                (
+                    format!("{}:{}:error:{}", worker.id, event.generation, worker.last_activity_ms),
+                    format!("{} failed: {error}", worker.name),
+                )
+            }
+            _ => continue,
+        };
+        if notified.contains(&key) {
+            continue;
+        }
+        let text = format!(
+            "{TEAM_NOTICE_PREFIX} worker_id={}\n{detail}\nUse team_status with this exact worker_id. Reply with team_message, or use team_stop/team_compact as appropriate. Never infer lifecycle from Git, files, timestamps, or team.json.",
+            worker.id
+        );
+        let engine = engine.lock().await.clone();
+        let Some(session) = engine.as_ref() else {
+            continue;
+        };
+        let Some(session) = session.session(&session_id).await else {
+            continue;
+        };
+        let command = if team.lead_is_busy() {
+            SessionCommand::Steer { text }
+        } else {
+            SessionCommand::Prompt {
+                text,
+                images: Vec::new(),
+            }
+        };
+        match session.send(command).await {
+            Ok(()) => {
+                notified.insert(key);
+                if notified.len() > 1024 {
+                    notified.clear();
+                }
+            }
+            Err(error) => eprintln!(
+                "mnemo2: could not deliver worker '{}' notice to the lead: {error}",
+                worker.id
+            ),
         }
     }
 }
@@ -974,6 +1091,7 @@ mod tests {
                 state_dir: state.path().to_path_buf(),
                 slots: Some(1),
                 max_spawns_per_turn: 1,
+                model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
                 pricing,
             })
             .await
@@ -1366,6 +1484,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(2),
             max_spawns_per_turn: 2,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1463,6 +1582,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(2),
             max_spawns_per_turn: 2,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1500,6 +1620,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(2),
             max_spawns_per_turn: 2,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1549,6 +1670,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1599,6 +1721,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1637,6 +1760,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1654,6 +1778,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1693,6 +1818,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -1811,6 +1937,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -2026,6 +2153,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -2084,6 +2212,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -2116,6 +2245,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_preserves_unrelated_lead_changes_during_a_conflict() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])])),
+        )
+        .await;
+        let worker = team.dispatch("implement".into(), None).await.expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        commit_worker_file(&worker, "README.md", "worker\n", "worker edit");
+        std::fs::write(root.path().join("README.md"), "lead\n").expect("lead edit");
+        run_git(root.path(), &["add", "README.md"]);
+        run_git(root.path(), &["commit", "-m", "lead edit"]);
+        team.review(&worker.id, "reviewed".into(), Vec::new()).await.expect("review");
+        team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        team.shutdown().await;
+        let conflict = std::process::Command::new("git")
+            .args(["merge", "--no-ff", &worker.branch])
+            .current_dir(root.path())
+            .output()
+            .expect("conflicting merge");
+        assert!(!conflict.status.success());
+        std::fs::write(root.path().join("lead-note.txt"), "unrelated work\n").expect("unrelated work");
+        mark_merge_interrupted_for_test(&state);
+
+        let reopened = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: Some(1),
+            max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team reopens without changing the lead");
+        let recovered = reopened.worker(&worker.id).await.expect("recovered worker");
+        assert_eq!(recovered.status, WorkerStatus::Conflict);
+        assert!(recovered.error.as_deref().is_some_and(|error| error.contains("unrelated changes")));
+        assert_eq!(std::fs::read_to_string(root.path().join("lead-note.txt")).expect("preserved file"), "unrelated work\n");
+        let merge_head = crate::mnemo2::phase3::git(
+            root.path(),
+            &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        )
+        .await
+        .expect("merge-head probe");
+        assert!(merge_head.status.success(), "an unsafe automatic abort must not run");
+        assert!(worker.worktree.exists());
+
+        reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pre_delivery_spawn_failure_retries_the_same_tracked_worker() {
+        use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(Vec::new()));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = TeamRuntime::open(TeamRuntimeOptions {
+            engine: lead.engine_handle().await.expect("engine"),
+            workspace_root: root.path().to_path_buf(),
+            state_dir: state.path().to_path_buf(),
+            slots: Some(1),
+            max_spawns_per_turn: 1,
+            model_specs: vec!["test/scripted-a".into(), "broken".into()],
+            pricing: Vec::new(),
+        })
+        .await
+        .expect("team opens");
+        let worker_id = "failure001";
+        let error = team
+            .dispatch_with_id(
+                "retry without duplication".into(),
+                Some("broken".into()),
+                Some(worker_id.into()),
+            )
+            .await
+            .expect_err("the engine rejects an invalid forced model spec");
+        assert!(error.contains("retains its checkout"), "{error}");
+        let failed = team.worker(worker_id).await.expect("tracked failed dispatch");
+        assert_eq!(failed.status, WorkerStatus::Failed);
+        assert!(!failed.brief_sent);
+        assert!(failed.worktree.exists());
+
+        let retry = team
+            .dispatch_with_id(
+                "retry without duplication".into(),
+                Some("broken".into()),
+                Some(worker_id.into()),
+            )
+            .await
+            .expect_err("retry still surfaces the host failure");
+        assert!(retry.contains("retains its checkout"), "{retry}");
+        let retried = team.worker(worker_id).await.expect("same tracked worker");
+        assert_eq!(retried.branch, failed.branch);
+        assert_eq!(retried.worktree, failed.worktree);
+        assert_eq!(team.snapshot().await.workers.len(), 1);
+        assert_eq!(llm.calls(), 0, "no provider turn was delivered");
+        assert!(crate::mnemo2::phase3::git_value(
+            root.path(),
+            &["rev-parse", "--verify", &format!("refs/heads/{}", failed.branch)],
+        )
+        .await
+        .is_ok());
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_rollback_removes_only_untouched_fresh_worktrees() {
+        let root = tempfile::tempdir().expect("workspace");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        std::fs::write(root.path().join("lead-note.txt"), "keep lead work\n").expect("lead work");
+        let (checkout, branch) = mnemo::app::worktrees::provision_agent_worktree(
+            root.path().to_path_buf(),
+            "rollback001".into(),
+            "wt/lead".into(),
+        )
+        .await
+        .expect("fresh checkout");
+        let base_tip = crate::mnemo2::phase3::tip(&checkout).await.expect("base tip");
+        mnemo::app::worktrees::rollback_agent_worktree(
+            root.path().to_path_buf(),
+            "rollback001".into(),
+            base_tip.clone(),
+        )
+        .await
+        .expect("untouched fresh checkout rolls back");
+        assert!(!checkout.exists());
+        assert!(crate::mnemo2::phase3::git_value(root.path(), &["rev-parse", &branch])
+            .await
+            .is_err());
+
+        let (checkout, branch) = mnemo::app::worktrees::provision_agent_worktree(
+            root.path().to_path_buf(),
+            "rollback001".into(),
+            "wt/lead".into(),
+        )
+        .await
+        .expect("new checkout after rollback");
+        std::fs::write(checkout.join("feature.txt"), "useful commit\n").expect("feature");
+        run_git(&checkout, &["add", "feature.txt"]);
+        run_git(&checkout, &["commit", "-m", "useful worker commit"]);
+        let preserved = mnemo::app::worktrees::rollback_agent_worktree(
+            root.path().to_path_buf(),
+            "rollback001".into(),
+            base_tip.clone(),
+        )
+        .await
+        .expect_err("advanced worker commits are never deleted");
+        assert!(preserved.contains("advanced"), "{preserved}");
+        assert!(crate::mnemo2::phase3::git_value(root.path(), &["rev-parse", &branch])
+            .await
+            .is_ok());
+        assert_eq!(std::fs::read_to_string(checkout.join("feature.txt")).expect("worker file"), "useful commit\n");
+
+        let (dirty, _) = mnemo::app::worktrees::provision_agent_worktree(
+            root.path().to_path_buf(),
+            "dirty00002".into(),
+            "wt/lead".into(),
+        )
+        .await
+        .expect("dirty-test checkout");
+        let dirty_tip = crate::mnemo2::phase3::tip(&dirty).await.expect("dirty base");
+        std::fs::write(dirty.join("untracked.txt"), "keep worker work\n").expect("dirty work");
+        let preserved = mnemo::app::worktrees::rollback_agent_worktree(
+            root.path().to_path_buf(),
+            "dirty00002".into(),
+            dirty_tip,
+        )
+        .await
+        .expect_err("dirty work is never deleted");
+        assert!(preserved.contains("uncommitted"), "{preserved}");
+        assert_eq!(std::fs::read_to_string(dirty.join("untracked.txt")).expect("dirty file"), "keep worker work\n");
+        assert_eq!(std::fs::read_to_string(root.path().join("lead-note.txt")).expect("lead file"), "keep lead work\n");
+    }
+
+    #[tokio::test]
     async fn merge_requires_tip_checks_and_supports_local_revert() {
         use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
 
@@ -2137,6 +2463,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -2214,7 +2541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_budget_pause_raise_stop_all_and_restart_use_real_usage() {
+    async fn usage_above_former_budget_never_pauses_and_survives_restart() {
         use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, WorkerStatus};
 
         let root = tempfile::tempdir().expect("workspace");
@@ -2227,51 +2554,33 @@ mod tests {
             cached_per_1m: 1.0,
         }];
         let llm = Arc::new(ScriptedLlm::new(vec![
-            usage_turn(80, 20, 10),
-            usage_turn(30, 20, 5),
+            usage_turn(180_000, 20_000, 120_000),
+            usage_turn(50_000, 25_000, 40_000),
             text_turn(&["continued"]),
         ]));
         let (lead, team) = open_git_team_with_pricing(&root, &config, &state, llm, pricing).await;
-        let team = team.with_worker_token_budget(150);
         let worker = team
             .dispatch("usage task".into(), None)
             .await
             .expect("dispatch");
         let first = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
-        assert_eq!(first.total_tokens, 100);
-        assert_eq!(first.cost_micros, Some(350));
+        assert_eq!(first.total_tokens, 200_000);
+        assert_eq!(first.cost_micros, Some(440_000));
         team.message(&worker.id, "second usage turn".into())
             .await
             .expect("second turn");
-        let exhausted = wait_for_worker_status(&team, &worker.id, WorkerStatus::NeedsYou).await;
-        assert_eq!(exhausted.total_tokens, 150);
-        assert_eq!(exhausted.prompt_tokens, 110);
-        assert_eq!(exhausted.completion_tokens, 40);
-        assert_eq!(exhausted.cached_tokens, 15);
-        assert_eq!(exhausted.requests, 2);
-        assert_eq!(exhausted.cost_micros, Some(605));
-        assert!(exhausted
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("increase the budget")));
-        let blocked = team
-            .message(&worker.id, "continue".into())
-            .await
-            .expect_err("budget blocks continuation");
-        assert!(
-            blocked.contains("increase the worker token budget"),
-            "{blocked}"
-        );
+        let continued = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        assert_eq!(continued.total_tokens, 275_000);
+        assert_eq!(continued.prompt_tokens, 230_000);
+        assert_eq!(continued.completion_tokens, 45_000);
+        assert_eq!(continued.cached_tokens, 160_000);
+        assert_eq!(continued.requests, 2);
+        assert_eq!(continued.cost_micros, Some(750_000));
+        assert!(continued.error.is_none());
 
-        let raised = team
-            .set_token_budget(&worker.id, 160)
+        team.message(&worker.id, "continue without a budget".into())
             .await
-            .expect("raise budget");
-        assert_eq!(raised.token_budget, 160);
-        assert!(raised.error.is_none());
-        team.message(&worker.id, "continue".into())
-            .await
-            .expect("continue after raise");
+            .expect("usage never blocks continuation");
         wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
         team.stop_all().await.expect("stop all");
         let stopped = team.snapshot().await;
@@ -2284,18 +2593,87 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
         .expect("reopen");
         let restored = reopened.worker(&worker.id).await.expect("restored worker");
-        assert_eq!(restored.total_tokens, 150);
+        assert_eq!(restored.total_tokens, 275_000);
         assert_eq!(restored.requests, 2);
-        assert_eq!(restored.cost_micros, Some(605));
-        assert_eq!(restored.token_budget, 160);
+        assert_eq!(restored.cost_micros, Some(750_000));
+        assert!(restored.brief_sent);
 
         team.shutdown().await;
         reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_validates_models_and_retries_one_worker_id() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])])),
+        )
+        .await;
+        let worker_id = "worker0001";
+        let invalid = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": worker_id,
+                    "brief": "invalid model task",
+                    "model": "test/missing"
+                }),
+            )
+            .await;
+        assert!(!invalid.success);
+        assert_eq!(invalid.data.as_ref().and_then(|data| data.get("error_kind")).and_then(|value| value.as_str()), Some("domain"));
+        assert!(team.snapshot().await.workers.is_empty());
+        assert!(!root.path().join(".worktrees/agent-worker00").exists());
+        assert!(crate::mnemo2::phase3::git_value(
+            root.path(),
+            &["rev-parse", "--verify", "refs/heads/wt/agent-worker00"],
+        )
+        .await
+        .is_err());
+
+        let args = serde_json::json!({"worker_id": worker_id, "brief": "retry this task"});
+        let first = team.handle_lead_host_tool("team_dispatch", args.clone()).await;
+        assert!(first.success, "{}", first.output);
+        let receipt: serde_json::Value = serde_json::from_str(&first.output).expect("JSON receipt");
+        assert_eq!(receipt.pointer("/result/worker/id").and_then(|value| value.as_str()), Some(worker_id));
+        assert!(receipt.pointer("/result/worker/status").is_some());
+        assert_eq!(receipt.pointer("/result/reused").and_then(|value| value.as_bool()), Some(false));
+        let worker = team.worker(worker_id).await.expect("tracked worker");
+        assert!(worker.brief_sent);
+
+        let retried = team.handle_lead_host_tool("team_dispatch", args).await;
+        let receipt: serde_json::Value = serde_json::from_str(&retried.output).expect("retry receipt");
+        assert_eq!(receipt.pointer("/result/reused").and_then(|value| value.as_bool()), Some(true));
+        assert_eq!(team.snapshot().await.workers.len(), 1);
+        assert_eq!(team.snapshot().await.active, 1);
+        let conflict = team
+            .dispatch_with_id(
+                "a different brief".into(),
+                None,
+                Some(worker_id.to_string()),
+            )
+            .await
+            .expect_err("same ID cannot change the logical task");
+        assert!(conflict.contains("different brief or model"), "{conflict}");
+        let cap = team
+            .dispatch("a genuinely different task".into(), None)
+            .await
+            .expect_err("an idempotent retry did not consume the one spawn allowed this turn");
+        assert!(cap.contains("already delegated"), "{cap}");
+
+        team.shutdown().await;
         lead.shutdown().await;
     }
 
@@ -2321,6 +2699,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: Some(1),
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await
@@ -2345,6 +2724,131 @@ mod tests {
             "the host-tool result drove a follow-up turn"
         );
         let _ = team.stop(&worker.id).await;
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blocked_worker_notice_reaches_the_actual_lead_once() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_turn("message_parent", r#"{"text":"need the API key"}"#),
+            text_turn(&["worker done"]),
+            text_turn(&["lead acknowledged"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("lead's actual team");
+        let worker = team
+            .dispatch_with_id(
+                "ask for the key".into(),
+                None,
+                Some("notice0001".into()),
+            )
+            .await
+            .expect("worker dispatches");
+        let mut notified = false;
+        for _ in 0..100 {
+            let snapshot = lead.snapshot().await.expect("lead snapshot");
+            let notices = snapshot
+                .transcript
+                .messages
+                .iter()
+                .filter(|message| message.content.as_text().starts_with(TEAM_NOTICE_PREFIX))
+                .count();
+            if notices == 1 && !snapshot.busy && llm.calls() >= 3 {
+                notified = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(notified, "the worker notice must drive one real lead turn");
+        let snapshot = lead.snapshot().await.expect("notified lead snapshot");
+        let notice = snapshot
+            .transcript
+            .messages
+            .iter()
+            .find(|message| message.content.as_text().starts_with(TEAM_NOTICE_PREFIX))
+            .expect("TeamManager-attributed notice");
+        let text = notice.content.as_text();
+        assert!(text.contains(&format!("worker_id={}", worker.id)), "{text}");
+        assert!(text.contains("need the API key"), "{text}");
+        assert!(text.contains("team_status"), "{text}");
+        assert!(team.messages().await.iter().any(|message| {
+            message.worker_id == worker.id && message.text == "need the API key"
+        }));
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_an_active_worker_preserves_its_brief() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(&root, &config, &state, Arc::new(SlowLlm::new())).await;
+        let worker = team
+            .dispatch("retain the running brief".into(), None)
+            .await
+            .expect("dispatch");
+        let stopped = team.stop(&worker.id).await.expect("stop active worker");
+        assert_eq!(stopped.status, crate::mnemo2::team::WorkerStatus::Stopped);
+        assert!(stopped.transcript.messages.iter().any(|message| {
+            message.content.as_text() == "retain the running brief"
+        }));
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn compact_resumes_one_stopped_worker_and_persists_the_real_outcome() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["implemented"]),
+            text_turn(&["compact summary"]),
+        ]));
+        let (lead, team) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let mut events = team.subscribe();
+        let worker = team.dispatch("retain this work".into(), None).await.expect("dispatch");
+        let mut worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        for _ in 0..100 {
+            worker = team.worker(&worker.id).await.expect("worker");
+            if worker.transcript.messages.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(worker.transcript.messages.len() >= 2, "the completed transcript is saved before stopping");
+        team.stop(&worker.id).await.expect("stop before compaction");
+        let requested = team.compact(&worker.id).await.expect("compaction accepted");
+        assert_eq!(requested.id, worker.id);
+        assert!(requested.generation > worker.generation);
+        let compacted = wait_for_worker_status(&team, &worker.id, WorkerStatus::Idle).await;
+        assert!(!compacted.compacting);
+        assert!(compacted.error.is_none(), "{:?}", compacted.error);
+        let observed: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|event| format!("{:?}", event.event.event))
+            .collect();
+        assert_eq!(
+            compacted.turns, worker.turns,
+            "events: {observed:?}; before: {worker:?}; after: {compacted:?}"
+        );
+        assert!(observed.iter().any(|event| event.starts_with("CompactStarted")), "{observed:?}");
+        assert!(observed.iter().any(|event| event.starts_with("Compacted { before:")), "{observed:?}");
+        assert!(compacted.transcript.messages.len() >= 2);
+        assert!(compacted.used_tokens > 0);
+
         team.shutdown().await;
         lead.shutdown().await;
     }
@@ -2375,6 +2879,7 @@ mod tests {
             state_dir: state.path().to_path_buf(),
             slots: None,
             max_spawns_per_turn: 1,
+            model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: Vec::new(),
         })
         .await

@@ -2191,6 +2191,7 @@ impl AgentLoop {
             // denial => `batch_triage` stays `None` and every branch below
             // keeps its pre-classifier behavior byte-for-byte.
             if !result.success
+                && !is_domain_tool_error(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && batch_triage.is_none()
                 && stop_signal.is_none()
@@ -2549,6 +2550,7 @@ impl AgentLoop {
             // not a stuck model — excluded, mirroring the MAX_RETRIES
             // rule at the top of this loop.
             if !result.success
+                && !is_domain_tool_error(&result)
                 && !is_user_denial_tool_output(&result.output)
                 && pending_correction.is_none()
                 && repeated_tool_failure(messages, &tc.name, &tool_content)
@@ -5338,6 +5340,15 @@ fn repair_empty_assistant_messages(messages: &mut [Message]) {
             m.content = MessageContent::text("(no output)");
         }
     }
+}
+
+fn is_domain_tool_error(result: &ToolResult) -> bool {
+    result
+        .data
+        .as_ref()
+        .and_then(|data| data.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("domain")
 }
 
 /// Whether a tool-result error string is a user denial / interrupt rather than

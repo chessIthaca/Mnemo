@@ -880,6 +880,7 @@ mod tests {
     struct ScriptedLlm {
         responses: std::sync::Mutex<VecDeque<Vec<LlmEvent>>>,
         calls: std::sync::atomic::AtomicUsize,
+        advertised_tools: std::sync::Mutex<Vec<Vec<String>>>,
         caps: Capabilities,
     }
 
@@ -888,12 +889,20 @@ mod tests {
             Self {
                 responses: std::sync::Mutex::new(responses.into()),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                advertised_tools: std::sync::Mutex::new(Vec::new()),
                 caps: Capabilities::openai(),
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn advertised_tools(&self) -> Vec<Vec<String>> {
+            self.advertised_tools
+                .lock()
+                .expect("advertised tool lock poisoned")
+                .clone()
         }
     }
 
@@ -917,6 +926,10 @@ mod tests {
             _tools: &[ToolSchema],
             _tool_choice: Option<ToolChoice>,
         ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+            self.advertised_tools
+                .lock()
+                .expect("advertised tool lock poisoned")
+                .push(_tools.iter().map(|tool| tool.name.clone()).collect());
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let next = self
                 .responses
@@ -2924,6 +2937,74 @@ mod tests {
         let lead_tip = crate::mnemo2::phase3::tip(root.path()).await.expect("lead tip");
         assert!(team.merge(&worker.id).await.is_err());
         assert_eq!(crate::mnemo2::phase3::tip(root.path()).await.expect("unchanged lead"), lead_tip);
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn executor_advertises_and_executes_coding_tools() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            tool_turn(
+                "file_write",
+                r#"{"path":"executor-proof.txt","content":"worker wrote this\n"}"#,
+            ),
+            tool_turn(
+                "shell",
+                r#"{"command":"echo worker-shell","purpose":"verify worker execution"}"#,
+            ),
+            tool_turn(
+                "git",
+                r#"{"subcommand":"commit","message":"executor proof"}"#,
+            ),
+            text_turn(&["done"]),
+        ]));
+        let (lead, team) = open_git_team(&root, &config, &state, llm.clone()).await;
+        let worker = team
+            .dispatch("write and commit a proof file".into(), None)
+            .await
+            .expect("dispatch");
+        let mut worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        for _ in 0..100 {
+            if worker.transcript.messages.iter().any(|message| {
+                message.name.as_deref() == Some("git")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            worker = team.worker(&worker.id).await.expect("worker");
+        }
+        let advertised = llm.advertised_tools();
+        let first = advertised.first().expect("worker request");
+        for name in ["file_edit", "file_write", "shell", "git", "git_read"] {
+            assert!(first.iter().any(|tool| tool == name), "{name} is not advertised to the worker: {first:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(worker.worktree.join("executor-proof.txt"))
+                .expect("worker-written file"),
+            "worker wrote this\n"
+        );
+        assert!(worker.transcript.messages.iter().any(|message| {
+            message.name.as_deref() == Some("shell")
+                && message.content.as_text().contains("worker-shell")
+                && !message.tool_is_error
+        }), "shell did not execute: {:?}", worker.transcript);
+        for name in ["file_write", "git"] {
+            assert!(worker.transcript.messages.iter().any(|message| {
+                message.name.as_deref() == Some(name) && !message.tool_is_error
+            }), "{name} did not execute successfully: {:?}", worker.transcript);
+        }
+        assert_eq!(
+            crate::mnemo2::phase3::git_value(&worker.worktree, &["log", "-1", "--pretty=%s"])
+                .await
+                .expect("worker commit"),
+            "executor proof"
+        );
+
         team.shutdown().await;
         lead.shutdown().await;
     }

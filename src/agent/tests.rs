@@ -17047,15 +17047,15 @@ async fn guardrails_is_default_and_gate_rules() {
         Continuation::Stop
     ));
 
-    // The free-agent defaults: the ungated surface (advertise None —
-    // the registry narrows; gate Free) over the plain spec.
+    // The registry narrows the selected groups; the policy must not inherit
+    // the unwired workflow's read-only Complete filter.
     let plain = DeclarativePolicy::new(std::sync::Arc::new(Guardrails::default()))
         .expect("the default spec compiles");
     let surface = plain.tool_surface().await;
-    assert!(
-        surface.advertise.is_none(),
-        "the registry narrows; the policy does not filter"
-    );
+    assert!(matches!(
+        surface.advertise,
+        Some(crate::tool::ToolFilter::Free)
+    ));
     assert!(matches!(
         surface.gate,
         Some(crate::tool::ToolFilter::Free)

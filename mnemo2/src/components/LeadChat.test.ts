@@ -416,7 +416,10 @@ describe("LeadChat", () => {
     expect(tool.compareDocumentPosition(assistant) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(getComputedStyle(user).marginLeft).toBe("0px");
     expect(getComputedStyle(user).maxWidth).toBe("800px");
-    expect(getComputedStyle(assistant.querySelector(".markdown p")!).maxWidth).toBe("800px");
+    const prose = assistant.querySelector(".markdown p")!;
+    const proseStyle = getComputedStyle(prose);
+    expect(proseStyle.fontSize).toBe("14px");
+    expect(proseStyle.maxWidth).toBe(`${parseFloat(proseStyle.fontSize) * 50}px`);
   });
 
   it("does not follow new activity after the user scrolls up", async () => {

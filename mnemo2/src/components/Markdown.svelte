@@ -1,72 +1,23 @@
-<script module lang="ts">
-  let markdownModule: Promise<typeof import("../lib/markdown")> | null = null;
-
-  function loadMarkdown(): Promise<typeof import("../lib/markdown")> {
-    markdownModule ??= import("../lib/markdown").catch((error) => {
-      markdownModule = null;
-      throw error;
-    });
-    return markdownModule;
-  }
-</script>
-
 <script lang="ts">
   import { onMount } from "svelte";
+  import { renderMarkdown } from "../lib/markdown";
 
   let { source, onOpenLink }: { source: string; onOpenLink?: (url: string) => void } = $props();
-  let html = $state("");
-  let hasRendered = $state(false);
   let container: HTMLDivElement;
-  let renderVersion = 0;
-  let latestSource = "";
-  let fallbackSource = $state("");
-  let fallbackCaptured = false;
-  let frame: number | null = null;
-  let destroyed = false;
+  let cachedSource = "";
+  let cachedHtml = "";
+  const html = $derived.by(() => {
+    if (source !== cachedSource) {
+      cachedSource = source;
+      cachedHtml = renderMarkdown(source);
+    }
+    return cachedHtml;
+  });
 
   onMount(() => {
     container.addEventListener("click", handleClick);
-    return () => {
-      container.removeEventListener("click", handleClick);
-      destroyed = true;
-      renderVersion += 1;
-      if (frame !== null) {
-        cancelAnimationFrame(frame);
-        frame = null;
-      }
-    };
+    return () => container.removeEventListener("click", handleClick);
   });
-
-  $effect(() => {
-    if (!fallbackCaptured) {
-      fallbackSource = source;
-      fallbackCaptured = true;
-    }
-    latestSource = source;
-    renderVersion += 1;
-    scheduleRender();
-  });
-
-  function scheduleRender() {
-    if (destroyed || frame !== null) return;
-    frame = requestAnimationFrame(renderFrame);
-  }
-
-  function renderFrame() {
-    frame = null;
-    if (destroyed) return;
-    const version = renderVersion;
-    const text = latestSource;
-    void loadMarkdown()
-      .then(({ renderMarkdown }) => {
-        if (destroyed || version !== renderVersion) return;
-        html = renderMarkdown(text);
-        hasRendered = true;
-      })
-      .catch(() => {
-        // Keep the previous frame (or the initial source fallback) on failure.
-      });
-  }
 
   function handleClick(event: MouseEvent) {
     const origin = event.target instanceof Element ? event.target : null;
@@ -88,13 +39,7 @@
   }
 </script>
 
-<div class="markdown" bind:this={container}>
-  {#if hasRendered}
-    {@html html}
-  {:else}
-    <p class="markdown-loading">{fallbackSource}</p>
-  {/if}
-</div>
+<div class="markdown" bind:this={container}>{@html html}</div>
 
 <style>
   .markdown {
@@ -103,27 +48,26 @@
     overflow-x: auto;
     color: var(--ink);
     font-family: var(--font-prose);
-    font-size: 16px;
-    line-height: 1.72;
+    font-size: 14px;
+    line-height: 1.62;
     overflow-wrap: anywhere;
   }
-  .markdown-loading { white-space: pre-wrap; }
   .markdown :global(p) { margin: 0 0 16px; }
   .markdown :global(p:last-child) { margin-bottom: 0; }
   .markdown :global(h1), .markdown :global(h2), .markdown :global(h3),
   .markdown :global(h4), .markdown :global(h5), .markdown :global(h6) {
-    margin: 28px 0 12px;
+    margin: 22px 0 10px;
     font-family: var(--font-ui);
     font-weight: 680;
     letter-spacing: -0.01em;
     line-height: 1.35;
   }
-  .markdown :global(h1) { font-size: 22px; }
-  .markdown :global(h2) { font-size: 19px; }
-  .markdown :global(h3) { font-size: 17px; }
-  .markdown :global(h4) { font-size: 16px; }
-  .markdown :global(h5) { font-size: 15px; }
-  .markdown :global(h6) { font-size: 14px; color: var(--ink-soft); }
+  .markdown :global(h1) { font-size: 20px; }
+  .markdown :global(h2) { font-size: 18px; }
+  .markdown :global(h3) { font-size: 16px; }
+  .markdown :global(h4) { font-size: 15px; }
+  .markdown :global(h5) { font-size: 14px; }
+  .markdown :global(h6) { font-size: 13px; color: var(--ink-soft); }
   .markdown :global(h1:first-child), .markdown :global(h2:first-child), .markdown :global(h3:first-child),
   .markdown :global(h4:first-child), .markdown :global(h5:first-child), .markdown :global(h6:first-child) { margin-top: 0; }
   .markdown :global(ul), .markdown :global(ol) { margin: 0 0 18px; padding-left: 22px; }

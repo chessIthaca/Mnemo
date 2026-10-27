@@ -2680,6 +2680,15 @@ mod tests {
             .await
             .expect_err("same ID cannot change the logical task");
         assert!(conflict.contains("different brief or model"), "{conflict}");
+        let model_conflict = team
+            .dispatch_with_id(
+                "retry this task".into(),
+                Some("test/scripted-a".into()),
+                Some(worker_id.to_string()),
+            )
+            .await
+            .expect_err("a retry cannot silently change the worker model");
+        assert!(model_conflict.contains("different brief or model"), "{model_conflict}");
         let cap = team
             .dispatch("a genuinely different task".into(), None)
             .await

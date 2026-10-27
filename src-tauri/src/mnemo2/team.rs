@@ -1924,6 +1924,22 @@ async fn merge_conflicts_only(root: &Path) -> Result<bool, String> {
 async fn recover_worker(root: &std::path::Path, worker: &mut WorkerRecord) -> Result<(), String> {
     worker.brief_sent = true;
     worker.compacting = false;
+    let legacy_budget_pause = worker.error.as_deref().is_some_and(|error| {
+        error.starts_with("worker token budget of ")
+            || matches!(
+                error,
+                "increase the worker token budget before continuing"
+                    | "increase the worker token budget before resuming"
+            )
+    });
+    if legacy_budget_pause {
+        worker.error = None;
+        if worker.pending.is_none()
+            && matches!(worker.status, WorkerStatus::NeedsYou | WorkerStatus::Failed)
+        {
+            worker.status = WorkerStatus::Interrupted;
+        }
+    }
     if worker.total_tokens == 0 && worker.used_tokens > 0 {
         worker.total_tokens = worker.used_tokens as u64;
         worker.prompt_tokens = worker.used_tokens as u64;
@@ -2664,7 +2680,7 @@ mod tests {
                     "status": "passed",
                     "detail": null
                 }],
-                "error": null
+                "error": "worker token budget of 200000 was exhausted; increase the budget before continuing"
             }]
         });
 
@@ -2684,6 +2700,7 @@ mod tests {
         recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0])
             .await
             .expect("legacy recovery");
+        assert!(persisted.workers[0].error.is_none());
         assert_eq!(persisted.workers[0].total_tokens, 120);
         assert_eq!(persisted.workers[0].prompt_tokens, 120);
     }

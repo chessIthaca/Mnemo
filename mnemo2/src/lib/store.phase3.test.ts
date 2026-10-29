@@ -2,6 +2,7 @@ import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TeamTransport } from "./teamEngine";
 import {
+  emptyProjectUsageView,
   findingFromWire,
   type TeamFinding,
   type TeamMergeRecord,
@@ -110,7 +111,7 @@ function nativeWorker(): TeamWorkerRecord {
 function makeTransport(initial: TeamWorkerRecord) {
   let current = initial;
   const transport: TeamTransport = {
-    snapshot: vi.fn(async () => ({ workers: [current], slots: 3, active: 1 })),
+    snapshot: vi.fn(async () => ({ workers: [current], slots: 3, active: 1, usage: emptyProjectUsageView() })),
     dispatch: vi.fn(async () => current),
     message: vi.fn(async () => current),
     pause: vi.fn(async () => current),
@@ -134,7 +135,7 @@ function makeTransport(initial: TeamWorkerRecord) {
       return current;
     }),
     stopAll: vi.fn(async () => {}),
-    setSlots: vi.fn(async () => ({ workers: [current], slots: 3, active: 1 })),
+    setSlots: vi.fn(async () => ({ workers: [current], slots: 3, active: 1, usage: emptyProjectUsageView() })),
     compact: vi.fn(async () => current),
     messages: vi.fn(async () => []),
     onEvent: vi.fn(async () => () => {}),

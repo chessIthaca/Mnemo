@@ -3,6 +3,7 @@ import type {
   LeadAgentEvent,
   LeadPendingInteraction,
   LeadTranscript,
+  ProjectUsage,
 } from "./types";
 import { messageText } from "./leadState";
 
@@ -101,10 +102,28 @@ export interface TeamWorkerRecord {
   error: string | null;
 }
 
+/**
+ * The durable per-project usage accumulator as serialized by the native host.
+ *
+ * `input_tokens` is uncached input only, `cached_tokens` is reported
+ * separately, `output_tokens` is completion output, and `cost_micros` covers
+ * priced usage only — `unpriced_models` names the models whose usage has no
+ * configured or vendor price, so the UI can mark the total as partial.
+ */
+export interface ProjectUsageView {
+  input_tokens: number;
+  cached_tokens: number;
+  output_tokens: number;
+  cost_micros: number;
+  unpriced_models: string[];
+}
+
 export interface TeamSnapshot {
   workers: TeamWorkerRecord[];
   slots: number;
   active: number;
+  /** Durable usage for the whole project, including lead and deleted workers. */
+  usage: ProjectUsageView;
 }
 
 export interface TeamMessage {
@@ -163,13 +182,63 @@ export interface TeamViewState {
   workers: TeamWorkerView[];
   slots: number;
   active: number;
+  usage: ProjectUsage;
   messages: TeamMessage[];
+}
+
+/** A zeroed usage aggregate for a project that has recorded nothing yet. */
+export function emptyProjectUsage(): ProjectUsage {
+  return {
+    inputTokens: 0,
+    cachedTokens: 0,
+    outputTokens: 0,
+    costMicros: 0,
+    unpricedModels: [],
+  };
+}
+
+/** A zeroed usage record in the host's wire shape, for fixtures and defaults. */
+export function emptyProjectUsageView(): ProjectUsageView {
+  return {
+    input_tokens: 0,
+    cached_tokens: 0,
+    output_tokens: 0,
+    cost_micros: 0,
+    unpriced_models: [],
+  };
+}
+
+function usageCount(value: unknown): number {
+  const count = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(count) && count > 0 ? Math.trunc(count) : 0;
+}
+
+/**
+ * Normalize the host's durable usage record into the UI view.
+ *
+ * Counts are truncated to non-negative integers with saturating semantics so
+ * a malformed or older record can never render a negative cost, and a host
+ * that predates the accumulator simply reads as zero usage.
+ */
+export function projectUsageFrom(record: ProjectUsageView | null | undefined): ProjectUsage {
+  if (!record || typeof record !== "object") return emptyProjectUsage();
+  const models = Array.isArray(record.unpriced_models)
+    ? record.unpriced_models.filter((model): model is string => typeof model === "string")
+    : [];
+  return {
+    inputTokens: usageCount(record.input_tokens),
+    cachedTokens: usageCount(record.cached_tokens),
+    outputTokens: usageCount(record.output_tokens),
+    costMicros: usageCount(record.cost_micros),
+    unpricedModels: [...new Set(models)],
+  };
 }
 
 export const initialTeamState: TeamViewState = {
   workers: [],
   slots: 0,
   active: 0,
+  usage: emptyProjectUsage(),
   messages: [],
 };
 
@@ -242,6 +311,7 @@ export function applyTeamSnapshot(
     workers: snapshot.workers.map(toView),
     slots: snapshot.slots,
     active: snapshot.active,
+    usage: projectUsageFrom(snapshot.usage),
     messages,
   };
 }

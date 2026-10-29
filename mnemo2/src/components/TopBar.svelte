@@ -1,24 +1,22 @@
 <script lang="ts">
   import { ChevronDown, MessageSquare, PanelsTopLeft, UsersRound, Wallet } from "@lucide/svelte";
   import { actions, app, currentProject, needsYouCount } from "../lib/store";
+  import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
 
   const visibleWorkers = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing"].includes(worker.status)));
   const activeCount = $derived($app.workers.filter((worker) => ["working", "in_review", "fixing", "merging"].includes(worker.status)).length);
-  const tokenUsage = $derived($app.workers.reduce((total, worker) => total + worker.tokens, 0));
-  const teamCost = $derived.by(() => {
-    let total = 0;
-    let hasPricing = false;
-    for (const worker of $app.workers) {
-      if (worker.cost == null) continue;
-      hasPricing = true;
-      total += worker.cost;
-    }
-    return hasPricing ? total : null;
-  });
+  const usage = $derived($app.projectUsage);
+  const costLabel = $derived(formatUsageCost(usage.costMicros));
+  const usagePartial = $derived(usageIsPartial(usage));
+  const totalTokens = $derived(usageTotalTokens(usage));
+  const usageLabel = $derived(
+    `Project cost ${costLabel}${usagePartial ? ", partial estimate: some usage has no price" : ""}. Open project settings.`,
+  );
   let settingsOpen = $state(false);
+  let usageTipOpen = $state(false);
 
   function handleTeam() {
     if ($app.route === "lead") actions.toggleTeamPeek();
@@ -61,9 +59,35 @@
         onclick={() => ($app.workbenchOpen ? actions.closeWorkbench() : actions.openWorkbench("browser"))}
       ><PanelsTopLeft size={15} /></button>
     {/if}
-    <button class="budget-chip" aria-label="Open project settings" title="Cumulative worker usage and project settings" onclick={() => (settingsOpen = true)}>
-      <Wallet size={13} /><span>{#if teamCost != null}${teamCost.toFixed(2)}{:else}{tokenUsage} tokens{/if}</span>
-    </button>
+    <div class="usage-chip">
+      <button
+        class="budget-chip"
+        aria-label={usageLabel}
+        aria-describedby="project-usage-detail"
+        onmouseenter={() => (usageTipOpen = true)}
+        onmouseleave={() => (usageTipOpen = false)}
+        onfocus={() => (usageTipOpen = true)}
+        onblur={() => (usageTipOpen = false)}
+        onclick={() => (settingsOpen = true)}
+      >
+        <Wallet size={13} />
+        <span class="usage-cost">{costLabel}{#if usagePartial}<span class="usage-partial" aria-hidden="true">+</span>{/if}</span>
+      </button>
+      <div id="project-usage-detail" class="usage-tip" class:open={usageTipOpen} role="tooltip">
+        <strong>Project usage</strong>
+        <dl>
+          <div><dt>Cached input</dt><dd>{formatTokenCount(usage.cachedTokens)} tokens</dd></div>
+          <div><dt>Uncached input</dt><dd>{formatTokenCount(usage.inputTokens)} tokens</dd></div>
+          <div><dt>Output</dt><dd>{formatTokenCount(usage.outputTokens)} tokens</dd></div>
+          <div><dt>Total</dt><dd>{formatTokenCount(totalTokens)} tokens</dd></div>
+        </dl>
+        {#if usagePartial}
+          <p class="usage-note">No price for: {usage.unpricedModels.join(", ")}. The cost covers priced usage only.</p>
+        {:else if totalTokens === 0}
+          <p class="usage-note">No usage recorded for this project yet.</p>
+        {/if}
+      </div>
+    </div>
   </div>
 </header>
 
@@ -104,6 +128,17 @@
   .team-stack { display: flex; align-items: center; gap: 8px; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 9px; }
   .budget-chip { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); cursor: pointer; font-size: 9px; }
   .budget-chip:hover { border-color: var(--line-strong); }
+  .usage-chip { position: relative; display: inline-flex; }
+  .usage-cost { font-variant-numeric: tabular-nums; }
+  .usage-partial { margin-left: -1px; color: var(--warning); font-weight: 700; }
+  .usage-tip { position: absolute; top: calc(100% + 7px); right: 0; z-index: 30; width: 228px; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 120ms ease; }
+  .usage-tip.open { opacity: 1; visibility: visible; }
+  .usage-tip strong { display: block; margin-bottom: 7px; font-size: 9px; font-weight: 650; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+  .usage-tip dl { display: grid; gap: 4px; margin: 0; }
+  .usage-tip dl div { display: flex; justify-content: space-between; gap: 10px; }
+  .usage-tip dt { color: var(--muted); font-size: 9px; }
+  .usage-tip dd { margin: 0; color: var(--ink); font-family: var(--font-mono); font-size: 9px; font-variant-numeric: tabular-nums; }
+  .usage-note { margin: 8px 0 0; color: var(--warning); font-size: 8px; line-height: 1.45; }
   .settings-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
   .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 0; border-top: 1px solid var(--line); }
   .settings-row strong, .settings-row small { display: block; }

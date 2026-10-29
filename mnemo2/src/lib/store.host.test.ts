@@ -1,5 +1,6 @@
 import { get } from "svelte/store";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { emptyProjectUsageView } from "./teamState";
 
 /**
  * Regression: a Tauri WebView is not necessarily the Mnemo2 host.
@@ -56,7 +57,7 @@ vi.mock("./teamEngine", () => ({
       host.teamSubscriptions += 1;
       return () => {};
     },
-    snapshot: async () => ({ workers: [], slots: 0, active: 0 }),
+    snapshot: async () => ({ workers: [], slots: 0, active: 0, usage: emptyProjectUsageView() }),
     messages: async () => [],
     message: async () => {},
     dispatch: async () => {},

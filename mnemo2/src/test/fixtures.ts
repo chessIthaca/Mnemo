@@ -551,5 +551,12 @@ export function fixtureState(): AppState {
     selectedWorkerId: "ana",
     planItems: createPlanItems(),
     diffFiles: createDiffFiles(),
+    projectUsage: {
+      inputTokens: 486_200,
+      cachedTokens: 212_400,
+      outputTokens: 64_800,
+      costMicros: 4_320_000,
+      unpricedModels: [],
+    },
   };
 }

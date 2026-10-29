@@ -635,3 +635,14 @@ export function leadEventNeedsSnapshot(event: LeadEvent): boolean {
     event.event?.event?.kind ?? "",
   );
 }
+
+/**
+ * Whether this event records project cost and token usage.
+ *
+ * A lead `usage` event changes the durable per-project accumulator, so the
+ * header's cost metric must re-read the team snapshot (which carries the
+ * aggregate) rather than trusting the lead runtime counters.
+ */
+export function leadEventAffectsUsage(event: LeadEvent): boolean {
+  return event.event?.event?.kind === "usage";
+}

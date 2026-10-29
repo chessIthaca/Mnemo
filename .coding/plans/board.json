@@ -1,0 +1,12 @@
+{
+  "plans": [
+    {
+      "id": "b952eab4",
+      "status": "open",
+      "created_at_ms": 1793315412638,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
+    }
+  ]
+}

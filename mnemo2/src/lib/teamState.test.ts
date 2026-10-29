@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyTeamEvent,
   applyTeamSnapshot,
+  emptyProjectUsageView,
   initialTeamState,
+  projectUsageFrom,
   type TeamEvent,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -60,7 +62,7 @@ const event = (kind: string, extra: Record<string, unknown> = {}, generation = 1
 
 describe("teamState", () => {
   it("restores real workers from a snapshot", () => {
-    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 });
+    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
     expect(state.workers).toHaveLength(1);
     expect(state.workers[0]).toMatchObject({
       id: "w1",
@@ -101,6 +103,7 @@ describe("teamState", () => {
       }],
       slots: 1,
       active: 0,
+      usage: emptyProjectUsageView(),
     });
     expect(state.workers[0].merge).toMatchObject({
       commit: "merge-1",
@@ -114,7 +117,7 @@ describe("teamState", () => {
 
   it("accumulates real usage into cumulative telemetry", () => {
     const state = applyTeamEvent(
-      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 }),
+      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() }),
       event("usage", { prompt_tokens: 80, completion_tokens: 20, cached_tokens: 10 }),
     );
     expect(state.workers[0]).toMatchObject({
@@ -129,20 +132,20 @@ describe("teamState", () => {
 
   it("accumulates streamed deltas for only the tagged worker", () => {
     const state = applyTeamEvent(
-      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 }),
+      applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() }),
       event("text_delta", { text: " and done" }),
     );
     expect(state.workers[0].text).toBe("working on it and done");
   });
 
   it("rejects a stale generation", () => {
-    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 });
+    const state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
     const stale = applyTeamEvent(state, event("text_delta", { text: " stale" }, 0));
     expect(stale).toBe(state);
   });
 
   it("marks approvals as needs-you and clears them on finish", () => {
-    let state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1 });
+    let state = applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() });
     state = applyTeamEvent(state, event("approval_request", { tool_call_id: "t1" }));
     expect(state.workers[0].needsYou).toBe(true);
     expect(state.workers[0].status).toBe("needs_you");
@@ -152,7 +155,7 @@ describe("teamState", () => {
   });
 
   it("tracks compaction completion and failure without a synthetic budget pause", () => {
-    let state = applyTeamSnapshot({ workers: [worker], slots: 1, active: 1 });
+    let state = applyTeamSnapshot({ workers: [worker], slots: 1, active: 1, usage: emptyProjectUsageView() });
     state = applyTeamEvent(state, event("compact_started"));
     expect(state.workers[0]).toMatchObject({ compacting: true, status: "working" });
     state = applyTeamEvent(state, event("compacted", { before: 100, after: 60 }));
@@ -167,15 +170,15 @@ describe("teamState", () => {
   });
 
   it("does not turn stopped, idle, or interrupted sessions into phantom completions", () => {
-    let stopped = applyTeamSnapshot({ workers: [{ ...worker, status: "stopped" }], slots: 1, active: 0 });
+    let stopped = applyTeamSnapshot({ workers: [{ ...worker, status: "stopped" }], slots: 1, active: 0, usage: emptyProjectUsageView() });
     stopped = applyTeamEvent(stopped, event("finished"));
     stopped = applyTeamEvent(stopped, event("exited"));
     expect(stopped.workers[0].status).toBe("stopped");
-    let idle = applyTeamSnapshot({ workers: [{ ...worker, status: "idle" }], slots: 1, active: 1 });
+    let idle = applyTeamSnapshot({ workers: [{ ...worker, status: "idle" }], slots: 1, active: 1, usage: emptyProjectUsageView() });
     idle = applyTeamEvent(idle, event("exited"));
     expect(idle.workers[0].status).toBe("idle");
     const interrupted = applyTeamEvent(
-      applyTeamSnapshot({ workers: [worker], slots: 1, active: 1 }),
+      applyTeamSnapshot({ workers: [worker], slots: 1, active: 1, usage: emptyProjectUsageView() }),
       event("exited"),
     );
     expect(interrupted.workers[0]).toMatchObject({
@@ -187,5 +190,53 @@ describe("teamState", () => {
   it("starts empty", () => {
     expect(initialTeamState.workers).toEqual([]);
     expect(initialTeamState.active).toBe(0);
+    expect(initialTeamState.usage.costMicros).toBe(0);
+  });
+
+  it("carries the durable project usage aggregate into the view", () => {
+    const state = applyTeamSnapshot({
+      workers: [],
+      slots: 2,
+      active: 0,
+      usage: {
+        input_tokens: 900,
+        cached_tokens: 300,
+        output_tokens: 120,
+        cost_micros: 1_234_567,
+        unpriced_models: ["mystery-model", "mystery-model"],
+      },
+    });
+    expect(state.usage).toEqual({
+      inputTokens: 900,
+      cachedTokens: 300,
+      outputTokens: 120,
+      costMicros: 1_234_567,
+      unpricedModels: ["mystery-model"],
+    });
+  });
+
+  it("normalizes a malformed usage record without fabricating a negative cost", () => {
+    expect(projectUsageFrom(undefined)).toEqual({
+      inputTokens: 0,
+      cachedTokens: 0,
+      outputTokens: 0,
+      costMicros: 0,
+      unpricedModels: [],
+    });
+    expect(
+      projectUsageFrom({
+        input_tokens: -5,
+        cached_tokens: Number.NaN,
+        output_tokens: 12.9,
+        cost_micros: -1,
+        unpriced_models: ["a", 7 as unknown as string, "b"],
+      }),
+    ).toEqual({
+      inputTokens: 0,
+      cachedTokens: 0,
+      outputTokens: 12,
+      costMicros: 0,
+      unpricedModels: ["a", "b"],
+    });
   });
 });

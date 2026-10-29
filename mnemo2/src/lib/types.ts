@@ -419,6 +419,20 @@ export interface ProjectConflict {
   startedAt: number | null;
 }
 
+/** Durable per-project usage aggregate behind the header cost metric. */
+export interface ProjectUsage {
+  /** Uncached input tokens (prompt tokens minus cached tokens). */
+  inputTokens: number;
+  /** Cached input tokens, counted separately from uncached input. */
+  cachedTokens: number;
+  /** Completion output tokens. */
+  outputTokens: number;
+  /** Estimated cost in integer micro-USD for priced usage only. */
+  costMicros: number;
+  /** Models with recorded usage but no configured or vendor price. */
+  unpricedModels: string[];
+}
+
 export interface AppState {
   route: Route;
   projectId: string | null;
@@ -433,6 +447,8 @@ export interface AppState {
   teamSlots: number;
   /** Real count of live worker sessions. */
   teamActive: number;
+  /** Durable per-project usage, including the lead and deleted workers. */
+  projectUsage: ProjectUsage;
   workbenchOpen: boolean;
   workbenchTab: WorkbenchTab;
   workbenchWidth: number;

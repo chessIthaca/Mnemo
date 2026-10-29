@@ -7,8 +7,10 @@ import { createWorkbenchTransport, type WorkbenchTransport } from "./workbenchEn
 import { createBrowserTransport, type BrowserTransport } from "./browserEngine";
 import { workerScreenshotPaths } from "./workbenchState";
 import {
+  emptyProjectUsage,
   findingFromWire,
   findingToWire,
+  projectUsageFrom,
   type TeamMergeRecord,
   type TeamMessage,
   type TeamWorkerRecord,
@@ -17,6 +19,7 @@ import {
   applyLeadEvent,
   applyLeadSnapshot,
   initialLeadRuntime,
+  leadEventAffectsUsage,
   leadEventNeedsSnapshot,
   messageText,
 } from "./leadState";
@@ -115,6 +118,11 @@ async function refreshNativeLead(token: number): Promise<void> {
 function handleNativeLeadEvent(token: number, event: LeadEvent): void {
   if (token !== leadSessionToken) return;
   app.update((state) => applyLeadEvent(state, event));
+  if (leadEventAffectsUsage(event)) {
+    // The durable per-project accumulator changed; re-read the team snapshot
+    // (debounced and project-guarded) so the header cost follows the lead too.
+    scheduleTeamSync();
+  }
   if (leadEventNeedsSnapshot(event)) {
     setTimeout(() => {
       if (token === leadSessionToken) void refreshNativeLead(token);
@@ -180,6 +188,7 @@ export function createInitialState(): AppState {
     teamFilter: "all",
     teamSlots: 0,
     teamActive: 0,
+    projectUsage: emptyProjectUsage(),
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
@@ -384,6 +393,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     teamPeekOpen: false,
     teamSlots: 0,
     teamActive: 0,
+    projectUsage: emptyProjectUsage(),
     workbenchOpen: false,
     browserUrl: "about:blank",
     browserTitle: "",
@@ -459,6 +469,9 @@ async function closeProjectNow(): Promise<void> {
     workers: [],
     selectedWorkerId: null,
     teamPeekOpen: false,
+    teamSlots: 0,
+    teamActive: 0,
+    projectUsage: emptyProjectUsage(),
     workbenchOpen: false,
   }));
 }
@@ -1512,6 +1525,7 @@ async function syncTeam(): Promise<void> {
   const transport = teamTransport;
   if (!transport) return;
   const token = teamToken;
+  const projectId = get(app).projectId;
   try {
     const [snapshot, messages] = await Promise.all([
       transport.snapshot(),
@@ -1519,6 +1533,9 @@ async function syncTeam(): Promise<void> {
     ]);
     if (token !== teamToken) return;
     app.update((state) => {
+      // A snapshot belongs to the project that requested it: a slow response
+      // must never repaint (or reprice) a project the human has since opened.
+      if (state.projectId !== projectId) return state;
       const diffWorkerId = state.diffWorkerId ?? state.selectedWorkerId;
       return {
         ...state,
@@ -1534,6 +1551,7 @@ async function syncTeam(): Promise<void> {
         leadEntries: mergeTeamActivity(state.leadEntries, messages, snapshot.workers),
         teamSlots: snapshot.slots,
         teamActive: snapshot.active,
+        projectUsage: projectUsageFrom(snapshot.usage),
         selectedWorkerId: state.selectedWorkerId ?? snapshot.workers[0]?.id ?? null,
         diffWorkerId: snapshot.workers.some((worker) => worker.id === diffWorkerId)
           ? diffWorkerId
@@ -1597,15 +1615,20 @@ function setWorkerSlots(workerSlots: number): void {
   }
   const transport = requireTeam();
   if (!transport) return;
+  const projectId = get(app).projectId;
   void transport.setSlots(workerSlots).then((snapshot) => {
-    app.update((state) => ({
-      ...state,
-      teamSlots: snapshot.slots,
-      teamActive: snapshot.active,
-      projects: state.projects.map((project) => project.id === state.projectId
-        ? { ...project, workerSlots: snapshot.slots }
-        : project),
-    }));
+    app.update((state) => {
+      if (state.projectId !== projectId) return state;
+      return {
+        ...state,
+        teamSlots: snapshot.slots,
+        teamActive: snapshot.active,
+        projectUsage: projectUsageFrom(snapshot.usage),
+        projects: state.projects.map((project) => project.id === state.projectId
+          ? { ...project, workerSlots: snapshot.slots }
+          : project),
+      };
+    });
   }).catch(noteTeamError);
 }
 

@@ -19,6 +19,9 @@ pub mod phase3;
 /// The real worker team runtime.
 pub mod team;
 
+/// Durable per-project usage and cost accounting.
+pub mod usage;
+
 /// The typed Tauri command surface for the lead conversation.
 pub mod ipc;
 

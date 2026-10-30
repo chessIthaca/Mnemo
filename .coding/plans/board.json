@@ -23,6 +23,14 @@
       "closed_at_ms": 1793373141216,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-3420ba1d-20261030-151221.md",
       "abandon_reason": null
+    },
+    {
+      "id": "292139df",
+      "status": "open",
+      "created_at_ms": 1793377597149,
+      "closed_at_ms": null,
+      "report_path": null,
+      "abandon_reason": null
     }
   ]
 }

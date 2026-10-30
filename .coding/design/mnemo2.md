@@ -72,16 +72,20 @@ Brief → Implement → Verify → Review → Merge
 ```
 
 - **Brief** — the lead writes a self-contained brief: plan excerpt, paths,
-  acceptance criteria, scope limit, model choice, and check scope.
+  acceptance criteria/scenarios, scope limit, model choice, and check scope. A
+  plan that will dispatch `review_risk: "high"` carries a
+  `## Acceptance scenarios` section of observable bullets before implementation.
 - **Implement** — the worker edits in its worktree and commits. It may message
   the lead for a decision, but it does not replan.
 - **Verify** — the check scope runs on the branch tip. A fix commit invalidates
   the previous result; the affected scope must pass again.
-- **Review** — the lead reviews the delta and records findings. Every finding
+- **Review** — the lead performs an unanchored diff pass first, then records
+  structured evidence, risk, findings, and any independent audit; every finding
   must be fixed or `wontfix` with a written justification before Merge.
-- **Merge** — when review is closed, checks pass on the tip, and the lead is
-  idle with a clean tree, the TeamManager serializes the merge. A conflict
-  halts and routes the task back; it is never auto-resolved.
+- **Merge** — when review is closed, evidence is complete (and a high-risk audit
+  is adjudicated at the same tip), checks pass on the tip, and the lead is idle
+  with a clean tree, the TeamManager serializes the merge. A conflict halts and
+  routes the task back; it is never auto-resolved.
 
 Tasks are independent. One task may be in Review while another is implementing
 and a third is waiting on a check. Mission Control must show that reality
@@ -141,11 +145,24 @@ checks, and Git commits remain available for implementation tasks.
 The lead's plan is the plan of record. This is the biggest cost lever: one
 planning loop, not one per worker.
 
-### Reviewer (optional)
+### Audit reviewer (high risk)
 
-An independent, read-only reviewer can be spawned for large or high-risk
-diffs. It is a second opinion, not the gate: the lead remains the reviewer of
-record. It writes a report under `.coding/reviews/` and the lead triages it.
+An independent, read-only **audit worker** is required for `review_risk: "high"`
+work — shared contracts, persistence, concurrency, security, and large or
+cross-cutting changes — and remains optional for standard work. It is a fresh
+context, not a second opinion the lead can ignore: the audit is a merge
+precondition that the lead must adjudicate. The lead remains the reviewer of
+record.
+
+`team_audit_dispatch { worker_id, reviewer_id, model?, reasoning_effort?, brief? }`
+creates the audit worker against the implementation worker's current branch/tip
+and plan context. It receives the plan/intent and target diff; it does **not**
+receive the implementation worker's review summary, findings, or conclusions.
+The audit worker has no plan step, and is read-only by construction: no file
+mutation, no commits, no merge, no `spawn_agent`, no `ask_user`, no plan ticking.
+Its completion notice asks the lead to adjudicate the target review, never to
+merge the reviewer. A different model is preferred when available, but fresh
+context is the independence requirement — a different model is not mandatory.
 
 ## 3. Review protocol (lead of record)
 
@@ -156,10 +173,63 @@ Every worker completion goes through a lead review before any merge.
 (`open` / `fixed` / `wontfix`), `fix_commit`, and `evidence`. The record is
 shown in the worker detail and linked from the merge card.
 
-**Lead review.** The lead inspects the diff, the changed call sites, the tests
-the worker ran, and the relevant plan steps. It writes findings. It must not
-merge while any finding is `open`. A `wontfix` is allowed only with a written
-justification (the same rule the Mnemo reviewer protocol uses).
+**Unanchored pass, then evidence.** The lead reviews in two phases. First it
+reads the target diff *unanchored* — `git_read` op `diff`/`show`, the Diff tab, or
+`git diff <base>..<tip>` — and forms its own opinion **before** reading the
+worker's review summary, findings, or test claims. Only then does it verify the
+worker's conclusions against the diff and record one evidence object per review:
+
+```text
+evidence: {
+  unanchored_pass: boolean,
+  intent: string,
+  execution: string,
+  integration: string,
+  test_quality: string,
+  residual_risk: string,
+  independent_reviewer_id?: string | null,
+  audit_adjudication?: string | null
+}
+```
+
+- `unanchored_pass` — true only when the raw-diff pass happened for the exact
+  tip under review.
+- `intent` — what the change was meant to do and whether the diff matches the
+  plan/acceptance scenarios; quote the diff, not the brief.
+- `execution` — the real execution path: changed call sites, error handling, and
+  what can now run differently.
+- `integration` — interactions with existing contracts, persistence,
+  concurrency, and neighbouring modules; who calls what changed.
+- `test_quality` — whether the tests genuinely exercise the change, including a
+  red-before/green-after regression test for a defect fix; a passing count alone
+  is insufficient.
+- `residual_risk` — what remains unverified, out of scope, or reliant on an
+  assumption.
+
+A **standard** review requires `unanchored_pass: true` and all five assessment
+strings nonempty; a **high-risk** review additionally requires
+`independent_reviewer_id` and `audit_adjudication`. No findings is a recorded
+conclusion, not an absent one: the lead writes a substantive rationale naming
+what it inspected and why the delta holds. "Looks good", a restated worker
+summary, or a test count does not satisfy the gate. It must not merge while any
+finding is `open`; a `wontfix` requires a written justification (the same rule
+the Mnemo reviewer protocol uses).
+
+**Risk and independent audit.** `team_dispatch` accepts
+`review_risk: "standard" | "high"` (default standard); the lead marks shared
+contracts, persistence, concurrency, security, and large or cross-cutting work
+**high**, because those are where implementation context most biases judgment. A
+high-risk dispatch requires the plan's `## Acceptance scenarios` section with at
+least one observable bullet, written before implementation. A high-risk worker
+cannot merge on lead review alone: the lead runs `team_audit_dispatch` (see
+§2), links the completed audit as `independent_reviewer_id`, and records what it
+accepted or rejected in `audit_adjudication`. At review and merge the host
+validates the linked worker is `kind: "audit"`, targets the same implementation
+worker, inspected the exact tip, and reached a terminal non-failed state. Worker
+records carry `kind` (default `"implementation"`), `review_risk` (default
+`"standard"`), and optional `audit_target`/`audit_tip`; legacy records
+deserialize as implementation/standard with no evidence and need a fresh review
+(plus an audit where high risk) before merge.
 
 **Tiny findings — the lead fixes them.** Phase 3 constrains this to one
 existing non-test source file and an exact unique replacement of at most 100
@@ -179,14 +249,19 @@ subagent remains an optional later refinement.
 **Re-review.** The lead re-reviews the delta, not the whole branch, and closes
 each finding with fixed evidence or a written `wontfix` justification. The merge
 card shows `Review: N findings · X fixed · Y wontfix`. Any open or unevidenced
-finding blocks merge and keeps the worker in **In review** / **Fixing**.
+finding blocks merge and keeps the worker in **In review** / **Fixing**. A fix
+commit invalidates the prior lead review: the lead repeats the unanchored pass,
+replaces the evidence for the new tip, and a high-risk worker needs a **fresh
+audit** — the earlier `audit_tip` is stale and its adjudication no longer
+applies.
 
-The lead's review is itself a cost center. For a large diff it may spawn a
-read-only reviewer to pre-read and return findings (cheaper than pulling the
-whole diff into the lead's long context), then triage and fix; for small diffs
-it reviews directly.
+The lead's review is itself a cost center. It reviews small diffs directly; a
+large or high-risk diff gets the independent audit above rather than an
+unreviewed pre-read.
 
-**Check binding.** The checks precondition binds to the **branch tip being merged**. After a `review_fix` or worker fix commit, the lead runs the affected scope in the worker worktree and records real outcomes through `team_check`; TeamManager stamps the server-observed current tip. The affected checks must pass and receive a fresh delta review before the merge card becomes mergeable. For this repository the check scope is `cargo test --workspace`.
+**Check binding.** The checks precondition binds to the **branch tip being merged**. After a `review_fix` or worker fix commit, the lead runs the affected scope in the worker worktree and records real outcomes through `team_check`; TeamManager stamps the server-observed current tip. The affected checks, the review evidence, and any high-risk audit must all match that tip and pass before the merge card becomes mergeable. For this repository the check scope is `cargo test --workspace`.
+
+**Closing verification.** The closing review keeps the structured evidence (it is not discarded at merge), and the lead re-verifies the original user scenarios end to end on the integrated tree — including the plan's `## Acceptance scenarios` when present. A closing record that only cites passing tests does not close the plan.
 
 ## 4. Auto-merge
 
@@ -197,6 +272,10 @@ the worker branch into the lead's **local working branch**:
   checks, dispatch, messaging, stop/resume, and merge/revert share one operation
   lock, so exact-tip evidence cannot change after validation. A busy lead or
   worker is rejected with an actionable error rather than silently queued.
+- The gate requires complete review evidence for the current tip, and for
+  `review_risk: "high"` a linked completed audit whose `audit_tip` is that tip
+  plus a nonempty lead adjudication. An open/unevidenced finding, incomplete
+  evidence, or a stale audit keeps the worker in review.
 - The merge target is never `main`. If the project is on `main`, merge refuses
   until a `wt/*` working branch exists.
 - Worker branches fork from the lead's working-branch tip at dispatch. A
@@ -204,8 +283,9 @@ the worker branch into the lead's **local working branch**:
   conflict-halt + route-back rule is the handling.
 - A conflict aborts the merge (`git merge --abort`), marks the worker
   **Conflict**, and routes it back to the worker/lead. No auto-resolution.
-- The merge record stores: commit, files, `+x −y`, checks, review verdict,
-  worker model, cumulative tokens, and pricing-derived cost when available.
+- The merge record stores: commit, files, `+x −y`, checks, review verdict with
+  its structured evidence, `review_risk`, any linked audit, worker model,
+  cumulative tokens, and pricing-derived cost when available.
   `Revert` requires the original non-`main` lead branch, the merge in current
   history, and no evidence that it already landed on `main`.
 - The worker session is closed before its worktree is removed; the branch is
@@ -247,8 +327,9 @@ The team has operational session limits, not per-agent spending budgets.
 - **Executor workers**: one plan of record (the lead's), not one per worker.
 - **Self-contained briefs**: the lead attaches the plan excerpt, paths,
   acceptance criteria, and scope limit; workers do not rediscover the repo.
-- **Review economics**: review small diffs directly; pre-read large diffs with
-  an optional reviewer; never spawn a worker for a read or an answer.
+- **Review economics**: review small diffs directly; a large or high-risk diff
+  gets the required independent audit rather than an unreviewed pre-read; never
+  spawn a worker for a read or an answer.
 - **Blocked workers**: worker messages and blocked/failure transitions send a
   deduplicated, attributed notice to the actual lead session. The lead uses
   `team_message`, `team_stop`, `team_resume`, and `team_compact` with exact
@@ -354,7 +435,6 @@ States: **Dispatching**, **Working**, **Needs you**, **Idle**, **Paused**,
 - Custom worker-slot defaults are persisted.
 - Whether a fresh fixer subagent is ever preferable to the current original-worker
   re-tasking path.
-- Reviewer pre-pass threshold (diff size/files/risk).
 - Whether workers may message the user directly or only the lead.
 - Main landing UX (PR button vs the existing `merge_to_main` skill).
 

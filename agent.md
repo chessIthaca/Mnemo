@@ -138,9 +138,36 @@ Mnemo2 is a separate application built on the headless engine, not an Mnemo1 age
 
 - the worker's turn finished successfully and its checks passed **on the branch tip being merged** — after any `review_fix` or fixer commit, the affected check scope (for this repo `cargo test --workspace`) is re-run and passes;
 - the lead reviewed the branch and **every finding is closed** (fixed) or explicitly marked `wontfix` with a written justification;
+- the review carries structured evidence for the exact merged tip: `unanchored_pass: true`, nonempty `intent`, `execution`, `integration`, `test_quality`, and `residual_risk` (see **Mnemo2 review evidence** below);
+- for `review_risk: "high"`, a completed read-only audit is linked to the same tip and the lead recorded a nonempty adjudication;
 - the lead's working tree is clean and the lead is idle; the merge is serialized (one branch at a time).
 
 It halts on conflicts, never pushes, and never merges into `main`. Landing to `main` remains the repository's protected-PR path (ruleset 23755694; the human approves the PR). Worker branches are per-agent `wt/agent-*` worktrees forked from the lead's working-branch tip at dispatch; a base that goes stale while a worker runs is never auto-rebased — the conflict-halt and route-back rule handles it. The TeamManager performs the merge, not the agent's `git` tool. The compiled agent git gate still applies to the agent's own `git merge`/`git push` calls.
+
+### Mnemo2 review evidence and independent audits
+
+This policy is **Mnemo2 only**. Mnemo1's read-only reviewer workflow in **Review expectations** below is unchanged: this section neither narrows nor replaces it. The lead remains Mnemo2's reviewer of record, but a worker summary plus passing checks is not a review — the lead must record what it actually inspected and concluded.
+
+**Acceptance scenarios first.** A new plan that will dispatch `review_risk: "high"` MUST contain a `## Acceptance scenarios` section with at least one **observable** bullet — a command, a persistence state, a concurrency outcome, a security property, or a UI behavior a reviewer can check without trusting the worker. Other plans are encouraged to include the section. `team_dispatch` with `review_risk: "high"` is rejected when that section is missing or has no observable bullet. Scenarios are written before implementation and re-verified at closing integration; they are never restated from the worker's own claims.
+
+**Unanchored pass, then evidence.** For every completion the lead first reads the target diff *unanchored* — `git_read` op `diff`/`show`, the Diff tab, or `git diff <base>..<tip>` — and forms its own opinion **before** reading the worker's review summary, findings, or test claims. It then records one evidence object on the review:
+
+- `unanchored_pass` — `true` only when that raw-diff pass happened for the exact tip under review.
+- `intent` — what the change was meant to do and whether the diff matches the plan and its acceptance scenarios. Quote the diff, not the brief.
+- `execution` — the real execution path: changed call sites, error handling, and what can now run differently.
+- `integration` — interactions with existing contracts, persistence, concurrency, and neighbouring modules — who calls what changed.
+- `test_quality` — whether the tests genuinely exercise the change, including a red-before/green-after test for a defect fix; a passing count alone is insufficient.
+- `residual_risk` — what remains unverified, out of scope, or dependent on an assumption.
+
+A **standard** review requires `unanchored_pass: true` and all five assessment strings nonempty. A high-risk review additionally requires `independent_reviewer_id` and `audit_adjudication`. A no-findings result still needs a **substantive rationale**: what was inspected, at which tip, and why the delta is believed correct. "Looks good", a restated worker summary, or a test count is not a rationale and does not satisfy the gate.
+
+**Risk classification.** The lead sets `review_risk: "high"` (through `team_dispatch`; default `"standard"`) for **shared contracts, persistence, concurrency, security, and large or cross-cutting work**. These are exactly the changes where the lead's implementation context is most likely to bias the review.
+
+**Independent audit for high risk.** A high-risk worker cannot merge on lead review alone. `team_audit_dispatch` takes `{ worker_id, reviewer_id, model?, reasoning_effort?, brief? }` and creates a fresh read-only **audit worker** against the implementation worker's current branch/tip and plan context, with **no plan step** and **without** the implementation worker's summary, findings, or conclusions. The audit worker is read-only by construction: it cannot edit files, commit, merge, spawn work, ask the user, or tick a plan step. Its completion notice asks the lead to **adjudicate the target review**, never to merge the reviewer. Fresh context is mandatory for independence; a different model is preferred when one is available, but a different model is not required.
+
+**Adjudication and staleness.** The lead links the completed audit with `review.evidence.independent_reviewer_id` and records a nonempty `audit_adjudication`: what the audit found, what the lead accepted or rejected, and why. At both review and merge the host validates that the linked worker is an `audit` worker, targets the same implementation worker, inspected the exact tip, and is terminal non-failed. Worker records carry `kind` (`"implementation"` / `"audit"`, default implementation), `review_risk`, optional `audit_target`, and `audit_tip` (the implementation tip the reviewer inspected). Any fix commit — `review_fix`, a worker fix, or a routed fixer — invalidates the prior lead review and makes the previous audit tip **stale**; the review (and, for high risk, a fresh audit at the new tip) must be repeated. Legacy ledger records deserialize as `kind: "implementation"` / `review_risk: "standard"` with no evidence, so an in-flight worker from before this policy needs a fresh review — plus an audit if its risk is high — before merge.
+
+**Closing verification.** The closing review keeps the structured evidence rather than discarding it at merge, and the lead re-verifies the original user scenarios end to end on the integrated tree — including the plan's `## Acceptance scenarios` when present — before `finish`. A closing record that only cites passing tests does not close the plan.
 
 ## Review expectations
 

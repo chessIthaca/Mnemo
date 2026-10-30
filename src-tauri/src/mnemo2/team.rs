@@ -3267,8 +3267,9 @@ pub(crate) fn audit_prompt() -> PromptSpec {
 
 /// The audit surface: every read tool (files, search, graph, git_read, web,
 /// memory reads) with all mutation paths excluded — no file writes, no
-/// shell, no git writes, no spawning, no user questions, no plan ticks, no
-/// memory mutations.
+/// shell, no git writes, no spawning, no user questions, no plan-board or
+/// step ticks, and no durable-memory mutations (writes, amendments, or
+/// consolidation).
 fn audit_guardrails() -> Guardrails {
     let mut tools = ToolSelection::all();
     tools.exclude = vec![
@@ -3288,6 +3289,9 @@ fn audit_guardrails() -> Guardrails {
         "memory_update".to_string(),
         "memory_supersede".to_string(),
         "memory_delete".to_string(),
+        "memory_consolidate".to_string(),
+        "complete_step".to_string(),
+        "abandon_plan".to_string(),
     ];
     Guardrails {
         prompt: Some(audit_prompt()),

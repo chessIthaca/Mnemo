@@ -3938,8 +3938,11 @@ mod tests {
             "finish",
             "create_plan",
             "update_plan",
+            "complete_step",
+            "abandon_plan",
             "memory_write",
             "memory_supersede",
+            "memory_consolidate",
         ] {
             assert!(
                 !audit_tools.iter().any(|tool| tool == name),
@@ -4409,9 +4412,13 @@ mod tests {
             "git",
             "create_plan",
             "update_plan",
+            "complete_step",
+            "abandon_plan",
             "finish",
             "spawn_agent",
             "ask_user",
+            "memory_write",
+            "memory_consolidate",
         ] {
             assert!(
                 !audit_tools.iter().any(|tool| tool == name),

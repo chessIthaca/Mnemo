@@ -4,6 +4,9 @@ import type {
   LeadPendingInteraction,
   LeadTranscript,
   ProjectUsage,
+  ReviewEvidence,
+  ReviewRisk,
+  WorkerKind,
 } from "./types";
 import { messageText } from "./leadState";
 
@@ -32,10 +35,23 @@ export interface TeamWorkerCheck {
   tip: string;
 }
 
+/** The review evidence object as serialized by the native host. */
+export interface TeamReviewEvidence {
+  unanchored_pass?: boolean | null;
+  intent?: string | null;
+  execution?: string | null;
+  integration?: string | null;
+  test_quality?: string | null;
+  residual_risk?: string | null;
+  independent_reviewer_id?: string | null;
+  audit_adjudication?: string | null;
+}
+
 export interface TeamReviewRecord {
   summary: string;
   tip: string;
   reviewed_at_ms: number;
+  evidence?: TeamReviewEvidence | null;
 }
 
 export interface TeamMergeRecord {
@@ -100,6 +116,14 @@ export interface TeamWorkerRecord {
   fixer_finding_id: string | null;
   merge: TeamMergeRecord | null;
   error: string | null;
+  /** Serde-defaulted on the host: absent means an implementation worker. */
+  kind?: string | null;
+  /** Serde-defaulted on the host: absent means a standard-risk review. */
+  review_risk?: string | null;
+  /** Set on audit workers: the implementation worker whose tip is inspected. */
+  audit_target?: string | null;
+  /** Set on audit workers: the exact implementation tip the audit inspected. */
+  audit_tip?: string | null;
 }
 
 /**
@@ -176,6 +200,10 @@ export interface TeamWorkerView {
   fixerFindingId: string | null;
   merge: TeamMergeRecord | null;
   error: string | null;
+  kind: WorkerKind;
+  reviewRisk: ReviewRisk;
+  auditTarget: string | null;
+  auditTip: string | null;
 }
 
 export interface TeamViewState {
@@ -258,6 +286,51 @@ export function findingFromWire(finding: TeamFinding): Finding {
   };
 }
 
+/**
+ * Normalize the host's worker kind.
+ *
+ * The field is serde-defaulted on the host, so a record written before audit
+ * workers existed (or any unrecognized value) reads as an implementation
+ * worker; only an explicit `"audit"` marks a read-only reviewer.
+ */
+export function workerKindFrom(value: string | null | undefined): WorkerKind {
+  return value === "audit" ? "audit" : "implementation";
+}
+
+/**
+ * Normalize the host's review risk.
+ *
+ * Absent or unrecognized values read as `"standard"`, matching the host's
+ * serde default, so legacy ledgers never demand an audit they never had.
+ */
+export function reviewRiskFrom(value: string | null | undefined): ReviewRisk {
+  return value === "high" ? "high" : "standard";
+}
+
+/**
+ * Normalize a host review-evidence object into the UI shape.
+ *
+ * Returns `undefined` for a review recorded before structured evidence
+ * existed, which is a distinct state from an evidence object with an empty
+ * assessment: the UI must ask for a fresh review rather than render blanks.
+ */
+export function reviewEvidenceFrom(
+  evidence: TeamReviewEvidence | null | undefined,
+): ReviewEvidence | undefined {
+  if (!evidence || typeof evidence !== "object") return undefined;
+  const text = (value: string | null | undefined) => (typeof value === "string" ? value : "");
+  return {
+    unanchoredPass: evidence.unanchored_pass === true,
+    intent: text(evidence.intent),
+    execution: text(evidence.execution),
+    integration: text(evidence.integration),
+    testQuality: text(evidence.test_quality),
+    residualRisk: text(evidence.residual_risk),
+    independentReviewerId: evidence.independent_reviewer_id ?? undefined,
+    auditAdjudication: evidence.audit_adjudication ?? undefined,
+  };
+}
+
 export function findingToWire(finding: Finding): TeamFinding {
   return {
     ...finding,
@@ -299,6 +372,10 @@ function toView(record: TeamWorkerRecord): TeamWorkerView {
     fixerFindingId: record.fixer_finding_id,
     merge: record.merge,
     error: record.error,
+    kind: workerKindFrom(record.kind),
+    reviewRisk: reviewRiskFrom(record.review_risk),
+    auditTarget: record.audit_target ?? null,
+    auditTip: record.audit_tip ?? null,
   };
 }
 

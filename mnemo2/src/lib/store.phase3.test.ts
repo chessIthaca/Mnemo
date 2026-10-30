@@ -69,7 +69,7 @@ const merge: TeamMergeRecord = {
   revert_commit: null,
 };
 
-function nativeWorker(): TeamWorkerRecord {
+function nativeWorker(overrides: Partial<TeamWorkerRecord> = {}): TeamWorkerRecord {
   return {
     id: "ana",
     name: "Ana",
@@ -105,6 +105,7 @@ function nativeWorker(): TeamWorkerRecord {
     fixer_finding_id: null,
     merge: null,
     error: null,
+    ...overrides,
   };
 }
 
@@ -249,5 +250,66 @@ describe("native Phase 3 store integration", () => {
       null,
       "justified separately",
     );
+  });
+
+  it("maps a legacy worker record to an implementation worker with no evidence", async () => {
+    const transport = makeTransport(nativeWorker());
+    await openNativeTeam(transport);
+
+    expect(get(app).workers[0]).toMatchObject({
+      kind: "implementation",
+      reviewRisk: "standard",
+      auditTarget: undefined,
+      auditTip: undefined,
+    });
+    expect(get(app).workers[0].review?.tip).toBe("tip-1");
+    expect(get(app).workers[0].review?.evidence).toBeUndefined();
+  });
+
+  it("maps a high-risk audit worker and its review evidence into the UI", async () => {
+    const transport = makeTransport(nativeWorker({
+      id: "audit-1",
+      name: "Ada",
+      kind: "audit",
+      review_risk: "high",
+      audit_target: "ana",
+      audit_tip: "tip-1",
+      review: {
+        summary: "audited tip-1",
+        tip: "tip-1",
+        reviewed_at_ms: 1_787_400_000_000,
+        evidence: {
+          unanchored_pass: true,
+          intent: "intent",
+          execution: "execution",
+          integration: "integration",
+          test_quality: "test quality",
+          residual_risk: "residual risk",
+          independent_reviewer_id: "audit-1",
+          audit_adjudication: "accepted",
+        },
+      },
+    }));
+    await openNativeTeam(transport);
+
+    expect(get(app).workers[0]).toMatchObject({
+      kind: "audit",
+      reviewRisk: "high",
+      auditTarget: "ana",
+      auditTip: "tip-1",
+      review: {
+        tip: "tip-1",
+        evidence: {
+          unanchoredPass: true,
+          intent: "intent",
+          execution: "execution",
+          integration: "integration",
+          testQuality: "test quality",
+          residualRisk: "residual risk",
+          independentReviewerId: "audit-1",
+          auditAdjudication: "accepted",
+        },
+      },
+    });
   });
 });

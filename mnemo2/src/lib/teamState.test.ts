@@ -5,6 +5,7 @@ import {
   emptyProjectUsageView,
   initialTeamState,
   projectUsageFrom,
+  reviewEvidenceFrom,
   type TeamEvent,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -257,5 +258,88 @@ describe("teamState", () => {
       costMicros: 0,
       unpricedModels: ["a", "b"],
     });
+  });
+
+  it("reads a legacy ledger record as an implementation worker under standard risk", () => {
+    const state = applyTeamSnapshot({
+      workers: [worker],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0]).toMatchObject({
+      kind: "implementation",
+      reviewRisk: "standard",
+      auditTarget: null,
+      auditTip: null,
+    });
+    // A review recorded before structured evidence carries none, which is a
+    // distinct state from an evidence object with blank assessments.
+    expect(state.workers[0].review?.evidence).toBeUndefined();
+  });
+
+  it("normalizes an audit worker and the tip it inspected", () => {
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        id: "audit-1",
+        kind: "audit",
+        review_risk: "high",
+        audit_target: "w1",
+        audit_tip: "tip-1",
+      }],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0]).toMatchObject({
+      kind: "audit",
+      reviewRisk: "high",
+      auditTarget: "w1",
+      auditTip: "tip-1",
+    });
+  });
+
+  it("carries recorded review evidence through the wire view and defaults unknown kinds and risks", () => {
+    const evidence = {
+      unanchored_pass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      test_quality: "test quality",
+      residual_risk: "residual risk",
+      independent_reviewer_id: "audit-1",
+      audit_adjudication: "accepted",
+    };
+    const state = applyTeamSnapshot({
+      workers: [{
+        ...worker,
+        kind: "something-else",
+        review_risk: "unknown",
+        review: {
+          summary: "reviewed with evidence",
+          tip: "tip-1",
+          reviewed_at_ms: 1_787_400_000_000,
+          evidence,
+        },
+      }],
+      slots: 1,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    expect(state.workers[0].kind).toBe("implementation");
+    expect(state.workers[0].reviewRisk).toBe("standard");
+    // The wire view keeps the host's field names; `store.ts` owns the camelCase
+    // mapping into the UI `Worker` (covered by store.phase3.test.ts).
+    expect(state.workers[0].review?.evidence).toEqual(evidence);
+  });
+
+  it("treats evidence with an absent unanchored pass as not recorded", () => {
+    expect(reviewEvidenceFrom({ intent: "only intent" })).toMatchObject({
+      unanchoredPass: false,
+      intent: "only intent",
+      execution: "",
+    });
+    expect(reviewEvidenceFrom(null)).toBeUndefined();
   });
 });

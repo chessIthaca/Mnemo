@@ -1,9 +1,14 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
-import { fixtureState } from "../test/fixtures";
+import {
+  createAuditWorker,
+  createHighRiskWorker,
+  createWorkers,
+  fixtureState,
+} from "../test/fixtures";
 import { initialLeadRuntime } from "../lib/leadState";
-import type { LeadEntry } from "../lib/types";
+import type { LeadEntry, Worker } from "../lib/types";
 import LeadChat from "./LeadChat.svelte";
 
 function setLeadEntries(entries: LeadEntry[]) {
@@ -423,6 +428,65 @@ describe("LeadChat", () => {
     expect((await screen.findByText("update")).tagName).toBe("STRONG");
     expect((await screen.findByText("closed")).tagName).toBe("STRONG");
     expect(screen.getByText("F-1").tagName).toBe("CODE");
+  });
+
+  it("labels a high-risk lead review with its audit linkage", async () => {
+    // Drain the pending project open from `beforeEach`: it resets the team.
+    await act();
+    const mara = createHighRiskWorker();
+    app.update((state) => ({
+      ...state,
+      workers: [mara, createAuditWorker()],
+      selectedWorkerId: "mara",
+      leadEntries: [
+        {
+          id: "review-mara",
+          kind: "review" as const,
+          time: "now",
+          workerId: "mara",
+          title: "Lead review recorded",
+          body: "Adjudicated the audit at the reviewed tip.",
+        },
+      ],
+    }));
+    render(LeadChat);
+    flushFrame();
+    await act();
+
+    expect(await screen.findByText("High risk")).toBeTruthy();
+    expect(screen.getByText(/Independent audit linked at the reviewed tip/)).toBeTruthy();
+  });
+
+  it("marks a legacy lead review as missing structured evidence", async () => {
+    // Drain the pending project open from `beforeEach`: it resets the team.
+    await act();
+    const source = createWorkers().find((item) => item.id === "ana")!;
+    const legacyAna: Worker = {
+      ...source,
+      review: { summary: "legacy review", tip: "tip-ana", reviewedAtMs: 1 },
+    };
+    app.update((state) => ({
+      ...state,
+      workers: [legacyAna],
+      selectedWorkerId: "ana",
+      leadEntries: [
+        {
+          id: "review-legacy",
+          kind: "review" as const,
+          time: "now",
+          workerId: "ana",
+          title: "Lead review recorded",
+          body: "Legacy tip reviewed.",
+        },
+      ],
+    }));
+    expect(legacyAna.review).not.toHaveProperty("evidence");
+
+    render(LeadChat);
+    flushFrame();
+    await act();
+
+    expect(await screen.findByText(/Legacy review · structured evidence is missing/)).toBeTruthy();
   });
 
   it("uses the available lead width instead of a centered fixed column", () => {

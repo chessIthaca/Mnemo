@@ -99,12 +99,32 @@
             </article>
           {:else if entry.kind === "review"}
             {@const worker = $app.workers.find((item) => item.id === entry.workerId)}
+            {@const evidence = worker?.review?.evidence}
             <article class="team-card review-card">
               <div class="team-card-heading">
                 <span class="team-card-icon"><ClipboardCheck size={15} /></span>
-                <div><strong>{entry.title}</strong><span>LEAD REVIEW · {entry.time}</span></div>
+                <div>
+                  <strong>{entry.title}</strong>
+                  <span>LEAD REVIEW · {entry.time}</span>
+                  {#if worker?.reviewRisk === "high"}
+                    <span class="review-risk" data-risk="high">High risk</span>
+                  {/if}
+                </div>
               </div>
               <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
+              {#if worker && worker.reviewRisk === "high"}
+                <p class="review-audit" data-audited={Boolean(evidence?.independentReviewerId)}>
+                  {#if evidence?.independentReviewerId}
+                    Independent audit linked at the reviewed tip.
+                  {:else}
+                    No independent audit linked yet — this merge is blocked until the lead adjudicates one.
+                  {/if}
+                </p>
+              {:else if worker?.review && !evidence}
+                <p class="review-audit" data-audited="legacy">
+                  Legacy review · structured evidence is missing, so a fresh review is required before merge.
+                </p>
+              {/if}
               <button onclick={() => actions.selectWorker(entry.workerId)}>Review {worker?.name ?? "worker"}’s delta <ArrowUpRight size={13} /></button>
             </article>
           {:else if entry.kind === "merge"}
@@ -195,6 +215,10 @@
   .team-card :global(.markdown) { margin: 9px 0; color: var(--ink-soft); font-size: 14px; line-height: 1.55; }
   .team-card button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font-size: 9px; font-weight: 650; }
   .review-card { background: #f4f2ed; }
+  .review-risk { display: inline-block; margin-top: 4px; padding: 2px 6px; border-radius: 5px; background: #f4e4e1; color: var(--danger); font-size: 7px; font-weight: 650; letter-spacing: 0.04em; }
+  .review-audit { margin: 0 0 9px; padding: 6px 9px; border-radius: 8px; background: var(--surface); color: var(--muted); font-size: 9px; line-height: 1.45; }
+  .review-audit[data-audited="true"] { color: var(--accent-strong); }
+  .review-audit[data-audited="false"], .review-audit[data-audited="legacy"] { color: var(--warning); }
   .lead-notice { margin: 0 0 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
   .lead-notice p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.5; }
   .lead-notice .notice-detail { margin-top: 5px; color: var(--muted); font-size: 10px; }

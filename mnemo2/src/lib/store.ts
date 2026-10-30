@@ -11,6 +11,9 @@ import {
   findingFromWire,
   findingToWire,
   projectUsageFrom,
+  reviewEvidenceFrom,
+  reviewRiskFrom,
+  workerKindFrom,
   type TeamMergeRecord,
   type TeamMessage,
   type TeamWorkerRecord,
@@ -1443,6 +1446,10 @@ function workerFromRecord(
     needsYou:
       record.pending != null || ["needs_you", "conflict", "failed"].includes(record.status),
     fixerFindingId: record.fixer_finding_id ?? undefined,
+    kind: workerKindFrom(record.kind),
+    reviewRisk: reviewRiskFrom(record.review_risk),
+    auditTarget: record.audit_target ?? undefined,
+    auditTip: record.audit_tip ?? undefined,
     checks: record.checks.map((check) => ({
       name: check.name,
       status:
@@ -1458,6 +1465,7 @@ function workerFromRecord(
           summary: record.review.summary,
           tip: record.review.tip,
           reviewedAtMs: record.review.reviewed_at_ms,
+          evidence: reviewEvidenceFrom(record.review.evidence),
         }
       : undefined,
     messages: workerMessages(record, messages),

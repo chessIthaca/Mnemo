@@ -27,7 +27,7 @@
 >
   <span class="avatar" style="--hue: {worker.hue}">{worker.initials}</span>
   <span class="worker-copy">
-    <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}<ModelBadge model={worker.model} /></span>
+    <span class="worker-name"><strong>{worker.name}</strong>{#if worker.needsYou}<AlertCircle size={11} />{/if}{#if worker.kind === "audit"}<span class="row-badge" data-kind="audit">Audit</span>{/if}{#if worker.reviewRisk === "high"}<span class="row-badge" data-risk="high">High risk</span>{/if}<ModelBadge model={worker.model} /></span>
     <span class="worker-task">{worker.task}</span>
     {#if !compact}<span class="worker-progress"><span style={`width: ${worker.progress}%`}></span></span>{/if}
   </span>
@@ -49,6 +49,9 @@
   .worker-name strong { font-size: 10px; font-weight: 670; }
   .worker-name :global(svg) { color: var(--warning); }
   .worker-name :global(.model-badge) { max-width: 130px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+  .row-badge { flex: 0 0 auto; padding: 2px 5px; border-radius: 5px; background: var(--surface-soft); color: var(--ink-soft); font-size: 7px; font-weight: 650; }
+  .row-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
+  .row-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
   .worker-task { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
   .worker-progress { display: block; height: 2px; margin-top: 7px; overflow: hidden; border-radius: 2px; background: var(--line); }
   .worker-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }

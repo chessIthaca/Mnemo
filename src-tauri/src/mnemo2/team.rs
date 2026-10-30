@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewRecord};
+use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewEvidence, ReviewRecord};
 use crate::mnemo2::runtime::LeadRuntime;
 use crate::mnemo2::usage::{
     event_session, usage_model_key, ProjectUsage, ProjectUsageView,
@@ -176,6 +176,11 @@ pub struct WorkerRecord {
     pub last_activity_ms: u128,
     /// Real exact-tip check results.
     pub checks: Vec<WorkerCheck>,
+    /// Lead-assigned review risk: `standard` or `high` (legacy ledgers:
+    /// `standard`). High-risk workers touch shared contracts, persistence,
+    /// concurrency, security, or large cross-cutting surfaces.
+    #[serde(default = "default_review_risk")]
+    pub review_risk: String,
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -190,6 +195,11 @@ pub struct WorkerRecord {
     pub merge: Option<MergeRecord>,
     /// The last error, when the worker failed or conflicted.
     pub error: Option<String>,
+}
+
+/// Legacy ledgers carry no review risk; they decode as `standard`.
+fn default_review_risk() -> String {
+    "standard".to_string()
 }
 
 /// The team's public snapshot.
@@ -581,8 +591,8 @@ impl TeamRuntime {
         vec![
             HostToolSpec {
                 name: "team_dispatch".to_string(),
-                description: "Delegate one implementation task through TeamManager. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"brief":{"type":"string"},"model":{"type":"string"}},"required":["worker_id","brief"]}),
+                description: "Delegate one implementation task through TeamManager. Choose a stable unique worker_id of 8-64 ASCII letters/digits and keep it with the brief/model; after a timeout or uncertain host result retry with that same identity, never a guessed replacement. Mark shared contracts, persistence, concurrency, security, or large/cross-cutting work with review_risk='high'; high-risk dispatch requires the active plan's '## Acceptance scenarios' section with observable bullets. The JSON response returns the authoritative worker ID and status. Never use generic agent spawning, Git, files, or team.json to infer or mutate worker lifecycle.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"brief":{"type":"string"},"model":{"type":"string"},"review_risk":{"type":"string","enum":["standard","high"]}},"required":["worker_id","brief"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -623,8 +633,8 @@ impl TeamRuntime {
             },
             HostToolSpec {
                 name: "team_review".to_string(),
-                description: "Persist your review of the current worker tip and its complete finding list. Re-review after every fix.".to_string(),
-                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object"}}},"required":["worker_id","summary","findings"]}),
+                description: "Persist your review of the current worker tip and its complete finding list. Review more than the worker's summary: read the diff unanchored first, then record substantive evidence — intent, execution path, integration, test quality, and residual risk. A passing test count alone is not a review. Re-review after every fix.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object"}},"evidence":{"type":"object","properties":{"unanchored_pass":{"type":"boolean"},"intent":{"type":"string"},"execution":{"type":"string"},"integration":{"type":"string"},"test_quality":{"type":"string"},"residual_risk":{"type":"string"},"independent_reviewer_id":{"type":"string"},"audit_adjudication":{"type":"string"}},"required":["unanchored_pass","intent","execution","integration","test_quality","residual_risk"]}},"required":["worker_id","summary","findings","evidence"]}),
                 safety: SafetyLevel::AutoRun,
                 timeout_ms: Some(10_000),
             },
@@ -699,8 +709,17 @@ impl TeamRuntime {
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let review_risk = args
+                .get("review_risk")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let result = self
-                .dispatch_request(brief.to_string(), model, Some(worker_id.to_string()))
+                .dispatch_request(
+                    brief.to_string(),
+                    model,
+                    Some(worker_id.to_string()),
+                    review_risk,
+                )
                 .await
                 .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
             return worker_result(result, "team_dispatch");
@@ -725,11 +744,26 @@ impl TeamRuntime {
             "team_compact" => self.compact(worker_id).await,
             "team_review" => {
                 let summary = args.get("summary").and_then(Value::as_str).unwrap_or("");
-                match serde_json::from_value::<Vec<Finding>>(
+                let evidence = args
+                    .get("evidence")
+                    .cloned()
+                    .ok_or_else(|| {
+                        "team_review requires a complete 'evidence' object with unanchored_pass, intent, execution, integration, test_quality, and residual_risk"
+                            .to_string()
+                    })
+                    .and_then(|value| {
+                        serde_json::from_value::<ReviewEvidence>(value)
+                            .map_err(|err| format!("invalid review evidence: {err}"))
+                    });
+                let findings = serde_json::from_value::<Vec<Finding>>(
                     args.get("findings").cloned().unwrap_or_else(|| json!([])),
-                ) {
-                    Ok(findings) => self.review(worker_id, summary.to_string(), findings).await,
-                    Err(err) => Err(format!("invalid findings: {err}")),
+                );
+                match (evidence, findings) {
+                    (Ok(evidence), Ok(findings)) => {
+                        self.review(worker_id, summary.to_string(), findings, evidence).await
+                    }
+                    (Ok(_), Err(err)) => Err(format!("invalid findings: {err}")),
+                    (Err(err), _) => Err(err),
                 }
             }
             "team_check" => {
@@ -806,7 +840,7 @@ impl TeamRuntime {
         brief: String,
         model: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_with_id(brief, model, None).await
+        self.dispatch_with_id(brief, model, None, None).await
     }
 
     /// Dispatch or recover one logical task, keyed by its actual worker ID.
@@ -815,8 +849,9 @@ impl TeamRuntime {
         brief: String,
         model: Option<String>,
         worker_id: Option<String>,
+        review_risk: Option<String>,
     ) -> Result<WorkerRecord, String> {
-        self.dispatch_request(brief, model, worker_id)
+        self.dispatch_request(brief, model, worker_id, review_risk)
             .await
             .map(|(worker, _)| worker)
     }
@@ -826,11 +861,26 @@ impl TeamRuntime {
         brief: String,
         model: Option<String>,
         worker_id: Option<String>,
+        review_risk: Option<String>,
     ) -> Result<(WorkerRecord, bool), String> {
         let _guard = self.merge_lock.lock().await;
         if brief.trim().is_empty() {
             return Err("the worker brief is empty".to_string());
         }
+        // High-risk work needs observable acceptance scenarios the lead can
+        // verify at closing integration; standard dispatch needs none.
+        let review_risk = match review_risk.as_deref() {
+            None | Some("standard") => "standard".to_string(),
+            Some("high") => {
+                require_acceptance_scenarios(&self.workspace_root)?;
+                "high".to_string()
+            }
+            Some(other) => {
+                return Err(format!(
+                    "review_risk must be 'standard' or 'high', not '{other}'"
+                ));
+            }
+        };
         if let Some(id) = worker_id.as_deref() {
             validate_worker_id(id)?;
             let existing = {
@@ -880,7 +930,9 @@ impl TeamRuntime {
             self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
             return Err(format!("all {slots} worker slots are busy"));
         }
-        let result = self.provision_worker(brief, model, worker_id).await;
+        let result = self
+            .provision_worker(brief, model, worker_id, review_risk)
+            .await;
         if result.is_err() {
             self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
         }
@@ -903,6 +955,7 @@ impl TeamRuntime {
         brief: String,
         model: Option<String>,
         worker_id: Option<String>,
+        review_risk: String,
     ) -> Result<WorkerRecord, String> {
         let base_ref = current_branch(&self.workspace_root).map_err(|err| {
             format!(
@@ -949,6 +1002,7 @@ impl TeamRuntime {
             turns: 0,
             last_activity_ms: millis,
             checks: Vec::new(),
+            review_risk,
             findings: Vec::new(),
             review: None,
             fixer_finding_id: None,
@@ -1419,16 +1473,24 @@ impl TeamRuntime {
     }
 
     /// Persist a lead review against the current worker commit.
+    ///
+    /// Every new review carries complete structured evidence: an unanchored
+    /// diff pass plus substantive intent, execution, integration, test-quality,
+    /// and residual-risk assessments. Independent-audit linkage becomes
+    /// mandatory for high-risk reviews once `team_audit_dispatch` lands
+    /// (plan step 4).
     pub async fn review(
         &self,
         worker_id: &str,
         summary: String,
         findings: Vec<Finding>,
+        evidence: ReviewEvidence,
     ) -> Result<WorkerRecord, String> {
         let _guard = self.merge_lock.lock().await;
         if summary.trim().is_empty() {
             return Err("the review summary is empty".to_string());
         }
+        phase3::validate_review_evidence(&evidence, false)?;
         phase3::validate_findings(&findings)?;
         let worker = self.worker(worker_id).await?;
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
@@ -1452,6 +1514,7 @@ impl TeamRuntime {
                 summary,
                 tip,
                 reviewed_at_ms: phase3::now_ms(),
+                evidence: Some(evidence),
             });
             worker.findings = findings;
             worker.fixer_finding_id = None;
@@ -1961,6 +2024,8 @@ async fn merge_record_from_git(
             .map(|check| check.name.clone())
             .collect(),
         review_summary: review.summary.clone(),
+        review_risk: Some(worker.review_risk.clone()),
+        review_evidence: review.evidence.clone(),
         files,
         additions,
         deletions,
@@ -2679,6 +2744,91 @@ fn worker_result<T: Serialize>(result: Result<T, String>, action: &str) -> ToolR
 }
 
 /// Enforce every source/evidence precondition while the merge lock is held.
+/// The active-plan stack (`.coding/plans/stack.json`), read for high-risk
+/// dispatch validation.
+#[derive(Deserialize)]
+struct PlanStack {
+    /// Plan ids, newest active plan last.
+    #[serde(default)]
+    stack: Vec<String>,
+}
+
+/// Scan a plan document for its `## Acceptance scenarios` section.
+///
+/// Returns whether the section exists and how many observable bullets it
+/// carries. The section runs from its level-2 heading to the next heading of
+/// level 2 or above; a bullet is observable when its list-item text carries at
+/// least eight characters of substance, so placeholders like `- x` do not
+/// count.
+fn acceptance_scenarios(doc: &str) -> (bool, usize) {
+    let mut in_section = false;
+    let mut found = false;
+    let mut bullets = 0;
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        let level = trimmed.chars().take_while(|c| *c == '#').count();
+        if level > 0 && trimmed[level..].starts_with(' ') {
+            if level <= 2 {
+                in_section = level == 2
+                    && trimmed[level..]
+                        .trim()
+                        .eq_ignore_ascii_case("acceptance scenarios");
+                found = found || in_section;
+            }
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let text = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .map(str::trim)
+            .unwrap_or("");
+        if text.len() >= 8 {
+            bullets += 1;
+        }
+    }
+    (found, bullets)
+}
+
+/// Require the lead's active plan document to declare observable
+/// `## Acceptance scenarios` before a high-risk dispatch.
+///
+/// Returns actionable errors for every failure mode: no active plan, an
+/// unreadable plan document, a missing section, or a section without an
+/// observable bullet.
+fn require_acceptance_scenarios(root: &Path) -> Result<(), String> {
+    let plans_dir = root.join(".coding/plans");
+    let guidance = "dispatch with review_risk='standard', or give the active plan a '## Acceptance scenarios' section with observable bullets before dispatching high-risk work";
+    let stack = std::fs::read_to_string(plans_dir.join("stack.json")).map_err(|_| {
+        format!("review_risk='high' requires the active plan's acceptance scenarios, but no active plan was found in .coding/plans/stack.json; {guidance}")
+    })?;
+    let stack: PlanStack = serde_json::from_str(&stack).map_err(|_| {
+        format!("review_risk='high' requires the active plan's acceptance scenarios, but .coding/plans/stack.json is unreadable; {guidance}")
+    })?;
+    let Some(id) = stack.stack.last() else {
+        return Err(format!(
+            "review_risk='high' requires the active plan's acceptance scenarios, but the plan stack is empty; {guidance}"
+        ));
+    };
+    let doc = std::fs::read_to_string(plans_dir.join(format!("{id}.md"))).map_err(|_| {
+        format!("review_risk='high' requires the active plan's acceptance scenarios, but plan '{id}' has no readable document at .coding/plans/{id}.md; {guidance}")
+    })?;
+    let (found, bullets) = acceptance_scenarios(&doc);
+    if !found {
+        return Err(format!(
+            "the active plan '{id}' does not declare a '## Acceptance scenarios' section; add one with observable bullets describing verifiable outcomes before dispatching high-risk work"
+        ));
+    }
+    if bullets == 0 {
+        return Err(format!(
+            "the active plan '{id}' declares '## Acceptance scenarios' but no observable bullet was found; write at least one concrete, verifiable outcome bullet before dispatching high-risk work"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_merge(worker: &WorkerRecord, tip: &str) -> Result<(), String> {
     if worker.status != WorkerStatus::InReview {
         return Err(format!("worker is {:?}, not in review", worker.status));
@@ -2690,6 +2840,17 @@ fn validate_merge(worker: &WorkerRecord, tip: &str) -> Result<(), String> {
     if review.tip != tip {
         return Err("the review is stale; review the current worker tip".to_string());
     }
+    // A summary plus passing checks alone cannot merge: every review of the
+    // merge-time tip must carry complete structured evidence. Legacy reviews
+    // decoded without evidence fail here, so old records need a fresh review.
+    let evidence = review.evidence.as_ref().ok_or_else(|| {
+        "the review predates structured evidence; re-review the current worker tip with a complete evidence object"
+            .to_string()
+    })?;
+    // High-risk merges will additionally require the independent audit once
+    // `team_audit_dispatch` lands (plan step 4); every merge keeps the base
+    // evidence contract for now.
+    phase3::validate_review_evidence(evidence, false)?;
     if let Some(finding) = worker
         .findings
         .iter()
@@ -2809,6 +2970,8 @@ mod tests {
         assert!(worker.fixer_finding_id.is_none());
         assert!(worker.merge.is_none());
         assert_eq!(worker.checks[0].tip, "");
+        // Legacy ledgers predate review risk: they decode as standard.
+        assert_eq!(worker.review_risk, "standard");
         recover_worker(std::path::Path::new("unused"), &mut persisted.workers[0])
             .await
             .expect("legacy recovery");
@@ -2982,5 +3145,134 @@ mod tests {
             None
         );
         assert_eq!(usage_cost_micros(&pricing, None, 100, 25, 10), None);
+    }
+
+    /// Complete structured review evidence for the merge-gate fixtures.
+    fn evidence() -> ReviewEvidence {
+        ReviewEvidence {
+            unanchored_pass: true,
+            intent: "the worker implements the scoped brief".into(),
+            execution: "the change flows through the documented path".into(),
+            integration: "the module fits the surrounding runtime".into(),
+            test_quality: "the regression reproduces the defect before the fix".into(),
+            residual_risk: "no residual risk beyond the reviewed diff".into(),
+            independent_reviewer_id: None,
+            audit_adjudication: None,
+        }
+    }
+
+    /// A worker parked in review at one exact tip with passing checks.
+    fn in_review_worker(evidence: Option<ReviewEvidence>) -> WorkerRecord {
+        let mut worker = cleanup_worker(
+            "evidence0001",
+            "wt/agent-evidence0001",
+            Path::new("unused"),
+            WorkerStatus::InReview,
+        );
+        worker.checks = vec![WorkerCheck {
+            name: "cargo test --workspace".into(),
+            status: "passed".into(),
+            detail: None,
+            tip: "tip0001".into(),
+        }];
+        worker.review = Some(ReviewRecord {
+            summary: "reviewed".into(),
+            tip: "tip0001".into(),
+            reviewed_at_ms: 1,
+            evidence,
+        });
+        worker
+    }
+
+    #[test]
+    fn legacy_workers_decode_as_standard_risk_without_evidence() {
+        let worker = in_review_worker(None);
+        assert_eq!(worker.review_risk, "standard");
+        // A pre-evidence ledger round-trips its review without the new field.
+        let value = serde_json::to_value(&worker).expect("worker JSON");
+        let restored: WorkerRecord =
+            serde_json::from_value(value).expect("legacy-shaped worker decodes");
+        assert!(restored
+            .review
+            .as_ref()
+            .expect("review")
+            .evidence
+            .is_none());
+    }
+
+    #[test]
+    fn merge_gate_requires_substantive_review_evidence() {
+        // A summary plus passing checks alone can no longer merge: the
+        // legacy-shaped review (evidence absent) is rejected.
+        let unevidenced = in_review_worker(None);
+        let error = validate_merge(&unevidenced, "tip0001")
+            .expect_err("a legacy review must not merge without fresh evidence");
+        assert!(error.contains("structured evidence"), "{error}");
+
+        // An anchored-only pass is not substantive either.
+        let mut unanchored = evidence();
+        unanchored.unanchored_pass = false;
+        let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001")
+            .expect_err("unanchored evidence must not merge");
+        assert!(rejected.contains("unanchored"), "{rejected}");
+
+        // Empty assessments are rejected.
+        let mut empty_intent = evidence();
+        empty_intent.intent = "  ".into();
+        let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001")
+            .expect_err("empty intent must not merge");
+        assert!(empty.contains("intent"), "{empty}");
+
+        // Complete evidence passes the gate.
+        validate_merge(&in_review_worker(Some(evidence())), "tip0001")
+            .expect("complete evidence merges");
+    }
+
+    #[test]
+    fn high_risk_dispatch_requires_observable_acceptance_scenarios() {
+        let root = tempfile::tempdir().expect("plans root");
+        let plans = root.path().join(".coding/plans");
+
+        let missing = require_acceptance_scenarios(root.path())
+            .expect_err("no active plan must block high-risk dispatch");
+        assert!(missing.contains("stack.json"), "{missing}");
+
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(plans.join("stack.json"), r#"{"stack":[]}"#).expect("empty stack");
+        let empty = require_acceptance_scenarios(root.path())
+            .expect_err("an empty plan stack must block high-risk dispatch");
+        assert!(empty.contains("stack is empty"), "{empty}");
+
+        std::fs::write(
+            plans.join("stack.json"),
+            r#"{"stack":["planid01"],"reviewed":false}"#,
+        )
+        .expect("stack");
+        let unreadable = require_acceptance_scenarios(root.path())
+            .expect_err("a missing plan document must block high-risk dispatch");
+        assert!(unreadable.contains("no readable document"), "{unreadable}");
+
+        std::fs::write(plans.join("planid01.md"), "# Plan\n\n## Goal\nShip it.\n")
+            .expect("plan doc");
+        let no_section = require_acceptance_scenarios(root.path())
+            .expect_err("a plan without the section must block high-risk dispatch");
+        assert!(no_section.contains("does not declare"), "{no_section}");
+
+        std::fs::write(
+            plans.join("planid01.md"),
+            "# Plan\n\n## Acceptance scenarios\n\n- x\n\nNone yet.\n",
+        )
+        .expect("plan doc");
+        let no_bullet = require_acceptance_scenarios(root.path())
+            .expect_err("a section without observable bullets must block high-risk dispatch");
+        assert!(no_bullet.contains("no observable bullet"), "{no_bullet}");
+
+        std::fs::write(
+            plans.join("planid01.md"),
+            "# Plan\n\n## Acceptance scenarios\n\n- A standard worker cannot merge with only a summary and passing checks.\n\n## Steps\n- done\n",
+        )
+        .expect("plan doc");
+        require_acceptance_scenarios(root.path())
+            .expect("observable bullets validate high-risk dispatch");
     }
 }

@@ -130,6 +130,25 @@ describe("teamState", () => {
     });
   });
 
+  it("ignores a tool execution start on the worker event stream", () => {
+    const base = applyTeamSnapshot({
+      workers: [worker],
+      slots: 2,
+      active: 1,
+      usage: emptyProjectUsageView(),
+    });
+    const state = applyTeamEvent(
+      base,
+      event("tool_execution_start", { tool_call_id: "call-1" }),
+    );
+    expect(state.workers[0]).toEqual(base.workers[0]);
+    expect(state.workers[0]).toMatchObject({
+      text: "working on it",
+      status: "working",
+      totalTokens: 10,
+    });
+  });
+
   it("accumulates streamed deltas for only the tagged worker", () => {
     const state = applyTeamEvent(
       applyTeamSnapshot({ workers: [worker], slots: 2, active: 1, usage: emptyProjectUsageView() }),

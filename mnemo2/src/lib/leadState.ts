@@ -194,6 +194,27 @@ function appendToolOutput(state: AppState, callId: string, text: string): AppSta
   return changed ? { ...state, leadEntries } : state;
 }
 
+/**
+ * Restart the matching RUNNING call's clock at its actual execution start.
+ *
+ * A batch of calls is announced while the model streams, but the engine runs
+ * them one at a time: only now does this call's own clock begin, so a later
+ * card no longer inherits the queue time of the calls before it. A completed
+ * call keeps its measured span — a trailing event must never reopen it — and
+ * an unknown call id is ignored because the announcement owns card creation.
+ */
+function startToolExecution(state: AppState, callId: string): AppState {
+  let changed = false;
+  const leadEntries = state.leadEntries.map((entry) => {
+    if (entry.kind !== "tool" || entry.toolCallId !== callId || entry.result !== null) {
+      return entry;
+    }
+    changed = true;
+    return { ...entry, startedAtMs: Date.now() };
+  });
+  return changed ? { ...state, leadEntries } : state;
+}
+
 /** Finalize a real call; an unseen call still gets a result-only entry. */
 function finishToolEntry(
   state: AppState,
@@ -493,6 +514,13 @@ export function applyLeadEvent(state: AppState, event: LeadEvent): AppState {
         name: toolName,
         streamIndex: typeof inner.index === "number" ? inner.index : undefined,
       });
+    }
+
+    case "tool_execution_start": {
+      const callId =
+        typeof inner.tool_call_id === "string" ? inner.tool_call_id : "";
+      if (!callId) return state;
+      return startToolExecution(state, callId);
     }
 
     case "tool_call_arg_delta":

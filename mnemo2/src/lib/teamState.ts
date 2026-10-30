@@ -370,6 +370,11 @@ export function applyTeamEvent(state: TeamViewState, event: TeamEvent): TeamView
     case "text_delta":
       next.text += payload.text ?? "";
       break;
+    case "tool_execution_start":
+      // The worker view carries no per-call timers (tool cards and their
+      // elapsed suffixes live in the lead thread); the event must never
+      // disturb worker status, text, or token counters.
+      break;
     case "approval_request":
     case "user_question":
     case "host_tool_call":

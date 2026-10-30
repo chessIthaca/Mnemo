@@ -26,10 +26,10 @@
     },
     {
       "id": "292139df",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793377597149,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793387190181,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-292139df-20261030-190630.md",
       "abandon_reason": null
     }
   ]

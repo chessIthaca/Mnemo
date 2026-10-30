@@ -30,6 +30,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::mnemo2::team::{TeamRuntime, TeamRuntimeOptions, DEFAULT_SPAWNS_PER_TURN};
+use crate::mnemo2::usage::event_session;
 
 /// The Tauri event channel name used by the IPC layer.
 pub const LEAD_EVENT_CHANNEL: &str = "mnemo2://lead-event";
@@ -793,7 +794,39 @@ async fn pump_events(
                 false
             }
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
-                *observed_model.lock().await = Some(changed.clone());
+                // The engine's bus is engine-wide: only OUR session's
+                // model change may re-point the lead's observed model
+                // (and its next usage row) — a worker's ModelChanged must
+                // not cross into it.
+                if event_session(&event) == Some(session_id) {
+                    *observed_model.lock().await = Some(changed.clone());
+                }
+                false
+            }
+            SerializableAgentEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                ..
+            } => {
+                // Fold the lead's own usage into the durable per-project
+                // accumulator, keyed by the actual observed model id (the
+                // spec-derived id until the session reports its own). The
+                // engine's bus is engine-wide, so fold only OUR session's
+                // report — worker events are folded by their own pumps.
+                if event_session(&event) == Some(session_id) {
+                    let model = observed_model.lock().await.clone();
+                    if let Some(team) = &team {
+                        let _ = team
+                            .record_usage(
+                                model.as_deref(),
+                                *prompt_tokens as u64,
+                                *cached_tokens as u64,
+                                *completion_tokens as u64,
+                            )
+                            .await;
+                    }
+                }
                 false
             }
             _ => false,
@@ -877,21 +910,61 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    /// One scripted turn: the events to emit, optionally held inside
+    /// `complete` until the test releases a gate.
+    struct ScriptedTurn {
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        events: Vec<LlmEvent>,
+    }
+
     struct ScriptedLlm {
-        responses: std::sync::Mutex<VecDeque<Vec<LlmEvent>>>,
+        responses: std::sync::Mutex<VecDeque<ScriptedTurn>>,
         calls: std::sync::atomic::AtomicUsize,
         advertised_tools: std::sync::Mutex<Vec<Vec<String>>>,
         caps: Capabilities,
+        models: Vec<std::sync::Arc<str>>,
+        active_model: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedLlm {
         fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self::new_with_model("scripted-a", responses)
+        }
+
+        /// A scripted provider that reports the given model id — what a
+        /// session's ModelChanged events and per-model usage rows observe.
+        fn new_with_model(model: &str, responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self::new_gated(vec![model], responses.into_iter().map(|events| (None, events)).collect())
+        }
+
+        /// A scripted provider over a table of model names (see
+        /// [`ScriptedLlm::set_model`]) whose turns can be held inside
+        /// `complete` until the test releases them — the interleaving seam
+        /// for cross-session model-attribution tests.
+        fn new_gated(
+            models: Vec<&str>,
+            turns: Vec<(Option<tokio::sync::oneshot::Receiver<()>>, Vec<LlmEvent>)>,
+        ) -> Self {
             Self {
-                responses: std::sync::Mutex::new(responses.into()),
+                responses: std::sync::Mutex::new(
+                    turns
+                        .into_iter()
+                        .map(|(gate, events)| ScriptedTurn { gate, events })
+                        .collect(),
+                ),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 advertised_tools: std::sync::Mutex::new(Vec::new()),
                 caps: Capabilities::openai(),
+                models: models.into_iter().map(std::sync::Arc::from).collect(),
+                active_model: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Point `model()` at table entry `index` — the next request's
+        /// ModelChanged carries the new name.
+        fn set_model(&self, index: usize) {
+            self.active_model
+                .store(index, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn calls(&self) -> usize {
@@ -917,7 +990,7 @@ mod tests {
         }
 
         fn model(&self) -> &str {
-            "scripted-a"
+            &self.models[self.active_model.load(std::sync::atomic::Ordering::SeqCst)]
         }
 
         async fn complete(
@@ -936,8 +1009,15 @@ mod tests {
                 .lock()
                 .expect("script lock poisoned")
                 .pop_front()
-                .unwrap_or_default();
-            Ok(Box::pin(futures::stream::iter(next)))
+                .map(|turn| (turn.gate, turn.events))
+                .unwrap_or((None, Vec::new()));
+            let (gate, events) = next;
+            if let Some(gate) = gate {
+                // Hold the request mid-turn: the session's ModelChanged is
+                // already on the bus, but its usage events are not.
+                let _ = gate.await;
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
@@ -1023,6 +1103,25 @@ mod tests {
                 reason: FinishReason::Stop,
             },
         ]
+    }
+
+    /// A usage turn that also carries assistant text — the shape a real
+    /// response has, so a persisted-then-resumed lead transcript ends with a
+    /// well-formed assistant reply.
+    fn usage_text_turn(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: u32,
+        text: &str,
+    ) -> Vec<LlmEvent> {
+        let mut events = usage_turn(prompt_tokens, completion_tokens, cached_tokens);
+        events.insert(
+            events.len() - 1,
+            LlmEvent::TextDelta {
+                text: text.to_string(),
+            },
+        );
+        events
     }
 
     fn tool_turn(name: &str, args: &str) -> Vec<LlmEvent> {
@@ -1112,6 +1211,45 @@ mod tests {
         (lead, team)
     }
 
+    /// Write a config whose `endpoints.toml` also carries explicit
+    /// `[[pricing]]` rows: `(model, input, cached, output)` per 1M tokens.
+    fn write_config_with_pricing(
+        dir: &Path,
+        models: &[&str],
+        pricing: &[(&str, f64, f64, f64)],
+    ) {
+        write_config(dir, models);
+        let rows = pricing
+            .iter()
+            .map(|(model, input, cached, output)| {
+                format!(
+                    "\n[[pricing]]\nmodel = \"{model}\"\ninput_per_1m = {input}\ncached_per_1m = {cached}\noutput_per_1m = {output}\n"
+                )
+            })
+            .collect::<String>();
+        let endpoints = dir.join("endpoints.toml");
+        let base = std::fs::read_to_string(&endpoints).expect("endpoints.toml");
+        std::fs::write(&endpoints, format!("{base}\n{rows}")).expect("endpoints pricing");
+    }
+
+    /// Open a lead together with its own internal team — the single
+    /// TeamRuntime the IPC layer drives in production — on a fresh git root.
+    /// The config must already be written (see [`write_config`]).
+    async fn open_git_lead(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        llm: Arc<dyn LlmClient>,
+    ) -> (LeadRuntime, Arc<crate::mnemo2::team::TeamRuntime>) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        let lead = LeadRuntime::open_inner(options(root, config, state), Some(llm))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("team handle");
+        (lead, team)
+    }
+
     fn commit_worker_file(
         worker: &crate::mnemo2::team::WorkerRecord,
         relative: &str,
@@ -1141,6 +1279,71 @@ mod tests {
         }
         let worker = team.worker(worker_id).await.expect("worker record");
         panic!("worker did not reach {status:?}: {worker:?}");
+    }
+
+    /// Poll until the worker's record carries the given observed model id
+    /// (the ModelChanged may land on the bus shortly after the turn ends).
+    async fn wait_for_worker_model(
+        team: &crate::mnemo2::team::TeamRuntime,
+        worker_id: &str,
+        model: &str,
+    ) -> crate::mnemo2::team::WorkerRecord {
+        for _ in 0..250 {
+            let worker = team.worker(worker_id).await.expect("worker record");
+            if worker.model_id.as_deref() == Some(model) {
+                return worker;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = team.worker(worker_id).await.expect("worker record");
+        panic!("worker did not observe '{model}': {worker:?}");
+    }
+    async fn wait_for_calls(llm: &Arc<ScriptedLlm>, expected: usize) {
+        for _ in 0..500 {
+            if llm.calls() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the provider only served {} of {expected} requests",
+            llm.calls()
+        );
+    }
+
+    /// One raw model row of the persisted usage accumulator, read from the
+    /// project ledger: `(prompt_tokens, cached_tokens, output_tokens)`.
+    fn ledger_usage_row(state_dir: &Path, model: &str) -> Option<(u64, u64, u64)> {
+        let ledger: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state_dir.join("team.json")).expect("ledger"),
+        )
+        .expect("ledger JSON");
+        let row = ledger["usage"]["models"][model].as_object()?;
+        Some((
+            row["prompt_tokens"].as_u64()?,
+            row["cached_tokens"].as_u64()?,
+            row["output_tokens"].as_u64()?,
+        ))
+    }
+
+    /// Poll until the persisted ledger carries the given raw model row —
+    /// the terminal refresh can surface a worker's Completed status a beat
+    /// before its own trailing usage report is folded and saved.
+    async fn wait_for_ledger_row(
+        state_dir: &Path,
+        model: &str,
+        expected: (u64, u64, u64),
+    ) {
+        for _ in 0..250 {
+            if ledger_usage_row(state_dir, model) == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "ledger row '{model}' never reached {expected:?}: {:?}",
+            ledger_usage_row(state_dir, model)
+        );
     }
 
     async fn next_event(rx: &mut broadcast::Receiver<LeadEvent>) -> LeadEvent {
@@ -1609,6 +1812,386 @@ mod tests {
 
         team.shutdown().await;
         reopened.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_usage_records_lead_and_worker_usage_and_survives_restart_and_resume() {
+        use crate::mnemo2::team::WorkerStatus;
+        use crate::mnemo2::usage::ProjectUsageView;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config_with_pricing(
+            config.path(),
+            &["scripted-a"],
+            &[("scripted-a", 2.0, 1.0, 10.0)],
+        );
+        let (lead, team) = open_git_lead(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![
+                usage_turn(100_000, 20_000, 30_000),
+                usage_turn(40_000, 10_000, 0),
+                usage_text_turn(60_000, 10_000, 5_000, "lead reply"),
+            ])),
+        )
+        .await;
+
+        // Worker usage is folded into the durable project accumulator.
+        let worker = team
+            .dispatch("usage task".into(), None)
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        assert_eq!(
+            team.snapshot().await.usage,
+            ProjectUsageView {
+                input_tokens: 70_000,
+                cached_tokens: 30_000,
+                output_tokens: 20_000,
+                cost_micros: 370_000,
+                unpriced_models: Vec::new(),
+            }
+        );
+
+        // A second worker turn accumulates on the same model row.
+        team.message(&worker.id, "second usage turn".into())
+            .await
+            .expect("second turn");
+        let worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        assert_eq!(worker.cost_micros, Some(550_000));
+        let after_worker = team.snapshot().await.usage;
+        assert_eq!(after_worker.input_tokens, 110_000);
+        assert_eq!(after_worker.cached_tokens, 30_000);
+        assert_eq!(after_worker.output_tokens, 30_000);
+        assert_eq!(after_worker.cost_micros, 550_000);
+
+        // The lead's own usage is recorded on the same accumulator.
+        let mut events = lead.subscribe();
+        lead.send_prompt("lead usage turn".into())
+            .await
+            .expect("lead prompt");
+        drain_turn(&mut events).await;
+        let after_lead = team.snapshot().await.usage;
+        assert_eq!(after_lead.input_tokens, 165_000);
+        assert_eq!(after_lead.cached_tokens, 35_000);
+        assert_eq!(after_lead.output_tokens, 40_000);
+        assert_eq!(after_lead.cost_micros, 765_000);
+        assert!(after_lead.unpriced_models.is_empty());
+
+        // Restart: a fresh runtime reloads the accumulator exactly once —
+        // the resumed transcripts do NOT replay their historical usage.
+        lead.shutdown().await;
+        let reopened = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(vec![usage_turn(
+                10_000, 2_000, 3_000,
+            )]))),
+        )
+        .await
+        .expect("lead reopens");
+        let reopened_team = reopened.team_handle().await.expect("team handle");
+        assert_eq!(reopened_team.snapshot().await.usage, after_lead);
+
+        // Resuming the stopped worker recovers its saved session snapshot
+        // and records only the NEW turn's usage — no double count from the
+        // recovered session or the reloaded ledger.
+        reopened_team.resume(&worker.id).await.expect("resume worker");
+        reopened_team
+            .message(&worker.id, "resume usage turn".into())
+            .await
+            .expect("post-restart worker turn");
+        wait_for_worker_status(&reopened_team, &worker.id, WorkerStatus::Completed).await;
+        let final_usage = reopened_team.snapshot().await.usage;
+        assert_eq!(final_usage.input_tokens, 172_000);
+        assert_eq!(final_usage.cached_tokens, 38_000);
+        assert_eq!(final_usage.output_tokens, 42_000);
+        assert_eq!(final_usage.cost_micros, 802_000);
+
+        // A second restart persists the same totals.
+        reopened.shutdown().await;
+        let reopened_again = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(Vec::new()))),
+        )
+        .await
+        .expect("second reopen");
+        assert_eq!(
+            reopened_again
+                .team_handle()
+                .await
+                .expect("team")
+                .snapshot()
+                .await
+                .usage,
+            final_usage
+        );
+        reopened_again.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_usage_is_isolated_per_project_and_survives_worker_record_pruning() {
+        use crate::mnemo2::team::WorkerStatus;
+        use crate::mnemo2::usage::ProjectUsageView;
+
+        let root_a = tempfile::tempdir().expect("workspace A");
+        let config_a = tempfile::tempdir().expect("config A");
+        let state_a = tempfile::tempdir().expect("state A");
+        let root_b = tempfile::tempdir().expect("workspace B");
+        let config_b = tempfile::tempdir().expect("config B");
+        let state_b = tempfile::tempdir().expect("state B");
+        write_config_with_pricing(
+            config_a.path(),
+            &["scripted-a"],
+            &[("scripted-a", 2.0, 1.0, 10.0)],
+        );
+        write_config(config_b.path(), &["scripted-a"]);
+
+        let (lead_a, team_a) = open_git_lead(
+            &root_a,
+            &config_a,
+            &state_a,
+            Arc::new(ScriptedLlm::new(vec![usage_turn(100_000, 20_000, 30_000)])),
+        )
+        .await;
+        let (lead_b, team_b) = open_git_lead(
+            &root_b,
+            &config_b,
+            &state_b,
+            Arc::new(ScriptedLlm::new(vec![text_turn(&["unused"])])),
+        )
+        .await;
+
+        let worker = team_a
+            .dispatch("usage task".into(), None)
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team_a, &worker.id, WorkerStatus::Completed).await;
+        let project_a = team_a.snapshot().await.usage;
+        assert_eq!(
+            project_a,
+            ProjectUsageView {
+                input_tokens: 70_000,
+                cached_tokens: 30_000,
+                output_tokens: 20_000,
+                cost_micros: 370_000,
+                unpriced_models: Vec::new(),
+            }
+        );
+
+        // Project B has its own state dir: A's usage never leaks into it.
+        assert_eq!(team_b.snapshot().await.usage, ProjectUsageView::default());
+        lead_b.shutdown().await;
+
+        // Deleting the worker's record (the frontend prunes records from
+        // its derived store) must not remove its usage contribution.
+        lead_a.shutdown().await;
+        let ledger_path = state_a.path().join("team.json");
+        let mut ledger: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_path).expect("ledger"))
+                .expect("ledger JSON");
+        ledger["workers"] = serde_json::json!([]);
+        std::fs::write(&ledger_path, ledger.to_string()).expect("pruned ledger");
+        let reopened =
+            LeadRuntime::open_inner(options(&root_a, &config_a, &state_a), Some(Arc::new(ScriptedLlm::new(Vec::new()))))
+                .await
+                .expect("reopen");
+        let reopened_team = reopened.team_handle().await.expect("team handle");
+        let snapshot = reopened_team.snapshot().await;
+        assert!(snapshot.workers.is_empty(), "the worker record was pruned");
+        assert_eq!(snapshot.usage, project_a, "usage survives record deletion");
+        reopened.shutdown().await;
+    }
+
+    /// Open a fresh lead whose scripted provider reports `model` as the
+    /// observed model id, dispatch one usage turn, and return the project
+    /// usage view plus the completed worker record.
+    async fn dispatch_usage_under_model(
+        model: &str,
+        config_models: &[&str],
+        turn: Vec<LlmEvent>,
+    ) -> (
+        crate::mnemo2::usage::ProjectUsageView,
+        crate::mnemo2::team::WorkerRecord,
+    ) {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), config_models);
+        let (lead, team) = open_git_lead(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new_with_model(model, vec![turn])),
+        )
+        .await;
+        let worker = team
+            .dispatch("usage task".into(), None)
+            .await
+            .expect("dispatch");
+        let worker = wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        let usage = team.snapshot().await.usage;
+        lead.shutdown().await;
+        (usage, worker)
+    }
+
+    #[tokio::test]
+    async fn vendor_default_pricing_prices_configured_models_without_explicit_rows() {
+        // glm-5.3 via the official Ollama table, with no configured pricing:
+        // 70k * 1.40 + 30k * 0.26 + 20k * 4.40 = 193,800 micro-USD.
+        let (glm_usage, glm_worker) = dispatch_usage_under_model(
+            "glm-5.3",
+            &["glm-5.3"],
+            usage_turn(100_000, 20_000, 30_000),
+        )
+        .await;
+        assert_eq!(glm_worker.model_id.as_deref(), Some("glm-5.3"));
+        assert_eq!(
+            glm_worker.cost_micros,
+            None,
+            "per-worker telemetry still needs explicit pricing"
+        );
+        assert_eq!(glm_usage.input_tokens, 70_000);
+        assert_eq!(glm_usage.cached_tokens, 30_000);
+        assert_eq!(glm_usage.output_tokens, 20_000);
+        assert_eq!(glm_usage.cost_micros, 193_800);
+        assert!(glm_usage.unpriced_models.is_empty());
+
+        // The configured Ollama tag `deepseek-v4.1-flash:1017` resolves the
+        // vendor row after stripping the tag:
+        // 5k * 0.30 + 5k * 0.006 + 1k * 1.20 = 2,730 micro-USD.
+        let (tagged_usage, tagged_worker) = dispatch_usage_under_model(
+            "deepseek-v4.1-flash:1017",
+            &["deepseek-v4.1-flash"],
+            usage_turn(10_000, 1_000, 5_000),
+        )
+        .await;
+        assert_eq!(
+            tagged_worker.model_id.as_deref(),
+            Some("deepseek-v4.1-flash:1017")
+        );
+        assert_eq!(tagged_usage.input_tokens, 5_000);
+        assert_eq!(tagged_usage.cached_tokens, 5_000);
+        assert_eq!(tagged_usage.output_tokens, 1_000);
+        assert_eq!(tagged_usage.cost_micros, 2_730);
+        assert!(tagged_usage.unpriced_models.is_empty());
+
+        // A model with neither configured nor vendor pricing keeps its
+        // tokens in the totals but is excluded from the cost and listed
+        // so the UI can mark the estimate partial.
+        let (mystery_usage, mystery_worker) =
+            dispatch_usage_under_model("scripted-b", &["scripted-b"], usage_turn(1_000, 0, 0))
+                .await;
+        assert_eq!(mystery_worker.model_id.as_deref(), Some("scripted-b"));
+        assert_eq!(mystery_usage.input_tokens, 1_000);
+        assert_eq!(mystery_usage.cached_tokens, 0);
+        assert_eq!(mystery_usage.output_tokens, 0);
+        assert_eq!(mystery_usage.cost_micros, 0);
+        assert_eq!(
+            mystery_usage.unpriced_models,
+            vec!["scripted-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn interleaved_model_changes_stay_with_their_own_session() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        // Two real vendor-priced models so the per-model cost proves the
+        // attribution: glm-5.3 (1.40/0.26/4.40) and deepseek-v4.1-flash:1017
+        // (0.30/0.006/1.20), no explicit pricing. The workers share one
+        // configured spec; their OBSERVED ids come from what the provider
+        // serves, which the test switches mid-run.
+        write_config(config.path(), &["scripted-a"]);
+        let (release_a1, held_a1) = tokio::sync::oneshot::channel::<()>();
+        let (release_a2, held_a2) = tokio::sync::oneshot::channel::<()>();
+        let (release_b1, held_b1) = tokio::sync::oneshot::channel::<()>();
+        // Index 0 = deepseek-v4.1-flash:1017, index 1 = glm-5.3; the test
+        // switches the shared provider between them mid-run so each
+        // worker's SECOND request resolves under a model that differs from
+        // its session's serve seed — the only way the engine emits a
+        // ModelChanged in a scripted-provider setup.
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["deepseek-v4.1-flash:1017", "glm-5.3"],
+            vec![
+                // A's first request: a kernel-tool call keeps A's turn alive
+                // for a second (held) request.
+                (Some(held_a1), tool_turn("read_file", r#"{"path":"README.md"}"#)),
+                // B's first request, held inside the provider.
+                (Some(held_b1), tool_turn("read_file", r#"{"path":"README.md"}"#)),
+                // A's second request: resolves under glm-5.3 (emitting A's
+                // own ModelChanged) and then holds while B's turn continues.
+                (Some(held_a2), usage_turn(100_000, 20_000, 30_000)),
+                // B's second request: resolves under deepseek-v4.1-flash:1017
+                // (emitting B's own ModelChanged) and completes.
+                (None, usage_turn(50_000, 10_000, 20_000)),
+            ],
+        ));
+        let (lead, team) = open_git_lead(&root, &config, &state, llm.clone()).await;
+
+        // A starts under deepseek (seeded and served — suppressed), then
+        // holds inside its first request.
+        let a = team
+            .dispatch("held task".into(), None)
+            .await
+            .expect("dispatch A");
+        wait_for_calls(&llm, 1).await;
+        // Switch the serving model BEFORE B starts, so B seeds glm-5.3.
+        llm.set_model(1);
+        let b = team
+            .dispatch("quick task".into(), None)
+            .await
+            .expect("dispatch B");
+        wait_for_calls(&llm, 2).await;
+
+        // A's second request resolves under glm-5.3 — emitting A's own
+        // ModelChanged, which sets A's observed model — and then holds, so
+        // A's usage stays pending while B's turn continues.
+        release_a1.send(()).expect("release A request 1");
+        wait_for_calls(&llm, 3).await;
+
+        // Switch back, then let B's turn continue: B's second request
+        // resolves under deepseek-v4.1-flash:1017 and its ModelChanged
+        // rides the engine-wide bus into A's pump — it must not re-point
+        // A's row.
+        llm.set_model(0);
+        release_b1.send(()).expect("release B request 1");
+        wait_for_worker_status(&team, &b.id, WorkerStatus::Completed).await;
+        wait_for_worker_model(&team, &b.id, "deepseek-v4.1-flash:1017").await;
+
+        // Release A: its held usage must still land under its own model.
+        release_a2.send(()).expect("release A request 2");
+        wait_for_worker_status(&team, &a.id, WorkerStatus::Completed).await;
+        let a = team.worker(&a.id).await.expect("worker A");
+        assert_eq!(
+            a.model_id.as_deref(),
+            Some("glm-5.3"),
+            "A's observed model must survive B's concurrent ModelChanged"
+        );
+
+        // Per-model raw rows in the persisted ledger prove the attribution:
+        // A's 100k/30k/20k under glm-5.3, B's 50k/20k/10k under the tag.
+        wait_for_ledger_row(state.path(), "glm-5.3", (100_000, 30_000, 20_000)).await;
+        wait_for_ledger_row(state.path(), "deepseek-v4.1-flash:1017", (50_000, 20_000, 10_000)).await;
+
+        // Aggregate cost: A at glm rates (70k*1.40 + 30k*0.26 + 20k*4.40 =
+        // 193,800) + B at deepseek rates (30k*0.30 + 20k*0.006 + 10k*1.20
+        // = 21,120). If A were misattributed to the deepseek row the total
+        // would be 66,300 instead.
+        let view = team.snapshot().await.usage;
+        assert_eq!(view.input_tokens, 100_000);
+        assert_eq!(view.cached_tokens, 50_000);
+        assert_eq!(view.output_tokens, 30_000);
+        assert_eq!(view.cost_micros, 193_800 + 21_120);
+        assert!(view.unpriced_models.is_empty());
         lead.shutdown().await;
     }
 

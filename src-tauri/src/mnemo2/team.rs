@@ -34,6 +34,9 @@ use tokio::task::JoinHandle;
 
 use crate::mnemo2::phase3::{self, Finding, MergeRecord, ReviewRecord};
 use crate::mnemo2::runtime::LeadRuntime;
+use crate::mnemo2::usage::{
+    event_session, usage_model_key, ProjectUsage, ProjectUsageView,
+};
 
 /// The Tauri event channel emitted by the team runtime.
 pub const TEAM_EVENT_CHANNEL: &str = "mnemo2://team-event";
@@ -198,6 +201,9 @@ pub struct TeamSnapshot {
     pub slots: usize,
     /// The number of currently live worker sessions.
     pub active: usize,
+    /// Durable per-project usage and estimated cost across the lead and
+    /// every worker; totals survive restarts and worker deletion.
+    pub usage: ProjectUsageView,
 }
 
 /// One event forwarded from a worker session, tagged with its worker id.
@@ -247,6 +253,11 @@ struct PersistedTeam {
     workers: Vec<WorkerRecord>,
     #[serde(default)]
     slots: Option<usize>,
+    /// Raw per-model usage accumulated from live lead and worker events.
+    /// The `#[serde(default)]` keeps ledgers written before this field
+    /// (legacy `team.json`) decodable, starting them at an empty accumulator.
+    #[serde(default)]
+    usage: ProjectUsage,
 }
 
 /// The backup-recoverable `team.json` store.
@@ -360,6 +371,12 @@ pub struct TeamRuntime {
     max_spawns_per_turn: usize,
     model_specs: Vec<String>,
     persistence: TeamPersistence,
+    /// The durable per-project usage accumulator (lead + workers).
+    usage: Arc<Mutex<ProjectUsage>>,
+    /// Serializes every `team.json` write across worker pumps, the lead's
+    /// usage recording, and cleanup so no usage report can be lost to a
+    /// stale interleaving of concurrent ledger saves.
+    save_lock: Arc<Mutex<()>>,
 }
 
 /// Upper bound for concurrently live worker sessions in one project.
@@ -376,6 +393,10 @@ impl TeamRuntime {
             .unwrap_or(DEFAULT_SLOTS)
             .clamp(1, MAX_WORKER_SLOTS);
         persistence.slots.store(slots, Ordering::SeqCst);
+        let usage = persisted
+            .as_ref()
+            .map(|team| team.usage.clone())
+            .unwrap_or_default();
         let mut workers = persisted.map(|team| team.workers).unwrap_or_default();
         for worker in &mut workers {
             recover_worker(&options.workspace_root, worker).await?;
@@ -398,6 +419,8 @@ impl TeamRuntime {
             max_spawns_per_turn: options.max_spawns_per_turn.max(1),
             model_specs: options.model_specs,
             persistence,
+            usage: Arc::new(Mutex::new(usage)),
+            save_lock: Arc::new(Mutex::new(())),
         };
         runtime.persist().await?;
         Ok(runtime)
@@ -472,6 +495,10 @@ impl TeamRuntime {
     /// Clean inactive clean checkouts and refresh this runtime's worker records.
     pub async fn cleanup(&self) -> Result<CleanupReport, String> {
         let _operation = self.merge_lock.lock().await;
+        // Serialize with concurrent usage recording (and pump saves) so
+        // cleanup's own ledger rewrite cannot drop a usage report that
+        // lands mid-cleanup; the in-memory accumulator stays authoritative.
+        let _ledger_save = self.save_lock.lock().await;
         if !self.live.lock().await.is_empty() {
             return Err("stop all workers before cleaning their worktrees".to_string());
         }
@@ -491,11 +518,45 @@ impl TeamRuntime {
     pub async fn snapshot(&self) -> TeamSnapshot {
         let workers = self.records.lock().await.clone();
         let active = self.live.lock().await.len();
+        let usage = self.usage.lock().await.clone();
+        let pricing = self
+            .pricing
+            .read()
+            .expect("pricing lock poisoned")
+            .clone();
         TeamSnapshot {
             workers,
             slots: self.persistence.slots.load(Ordering::SeqCst),
             active,
+            usage: usage.view(&pricing),
         }
+    }
+
+    /// Fold one live usage report (lead or worker session) into the durable
+    /// per-project accumulator and persist the ledger.
+    ///
+    /// The observed model id (already keyed through [`usage_model_key`])
+    /// attributes the row; a report with no observed model lands on the
+    /// literal `"unknown"` row so it still shows up in totals and in
+    /// `unpriced_models` instead of being silently dropped. Raw token counts
+    /// are stored (not costs), so the totals can be repriced whenever the
+    /// pricing tables change.
+    pub async fn record_usage(
+        &self,
+        model: Option<&str>,
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        completion_tokens: u64,
+    ) -> Result<(), String> {
+        let key = model
+            .map(usage_model_key)
+            .unwrap_or("unknown")
+            .to_string();
+        {
+            let mut usage = self.usage.lock().await;
+            usage.record(&key, prompt_tokens, cached_tokens, completion_tokens);
+        }
+        save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
     }
 
     /// One worker by id.
@@ -737,7 +798,7 @@ impl TeamRuntime {
     }
 
     async fn persist(&self) -> Result<(), String> {
-        save_workers(&self.records, &self.persistence).await
+        save_workers(&self.records, &self.usage, &self.save_lock, &self.persistence).await
     }
     /// Delegate one real worker task. The brief is the worker's first prompt.
     pub async fn dispatch(
@@ -968,6 +1029,8 @@ impl TeamRuntime {
             busy.clone(),
             self.messages.clone(),
             self.records.clone(),
+            self.usage.clone(),
+            self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
         ));
@@ -1242,6 +1305,8 @@ impl TeamRuntime {
             busy.clone(),
             self.messages.clone(),
             self.records.clone(),
+            self.usage.clone(),
+            self.save_lock.clone(),
             self.pricing.clone(),
             self.persistence.clone(),
         ));
@@ -2116,6 +2181,8 @@ async fn pump_worker(
     busy: Arc<AtomicBool>,
     messages: Arc<Mutex<Vec<TeamMessage>>>,
     records: Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: Arc<Mutex<ProjectUsage>>,
+    save_lock: Arc<Mutex<()>>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
     persistence: TeamPersistence,
 ) {
@@ -2178,8 +2245,15 @@ async fn pump_worker(
                         }
                     }
                     SerializableAgentEvent::ModelChanged { model, .. } => {
-                        worker.model_id = Some(model.clone());
-                        changed = true;
+                        // The engine's bus is engine-wide: only OUR
+                        // session's model change may re-point this
+                        // worker's observed model (and its next usage
+                        // row) — a concurrent worker's ModelChanged must
+                        // not cross into it.
+                        if event_session(&event) == Some(session_id) {
+                            worker.model_id = Some(model.clone());
+                            changed = true;
+                        }
                     }
                     SerializableAgentEvent::Usage {
                         prompt_tokens,
@@ -2211,6 +2285,31 @@ async fn pump_worker(
                         ) {
                             worker.cost_micros =
                                 Some(worker.cost_micros.unwrap_or(0).saturating_add(cost));
+                        }
+                        // Fold the same report into the durable per-project
+                        // accumulator: raw tokens keyed by the observed model,
+                        // independent of this worker record so the totals
+                        // survive worker deletion and restarts. The engine's
+                        // bus is engine-wide, so fold only OUR session's
+                        // report — otherwise every listening pump would fold
+                        // the same event.
+                        if event_session(&event) == Some(session_id) {
+                            let accumulator_model = worker
+                                .model_id
+                                .clone()
+                                .or_else(|| usage_model.clone())
+                                .or_else(|| {
+                                    worker
+                                        .model
+                                        .as_deref()
+                                        .map(|spec| usage_model_key(spec).to_string())
+                                });
+                            usage.lock().await.record(
+                                accumulator_model.as_deref().unwrap_or("unknown"),
+                                prompt,
+                                cached,
+                                completion,
+                            );
                         }
                         changed = true;
                     }
@@ -2358,11 +2457,13 @@ async fn pump_worker(
             event,
         });
         if terminal || changed {
-            let _ = save_workers(&records, &persistence).await;
+            let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
         }
         if terminal || refresh {
             let engine = engine.clone();
             let records = records.clone();
+            let usage = usage.clone();
+            let save_lock = save_lock.clone();
             let persistence = persistence.clone();
             let worker_id = worker_id.clone();
             tokio::spawn(async move {
@@ -2410,20 +2511,31 @@ async fn pump_worker(
                         }
                     }
                 }
-                let _ = save_workers(&records, &persistence).await;
+                let _ = save_workers(&records, &usage, &save_lock, &persistence).await;
             });
         }
     }
 }
 
+/// Write the whole ledger — workers, slots, and the usage accumulator.
+///
+/// `save_lock` serializes every `team.json` write (pump saves, the lead's
+/// usage recording, cleanup) so a usage report folded into the accumulator
+/// can never be lost to a stale interleaving of concurrent saves: each save
+/// clones the latest committed state while holding the lock.
 async fn save_workers(
     records: &Arc<Mutex<Vec<WorkerRecord>>>,
+    usage: &Arc<Mutex<ProjectUsage>>,
+    save_lock: &Arc<Mutex<()>>,
     persistence: &TeamPersistence,
 ) -> Result<(), String> {
+    let _serialized = save_lock.lock().await;
     let workers = records.lock().await.clone();
+    let usage = usage.lock().await.clone();
     persistence.save(&PersistedTeam {
         workers,
         slots: Some(persistence.slots.load(Ordering::SeqCst)),
+        usage,
     })
 }
 
@@ -2731,6 +2843,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_ledger_without_usage_decodes_with_an_empty_accumulator() {
+        // Regression: team.json files written before the durable usage
+        // accumulator existed have no `usage` key; they must decode to an
+        // empty accumulator instead of failing the ledger load.
+        let dir = tempfile::tempdir().expect("ledger dir");
+        let path = dir.path().join(TEAM_STATE_FILE);
+        std::fs::write(
+            &path,
+            serde_json::json!({ "workers": [], "slots": 4 }).to_string(),
+        )
+        .expect("legacy ledger");
+        let persistence = TeamPersistence::new(dir.path());
+        let loaded = persistence
+            .load()
+            .expect("legacy ledger decodes")
+            .expect("some ledger");
+        assert_eq!(loaded.slots, Some(4));
+        assert!(loaded.usage.models.is_empty());
+
+        // A usage-bearing ledger round-trips its raw token rows verbatim.
+        let mut usage = ProjectUsage::default();
+        usage.record("glm-5.3", 1_000, 250, 100);
+        persistence
+            .save(&PersistedTeam {
+                workers: Vec::new(),
+                slots: Some(4),
+                usage: usage.clone(),
+            })
+            .expect("usage-bearing save");
+        let restored = persistence.load().expect("reload").expect("some ledger");
+        assert_eq!(restored.usage, usage);
+    }
+
     fn lifecycle_git(root: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
             .args(args)
@@ -2791,6 +2937,7 @@ mod tests {
         persistence.save(&PersistedTeam {
             workers: vec![clean.clone(), dirty.clone()],
             slots: Some(4),
+            usage: ProjectUsage::default(),
         }).expect("ledger");
 
         let report = cleanup_workspace(root, state.path()).await.expect("cleanup");

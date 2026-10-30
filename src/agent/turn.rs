@@ -2172,6 +2172,25 @@ impl AgentLoop {
                 break;
             }
 
+            // Execution-start marker (plan b2052a9c): the per-call execution
+            // clock starts HERE — not back at `ToolCallStart`, which fired
+            // mid-stream when the model ANNOUNCED the whole batch. This loop
+            // runs calls one at a time, so a card anchored on the announcement
+            // would bill earlier calls' running time to later ones and make
+            // the suffixes look cumulative. Emitted exactly once per logical
+            // call — the failure-triage retry below and the not-run synthesis
+            // above never re-emit it — so one card measures the whole logical
+            // call (approval + execution + retry) minus the queue time behind
+            // earlier siblings.
+            let _ = fanin_tx
+                .send((
+                    agent_id,
+                    AgentEvent::ToolExecutionStart {
+                        tool_call_id: tc.id.clone(),
+                    },
+                ))
+                .await;
+
             let (mut result, mut buffered) = self
                 .execute_tool_call(
                     tc,

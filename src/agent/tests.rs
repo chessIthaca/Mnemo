@@ -13482,6 +13482,37 @@ fn one_call_batch(call_id: &str, name: &str) -> Vec<LlmEvent> {
     ]
 }
 
+/// A tool-call response batch carrying TWO calls — the shape a model produces
+/// when it announces several calls in one assistant message (both streamed
+/// back to back, one `ToolCalls` finish). The engine then executes them
+/// sequentially, which is exactly what the execution-marker tests need: the
+/// second call is queued behind the first.
+fn two_call_batch(id_a: &str, id_b: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: id_a.to_string(),
+            name: "memory_search".to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: r#"{"query":"first"}"#.to_string(),
+        },
+        LlmEvent::ToolCallStart {
+            index: 1,
+            id: id_b.to_string(),
+            name: "memory_search".to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 1,
+            fragment: r#"{"query":"second"}"#.to_string(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
 /// A plain text response that ends the turn.
 fn text_stop(text: &str) -> Vec<LlmEvent> {
     vec![
@@ -13549,13 +13580,31 @@ async fn transient_read_only_failure_is_auto_retried_without_a_model_roundtrip()
     )
     .with_failure_triage(triage_gate("transient", 0.95, true, log.clone()));
 
-    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let mut messages = vec![Message::user_text("read x.txt")];
     agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
         .await
         .unwrap();
+
+    // One logical call, two execution attempts (the harness auto-retry): the
+    // execution-start marker fires exactly ONCE — a re-run is part of the
+    // same logical call, so the card's timer must not reset mid-call (plan
+    // b2052a9c).
+    let mut markers = 0;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if matches!(
+            ev,
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call_1"
+        ) {
+            markers += 1;
+        }
+    }
+    assert_eq!(
+        markers, 1,
+        "the failure-triage auto-retry must not re-emit the execution marker"
+    );
 
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -13590,6 +13639,247 @@ async fn transient_read_only_failure_is_auto_retried_without_a_model_roundtrip()
     assert_eq!(rows[0].class, "transient");
     assert_eq!(rows[0].action, "auto_retry");
     assert_eq!(rows[0].disposition.as_deref(), Some("retry_succeeded"));
+}
+
+#[tokio::test]
+async fn sequential_tool_calls_time_from_execution_not_announcement() {
+    // Regression (plan b2052a9c): a model batch ANNOUNCES all of its calls
+    // together (ToolCallStart, mid-stream), but the engine executes them one
+    // at a time. A tool card whose timer anchors on the announcement bills
+    // the earlier siblings' running time to the later ones — suffixes look
+    // cumulative. Each call therefore emits its own ToolExecutionStart,
+    // immediately before its first execution attempt. The proof that the
+    // second card's anchor is the execution, not the announcement: the
+    // second marker must arrive only AFTER the first call's result.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let provider = Arc::new(MockProvider::sequence(vec![
+        two_call_batch("call_a", "call_b"),
+        text_stop("done"),
+    ]));
+    let agent = AgentLoop::new(
+        test_config(
+            provider,
+            make_registry((*sandbox).clone(), workflow.clone()),
+            workflow,
+            sandbox,
+        ),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run both searches")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+
+    let announce_a = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCallStart { id, .. } if id == "call_a"))
+        .expect("the first call is announced mid-stream");
+    let announce_b = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCallStart { id, .. } if id == "call_b"))
+        .expect("the second call is announced mid-stream");
+    let exec = |id: &str| {
+        events.iter().position(|e| {
+            matches!(e, AgentEvent::ToolExecutionStart { tool_call_id } if tool_call_id == id)
+        })
+    };
+    let result = |id: &str| {
+        events.iter().position(|e| {
+            matches!(e, AgentEvent::ToolResult { tool_call_id, .. } if tool_call_id == id)
+        })
+    };
+
+    let exec_a = exec("call_a").expect(
+        "RED pre-fix: the first call has no execution-start marker — its card \
+         could only anchor the timer on the shared batch announcement",
+    );
+    let exec_b = exec("call_b").expect(
+        "RED pre-fix: the second call has no execution-start marker — its card \
+         could only anchor the timer on the shared batch announcement",
+    );
+    let result_a = result("call_a").expect("the first call finished with a result");
+    let result_b = result("call_b").expect("the second call finished with a result");
+
+    // Exactly ONE marker per logical call.
+    let markers = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+        .count();
+    assert_eq!(markers, 2, "exactly one execution-start marker per call");
+
+    // Markers are execution-anchored, not announcement-anchored: both calls
+    // were announced (in the same stream) before any execution began.
+    assert!(announce_a < announce_b, "announcements arrive in stream order");
+    assert!(
+        exec_a > announce_b && exec_b > announce_b,
+        "both markers come after the WHOLE batch was announced"
+    );
+
+    // The core property (plan b2052a9c): the first call's result precedes
+    // the second call's marker — the second card's clock starts only when
+    // the second call actually starts running, so it never bills the time
+    // its sibling spent running.
+    assert!(
+        result_a < exec_b,
+        "the first call's result ({result_a}) must precede the second call's \
+         execution-start ({exec_b}) — sequential execution, independent timers"
+    );
+    assert!(exec_a < result_a, "the first marker precedes its own result");
+    assert!(exec_b < result_b, "the second marker precedes its own result");
+}
+
+#[tokio::test]
+async fn not_run_synthesized_calls_never_get_execution_markers() {
+    // Companion (plan b2052a9c): calls that never executed must NOT get an
+    // execution-start marker. An Interrupt arriving mid-stream (after the
+    // whole batch was announced but before any call ran) makes the stop path
+    // synthesize "interrupted: not run" results for both calls; their cards
+    // keep the ToolCallStart timestamp as the compatibility-fallback anchor —
+    // a marker would claim execution that never happened.
+    use crate::runtime::AgentCommand;
+    use tokio::sync::Notify;
+
+    struct BatchPausingProvider {
+        gate: Arc<Notify>,
+        caps: Capabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for BatchPausingProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            use futures::StreamExt;
+            let gate = self.gate.clone();
+            // Both calls announce together, then the stream PENDS — the
+            // interrupt lands while the batch is announced but idle.
+            let stream = futures::stream::iter(vec![
+                LlmEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_a".into(),
+                    name: "memory_search".into(),
+                },
+                LlmEvent::ToolCallArgumentDelta {
+                    index: 0,
+                    fragment: r#"{"query":"first"}"#.into(),
+                },
+                LlmEvent::ToolCallStart {
+                    index: 1,
+                    id: "call_b".into(),
+                    name: "memory_search".into(),
+                },
+                LlmEvent::ToolCallArgumentDelta {
+                    index: 1,
+                    fragment: r#"{"query":"second"}"#.into(),
+                },
+            ])
+            .chain(futures::stream::once(async move {
+                gate.notified().await;
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                }
+            }));
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let gate = Arc::new(Notify::new());
+    let provider: Arc<dyn LlmClient> = Arc::new(BatchPausingProvider {
+        gate: gate.clone(),
+        caps: Capabilities::openai(),
+    });
+    let agent = Arc::new(AgentLoop::new(
+        test_config(
+            provider,
+            make_registry((*sandbox).clone(), workflow.clone()),
+            workflow,
+            sandbox,
+        ),
+        crate::project::Constitution::default(),
+    ));
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let turn_tx = fanin_tx.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run both searches")];
+
+    let collect_handle = tokio::spawn(async move {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        while let Some((_id, event)) = fanin_rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+
+    let agent_clone = Arc::clone(&agent);
+    let turn_handle = tokio::spawn(async move {
+        let outcome = agent_clone
+            .run_turn(&mut messages, &turn_tx, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+        (outcome, messages)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    cmd_tx.send(AgentCommand::Interrupt).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    gate.notify_one();
+
+    let (outcome, _messages) = turn_handle.await.unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        Some(crate::agent::StopReason::Interrupt),
+        "the mid-stream interrupt must stop the batch"
+    );
+
+    drop(fanin_tx);
+    let events = collect_handle.await.unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })),
+        "calls the stop gate skipped must never emit an execution marker"
+    );
+    // Both calls DID get their terminal (synthetic) results, so their cards
+    // resolve instead of spinning "running" forever — with only the
+    // announcement anchor for their duration.
+    for id in ["call_a", "call_b"] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolResult { tool_call_id, result }
+                    if tool_call_id == id && result.output.contains("not run")
+            )),
+            "{id} must carry the synthetic not-run result"
+        );
+    }
 }
 
 #[tokio::test]

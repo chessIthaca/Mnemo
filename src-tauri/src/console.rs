@@ -250,6 +250,11 @@ pub(crate) fn render_event(event: &AgentEvent) -> Rendered {
             text: text.clone(),
         },
         AgentEvent::ToolCallStart { name, .. } => Rendered::Lines(vec![format!("→ {name}")]),
+        // Execution-start marker (plan b2052a9c): a UI-timer affordance —
+        // the card's duration re-anchors on it. The console already printed
+        // the call header on ToolCallStart and prints the result when it
+        // finishes; nothing to say in between.
+        AgentEvent::ToolExecutionStart { .. } => Rendered::Silent,
         AgentEvent::ToolCallArgDelta { .. } => Rendered::Silent,
         // Live partial output is a UI affordance, not console text: the console
         // prints the FULL result when the call finishes, so streaming chunks

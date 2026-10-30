@@ -794,7 +794,13 @@ async fn pump_events(
                 false
             }
             SerializableAgentEvent::ModelChanged { model: changed, .. } => {
-                *observed_model.lock().await = Some(changed.clone());
+                // The engine's bus is engine-wide: only OUR session's
+                // model change may re-point the lead's observed model
+                // (and its next usage row) — a worker's ModelChanged must
+                // not cross into it.
+                if event_session(&event) == Some(session_id) {
+                    *observed_model.lock().await = Some(changed.clone());
+                }
                 false
             }
             SerializableAgentEvent::Usage {
@@ -904,12 +910,20 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    /// One scripted turn: the events to emit, optionally held inside
+    /// `complete` until the test releases a gate.
+    struct ScriptedTurn {
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        events: Vec<LlmEvent>,
+    }
+
     struct ScriptedLlm {
-        responses: std::sync::Mutex<VecDeque<Vec<LlmEvent>>>,
+        responses: std::sync::Mutex<VecDeque<ScriptedTurn>>,
         calls: std::sync::atomic::AtomicUsize,
         advertised_tools: std::sync::Mutex<Vec<Vec<String>>>,
         caps: Capabilities,
-        model: String,
+        models: Vec<std::sync::Arc<str>>,
+        active_model: std::sync::atomic::AtomicUsize,
     }
 
     impl ScriptedLlm {
@@ -920,13 +934,37 @@ mod tests {
         /// A scripted provider that reports the given model id — what a
         /// session's ModelChanged events and per-model usage rows observe.
         fn new_with_model(model: &str, responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self::new_gated(vec![model], responses.into_iter().map(|events| (None, events)).collect())
+        }
+
+        /// A scripted provider over a table of model names (see
+        /// [`ScriptedLlm::set_model`]) whose turns can be held inside
+        /// `complete` until the test releases them — the interleaving seam
+        /// for cross-session model-attribution tests.
+        fn new_gated(
+            models: Vec<&str>,
+            turns: Vec<(Option<tokio::sync::oneshot::Receiver<()>>, Vec<LlmEvent>)>,
+        ) -> Self {
             Self {
-                responses: std::sync::Mutex::new(responses.into()),
+                responses: std::sync::Mutex::new(
+                    turns
+                        .into_iter()
+                        .map(|(gate, events)| ScriptedTurn { gate, events })
+                        .collect(),
+                ),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 advertised_tools: std::sync::Mutex::new(Vec::new()),
                 caps: Capabilities::openai(),
-                model: model.to_string(),
+                models: models.into_iter().map(std::sync::Arc::from).collect(),
+                active_model: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Point `model()` at table entry `index` — the next request's
+        /// ModelChanged carries the new name.
+        fn set_model(&self, index: usize) {
+            self.active_model
+                .store(index, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn calls(&self) -> usize {
@@ -952,7 +990,7 @@ mod tests {
         }
 
         fn model(&self) -> &str {
-            &self.model
+            &self.models[self.active_model.load(std::sync::atomic::Ordering::SeqCst)]
         }
 
         async fn complete(
@@ -971,8 +1009,15 @@ mod tests {
                 .lock()
                 .expect("script lock poisoned")
                 .pop_front()
-                .unwrap_or_default();
-            Ok(Box::pin(futures::stream::iter(next)))
+                .map(|turn| (turn.gate, turn.events))
+                .unwrap_or((None, Vec::new()));
+            let (gate, events) = next;
+            if let Some(gate) = gate {
+                // Hold the request mid-turn: the session's ModelChanged is
+                // already on the bus, but its usage events are not.
+                let _ = gate.await;
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
@@ -1234,6 +1279,71 @@ mod tests {
         }
         let worker = team.worker(worker_id).await.expect("worker record");
         panic!("worker did not reach {status:?}: {worker:?}");
+    }
+
+    /// Poll until the worker's record carries the given observed model id
+    /// (the ModelChanged may land on the bus shortly after the turn ends).
+    async fn wait_for_worker_model(
+        team: &crate::mnemo2::team::TeamRuntime,
+        worker_id: &str,
+        model: &str,
+    ) -> crate::mnemo2::team::WorkerRecord {
+        for _ in 0..250 {
+            let worker = team.worker(worker_id).await.expect("worker record");
+            if worker.model_id.as_deref() == Some(model) {
+                return worker;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = team.worker(worker_id).await.expect("worker record");
+        panic!("worker did not observe '{model}': {worker:?}");
+    }
+    async fn wait_for_calls(llm: &Arc<ScriptedLlm>, expected: usize) {
+        for _ in 0..500 {
+            if llm.calls() >= expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "the provider only served {} of {expected} requests",
+            llm.calls()
+        );
+    }
+
+    /// One raw model row of the persisted usage accumulator, read from the
+    /// project ledger: `(prompt_tokens, cached_tokens, output_tokens)`.
+    fn ledger_usage_row(state_dir: &Path, model: &str) -> Option<(u64, u64, u64)> {
+        let ledger: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state_dir.join("team.json")).expect("ledger"),
+        )
+        .expect("ledger JSON");
+        let row = ledger["usage"]["models"][model].as_object()?;
+        Some((
+            row["prompt_tokens"].as_u64()?,
+            row["cached_tokens"].as_u64()?,
+            row["output_tokens"].as_u64()?,
+        ))
+    }
+
+    /// Poll until the persisted ledger carries the given raw model row —
+    /// the terminal refresh can surface a worker's Completed status a beat
+    /// before its own trailing usage report is folded and saved.
+    async fn wait_for_ledger_row(
+        state_dir: &Path,
+        model: &str,
+        expected: (u64, u64, u64),
+    ) {
+        for _ in 0..250 {
+            if ledger_usage_row(state_dir, model) == Some(expected) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "ledger row '{model}' never reached {expected:?}: {:?}",
+            ledger_usage_row(state_dir, model)
+        );
     }
 
     async fn next_event(rx: &mut broadcast::Receiver<LeadEvent>) -> LeadEvent {
@@ -1986,6 +2096,103 @@ mod tests {
             mystery_usage.unpriced_models,
             vec!["scripted-b".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn interleaved_model_changes_stay_with_their_own_session() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        // Two real vendor-priced models so the per-model cost proves the
+        // attribution: glm-5.3 (1.40/0.26/4.40) and deepseek-v4.1-flash:1017
+        // (0.30/0.006/1.20), no explicit pricing. The workers share one
+        // configured spec; their OBSERVED ids come from what the provider
+        // serves, which the test switches mid-run.
+        write_config(config.path(), &["scripted-a"]);
+        let (release_a1, held_a1) = tokio::sync::oneshot::channel::<()>();
+        let (release_a2, held_a2) = tokio::sync::oneshot::channel::<()>();
+        let (release_b1, held_b1) = tokio::sync::oneshot::channel::<()>();
+        // Index 0 = deepseek-v4.1-flash:1017, index 1 = glm-5.3; the test
+        // switches the shared provider between them mid-run so each
+        // worker's SECOND request resolves under a model that differs from
+        // its session's serve seed — the only way the engine emits a
+        // ModelChanged in a scripted-provider setup.
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["deepseek-v4.1-flash:1017", "glm-5.3"],
+            vec![
+                // A's first request: a kernel-tool call keeps A's turn alive
+                // for a second (held) request.
+                (Some(held_a1), tool_turn("read_file", r#"{"path":"README.md"}"#)),
+                // B's first request, held inside the provider.
+                (Some(held_b1), tool_turn("read_file", r#"{"path":"README.md"}"#)),
+                // A's second request: resolves under glm-5.3 (emitting A's
+                // own ModelChanged) and then holds while B's turn continues.
+                (Some(held_a2), usage_turn(100_000, 20_000, 30_000)),
+                // B's second request: resolves under deepseek-v4.1-flash:1017
+                // (emitting B's own ModelChanged) and completes.
+                (None, usage_turn(50_000, 10_000, 20_000)),
+            ],
+        ));
+        let (lead, team) = open_git_lead(&root, &config, &state, llm.clone()).await;
+
+        // A starts under deepseek (seeded and served — suppressed), then
+        // holds inside its first request.
+        let a = team
+            .dispatch("held task".into(), None)
+            .await
+            .expect("dispatch A");
+        wait_for_calls(&llm, 1).await;
+        // Switch the serving model BEFORE B starts, so B seeds glm-5.3.
+        llm.set_model(1);
+        let b = team
+            .dispatch("quick task".into(), None)
+            .await
+            .expect("dispatch B");
+        wait_for_calls(&llm, 2).await;
+
+        // A's second request resolves under glm-5.3 — emitting A's own
+        // ModelChanged, which sets A's observed model — and then holds, so
+        // A's usage stays pending while B's turn continues.
+        release_a1.send(()).expect("release A request 1");
+        wait_for_calls(&llm, 3).await;
+
+        // Switch back, then let B's turn continue: B's second request
+        // resolves under deepseek-v4.1-flash:1017 and its ModelChanged
+        // rides the engine-wide bus into A's pump — it must not re-point
+        // A's row.
+        llm.set_model(0);
+        release_b1.send(()).expect("release B request 1");
+        wait_for_worker_status(&team, &b.id, WorkerStatus::Completed).await;
+        wait_for_worker_model(&team, &b.id, "deepseek-v4.1-flash:1017").await;
+
+        // Release A: its held usage must still land under its own model.
+        release_a2.send(()).expect("release A request 2");
+        wait_for_worker_status(&team, &a.id, WorkerStatus::Completed).await;
+        let a = team.worker(&a.id).await.expect("worker A");
+        assert_eq!(
+            a.model_id.as_deref(),
+            Some("glm-5.3"),
+            "A's observed model must survive B's concurrent ModelChanged"
+        );
+
+        // Per-model raw rows in the persisted ledger prove the attribution:
+        // A's 100k/30k/20k under glm-5.3, B's 50k/20k/10k under the tag.
+        wait_for_ledger_row(state.path(), "glm-5.3", (100_000, 30_000, 20_000)).await;
+        wait_for_ledger_row(state.path(), "deepseek-v4.1-flash:1017", (50_000, 20_000, 10_000)).await;
+
+        // Aggregate cost: A at glm rates (70k*1.40 + 30k*0.26 + 20k*4.40 =
+        // 193,800) + B at deepseek rates (30k*0.30 + 20k*0.006 + 10k*1.20
+        // = 21,120). If A were misattributed to the deepseek row the total
+        // would be 66,300 instead.
+        let view = team.snapshot().await.usage;
+        assert_eq!(view.input_tokens, 100_000);
+        assert_eq!(view.cached_tokens, 50_000);
+        assert_eq!(view.output_tokens, 30_000);
+        assert_eq!(view.cost_micros, 193_800 + 21_120);
+        assert!(view.unpriced_models.is_empty());
+        lead.shutdown().await;
     }
 
     #[tokio::test]

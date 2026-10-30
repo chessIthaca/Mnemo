@@ -2245,8 +2245,15 @@ async fn pump_worker(
                         }
                     }
                     SerializableAgentEvent::ModelChanged { model, .. } => {
-                        worker.model_id = Some(model.clone());
-                        changed = true;
+                        // The engine's bus is engine-wide: only OUR
+                        // session's model change may re-point this
+                        // worker's observed model (and its next usage
+                        // row) — a concurrent worker's ModelChanged must
+                        // not cross into it.
+                        if event_session(&event) == Some(session_id) {
+                            worker.model_id = Some(model.clone());
+                            changed = true;
+                        }
                     }
                     SerializableAgentEvent::Usage {
                         prompt_tokens,

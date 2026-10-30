@@ -2,10 +2,10 @@
   "plans": [
     {
       "id": "b952eab4",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793315412638,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793321060622,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-b952eab4-20261030-004420.md",
       "abandon_reason": null
     }
   ]

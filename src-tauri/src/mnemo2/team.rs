@@ -181,6 +181,21 @@ pub struct WorkerRecord {
     /// concurrency, security, or large cross-cutting surfaces.
     #[serde(default = "default_review_risk")]
     pub review_risk: String,
+    /// The worker's role: `"implementation"` (default) or `"audit"`. Audit
+    /// workers are fresh read-only independent reviewers; they are never
+    /// reviewed, never merged, and carry no plan step.
+    #[serde(default = "default_worker_kind")]
+    pub kind: String,
+    /// The implementation worker this audit reviews (audit workers only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_target: Option<String>,
+    /// The exact implementation worker tip this audit inspected. A fix
+    /// commit moves the tip and makes this audit stale for the new tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_tip: Option<String>,
+    /// The lead-requested audit reasoning depth, when one was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Durable lead findings.
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -200,6 +215,11 @@ pub struct WorkerRecord {
 /// Legacy ledgers carry no review risk; they decode as `standard`.
 fn default_review_risk() -> String {
     "standard".to_string()
+}
+
+/// Legacy ledgers predate audit workers; they decode as `implementation`.
+fn default_worker_kind() -> String {
+    "implementation".to_string()
 }
 
 /// The team's public snapshot.
@@ -597,6 +617,13 @@ impl TeamRuntime {
                 timeout_ms: Some(10_000),
             },
             HostToolSpec {
+                name: "team_audit_dispatch".to_string(),
+                description: "Dispatch a fresh read-only independent audit of one implementation worker's current branch/tip for a high-risk review. The reviewer_id is a stable unique 8-64 ASCII letters/digits ID of your choosing; retry a timed-out dispatch with that same identity for the same worker and tip, and choose a new reviewer_id after any fix commit moves the tip. The audit receives the active plan, the worker's intent brief, and the target diff — never the worker's own summary or findings — and cannot edit files, commit, merge, spawn, ask the user, or tick plan steps. When it completes, link it through team_review's evidence.independent_reviewer_id and write an audit_adjudication; never merge the audit worker itself.".to_string(),
+                parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"reviewer_id":{"type":"string","minLength":8,"maxLength":64,"pattern":"^[A-Za-z0-9]+$"},"model":{"type":"string"},"reasoning_effort":{"type":"string","enum":["max","high","medium","low","minimal","none"]},"brief":{"type":"string"}},"required":["worker_id","reviewer_id"]}),
+                safety: SafetyLevel::AutoRun,
+                timeout_ms: Some(10_000),
+            },
+            HostToolSpec {
                 name: "team_message".to_string(),
                 description: "Send a message to a worker; a busy worker receives it as a steer.".to_string(),
                 parameters: json!({"type":"object","properties":{"worker_id":{"type":"string"},"text":{"type":"string"}},"required":["worker_id","text"]}),
@@ -723,6 +750,37 @@ impl TeamRuntime {
                 .await
                 .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
             return worker_result(result, "team_dispatch");
+        }
+        if name == "team_audit_dispatch" {
+            let Some(worker_id) = args.get("worker_id").and_then(Value::as_str) else {
+                return ToolResult::error("team_audit_dispatch requires a 'worker_id' string");
+            };
+            let Some(reviewer_id) = args.get("reviewer_id").and_then(Value::as_str) else {
+                return ToolResult::error("team_audit_dispatch requires a 'reviewer_id' string");
+            };
+            let model = args
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let reasoning_effort = args
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let brief = args
+                .get("brief")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let result = self
+                .audit_dispatch(
+                    worker_id,
+                    reviewer_id,
+                    model,
+                    reasoning_effort,
+                    brief,
+                )
+                .await
+                .map(|(worker, reused)| json!({"worker": worker, "reused": reused}));
+            return worker_result(result, "team_audit_dispatch");
         }
         if name == "team_status" {
             let result = match args.get("worker_id").and_then(Value::as_str) {
@@ -939,6 +997,227 @@ impl TeamRuntime {
         result.map(|worker| (worker, false))
     }
 
+    /// Dispatch one fresh read-only independent audit of an implementation
+    /// worker's current branch/tip.
+    ///
+    /// The audit reuses the tracked session/telemetry lifecycle: it gets its
+    /// own worktree checked out at the audited branch, its own ledger record
+    /// (`kind: "audit"`, no plan step), and the standard worker event pump.
+    /// Its opening brief carries the active plan, the lead's intent brief,
+    /// and the target diff — never the implementation worker's own summary,
+    /// findings, or review — and its tool selection is read-only by
+    /// construction: no file mutation, shell, git writes, spawning, user
+    /// questions, or plan-step ticks.
+    ///
+    /// Idempotency: retrying the same `reviewer_id` for the same worker and
+    /// the same tip reuses (and restarts, when needed) the existing audit;
+    /// a moved tip needs a fresh `reviewer_id` so the next audit has fresh
+    /// context.
+    pub async fn audit_dispatch(
+        &self,
+        worker_id: &str,
+        reviewer_id: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        brief: Option<String>,
+    ) -> Result<(WorkerRecord, bool), String> {
+        let _guard = self.merge_lock.lock().await;
+        validate_worker_id(reviewer_id)?;
+        if let Some(effort) = reasoning_effort.as_deref() {
+            if !matches!(effort, "max" | "high" | "medium" | "low" | "minimal" | "none") {
+                return Err(format!(
+                    "reasoning_effort '{effort}' is not one of max/high/medium/low/minimal/none"
+                ));
+            }
+        }
+        let target = self.worker(worker_id).await?;
+        if target.kind != "implementation" {
+            return Err(format!(
+                "worker '{worker_id}' is not an implementation worker; only implementation work is audited"
+            ));
+        }
+        if matches!(target.status, WorkerStatus::Merged | WorkerStatus::Merging) {
+            return Err("a merged worker no longer needs an audit; its review already landed".to_string());
+        }
+        if self.worker_is_busy(worker_id).await {
+            return Err("the implementation worker must be idle before audit dispatch".to_string());
+        }
+        let tip = self.worker_tip(&target).await?;
+        // Reuse semantics: the same reviewer may be retried for the same
+        // worker at the same tip; a moved tip needs a fresh reviewer id so
+        // the stale audit cannot be relinked at the new tip.
+        {
+            let existing = {
+                let records = self.records.lock().await;
+                records
+                    .iter()
+                    .find(|worker| worker.id == reviewer_id)
+                    .cloned()
+            };
+            if let Some(existing) = existing {
+                if existing.kind != "audit" {
+                    return Err(format!(
+                        "worker '{reviewer_id}' already exists as an implementation worker; choose a different reviewer_id"
+                    ));
+                }
+                if existing.audit_target.as_deref() != Some(worker_id) {
+                    return Err(format!(
+                        "audit worker '{reviewer_id}' already reviews another implementation worker; choose a different reviewer_id"
+                    ));
+                }
+                if existing.audit_tip.as_deref() != Some(tip.as_str()) {
+                    return Err(format!(
+                        "audit worker '{reviewer_id}' inspected an older tip of worker '{worker_id}'; the fix commit moved the tip — dispatch a fresh audit with a new reviewer_id"
+                    ));
+                }
+                self.validate_model(&existing.model)?;
+                if !existing.brief_sent
+                    && !self.live.lock().await.contains_key(reviewer_id)
+                    && matches!(
+                        existing.status,
+                        WorkerStatus::Dispatching | WorkerStatus::Failed | WorkerStatus::Interrupted
+                    )
+                {
+                    if !existing.worktree.is_dir() {
+                        return Err(format!(
+                            "audit worker '{reviewer_id}' has no recoverable worktree"
+                        ));
+                    }
+                    return self
+                        .start_worker(existing)
+                        .await
+                        .map(|worker| (worker, true));
+                }
+                return Ok((existing, true));
+            }
+        }
+        self.validate_model(&model)?;
+        let branch = agent_branch(reviewer_id);
+        if self
+            .records
+            .lock()
+            .await
+            .iter()
+            .any(|worker| worker.branch == branch)
+        {
+            return Err(format!("reviewer ID prefix collides with an existing {branch}"));
+        }
+        // The audit reviews a plan's change: the active plan document is its
+        // context, alongside the lead's intent and the target diff.
+        let (plan_id, plan_doc) = active_plan_document(&self.workspace_root)?;
+        let audit_brief = audit_brief_text(
+            &self.workspace_root,
+            &target,
+            &tip,
+            &plan_id,
+            &plan_doc,
+            brief.as_deref(),
+            reasoning_effort.as_deref(),
+        )
+        .await?;
+        let used = self.spawns_this_turn.fetch_add(1, Ordering::SeqCst);
+        if used >= self.max_spawns_per_turn {
+            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!(
+                "the lead already delegated {} worker(s) this turn",
+                self.max_spawns_per_turn
+            ));
+        }
+        let active = self.live.lock().await.len();
+        let slots = self.persistence.slots.load(Ordering::SeqCst);
+        if active >= slots {
+            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
+            return Err(format!("all {slots} worker slots are busy"));
+        }
+        // The audit worktree checks out the audited branch itself so the
+        // reviewer reads the exact tree it is auditing.
+        let (worktree, branch_created) =
+            provision_agent_worktree(self.workspace_root.clone(), reviewer_id.to_string(), target.branch.clone())
+                .await
+                .map_err(|err| format!("could not provision the audit worktree: {err}"))?;
+        let base_tip = phase3::tip(&worktree).await?;
+        let millis = phase3::now_ms();
+        let record = WorkerRecord {
+            id: reviewer_id.to_string(),
+            name: format!("Audit {}", agent_short_id(reviewer_id)),
+            brief: audit_brief,
+            model,
+            model_id: None,
+            branch: branch_created,
+            worktree,
+            status: WorkerStatus::Dispatching,
+            generation: 0,
+            transcript: Transcript::default(),
+            pending: None,
+            used_tokens: 0,
+            max_tokens: 0,
+            brief_sent: false,
+            compacting: false,
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            requests: 0,
+            cost_micros: None,
+            created_at_ms: millis,
+            elapsed_ms: 0,
+            turns: 0,
+            last_activity_ms: millis,
+            checks: Vec::new(),
+            review_risk: "standard".to_string(),
+            kind: "audit".to_string(),
+            audit_target: Some(worker_id.to_string()),
+            audit_tip: Some(tip),
+            reasoning_effort,
+            findings: Vec::new(),
+            review: None,
+            fixer_finding_id: None,
+            merge: None,
+            error: None,
+        };
+        let result = self.start_audit_worker(record, base_tip).await;
+        if result.is_err() {
+            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
+        }
+        result.map(|worker| (worker, false))
+    }
+
+    /// Provision and start one audit worker record (the audit counterpart of
+    /// [`TeamRuntime::provision_worker`]).
+    async fn start_audit_worker(
+        &self,
+        record: WorkerRecord,
+        base_tip: String,
+    ) -> Result<WorkerRecord, String> {
+        let id = record.id.clone();
+        self.records.lock().await.push(record.clone());
+        if let Err(err) = self.persist().await {
+            self.records.lock().await.retain(|worker| worker.id != id);
+            let rollback = mnemo::app::worktrees::rollback_agent_worktree(
+                self.workspace_root.clone(),
+                id.clone(),
+                base_tip,
+            )
+            .await;
+            return Err(match rollback {
+                Ok(()) => err,
+                Err(rollback) => {
+                    let error = format!(
+                        "{err}; audit worker '{id}' retains its checkout because rollback was refused: {rollback}"
+                    );
+                    self.records.lock().await.push(WorkerRecord {
+                        status: WorkerStatus::Failed,
+                        error: Some(error.clone()),
+                        ..record
+                    });
+                    let _ = self.persist().await;
+                    error
+                }
+            });
+        }
+        self.start_worker(record).await
+    }
+
     fn validate_model(&self, model: &Option<String>) -> Result<(), String> {
         if let Some(spec) = model {
             if !self.model_specs.iter().any(|configured| configured == spec) {
@@ -1003,6 +1282,10 @@ impl TeamRuntime {
             last_activity_ms: millis,
             checks: Vec::new(),
             review_risk,
+            kind: "implementation".to_string(),
+            audit_target: None,
+            audit_tip: None,
+            reasoning_effort: None,
             findings: Vec::new(),
             review: None,
             fixer_finding_id: None,
@@ -1060,6 +1343,7 @@ impl TeamRuntime {
                 record.model.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
+                record.kind.as_str(),
             )
             .await
         {
@@ -1131,6 +1415,7 @@ impl TeamRuntime {
         model: Option<String>,
         worktree: PathBuf,
         resume: Option<Transcript>,
+        kind: &str,
     ) -> Result<AgentSession, String> {
         self.engine
             .spawn(SpawnOptions {
@@ -1143,7 +1428,7 @@ impl TeamRuntime {
                 limits: None,
                 host_tools: self.worker_host_tools(),
                 external_policy: None,
-                guardrails: Some(executor_guardrails()),
+                guardrails: Some(guardrails_for(kind)),
             })
             .await
             .map_err(|err| format!("could not spawn the worker session: {err}"))
@@ -1344,6 +1629,7 @@ impl TeamRuntime {
                 record.model.clone(),
                 record.worktree.clone(),
                 Some(record.transcript.clone()),
+                record.kind.as_str(),
             )
             .await?;
         let session_id = session.id();
@@ -1476,9 +1762,9 @@ impl TeamRuntime {
     ///
     /// Every new review carries complete structured evidence: an unanchored
     /// diff pass plus substantive intent, execution, integration, test-quality,
-    /// and residual-risk assessments. Independent-audit linkage becomes
-    /// mandatory for high-risk reviews once `team_audit_dispatch` lands
-    /// (plan step 4).
+    /// and residual-risk assessments. High-risk reviews additionally require a
+    /// completed fresh independent audit (`independent_reviewer_id` plus a
+    /// written `audit_adjudication`) linked at the exact reviewed tip.
     pub async fn review(
         &self,
         worker_id: &str,
@@ -1490,9 +1776,18 @@ impl TeamRuntime {
         if summary.trim().is_empty() {
             return Err("the review summary is empty".to_string());
         }
-        phase3::validate_review_evidence(&evidence, false)?;
-        phase3::validate_findings(&findings)?;
         let worker = self.worker(worker_id).await?;
+        if worker.kind == "audit" {
+            return Err(
+                "an audit worker is a read-only reviewer and is not reviewed; adjudicate it by recording team_review on its implementation worker with independent_reviewer_id".to_string(),
+            );
+        }
+        // High-risk reviews require a completed, fresh independent audit at
+        // the exact reviewed tip; every linked reviewer is validated against
+        // the live ledger so a stale or foreign audit can never be attached.
+        let require_audit = worker.review_risk == "high";
+        phase3::validate_review_evidence(&evidence, require_audit)?;
+        phase3::validate_findings(&findings)?;
         if matches!(worker.status, WorkerStatus::Merged | WorkerStatus::Merging) {
             return Err("a merged worker cannot be reviewed again".to_string());
         }
@@ -1503,6 +1798,8 @@ impl TeamRuntime {
             return Err("the worker must be idle before review".to_string());
         }
         let tip = self.worker_tip(&worker).await?;
+        let records = self.records.lock().await.clone();
+        validate_audit_linkage(&records, &evidence, worker_id, &tip)?;
         let was_cancelled = worker.status == WorkerStatus::Cancelled;
         self.update_worker(worker_id, |worker| {
             worker.status = if was_cancelled {
@@ -1775,9 +2072,15 @@ impl TeamRuntime {
         }
         phase3::require_clean(&self.workspace_root, "lead").await?;
         let worker = self.worker(worker_id).await?;
+        if worker.kind == "audit" {
+            return Err(
+                "an audit worker is a read-only reviewer and is never merged; adjudicate it on its implementation worker's review".to_string(),
+            );
+        }
         phase3::require_clean(&worker.worktree, "worker").await?;
         let tip = phase3::tip(&worker.worktree).await?;
-        validate_merge(&worker, &tip)?;
+        let records = self.records.lock().await.clone();
+        validate_merge(&worker, &tip, &records)?;
         let previous = worker.clone();
         self.update_worker(worker_id, |worker| worker.status = WorkerStatus::Merging)
             .await;
@@ -2829,7 +3132,7 @@ fn require_acceptance_scenarios(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_merge(worker: &WorkerRecord, tip: &str) -> Result<(), String> {
+fn validate_merge(worker: &WorkerRecord, tip: &str, records: &[WorkerRecord]) -> Result<(), String> {
     if worker.status != WorkerStatus::InReview {
         return Err(format!("worker is {:?}, not in review", worker.status));
     }
@@ -2847,10 +3150,13 @@ fn validate_merge(worker: &WorkerRecord, tip: &str) -> Result<(), String> {
         "the review predates structured evidence; re-review the current worker tip with a complete evidence object"
             .to_string()
     })?;
-    // High-risk merges will additionally require the independent audit once
-    // `team_audit_dispatch` lands (plan step 4); every merge keeps the base
-    // evidence contract for now.
-    phase3::validate_review_evidence(evidence, false)?;
+    // High-risk merges additionally require a completed, fresh, read-only
+    // audit linked to this exact tip plus a written lead adjudication. Any
+    // fix commit moved the tip and made the previous audit stale — this gate
+    // blocks the merge until a fresh audit ran at the new tip.
+    let require_audit = worker.review_risk == "high";
+    phase3::validate_review_evidence(evidence, require_audit)?;
+    validate_audit_linkage(records, evidence, &worker.id, tip)?;
     if let Some(finding) = worker
         .findings
         .iter()
@@ -2924,6 +3230,241 @@ fn executor_guardrails() -> Guardrails {
         question_policy: QuestionPolicy::Deny,
         turn_end: TurnEndPolicy::Stop,
     }
+}
+
+/// Guardrails for one worker kind: executors keep the coding surface, audit
+/// workers are read-only independent reviewers.
+fn guardrails_for(kind: &str) -> Guardrails {
+    if kind == "audit" {
+        audit_guardrails()
+    } else {
+        executor_guardrails()
+    }
+}
+
+/// The Mnemo2 independent-audit identity: a fresh read-only reviewer that
+/// never touches lifecycle state.
+pub(crate) fn audit_prompt() -> PromptSpec {
+    PromptSpec {
+        identity: concat!(
+            "You are a Mnemo2 independent audit worker. You did not implement the change under ",
+            "review; form your own opinion from the plan, the brief, and the diff alone — never ",
+            "from the implementer's claims. You are read-only by construction: you cannot edit ",
+            "files, run shell commands, commit, merge, push, spawn work, ask the user, or tick ",
+            "plan steps. Audit correctness, error handling, integration with neighbouring ",
+            "contracts, persistence, concurrency, security, and test quality against the plan's ",
+            "intent and acceptance scenarios. Report findings with file/line evidence through ",
+            "message_parent, then end your turn; the lead adjudicates your audit on the ",
+            "implementation worker's review. Never merge, never mutate files, and never use ",
+            "Git or files as lifecycle status."
+        )
+        .to_string(),
+        blocks: Vec::new(),
+        extra_stable: None,
+        constitution: ConstitutionMode::Both,
+    }
+}
+
+/// The audit surface: every read tool (files, search, graph, git_read, web,
+/// memory reads) with all mutation paths excluded — no file writes, no
+/// shell, no git writes, no spawning, no user questions, no plan-board or
+/// step ticks, and no durable-memory mutations (writes, amendments, or
+/// consolidation).
+fn audit_guardrails() -> Guardrails {
+    let mut tools = ToolSelection::all();
+    tools.exclude = vec![
+        "create_plan".to_string(),
+        "update_plan".to_string(),
+        "finish".to_string(),
+        "spawn_agent".to_string(),
+        "ask_user".to_string(),
+        "file_edit".to_string(),
+        "file_write".to_string(),
+        "multi_edit".to_string(),
+        "convert_line_endings".to_string(),
+        "shell".to_string(),
+        "git".to_string(),
+        "memory_write".to_string(),
+        "memory_amend".to_string(),
+        "memory_update".to_string(),
+        "memory_supersede".to_string(),
+        "memory_delete".to_string(),
+        "memory_consolidate".to_string(),
+        "complete_step".to_string(),
+        "abandon_plan".to_string(),
+    ];
+    Guardrails {
+        prompt: Some(audit_prompt()),
+        tools,
+        route: vec!["free".to_string()],
+        limits: Some(executor_limits()),
+        gate_rules: Vec::new(),
+        question_policy: QuestionPolicy::Deny,
+        turn_end: TurnEndPolicy::Stop,
+    }
+}
+
+/// Load the lead's active plan document: `(plan id, markdown body)`.
+fn active_plan_document(root: &Path) -> Result<(String, String), String> {
+    let plans_dir = root.join(".coding/plans");
+    let stack = std::fs::read_to_string(plans_dir.join("stack.json")).map_err(|_| {
+        "no active plan was found in .coding/plans/stack.json; audits review a plan's change — activate the plan first".to_string()
+    })?;
+    let stack: PlanStack = serde_json::from_str(&stack).map_err(|_| {
+        ".coding/plans/stack.json is unreadable; fix the plan stack before dispatching an audit".to_string()
+    })?;
+    let id = stack
+        .stack
+        .last()
+        .ok_or_else(|| "the plan stack is empty; audits review a plan's change — activate the plan first".to_string())?
+        .clone();
+    let doc = std::fs::read_to_string(plans_dir.join(format!("{id}.md")))
+        .map_err(|_| format!("plan '{id}' has no readable document at .coding/plans/{id}.md"))?;
+    Ok((id, doc))
+}
+
+/// Cap one brief section, keeping the cut visible to the reviewer.
+fn truncate_for_brief(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[truncated — {end} of {} bytes shown; read the remainder in your checkout at the audited tip]",
+        &text[..end],
+        text.len()
+    )
+}
+
+/// Build the audit worker's opening brief: the plan context, the lead's
+/// intent brief, and the target diff. It never includes the implementation
+/// worker's own summary, findings, or review — the reviewer starts
+/// unanchored to the implementer's conclusions.
+async fn audit_brief_text(
+    root: &Path,
+    target: &WorkerRecord,
+    tip: &str,
+    plan_id: &str,
+    plan_doc: &str,
+    lead_instructions: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Result<String, String> {
+    let merge_base = phase3::git_value(root, &["merge-base", "HEAD", tip])
+        .await
+        .map_err(|err| format!("could not compute the audit's diff base: {err}"))?;
+    let log = phase3::git_value(root, &["log", "--oneline", &format!("{merge_base}..{tip}")])
+        .await
+        .unwrap_or_default();
+    let stat = phase3::git_value(root, &["diff", "--stat", &merge_base, tip])
+        .await
+        .unwrap_or_default();
+    let diff = truncate_for_brief(
+        &phase3::git_value(root, &["diff", &merge_base, tip])
+            .await
+            .unwrap_or_default(),
+        48_000,
+    );
+    let mut text = String::new();
+    text.push_str("# Independent read-only audit\n\n");
+    text.push_str(
+        "You are a Mnemo2 independent audit worker. You did not implement this change; form your own opinion from the plan and the diff alone. You are read-only by construction: you cannot edit files, run shell commands, commit, merge, push, spawn work, ask the user, or tick plan steps. Do not try.\n\n",
+    );
+    text.push_str(&format!(
+        "Implementation worker: {} ({}), branch `{}`, audited tip `{tip}`.\n\n",
+        target.name, target.id, target.branch
+    ));
+    if let Some(effort) = reasoning_effort {
+        text.push_str(&format!(
+            "Lead-requested reasoning depth: {effort}. Plan the depth of your audit accordingly.\n\n"
+        ));
+    }
+    text.push_str("## The lead's brief to the implementation worker (intent — not a summary of what was done)\n\n");
+    text.push_str(&target.brief);
+    text.push_str("\n\n");
+    if let Some(instructions) = lead_instructions.filter(|value| !value.trim().is_empty()) {
+        text.push_str("## Additional lead audit instructions\n\n");
+        text.push_str(instructions);
+        text.push_str("\n\n");
+    }
+    text.push_str(&format!(
+        "## Plan context — active plan `{plan_id}`\n\n```markdown\n{plan_doc}\n```\n\n"
+    ));
+    text.push_str(&format!(
+        "## Target diff `{merge_base}..{tip}`\n\n### Commits\n\n```\n{log}\n```\n\n### Stat\n\n```\n{stat}\n```\n\n### Full diff\n\n```diff\n{diff}\n```\n\n"
+    ));
+    text.push_str(
+        "## Your task\n\nAudit the change against the plan's intent and its acceptance scenarios where present: correctness of the real execution path, error handling, integration with neighbouring contracts and persistence, concurrency and security interactions, and whether the tests genuinely exercise the change (a passing count alone is insufficient). Report every finding with file/line evidence through message_parent, then end your turn. Never merge, never modify files, never tick plan steps; the lead adjudicates your audit on the implementation worker's review.\n",
+    );
+    Ok(text)
+}
+
+/// Validate the review's independent-audit linkage against the live ledger.
+///
+/// Any linked reviewer must be a completed audit worker that targets this
+/// worker at exactly this tip: a fix commit moves the tip and makes the
+/// previous audit stale, blocking review and merge until a fresh audit ran
+/// at the new tip. Linking a reviewer also requires a written lead
+/// adjudication of its findings.
+fn validate_audit_linkage(
+    records: &[WorkerRecord],
+    evidence: &ReviewEvidence,
+    worker_id: &str,
+    tip: &str,
+) -> Result<(), String> {
+    let Some(reviewer_id) = evidence
+        .independent_reviewer_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    if evidence
+        .audit_adjudication
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        return Err(
+            "linking an independent audit requires a written audit_adjudication of its findings"
+                .to_string(),
+        );
+    }
+    let audit = records
+        .iter()
+        .find(|record| record.id == reviewer_id)
+        .ok_or_else(|| {
+            format!(
+                "independent reviewer '{reviewer_id}' is not a tracked worker; dispatch one with team_audit_dispatch first"
+            )
+        })?;
+    if audit.kind != "audit" {
+        return Err(format!(
+            "independent reviewer '{reviewer_id}' is an implementation worker, not a read-only audit worker"
+        ));
+    }
+    if audit.audit_target.as_deref() != Some(worker_id) {
+        return Err(format!(
+            "audit worker '{reviewer_id}' reviews '{}' rather than worker '{worker_id}'",
+            audit.audit_target.as_deref().unwrap_or("(none)")
+        ));
+    }
+    if audit.audit_tip.as_deref() != Some(tip) {
+        return Err(format!(
+            "the audit worker '{reviewer_id}' inspected tip '{}' but worker '{worker_id}' is now at tip '{tip}'; the audit is stale — dispatch a fresh audit with team_audit_dispatch at the current tip",
+            audit.audit_tip.as_deref().unwrap_or("(none)")
+        ));
+    }
+    if !matches!(audit.status, WorkerStatus::Completed | WorkerStatus::Stopped) {
+        return Err(format!(
+            "the audit worker '{reviewer_id}' is {:?}, not completed; let it finish before linking it",
+            audit.status
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3205,27 +3746,176 @@ mod tests {
         // A summary plus passing checks alone can no longer merge: the
         // legacy-shaped review (evidence absent) is rejected.
         let unevidenced = in_review_worker(None);
-        let error = validate_merge(&unevidenced, "tip0001")
+        let error = validate_merge(&unevidenced, "tip0001", &[])
             .expect_err("a legacy review must not merge without fresh evidence");
         assert!(error.contains("structured evidence"), "{error}");
 
         // An anchored-only pass is not substantive either.
         let mut unanchored = evidence();
         unanchored.unanchored_pass = false;
-        let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001")
+        let rejected = validate_merge(&in_review_worker(Some(unanchored)), "tip0001", &[])
             .expect_err("unanchored evidence must not merge");
         assert!(rejected.contains("unanchored"), "{rejected}");
 
         // Empty assessments are rejected.
         let mut empty_intent = evidence();
         empty_intent.intent = "  ".into();
-        let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001")
+        let empty = validate_merge(&in_review_worker(Some(empty_intent)), "tip0001", &[])
             .expect_err("empty intent must not merge");
         assert!(empty.contains("intent"), "{empty}");
 
-        // Complete evidence passes the gate.
-        validate_merge(&in_review_worker(Some(evidence())), "tip0001")
+        // Complete evidence passes the gate for standard-risk work.
+        validate_merge(&in_review_worker(Some(evidence())), "tip0001", &[])
             .expect("complete evidence merges");
+    }
+
+    /// One audit-worker record for linkage tests.
+    fn audit_worker(status: WorkerStatus, target: &str, tip: &str) -> WorkerRecord {
+        let mut worker = cleanup_worker(
+            "auditor0001",
+            "wt/agent-auditor0001",
+            Path::new("unused"),
+            status,
+        );
+        worker.kind = "audit".into();
+        worker.audit_target = Some(target.into());
+        worker.audit_tip = Some(tip.into());
+        worker
+    }
+
+    #[test]
+    fn legacy_workers_decode_as_implementation_kind_without_audit_fields() {
+        let mut worker = in_review_worker(Some(evidence()));
+        worker.kind = "implementation".into();
+        worker.audit_target = None;
+        worker.audit_tip = None;
+        // A phase-three ledger written before audits has none of the new
+        // fields serialized; it must decode as a plain implementation worker.
+        let legacy = json!({
+            "id": "00000001000000000001",
+            "name": "Worker 00000001",
+            "brief": "implement the task",
+            "model": "test/scripted-a",
+            "model_id": "scripted-a",
+            "branch": "wt/agent-00000001000000000001",
+            "worktree": "",
+            "status": "in_review",
+            "generation": 0,
+            "transcript": { "messages": [] },
+            "used_tokens": 0,
+            "max_tokens": 0,
+            "brief_sent": true,
+            "compacting": false,
+            "created_at_ms": 1,
+            "elapsed_ms": 1,
+            "turns": 1,
+            "last_activity_ms": 1,
+            "checks": [],
+            "findings": [],
+        });
+        let restored: WorkerRecord =
+            serde_json::from_value(legacy).expect("pre-audit ledger decodes");
+        assert_eq!(restored.kind, "implementation");
+        assert!(restored.audit_target.is_none());
+        assert!(restored.audit_tip.is_none());
+        assert!(restored.reasoning_effort.is_none());
+        // A modern audit record keeps its fields through a round-trip.
+        let audit = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001");
+        let audit_value = serde_json::to_value(&audit).expect("audit JSON");
+        assert!(audit_value.get("kind").and_then(Value::as_str) == Some("audit"));
+        let restored_audit: WorkerRecord =
+            serde_json::from_value(audit_value).expect("audit worker round-trips");
+        assert_eq!(restored_audit.kind, "audit");
+        assert_eq!(restored_audit.audit_target.as_deref(), Some("evidence0001"));
+        assert_eq!(restored_audit.audit_tip.as_deref(), Some("tip0001"));
+    }
+
+    #[test]
+    fn high_risk_merge_gate_requires_a_fresh_completed_audit() {
+        let records_empty: Vec<WorkerRecord> = Vec::new();
+
+        // High-risk work cannot merge on the lead's evidence alone.
+        let mut high = in_review_worker(Some(evidence()));
+        high.review_risk = "high".into();
+        let missing = validate_merge(&high, "tip0001", &records_empty)
+            .expect_err("high-risk work needs an independent audit");
+        assert!(
+            missing.contains("high-risk reviews require an independent reviewer"),
+            "{missing}"
+        );
+
+        // A linked adjudication without the tracked audit is refused.
+        let mut untracked_evidence = evidence();
+        untracked_evidence.independent_reviewer_id = Some("auditor0001".into());
+        untracked_evidence.audit_adjudication = Some("accepted".into());
+        let mut untracked_worker = in_review_worker(Some(untracked_evidence));
+        untracked_worker.review_risk = "high".into();
+        let untracked = validate_merge(&untracked_worker, "tip0001", &records_empty)
+            .expect_err("the linked reviewer must be a tracked worker");
+        assert!(untracked.contains("not a tracked worker"), "{untracked}");
+
+        // Linking a tracked implementation worker is refused: only
+        // read-only audit workers may be linked.
+        let mut implementer = cleanup_worker(
+            "auditor0001",
+            "wt/agent-auditor0001",
+            Path::new("unused"),
+            WorkerStatus::Completed,
+        );
+        implementer.kind = "implementation".into();
+        let wrong_kind = validate_merge(&untracked_worker, "tip0001", &[implementer])
+            .expect_err("an implementation worker is not an independent audit");
+        assert!(wrong_kind.contains("not a read-only audit worker"), "{wrong_kind}");
+
+        // An audit still working cannot be linked.
+        let mut live = audit_worker(WorkerStatus::Working, "evidence0001", "tip0001");
+        live.status = WorkerStatus::Working;
+        let incomplete = validate_merge(&untracked_worker, "tip0001", &[live])
+            .expect_err("an unfinished audit must not merge");
+        assert!(incomplete.contains("not completed"), "{incomplete}");
+
+        // An audit of another worker is refused.
+        let foreign = audit_worker(WorkerStatus::Completed, "other0001", "tip0001");
+        let mismatched = validate_merge(&untracked_worker, "tip0001", &[foreign])
+            .expect_err("a foreign audit must not link");
+        assert!(mismatched.contains("reviews 'other0001'"), "{mismatched}");
+
+        // An audit at an older tip is stale after a fix commit moved it.
+        let stale = audit_worker(WorkerStatus::Completed, "evidence0001", "tip0000");
+        let stale_error = validate_merge(&untracked_worker, "tip0001", &[stale])
+            .expect_err("a stale audit must block the merge");
+        assert!(stale_error.contains("stale"), "{stale_error}");
+
+        // Linkage without a written adjudication is refused even for
+        // standard-risk work.
+        let mut unadjudicated = evidence();
+        unadjudicated.independent_reviewer_id = Some("auditor0001".into());
+        unadjudicated.audit_adjudication = None;
+        let standard = in_review_worker(Some(unadjudicated));
+        let unadjudicated_error = validate_merge(
+            &standard,
+            "tip0001",
+            &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        )
+        .expect_err("linking an audit requires an adjudication");
+        assert!(
+            unadjudicated_error.contains("audit_adjudication"),
+            "{unadjudicated_error}"
+        );
+
+        // A completed audit at the exact merge tip plus a written
+        // adjudication merges.
+        let mut adjudicated = evidence();
+        adjudicated.independent_reviewer_id = Some("auditor0001".into());
+        adjudicated.audit_adjudication = Some("accepted".into());
+        let mut reviewed = in_review_worker(Some(adjudicated));
+        reviewed.review_risk = "high".into();
+        validate_merge(
+            &reviewed,
+            "tip0001",
+            &[audit_worker(WorkerStatus::Completed, "evidence0001", "tip0001")],
+        )
+        .expect("a fresh completed audit with an adjudication merges");
     }
 
     #[test]

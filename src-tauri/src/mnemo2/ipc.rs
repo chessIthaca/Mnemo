@@ -509,6 +509,23 @@ pub async fn team_dispatch(
         .await
 }
 
+/// Dispatch a fresh read-only independent audit of one worker's current tip.
+#[tauri::command]
+pub async fn team_audit_dispatch(
+    state: State<'_, Mnemo2State>,
+    worker_id: String,
+    reviewer_id: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    brief: Option<String>,
+) -> Result<WorkerRecord, String> {
+    current_team(&state)
+        .await?
+        .audit_dispatch(&worker_id, &reviewer_id, model, reasoning_effort, brief)
+        .await
+        .map(|(worker, _reused)| worker)
+}
+
 /// Send a lead message to a worker.
 #[tauri::command]
 pub async fn team_message(

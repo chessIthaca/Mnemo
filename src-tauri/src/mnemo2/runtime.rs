@@ -702,6 +702,20 @@ async fn pump_team_notifications(
                     format!("{} failed: {error}", worker.name),
                 )
             }
+            SerializableAgentEvent::Finished { .. } if worker.kind == "audit" => {
+                // Audit completions surface as an explicit adjudication
+                // request for the target review — implementation workers
+                // keep the message-driven flow unchanged.
+                let target = worker.audit_target.clone().unwrap_or_default();
+                let tip = worker.audit_tip.as_deref().unwrap_or("(unknown)");
+                (
+                    format!("{}:{}:finished", worker.id, event.generation),
+                    format!(
+                        "{} ({}) finished its read-only audit of worker {} at tip {}. Adjudicate the audit: record team_review on {} with independent_reviewer_id='{}' and a written audit_adjudication. Never merge the audit worker itself.",
+                        worker.name, worker.id, target, tip, target, worker.id
+                    ),
+                )
+            }
             _ => continue,
         };
         if notified.contains(&key) {
@@ -1225,6 +1239,37 @@ mod tests {
         (lead, team)
     }
 
+    /// [`open_git_team`] with configurable concurrency: audit flows need
+    /// more than one delegated spawn per lead turn.
+    async fn open_git_team_spawns(
+        root: &TempDir,
+        config: &TempDir,
+        state: &TempDir,
+        llm: Arc<dyn LlmClient>,
+        slots: usize,
+        max_spawns_per_turn: usize,
+    ) -> (LeadRuntime, crate::mnemo2::team::TeamRuntime) {
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let lead = LeadRuntime::open_inner(options(root, config, state), Some(llm))
+            .await
+            .expect("lead opens");
+        let team =
+            crate::mnemo2::team::TeamRuntime::open(crate::mnemo2::team::TeamRuntimeOptions {
+                engine: lead.engine_handle().await.expect("engine"),
+                workspace_root: root.path().to_path_buf(),
+                state_dir: state.path().to_path_buf(),
+                slots: Some(slots),
+                max_spawns_per_turn,
+                model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
+                pricing: Vec::new(),
+            })
+            .await
+            .expect("team opens");
+        (lead, team)
+    }
+
     /// Write a config whose `endpoints.toml` also carries explicit
     /// `[[pricing]]` rows: `(model, input, cached, output)` per 1M tokens.
     fn write_config_with_pricing(
@@ -1284,7 +1329,9 @@ mod tests {
         worker_id: &str,
         status: crate::mnemo2::team::WorkerStatus,
     ) -> crate::mnemo2::team::WorkerRecord {
-        for _ in 0..100 {
+        // Generous budget: under the parallel test-suite load a spawned
+        // session's first provider request can take seconds to start.
+        for _ in 0..500 {
             let worker = team.worker(worker_id).await.expect("worker record");
             if worker.status == status {
                 return worker;
@@ -3307,11 +3354,17 @@ mod tests {
         let root = tempfile::tempdir().expect("workspace");
         let config = tempfile::tempdir().expect("config");
         let state = tempfile::tempdir().expect("state");
-        let (lead, team) = open_git_team(
+        let (lead, team) = open_git_team_spawns(
             &root,
             &config,
             &state,
-            Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])])),
+            Arc::new(ScriptedLlm::new(vec![
+                text_turn(&["done"]),
+                text_turn(&["audit findings: none"]),
+                text_turn(&["acknowledged"]),
+            ])),
+            2,
+            4,
         )
         .await;
 
@@ -3468,8 +3521,9 @@ mod tests {
         assert!(!empty.success);
         assert!(empty.output.contains("intent"), "{}", empty.output);
 
-        // Complete evidence reviews the exact tip and enables merge.
-        let reviewed = team
+        // Complete evidence alone no longer merges high-risk work: the
+        // review is refused until a fresh independent audit is linked.
+        let unaudited = team
             .handle_lead_host_tool(
                 "team_review",
                 serde_json::json!({
@@ -3477,6 +3531,110 @@ mod tests {
                     "summary": "reviewed",
                     "findings": [],
                     "evidence": review_evidence()
+                }),
+            )
+            .await;
+        assert!(!unaudited.success);
+        assert!(
+            unaudited
+                .output
+                .contains("high-risk reviews require an independent reviewer"),
+            "{}",
+            unaudited.output
+        );
+
+        // team_audit_dispatch provisions a read-only audit at the worker's
+        // exact current tip, with plan context and no implementer claims.
+        let audited = team
+            .handle_lead_host_tool(
+                "team_audit_dispatch",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "reviewer_id": "auditor01",
+                    "reasoning_effort": "high",
+                    "brief": "focus on concurrency"
+                }),
+            )
+            .await;
+        assert!(audited.success, "{}", audited.output);
+        let receipt: serde_json::Value =
+            serde_json::from_str(&audited.output).expect("JSON receipt");
+        assert_eq!(receipt.pointer("/result/reused").and_then(|value| value.as_bool()), Some(false));
+        let audit = team.worker("auditor01").await.expect("audit record");
+        assert_eq!(audit.kind, "audit");
+        assert_eq!(audit.audit_target.as_deref(), Some(worker.id.as_str()));
+        assert!(audit.audit_tip.is_some(), "the audit records the inspected tip");
+        assert!(
+            !audit
+                .brief
+                .contains("reviewed")
+                || audit.brief.contains("not a summary of what was done"),
+            "the audit brief re-frames the intent instead of echoing implementer claims"
+        );
+
+        // Retrying the same reviewer for the same worker and tip is an
+        // idempotent reuse; the audit is otherwise left to finish.
+        let retry = team
+            .handle_lead_host_tool(
+                "team_audit_dispatch",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "reviewer_id": "auditor01"
+                }),
+            )
+            .await;
+        assert!(retry.success, "{}", retry.output);
+        let retry_receipt: serde_json::Value =
+            serde_json::from_str(&retry.output).expect("JSON receipt");
+        assert_eq!(retry_receipt.pointer("/result/reused").and_then(|value| value.as_bool()), Some(true));
+
+        // The audit never merges and is never itself reviewable.
+        let merge_audit = team.merge("auditor01").await;
+        assert!(merge_audit.is_err(), "an audit worker must never merge");
+        assert!(
+            merge_audit
+                .err()
+                .unwrap_or_default()
+                .contains("never merged"),
+            "the audit merge refusal names the reviewer"
+        );
+        let review_audit = team
+            .review(
+                "auditor01",
+                "reviewed".into(),
+                Vec::new(),
+                review_evidence(),
+            )
+            .await;
+        assert!(review_audit.is_err(), "an audit worker is not reviewable");
+        assert!(
+            review_audit
+                .err()
+                .unwrap_or_default()
+                .contains("read-only reviewer"),
+            "the audit review refusal names the reviewer"
+        );
+
+        // Once the audit completes, linking it (with a written
+        // adjudication) completes the high-risk review.
+        wait_for_worker_status(&team, "auditor01", WorkerStatus::Completed).await;
+        let reviewed = team
+            .handle_lead_host_tool(
+                "team_review",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "summary": "reviewed",
+                    "findings": [],
+                    "evidence": {
+                        "unanchored_pass": true,
+                        "intent": "the worker implements the scoped brief",
+                        "execution": "the change flows through the documented path",
+                        "integration": "the module fits the surrounding runtime",
+                        "test_quality": "the regression reproduces the defect before the fix",
+                        "residual_risk": "no residual risk beyond the reviewed diff",
+                        "independent_reviewer_id": "auditor01",
+                        "audit_adjudication": "the independent audit found no additional defects; accepted"
+                    }
                 }),
             )
             .await;
@@ -3489,6 +3647,12 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            review_receipt
+                .pointer("/result/review/evidence/independent_reviewer_id")
+                .and_then(|value| value.as_str()),
+            Some("auditor01")
+        );
         team.record_check(
             &worker.id,
             "cargo test --workspace".into(),
@@ -3497,7 +3661,7 @@ mod tests {
         )
         .await
         .expect("check");
-        let merged = team.merge(&worker.id).await.expect("evidenced merge");
+        let merged = team.merge(&worker.id).await.expect("adjudicated merge");
         assert_eq!(merged.status, WorkerStatus::Merged);
         let record = merged.merge.as_ref().expect("merge record");
         assert_eq!(record.review_risk.as_deref(), Some("high"));
@@ -3508,6 +3672,283 @@ mod tests {
                 .is_some_and(|evidence| evidence.unanchored_pass),
             "the durable merge record captures the evidence"
         );
+        assert!(
+            record
+                .review_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.independent_reviewer_id.as_deref() == Some("auditor01")),
+            "the durable merge record captures the audit linkage"
+        );
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_audit_blocks_high_risk_merge_until_a_fresh_audit() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team_spawns(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![
+                text_turn(&["done"]),
+                text_turn(&["audit one complete"]),
+                text_turn(&["audit two complete"]),
+            ])),
+            2,
+            4,
+        )
+        .await;
+        let plans = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(
+            plans.join("stack.json"),
+            r#"{"stack":["planid02"],"reviewed":false}"#,
+        )
+        .expect("stack");
+        std::fs::write(
+            plans.join("planid02.md"),
+            "# Plan\n\n## Acceptance scenarios\n\n- A fix commit invalidates the prior audit.\n",
+        )
+        .expect("plan doc");
+        run_git(root.path(), &["add", ".coding/plans"]);
+        run_git(root.path(), &["commit", "-m", "plan acceptance scenarios"]);
+
+        let worker = team
+            .dispatch_with_id(
+                "high-risk feature".into(),
+                None,
+                Some("stalesk01".into()),
+                Some("high".into()),
+            )
+            .await
+            .expect("dispatch");
+        team.stop(&worker.id).await.expect("stop");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        // First audit at the first tip.
+        team.audit_dispatch(&worker.id, "audita001", None, None, None)
+            .await
+            .expect("first audit dispatch");
+        wait_for_worker_status(&team, "audita001", WorkerStatus::Completed).await;
+
+        // A fix commit moves the tip: the recorded audit is now stale.
+        std::fs::write(worker.worktree.join("fix.rs"), "pub fn fix() {}\n")
+            .expect("worker fix");
+        run_git(&worker.worktree, &["add", "fix.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "fix"]);
+
+        let stale = team
+            .review(
+                &worker.id,
+                "reviewed".into(),
+                Vec::new(),
+                crate::mnemo2::phase3::ReviewEvidence {
+                    independent_reviewer_id: Some("audita001".into()),
+                    audit_adjudication: Some("accepted".into()),
+                    ..review_evidence()
+                },
+            )
+            .await;
+        assert!(stale.is_err(), "a stale audit must not link to the new tip");
+        assert!(
+            stale.err().unwrap_or_default().contains("stale"),
+            "the stale refusal names the staleness"
+        );
+
+        // Reusing the stale reviewer identity is refused; a fresh reviewer
+        // at the new tip is required.
+        let reuse = team
+            .audit_dispatch(&worker.id, "audita001", None, None, None)
+            .await
+            .expect_err("the moved tip requires a fresh reviewer");
+        assert!(reuse.contains("older tip"), "{reuse}");
+        team.audit_dispatch(&worker.id, "auditb002", None, None, None)
+            .await
+            .expect("fresh audit dispatch at the new tip");
+        wait_for_worker_status(&team, "auditb002", WorkerStatus::Completed).await;
+        let fresh = team.worker("auditb002").await.expect("fresh audit");
+        let tip = crate::mnemo2::phase3::git_value(&worker.worktree, &["rev-parse", "HEAD"])
+            .await
+            .expect("current tip");
+        assert_eq!(fresh.audit_tip.as_deref(), Some(tip.as_str()));
+
+        team.review(
+            &worker.id,
+            "reviewed after the fix".into(),
+            Vec::new(),
+            crate::mnemo2::phase3::ReviewEvidence {
+                independent_reviewer_id: Some("auditb002".into()),
+                audit_adjudication: Some("the fresh audit covered the fix; accepted".into()),
+                ..review_evidence()
+            },
+        )
+        .await
+        .expect("fresh review with a fresh audit");
+        team.record_check(&worker.id, "cargo test".into(), "passed".into(), None)
+            .await
+            .expect("check");
+        let merged = team.merge(&worker.id).await.expect("merge behind the fresh audit");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_workers_are_read_only_and_unanchored_from_implementer_claims() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["implementation done"]),
+            text_turn(&["audit findings: none"]),
+        ]));
+        let (lead, team) =
+            open_git_team_spawns(&root, &config, &state, llm.clone(), 2, 4).await;
+        let plans = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(
+            plans.join("stack.json"),
+            r#"{"stack":["planid03"],"reviewed":false}"#,
+        )
+        .expect("stack");
+        std::fs::write(
+            plans.join("planid03.md"),
+            "# Plan\n\n## Goal\nShip PLANID03-GOAL-MARKER.\n\n## Acceptance scenarios\n\n- The audit receives the plan.\n",
+        )
+        .expect("plan doc");
+        run_git(root.path(), &["add", ".coding/plans"]);
+        run_git(root.path(), &["commit", "-m", "plan"]);
+
+        // One implementation worker with a distinctive intent brief.
+        let worker = team
+            .dispatch_with_id(
+                "INTENT-MARKER-77 implement the flux capacitor".into(),
+                None,
+                Some("auditsk01".into()),
+                None,
+            )
+            .await
+            .expect("dispatch");
+        wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        // A lead review whose summary and findings the audit must never see.
+        team.review(
+            &worker.id,
+            "SUMMARY-MARKER-42 looks complete".into(),
+            vec![crate::mnemo2::phase3::Finding {
+                id: "find01".into(),
+                severity: "low".into(),
+                title: "FINDING-MARKER-99".into(),
+                detail: "naming drift".into(),
+                file: "src/feature.rs".into(),
+                line: 0,
+                status: "open".into(),
+                fix_commit: None,
+                evidence: None,
+                justification: None,
+            }],
+            review_evidence(),
+        )
+        .await
+        .expect("lead review");
+
+        let (audit, reused) = team
+            .audit_dispatch(
+                &worker.id,
+                "auditor07",
+                None,
+                Some("high".into()),
+                Some("AUDIT-BRIEF-MARKER check concurrency".into()),
+            )
+            .await
+            .expect("audit dispatch");
+        assert!(!reused, "a fresh reviewer id starts a fresh audit");
+        assert_eq!(audit.kind, "audit");
+        assert_eq!(audit.name, "Audit ".to_string() + &audit.id[..8]);
+        assert_eq!(audit.audit_target.as_deref(), Some(worker.id.as_str()));
+        let tip = crate::mnemo2::phase3::git_value(&worker.worktree, &["rev-parse", "HEAD"])
+            .await
+            .expect("worker tip");
+        assert_eq!(audit.audit_tip.as_deref(), Some(tip.as_str()));
+
+        // The audit brief carries plan, intent, diff, and effort — and
+        // never the implementer's summary, findings, or review.
+        let brief = &audit.brief;
+        for needle in [
+            "PLANID03-GOAL-MARKER",
+            "INTENT-MARKER-77",
+            "Target diff",
+            "AUDIT-BRIEF-MARKER",
+            "reasoning depth: high",
+            "feature.rs",
+        ] {
+            assert!(brief.contains(needle), "the audit brief is missing {needle}");
+        }
+        for leaked in ["SUMMARY-MARKER-42", "FINDING-MARKER-99", "naming drift"] {
+            assert!(
+                !brief.contains(leaked),
+                "the audit brief leaks the implementer's claims: {leaked}"
+            );
+        }
+
+        // The audit worktree sits at the audited tip and the reviewer's
+        // advertised tools exclude every mutation surface.
+        assert!(
+            audit.worktree.join("feature.rs").is_file(),
+            "the audit checks out the audited tip"
+        );
+        wait_for_worker_status(&team, "auditor07", WorkerStatus::Completed).await;
+        let advertised = llm.advertised_tools();
+        let audit_tools = advertised
+            .iter()
+            .rev()
+            .find(|tools| !tools.iter().any(|name| name == "file_write"))
+            .expect("the audit session advertised a read-only tool set");
+        for name in ["read_files", "git_read", "search", "message_parent"] {
+            assert!(
+                audit_tools.iter().any(|tool| tool == name),
+                "the audit lost its read tool {name}: {audit_tools:?}"
+            );
+        }
+        for name in [
+            "file_edit",
+            "file_write",
+            "multi_edit",
+            "convert_line_endings",
+            "shell",
+            "git",
+            "spawn_agent",
+            "ask_user",
+            "finish",
+            "create_plan",
+            "update_plan",
+            "complete_step",
+            "abandon_plan",
+            "memory_write",
+            "memory_supersede",
+            "memory_consolidate",
+        ] {
+            assert!(
+                !audit_tools.iter().any(|tool| tool == name),
+                "the audit can mutate through {name}: {audit_tools:?}"
+            );
+        }
 
         team.shutdown().await;
         lead.shutdown().await;
@@ -3620,6 +4061,93 @@ mod tests {
         assert!(team.messages().await.iter().any(|message| {
             message.worker_id == worker.id && message.text == "need the API key"
         }));
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn audit_completion_notice_asks_the_lead_to_adjudicate() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        let plans = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(
+            plans.join("stack.json"),
+            r#"{"stack":["planid04"],"reviewed":false}"#,
+        )
+        .expect("stack");
+        std::fs::write(plans.join("planid04.md"), "# Plan\n\n## Goal\nAudited change.\n")
+            .expect("plan doc");
+        run_git(root.path(), &["add", ".coding/plans"]);
+        run_git(root.path(), &["commit", "-m", "plan"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["worker done"]),
+            text_turn(&["audit complete"]),
+            text_turn(&["lead acknowledged"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("lead's actual team");
+        let worker = team
+            .dispatch_with_id(
+                "implement the audited change".into(),
+                None,
+                Some("notice0002".into()),
+                None,
+            )
+            .await
+            .expect("worker dispatches");
+        wait_for_worker_status(&team, &worker.id, crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+        let (audit, _reused) = team
+            .audit_dispatch(&worker.id, "auditnot01", None, None, None)
+            .await
+            .expect("audit dispatches");
+        wait_for_worker_status(&team, &audit.id, crate::mnemo2::team::WorkerStatus::Completed)
+            .await;
+        let mut notified = false;
+        for _ in 0..100 {
+            let snapshot = lead.snapshot().await.expect("lead snapshot");
+            let notices = snapshot
+                .transcript
+                .messages
+                .iter()
+                .filter(|message| message.content.as_text().starts_with(TEAM_NOTICE_PREFIX))
+                .count();
+            if notices == 1 && !snapshot.busy && llm.calls() >= 3 {
+                notified = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(notified, "the audit completion must drive one real lead turn");
+        let snapshot = lead.snapshot().await.expect("notified lead snapshot");
+        let notice = snapshot
+            .transcript
+            .messages
+            .iter()
+            .find(|message| message.content.as_text().starts_with(TEAM_NOTICE_PREFIX))
+            .expect("TeamManager-attributed audit notice");
+        let text = notice.content.as_text();
+        assert!(text.contains(&format!("worker_id={}", audit.id)), "{text}");
+        assert!(
+            text.contains(&format!(
+                "at tip {}.",
+                audit.audit_tip.as_deref().unwrap_or("")
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Adjudicate the audit"), "{text}");
+        assert!(
+            text.contains(&format!("independent_reviewer_id='{}'", audit.id)),
+            "{text}"
+        );
+        assert!(text.contains("Never merge the audit worker itself"), "{text}");
 
         lead.shutdown().await;
     }
@@ -3840,7 +4368,7 @@ mod tests {
         let state = tempfile::tempdir().expect("state");
         let (lead, team) = open_git_team(&root, &config, &state, Arc::new(ScriptedLlm::new(vec![]))).await;
         let session = team
-            .spawn_worker_session("Executor test".to_string(), None, root.path().to_path_buf(), None)
+            .spawn_worker_session("Executor test".to_string(), None, root.path().to_path_buf(), None, "implementation")
             .await
             .expect("spawn executor");
         let tools = session.tool_names().await.expect("registered tool names");
@@ -3861,6 +4389,49 @@ mod tests {
         assert!(head.contains("Git commits"));
         assert!(head.contains("lead reviews your work on its main thread"));
         assert!(!head.contains("spawn_agent"));
+
+        // The audit profile is the read-only counterpart: every mutation
+        // surface is gone, and the identity forbids lifecycle actions.
+        let audit = team
+            .spawn_worker_session("Audit test".to_string(), None, root.path().to_path_buf(), None, "audit")
+            .await
+            .expect("spawn audit");
+        let audit_tools = audit.tool_names().await.expect("registered audit tools");
+        for name in ["read_files", "search", "git_read", "graph_search", "message_parent"] {
+            assert!(
+                audit_tools.iter().any(|tool| tool == name),
+                "the audit lost its read tool {name}"
+            );
+        }
+        for name in [
+            "file_edit",
+            "file_write",
+            "multi_edit",
+            "convert_line_endings",
+            "shell",
+            "git",
+            "create_plan",
+            "update_plan",
+            "complete_step",
+            "abandon_plan",
+            "finish",
+            "spawn_agent",
+            "ask_user",
+            "memory_write",
+            "memory_consolidate",
+        ] {
+            assert!(
+                !audit_tools.iter().any(|tool| tool == name),
+                "the audit must not mutate through {name}: {audit_tools:?}"
+            );
+        }
+        let audit_head = mnemo::headless::assemble_spec_head(
+            &crate::mnemo2::team::audit_prompt(),
+            &mnemo::headless::Constitution::default(),
+        );
+        assert!(audit_head.contains("independent audit worker"));
+        assert!(audit_head.contains("read-only by construction"));
+        assert!(audit_head.contains("Never merge"));
         team.shutdown().await;
         lead.shutdown().await;
     }

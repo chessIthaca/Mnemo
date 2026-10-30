@@ -101,6 +101,7 @@ pub fn run() {
             ipc::lead_close,
             ipc::team_snapshot,
             ipc::team_dispatch,
+            ipc::team_audit_dispatch,
             ipc::team_message,
             ipc::team_pause,
             ipc::team_interrupt,

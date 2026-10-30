@@ -403,7 +403,16 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     browserImage: null,
     toast: null,
   }));
-  await Promise.all([connectNativeLead(project, allowConflict), connectTeam()]);
+  // Dependent startup IPC (the team snapshot and event subscription) is
+  // rejected by the native host with "Mnemo2 has no open lead; call lead_open
+  // first" until the automatic lead open has completed, so the lead opens
+  // first — ordering only: no timers, no retries, and the backend guard stays
+  // for real misuse. A genuine lead-open failure is already surfaced on the
+  // lead runtime by connectNativeLead.
+  await connectNativeLead(project, allowConflict);
+  // A project switch during the lead open owns the rest of the startup.
+  if (get(app).projectId !== projectId) return;
+  await connectTeam();
   await syncTeam();
   await restoreWorkbench(project);
 }

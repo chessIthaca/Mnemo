@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { createWorkers } from "../test/fixtures";
-import { canMerge, isLeadTinyEdit, leadEditViolation } from "./review";
+import { createAuditWorker, createHighRiskWorker, createWorkers } from "../test/fixtures";
+import {
+  canMerge,
+  isAuditWorker,
+  isLeadTinyEdit,
+  leadEditViolation,
+  reviewEvidenceGaps,
+} from "./review";
+import type { Worker } from "./types";
 
 const files = (count: number, changedLines = 10) =>
   Array.from({ length: count }, (_, index) => ({
@@ -88,5 +95,87 @@ describe("merge eligibility", () => {
       })),
     };
     expect(canMerge(ready).ok).toBe(false);
+  });
+
+  const closed = (worker: Worker): Worker => ({
+    ...worker,
+    findings: worker.findings.map((finding) => ({
+      ...finding,
+      status: "fixed" as const,
+      evidence: "verified on the fix commit",
+    })),
+  });
+
+  it("refuses a merge when the review carries no structured evidence", () => {
+    const ana = createWorkers().find((worker) => worker.id === "ana")!;
+    const legacy: Worker = {
+      ...closed(ana),
+      review: { summary: "legacy review", tip: ana.review!.tip, reviewedAtMs: 1 },
+    };
+    const eligibility = canMerge(legacy);
+    expect(eligibility.ok).toBe(false);
+    expect(eligibility.ok === false && eligibility.reason).toMatch(/structured evidence/i);
+  });
+
+  it("refuses a merge until every base assessment and the unanchored pass are recorded", () => {
+    const ana = createWorkers().find((worker) => worker.id === "ana")!;
+    const evidence = ana.review!.evidence!;
+    const cases: Array<[string, typeof evidence]> = [
+      ["unanchoredPass", { ...evidence, unanchoredPass: false }],
+      ["intent", { ...evidence, intent: "  " }],
+      ["execution", { ...evidence, execution: "" }],
+      ["integration", { ...evidence, integration: "" }],
+      ["testQuality", { ...evidence, testQuality: "" }],
+      ["residualRisk", { ...evidence, residualRisk: "" }],
+    ];
+    for (const [field, partial] of cases) {
+      const worker: Worker = {
+        ...closed(ana),
+        review: { ...ana.review!, evidence: partial },
+      };
+      expect(reviewEvidenceGaps(worker).some((gap) => gap.field === field)).toBe(true);
+      expect(canMerge(worker).ok).toBe(false);
+    }
+    expect(reviewEvidenceGaps(closed(ana))).toEqual([]);
+    expect(canMerge(closed(ana))).toEqual({ ok: true });
+  });
+
+  it("refuses a high-risk merge without a linked audit and the lead adjudication", () => {
+    const mara = createHighRiskWorker();
+    expect(canMerge(mara)).toEqual({ ok: true });
+
+    const unaudited: Worker = {
+      ...mara,
+      review: {
+        ...mara.review!,
+        evidence: {
+          ...mara.review!.evidence!,
+          independentReviewerId: undefined,
+          auditAdjudication: undefined,
+        },
+      },
+    };
+    const gaps = reviewEvidenceGaps(unaudited).map((gap) => gap.field);
+    expect(gaps).toEqual(["independentReviewerId", "auditAdjudication"]);
+    expect(canMerge(unaudited).ok).toBe(false);
+
+    const judged: Worker = {
+      ...mara,
+      review: {
+        ...mara.review!,
+        evidence: { ...mara.review!.evidence!, auditAdjudication: "   " },
+      },
+    };
+    expect(canMerge(judged).ok).toBe(false);
+  });
+
+  it("never merges an audit worker, whatever its review state", () => {
+    const audit = createAuditWorker();
+    expect(isAuditWorker(audit)).toBe(true);
+    expect(canMerge(audit)).toEqual({
+      ok: false,
+      reason: "Independent audits never merge; the lead adjudicates the target review.",
+    });
+    expect(canMerge({ ...audit, status: "in_review" }).ok).toBe(false);
   });
 });

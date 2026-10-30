@@ -11,6 +11,10 @@ import {
   findingFromWire,
   findingToWire,
   projectUsageFrom,
+  reviewEvidenceFrom,
+  reviewEvidenceToWire,
+  reviewRiskFrom,
+  workerKindFrom,
   type TeamMergeRecord,
   type TeamMessage,
   type TeamWorkerRecord,
@@ -32,6 +36,7 @@ import type {
   LeadEvent,
   MergeRecord,
   Project,
+  ReviewEvidence,
   TeamFilter,
   Worker,
   WorkerStatus,
@@ -1189,9 +1194,14 @@ async function performTeam(
   }
 }
 
-async function reviewWorker(workerId: string, summary: string, findings: Finding[]): Promise<void> {
+async function reviewWorker(
+  workerId: string,
+  summary: string,
+  findings: Finding[],
+  evidence: ReviewEvidence,
+): Promise<void> {
   await performTeam((transport) =>
-    transport.review(workerId, summary, findings.map(findingToWire)),
+    transport.review(workerId, summary, findings.map(findingToWire), reviewEvidenceToWire(evidence)),
   );
 }
 
@@ -1443,6 +1453,10 @@ function workerFromRecord(
     needsYou:
       record.pending != null || ["needs_you", "conflict", "failed"].includes(record.status),
     fixerFindingId: record.fixer_finding_id ?? undefined,
+    kind: workerKindFrom(record.kind),
+    reviewRisk: reviewRiskFrom(record.review_risk),
+    auditTarget: record.audit_target ?? undefined,
+    auditTip: record.audit_tip ?? undefined,
     checks: record.checks.map((check) => ({
       name: check.name,
       status:
@@ -1458,6 +1472,7 @@ function workerFromRecord(
           summary: record.review.summary,
           tip: record.review.tip,
           reviewedAtMs: record.review.reviewed_at_ms,
+          evidence: reviewEvidenceFrom(record.review.evidence),
         }
       : undefined,
     messages: workerMessages(record, messages),

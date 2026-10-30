@@ -47,7 +47,17 @@ describe("teamEngine", () => {
       evidence: null,
       justification: null,
     };
-    await transport.review("w1", "summary", [finding]);
+    const evidence = {
+      unanchored_pass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      test_quality: "test quality",
+      residual_risk: "residual risk",
+      independent_reviewer_id: "audit-1",
+      audit_adjudication: "accepted",
+    };
+    await transport.review("w1", "summary", [finding], evidence);
     await transport.recordCheck("w1", "workspace tests", "passed", "ok");
     await transport.resolveFinding("w1", "F-1", "fixed", "verified", null);
     await transport.reviewFix("w1", "F-1", "src/lib.rs", "old", "new");
@@ -61,6 +71,7 @@ describe("teamEngine", () => {
       workerId: "w1",
       summary: "summary",
       findings: [finding],
+      evidence,
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "team_record_check", {
       workerId: "w1",

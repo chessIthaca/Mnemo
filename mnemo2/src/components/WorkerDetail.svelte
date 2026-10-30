@@ -11,12 +11,13 @@
     XCircle,
   } from "@lucide/svelte";
   import { actions } from "../lib/store";
-  import { canMerge } from "../lib/review";
+  import { canMerge, isAuditWorker } from "../lib/review";
   import { workerStatusLabel, type Worker } from "../lib/types";
   import { deriveTaskWorkflow } from "../lib/workflow";
   import FindingsPanel from "./FindingsPanel.svelte";
   import Markdown from "./Markdown.svelte";
   import ModelBadge from "./ModelBadge.svelte";
+  import ReviewEvidence from "./ReviewEvidence.svelte";
   import TaskWorkflow from "./TaskWorkflow.svelte";
 
   let { worker }: { worker: Worker } = $props();
@@ -25,6 +26,8 @@
   let lastWorkerId = "";
 
   const openFindings = $derived(worker.findings.filter((finding) => finding.status === "open").length);
+  const audit = $derived(isAuditWorker(worker));
+  const highRisk = $derived(worker.reviewRisk === "high");
   const workflow = $derived(deriveTaskWorkflow(worker));
   const mergeEligibility = $derived(canMerge(worker));
 
@@ -58,10 +61,22 @@
       <div class="worker-heading">
         <div class="worker-title">
           <h2>{worker.name}<span data-status={worker.status}>{workerStatusLabel[worker.status]}</span></h2>
+          {#if audit}
+            <span class="kind-badge" data-kind="audit">Audit</span>
+          {/if}
+          {#if highRisk}
+            <span class="kind-badge" data-risk="high">High risk</span>
+          {/if}
           <ModelBadge model={worker.model} />
         </div>
         <h3>{worker.task}</h3>
-        <TaskWorkflow {workflow} />
+        {#if audit}
+          <p class="audit-scope">
+            Read-only audit{#if worker.auditTarget} of <code>{worker.auditTarget}</code>{/if}{#if worker.auditTip} at <code>{worker.auditTip}</code>{/if} · no plan step, no merge
+          </p>
+        {:else}
+          <TaskWorkflow {workflow} />
+        {/if}
       </div>
     </div>
     <div class="worker-actions">
@@ -98,11 +113,23 @@
           </div>
         {/each}
       </section>
+      {#if !audit}
+        <ReviewEvidence {worker} />
+      {/if}
       <FindingsPanel {worker} />
 
       <section class="merge-panel">
         <div class="merge-decision">
-          {#if worker.merge}
+          {#if audit}
+            <div>
+              <p>READ-ONLY AUDIT</p>
+              <h3>Audits never merge</h3>
+              <span>
+                This worker inspects another worker's tip and reports to the lead; it holds no plan
+                step and no merge action.
+              </span>
+            </div>
+          {:else if worker.merge}
             <div>
               <p>MERGE RECORD · {worker.merge.target}</p>
               <h3><code>{worker.merge.commit}</code></h3>
@@ -177,6 +204,11 @@
   .worker-identity h2 span[data-status="in_review"], .worker-identity h2 span[data-status="conflict"] { background: var(--warning-soft); color: var(--warning); }
   .worker-identity h3 { margin: 4px 0 0; color: var(--ink-soft); font-size: 10px; font-weight: 500; }
   .worker-title :global(.model-badge) { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
+  .kind-badge { padding: 3px 7px; border-radius: 6px; background: var(--surface-soft); color: var(--ink-soft); font-family: var(--font-ui); font-size: 7px; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; }
+  .kind-badge[data-kind="audit"] { background: var(--accent-soft); color: var(--accent-strong); }
+  .kind-badge[data-risk="high"] { background: #f4e4e1; color: var(--danger); }
+  .audit-scope { margin: 6px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+  .audit-scope code { font-family: var(--font-mono); font-size: 9px; }
   .worker-heading :global(.task-workflow) { margin-top: 7px; max-width: 470px; }
   .worker-actions { display: flex; flex-wrap: wrap; gap: 7px; }
   .file-areas { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }

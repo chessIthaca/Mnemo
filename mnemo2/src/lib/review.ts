@@ -51,8 +51,67 @@ export function isLeadTinyEdit(scope: LeadEditScope): boolean {
   return leadEditViolation(scope) === null;
 }
 
+/** One structured review-evidence item that still blocks a merge. */
+export interface ReviewEvidenceGap {
+  field: string;
+  label: string;
+}
+
+/** The five base assessments every new standard review must record. */
+const BASE_EVIDENCE_FIELDS = [
+  ["intent", "Intent"],
+  ["execution", "Execution path"],
+  ["integration", "Integration"],
+  ["testQuality", "Test quality"],
+  ["residualRisk", "Residual risk"],
+] as const;
+
+/**
+ * List the structured review-evidence items still missing for this worker.
+ *
+ * Mirrors the host gate so the UI never offers a merge the runtime would
+ * refuse: a review without evidence (any legacy review) needs a fresh review,
+ * a high-risk review additionally needs an independent audit linked at the
+ * reviewed tip plus the lead's adjudication.
+ */
+export function reviewEvidenceGaps(worker: Worker): ReviewEvidenceGap[] {
+  const review = worker.review;
+  if (!review) return [{ field: "review", label: "A review of the current tip" }];
+  const evidence = review.evidence;
+  if (!evidence) {
+    return [{ field: "evidence", label: "A fresh review with structured evidence" }];
+  }
+  const gaps: ReviewEvidenceGap[] = [];
+  if (!evidence.unanchoredPass) {
+    gaps.push({ field: "unanchoredPass", label: "An unanchored diff pass" });
+  }
+  for (const [field, label] of BASE_EVIDENCE_FIELDS) {
+    if (!evidence[field]?.trim()) gaps.push({ field, label });
+  }
+  if (worker.reviewRisk === "high") {
+    if (!evidence.independentReviewerId?.trim()) {
+      gaps.push({ field: "independentReviewerId", label: "A linked independent audit" });
+    }
+    if (!evidence.auditAdjudication?.trim()) {
+      gaps.push({ field: "auditAdjudication", label: "The lead's audit adjudication" });
+    }
+  }
+  return gaps;
+}
+
+/** Whether this worker is a read-only independent audit rather than an implementer. */
+export function isAuditWorker(worker: Worker): boolean {
+  return worker.kind === "audit";
+}
+
 /** Check the durable review and exact-tip evidence required before merge. */
 export function canMerge(worker: Worker): MergeEligibility {
+  if (isAuditWorker(worker)) {
+    return {
+      ok: false,
+      reason: "Independent audits never merge; the lead adjudicates the target review.",
+    };
+  }
   if (worker.status === "cancelled") {
     return { ok: false, reason: "Checkout was cleaned; the retained branch is review-only." };
   }
@@ -92,6 +151,11 @@ export function canMerge(worker: Worker): MergeEligibility {
   );
   if (incompleteCheck) {
     return { ok: false, reason: `${incompleteCheck.name} has not passed on the merge-time tip.` };
+  }
+
+  const gaps = reviewEvidenceGaps(worker);
+  if (gaps.length > 0) {
+    return { ok: false, reason: `Review evidence is incomplete: ${gaps[0].label.toLowerCase()}.` };
   }
 
   return { ok: true };

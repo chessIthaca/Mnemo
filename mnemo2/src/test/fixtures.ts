@@ -65,6 +65,8 @@ function makeWorker(input: WorkerInput): Worker {
     progress: 40,
     lastActivity: "just now",
     needsYou: false,
+    kind: "implementation",
+    reviewRisk: "standard",
     checks: passingChecks(),
     findings: [],
     messages: [{ id: `${id}-note`, from: "worker", body: summary, time: "09:42" }],
@@ -140,6 +142,14 @@ export function createWorkers(): Worker[] {
         summary: "Two findings need resolution before merge.",
         tip: "tip-ana",
         reviewedAtMs: 1_787_400_000_000,
+        evidence: {
+          unanchoredPass: true,
+          intent: "Ship the intent-driven review core: risk record, review evidence, and the audit gate.",
+          execution: "store.ts maps record.kind/review_risk/evidence; review.ts mirrors the host merge gate.",
+          integration: "TeamManager merge policy reads the same evidence; legacy records keep their old shape.",
+          testQuality: "Reducer tests cover legacy defaults; component tests drive the evidence panel from fixtures.",
+          residualRisk: "Host-side validation of the audit tip stays authoritative; the UI only mirrors it.",
+        },
       },
       findings: [
         {
@@ -559,4 +569,76 @@ export function fixtureState(): AppState {
       unpricedModels: [],
     },
   };
+}
+
+/**
+ * A high-risk implementation worker whose review is complete and audited.
+ * Kept out of `createWorkers()` so the default fixture team keeps its shape.
+ */
+export function createHighRiskWorker(): Worker {
+  return makeWorker({
+    id: "mara",
+    name: "Mara",
+    hue: 12,
+    task: "TeamManager serialized merge",
+    summary: "Merge policy is ready; the independent audit found one low-risk note.",
+    status: "in_review",
+    model: "kimi-k3.1-pro",
+    files: ["src-tauri/src/team/mod.rs"],
+    tokens: 24_100,
+    cost: 2.14,
+    elapsed: "31m",
+    turns: 9,
+    progress: 88,
+    reviewRisk: "high",
+    checks: passingChecks("tip-mara"),
+    review: {
+      summary: "Audit adjudicated: shipped as reviewed, no blocking findings.",
+      tip: "tip-mara",
+      reviewedAtMs: 1_787_400_000_000,
+      evidence: {
+        unanchoredPass: true,
+        intent: "Serialize worker merges behind one TeamManager queue.",
+        execution: "The merge path locks the lead branch before applying the worker tip.",
+        integration: "Merge records keep the reviewed tip; reverts reuse the same commit id.",
+        testQuality: "Reducer tests cover queue ordering; the audit added a conflict case.",
+        residualRisk: "Windows file locking is still unverified under a live worktree.",
+        independentReviewerId: "ada",
+        auditAdjudication: "Accepted the audit's conflict-case finding and fixed it at tip-mara.",
+      },
+    },
+    findings: [],
+    timeline: [
+      { id: "mara-brief", label: "Brief accepted", detail: "Merge policy scope", status: "done" },
+      { id: "mara-review", label: "Lead review", detail: "High risk · audit adjudicated", status: "done" },
+    ],
+  });
+}
+
+/** A read-only audit worker inspecting the high-risk worker's tip. */
+export function createAuditWorker(): Worker {
+  return makeWorker({
+    id: "ada",
+    name: "Ada",
+    hue: 210,
+    task: "Audit: TeamManager serialized merge",
+    summary: "Read-only audit of tip-mara. One low finding on conflict handling.",
+    status: "completed",
+    model: "glm-5.3-flash",
+    files: [],
+    tokens: 6_200,
+    cost: 0.31,
+    elapsed: "6m",
+    turns: 2,
+    progress: 100,
+    kind: "audit",
+    auditTarget: "mara",
+    auditTip: "tip-mara",
+    checks: [],
+    findings: [],
+    timeline: [
+      { id: "ada-brief", label: "Audit dispatched", detail: "Read-only · no plan step", status: "done" },
+      { id: "ada-report", label: "Audit reported", detail: "1 low finding · adjudication pending", status: "active" },
+    ],
+  });
 }

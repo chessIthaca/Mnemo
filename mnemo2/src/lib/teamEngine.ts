@@ -5,6 +5,7 @@ import type {
   TeamEvent,
   TeamFinding,
   TeamMessage,
+  TeamReviewEvidence,
   TeamSnapshot,
   TeamWorkerRecord,
 } from "./teamState";
@@ -27,7 +28,12 @@ export interface TeamTransport {
   stop(workerId: string): Promise<TeamWorkerRecord>;
   resume(workerId: string): Promise<TeamWorkerRecord>;
   compact(workerId: string): Promise<TeamWorkerRecord>;
-  review(workerId: string, summary: string, findings: TeamFinding[]): Promise<TeamWorkerRecord>;
+  review(
+    workerId: string,
+    summary: string,
+    findings: TeamFinding[],
+    evidence: TeamReviewEvidence,
+  ): Promise<TeamWorkerRecord>;
   recordCheck(
     workerId: string,
     name: string,
@@ -81,8 +87,13 @@ export function createTauriTeamTransport(
       bindings.invoke<TeamWorkerRecord>("team_resume", { workerId }),
     compact: (workerId) =>
       bindings.invoke<TeamWorkerRecord>("team_compact", { workerId }),
-    review: (workerId, summary, findings) =>
-      bindings.invoke<TeamWorkerRecord>("team_review", { workerId, summary, findings }),
+    review: (workerId, summary, findings, evidence) =>
+      bindings.invoke<TeamWorkerRecord>("team_review", {
+        workerId,
+        summary,
+        findings,
+        evidence,
+      }),
     recordCheck: (workerId, name, status, detail) =>
       bindings.invoke<TeamWorkerRecord>("team_record_check", {
         workerId,

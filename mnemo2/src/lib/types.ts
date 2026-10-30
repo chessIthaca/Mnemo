@@ -100,10 +100,36 @@ export interface Finding {
   justification?: string;
 }
 
+/** How much independent scrutiny a change needs before it may merge. */
+export type ReviewRisk = "standard" | "high";
+
+/** Whether a worker implements the brief or audits another worker's branch. */
+export type WorkerKind = "implementation" | "audit";
+
+/**
+ * The structured, intent-driven review the lead records with every review.
+ *
+ * Legacy review records carry no evidence at all. The UI treats that as
+ * "recorded before structured evidence existed" (a fresh review is required
+ * before merge) rather than as an empty pass.
+ */
+export interface ReviewEvidence {
+  unanchoredPass: boolean;
+  intent: string;
+  execution: string;
+  integration: string;
+  testQuality: string;
+  residualRisk: string;
+  independentReviewerId?: string;
+  auditAdjudication?: string;
+}
+
+/** The durable review of one exact worker tip. */
 export interface ReviewRecord {
   summary: string;
   tip: string;
   reviewedAtMs: number;
+  evidence?: ReviewEvidence;
 }
 
 export interface WorkerMessage {
@@ -157,6 +183,14 @@ export interface Worker {
   progress: number;
   lastActivity: string;
   needsYou: boolean;
+  /** Implementation workers own the brief; audit workers only review one tip. */
+  kind: WorkerKind;
+  /** Risk assigned at dispatch; high-risk reviews need an independent audit. */
+  reviewRisk: ReviewRisk;
+  /** For an audit worker: the worker whose branch/tip it inspects. */
+  auditTarget?: string;
+  /** For an audit worker: the exact implementation tip it inspected. */
+  auditTip?: string;
   fixerFindingId?: string;
   checks: Check[];
   findings: Finding[];

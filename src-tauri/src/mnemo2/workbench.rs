@@ -830,6 +830,8 @@ mod tests {
             target: "wt/test".to_string(),
             checks: vec!["test".to_string()],
             review_summary: "Reviewed".to_string(),
+            review_risk: None,
+            review_evidence: None,
             files: 1,
             additions: 1,
             deletions: 0,

@@ -39,6 +39,87 @@ pub struct Finding {
     pub justification: Option<String>,
 }
 
+/// Structured lead-review evidence: the lead's own unanchored read of the
+/// change plus the substantive assessments it must author itself, beyond the
+/// worker's summary and test counts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewEvidence {
+    /// The lead read the change itself first, unanchored to worker claims.
+    pub unanchored_pass: bool,
+    /// Why the work exists and what it was meant to achieve.
+    pub intent: String,
+    /// How the implementation actually reaches that goal.
+    pub execution: String,
+    /// How the change fits the surrounding contracts, modules, and callers.
+    pub integration: String,
+    /// How well the tests genuinely exercise the change.
+    pub test_quality: String,
+    /// Residual risk the lead explicitly accepts.
+    pub residual_risk: String,
+    /// The independent audit worker linked to the same reviewed tip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_reviewer_id: Option<String>,
+    /// The lead's written adjudication of that audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_adjudication: Option<String>,
+}
+
+/// Require complete, substantive evidence for a lead review or merge gate.
+///
+/// `require_audit` additionally demands the independent-audit linkage fields;
+/// high-risk reviews pass it once `team_audit_dispatch` exists (plan step 4).
+pub fn validate_review_evidence(
+    evidence: &ReviewEvidence,
+    require_audit: bool,
+) -> Result<(), String> {
+    if !evidence.unanchored_pass {
+        return Err(
+            "review evidence must record an unanchored diff pass (unanchored_pass=true); read the change itself, not only the worker summary"
+                .to_string(),
+        );
+    }
+    for (field, value) in [
+        ("intent", &evidence.intent),
+        ("execution", &evidence.execution),
+        ("integration", &evidence.integration),
+        ("test_quality", &evidence.test_quality),
+        ("residual_risk", &evidence.residual_risk),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "review evidence '{field}' is empty; record a substantive assessment"
+            ));
+        }
+    }
+    if require_audit {
+        if evidence
+            .independent_reviewer_id
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(
+                "high-risk reviews require an independent reviewer; dispatch one and link its audit"
+                    .to_string(),
+            );
+        }
+        if evidence
+            .audit_adjudication
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err(
+                "high-risk reviews require a written adjudication of the independent audit"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The lead's review of one exact worker commit.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReviewRecord {
@@ -48,6 +129,9 @@ pub struct ReviewRecord {
     pub tip: String,
     /// Unix epoch milliseconds.
     pub reviewed_at_ms: u128,
+    /// Structured review evidence; legacy records decode without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ReviewEvidence>,
 }
 
 /// A successful local merge and its optional later revert.
@@ -65,6 +149,12 @@ pub struct MergeRecord {
     pub checks: Vec<String>,
     /// Review summary captured at merge time.
     pub review_summary: String,
+    /// Review risk captured at merge time; absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_risk: Option<String>,
+    /// Structured review evidence captured at merge time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_evidence: Option<ReviewEvidence>,
     /// Files changed relative to the merge commit's first parent.
     #[serde(default)]
     pub files: u64,
@@ -378,5 +468,101 @@ mod tests {
             .contains("evidence"));
         fixed.evidence = Some("regression test passes on the fix commit".into());
         validate_findings(&[fixed]).expect("fully evidenced fixed finding");
+    }
+
+    /// Complete evidence: an unanchored pass plus five substantive assessments.
+    fn evidence() -> ReviewEvidence {
+        ReviewEvidence {
+            unanchored_pass: true,
+            intent: "the worker implements the scoped brief".into(),
+            execution: "the change flows through the documented path".into(),
+            integration: "the module fits the surrounding runtime".into(),
+            test_quality: "the regression reproduces the defect before the fix".into(),
+            residual_risk: "no residual risk beyond the reviewed diff".into(),
+            independent_reviewer_id: None,
+            audit_adjudication: None,
+        }
+    }
+
+    #[test]
+    fn legacy_reviews_decode_without_evidence() {
+        let review: ReviewRecord = serde_json::from_value(serde_json::json!({
+            "summary": "old-style review",
+            "tip": "abc123",
+            "reviewed_at_ms": 7
+        }))
+        .expect("legacy review decodes");
+        assert_eq!(review.summary, "old-style review");
+        assert!(review.evidence.is_none());
+    }
+
+    #[test]
+    fn review_evidence_round_trips() {
+        let review = ReviewRecord {
+            summary: "review".into(),
+            tip: "abc123".into(),
+            reviewed_at_ms: 7,
+            evidence: Some(evidence()),
+        };
+        let value = serde_json::to_value(&review).expect("review JSON");
+        assert!(value.get("evidence").is_some());
+        let restored: ReviewRecord =
+            serde_json::from_value(value).expect("evidence round-trips");
+        assert_eq!(restored, review);
+    }
+
+    #[test]
+    fn merge_records_decode_without_legacy_evidence() {
+        let merged: MergeRecord = serde_json::from_value(serde_json::json!({
+            "commit": "def456",
+            "worker_tip": "abc123",
+            "branch": "wt/agent-00000001",
+            "target": "wt/lead",
+            "checks": ["cargo test --workspace"],
+            "review_summary": "reviewed",
+            "merged_at_ms": 9
+        }))
+        .expect("legacy merge record decodes");
+        assert!(merged.review_risk.is_none());
+        assert!(merged.review_evidence.is_none());
+    }
+
+    #[test]
+    fn unanchored_or_empty_evidence_is_rejected() {
+        let mut missing_pass = evidence();
+        missing_pass.unanchored_pass = false;
+        assert!(validate_review_evidence(&missing_pass, false)
+            .expect_err("an anchored-only review is not substantive")
+            .contains("unanchored"));
+
+        let mut empty_intent = evidence();
+        empty_intent.intent = "   ".into();
+        assert!(validate_review_evidence(&empty_intent, false)
+            .expect_err("empty intent is not substantive")
+            .contains("intent"));
+
+        let mut empty_risk = evidence();
+        empty_risk.residual_risk = String::new();
+        assert!(validate_review_evidence(&empty_risk, false)
+            .expect_err("empty residual risk is not substantive")
+            .contains("residual_risk"));
+
+        validate_review_evidence(&evidence(), false).expect("complete evidence passes");
+    }
+
+    #[test]
+    fn high_risk_evidence_requires_an_audit_linkage_when_demanded() {
+        assert!(validate_review_evidence(&evidence(), true)
+            .expect_err("an unlinked review is incomplete")
+            .contains("independent reviewer"));
+        let mut linked = evidence();
+        linked.independent_reviewer_id = Some("audit0001".into());
+        assert!(validate_review_evidence(&linked, true)
+            .expect_err("an unadjudicated audit is incomplete")
+            .contains("adjudication"));
+        linked.audit_adjudication = Some("the audit confirmed the reviewed tip".into());
+        validate_review_evidence(&linked, true).expect("audited evidence passes");
+        // The base contract never demands the audit fields.
+        validate_review_evidence(&evidence(), false).expect("standard evidence passes");
     }
 }

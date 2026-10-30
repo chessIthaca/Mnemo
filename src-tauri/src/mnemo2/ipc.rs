@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use mnemo::{Approval, UserAnswer};
 
-use crate::mnemo2::phase3::Finding;
+use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
@@ -501,10 +501,11 @@ pub async fn team_dispatch(
     brief: String,
     model: Option<String>,
     worker_id: Option<String>,
+    review_risk: Option<String>,
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .dispatch_with_id(brief, model, worker_id)
+        .dispatch_with_id(brief, model, worker_id, review_risk)
         .await
 }
 
@@ -563,17 +564,18 @@ pub async fn team_compact(
     current_team(&state).await?.compact(&worker_id).await
 }
 
-/// Persist the lead's review and complete finding list.
+/// Persist the lead's review, complete finding list, and structured evidence.
 #[tauri::command]
 pub async fn team_review(
     state: State<'_, Mnemo2State>,
     worker_id: String,
     summary: String,
     findings: Vec<Finding>,
+    evidence: ReviewEvidence,
 ) -> Result<WorkerRecord, String> {
     current_team(&state)
         .await?
-        .review(&worker_id, summary, findings)
+        .review(&worker_id, summary, findings, evidence)
         .await
 }
 

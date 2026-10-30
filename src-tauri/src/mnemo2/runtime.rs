@@ -1089,6 +1089,20 @@ mod tests {
         events
     }
 
+    /// Complete structured review evidence for lead-review call sites.
+    fn review_evidence() -> crate::mnemo2::phase3::ReviewEvidence {
+        crate::mnemo2::phase3::ReviewEvidence {
+            unanchored_pass: true,
+            intent: "the worker implements the scoped brief".into(),
+            execution: "the change flows through the documented path".into(),
+            integration: "the module fits the surrounding runtime".into(),
+            test_quality: "the regression reproduces the defect before the fix".into(),
+            residual_risk: "no residual risk beyond the reviewed diff".into(),
+            independent_reviewer_id: None,
+            audit_adjudication: None,
+        }
+    }
+
     fn usage_turn(prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) -> Vec<LlmEvent> {
         vec![
             LlmEvent::Usage {
@@ -2440,7 +2454,7 @@ mod tests {
             evidence: None,
             justification: None,
         };
-        team.review(&worker.id, "initial review".into(), vec![finding])
+        team.review(&worker.id, "initial review".into(), vec![finding], review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2499,7 +2513,7 @@ mod tests {
             .await
             .expect_err("merge needs delta review");
         assert!(stale.contains("has not been reviewed"), "{stale}");
-        team.review(&worker.id, "delta review".into(), fixed.findings.clone())
+        team.review(&worker.id, "delta review".into(), fixed.findings.clone(), review_evidence())
             .await
             .expect("delta review");
         let merged = team.merge(&worker.id).await.expect("reviewed merge");
@@ -2564,7 +2578,7 @@ mod tests {
             evidence: None,
             justification: None,
         };
-        team.review(&worker.id, "initial review".into(), vec![finding])
+        team.review(&worker.id, "initial review".into(), vec![finding], review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2608,7 +2622,7 @@ mod tests {
             Some(fix_tip.as_str())
         );
         let reviewed = team
-            .review(&worker.id, "delta review".into(), resolved.findings.clone())
+            .review(&worker.id, "delta review".into(), resolved.findings.clone(), review_evidence())
             .await
             .expect("delta review");
         assert_eq!(reviewed.review.expect("review record").tip, fix_tip);
@@ -2643,7 +2657,7 @@ mod tests {
             .expect("dispatch");
         team.stop(&worker.id).await.expect("stop initial turn");
         commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
-        team.review(&worker.id, "reviewed".into(), Vec::new())
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2680,7 +2694,7 @@ mod tests {
             .expect("dispatch");
         wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
         commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
-        team.review(&worker.id, "reviewed".into(), Vec::new())
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2716,7 +2730,7 @@ mod tests {
             .expect("dispatch");
         wait_for_worker_status(&team, &worker.id, WorkerStatus::Completed).await;
         commit_worker_file(&worker, "src/lib.rs", "pub fn feature() {}\n", "feature");
-        team.review(&worker.id, "reviewed".into(), Vec::new())
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2787,7 +2801,7 @@ mod tests {
         std::fs::write(root.path().join("README.md"), "lead\n").expect("lead edit");
         run_git(root.path(), &["add", "README.md"]);
         run_git(root.path(), &["commit", "-m", "lead edit"]);
-        team.review(&worker.id, "reviewed".into(), Vec::new())
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence())
             .await
             .expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
@@ -2860,7 +2874,7 @@ mod tests {
         std::fs::write(root.path().join("README.md"), "lead\n").expect("lead edit");
         run_git(root.path(), &["add", "README.md"]);
         run_git(root.path(), &["commit", "-m", "lead edit"]);
-        team.review(&worker.id, "reviewed".into(), Vec::new()).await.expect("review");
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence()).await.expect("review");
         team.record_check(&worker.id, "workspace tests".into(), "passed".into(), None)
             .await
             .expect("check");
@@ -2933,6 +2947,7 @@ mod tests {
                 "retry without duplication".into(),
                 Some("broken".into()),
                 Some(worker_id.into()),
+                None,
             )
             .await
             .expect_err("the engine rejects an invalid forced model spec");
@@ -2947,6 +2962,7 @@ mod tests {
                 "retry without duplication".into(),
                 Some("broken".into()),
                 Some(worker_id.into()),
+                None,
             )
             .await
             .expect_err("retry still surfaces the host failure");
@@ -3073,7 +3089,7 @@ mod tests {
             .expect("worker source");
         run_git(&worker.worktree, &["add", "feature.rs"]);
         run_git(&worker.worktree, &["commit", "-m", "feature"]);
-        team.review(&worker.id, "reviewed".into(), Vec::new())
+        team.review(&worker.id, "reviewed".into(), Vec::new(), review_evidence())
             .await
             .expect("review");
         let empty = team
@@ -3259,6 +3275,7 @@ mod tests {
                 "a different brief".into(),
                 None,
                 Some(worker_id.to_string()),
+                None,
             )
             .await
             .expect_err("same ID cannot change the logical task");
@@ -3268,6 +3285,7 @@ mod tests {
                 "retry this task".into(),
                 Some("test/scripted-a".into()),
                 Some(worker_id.to_string()),
+                None,
             )
             .await
             .expect_err("a retry cannot silently change the worker model");
@@ -3277,6 +3295,219 @@ mod tests {
             .await
             .expect_err("an idempotent retry did not consume the one spawn allowed this turn");
         assert!(cap.contains("already delegated"), "{cap}");
+
+        team.shutdown().await;
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn high_risk_dispatch_and_review_require_substantive_evidence() {
+        use crate::mnemo2::team::WorkerStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (lead, team) = open_git_team(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(vec![text_turn(&["done"])])),
+        )
+        .await;
+
+        // An unknown risk classification is rejected outright.
+        let invalid = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "hiresk0001",
+                    "brief": "high-risk task",
+                    "review_risk": "extreme"
+                }),
+            )
+            .await;
+        assert!(!invalid.success);
+        assert!(
+            invalid.output.contains("review_risk must be 'standard' or 'high'"),
+            "{}",
+            invalid.output
+        );
+
+        // High-risk dispatch requires the active plan's acceptance scenarios:
+        // with no active plan the dispatch is refused before provisioning.
+        let no_plan = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "hiresk0001",
+                    "brief": "high-risk task",
+                    "review_risk": "high"
+                }),
+            )
+            .await;
+        assert!(!no_plan.success);
+        assert!(no_plan.output.contains("stack.json"), "{}", no_plan.output);
+        assert!(team.worker("hiresk0001").await.is_err());
+        assert!(team.snapshot().await.workers.is_empty());
+
+        // A plan without the section still blocks…
+        let plans = root.path().join(".coding/plans");
+        std::fs::create_dir_all(&plans).expect("plans dir");
+        std::fs::write(
+            plans.join("stack.json"),
+            r#"{"stack":["planid01"],"reviewed":false}"#,
+        )
+        .expect("stack");
+        std::fs::write(plans.join("planid01.md"), "# Plan\n\n## Goal\nShip it.\n")
+            .expect("plan doc");
+        run_git(root.path(), &["add", ".coding/plans"]);
+        run_git(root.path(), &["commit", "-m", "plan without scenarios"]);
+        let no_section = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "hiresk0001",
+                    "brief": "high-risk task",
+                    "review_risk": "high"
+                }),
+            )
+            .await;
+        assert!(!no_section.success);
+        assert!(
+            no_section.output.contains("does not declare"),
+            "{}",
+            no_section.output
+        );
+
+        // …while observable bullets unblock it, and the risk is recorded.
+        std::fs::write(
+            plans.join("planid01.md"),
+            "# Plan\n\n## Acceptance scenarios\n\n- A high-risk worker cannot merge without structured evidence.\n",
+        )
+        .expect("plan doc");
+        run_git(root.path(), &["add", ".coding/plans"]);
+        run_git(root.path(), &["commit", "-m", "plan acceptance scenarios"]);
+        let dispatched = team
+            .handle_lead_host_tool(
+                "team_dispatch",
+                serde_json::json!({
+                    "worker_id": "hiresk0001",
+                    "brief": "high-risk task",
+                    "review_risk": "high"
+                }),
+            )
+            .await;
+        assert!(dispatched.success, "{}", dispatched.output);
+        let worker = team.worker("hiresk0001").await.expect("high-risk worker");
+        assert_eq!(worker.review_risk, "high");
+        team.stop(&worker.id).await.expect("stop");
+        std::fs::write(worker.worktree.join("feature.rs"), "pub fn feature() {}\n")
+            .expect("worker source");
+        run_git(&worker.worktree, &["add", "feature.rs"]);
+        run_git(&worker.worktree, &["commit", "-m", "feature"]);
+
+        // team_review without an evidence object is refused.
+        let unevidenced = team
+            .handle_lead_host_tool(
+                "team_review",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "summary": "reviewed",
+                    "findings": []
+                }),
+            )
+            .await;
+        assert!(!unevidenced.success);
+        assert!(
+            unevidenced
+                .output
+                .contains("requires a complete 'evidence' object"),
+            "{}",
+            unevidenced.output
+        );
+
+        // An anchored-only pass and an empty assessment are refused.
+        let anchored = team
+            .handle_lead_host_tool(
+                "team_review",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "summary": "reviewed",
+                    "findings": [],
+                    "evidence": {
+                        "unanchored_pass": false,
+                        "intent": "the worker implements the scoped brief",
+                        "execution": "the change flows through the documented path",
+                        "integration": "the module fits the surrounding runtime",
+                        "test_quality": "the regression reproduces the defect before the fix",
+                        "residual_risk": "no residual risk beyond the reviewed diff"
+                    }
+                }),
+            )
+            .await;
+        assert!(!anchored.success);
+        assert!(anchored.output.contains("unanchored"), "{}", anchored.output);
+        let empty = team
+            .handle_lead_host_tool(
+                "team_review",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "summary": "reviewed",
+                    "findings": [],
+                    "evidence": {
+                        "unanchored_pass": true,
+                        "intent": "  ",
+                        "execution": "the change flows through the documented path",
+                        "integration": "the module fits the surrounding runtime",
+                        "test_quality": "the regression reproduces the defect before the fix",
+                        "residual_risk": "no residual risk beyond the reviewed diff"
+                    }
+                }),
+            )
+            .await;
+        assert!(!empty.success);
+        assert!(empty.output.contains("intent"), "{}", empty.output);
+
+        // Complete evidence reviews the exact tip and enables merge.
+        let reviewed = team
+            .handle_lead_host_tool(
+                "team_review",
+                serde_json::json!({
+                    "worker_id": worker.id,
+                    "summary": "reviewed",
+                    "findings": [],
+                    "evidence": review_evidence()
+                }),
+            )
+            .await;
+        assert!(reviewed.success, "{}", reviewed.output);
+        let review_receipt: serde_json::Value =
+            serde_json::from_str(&reviewed.output).expect("JSON receipt");
+        assert_eq!(
+            review_receipt
+                .pointer("/result/review/evidence/unanchored_pass")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        team.record_check(
+            &worker.id,
+            "cargo test --workspace".into(),
+            "passed".into(),
+            None,
+        )
+        .await
+        .expect("check");
+        let merged = team.merge(&worker.id).await.expect("evidenced merge");
+        assert_eq!(merged.status, WorkerStatus::Merged);
+        let record = merged.merge.as_ref().expect("merge record");
+        assert_eq!(record.review_risk.as_deref(), Some("high"));
+        assert!(
+            record
+                .review_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.unanchored_pass),
+            "the durable merge record captures the evidence"
+        );
 
         team.shutdown().await;
         lead.shutdown().await;
@@ -3355,6 +3586,7 @@ mod tests {
                 "ask for the key".into(),
                 None,
                 Some("notice0001".into()),
+                None,
             )
             .await
             .expect("worker dispatches");
@@ -3515,7 +3747,7 @@ mod tests {
             .expect("clean checkout");
         assert!(!worker.worktree.exists(), "cleanup did not remove the checkout: {report:?}");
         let reviewed = team
-            .review(&worker.id, "reviewed retained branch".to_string(), Vec::new())
+            .review(&worker.id, "reviewed retained branch".to_string(), Vec::new(), review_evidence())
             .await
             .expect("review retained branch");
         assert_eq!(reviewed.status, crate::mnemo2::team::WorkerStatus::Cancelled);

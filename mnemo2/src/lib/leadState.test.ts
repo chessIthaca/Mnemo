@@ -731,6 +731,116 @@ describe("lead event reducer", () => {
     now.mockRestore();
   });
 
+  it("times batched tool calls from their own execution start, not the announcement", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    const tool = (state: AppState, callId: string) => {
+      const entry = state.leadEntries.find(
+        (item) => item.kind === "tool" && item.toolCallId === callId,
+      );
+      if (entry?.kind !== "tool") throw new Error(`missing tool entry ${callId}`);
+      return entry;
+    };
+    const executionStart = (callId: string): LeadEvent => ({
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_execution_start", tool_call_id: callId },
+      },
+    });
+    const result = (callId: string, output: string): LeadEvent => ({
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: callId,
+          tool_name: "shell",
+          result: { success: true, output },
+        },
+      },
+    });
+
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    // One assistant batch announces both calls at the same instant.
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-a", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 1, id: "call-b", name: "shell" },
+      },
+    });
+    expect(tool(state, "call-a").startedAtMs).toBe(1000);
+    expect(tool(state, "call-b").startedAtMs).toBe(1000);
+
+    now.mockReturnValue(2000);
+    state = applyLeadEvent(state, executionStart("call-a"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, result: null });
+
+    now.mockReturnValue(6000);
+    state = applyLeadEvent(state, result("call-a", "a done"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    // Call B waited in the queue, so its clock has not started yet.
+    expect(tool(state, "call-b")).toMatchObject({ startedAtMs: 1000, result: null });
+
+    state = applyLeadEvent(state, executionStart("call-b"));
+    expect(tool(state, "call-b")).toMatchObject({
+      startedAtMs: 6000,
+      arguments: "",
+      liveOutput: "",
+      result: null,
+    });
+    // A finished call keeps its measured span; execution-start never reopens it.
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+
+    now.mockReturnValue(9000);
+    state = applyLeadEvent(state, result("call-b", "b done"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    expect(tool(state, "call-b")).toMatchObject({ startedAtMs: 6000, endedAtMs: 9000 });
+    // Each suffix measures only its own execution: 4s and 3s, never cumulative.
+    expect(tool(state, "call-a").endedAtMs! - tool(state, "call-a").startedAtMs!).toBe(4000);
+    expect(tool(state, "call-b").endedAtMs! - tool(state, "call-b").startedAtMs!).toBe(3000);
+
+    // Execution-start timestamps survive a transcript snapshot restore.
+    const restored = applyLeadSnapshot(state, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "call-a", name: "shell", arguments: "{}" },
+              { id: "call-b", name: "shell", arguments: "{}" },
+            ],
+          },
+          { role: "tool", content: "a done", tool_call_id: "call-a", name: "shell" },
+          { role: "tool", content: "b done", tool_call_id: "call-b", name: "shell" },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+    expect(tool(restored, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    expect(tool(restored, "call-b")).toMatchObject({ startedAtMs: 6000, endedAtMs: 9000 });
+    now.mockRestore();
+  });
+
   it("keeps LLM errors visible across snapshots and clears transient retries on progress", () => {
     const snapshot: LeadSnapshot = {
       generation: 3,

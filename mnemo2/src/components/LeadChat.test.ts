@@ -276,6 +276,40 @@ describe("LeadChat", () => {
     now.mockRestore();
   });
 
+  it("shows each batched tool's own elapsed suffix instead of cumulative queue time", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(9000);
+    setRuntime({ busy: true });
+    setLeadEntries([
+      toolEntry({
+        id: "tool-a",
+        toolCallId: "call-a",
+        toolName: "read_files",
+        arguments: '{"files":["README.md"]}',
+        liveOutput: "",
+        // Announced with the batch at 1000, executed 2000 → 6000.
+        startedAtMs: 2000,
+        endedAtMs: 6000,
+        result: { success: true, output: "read 42 lines" },
+      }),
+      toolEntry({
+        id: "tool-b",
+        toolCallId: "call-b",
+        // Announced at 1000 as well, executed from 6000; still running at 9000.
+        liveOutput: "running tests",
+        startedAtMs: 6000,
+        result: null,
+      }),
+    ]);
+    render(LeadChat);
+    const finished = screen.getByText("Reading a file").closest("summary")!;
+    expect(finished.textContent).toContain("0:04");
+    expect(finished.textContent).not.toContain("0:05");
+    const running = screen.getByText("Running a command").closest("summary")!;
+    expect(running.textContent).toContain("0:03");
+    expect(running.textContent).not.toContain("0:08");
+    now.mockRestore();
+  });
+
   it("does not let an unfinished tool from an older turn suppress thinking", () => {
     setRuntime({ busy: true, turnStartedAtMs: 4000 });
     setLeadEntries([toolEntry({ startedAtMs: 1000, result: null })]);

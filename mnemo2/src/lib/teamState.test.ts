@@ -6,6 +6,7 @@ import {
   initialTeamState,
   projectUsageFrom,
   reviewEvidenceFrom,
+  reviewEvidenceToWire,
   type TeamEvent,
   type TeamWorkerRecord,
 } from "./teamState";
@@ -341,5 +342,52 @@ describe("teamState", () => {
       execution: "",
     });
     expect(reviewEvidenceFrom(null)).toBeUndefined();
+  });
+
+  it("serializes review evidence into the host's team_review wire shape", () => {
+    expect(
+      reviewEvidenceToWire({
+        unanchoredPass: true,
+        intent: "intent",
+        execution: "execution",
+        integration: "integration",
+        testQuality: "test quality",
+        residualRisk: "residual risk",
+      }),
+    ).toEqual({
+      unanchored_pass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      test_quality: "test quality",
+      residual_risk: "residual risk",
+    });
+
+    // The optional audit linkage travels only when the lead recorded it.
+    expect(
+      reviewEvidenceToWire({
+        unanchoredPass: true,
+        intent: "intent",
+        execution: "execution",
+        integration: "integration",
+        testQuality: "test quality",
+        residualRisk: "residual risk",
+        independentReviewerId: "audit-1",
+        auditAdjudication: "accepted",
+      }),
+    ).toMatchObject({
+      independent_reviewer_id: "audit-1",
+      audit_adjudication: "accepted",
+    });
+
+    // Round-tripping the wire shape preserves the assessments the host gates on.
+    expect(reviewEvidenceFrom(reviewEvidenceToWire({
+      unanchoredPass: true,
+      intent: "intent",
+      execution: "execution",
+      integration: "integration",
+      testQuality: "test quality",
+      residualRisk: "residual risk",
+    }))).toMatchObject({ unanchoredPass: true, intent: "intent" });
   });
 });

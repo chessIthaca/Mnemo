@@ -331,6 +331,33 @@ export function reviewEvidenceFrom(
   };
 }
 
+/**
+ * Serialize the UI evidence shape into the host's `ReviewEvidence` wire
+ * object for `team_review`.
+ *
+ * The base six fields are always sent because the host requires them; the
+ * optional audit fields are omitted when absent, matching the host's
+ * `skip_serializing_if` on `Option<String>`. Callers pass the lead's real
+ * assessments, never a placeholder: the host rejects incomplete evidence.
+ */
+export function reviewEvidenceToWire(evidence: ReviewEvidence): TeamReviewEvidence {
+  const wire: TeamReviewEvidence = {
+    unanchored_pass: evidence.unanchoredPass,
+    intent: evidence.intent,
+    execution: evidence.execution,
+    integration: evidence.integration,
+    test_quality: evidence.testQuality,
+    residual_risk: evidence.residualRisk,
+  };
+  if (evidence.independentReviewerId !== undefined) {
+    wire.independent_reviewer_id = evidence.independentReviewerId;
+  }
+  if (evidence.auditAdjudication !== undefined) {
+    wire.audit_adjudication = evidence.auditAdjudication;
+  }
+  return wire;
+}
+
 export function findingToWire(finding: Finding): TeamFinding {
   return {
     ...finding,

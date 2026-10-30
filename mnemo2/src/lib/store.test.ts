@@ -39,7 +39,14 @@ describe("Mnemo2 store production state", () => {
     await actions.openProject("mnemo");
     const before = state().workers.map((worker) => worker.status);
 
-    await actions.reviewWorker("ana", "review", []);
+    await actions.reviewWorker("ana", "review", [], {
+      unanchoredPass: true,
+      intent: "review the current tip",
+      execution: "the lead read the diff itself",
+      integration: "no neighbouring contract changes",
+      testQuality: "the reducer test covers the action path",
+      residualRisk: "nothing beyond the reviewed tip",
+    });
     await actions.recordWorkerCheck("ana", "workspace tests", "passed");
     await actions.fixFinding("ana", "ana-copy", "old", "new");
     await actions.spawnFixer("ana", "ana-copy");

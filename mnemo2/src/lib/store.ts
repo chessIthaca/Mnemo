@@ -12,6 +12,7 @@ import {
   findingToWire,
   projectUsageFrom,
   reviewEvidenceFrom,
+  reviewEvidenceToWire,
   reviewRiskFrom,
   workerKindFrom,
   type TeamMergeRecord,
@@ -35,6 +36,7 @@ import type {
   LeadEvent,
   MergeRecord,
   Project,
+  ReviewEvidence,
   TeamFilter,
   Worker,
   WorkerStatus,
@@ -1192,9 +1194,14 @@ async function performTeam(
   }
 }
 
-async function reviewWorker(workerId: string, summary: string, findings: Finding[]): Promise<void> {
+async function reviewWorker(
+  workerId: string,
+  summary: string,
+  findings: Finding[],
+  evidence: ReviewEvidence,
+): Promise<void> {
   await performTeam((transport) =>
-    transport.review(workerId, summary, findings.map(findingToWire)),
+    transport.review(workerId, summary, findings.map(findingToWire), reviewEvidenceToWire(evidence)),
   );
 }
 

@@ -8,6 +8,7 @@ import {
   type TeamMergeRecord,
   type TeamWorkerRecord,
 } from "./teamState";
+import type { ReviewEvidence } from "./types";
 
 const team = vi.hoisted(() => ({
   transport: null as TeamTransport | null,
@@ -210,7 +211,15 @@ describe("native Phase 3 store integration", () => {
     const transport = makeTransport(nativeWorker());
     await openNativeTeam(transport);
 
-    await actions.reviewWorker("ana", "delta review", [findingFromWire(finding)]);
+    const evidence: ReviewEvidence = {
+      unanchoredPass: true,
+      intent: "record the intent-driven review",
+      execution: "the action serializes evidence for team_review",
+      integration: "the merge gate reads the same record",
+      testQuality: "the transport payload is asserted below",
+      residualRisk: "host validation remains authoritative",
+    };
+    await actions.reviewWorker("ana", "delta review", [findingFromWire(finding)], evidence);
     await actions.recordWorkerCheck("ana", "workspace tests", "passed", "ok");
     await actions.fixFinding("ana", "F-1", "old", "new");
     await actions.spawnFixer("ana", "F-1");
@@ -219,7 +228,14 @@ describe("native Phase 3 store integration", () => {
     await actions.compactWorker("ana");
 
     expect(transport.compact).toHaveBeenCalledWith("ana");
-    expect(transport.review).toHaveBeenCalledWith("ana", "delta review", [finding]);
+    expect(transport.review).toHaveBeenCalledWith("ana", "delta review", [finding], {
+      unanchored_pass: true,
+      intent: "record the intent-driven review",
+      execution: "the action serializes evidence for team_review",
+      integration: "the merge gate reads the same record",
+      test_quality: "the transport payload is asserted below",
+      residual_risk: "host validation remains authoritative",
+    });
     expect(transport.recordCheck).toHaveBeenCalledWith(
       "ana",
       "workspace tests",

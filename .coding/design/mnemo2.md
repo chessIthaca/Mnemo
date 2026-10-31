@@ -305,9 +305,11 @@ policy (see `agent.md`).
 The team has operational session limits, not per-agent spending budgets.
 
 - **Operational limits**: `DEFAULT_SLOTS = 3` live worker sessions,
-  `DEFAULT_SPAWNS_PER_TURN = 4` delegations per lead turn, 64 worker turns and
+  64 worker turns and
   30 minutes per session. There is no cumulative worker token or cost budget and
-  no budget-increase flow. Prompt, completion, cached, and context-window usage
+  no budget-increase flow. There is no per-lead-turn delegation limit (the
+  four-per-turn cap was removed by user decision 2026-10-31) — the concurrent
+  slot limit is the only spawn limit. Prompt, completion, cached, and context-window usage
   never pause a worker or block a message/resume. Provider context limits and
   parked sessions remain actual lifecycle outcomes, not spending limits.
 - **Tracked, idempotent dispatch**: the lead chooses a stable worker ID for each
@@ -507,8 +509,9 @@ Shipped in the native host:
   by the team runtime. (The plan sketched `message_agent`/`review_fix`; the
   landed lead-side tools are `team_message` and `team_status`, with
   `review_fix` deferred to Phase 3 along with review itself.)
-- **Scheduling:** configurable live-session slots (`DEFAULT_SLOTS = 3`) and a
-  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`). Pause,
+- **Scheduling:** configurable live-session slots (`DEFAULT_SLOTS = 3`) are the
+  only spawn limit — there is no per-lead-turn delegation cap (removed by user
+  decision 2026-10-31). Pause,
   interrupt, stop, and resume drive real `SessionCommand`s.
 - **Recovery:** on open, `dispatching`/`working`/`needs_you` records downgrade to
   `interrupted` (or stay `needs_you` when a pending interaction survived);

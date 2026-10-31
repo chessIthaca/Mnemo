@@ -273,9 +273,10 @@ reviewer workflow is unchanged.
   merges without auto-resolution, never pushes, and supports guarded revert
   before landing. Successful merge closes the worker session, removes a verified
   clean worktree, and keeps the branch for audit; new dirty work is retained.
-- **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`), a
-  per-lead-turn delegation cap (`DEFAULT_SPAWNS_PER_TURN = 4`), and worker
-  turn/wall-clock limits. There is no cumulative worker token or cost budget.
+- **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`) and
+  worker
+  turn/wall-clock limits. There is no per-lead-turn delegation cap (removed by
+  user decision 2026-10-31) and no cumulative worker token or cost budget.
   Requests, prompt/completion/cached tokens, turns, and elapsed time come from
   real events and never trigger a budget pause. Cost is shown only when model
   pricing is configured; unknown cost remains unknown, and usage is always shown.

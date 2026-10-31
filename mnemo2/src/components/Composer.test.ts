@@ -492,6 +492,45 @@ describe("Composer", () => {
     expect(draft().images).toEqual([expected]);
   });
 
+  it("an Explorer-copied PNG file renders its thumbnail before sending", async () => {
+    setLead(false);
+    // Real converter, same as the direct paste regression above: the paste
+    // must run the true clipboard File -> FileReader -> data URL -> store
+    // -> <img> path, not a mocked conversion.
+    const actual =
+      await vi.importActual<
+        typeof import("../../../frontend/src/lib/attachImages")
+      >("../../../frontend/src/lib/attachImages");
+    attach.fileToAttachedDataUrl.mockImplementation(actual.fileToAttachedDataUrl);
+    render(Composer);
+
+    // A genuine 1x1 transparent PNG (68 bytes, zlib-verified), not mock bytes.
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=";
+    const file = new File(
+      [Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0))],
+      "shot.png",
+      { type: "image/png" },
+    );
+    // What an Explorer-copied image FILE pastes like: the file-kind item
+    // carries an EMPTY type (never image/*), while the actual image File
+    // only surfaces in clipboardData.files.
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: "", getAsFile: () => file }],
+        files: [file],
+      },
+    });
+    await fireEvent(textbox(), paste);
+
+    const expected = `data:image/png;base64,${pngBase64}`;
+    await vi.waitFor(() => expect(draft().images).toEqual([expected]));
+    expect(
+      (await screen.findByAltText("Attachment 1")).getAttribute("src"),
+    ).toBe(expected);
+  });
+
   it("removes an attached image without touching the text", async () => {
     setLead(false);
     const image = "data:image/png;base64,one";

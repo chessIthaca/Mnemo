@@ -4,6 +4,7 @@ import {
   applyLeadSnapshot,
   initialLeadRuntime,
   leadEntriesFromTranscript,
+  leadEventNeedsSnapshot,
 } from "./leadState";
 import { createInitialState } from "./store";
 import type { AppState, LeadEvent, LeadSnapshot } from "./types";
@@ -86,6 +87,75 @@ describe("lead event reducer", () => {
     });
     expect(finished.leadRuntime.busy).toBe(false);
     expect(finished.leadRuntime.streamingEntryId).toBeNull();
+  });
+
+  it("applies context_usage events with their per-role breakdown", () => {
+    const state = nativeState(3);
+    const updated = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "context_usage",
+          used: 150_000,
+          max: 200_000,
+          breakdown: { system: 20_000, user: 5_000, assistant: 25_000, tool: 100_000 },
+        },
+      },
+    });
+    expect(updated).not.toBe(state);
+    expect(updated.leadRuntime.usedTokens).toBe(150_000);
+    expect(updated.leadRuntime.maxTokens).toBe(200_000);
+    expect(updated.leadRuntime.contextBreakdown).toEqual({
+      system: 20_000,
+      user: 5_000,
+      assistant: 25_000,
+      tool: 100_000,
+    });
+
+    const malformed = applyLeadEvent(updated, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "context_usage", used: 10, max: 20, breakdown: "unavailable" },
+      },
+    });
+    expect(malformed.leadRuntime.usedTokens).toBe(10);
+    expect(malformed.leadRuntime.contextBreakdown).toBeNull();
+  });
+
+  it("tracks compaction from compact_started through compacted", () => {
+    const started = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    });
+    expect(started.leadRuntime.compacting).toBe(true);
+
+    const compacted = applyLeadEvent(started, {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compacted", before: 150_000, after: 30_000 } },
+    });
+    expect(compacted.leadRuntime.compacting).toBe(false);
+    expect(compacted.leadRuntime.usedTokens).toBe(30_000);
+
+    const stale = applyLeadEvent(compacted, {
+      generation: 2,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    });
+    expect(stale.leadRuntime.compacting).toBe(false);
+  });
+
+  it("requests a snapshot refresh when a compaction finishes", () => {
+    const compacted: LeadEvent = {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compacted", before: 10, after: 5 } },
+    };
+    expect(leadEventNeedsSnapshot(compacted)).toBe(true);
+    const started: LeadEvent = {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    };
+    expect(leadEventNeedsSnapshot(started)).toBe(false);
   });
 
   it("maps a real approval event to a resolvable pending interaction", () => {

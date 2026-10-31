@@ -496,6 +496,10 @@ export interface LeadRuntimeInfo {
   pending: LeadPendingInteraction | null;
   usedTokens: number;
   maxTokens: number;
+  /** Per-role context breakdown from the last `context_usage` event; null when unknown. */
+  contextBreakdown: { system: number; user: number; assistant: number; tool: number } | null;
+  /** Whether the lead's context is currently being compacted. */
+  compacting: boolean;
   /** Observed start of the active turn; null while idle or unknown on restore. */
   turnStartedAtMs: number | null;
   streamingEntryId: string | null;

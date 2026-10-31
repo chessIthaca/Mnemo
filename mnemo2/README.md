@@ -339,6 +339,15 @@ reviewer workflow is unchanged.
   Requests, prompt/completion/cached tokens, turns, and elapsed time come from
   real events and never trigger a budget pause. Cost is shown only when model
   pricing is configured; unknown cost remains unknown, and usage is always shown.
+- **Real lead context indicator:** the top bar shows how much of the lead's
+  context window is used as a small circular progress ring (green, amber, or
+  red by fill level; neutral while the window size is unknown). Live
+  `context_usage` events update it without a snapshot reload. Hovering, focusing,
+  or clicking the ring opens a Mnemo1-style popup with the used/max totals, the
+  per-role breakdown (system / user / assistant / tool) as proportional bars, and
+  a **Compact now** button that sends a real between-turns compact command; the
+  outcome arrives as `compact_started` / `compacted` lead events, and a busy or
+  compacting lead disables the button.
 - **Real recovery:** running workers reopen as interrupted, and `team.json` has
   a backup-recoverable replacement path. Conflict-only recovery can abort and
   verify clean; unrelated lead changes prevent automatic abort and remain in

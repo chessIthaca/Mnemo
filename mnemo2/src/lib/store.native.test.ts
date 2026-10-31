@@ -53,6 +53,7 @@ function makeTransport(initial: LeadSnapshot) {
     snapshot: vi.fn(async () => current),
     prompt: vi.fn(async () => {}),
     interrupt: vi.fn(async () => {}),
+    compact: vi.fn(async () => {}),
     setModel: vi.fn(async (spec: string) => {
       const modelId = spec.split("/").at(-1) ?? spec;
       current = {
@@ -292,6 +293,33 @@ describe("native lead store path", () => {
 
     await expect(actions.interruptLead()).rejects.toThrow("stop failed");
     expect(get(app).toast?.message).toContain("stop failed");
+  });
+
+  it("compacts the lead context through the transport and toasts failures", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+    const toastBefore = get(app).toast?.message ?? null;
+
+    await actions.compactLead();
+    expect(harness.transport.compact).toHaveBeenCalledTimes(1);
+    expect(get(app).toast?.message ?? null).toBe(toastBefore);
+
+    harness.transport.compact = vi.fn(async () => {
+      throw new Error("compact failed");
+    });
+    await actions.compactLead();
+    expect(harness.transport.compact).toHaveBeenCalledTimes(1);
+    expect(get(app).toast?.message).toContain("compact failed");
+  });
+
+  it("toasts instead of throwing when no native transport can compact", async () => {
+    actions.openProject("mnemo");
+    await Promise.resolve();
+    expect(get(app).leadRuntime.mode).toBe("mock");
+    await actions.compactLead();
+    expect(get(app).toast?.message).toMatch(/native lead is not connected/i);
   });
 
   it("never fabricates a lead reply when no native transport exists", async () => {

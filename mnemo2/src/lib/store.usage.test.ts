@@ -131,6 +131,7 @@ function makeLead() {
     snapshot: vi.fn(async () => current),
     prompt: vi.fn(async () => {}),
     interrupt: vi.fn(async () => {}),
+    compact: vi.fn(async () => {}),
     setModel: vi.fn(async () => current),
     approve: vi.fn(async () => {}),
     answer: vi.fn(async () => {}),

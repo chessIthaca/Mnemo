@@ -32,6 +32,8 @@ export interface LeadTransport {
    */
   prompt(text: string, images?: string[]): Promise<void>;
   interrupt(): Promise<void>;
+  /** Compact the lead's context between turns; the session stays open. */
+  compact(): Promise<void>;
   setModel(spec: string, reasoningEffort?: string | null): Promise<LeadSnapshot>;
   approve(requestId: string, decision: LeadApprovalDecision): Promise<void>;
   answer(questionId: string, answer: LeadAnswerInput): Promise<void>;
@@ -69,6 +71,7 @@ export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadT
         images && images.length > 0 ? { text, images } : { text },
       ),
     interrupt: () => bindings.invoke<void>("lead_interrupt"),
+    compact: () => bindings.invoke<void>("lead_compact"),
     setModel: (spec, reasoningEffort) =>
       bindings.invoke<LeadSnapshot>("lead_set_model", {
         spec,

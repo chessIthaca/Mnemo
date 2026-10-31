@@ -227,6 +227,7 @@ export function createInitialState(): AppState {
     workbenchOpen: false,
     workbenchTab: "browser",
     workbenchWidth: 480,
+    workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
     browserLoading: false,
@@ -472,6 +473,7 @@ async function openProject(projectId: string, allowConflict = false): Promise<vo
     teamActive: 0,
     projectUsage: emptyProjectUsage(),
     workbenchOpen: false,
+    workerPanelId: null,
     browserUrl: "about:blank",
     browserTitle: "",
     browserLoading: false,
@@ -565,6 +567,7 @@ async function closeProjectNow(): Promise<void> {
     teamActive: 0,
     projectUsage: emptyProjectUsage(),
     workbenchOpen: false,
+    workerPanelId: null,
   }));
 }
 
@@ -726,6 +729,28 @@ function setTeamFilter(teamFilter: TeamFilter) {
   app.update((state) => ({ ...state, teamFilter }));
 }
 
+/**
+ * Stream a worker's output beside the lead chat. The route stays on "lead",
+ * the Workbench gives way, and unknown ids are ignored.
+ */
+function openWorkerPanel(workerId: string) {
+  app.update((state) => {
+    if (!state.workers.some((worker) => worker.id === workerId)) return state;
+    return {
+      ...state,
+      route: state.projectId ? "lead" : state.route,
+      teamPeekOpen: false,
+      workbenchOpen: false,
+      workerPanelId: workerId,
+    };
+  });
+}
+
+/** Close the lead-side worker output panel; the Workbench stays closed. */
+function closeWorkerPanel() {
+  app.update((state) => ({ ...state, workerPanelId: null }));
+}
+
 async function refreshDiff(): Promise<void> {
   const current = get(app);
   const workerId = current.diffWorkerId ?? current.selectedWorkerId ?? current.workers[0]?.id;
@@ -832,6 +857,7 @@ function openWorkbench(workbenchTab: WorkbenchTab = "browser") {
     route: state.projectId ? "lead" : state.route,
     teamPeekOpen: false,
     workbenchOpen: true,
+    workerPanelId: null,
     workbenchTab,
   }));
   if (workbenchTab === "diff" && get(app).leadRuntime.mode === "native") void refreshDiff();
@@ -844,7 +870,7 @@ function closeWorkbench() {
 }
 
 function setWorkbenchTab(workbenchTab: WorkbenchTab) {
-  app.update((state) => ({ ...state, workbenchOpen: true, workbenchTab }));
+  app.update((state) => ({ ...state, workbenchOpen: true, workerPanelId: null, workbenchTab }));
   if (workbenchTab === "diff" && get(app).leadRuntime.mode === "native") void refreshDiff();
   schedulePreferenceSave();
 }
@@ -2022,6 +2048,9 @@ async function syncTeam(): Promise<void> {
         diffWorkerId: snapshot.workers.some((worker) => worker.id === diffWorkerId)
           ? diffWorkerId
           : snapshot.workers[0]?.id ?? null,
+        workerPanelId: snapshot.workers.some((worker) => worker.id === state.workerPanelId)
+          ? state.workerPanelId
+          : null,
       };
     });
     scheduleDiffSync();
@@ -2143,6 +2172,8 @@ export const actions = {
   toggleTeamPeek,
   selectWorker,
   setTeamFilter,
+  openWorkerPanel,
+  closeWorkerPanel,
   openWorkbench,
   closeWorkbench,
   setWorkbenchTab,

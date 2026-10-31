@@ -548,6 +548,8 @@ export interface AppState {
   workbenchOpen: boolean;
   workbenchTab: WorkbenchTab;
   workbenchWidth: number;
+  /** Worker whose output streams in the lead-side panel; null when closed. */
+  workerPanelId: string | null;
   browserUrl: string;
   browserTitle: string;
   browserLoading: boolean;

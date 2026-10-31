@@ -7,6 +7,7 @@
   import TeamPeek from "./components/TeamPeek.svelte";
   import Toast from "./components/Toast.svelte";
   import TopBar from "./components/TopBar.svelte";
+  import WorkerPanel from "./components/WorkerPanel.svelte";
   import Workbench from "./components/Workbench.svelte";
   import WorkerDeleteSheet from "./components/WorkerDeleteSheet.svelte";
 </script>
@@ -24,7 +25,7 @@
       {#if $app.route === "lead"}
         <div class="lead-column">
           <LeadChat />
-          {#if $app.workbenchOpen}<Workbench />{/if}
+          {#if $app.workbenchOpen}<Workbench />{:else if $app.workerPanelId}<WorkerPanel />{/if}
         </div>
       {:else}
         <ControlRoom />

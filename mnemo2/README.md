@@ -372,6 +372,15 @@ reviewer workflow is unchanged.
 - Workbench lives beside the lead chat only; opening Mission Control hides it,
   mirroring the native-webview overlay rule. On narrow layouts it becomes a
   full-height overlay, with bottom navigation space reserved.
+- The lead's "Waiting on …" and "Needs you: …" lines name live workers as
+  inline buttons that open a worker output panel beside the chat: the same
+  live Thread Mission Control shows (streamed messages, tool calls, screenshot
+  links) plus a worker picker, model/status/plan header, a private steer box
+  that sends `team_message`, and a Mission Control hand-off. A failed,
+  conflict, stopped, or interrupted worker gets a banner with its error and
+  Continue/Delete ways out. The panel shares the right side with the Workbench
+  — opening one closes the other — and resets when the project changes or the
+  worker vanishes from a sync.
 - The team peek is anchored over the chat side.
 
 ## Roadmap status

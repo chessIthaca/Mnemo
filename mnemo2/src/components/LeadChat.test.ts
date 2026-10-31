@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import {
@@ -562,6 +563,29 @@ describe("LeadChat", () => {
     const name = fixtureState().workers[0].name;
     render(LeadChat);
     expect(document.body.textContent).toContain(`Waiting on ${name}. The lead picks up when it finishes.`);
+    setRuntime({ busy: true });
+  });
+
+  it("opens the worker output panel from the waiting-line names", async () => {
+    setRuntime({ busy: false });
+    const workers = fixtureState().workers
+      .slice(0, 2)
+      .map((worker) => ({ ...worker, status: "working" as const }));
+    app.update((state) => ({ ...state, workers }));
+    const [first, second] = workers;
+    render(LeadChat);
+
+    // Both running workers get an inline button; the sentence keeps its wording.
+    expect(screen.getByRole("button", { name: `Show ${first.name}'s output` })).toBeTruthy();
+    expect(screen.getByRole("button", { name: `Show ${second.name}'s output` })).toBeTruthy();
+    expect(document.body.textContent).toContain(
+      `Waiting on ${first.name}, ${second.name}. The lead picks up when one finishes.`,
+    );
+
+    await fireEvent.click(screen.getByRole("button", { name: `Show ${second.name}'s output` }));
+    expect(get(app).workerPanelId).toBe(second.id);
+    expect(get(app).route).toBe("lead");
+    expect(get(app).workbenchOpen).toBe(false);
     setRuntime({ busy: true });
   });
 

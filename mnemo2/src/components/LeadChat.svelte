@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { ArrowUpRight, ClipboardCheck, MessageSquareText } from "@lucide/svelte";
   import { actions, app } from "../lib/store";
+  import { workerStatusText } from "../lib/types";
   import Composer from "./Composer.svelte";
   import Markdown from "./Markdown.svelte";
   import EventRow from "./EventRow.svelte";
@@ -36,6 +37,8 @@
   const runningWorkers = $derived(
     $app.workers.filter((worker) => ["dispatching", "working", "fixing"].includes(worker.status)),
   );
+  // Same predicate as needsYouCount: any worker waiting on a human, busy lead or not.
+  const needsYouWorkers = $derived($app.workers.filter((worker) => worker.needsYou));
   const showWaiting = $derived(
     !$app.leadRuntime.busy && !$app.leadRuntime.pending && !$app.leadRuntime.error && runningWorkers.length > 0,
   );
@@ -175,7 +178,13 @@
         {#if showWaiting}
           <div class="thinking-status waiting-status" role="status" aria-live="polite">
             <span class="thinking-dot" aria-hidden="true"></span>
-            <span>{`Waiting on ${runningWorkers.map((worker) => worker.name).join(", ")}. The lead picks up when ${runningWorkers.length === 1 ? "it finishes" : "one finishes"}.`}</span>
+            <span>{`Waiting on `}{#each runningWorkers as worker, index (worker.id)}{#if index > 0}{`, `}{/if}<button class="waiting-worker" type="button" aria-label={`Show ${worker.name}'s output`} onclick={() => actions.openWorkerPanel(worker.id)}>{worker.name}</button>{/each}{`. The lead picks up when ${runningWorkers.length === 1 ? "it finishes" : "one finishes"}.`}</span>
+          </div>
+        {/if}
+        {#if needsYouWorkers.length > 0}
+          <div class="thinking-status needs-you-status" role="status" aria-live="polite">
+            <span class="thinking-dot" aria-hidden="true"></span>
+            <span>{`Needs you: `}{#each needsYouWorkers as worker, index (worker.id)}{#if index > 0}{`, `}{/if}<button class="waiting-worker" type="button" aria-label={`Open ${worker.name}`} onclick={() => actions.openWorkerPanel(worker.id)}>{worker.name}</button>{` (${workerStatusText(worker)})`}{/each}{`.`}</span>
           </div>
         {/if}
       </div>
@@ -227,6 +236,9 @@
   .thinking-status { display: flex; align-items: center; gap: 6px; margin: 6px 0 12px 30px; color: var(--muted); font-size: 10px; }
   .thinking-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); animation: thinking-pulse 1.2s ease-in-out infinite; }
   .waiting-status .thinking-dot { animation-duration: 2.4s; }
+  .waiting-worker { padding: 0; border: 0; background: transparent; color: var(--accent-strong); cursor: pointer; font: inherit; font-weight: 650; }
+  .waiting-worker:hover { text-decoration: underline; }
+  .needs-you-status .thinking-dot { animation-duration: 0.9s; background: var(--danger); }
   @keyframes thinking-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
   .user-entry { max-width: 100ch; margin: 20px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line-strong); }
   .user-entry p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }

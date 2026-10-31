@@ -49,15 +49,13 @@ pub struct WorktreeBinding {
 /// and their read-only plan mirror must show the worktree agent's plan
 /// (the parent's plans dir), not the main agent's. `None` for every
 /// factory-default parent — today's behavior.
-async fn parent_root_binding(
-    agent_loops: &AgentLoopMap,
-    parent_id: AgentId,
+fn parent_root_binding(
+    parent: &AgentLoop,
 ) -> Option<(crate::agent::factory::AgentRootSpec, std::path::PathBuf)> {
-    agent_loops.lock().await.get(&parent_id).and_then(|l| {
-        l.root_spec()
-            .cloned()
-            .map(|spec| (spec, l.plans_dir().to_path_buf()))
-    })
+    parent
+        .root_spec()
+        .cloned()
+        .map(|spec| (spec, parent.plans_dir().to_path_buf()))
 }
 
 /// The host dependencies a spawn needs: the loop factory (builds the
@@ -120,14 +118,36 @@ pub struct SessionOptions {
 /// UI-button spawns and the main agent) — used to notify the parent when this
 /// agent finishes. Returns `(agent_id, name)`.
 ///
-/// The only supported role is `reviewer`; any other role rejects the spawn
-/// before an agent id is allocated or any agent state is constructed.
+/// The only supported role is `reviewer`; any other role rejects the spawn.
+/// A supplied parent id must have a registered loop. Either validation failure
+/// rejects the spawn before an agent id is allocated or any agent state is
+/// constructed.
 pub async fn spawn_agent_shared(
     host: SpawnHost,
     name: String,
     initial_prompt: Option<String>,
     parent_id: Option<AgentId>,
     session: SessionOptions,
+) -> Result<(AgentId, String), String> {
+    spawn_agent_shared_inner(
+        host,
+        name,
+        initial_prompt,
+        parent_id,
+        session,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn spawn_agent_shared_inner(
+    host: SpawnHost,
+    name: String,
+    initial_prompt: Option<String>,
+    parent_id: Option<AgentId>,
+    session: SessionOptions,
+    #[cfg(test)] after_parent_validation: Option<&(dyn Fn() + Sync)>,
 ) -> Result<(AgentId, String), String> {
     let SpawnHost {
         factory,
@@ -151,6 +171,20 @@ pub async fn spawn_agent_shared(
                 "unknown role '{other}'; supported roles: reviewer"
             ));
         }
+    }
+    let parent = match parent_id {
+        Some(parent_id) => {
+            let parent = agent_loops.lock().await.get(&parent_id).cloned();
+            if parent.is_none() {
+                return Err(format!("parent agent {parent_id} has no registered loop"));
+            }
+            parent
+        }
+        None => None,
+    };
+    #[cfg(test)]
+    if let Some(hook) = after_parent_validation {
+        hook();
     }
 
     // Allocate the agent id from the manager FIRST, then build the loop with
@@ -177,10 +211,9 @@ pub async fn spawn_agent_shared(
     // agent's; the main agent + subagents share the main dir.
     // A subagent inherits its parent's per-agent root override (parallel
     // run-all worktree agents, plan ffd7a86f) — see parent_root_binding.
-    let parent_binding = match parent_id {
-        Some(pid) => parent_root_binding(&agent_loops, pid).await,
-        None => None,
-    };
+    let parent_binding = parent
+        .as_ref()
+        .and_then(|parent| parent_root_binding(parent));
     let agent_loop = if let Some((spec, parent_plans_dir)) = parent_binding {
         factory.build_with_root_spec(agent_id, parent_plans_dir, spec)
     } else if let Some(binding) = worktree {
@@ -263,7 +296,7 @@ pub async fn spawn_agent_shared(
     // they're safe (sandboxed output / read-only diff). The intersection is a
     // snapshot of the parent's permissions at spawn time; it doesn't track
     // parent state changes mid-spawn.
-    let allowlist = compute_subagent_allowlist(&agent_loops, parent_id, &role).await;
+    let allowlist = compute_subagent_allowlist_from_parent(parent.as_ref(), &role).await;
     if let Some(list) = allowlist {
         // 2b.3: the role allow-list write rides the neutral handle — the
         // reviewer arm enforces it STRICTLY (ToolFilter::Reviewer: only the
@@ -428,9 +461,10 @@ const ALWAYS_SAFE_ROLE_TOOLS: &[&str] = &["git_read", "write_review_report"];
 /// Returns `None` (no restriction) only when there is no parent and no role.
 /// A parentless reviewer receives exactly [`REVIEWER_BASE_TOOLS`]; there is no
 /// parent permission set to intersect, but the read-only role boundary still
-/// applies. Unknown roles are rejected by [`spawn_agent_shared`] before agent
-/// construction. A KNOWN `parent_id` whose loop is missing from the map returns
-/// `Some(vec![])`, so a missing parent cannot escalate the agent's permissions.
+/// applies. Unknown roles and unregistered supplied parents are rejected by
+/// [`spawn_agent_shared`] before agent construction. The parent passed here is
+/// the validated snapshot, so later removal from the loop map cannot change
+/// the computed permissions.
 ///
 /// The intersection is a snapshot of the parent's permissions at spawn time;
 /// it does not track parent state changes mid-spawn.
@@ -446,12 +480,11 @@ const ALWAYS_SAFE_ROLE_TOOLS: &[&str] = &["git_read", "write_review_report"];
 /// grants nothing implicitly, so a memory tool omitted from the allow-list is
 /// genuinely unavailable (query-only retrieval is in `REVIEWER_BASE_TOOLS`;
 /// memory writes are not).
-async fn compute_subagent_allowlist(
-    agent_loops: &AgentLoopMap,
-    parent_id: Option<AgentId>,
+async fn compute_subagent_allowlist_from_parent(
+    parent: Option<&Arc<AgentLoop>>,
     role: &Option<String>,
 ) -> Option<Vec<String>> {
-    let Some(parent_id) = parent_id else {
+    let Some(parent) = parent else {
         return match role.as_deref() {
             Some("reviewer") => Some(
                 REVIEWER_BASE_TOOLS
@@ -478,21 +511,6 @@ async fn compute_subagent_allowlist(
     // one-lock-at-a-time discipline is preserved and the registry snapshot
     // below needs no lock.
     let (filter, registered): (ToolFilter, Vec<(String, ToolCategory, SafetyLevel)>) = {
-        let loops = agent_loops.lock().await;
-        // Fail CLOSED: a KNOWN parent_id whose loop is missing from the map
-        // returns an empty allow-list (deny all tools) — NOT None (which would
-        // mean "no restriction" and grant the subagent the full tool set). The
-        // parent's loop should always be present for a tool-spawned subagent;
-        // if it isn't, something is wrong, so deny everything rather than
-        // silently escalating.
-        let parent = match loops.get(&parent_id) {
-            Some(p) => p.clone(),
-            None => {
-                eprintln!("spawn: parent {parent_id} loop missing — denying all tools to subagent");
-                return Some(Vec::new());
-            }
-        };
-        drop(loops);
         // 2a.7: the parent's allowed set consults the agent's policy —
         // WorkflowPolicy::tool_surface's gate IS allowed_tools() (the 2a.3
         // delegate), so a policy-carrying parent filters identically; a
@@ -503,9 +521,8 @@ async fn compute_subagent_allowlist(
             Some(filter) => filter,
             None => parent.workflow_handle().allowed_tools().await,
         };
-        // Collect owned (name, category, safety) tuples so the borrow of
-        // `parent` ends here (the Arc is dropped at the block close). No
-        // lock is held across this snapshot.
+        // Collect owned (name, category, safety) tuples so the parent's
+        // registry borrow ends here. No lock is held across this snapshot.
         let registered = parent
             .tools()
             .iter()
@@ -565,6 +582,21 @@ async fn compute_subagent_allowlist(
     }
 }
 
+#[cfg(test)]
+async fn compute_subagent_allowlist(
+    agent_loops: &AgentLoopMap,
+    parent_id: Option<AgentId>,
+    role: &Option<String>,
+) -> Option<Vec<String>> {
+    let parent = match parent_id {
+        Some(parent_id) => agent_loops.lock().await.get(&parent_id).cloned(),
+        None => None,
+    };
+    if parent_id.is_some() && parent.is_none() {
+        return Some(Vec::new());
+    }
+    compute_subagent_allowlist_from_parent(parent.as_ref(), role).await
+}
 
 /// Cancel every INACTIVE subagent registered with the manager, leaving the
 /// given `trigger_agent` and any RUNNING subagent untouched.
@@ -1194,11 +1226,8 @@ mod tests {
         .with_plans_dir(plans_dir.clone())
         .with_root_spec(Some(spec.clone()));
 
-        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        map.lock().await.insert(7, Arc::new(parent));
-
         let (got_spec, got_plans) =
-            parent_root_binding(&map, 7).await.expect("the parent's root binding");
+            parent_root_binding(&parent).expect("the parent's root binding");
         assert_eq!(got_spec.sandbox.root(), worktree_root);
         assert_eq!(got_spec.project_root, worktree_root);
         assert!(got_spec.codegraph.is_none());
@@ -1225,10 +1254,8 @@ mod tests {
             crate::project::Constitution::default(),
         )
         .with_agent_id(8);
-        let map2 = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        map2.lock().await.insert(8, Arc::new(plain));
         assert!(
-            parent_root_binding(&map2, 8).await.is_none(),
+            parent_root_binding(&plain).is_none(),
             "a factory-default parent has no root binding"
         );
     }
@@ -1573,18 +1600,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_parent_loop_denies_all() {
-        // C1 fail-closed: a KNOWN parent id whose loop is missing from the map
-        // returns an empty allow-list (deny all tools) — NOT None (which would
-        // mean "no restriction" and grant the subagent the full tool set). The
-        // parent's loop should always be present for a tool-spawned subagent;
-        // if it isn't, deny everything rather than silently escalating.
-        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let list = compute_subagent_allowlist(&map, Some(999), &Some("reviewer".into())).await;
+    async fn missing_parent_loop_rejects_roleless_spawn_before_registration() {
+        // An empty Skill allow-list still auto-grants memory writes, ask_user,
+        // and backlog mutations, so a stale parent must reject the whole spawn
+        // rather than reaching the roleless allow-list path.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let error = spawn_agent_shared(
+            host,
+            "stale-parent".to_string(),
+            None,
+            Some(999),
+            test_session(None),
+        )
+        .await
+        .expect_err("a missing parent loop must refuse a roleless spawn");
+        assert_eq!(error, "parent agent 999 has no registered loop");
         assert!(
-            list.as_ref().is_some_and(|v| v.is_empty()),
-            "missing parent loop → deny all (Some(vec![])), got: {:?}",
-            list
+            agent_loops.lock().await.is_empty(),
+            "a rejected stale-parent spawn must not register an agent"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_parent_loop_rejects_reviewer_spawn_before_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let error = spawn_agent_shared(
+            host,
+            "stale-parent-reviewer".to_string(),
+            None,
+            Some(999),
+            test_session(Some("reviewer")),
+        )
+        .await
+        .expect_err("a missing parent loop must refuse a reviewer spawn");
+        assert_eq!(error, "parent agent 999 has no registered loop");
+        assert!(
+            agent_loops.lock().await.is_empty(),
+            "a rejected stale-parent reviewer must not register an agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_exit_after_validation_uses_parent_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let worktree_root = worktree.path().canonicalize().unwrap();
+        let parent_plans = worktree_root.join("plans/agents/7");
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let parent = host.factory.build_with_root_spec(
+            7,
+            parent_plans.clone(),
+            crate::agent::factory::AgentRootSpec {
+                sandbox: crate::tool::agent::sandbox::Sandbox::new(&worktree_root).unwrap(),
+                project_root: worktree_root.clone(),
+                codegraph: None,
+            },
+        );
+        agent_loops.lock().await.insert(7, parent);
+
+        // Deterministically model parent exit after validation but before the
+        // old root-binding and allow-list lookups. The child must continue from
+        // the validated Arc snapshot, never from a later map miss.
+        let loops = agent_loops.clone();
+        let remove_validated_parent = move || {
+            assert!(loops.try_lock().unwrap().remove(&7).is_some());
+        };
+        let (child_id, _) = spawn_agent_shared_inner(
+            host,
+            "snapshot-child".to_string(),
+            None,
+            Some(7),
+            test_session(None),
+            Some(&remove_validated_parent),
+        )
+        .await
+        .unwrap();
+        let child = agent_loops.lock().await.get(&child_id).cloned().unwrap();
+
+        match child.workflow_handle().allowed_tools().await {
+            ToolFilter::Skill(tools) => {
+                assert!(!tools.is_empty(), "parent exit must not grant Skill([])");
+                assert!(
+                    !tools.iter().any(|name| name == "file_write"),
+                    "the Planning parent's restricted filter must be preserved"
+                );
+            }
+            other => panic!("roleless child must retain a Skill filter, got {other:?}"),
+        }
+        let root = child
+            .root_spec()
+            .expect("the validated parent's root binding must survive parent exit");
+        assert_eq!(root.project_root, worktree_root);
+        assert_eq!(root.sandbox.root(), worktree_root);
+        assert_eq!(child.plans_dir(), parent_plans);
     }
 }

@@ -441,10 +441,19 @@ pub async fn lead_snapshot(state: State<'_, Mnemo2State>) -> Result<LeadSnapshot
     current(&state).await?.snapshot().await
 }
 
-/// Send a user prompt to the real lead.
+/// Send a user prompt (with optional image attachments) to the real
+/// lead. A busy lead receives it as a queued steer injected at the next
+/// safe turn boundary instead of an error.
 #[tauri::command]
-pub async fn lead_prompt(state: State<'_, Mnemo2State>, text: String) -> Result<(), String> {
-    current(&state).await?.send_prompt(text).await
+pub async fn lead_prompt(
+    state: State<'_, Mnemo2State>,
+    text: String,
+    images: Option<Vec<String>>,
+) -> Result<(), String> {
+    current(&state)
+        .await?
+        .send_prompt(text, images.unwrap_or_default())
+        .await
 }
 
 /// Cancel the current lead generation without closing the session.

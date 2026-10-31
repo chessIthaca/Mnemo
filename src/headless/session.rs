@@ -261,12 +261,9 @@ impl AgentSession {
                 self.agent_command(AgentCommand::Prompt { text, images })
                     .await
             }
-            SessionCommand::Steer { text } => {
-                self.agent_command(AgentCommand::Suggestion(SteerPayload {
-                    text,
-                    images: vec![],
-                }))
-                .await
+            SessionCommand::Steer { text, images } => {
+                self.agent_command(AgentCommand::Suggestion(SteerPayload { text, images }))
+                    .await
             }
             SessionCommand::CancelSteer { text } => {
                 self.agent_command(AgentCommand::CancelSuggestion(text))

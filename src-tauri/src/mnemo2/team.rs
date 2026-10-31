@@ -56,9 +56,6 @@ const WORKER_WALL_CLOCK_MS: u64 = 30 * 60 * 1000;
 /// The default number of concurrently live worker sessions.
 pub const DEFAULT_SLOTS: usize = 3;
 
-/// The default delegation limit for one lead turn.
-pub const DEFAULT_SPAWNS_PER_TURN: usize = 4;
-
 /// The real lifecycle state of one worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -269,8 +266,6 @@ pub struct TeamRuntimeOptions {
     pub state_dir: PathBuf,
     /// Explicit cap override; `None` restores the saved cap or the default.
     pub slots: Option<usize>,
-    /// The per-lead-turn delegation limit.
-    pub max_spawns_per_turn: usize,
     /// Explicit worker models must belong to this configured inventory.
     pub model_specs: Vec<String>,
     /// Configured per-model prices used to estimate real worker cost.
@@ -393,12 +388,10 @@ pub struct TeamRuntime {
     events: broadcast::Sender<TeamEvent>,
     generation: Arc<AtomicU64>,
     next_worker: AtomicU64,
-    spawns_this_turn: AtomicUsize,
     lead_busy: AtomicBool,
     lead_session: Mutex<Option<SessionId>>,
     merge_lock: Mutex<()>,
     pricing: Arc<std::sync::RwLock<Vec<mnemo::config::PricingEntry>>>,
-    max_spawns_per_turn: usize,
     model_specs: Vec<String>,
     persistence: TeamPersistence,
     /// The durable per-project usage accumulator (lead + workers).
@@ -441,12 +434,10 @@ impl TeamRuntime {
             events,
             generation: Arc::new(AtomicU64::new(0)),
             next_worker: AtomicU64::new(1),
-            spawns_this_turn: AtomicUsize::new(0),
             lead_busy: AtomicBool::new(false),
             lead_session: Mutex::new(None),
             merge_lock: Mutex::new(()),
             pricing: Arc::new(std::sync::RwLock::new(options.pricing)),
-            max_spawns_per_turn: options.max_spawns_per_turn.max(1),
             model_specs: options.model_specs,
             persistence,
             usage: Arc::new(Mutex::new(usage)),
@@ -463,7 +454,6 @@ impl TeamRuntime {
             workspace_root: lead.workspace_root().to_path_buf(),
             state_dir,
             slots: None,
-            max_spawns_per_turn: DEFAULT_SPAWNS_PER_TURN,
             model_specs: lead.models().iter().map(|model| model.spec.clone()).collect(),
             pricing: lead.pricing()?,
         })
@@ -475,9 +465,9 @@ impl TeamRuntime {
         self.events.subscribe()
     }
 
-    /// Reset the per-turn delegation limit and mark the lead non-idle.
+    /// Mark the lead non-idle: the merge gate's busy hook, re-armed at
+    /// every turn boundary so mid-turn merges stay refused.
     pub fn begin_lead_turn(&self) {
-        self.spawns_this_turn.store(0, Ordering::SeqCst);
         self.lead_busy.store(true, Ordering::SeqCst);
     }
 
@@ -974,27 +964,14 @@ impl TeamRuntime {
                 return Err(format!("worker ID prefix collides with an existing {branch}"));
             }
         }
-        let used = self.spawns_this_turn.fetch_add(1, Ordering::SeqCst);
-        if used >= self.max_spawns_per_turn {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
-            return Err(format!(
-                "the lead already delegated {} worker(s) this turn",
-                self.max_spawns_per_turn
-            ));
-        }
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
             return Err(format!("all {slots} worker slots are busy"));
         }
-        let result = self
-            .provision_worker(brief, model, worker_id, review_risk)
-            .await;
-        if result.is_err() {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
-        }
-        result.map(|worker| (worker, false))
+        self.provision_worker(brief, model, worker_id, review_risk)
+            .await
+            .map(|worker| (worker, false))
     }
 
     /// Dispatch one fresh read-only independent audit of an implementation
@@ -1115,18 +1092,9 @@ impl TeamRuntime {
             reasoning_effort.as_deref(),
         )
         .await?;
-        let used = self.spawns_this_turn.fetch_add(1, Ordering::SeqCst);
-        if used >= self.max_spawns_per_turn {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
-            return Err(format!(
-                "the lead already delegated {} worker(s) this turn",
-                self.max_spawns_per_turn
-            ));
-        }
         let active = self.live.lock().await.len();
         let slots = self.persistence.slots.load(Ordering::SeqCst);
         if active >= slots {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
             return Err(format!("all {slots} worker slots are busy"));
         }
         // The audit worktree checks out the audited branch itself so the
@@ -1175,11 +1143,9 @@ impl TeamRuntime {
             merge: None,
             error: None,
         };
-        let result = self.start_audit_worker(record, base_tip).await;
-        if result.is_err() {
-            self.spawns_this_turn.fetch_sub(1, Ordering::SeqCst);
-        }
-        result.map(|worker| (worker, false))
+        self.start_audit_worker(record, base_tip)
+            .await
+            .map(|worker| (worker, false))
     }
 
     /// Provision and start one audit worker record (the audit counterpart of
@@ -1477,7 +1443,10 @@ impl TeamRuntime {
                     images: Vec::new(),
                 }
             } else {
-                SessionCommand::Steer { text }
+                SessionCommand::Steer {
+                    text,
+                    images: Vec::new(),
+                }
             };
             let result = live.session.send(command).await;
             (busy, idle, result)

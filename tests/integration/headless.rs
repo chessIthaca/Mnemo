@@ -137,7 +137,10 @@ fn public_types_serde_roundtrip() {
             text: "hi".into(),
             images: vec!["data:image/png;base64,AAA".into()],
         },
-        SessionCommand::Steer { text: "go".into() },
+        SessionCommand::Steer {
+            text: "go".into(),
+            images: vec![],
+        },
         SessionCommand::CancelSteer { text: "go".into() },
         SessionCommand::Interrupt,
         SessionCommand::Compact,
@@ -248,6 +251,28 @@ fn public_types_serde_roundtrip() {
         .unwrap(),
         json!({"type": "prompt", "text": "hi", "images": []})
     );
+    // A steer serializes with its images — and a legacy steer without
+    // the `images` key still decodes (the field defaults to none).
+    assert_eq!(
+        serde_json::to_value(SessionCommand::Steer {
+            text: "go".into(),
+            images: vec!["data:image/png;base64,AAA".into()],
+        })
+        .unwrap(),
+        json!({"type": "steer", "text": "go", "images": ["data:image/png;base64,AAA"]})
+    );
+    let legacy_steer: SessionCommand = serde_json::from_value(json!({"type": "steer", "text": "go"}))
+        .expect("a legacy steer without images decodes");
+    match legacy_steer {
+        SessionCommand::Steer { text, images } => {
+            assert_eq!(text, "go");
+            assert!(
+                images.is_empty(),
+                "the missing images key decodes to no images: {images:?}"
+            );
+        }
+        other => panic!("expected a steer command, got {other:?}"),
+    }
     // The permission policy rides along in kebab-case (the 2c.5 lesson:
     // SafetyMode is kebab-case on the wire; the tag is "mode").
     let opts_json = serde_json::to_value(sample_options()).unwrap();
@@ -585,6 +610,55 @@ async fn closed_session_error_code() {
         .await
         .expect_err("a closed session rejects sends");
     assert_eq!(err.code(), "session_closed");
+}
+
+/// A steer's image attachments survive the command boundary:
+/// `SessionCommand::Steer` must forward `images` to the kernel as
+/// `AgentCommand::Suggestion`, and the kernel's `SuggestionInjected`
+/// event re-attaches them. Regression: the session layer previously
+/// hardcoded empty images, so a steered image never reached the model.
+#[tokio::test]
+async fn steer_command_forwards_images_to_the_kernel() {
+    let (_engine, session, _root, _cfg) =
+        scripted_engine(vec![text_turn(&["one"]), text_turn(&["two"])]).await;
+    let mut rx = session.events();
+    session
+        .send(SessionCommand::Prompt {
+            text: "go".into(),
+            images: vec![],
+        })
+        .await
+        .expect("prompt");
+    session
+        .send(SessionCommand::Steer {
+            text: "a steer".into(),
+            images: vec!["data:image/png;base64,AAA".into()],
+        })
+        .await
+        .expect("steer");
+    let mut injected: Vec<(String, Vec<String>)> = Vec::new();
+    let mut finished = 0;
+    while finished < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the engine stayed responsive")
+            .expect("the bus stayed open");
+        match event.event {
+            SerializableAgentEvent::SuggestionInjected { text, images } => {
+                injected.push((text, images));
+            }
+            SerializableAgentEvent::Finished { .. } => finished += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        injected.iter().any(|(text, images)| {
+            text == "a steer"
+                && images.len() == 1
+                && images[0] == "data:image/png;base64,AAA"
+        }),
+        "the injected steer must re-attach its text and images: {injected:?}"
+    );
 }
 
 /// §7 row 15: shutdown ends the sessions — the event bus closes.

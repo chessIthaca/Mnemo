@@ -156,10 +156,18 @@
   }
 
   function imageFiles(data: DataTransfer | null): File[] {
-    return Array.from(data?.items ?? [])
+    const fromItems = Array.from(data?.items ?? [])
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
       .map((item) => item.getAsFile())
       .filter((file): file is File => file !== null);
+    // An image FILE copied in File Explorer pastes with a file-kind item
+    // carrying an EMPTY type (never image/*) — the real image File only
+    // surfaces in clipboardData.files. Items win first, so an ordinary
+    // screenshot paste (which Chromium lists in BOTH) can never double-attach.
+    if (fromItems.length > 0) return fromItems;
+    return Array.from(data?.files ?? []).filter((file) =>
+      file.type.startsWith("image/"),
+    );
   }
 
   async function handlePaste(event: ClipboardEvent) {

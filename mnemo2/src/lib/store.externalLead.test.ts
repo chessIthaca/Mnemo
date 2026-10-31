@@ -22,6 +22,7 @@ const host = vi.hoisted(() => ({
   /** Holds every status read until it resolves. */
   statusGate: null as Promise<void> | null,
   statusAsked: vi.fn(),
+  reportOpenFailure: vi.fn(async (_root: string, _reason: string) => undefined),
   openHandlers: [] as ((request: ExternalOpenRequest) => void)[],
   changeHandlers: [] as ((event: ExternalLeadEvent) => void)[],
   unlisten: vi.fn(),
@@ -77,6 +78,7 @@ vi.mock("./externalLeadEngine", async (importOriginal) => ({
             host.changeHandlers.push(handler);
             return host.unlisten;
           },
+          reportOpenFailure: host.reportOpenFailure,
         }
       : null,
 }));
@@ -111,6 +113,7 @@ describe("Claude Code opening a project", () => {
     host.statusError = false;
     host.statusGate = null;
     host.statusAsked.mockReset();
+    host.reportOpenFailure.mockClear();
     host.openHandlers = [];
     host.changeHandlers = [];
     host.unlisten.mockReset();
@@ -146,6 +149,11 @@ describe("Claude Code opening a project", () => {
     );
     // The registry is never changed on Claude Code's behalf.
     expect(state().projects.map((project) => project.name)).toEqual(["mnemo", "garden"]);
+    // The hidden window's toast reaches nobody, so the host learns why.
+    expect(host.reportOpenFailure).toHaveBeenCalledWith(
+      "C:\\Elsewhere\\Thing",
+      "it is not a registered Mnemo2 project",
+    );
   });
 
   it("opens the project an external-open-request names", async () => {

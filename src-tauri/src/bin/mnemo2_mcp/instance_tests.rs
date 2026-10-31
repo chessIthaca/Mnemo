@@ -243,6 +243,41 @@ fn resolve_starts_mnemo2_and_waits_for_its_run_file() {
 }
 
 #[test]
+fn a_reported_open_failure_is_returned_without_starting_another_mnemo2() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    // A hidden instance that failed to open the project: no project, and a
+    // reason on `/health` for this root.
+    let wanted = project.clone();
+    let server = FakeServer::start("tok", move |req| match req.path.as_str() {
+        "/health" if req.json()["root"] == wanted.as_str() => json_reply(serde_json::json!({
+            "pid": 802,
+            "version": "test",
+            "project": null,
+            "open_error": "could not start the headless engine: not_configured",
+        })),
+        "/health" => health(802, None),
+        _ => json_reply(serde_json::json!({})),
+    });
+    sandbox.write_run(802, server.port, "tok", None);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut env = sandbox.env();
+    env.spawner = {
+        let calls = calls.clone();
+        Arc::new(move |_: &Path| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        })
+    };
+    let Resolution::Failed(message) = resolve(&env, &sandbox.deep) else {
+        panic!("expected the reported failure");
+    };
+    assert!(message.contains("not_configured"), "{message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no second Mnemo2 may start");
+}
+
+#[test]
 fn a_second_helper_waits_instead_of_starting_a_second_mnemo2() {
     let sandbox = Sandbox::new();
     sandbox.register(&[&sandbox.project]);

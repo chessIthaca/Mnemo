@@ -107,4 +107,6 @@ Mnemo2 started on demand keeps running in the system tray, and Windows locks a r
 - Connection lost after Mnemo2 restarted: the helper retries the lookup once and tells Claude in plain text if it still cannot connect. Restart the Claude session in that case. Stale run files in `~/.mnemo/run/` (dead process or no answer) are ignored and removed.
 - No notices while idle: check that the waiter is running (the lead starts it with Bash in the background). `mnemo2-mcp wait` run by hand prints a notice or "no events".
 - Hooks seem silent: they are, outside an attached Mnemo2 project. Inside one, `/hooks` lists them.
+- Hooks and Claude Code versions: the hooks run `mnemo2-mcp` directly, with no shell. Versions that ignore a hook's `args` (2.1.138 does) still work, because the helper reads which hook fired from the event Claude Code sends it.
+- Claude says Mnemo2 "could not open the project": the reason that follows comes from Mnemo2 itself, for example a missing API key for the default model (`not_configured`). Fix it in Mnemo2 (open it from the tray), then retry. A failed hidden Mnemo2 stays in the tray, and no second one is started.
 - Tier errors on dispatch: set up tiers in Mnemo2 under Settings, Tiers. The lead may only use models a tier names.

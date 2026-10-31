@@ -67,6 +67,25 @@ pub struct Mnemo2State {
     run_file: std::sync::Mutex<Option<Arc<RunFileHandle>>>,
     /// The local endpoint for an external lead; dropping it stops listening.
     endpoint: std::sync::Mutex<Option<McpServer>>,
+    /// Why the UI could not open a project Claude Code asked for: the
+    /// canonical root and the reason, until the next request or open.
+    open_failure: std::sync::Mutex<Option<(PathBuf, String)>>,
+}
+
+impl Mnemo2State {
+    /// The reported reason the project at `root` could not be opened.
+    pub(crate) fn open_failure(&self, root: &std::path::Path) -> Option<String> {
+        let failure = self.open_failure.lock().unwrap_or_else(|e| e.into_inner());
+        failure
+            .as_ref()
+            .filter(|(failed, _)| failed.as_path() == root)
+            .map(|(_, reason)| reason.clone())
+    }
+
+    /// Forget a reported open failure (a new request, or a project opened).
+    pub(crate) fn clear_open_failure(&self) {
+        *self.open_failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// The external lead's state on the open project, as the UI reads it.
@@ -110,6 +129,9 @@ impl Mnemo2State {
 
     /// Record the open project (`None` once closed) in the run file.
     fn sync_run_file(&self, project: Option<&std::path::Path>) {
+        if project.is_some() {
+            self.clear_open_failure();
+        }
         let run_file = self.run_file.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(run_file) = run_file {
             if let Err(error) = run_file.set_project(project) {
@@ -594,6 +616,20 @@ pub async fn lead_open(
 #[tauri::command]
 pub fn mnemo2_startup_project(state: State<'_, Mnemo2State>) -> Option<String> {
     state.take_startup_project()
+}
+
+/// The UI could not open a project Claude Code asked for (`--project` or an
+/// external open request); the local endpoint reports `reason` to the
+/// waiting helper instead of letting it time out.
+#[tauri::command]
+pub async fn external_open_failed(
+    state: State<'_, Mnemo2State>,
+    root: String,
+    reason: String,
+) -> Result<(), String> {
+    let root = project::canonical_root(std::path::Path::new(&root))?;
+    *state.open_failure.lock().unwrap_or_else(|e| e.into_inner()) = Some((root, reason));
+    Ok(())
 }
 
 /// Whether an external lead (Claude Code over MCP) leads the open project.

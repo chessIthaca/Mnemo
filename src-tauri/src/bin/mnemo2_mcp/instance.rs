@@ -424,6 +424,12 @@ pub fn resolve(env: &Env, cwd: &Path) -> Resolution {
 }
 
 fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance, String> {
+    // An instance that already failed to open this project keeps running (in
+    // the tray, so the user can fix it); starting another would fail the same
+    // way and pile up hidden instances.
+    if let Some(reason) = open_error(env, root) {
+        return Err(format!("Mnemo2 could not open the project {root}: {reason}"));
+    }
     let mut busy = already_busy;
     let mut child = None;
     // The guard lives until this function returns, so the lock outlasts the wait.
@@ -444,6 +450,9 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
             return Ok(instance);
         }
         busy |= found.busy;
+        if let Some(reason) = open_error(env, root) {
+            return Err(format!("Mnemo2 could not open the project {root}: {reason}"));
+        }
         if let Some(child) = child.as_mut() {
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(format!(
@@ -464,6 +473,25 @@ fn start_instance(env: &Env, root: &str, already_busy: bool) -> Result<Instance,
         }
         std::thread::sleep(env.poll_interval);
     }
+}
+
+/// The reason a running instance reported for not opening `root`, if any
+/// (its UI hit an error, e.g. a failed lead open, and said so on `/health`).
+fn open_error(env: &Env, root: &str) -> Option<String> {
+    let body = serde_json::json!({ "root": root }).to_string();
+    read_run_files(&env.run_dir).into_iter().find_map(|(_, run)| {
+        let endpoint = Endpoint {
+            port: run.port,
+            token: run.token.clone(),
+        };
+        let response =
+            http::post(&endpoint, "/health", &[], &body, Some(env.health_timeout)).ok()?;
+        let health: Value = serde_json::from_str(&response.body).ok()?;
+        health
+            .get("open_error")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// Keeps two helpers (two Claude sessions) from both launching Mnemo2 for the

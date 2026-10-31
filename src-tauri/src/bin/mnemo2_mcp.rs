@@ -157,12 +157,43 @@ fn parse_hook(command: &str, rest: &[String]) -> Result<Hook, String> {
     }
 }
 
+/// The hook a Claude Code hook event runs, for a call without arguments.
+///
+/// Claude Code 2.1.138 ignores the `args` of an exec-form hook and runs the
+/// bare command, so the hook names itself through the `hook_event_name` its
+/// stdin JSON always carries. The plugin keeps `args` for versions that pass
+/// them; either way the same hook runs, with no shell in between.
+fn hook_for_event(input: &str) -> Option<Hook> {
+    let event: serde_json::Value = serde_json::from_str(input).ok()?;
+    match event.get("hook_event_name")?.as_str()? {
+        "SessionStart" => Some(Hook::Notices(NoticesMode::SessionStart)),
+        "PostToolUse" => Some(Hook::Notices(NoticesMode::Drain)),
+        "Stop" => Some(Hook::Notices(NoticesMode::StopCheck)),
+        "PreToolUse" => Some(Hook::GateAgent),
+        _ => None,
+    }
+}
+
+/// The explicit arguments of `hook`, for a delegate that may predate the
+/// event-name dispatch.
+fn hook_args(hook: Hook) -> Vec<String> {
+    let args: &[&str] = match hook {
+        Hook::Notices(NoticesMode::Drain) => &["notices", "--drain"],
+        Hook::Notices(NoticesMode::SessionStart) => &["notices", "--session-start"],
+        Hook::Notices(NoticesMode::StopCheck) => &["notices", "--stop-check"],
+        Hook::GateAgent => &["gate-agent"],
+    };
+    args.iter().map(|arg| arg.to_string()).collect()
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("");
     let rest = args.get(1..).unwrap_or_default();
     match command {
         "notices" | "gate-agent" => run_hook_command(command, rest, &args),
+        // A bare call with a hook's JSON on stdin (see `hook_for_event`).
+        "" if !std::io::stdin().is_terminal() => run_event_hook(),
         "serve" => {
             if let Some(code) = delegate_passthrough() {
                 return code;
@@ -224,8 +255,25 @@ fn run_hook_command(command: &str, rest: &[String], args: &[String]) -> ExitCode
             return ExitCode::SUCCESS;
         }
     };
+    run_hook(hook, args, read_stdin())
+}
+
+/// A hook named by its stdin JSON (no arguments). Anything else is ignored,
+/// like every other hook failure: no stdout, exit code 0.
+fn run_event_hook() -> ExitCode {
+    std::panic::set_hook(Box::new(|_| {}));
+    let input = read_stdin();
+    match hook_for_event(&input) {
+        Some(hook) => run_hook(hook, &hook_args(hook), input),
+        None => {
+            eprintln!("mnemo2-mcp: ignoring a call without arguments that is not a known hook event");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_hook(hook: Hook, args: &[String], input: String) -> ExitCode {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let input = read_stdin();
         // A fresher copy answers when it can; otherwise this copy does.
         let delegated = delegate_exe().and_then(|target| run_delegated_hook(&target, args, &input));
         if let Some(output) = delegated {
@@ -274,6 +322,31 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bare_call_picks_the_hook_from_the_event_name() {
+        let event = |name: &str| format!(r#"{{"hook_event_name":"{name}","cwd":"C:/x"}}"#);
+        assert_eq!(
+            hook_for_event(&event("SessionStart")),
+            Some(Hook::Notices(NoticesMode::SessionStart))
+        );
+        assert_eq!(hook_for_event(&event("PostToolUse")), Some(Hook::Notices(NoticesMode::Drain)));
+        assert_eq!(hook_for_event(&event("Stop")), Some(Hook::Notices(NoticesMode::StopCheck)));
+        assert_eq!(hook_for_event(&event("PreToolUse")), Some(Hook::GateAgent));
+        assert_eq!(hook_for_event(&event("SubagentStop")), None);
+        assert_eq!(hook_for_event("not json"), None);
+        assert_eq!(hook_for_event("{}"), None);
+        // The explicit form a delegate gets round-trips to the same hook.
+        for hook in [
+            Hook::Notices(NoticesMode::Drain),
+            Hook::Notices(NoticesMode::SessionStart),
+            Hook::Notices(NoticesMode::StopCheck),
+            Hook::GateAgent,
+        ] {
+            let args = hook_args(hook);
+            assert_eq!(parse_hook(&args[0], &args[1..]), Ok(hook));
+        }
     }
 
     fn touch(path: &Path, age: Duration) {

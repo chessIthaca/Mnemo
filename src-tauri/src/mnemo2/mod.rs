@@ -313,6 +313,7 @@ pub fn run() {
             mnemo2_host_ping,
             ipc::mnemo2_startup_project,
             ipc::external_lead_status,
+            ipc::external_open_failed,
             ipc::lead_open,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,

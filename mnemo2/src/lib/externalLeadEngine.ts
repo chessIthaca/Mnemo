@@ -44,6 +44,8 @@ export interface ExternalLeadTransport {
   status(): Promise<ExternalLeadStatus>;
   onOpenRequest(handler: (request: ExternalOpenRequest) => void): Promise<UnlistenFn>;
   onChanged(handler: (event: ExternalLeadEvent) => void): Promise<UnlistenFn>;
+  /** Tell the host why a requested project could not be opened. */
+  reportOpenFailure(root: string, reason: string): Promise<void>;
 }
 
 export function createTauriExternalLeadTransport(
@@ -56,6 +58,7 @@ export function createTauriExternalLeadTransport(
       bindings.listen<ExternalOpenRequest>(EXTERNAL_OPEN_CHANNEL, (event) => handler(event.payload)),
     onChanged: (handler) =>
       bindings.listen<ExternalLeadEvent>(EXTERNAL_LEAD_CHANNEL, (event) => handler(event.payload)),
+    reportOpenFailure: (root, reason) => bindings.invoke<void>("external_open_failed", { root, reason }),
   };
 }
 

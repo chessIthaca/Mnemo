@@ -117,6 +117,11 @@ pub trait LeadHost: Send + Sync + 'static {
     fn lead_changed(&self, attached: bool, root: Option<&Path>);
     /// Bring the Mnemo2 window to the front.
     fn show_window(&self);
+    /// Why the UI could not open the project at `root` after the last
+    /// request, if it reported a failure.
+    fn open_failure(&self, _root: &Path) -> Option<String> {
+        None
+    }
 }
 
 /// Server timing; the defaults are the documented 60 s and 10 minutes.
@@ -554,7 +559,7 @@ impl Shared {
             return Response::error(405, "use POST");
         }
         match request.path.as_str() {
-            "/health" => self.health().await,
+            "/health" => self.health(&request.body).await,
             "/mcp" => self.mcp(request).await,
             "/lead/notices" | "/lead/wait" | "/lead/gate-agent" | "/lead/detach" => {
                 self.lead_route(request).await
@@ -563,18 +568,26 @@ impl Shared {
         }
     }
 
-    async fn health(&self) -> Response {
+    async fn health(&self, request_body: &[u8]) -> Response {
         let project = self
             .host
             .lead()
             .await
             .map(|lead| lead.workspace_root().to_string_lossy().into_owned());
+        // A helper waiting for a hidden start learns why the project did not
+        // open instead of timing out.
+        let open_error = serde_json::from_slice::<Value>(request_body)
+            .ok()
+            .and_then(|body| body.get("root").and_then(Value::as_str).map(str::to_string))
+            .and_then(|root| project::canonical_root(Path::new(&root)).ok())
+            .and_then(|root| self.host.open_failure(&root));
         Response::json(
             200,
             &json!({
                 "pid": std::process::id(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "project": project,
+                "open_error": open_error,
             }),
         )
     }
@@ -891,6 +904,9 @@ impl Shared {
             if let Some(target) = self.target_for(&root).await? {
                 return Ok(target);
             }
+            if let Some(reason) = self.host.open_failure(&root) {
+                return Err(format!("Mnemo2 could not open {}: {reason}", root.display()));
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(format!(
                     "Mnemo2 did not open {} in time. Open the project in the Mnemo2 window, then try again.",
@@ -1032,7 +1048,16 @@ impl LeadHost for AppLeadHost {
         mnemo::config::resolve_config_dir(None)
     }
 
+    fn open_failure(&self, root: &Path) -> Option<String> {
+        let state = self.app.try_state::<crate::mnemo2::ipc::Mnemo2State>()?;
+        state.open_failure(root)
+    }
+
     fn request_open(&self, root: &Path) {
+        // A new attempt: an older failure must not answer for it.
+        if let Some(state) = self.app.try_state::<crate::mnemo2::ipc::Mnemo2State>() {
+            state.clear_open_failure();
+        }
         let _ = self.app.emit(
             EXTERNAL_OPEN_REQUEST_CHANNEL,
             json!({ "root": root.to_string_lossy() }),
@@ -1112,6 +1137,8 @@ mod tests {
         open_requests: Mutex<Vec<PathBuf>>,
         changes: Mutex<Vec<(bool, Option<PathBuf>)>>,
         shown: AtomicUsize,
+        /// A reported open failure: the canonical root and the reason.
+        failure: Mutex<Option<(PathBuf, String)>>,
     }
 
     #[async_trait]
@@ -1143,6 +1170,14 @@ mod tests {
 
         fn show_window(&self) {
             self.shown.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn open_failure(&self, root: &Path) -> Option<String> {
+            let failure = self.failure.lock().expect("failure slot");
+            failure
+                .as_ref()
+                .filter(|(failed, _)| failed.as_path() == root)
+                .map(|(_, reason)| reason.clone())
         }
     }
 
@@ -1489,8 +1524,38 @@ mod tests {
         assert_eq!(health["pid"], std::process::id());
         assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(health["project"], fixture.root.to_string_lossy().as_ref());
+        assert!(health["open_error"].is_null());
         let (status, _) = fixture.post("/nope", Some("tok-123"), &[], "{}").await;
         assert_eq!(status, 404);
+        fixture.shutdown().await;
+    }
+
+    /// A UI that could not open the requested project says why: `/health`
+    /// reports it for that root, and a waiting request fails at once with
+    /// the reason instead of running out the open wait.
+    #[tokio::test]
+    async fn a_reported_open_failure_reaches_health_and_the_open_wait() {
+        let fixture = Fixture::new(false, true, ServerOptions::default()).await;
+        // The UI tries (and fails) instead of opening the pending lead.
+        fixture.host.pending.lock().expect("pending slot").take();
+        let root = project::canonical_root(&fixture.root).expect("root");
+        *fixture.host.failure.lock().expect("failure slot") =
+            Some((root.clone(), "could not start the headless engine: not_configured".into()));
+        let body = json!({ "root": root.to_string_lossy() }).to_string();
+        let (status, reply) = fixture.post("/health", Some("tok-123"), &[], &body).await;
+        assert_eq!(status, 200);
+        let health: Value = serde_json::from_str(&reply).expect("health json");
+        assert_eq!(health["open_error"], "could not start the headless engine: not_configured");
+        // Another root learns nothing.
+        let other = json!({ "root": std::env::temp_dir().to_string_lossy() }).to_string();
+        let (_, reply) = fixture.post("/health", Some("tok-123"), &[], &other).await;
+        assert!(serde_json::from_str::<Value>(&reply).expect("json")["open_error"].is_null());
+
+        let started = std::time::Instant::now();
+        let reply = fixture.call("team_status", json!({})).await;
+        let message = reply["error"]["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("not_configured"), "{reply}");
+        assert!(started.elapsed() < Duration::from_secs(5), "no open-wait timeout");
         fixture.shutdown().await;
     }
 

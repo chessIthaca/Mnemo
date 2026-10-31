@@ -561,6 +561,16 @@ function handleExternalLeadEvent(token: number, event: ExternalLeadEvent): void 
  * Open the registered project at `root` for Claude Code. An unregistered root
  * is never added here: the user adds projects themselves.
  */
+/**
+ * Tell the host why a project Claude Code asked for did not open, so the
+ * waiting helper reports the reason instead of timing out. The window may be
+ * hidden, so the toast alone would reach nobody.
+ */
+function reportExternalOpenFailure(root: string, reason: string): void {
+  const transport = createExternalLeadTransport();
+  void transport?.reportOpenFailure(root, reason).catch(() => undefined);
+}
+
 async function openExternalRoot(root: string): Promise<void> {
   const find = () => get(app).projects.find((item) => sameProjectPath(item.path, root));
   let project = find();
@@ -573,6 +583,7 @@ async function openExternalRoot(root: string): Promise<void> {
     app.update((state) =>
       withToast(state, `Claude Code asked to open ${root}, which is not a Mnemo2 project. Add it first.`),
     );
+    reportExternalOpenFailure(root, "it is not a registered Mnemo2 project");
     return;
   }
   const open = get(app).projectId;
@@ -583,9 +594,22 @@ async function openExternalRoot(root: string): Promise<void> {
     app.update((state) =>
       withToast(state, `Claude Code asked to open ${name}, but another project is open. Close it first.`),
     );
+    reportExternalOpenFailure(root, "another project is open in this Mnemo2 window");
     return;
   }
   await openProject(project.id);
+  const after = get(app);
+  // A failed lead open keeps the project selected and shows the error on the
+  // lead runtime, so the project id alone is not success.
+  const openError = after.leadRuntime.status === "error" ? after.leadRuntime.error : null;
+  if (after.projectId === project.id && !openError) return;
+  const conflict = after.projectConflict;
+  reportExternalOpenFailure(
+    root,
+    conflict
+      ? `another Mnemo2 process (pid ${conflict.pid}) is using the project`
+      : openError ?? after.toast?.message ?? "the project did not open",
+  );
 }
 
 /**

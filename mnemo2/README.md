@@ -313,6 +313,49 @@ re-run before merge. The lead is the reviewer of record and remains accountable
 for the adjudication. This is Mnemo2's policy; Mnemo1's spawned read-only
 reviewer workflow is unchanged.
 
+## Claude Code as the lead
+
+Claude Code (the CLI or the Claude Desktop Code tab, on the user's own Claude
+subscription) can lead a Mnemo2 project in place of the built-in lead. It
+plans, dispatches, reviews and merges through the same team tools. Workers
+still run on the configured endpoints and tiers. Mission control shows it
+all live. Setup and day-to-day use are in
+[`mnemo2/plugin/README.md`](plugin/README.md).
+
+- **Plugin.** `mnemo2/plugin/` is the "mnemo" Claude Code plugin (an MCP
+  server, hooks and the `mnemo-lead`/`mnemo-plan`/`mnemo-review`/`mnemo-status`
+  skills). The repository root is its local marketplace
+  (`.claude-plugin/marketplace.json`).
+- **Helper.** `mnemo2-mcp` is a console binary built next to `mnemo2`.
+  `npm run build:mnemo2:native` copies it into `mnemo2/plugin/bin/` and
+  `~/.mnemo/bin/`.
+  - `serve` bridges MCP stdio to the Mnemo2 instance whose open project
+    contains the working directory. If there is none, it starts
+    `mnemo2 --hidden --project <root>`, which runs in the tray with no window.
+  - Outside a registered project it is inert.
+  - `notices`, `wait` and `gate-agent` answer the plugin hooks.
+- **Instances.** Each Mnemo2 instance writes `~/.mnemo/run/mnemo2-<pid>.json`
+  (port, token, open project). The local API listens on 127.0.0.1 and
+  requires the token. Several instances, one per project, keep working
+  side by side.
+- **External lead.** The first MCP call for a project attaches Claude Code as
+  that project's external lead. Mission control then shows
+  "Lead: Claude Code (external)".
+  - TeamManager notices go to Claude Code instead of the built-in lead: they
+    are appended to tool results, delivered by the PostToolUse hook, or wake
+    an idle session through a background `mnemo2-mcp wait`.
+  - Sending to the built-in lead asks for confirmation.
+  - The lead detaches when the Claude session ends or after 10 minutes
+    without a call or a waiter.
+- **Claude Code's own agents.** While a project is attached, a PreToolUse hook
+  makes Claude Code ask the user before `Agent`/`Task`/`Workflow` runs, so
+  delegated work goes to Mnemo workers. `Explore` and `claude-code-guide`
+  pass without a prompt; the list is `[claude_lead] agents_without_prompt`
+  in `~/.mnemo/config.toml`.
+- **Billing.** Only the lead uses the Claude subscription, inside Claude Code
+  itself. Workers bill to their own endpoints. A Claude model as a worker
+  needs an API key, like any other endpoint.
+
 ## What is real
 
 - **Real (native lead):** streaming, model identity and picker, cancellation,

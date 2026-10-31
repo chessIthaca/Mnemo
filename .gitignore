@@ -89,3 +89,7 @@ __pycache__/
 # docs/costsaving.md — cost-saving orchestration prompt working draft, kept
 # local for an architecture discussion (see the backlog). Never tracked.
 docs/costsaving.md
+
+# The "mnemo" Claude Code plugin: the mnemo2-mcp helper is copied here by
+# `npm run build:mnemo2:native` (scripts/install-mnemo2-mcp.mjs).
+mnemo2/plugin/bin/

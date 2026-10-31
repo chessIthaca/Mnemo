@@ -1,0 +1,55 @@
+{
+  "description": "Mnemo lead hooks: add the team summary and pending worker notices at session start, deliver notices after tool calls, remind the lead to keep the background waiter running, and ask before Claude Code's own agents run. All of them stay silent outside a Mnemo2 project.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": ["notices", "--session-start"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": ["notices", "--drain"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": ["notices", "--stop-check"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/mnemo2-mcp",
+            "args": ["gate-agent"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

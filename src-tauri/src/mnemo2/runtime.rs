@@ -1727,9 +1727,9 @@ mod tests {
             1,
         )
         .await;
-        // Wire the team in directly — the pump was spawned before the
-        // team existed, so only send_prompt itself touches the gate and
-        // the test is deterministic.
+        // Install the test's TeamRuntime as the lead handle. The production
+        // pump keeps its original handle; this test isolates send_prompt's
+        // gate arms instead of reproducing that cross-handle interleave.
         let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         assert!(
@@ -1785,8 +1785,8 @@ mod tests {
             ],
         ));
         let (runtime, team) = open_git_team_spawns(&root, &config, &state, llm, 1).await;
-        // Pump unwired (spawned before the team was attached), so the
-        // gate reflects only send_prompt's arms and the test's writes.
+        // The production pump keeps its original TeamRuntime handle; this
+        // replacement isolates send_prompt's arms and the test's gate writes.
         let team = Arc::new(team);
         *runtime.team.lock().await = Some(team.clone());
         runtime

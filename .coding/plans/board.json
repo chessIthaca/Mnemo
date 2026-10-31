@@ -34,10 +34,10 @@
     },
     {
       "id": "e51c04cd",
-      "status": "open",
+      "status": "closed",
       "created_at_ms": 1793433861479,
-      "closed_at_ms": null,
-      "report_path": null,
+      "closed_at_ms": 1793438936762,
+      "report_path": "C:\\Mnemo\\.coding\\reviews\\team-e51c04cd-20261031-092856.md",
       "abandon_reason": null
     }
   ]

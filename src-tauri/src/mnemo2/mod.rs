@@ -102,7 +102,7 @@ pub fn run() {
             ipc::indexing_snapshot,
             ipc::lead_prompt,
             ipc::lead_interrupt,
-    ipc::lead_compact,
+            ipc::lead_compact,
             ipc::lead_set_model,
             ipc::lead_approve,
             ipc::lead_answer,

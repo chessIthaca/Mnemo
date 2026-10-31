@@ -1,23 +1,32 @@
 <script lang="ts">
-  import { ArrowUp, Square } from "@lucide/svelte";
+  import { ArrowUp, Square, X } from "@lucide/svelte";
+  import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
   import LeadModelPicker from "./LeadModelPicker.svelte";
 
-  let draft = $state("");
   let stopping = $state(false);
+  let attaching = $state(false);
+  // The draft lives in store state (not component state) so unmounting the
+  // Lead view — for example by opening the Team view — never loses it.
+  const draft = $derived($app.leadDraft);
   const busy = $derived($app.leadRuntime.busy);
+  const pending = $derived($app.leadRuntime.pending !== null);
   const connecting = $derived(
     $app.leadRuntime.mode === "native" && $app.leadRuntime.status === "opening",
   );
   const canInterrupt = $derived(
     $app.leadRuntime.mode === "native" &&
       $app.leadRuntime.status === "ready" &&
-      ($app.leadRuntime.busy || $app.leadRuntime.pending !== null),
+      (busy || pending),
   );
+  // A busy native lead accepts a steer, so sending stays available unless a
+  // pending question/approval owns the turn (answer that first).
   const canSend = $derived(
-    $app.leadRuntime.pending === null &&
-      ($app.leadRuntime.mode === "mock" ||
-        ($app.leadRuntime.status === "ready" && !busy)),
+    !pending &&
+      ($app.leadRuntime.mode === "mock" || $app.leadRuntime.status === "ready"),
+  );
+  const hasContent = $derived(
+    draft.text.trim().length > 0 || draft.images.length > 0,
   );
 
   $effect(() => {
@@ -36,10 +45,45 @@
   }
 
   function send() {
-    const message = draft.trim();
-    if (!message || !canSend) return;
-    actions.sendLeadMessage(message);
-    draft = "";
+    if (!canSend) return;
+    const message = draft.text.trim();
+    const images = draft.images;
+    // An image-only submission is a real message for a vision model.
+    if (!message && images.length === 0) return;
+    actions.sendLeadMessage(message, images);
+    actions.clearLeadDraft();
+  }
+
+  function handleInput(event: Event) {
+    actions.setLeadDraftText((event.currentTarget as HTMLTextAreaElement).value);
+  }
+
+  function imageFiles(data: DataTransfer | null): File[] {
+    return Array.from(data?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+  }
+
+  async function handlePaste(event: ClipboardEvent) {
+    const files = imageFiles(event.clipboardData);
+    if (files.length === 0) return;
+    // Only swallow the paste when it actually carries an image; ordinary
+    // text pastes (and the browser's undo stack) keep working untouched.
+    event.preventDefault();
+    attaching = true;
+    try {
+      // Downscale/re-encode through the shared attachment pipeline before the
+      // data URL ever reaches the store, exactly like the Mnemo1 composer.
+      const attached = await Promise.allSettled(
+        files.map((file) => fileToAttachedDataUrl(file)),
+      );
+      for (const result of attached) {
+        if (result.status === "fulfilled") actions.addLeadDraftImage(result.value);
+      }
+    } finally {
+      attaching = false;
+    }
   }
 
   function handleSubmit(event: SubmitEvent) {
@@ -56,9 +100,29 @@
 </script>
 
 <form class="composer" onsubmit={handleSubmit}>
+  {#if draft.images.length > 0}
+    <ul class="draft-images" aria-label="Attached images">
+      {#each draft.images as image, index}
+        <li class="draft-image">
+          <img src={image} alt={`Attachment ${index + 1}`} />
+          <button
+            type="button"
+            class="remove-image"
+            aria-label={`Remove attachment ${index + 1}`}
+            title="Remove attachment"
+            onclick={() => actions.removeLeadDraftImage(index)}
+          >
+            <X size={11} strokeWidth={2.5} />
+          </button>
+        </li>
+      {/each}
+    </ul>
+  {/if}
   <div class="composer-input">
     <textarea
-      bind:value={draft}
+      value={draft.text}
+      oninput={handleInput}
+      onpaste={handlePaste}
       onkeydown={handleKeydown}
       rows="2"
       aria-label="Message the lead"
@@ -76,12 +140,24 @@
         <Square size={12} fill="currentColor" strokeWidth={1.5} />
         <span>{stopping ? "Stopping…" : "Stop"}</span>
       </button>
-    {:else}
+    {/if}
+    {#if canSend}
+      <button
+        class="send-button"
+        type="submit"
+        aria-label={busy ? "Steer the lead" : "Send message"}
+        title={busy ? "Steer the lead" : "Send message"}
+        disabled={!hasContent}
+      >
+        <ArrowUp size={17} strokeWidth={2} />
+      </button>
+    {:else if !canInterrupt}
       <button
         class="send-button"
         type="submit"
         aria-label="Send message"
-        disabled={!draft.trim() || !canSend}
+        title="Send message"
+        disabled
       >
         <ArrowUp size={17} strokeWidth={2} />
       </button>
@@ -91,12 +167,52 @@
     <LeadModelPicker compact />
     <div class="composer-status" aria-live="polite">
       {#if connecting}<span>Connecting</span>{/if}
+      {#if attaching}<span>Attaching image</span>{/if}
     </div>
   </div>
 </form>
 
 <style>
   .composer { width: 100%; margin: 0; }
+  .draft-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+  }
+  .draft-image {
+    position: relative;
+    width: 52px;
+    height: 52px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-soft);
+  }
+  .draft-image img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 9px;
+    object-fit: cover;
+  }
+  .remove-image {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    display: grid;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .remove-image:hover { background: var(--line); }
   .composer-input {
     display: flex;
     align-items: flex-end;

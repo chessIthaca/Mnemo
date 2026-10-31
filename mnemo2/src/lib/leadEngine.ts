@@ -26,7 +26,11 @@ export interface LeadTransport {
   probe(): Promise<boolean>;
   open(options: LeadOpenOptions): Promise<LeadSnapshot>;
   snapshot(): Promise<LeadSnapshot>;
-  prompt(text: string): Promise<void>;
+  /**
+   * Submit text (and optional image data URLs) to the lead. The host turns a
+   * submission on a busy turn into a steer instead of starting a new prompt.
+   */
+  prompt(text: string, images?: string[]): Promise<void>;
   interrupt(): Promise<void>;
   setModel(spec: string): Promise<LeadSnapshot>;
   approve(requestId: string, decision: LeadApprovalDecision): Promise<void>;
@@ -59,7 +63,11 @@ export function createTauriLeadTransport(bindings: LeadTransportBindings): LeadT
           : { allowInstanceConflict: options.allowInstanceConflict }),
       }),
     snapshot: () => bindings.invoke<LeadSnapshot>("lead_snapshot"),
-    prompt: (text) => bindings.invoke<void>("lead_prompt", { text }),
+    prompt: (text, images) =>
+      bindings.invoke<void>(
+        "lead_prompt",
+        images && images.length > 0 ? { text, images } : { text },
+      ),
     interrupt: () => bindings.invoke<void>("lead_interrupt"),
     setModel: (spec) => bindings.invoke<LeadSnapshot>("lead_set_model", { spec }),
     approve: (requestId, decision) =>

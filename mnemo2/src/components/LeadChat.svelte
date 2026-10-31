@@ -80,6 +80,13 @@
                 <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               {:else}
                 <p>{entry.body}</p>
+                {#if entry.images && entry.images.length > 0}
+                  <div class="user-images" aria-label="Attached images">
+                    {#each entry.images as image, imageIndex}
+                      <img src={image} alt={`Attachment ${imageIndex + 1}`} />
+                    {/each}
+                  </div>
+                {/if}
                 <div class="user-meta">YOU</div>
               {/if}
             </article>
@@ -203,6 +210,8 @@
   @keyframes thinking-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
   .user-entry { max-width: 100ch; margin: 20px 0; padding: 2px 0 2px 12px; border-left: 2px solid var(--line-strong); }
   .user-entry p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+  .user-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .user-images img { width: 72px; height: 72px; border: 1px solid var(--line); border-radius: 10px; object-fit: cover; }
   .user-meta { margin-top: 4px; color: var(--muted); font-size: 8px; letter-spacing: 0.08em; text-align: left; }
   .tool-activity-row { position: relative; min-width: 0; margin-left: 30px; }
   .tool-activity-row.tool-connected::after { position: absolute; top: 24px; bottom: 0; left: 9px; border-left: 1px dotted var(--line-strong); content: ""; pointer-events: none; }

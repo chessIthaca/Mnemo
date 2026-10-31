@@ -249,9 +249,11 @@ feature-enabled Mnemo2 lib tests.
 **Acceptance scenarios first.** A plan that will dispatch `review_risk: "high"`
 carries a `## Acceptance scenarios` section with at least one observable bullet
 (a command, a persistence state, a concurrency outcome, a security property, or
-a UI behavior) written before implementation. Other plans are encouraged to
-include it. `team_dispatch` rejects a high-risk dispatch without it, and the lead
-re-checks those scenarios on the integrated tree before `finish`.
+a UI behavior) written before implementation: `plan_create`
+`acceptance_scenarios`, or `plan_update` `add_acceptance_scenarios`. Other plans
+are encouraged to include it. `team_dispatch` rejects a high-risk dispatch whose
+plan has none, workers receive the scenarios with their plan, and the lead
+re-checks them on the integrated tree before the plan closes.
 
 **Unanchored pass, then evidence.** The lead reads the target diff first
 (`git_read` op `diff`/`show`, the **Diff** tab, or `git diff <base>..<tip>`) and

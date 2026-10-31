@@ -23,6 +23,7 @@ Call `plan_create` with:
 - `context`: at least 40 characters, in practice a page. Why the work exists, constraints, decisions already taken, exact file paths and symbols, and the verification commands. Workers read it, so write stable intent only. Never put status in it (commits, review state, what is next); that goes into `plan_update` `progress`.
 - `steps`: ordered, each starting with a bold **header**. The board refuses a step that names no file path (a research-only step may carry an explicit "no-code research" marker instead), so name the files each step touches.
 - `interfaces`: contracts between steps (exports, signatures, data shapes, file ownership).
+- `acceptance_scenarios`: observable outcomes, one per entry. Workers receive them, and high-risk dispatch requires at least one.
 
 The board also refuses a plan that is too thin to resume from.
 
@@ -37,7 +38,7 @@ The board also refuses a plan that is too thin to resume from.
 
 - Put the verification commands (build, tests, lint) in the context and repeat the relevant ones in each brief.
 - For each step, say what an observer can check afterwards: a test that passes, a command output, a screen state.
-- For shared contracts, persistence, concurrency or security work you will dispatch with `review_risk` "high". That also needs a `## Acceptance scenarios` section with observable bullets in the plan file. See the High-risk work section of the `mnemo-lead` skill for how this works today.
+- For shared contracts, persistence, concurrency or security work you will dispatch with `review_risk` "high". That needs observable acceptance scenarios on the plan: `acceptance_scenarios` in `plan_create`, or `plan_update` `add_acceptance_scenarios` later. See the High-risk work section of the `mnemo-lead` skill.
 
 ## 3. Confirm
 

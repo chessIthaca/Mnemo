@@ -257,8 +257,28 @@ pub struct LeadRuntime {
     /// The project's one plan board: the lead's board tools and the team's
     /// dispatch validation, tick, and close all use this instance.
     board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
+    /// The engine's memory, knowledge and code-graph handles, for the
+    /// knowledge tools an external lead gets over MCP.
+    stores: std::sync::Mutex<Option<ProjectStores>>,
     /// The engine's startup code-index and memory passes.
     indexing: Arc<crate::mnemo2::indexing::IndexingTracker>,
+}
+
+/// The project stores the engine wired into its own agent registries. The
+/// external lead's knowledge tools run over these same handles, so a record
+/// either lead writes is found by the other and no second database
+/// connection is opened.
+struct ProjectStores {
+    /// The project's memory store (`.coding/memory.db`).
+    memory: Option<Arc<dyn mnemo::memory::MemoryStoreTrait>>,
+    /// The knowledge-file store (`.coding/knowledge/**`): the sandbox every
+    /// memory write goes through.
+    knowledge: Option<Arc<mnemo::memory::KnowledgeStore>>,
+    /// The code graph (`.coding/codegraph.db`); `None` when the project's
+    /// config turns code indexing off.
+    codegraph: Option<Arc<mnemo::codegraph::CodeGraph>>,
+    /// `.coding/plans`, which the knowledge tools reindex against.
+    plans_dir: PathBuf,
 }
 
 impl LeadRuntime {
@@ -333,6 +353,7 @@ impl LeadRuntime {
             policy,
             team: Arc::new(Mutex::new(None)),
             board: std::sync::Mutex::new(None),
+            stores: std::sync::Mutex::new(None),
             indexing: crate::mnemo2::indexing::IndexingTracker::new(),
         };
         runtime.start_engine(provider).await?;
@@ -421,6 +442,106 @@ impl LeadRuntime {
     /// The shared plan board, once the engine has started.
     pub(crate) fn board_handle(&self) -> Option<Arc<PlanBoard>> {
         self.board.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The plan-board tools (`plan_create`, `plan_update`, `plan_show`,
+    /// `plan_list`, `plan_step_done`, `plan_abandon`) over this lead's board,
+    /// for an external lead that has no engine session to carry them. Empty
+    /// until the engine has started.
+    pub(crate) fn board_tools(&self) -> Vec<Box<dyn mnemo::tool::Tool>> {
+        use mnemo::app::tool::workflow::board::{
+            PlanAbandonTool, PlanCreateTool, PlanListTool, PlanShowTool, PlanStepDoneTool,
+            PlanUpdateTool,
+        };
+
+        let Some(board) = self.board_handle() else {
+            return Vec::new();
+        };
+        let ledger = Arc::new(LeadTeamLedger::new(self.team.clone()));
+        vec![
+            Box::new(PlanCreateTool::new(board.clone())),
+            Box::new(PlanUpdateTool::new(board.clone())),
+            Box::new(PlanShowTool::new(board.clone())),
+            Box::new(PlanListTool::new(board.clone())),
+            Box::new(PlanStepDoneTool::new(board.clone(), ledger)),
+            Box::new(PlanAbandonTool::new(board)),
+        ]
+    }
+
+    /// The knowledge tools the in-app lead has through its engine session,
+    /// for an external lead that has none: `memory_search`, `memory_write`,
+    /// `memory_amend`, `memory_supersede` over the project's memory store and
+    /// `graph_search`, `graph_context`, `graph_impact`, `graph_path` over its
+    /// code graph.
+    ///
+    /// Built exactly as the engine's agent factory builds them (same structs,
+    /// same shared handles, same knowledge-file backing), so schemas and
+    /// descriptions are the engine's own and memory writes land in
+    /// `.coding/knowledge/**` through the knowledge store's own path rules.
+    /// Left out: the Laya auto-typing gate (the app wires no classifier into
+    /// the headless engine either) and the engine's agent-root note (the lead
+    /// works in the main tree). Memory tools are absent until the engine has
+    /// started; graph tools also when code indexing is off, as in the engine.
+    pub(crate) fn knowledge_tools(&self) -> Vec<Box<dyn mnemo::tool::Tool>> {
+        use mnemo::tool::agent::codegraph::{
+            GraphContextTool, GraphImpactTool, GraphPathTool, GraphSearchTool,
+        };
+        use mnemo::tool::memory::retrieval::MemorySearchTool;
+        use mnemo::tool::memory::{
+            MemoryAmendTool, MemorySupersedeTool, MemoryUpdateTool, MemoryWriteTool,
+        };
+
+        let guard = self.stores.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(stores) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let mut tools: Vec<Box<dyn mnemo::tool::Tool>> = Vec::new();
+        if let Some(memory) = &stores.memory {
+            tools.push(Box::new(MemorySearchTool::new(memory.clone())));
+            match &stores.knowledge {
+                Some(knowledge) => {
+                    tools.push(Box::new(MemoryWriteTool::with_knowledge(
+                        memory.clone(),
+                        knowledge.clone(),
+                        stores.plans_dir.clone(),
+                    )));
+                    // File-only, so it exists only with the knowledge backing.
+                    tools.push(Box::new(MemoryAmendTool::new(
+                        memory.clone(),
+                        knowledge.clone(),
+                        stores.plans_dir.clone(),
+                    )));
+                    // The amend/supersede descriptions point to memory_update.
+                    tools.push(Box::new(MemoryUpdateTool::with_knowledge(
+                        memory.clone(),
+                        knowledge.clone(),
+                        stores.plans_dir.clone(),
+                    )));
+                    tools.push(Box::new(MemorySupersedeTool::with_knowledge(
+                        memory.clone(),
+                        knowledge.clone(),
+                        stores.plans_dir.clone(),
+                    )));
+                }
+                None => {
+                    tools.push(Box::new(MemoryWriteTool::new(memory.clone())));
+                    tools.push(Box::new(MemoryUpdateTool::new(memory.clone())));
+                    tools.push(Box::new(MemorySupersedeTool::new(memory.clone())));
+                }
+            }
+        }
+        if let Some(graph) = &stores.codegraph {
+            // The stale-index log lives in the config dir, like the engine's.
+            tools.push(Box::new(
+                GraphSearchTool::new(graph.clone()).with_staleness_log(
+                    mnemo::index_staleness::StalenessLog::at(self.config_dir.clone()),
+                ),
+            ));
+            tools.push(Box::new(GraphContextTool::new(graph.clone())));
+            tools.push(Box::new(GraphImpactTool::new(graph.clone())));
+            tools.push(Box::new(GraphPathTool::new(graph.clone())));
+        }
+        tools
     }
 
     /// The selected project root (for worker worktree provisioning).
@@ -718,6 +839,38 @@ impl LeadRuntime {
         self.snapshot().await
     }
 
+    /// Hand the project back to the in-app lead: detach any external lead and
+    /// give the in-app lead session the notices the external lead never read
+    /// (a steer while it works, a prompt when it idles; all in one message).
+    /// If the in-app session cannot take them they stay on the team's
+    /// undelivered list (logged), for the next in-app notice or external
+    /// lead. Returns `true` when an external lead was attached.
+    pub(crate) async fn release_external_lead(&self) -> bool {
+        let Ok(team) = self.team_handle().await else {
+            return false;
+        };
+        let was_attached = team.detach_external_lead();
+        let held = team.take_undelivered_notices();
+        if held.is_empty() {
+            return was_attached;
+        }
+        let session_id = self.live.lock().await.as_ref().map(|live| live.session.id());
+        let delivered = match session_id {
+            Some(session_id) => {
+                send_to_in_app_lead(&self.engine, session_id, &team, held.join("\n\n")).await
+            }
+            None => false,
+        };
+        if !delivered {
+            eprintln!(
+                "mnemo2: the in-app lead could not take {} notice(s) from the external lead; keeping them queued",
+                held.len()
+            );
+            team.restore_undelivered_notices(held);
+        }
+        was_attached
+    }
+
     /// Stop the session and discard the engine handles.
     pub async fn shutdown(&self) {
         self.indexing.stop();
@@ -780,7 +933,7 @@ impl LeadRuntime {
             .parent()
             .map(|coding| coding.join("plans"))
             .unwrap_or_default();
-        let mut board = PlanBoard::new(plans_dir, reviews_dir);
+        let mut board = PlanBoard::new(plans_dir.clone(), reviews_dir);
         if let Some(memory) = engine.memory_store_handle() {
             board = board.with_memory(memory);
         }
@@ -792,6 +945,12 @@ impl LeadRuntime {
         }
         let board = Arc::new(board);
         *self.board.lock().unwrap_or_else(|e| e.into_inner()) = Some(board.clone());
+        *self.stores.lock().unwrap_or_else(|e| e.into_inner()) = Some(ProjectStores {
+            memory: engine.memory_store_handle(),
+            knowledge: engine.knowledge_store_handle(),
+            codegraph: engine.codegraph_handle(),
+            plans_dir: plans_dir.clone(),
+        });
         engine.register_policy(
             "mnemo.workflow",
             Arc::new(
@@ -1110,8 +1269,36 @@ fn finished_notice(worker: &crate::mnemo2::team::WorkerRecord) -> String {
 }
 
 /// Send a TeamManager notice to the lead: a steer while it works, a prompt
-/// when it idles. `true` when the session accepted it.
+/// when it idles. `true` when the session accepted it. While an external lead
+/// (Claude Code over MCP) leads the team, the notice joins its queue instead
+/// and the in-app lead is left alone. The queue push decides under one lock
+/// whether an external lead is attached, so a detach in between sends the
+/// notice to the in-app lead rather than losing it.
 async fn deliver_lead_notice(
+    engine: &Arc<Mutex<Option<Arc<Engine>>>>,
+    session_id: SessionId,
+    team: &TeamRuntime,
+    text: String,
+) -> bool {
+    if team.push_external_notice(text.clone()) {
+        return true;
+    }
+    // Notices an earlier external lead never read go first, in one message.
+    let held = team.take_undelivered_notices();
+    if held.is_empty() {
+        return send_to_in_app_lead(engine, session_id, team, text).await;
+    }
+    let combined = format!("{}\n\n{text}", held.join("\n\n"));
+    if send_to_in_app_lead(engine, session_id, team, combined).await {
+        return true;
+    }
+    team.restore_undelivered_notices(held);
+    false
+}
+
+/// Give the in-app lead session a notice: a steer while it works, a prompt
+/// when it idles. `true` when the session accepted it.
+async fn send_to_in_app_lead(
     engine: &Arc<Mutex<Option<Arc<Engine>>>>,
     session_id: SessionId,
     team: &TeamRuntime,
@@ -6232,6 +6419,434 @@ mod tests {
             !ignored.contains("memory.db") && !ignored.contains("codegraph.db"),
             "{ignored}"
         );
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn external_lead_queue_attaches_pushes_drains_and_detaches() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, team) =
+            open_git_lead(&root, &config, &state, Arc::new(ScriptedLlm::new(Vec::new()))).await;
+
+        assert!(!team.external_lead_attached());
+        assert_eq!(team.external_lead_since_ms(), None);
+        assert!(
+            !team.push_external_notice("nobody leads".into()),
+            "with no external lead nothing is queued, so the caller uses the in-app lead"
+        );
+        assert!(team.peek_external_notices().is_empty());
+        assert!(team.attach_external_lead(), "the first attach is new");
+        assert!(!team.attach_external_lead(), "a second attach changes nothing");
+        assert!(team.external_lead_attached());
+        assert!(team.external_lead_since_ms().is_some());
+        assert!(team.peek_external_notices().is_empty(), "the refused notice was not kept");
+
+        assert!(team.push_external_notice("first".into()));
+        assert!(team.push_external_notice("second".into()));
+        assert_eq!(team.peek_external_notices(), vec!["first", "second"]);
+        assert_eq!(team.drain_external_notices(), vec!["first", "second"]);
+        assert!(team.drain_external_notices().is_empty(), "drained once");
+
+        // A detach does not drop what the lead never read: it is parked for
+        // the in-app lead (see `release_external_lead`), and a push after the
+        // detach is refused.
+        assert!(team.push_external_notice("unread".into()));
+        assert!(team.detach_external_lead());
+        assert!(!team.detach_external_lead(), "already detached");
+        assert!(!team.external_lead_attached());
+        assert!(team.drain_external_notices().is_empty());
+        assert!(!team.push_external_notice("after the detach".into()));
+        assert_eq!(team.take_undelivered_notices(), vec!["unread"]);
+        assert!(team.take_undelivered_notices().is_empty(), "taken once");
+        assert!(team.attach_external_lead());
+        assert!(team.drain_external_notices().is_empty(), "a new lead starts clean");
+
+        // What nobody took is handed to the next external lead, in order.
+        assert!(team.push_external_notice("older".into()));
+        assert!(team.detach_external_lead());
+        team.restore_undelivered_notices(vec!["oldest".into()]);
+        assert!(team.attach_external_lead());
+        assert_eq!(team.drain_external_notices(), vec!["oldest", "older"]);
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn requeued_external_notices_go_to_the_front_in_order() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, team) =
+            open_git_lead(&root, &config, &state, Arc::new(ScriptedLlm::new(Vec::new()))).await;
+        team.attach_external_lead();
+
+        assert!(team.push_external_notice("one".into()));
+        assert!(team.push_external_notice("two".into()));
+        let drained = team.drain_external_notices();
+        assert!(team.push_external_notice("three".into()), "a newer notice arrives meanwhile");
+        team.requeue_external_notices(drained);
+        assert_eq!(team.peek_external_notices(), vec!["one", "two", "three"]);
+        team.requeue_external_notices(Vec::new());
+        assert_eq!(team.peek_external_notices().len(), 3);
+
+        // If the lead detached before the put-back, they are not lost.
+        let drained = team.drain_external_notices();
+        team.detach_external_lead();
+        team.requeue_external_notices(drained);
+        assert!(team.drain_external_notices().is_empty());
+        assert_eq!(team.take_undelivered_notices(), vec!["one", "two", "three"]);
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_external_wait_says_how_it_ended() {
+        use crate::mnemo2::team::ExternalWaitStatus;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, team) =
+            open_git_lead(&root, &config, &state, Arc::new(ScriptedLlm::new(Vec::new()))).await;
+
+        // Not attached: nothing to wait for.
+        let outcome = team.wait_external(Duration::from_secs(5)).await;
+        assert_eq!(outcome.status, ExternalWaitStatus::Detached);
+        assert!(outcome.notices.is_empty());
+
+        team.attach_external_lead();
+        let outcome = team.wait_external(Duration::from_millis(100)).await;
+        assert_eq!(outcome.status, ExternalWaitStatus::Timeout);
+        assert_eq!(outcome.status.as_str(), "timeout");
+
+        team.push_external_notice("ready".into());
+        let outcome = team.wait_external(Duration::from_secs(5)).await;
+        assert_eq!(outcome.status.as_str(), "notices");
+        assert_eq!(outcome.notices, vec!["ready"]);
+
+        let waiting = {
+            let team = team.clone();
+            tokio::spawn(async move { team.wait_external(Duration::from_secs(30)).await })
+        };
+        for _ in 0..100 {
+            if team.external_waiter_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        team.detach_external_lead();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the detach frees the waiter")
+            .expect("waiter task");
+        assert_eq!(outcome.status.as_str(), "detached");
+        assert!(outcome.notices.is_empty());
+
+        lead.shutdown().await;
+    }
+
+    /// Wait until the lead's transcript has a message holding every needle.
+    async fn lead_transcript_has(lead: &LeadRuntime, needles: &[&str]) -> bool {
+        for _ in 0..250 {
+            let snapshot = lead.snapshot().await.expect("lead snapshot");
+            let seen = snapshot.transcript.messages.iter().any(|message| {
+                let text = message.content.as_text();
+                needles.iter().all(|needle| text.contains(needle))
+            });
+            if seen {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn releasing_the_external_lead_gives_its_unread_notices_to_the_in_app_lead() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["lead will review"])]));
+        let (lead, team) = open_git_lead(&root, &config, &state, llm.clone()).await;
+        team.attach_external_lead();
+        assert!(team.push_external_notice(format!("{TEAM_NOTICE_PREFIX} worker_id=aaaa0001\nfirst-unread")));
+        assert!(team.push_external_notice(format!("{TEAM_NOTICE_PREFIX} worker_id=bbbb0002\nsecond-unread")));
+
+        assert!(lead.release_external_lead().await, "an external lead was attached");
+        assert!(!team.external_lead_attached());
+        assert!(
+            lead_transcript_has(&lead, &["first-unread", "second-unread"]).await,
+            "one prompt carries both"
+        );
+        assert_eq!(llm.calls(), 1, "a single idle prompt, not one per notice");
+        assert!(team.take_undelivered_notices().is_empty());
+        assert!(
+            !lead.release_external_lead().await,
+            "releasing again changes nothing"
+        );
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn notices_the_in_app_lead_cannot_take_stay_queued_for_later() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["noted"])]));
+        let (lead, team) = open_git_lead(&root, &config, &state, llm.clone()).await;
+        team.attach_external_lead();
+        assert!(team.push_external_notice(format!("{TEAM_NOTICE_PREFIX} worker_id=cccc0003\nparked-notice")));
+
+        // The in-app session is unavailable for a moment: nowhere to hand the
+        // notice.
+        let live = lead.live.lock().await.take().expect("live lead");
+        let session_id = live.session.id();
+        assert!(lead.release_external_lead().await);
+        assert_eq!(
+            team.peek_external_notices().len(),
+            0,
+            "not in the (detached) external queue"
+        );
+        let parked = team.take_undelivered_notices();
+        assert_eq!(parked.len(), 1, "kept, not silently lost: {parked:?}");
+        assert!(parked[0].contains("parked-notice"));
+        team.restore_undelivered_notices(parked);
+
+        // The session comes back; the next in-app notice carries them along.
+        *lead.live.lock().await = Some(live);
+        let delivered = deliver_lead_notice(
+            &lead.engine,
+            session_id,
+            &team,
+            format!("{TEAM_NOTICE_PREFIX} worker_id=dddd0004\nfresh-notice"),
+        )
+        .await;
+        assert!(delivered);
+        assert!(
+            lead_transcript_has(&lead, &["parked-notice", "fresh-notice"]).await,
+            "parked notices go first, in the same message"
+        );
+        assert!(team.take_undelivered_notices().is_empty());
+
+        lead.shutdown().await;
+    }
+
+    /// Regression: the attach check and the push were two steps, so a detach
+    /// in between stranded the notice in a queue nobody read.
+    #[tokio::test]
+    async fn a_notice_arriving_after_a_detach_reaches_the_in_app_lead() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["on it"])]));
+        let (lead, team) = open_git_lead(&root, &config, &state, llm).await;
+        team.attach_external_lead();
+        team.detach_external_lead();
+        let session_id = lead.live.lock().await.as_ref().expect("live").session.id();
+        assert!(
+            deliver_lead_notice(
+                &lead.engine,
+                session_id,
+                &team,
+                format!("{TEAM_NOTICE_PREFIX} worker_id=eeee0005\nlate-notice"),
+            )
+            .await
+        );
+        assert!(team.peek_external_notices().is_empty(), "never queued for a lead that left");
+        assert!(lead_transcript_has(&lead, &["late-notice"]).await);
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn waiting_for_external_notices_wakes_on_a_push_and_times_out_empty() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, team) =
+            open_git_lead(&root, &config, &state, Arc::new(ScriptedLlm::new(Vec::new()))).await;
+        team.attach_external_lead();
+
+        // Nothing queued: the wait ends empty after its timeout.
+        let started = std::time::Instant::now();
+        assert!(team
+            .wait_external_notices(Duration::from_millis(150))
+            .await
+            .is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(!team.external_waiter_alive(), "a finished wait is not alive");
+
+        // A queued notice returns at once.
+        team.push_external_notice("ready".into());
+        assert_eq!(
+            team.wait_external_notices(Duration::from_secs(30)).await,
+            vec!["ready"]
+        );
+
+        // A push while blocked wakes the waiter, which is visibly alive.
+        let waiting = {
+            let team = team.clone();
+            tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
+        };
+        for _ in 0..100 {
+            if team.external_waiter_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(team.external_waiter_alive());
+        team.push_external_notice("woken".into());
+        let woken = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the push wakes the waiter")
+            .expect("waiter task");
+        assert_eq!(woken, vec!["woken"]);
+
+        // A detach also frees a blocked waiter, with nothing.
+        let waiting = {
+            let team = team.clone();
+            tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
+        };
+        for _ in 0..100 {
+            if team.external_waiter_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        team.detach_external_lead();
+        let freed = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the detach frees the waiter")
+            .expect("waiter task");
+        assert!(freed.is_empty());
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_external_lead_idles_out_unless_a_waiter_is_blocked() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let (lead, team) =
+            open_git_lead(&root, &config, &state, Arc::new(ScriptedLlm::new(Vec::new()))).await;
+        let minutes = |n: u64| n * 60 * 1000;
+        let now = crate::mnemo2::run_file::now_ms();
+        let idle = crate::mnemo2::team::EXTERNAL_LEAD_IDLE_MS;
+
+        assert!(
+            !team.external_idle_expired(now + minutes(60), idle),
+            "a detached lead has nothing to idle out"
+        );
+        team.attach_external_lead();
+        assert!(!team.external_idle_expired(now + minutes(9), idle));
+        assert!(team.external_idle_expired(now + minutes(11), idle));
+        team.touch_external_lead();
+        assert!(
+            !team.external_idle_expired(crate::mnemo2::run_file::now_ms() + minutes(9), idle),
+            "a call restarts the clock"
+        );
+
+        // A blocked waiter is presence: it never idles out.
+        let waiting = {
+            let team = team.clone();
+            tokio::spawn(async move { team.wait_external_notices(Duration::from_secs(30)).await })
+        };
+        for _ in 0..100 {
+            if team.external_waiter_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!team.external_idle_expired(now + minutes(120), idle));
+        team.detach_external_lead();
+        let _ = waiting.await;
+
+        lead.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_attached_external_lead_gets_worker_notices_instead_of_the_in_app_lead() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        init_git(root.path());
+        run_git(root.path(), &["checkout", "-b", "wt/lead"]);
+        write_config(config.path(), &["scripted-a"]);
+        // Worker one finishes; worker two finishes; then the in-app lead
+        // answers the one notice it is sent after the external lead detaches.
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            text_turn(&["worker one done"]),
+            text_turn(&["worker two done"]),
+            text_turn(&["lead will review"]),
+        ]));
+        let lead = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("lead opens");
+        let team = lead.team_handle().await.expect("lead's actual team");
+        team.attach_external_lead();
+
+        let first = team
+            .dispatch_with_id("finish quietly".into(), None, Some("firstwrk01".into()), None)
+            .await
+            .expect("worker dispatches");
+        let notices = team.wait_external_notices(Duration::from_secs(30)).await;
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        // It is the exact text the in-app lead would have been sent.
+        assert!(notices[0].starts_with(TEAM_NOTICE_PREFIX), "{}", notices[0]);
+        assert!(notices[0].contains("finished its turn"), "{}", notices[0]);
+        assert!(
+            notices[0].contains(&format!("worker_id={}", first.id)),
+            "{}",
+            notices[0]
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = lead.snapshot().await.expect("lead snapshot");
+        assert!(!snapshot.busy);
+        assert_eq!(llm.calls(), 1, "only the worker ran; the in-app lead was not prompted");
+        assert!(
+            !snapshot
+                .transcript
+                .messages
+                .iter()
+                .any(|message| message.content.as_text().starts_with(TEAM_NOTICE_PREFIX)),
+            "the in-app lead saw no notice"
+        );
+
+        // Detached, the next notice goes to the in-app lead again.
+        team.detach_external_lead();
+        let second = team
+            .dispatch_with_id("finish quietly".into(), None, Some("secondwk02".into()), None)
+            .await
+            .expect("second worker dispatches");
+        let mut delivered = false;
+        for _ in 0..200 {
+            let snapshot = lead.snapshot().await.expect("lead snapshot");
+            let seen = snapshot.transcript.messages.iter().any(|message| {
+                let text = message.content.as_text();
+                text.starts_with(TEAM_NOTICE_PREFIX)
+                    && text.contains(&format!("worker_id={}", second.id))
+            });
+            if seen && !snapshot.busy && llm.calls() >= 3 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(delivered, "after the detach the in-app lead gets the notice");
+        assert!(team.drain_external_notices().is_empty());
 
         lead.shutdown().await;
     }

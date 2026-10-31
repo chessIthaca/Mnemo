@@ -213,7 +213,10 @@ impl KeySource {
 /// Shared with the provider trace log ([`crate::provider::trace`]) so the
 /// `.coding/logs/*.jsonl` files — which persist full request/response bodies
 /// that may embed secrets — get the same user-only restriction as `keys.toml`.
-pub(crate) fn restrict_permissions(path: &Path) -> std::io::Result<()> {
+///
+/// Public so the Mnemo2 shell can protect its run file (which carries a
+/// bearer token) the same way.
+pub fn restrict_permissions(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -119,6 +119,9 @@ pub struct SessionOptions {
 /// `parent_id` is the agent that spawned this one via the tool (`None` for
 /// UI-button spawns and the main agent) — used to notify the parent when this
 /// agent finishes. Returns `(agent_id, name)`.
+///
+/// The only supported role is `reviewer`; any other role rejects the spawn
+/// before an agent id is allocated or any agent state is constructed.
 pub async fn spawn_agent_shared(
     host: SpawnHost,
     name: String,
@@ -141,6 +144,15 @@ pub async fn spawn_agent_shared(
         limits,
         host_tools,
     } = session;
+    match role.as_deref() {
+        None | Some("reviewer") => {}
+        Some(other) => {
+            return Err(format!(
+                "unknown role '{other}'; supported roles: reviewer"
+            ));
+        }
+    }
+
     // Allocate the agent id from the manager FIRST, then build the loop with
     // that id — so the agent's own `spawn_agent` tool records it as the parent
     // of any background agents it spawns (the completion-notification loop).
@@ -416,9 +428,9 @@ const ALWAYS_SAFE_ROLE_TOOLS: &[&str] = &["git_read", "write_review_report"];
 /// Returns `None` (no restriction) only when there is no parent and no role.
 /// A parentless reviewer receives exactly [`REVIEWER_BASE_TOOLS`]; there is no
 /// parent permission set to intersect, but the read-only role boundary still
-/// applies. A parentless unknown role fails closed with `Some(vec![])`, as does
-/// a KNOWN `parent_id` whose loop is missing from the map, so neither case can
-/// silently escalate the agent to the full tool set.
+/// applies. Unknown roles are rejected by [`spawn_agent_shared`] before agent
+/// construction. A KNOWN `parent_id` whose loop is missing from the map returns
+/// `Some(vec![])`, so a missing parent cannot escalate the agent's permissions.
 ///
 /// The intersection is a snapshot of the parent's permissions at spawn time;
 /// it does not track parent state changes mid-spawn.
@@ -1447,26 +1459,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn parentless_unknown_role_denies_all() {
-        // Unknown roles fail closed even without a parent to intersect with.
-        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let list = compute_subagent_allowlist(&map, None, &Some("unknown".into())).await;
-        assert!(
-            list.as_ref().is_some_and(|v| v.is_empty()),
-            "parentless unknown role → deny all (Some(vec![])), got: {:?}",
-            list
-        );
-    }
-
-    #[tokio::test]
-    async fn parentless_reviewer_spawn_uses_strict_reviewer_filter() {
-        // Exercise the real shared spawn path used by the review_only IPC:
-        // the role must reach the workflow as ToolFilter::Reviewer, not merely
-        // produce the right standalone vector in the allow-list helper.
-        let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global.md");
-        let project = dir.path().join("project.md");
+    fn test_spawn_host(dir: &std::path::Path) -> (SpawnHost, AgentLoopMap) {
+        let global = dir.join("global.md");
+        let project = dir.join("project.md");
         std::fs::write(&global, "").unwrap();
         std::fs::write(&project, "").unwrap();
         let memory: Arc<dyn crate::memory::MemoryStoreTrait> = Arc::new(
@@ -1481,16 +1476,14 @@ mod tests {
                 constitution_source: crate::project::ConstitutionSource::new(&global, &project)
                     .unwrap(),
                 memory: Some(memory),
-                sandbox: Arc::new(
-                    crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
-                ),
-                project_root: dir.path().to_path_buf(),
+                sandbox: Arc::new(crate::tool::agent::sandbox::Sandbox::new(dir).unwrap()),
+                project_root: dir.to_path_buf(),
                 safety_rules: None,
                 safety_mode: Arc::new(std::sync::RwLock::new(
                     crate::config::SafetyMode::Autonomous,
                 )),
                 context_manager: crate::agent::context::ContextManager::new(128_000, 0.5),
-                plans_dir: dir.path().join("plans"),
+                plans_dir: dir.join("plans"),
                 vision: None,
             },
         ));
@@ -1506,26 +1499,64 @@ mod tests {
         let manager = Arc::new(tokio::sync::Mutex::new(AgentManager::new(8)));
         let agent_loops: AgentLoopMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-        let (agent_id, _) = spawn_agent_shared(
+        (
             SpawnHost {
                 factory,
                 manager,
                 agent_loops: agent_loops.clone(),
             },
+            agent_loops,
+        )
+    }
+
+    fn test_session(role: Option<&str>) -> SessionOptions {
+        SessionOptions {
+            model: None,
+            role: role.map(str::to_string),
+            own_plans_dir: true,
+            worktree: None,
+            permission: None,
+            initial_messages: None,
+            limits: None,
+            host_tools: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn parentless_unknown_role_is_rejected_before_registration() {
+        // The shared public entry point must refuse an unknown role. Returning
+        // Skill(vec![]) is not deny-all: that filter auto-grants mutating tools.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let error = spawn_agent_shared(
+            host,
+            "unknown".to_string(),
+            None,
+            None,
+            test_session(Some("unknown")),
+        )
+        .await
+        .expect_err("an unknown role must refuse the spawn");
+        assert_eq!(error, "unknown role 'unknown'; supported roles: reviewer");
+        assert!(
+            agent_loops.lock().await.is_empty(),
+            "a rejected role must not register an agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn parentless_reviewer_spawn_uses_strict_reviewer_filter() {
+        // Exercise the real shared spawn path used by the review_only IPC:
+        // the role must reach the workflow as ToolFilter::Reviewer, not merely
+        // produce the right standalone vector in the allow-list helper.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let (agent_id, _) = spawn_agent_shared(
+            host,
             "reviewer".to_string(),
             None,
             None,
-            SessionOptions {
-                model: None,
-                role: Some("reviewer".to_string()),
-                own_plans_dir: true,
-                worktree: None,
-                permission: None,
-                initial_messages: None,
-                limits: None,
-                host_tools: vec![],
-            },
+            test_session(Some("reviewer")),
         )
         .await
         .unwrap();

@@ -1167,18 +1167,31 @@ function approveLead(requestId: string, decision: LeadApprovalDecision) {
     });
 }
 
-function answerLead(questionId: string, answer: LeadAnswerInput) {
+/**
+ * Answer the pending interaction.
+ *
+ * Resolves `true` once the host accepted (and the answer landed), `false`
+ * when it was refused. The caller owns the composer draft, so a refusal is
+ * toasted here and must leave the typed answer intact.
+ */
+async function answerLead(
+  questionId: string,
+  answer: LeadAnswerInput,
+): Promise<boolean> {
   const transport = leadTransport;
-  if (!transport) return;
+  if (!transport) return false;
   const token = leadSessionToken;
-  void transport
-    .answer(questionId, answer)
-    .then(() => refreshNativeLead(token))
-    .catch((error) => {
-      if (token === leadSessionToken) {
-        app.update((state) => withToast(state, leadError(error)));
-      }
-    });
+  try {
+    await transport.answer(questionId, answer);
+  } catch (error) {
+    if (token === leadSessionToken) {
+      app.update((state) => withToast(state, leadError(error)));
+    }
+    return false;
+  }
+  // The answer landed; refresh the accepted snapshot in the background.
+  void refreshNativeLead(token);
+  return true;
 }
 
 function setLeadModel(spec: string) {

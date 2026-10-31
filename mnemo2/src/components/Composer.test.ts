@@ -90,7 +90,7 @@ describe("Composer", () => {
 
   it("answers a pending question with a numeric choice", async () => {
     setLead(false);
-    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
     app.update((state) => ({
       ...state,
       leadRuntime: {
@@ -119,7 +119,7 @@ describe("Composer", () => {
 
   it("answers a pending question with freeform text", async () => {
     setLead(false);
-    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
     app.update((state) => ({
       ...state,
       leadRuntime: {
@@ -147,7 +147,7 @@ describe("Composer", () => {
 
   it("opens freeform mode instead of submitting the let's-talk number", async () => {
     setLead(false);
-    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
     app.update((state) => ({
       ...state,
       leadRuntime: {
@@ -235,6 +235,99 @@ describe("Composer", () => {
       expect(toast).toHaveBeenCalledWith("Could not attach the pasted image."),
     );
     expect(draft().images).toEqual([]);
+  });
+
+  it("keeps the typed answer when the host rejects it", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(false);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-4",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    await vi.waitFor(() =>
+      expect(answer).toHaveBeenCalledWith("q-4", { kind: "choice", index: 1 }),
+    );
+    // The question is still pending and the rejected answer must survive.
+    expect(draft().text).toBe("2)");
+  });
+
+  it("preserves attached images after a text-only answer", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+    const image = "data:image/png;base64,kept";
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-5",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    actions.addLeadDraftImage(image);
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    await vi.waitFor(() =>
+      expect(answer).toHaveBeenCalledWith("q-5", { kind: "choice", index: 1 }),
+    );
+    // An answer is text-only: the command clears and the attachment stays.
+    await vi.waitFor(() =>
+      expect(draft()).toEqual({ text: "", images: [image] }),
+    );
+  });
+
+  it("submits a pending-question answer only once on a double click", async () => {
+    setLead(false);
+    let accept!: (value: boolean) => void;
+    const answer = vi.spyOn(actions, "answerLead").mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-6",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    const button = screen.getByRole("button", { name: "Answer question" });
+    await fireEvent.click(button);
+    await fireEvent.click(button);
+    expect(answer).toHaveBeenCalledTimes(1);
+
+    accept(true);
+    await vi.waitFor(() => expect(draft().text).toBe(""));
   });
 
   it("keeps pending approvals on their own buttons, not the composer", () => {

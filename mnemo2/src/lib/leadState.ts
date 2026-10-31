@@ -59,9 +59,14 @@ export function messageText(content: unknown): string {
  * The headless transcript serializes user attachments as provider-neutral
  * `image_url` blocks; Anthropic-style base64 sources and legacy `data_url`
  * blocks are accepted too so a restored conversation keeps every image.
+ * Only local `data:image/...` URLs are returned: a restored transcript is
+ * untrusted input, and an `https://` block would otherwise make the renderer
+ * fetch a remote URL the user never sent.
  */
 export function messageImages(content: unknown): string[] {
   if (!Array.isArray(content)) return [];
+  const local = (url: unknown): string | null =>
+    typeof url === "string" && url.startsWith("data:image/") ? url : null;
   const images: string[] = [];
   for (const block of content) {
     if (!block || typeof block !== "object") continue;
@@ -74,17 +79,18 @@ export function messageImages(content: unknown): string[] {
           : imageUrl && typeof imageUrl === "object"
             ? (imageUrl as { url?: unknown }).url
             : record.url;
-      if (typeof url === "string" && url) images.push(url);
+      const accepted = local(url);
+      if (accepted) images.push(accepted);
       continue;
     }
     if (record.type === "data_url") {
-      const url = record.data_url ?? record.url;
-      if (typeof url === "string" && url) images.push(url);
+      const accepted = local(record.data_url ?? record.url);
+      if (accepted) images.push(accepted);
       continue;
     }
     if (record.type !== "image") continue;
-    const direct = record.data_url ?? record.url;
-    if (typeof direct === "string" && direct) {
+    const direct = local(record.data_url ?? record.url);
+    if (direct) {
       images.push(direct);
       continue;
     }
@@ -98,6 +104,7 @@ export function messageImages(content: unknown): string[] {
     if (
       type === "base64" &&
       typeof mediaType === "string" &&
+      mediaType.startsWith("image/") &&
       typeof data === "string"
     ) {
       images.push(`data:${mediaType};base64,${data}`);

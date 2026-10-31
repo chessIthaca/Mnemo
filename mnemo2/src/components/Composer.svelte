@@ -4,11 +4,13 @@
   import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
   import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
+  import type { LeadAnswerInput } from "../lib/types";
   import LeadModelPicker from "./LeadModelPicker.svelte";
 
   let stopping = $state(false);
   let attaching = $state(false);
   let submitting = $state(false);
+  let answering = $state(false);
   let freeformQuestionId = $state<string | null>(null);
   // The draft lives in store state (not component state) so unmounting the
   // Lead view — for example by opening the Team view — never loses it.
@@ -79,7 +81,7 @@
 
   async function send() {
     if (canAnswerQuestion && pendingQuestion) {
-      submitAnswer(pendingQuestion);
+      await submitAnswer(pendingQuestion);
       return;
     }
     if (!canSend || submitting) return;
@@ -106,34 +108,42 @@
     }
   }
 
-  function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
+  async function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
+    if (answering) return;
     const questionId = question.question_id;
     const answer = draft.text.trim();
-    if (!questionId) return;
+    if (!questionId || !answer) return;
+
+    let payload: LeadAnswerInput;
     if (freeformMode) {
-      if (!answer) return;
-      actions.answerLead(questionId, { kind: "freeform", text: answer });
-      freeformQuestionId = null;
-      actions.clearLeadDraft();
-      return;
+      payload = { kind: "freeform", text: answer };
+    } else {
+      const parsed = parseNumericAnswer(answer, question.options?.length ?? 0);
+      if (parsed?.kind === "choice") {
+        payload = { kind: "choice", index: parsed.index };
+      } else if (parsed?.kind === "freeform") {
+        // The "let's talk" number is a mode switch, not an answer: never
+        // submit the sentinel text. Clear just the command, keep attachments.
+        freeformQuestionId = questionId;
+        actions.setLeadDraftText("");
+        return;
+      } else {
+        // Any other text (including a bare number) is a freeform answer.
+        payload = { kind: "freeform", text: answer };
+      }
     }
-    if (!answer) return;
-    const parsed = parseNumericAnswer(answer, question.options?.length ?? 0);
-    if (parsed?.kind === "choice") {
-      actions.answerLead(questionId, { kind: "choice", index: parsed.index });
-      actions.clearLeadDraft();
-      return;
+
+    answering = true;
+    try {
+      // Clear only after the host accepts the answer. Answers are text-only,
+      // so attached images stay in the draft even on success.
+      if (await actions.answerLead(questionId, payload)) {
+        freeformQuestionId = null;
+        actions.setLeadDraftText("");
+      }
+    } finally {
+      answering = false;
     }
-    if (parsed?.kind === "freeform") {
-      // The "let's talk" number is a mode switch, not an answer: never submit
-      // the sentinel text. Clear just the command and keep any attachments.
-      freeformQuestionId = questionId;
-      actions.setLeadDraftText("");
-      return;
-    }
-    // Any other text (including a bare number) is a freeform answer.
-    actions.answerLead(questionId, { kind: "freeform", text: answer });
-    actions.clearLeadDraft();
   }
 
   function handleInput(event: Event) {
@@ -254,7 +264,7 @@
           : busy
             ? "Steer the lead"
             : "Send message"}
-        disabled={!canSubmit || submitting}
+        disabled={!canSubmit || submitting || answering}
       >
         <ArrowUp size={17} strokeWidth={2} />
       </button>

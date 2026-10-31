@@ -216,6 +216,59 @@ describe("lead event reducer", () => {
     });
   });
 
+  it("never restores remote image URLs from a transcript", () => {
+    const entries = leadEntriesFromTranscript({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "remote" },
+            {
+              type: "image_url",
+              image_url: { url: "https://evil.example/pixel.png" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: "http://evil.example/pixel.png" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "text/html",
+                data: "AAAA",
+              },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "data_url", data_url: "javascript:alert(1)" }],
+        },
+      ],
+    });
+
+    // Only the text survives; a restored transcript must never make the
+    // renderer fetch a remote URL the user did not send.
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "remote",
+    });
+    expect(entries[0].kind === "message" ? entries[0].images : undefined).toBeUndefined();
+  });
+
   it("restores image attachments, including image-only messages", () => {
     const snapshot: LeadSnapshot = {
       generation: 3,

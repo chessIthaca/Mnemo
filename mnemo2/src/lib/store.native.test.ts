@@ -96,7 +96,7 @@ describe("native lead store path", () => {
 
     actions.sendLeadMessage("hello");
     await vi.waitFor(() =>
-      expect(harness.transport.prompt).toHaveBeenCalledWith("hello"),
+      expect(harness.transport.prompt).toHaveBeenCalledWith("hello", []),
     );
     expect(get(app).leadRuntime.busy).toBe(true);
 
@@ -125,6 +125,160 @@ describe("native lead store path", () => {
     );
     await vi.waitFor(() => expect(get(app).leadRuntime.modelId).toBe("scripted-b"));
     expect(get(app).leadRuntime.generation).toBe(2);
+  });
+
+  it("forwards an image-only submission to the transport", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    const image = "data:image/png;base64,AAAA";
+    actions.sendLeadMessage("", [image]);
+    await vi.waitFor(() =>
+      expect(harness.transport.prompt).toHaveBeenCalledWith("", [image]),
+    );
+    expect(get(app).leadEntries.at(-1)).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "",
+      images: [image],
+    });
+  });
+
+  it("steers a busy lead with the submission's text and images", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    actions.sendLeadMessage("start the turn");
+    await vi.waitFor(() =>
+      expect(harness.transport.prompt).toHaveBeenCalledWith("start the turn", []),
+    );
+    expect(get(app).leadRuntime.busy).toBe(true);
+
+    // Pin the turn clock so a steer's (in)decision to reset it is observable.
+    app.update((state) => ({
+      ...state,
+      leadRuntime: { ...state.leadRuntime, turnStartedAtMs: 1_234 },
+    }));
+    const image = "data:image/jpeg;base64,BBBB";
+    actions.sendLeadMessage("  adjust the plan  ", [image]);
+    await vi.waitFor(() =>
+      expect(harness.transport.prompt).toHaveBeenCalledWith("adjust the plan", [image]),
+    );
+
+    expect(harness.transport.prompt).toHaveBeenCalledTimes(2);
+    expect(get(app).leadRuntime.busy).toBe(true);
+    // A steer joins the running turn — the elapsed clock must not restart.
+    expect(get(app).leadRuntime.turnStartedAtMs).toBe(1_234);
+    expect(get(app).leadEntries.at(-1)).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "adjust the plan",
+      images: [image],
+    });
+  });
+
+  it("keeps the running turn and the draft when a steer is rejected", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    await actions.sendLeadMessage("start the turn");
+    expect(get(app).leadRuntime.busy).toBe(true);
+
+    const image = "data:image/png;base64,one";
+    app.update((state) => ({
+      ...state,
+      leadDraft: { text: "please steer", images: [image] },
+      leadRuntime: {
+        ...state.leadRuntime,
+        turnStartedAtMs: 1_234,
+        streamingEntryId: "lead-1",
+      },
+    }));
+    harness.transport.prompt = vi.fn(async () => {
+      throw new Error("steer rejected");
+    });
+
+    const accepted = await actions.sendLeadMessage("please steer", [image]);
+    expect(accepted).toBe(false);
+    // The engine may still be working: never fabricate idle after a rejected
+    // steer, and keep the clock/streaming state it owns.
+    expect(get(app).leadRuntime.busy).toBe(true);
+    expect(get(app).leadRuntime.status).toBe("ready");
+    expect(get(app).leadRuntime.turnStartedAtMs).toBe(1_234);
+    expect(get(app).leadRuntime.streamingEntryId).toBe("lead-1");
+    expect(get(app).toast?.message).toContain("steer rejected");
+    // The caller owns the draft; the store never clears it.
+    expect(get(app).leadDraft).toEqual({ text: "please steer", images: [image] });
+    // The rejected steer is not left in the transcript as if delivered.
+    expect(
+      get(app).leadEntries.some(
+        (entry) => entry.kind === "message" && entry.body === "please steer",
+      ),
+    ).toBe(false);
+  });
+
+  it("reports an idle prompt failure without losing the draft", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    const image = "data:image/png;base64,one";
+    app.update((state) => ({
+      ...state,
+      leadDraft: { text: "hello", images: [image] },
+    }));
+    harness.transport.prompt = vi.fn(async () => {
+      throw new Error("ipc offline");
+    });
+
+    const accepted = await actions.sendLeadMessage("hello", [image]);
+    expect(accepted).toBe(false);
+    expect(get(app).leadRuntime.busy).toBe(false);
+    expect(get(app).leadRuntime.status).toBe("error");
+    expect(get(app).leadRuntime.error).toContain("ipc offline");
+    expect(get(app).toast?.message).toContain("ipc offline");
+    expect(get(app).leadDraft).toEqual({ text: "hello", images: [image] });
+    expect(
+      get(app).leadEntries.some(
+        (entry) => entry.kind === "message" && entry.body === "hello",
+      ),
+    ).toBe(false);
+  });
+
+  it("refuses a submission that races a pending question and keeps the draft", async () => {
+    const harness = makeTransport(snapshot());
+    mockState.transport = harness.transport;
+    actions.openProject("mnemo");
+    await vi.waitFor(() => expect(get(app).leadRuntime.status).toBe("ready"));
+
+    const image = "data:image/png;base64,one";
+    app.update((state) => ({
+      ...state,
+      leadDraft: { text: "queued text", images: [image] },
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-1",
+          question: "Which?",
+          options: [],
+        },
+      },
+    }));
+
+    const accepted = await actions.sendLeadMessage("queued text", [image]);
+    expect(accepted).toBe(false);
+    expect(harness.transport.prompt).not.toHaveBeenCalled();
+    expect(get(app).leadRuntime.busy).toBe(false);
+    expect(get(app).leadDraft).toEqual({ text: "queued text", images: [image] });
+    expect(get(app).toast?.message).toMatch(/answer the lead's question/i);
   });
 
   it("surfaces interruption failures instead of hiding them", async () => {

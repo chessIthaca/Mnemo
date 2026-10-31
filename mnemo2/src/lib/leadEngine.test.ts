@@ -48,6 +48,7 @@ describe("native lead transport", () => {
     await transport.setModel("test/scripted-b");
     await transport.approve("req-1", "deny");
     await transport.answer("q-1", { kind: "choice", index: 1 });
+    await transport.prompt("with an image", ["data:image/png;base64,one"]);
     await transport.close();
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, "lead_open", {
@@ -69,7 +70,11 @@ describe("native lead transport", () => {
       questionId: "q-1",
       answer: { kind: "choice", index: 1 },
     });
-    expect(invokeMock).toHaveBeenNthCalledWith(8, "lead_close");
+    expect(invokeMock).toHaveBeenNthCalledWith(9, "lead_close");
+    expect(invokeMock).toHaveBeenCalledWith("lead_prompt", {
+      text: "with an image",
+      images: ["data:image/png;base64,one"],
+    });
   });
 
   it("probes the Mnemo2 host handshake before native mode", async () => {

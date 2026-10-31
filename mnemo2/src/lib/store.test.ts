@@ -80,4 +80,46 @@ describe("Mnemo2 store production state", () => {
     expect(state().projectId).toBeNull();
     expect(state().workers).toEqual([]);
   });
+
+  it("keeps the unsent draft in store state and resets it on a project switch", async () => {
+    app.set(fixtureState());
+    const first = "data:image/png;base64,one";
+    const second = "data:image/png;base64,two";
+    actions.setLeadDraftText("keep this draft");
+    actions.addLeadDraftImage(first);
+    actions.addLeadDraftImage(second);
+    expect(state().leadDraft).toEqual({ text: "keep this draft", images: [first, second] });
+
+    actions.removeLeadDraftImage(0);
+    expect(state().leadDraft.images).toEqual([second]);
+
+    await actions.openProject("garden-game");
+    expect(state().projectId).toBe("garden-game");
+    expect(state().leadDraft).toEqual({ text: "", images: [] });
+  });
+
+  it("accepts an image-only submission but ignores a genuinely empty one", () => {
+    app.set(fixtureState());
+    const before = state().leadEntries.length;
+    actions.sendLeadMessage("   ");
+    expect(state().leadEntries).toHaveLength(before);
+
+    const image = "data:image/png;base64,one";
+    actions.sendLeadMessage("", [image]);
+    expect(state().leadEntries).toHaveLength(before + 1);
+    expect(state().leadEntries.at(-1)).toMatchObject({
+      author: "user",
+      body: "",
+      images: [image],
+    });
+    expect(state().toast?.message).toMatch(/native shell/i);
+  });
+
+  it("clears the whole draft when asked", () => {
+    app.set(fixtureState());
+    actions.setLeadDraftText("still here");
+    actions.addLeadDraftImage("data:image/png;base64,one");
+    actions.clearLeadDraft();
+    expect(state().leadDraft).toEqual({ text: "", images: [] });
+  });
 });

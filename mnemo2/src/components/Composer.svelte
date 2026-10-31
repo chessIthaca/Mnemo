@@ -1,27 +1,71 @@
 <script lang="ts">
-  import { ArrowUp, Square } from "@lucide/svelte";
+  import { ArrowUp, Square, X } from "@lucide/svelte";
+  import { get } from "svelte/store";
+  import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
+  import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
+  import type { LeadAnswerInput } from "../lib/types";
   import LeadModelPicker from "./LeadModelPicker.svelte";
 
-  let draft = $state("");
   let stopping = $state(false);
+  let attaching = $state(false);
+  let submitting = $state(false);
+  let answering = $state(false);
+  let freeformQuestionId = $state<string | null>(null);
+  // The draft lives in store state (not component state) so unmounting the
+  // Lead view — for example by opening the Team view — never loses it.
+  const draft = $derived($app.leadDraft);
   const busy = $derived($app.leadRuntime.busy);
+  const pending = $derived($app.leadRuntime.pending !== null);
   const connecting = $derived(
     $app.leadRuntime.mode === "native" && $app.leadRuntime.status === "opening",
   );
   const canInterrupt = $derived(
     $app.leadRuntime.mode === "native" &&
       $app.leadRuntime.status === "ready" &&
-      ($app.leadRuntime.busy || $app.leadRuntime.pending !== null),
+      (busy || pending),
   );
+  // A busy native lead accepts a steer, so sending stays available unless a
+  // pending question/approval owns the turn (answer that first).
   const canSend = $derived(
-    $app.leadRuntime.pending === null &&
-      ($app.leadRuntime.mode === "mock" ||
-        ($app.leadRuntime.status === "ready" && !busy)),
+    !pending &&
+      ($app.leadRuntime.mode === "mock" || $app.leadRuntime.status === "ready"),
+  );
+  const hasContent = $derived(
+    draft.text.trim().length > 0 || draft.images.length > 0,
+  );
+  // A pending question is answered from this same box: a numeric `N)` picks an
+  // option, anything else is a freeform answer. Approvals stay on their buttons.
+  const pendingQuestion = $derived(
+    $app.leadRuntime.pending?.kind === "question" &&
+      !!$app.leadRuntime.pending.question_id
+      ? $app.leadRuntime.pending
+      : null,
+  );
+  const canAnswerQuestion = $derived(
+    pendingQuestion !== null && $app.leadRuntime.status === "ready",
+  );
+  const canSubmit = $derived(
+    canAnswerQuestion ? draft.text.trim().length > 0 : hasContent,
+  );
+  // Selecting the trailing "let's talk" number (`options+1)`) opens freeform
+  // mode instead of submitting the sentinel itself; the next submission is
+  // the freeform answer text.
+  const freeformMode = $derived(
+    pendingQuestion !== null &&
+      freeformQuestionId === pendingQuestion.question_id,
   );
 
   $effect(() => {
     if (!canInterrupt) stopping = false;
+  });
+  $effect(() => {
+    if (
+      pendingQuestion === null ||
+      pendingQuestion.question_id !== freeformQuestionId
+    ) {
+      freeformQuestionId = null;
+    }
   });
 
   async function stop() {
@@ -35,11 +79,113 @@
     }
   }
 
-  function send() {
-    const message = draft.trim();
-    if (!message || !canSend) return;
-    actions.sendLeadMessage(message);
-    draft = "";
+  async function send() {
+    if (canAnswerQuestion && pendingQuestion) {
+      await submitAnswer(pendingQuestion);
+      return;
+    }
+    if (!canSend || submitting) return;
+    const message = draft.text.trim();
+    const images = draft.images;
+    // An image-only submission is a real message for a vision model.
+    if (!message && images.length === 0) return;
+    const submittedText = draft.text;
+    const submittedImages = [...images];
+    submitting = true;
+    try {
+      // Clear only after the host confirms acceptance: a rejected or raced
+      // submission keeps the draft instead of destroying text/attachments.
+      const accepted = await actions.sendLeadMessage(message, images);
+      if (!accepted) return;
+      const current = get(app).leadDraft;
+      const unchanged =
+        current.text === submittedText &&
+        current.images.length === submittedImages.length &&
+        current.images.every((image, index) => image === submittedImages[index]);
+      if (unchanged) actions.clearLeadDraft();
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
+    if (answering) return;
+    const questionId = question.question_id;
+    const answer = draft.text.trim();
+    if (!questionId || !answer) return;
+
+    let payload: LeadAnswerInput;
+    if (freeformMode) {
+      payload = { kind: "freeform", text: answer };
+    } else {
+      const parsed = parseNumericAnswer(answer, question.options?.length ?? 0);
+      if (parsed?.kind === "choice") {
+        payload = { kind: "choice", index: parsed.index };
+      } else if (parsed?.kind === "freeform") {
+        // The "let's talk" number is a mode switch, not an answer: never
+        // submit the sentinel text. Clear just the command, keep attachments.
+        freeformQuestionId = questionId;
+        actions.setLeadDraftText("");
+        return;
+      } else {
+        // Any other text (including a bare number) is a freeform answer.
+        payload = { kind: "freeform", text: answer };
+      }
+    }
+
+    answering = true;
+    try {
+      // Clear only after the host accepts the answer. Answers are text-only,
+      // so attached images stay in the draft even on success.
+      if (await actions.answerLead(questionId, payload)) {
+        freeformQuestionId = null;
+        actions.setLeadDraftText("");
+      }
+    } finally {
+      answering = false;
+    }
+  }
+
+  function handleInput(event: Event) {
+    actions.setLeadDraftText((event.currentTarget as HTMLTextAreaElement).value);
+  }
+
+  function imageFiles(data: DataTransfer | null): File[] {
+    return Array.from(data?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+  }
+
+  async function handlePaste(event: ClipboardEvent) {
+    const files = imageFiles(event.clipboardData);
+    if (files.length === 0) return;
+    // Only swallow the paste when it actually carries an image; ordinary
+    // text pastes (and the browser's undo stack) keep working untouched.
+    event.preventDefault();
+    attaching = true;
+    try {
+      // Downscale/re-encode through the shared attachment pipeline before the
+      // data URL ever reaches the store, exactly like the Mnemo1 composer.
+      const attached = await Promise.allSettled(
+        files.map((file) => fileToAttachedDataUrl(file)),
+      );
+      for (const result of attached) {
+        if (result.status === "fulfilled") actions.addLeadDraftImage(result.value);
+      }
+      // Never swallow a rejected conversion: the user must know the image
+      // never made it into the draft.
+      const failed = attached.filter((result) => result.status === "rejected").length;
+      if (failed > 0) {
+        actions.showToast(
+          failed === 1
+            ? "Could not attach the pasted image."
+            : `Could not attach ${failed} pasted images.`,
+        );
+      }
+    } finally {
+      attaching = false;
+    }
   }
 
   function handleSubmit(event: SubmitEvent) {
@@ -48,6 +194,11 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && freeformMode) {
+      event.preventDefault();
+      freeformQuestionId = null;
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       send();
@@ -56,13 +207,35 @@
 </script>
 
 <form class="composer" onsubmit={handleSubmit}>
+  {#if draft.images.length > 0}
+    <ul class="draft-images" aria-label="Attached images">
+      {#each draft.images as image, index}
+        <li class="draft-image">
+          <img src={image} alt={`Attachment ${index + 1}`} />
+          <button
+            type="button"
+            class="remove-image"
+            aria-label={`Remove attachment ${index + 1}`}
+            title="Remove attachment"
+            onclick={() => actions.removeLeadDraftImage(index)}
+          >
+            <X size={11} strokeWidth={2.5} />
+          </button>
+        </li>
+      {/each}
+    </ul>
+  {/if}
   <div class="composer-input">
     <textarea
-      bind:value={draft}
+      value={draft.text}
+      oninput={handleInput}
+      onpaste={handlePaste}
       onkeydown={handleKeydown}
       rows="2"
       aria-label="Message the lead"
-      placeholder="Ask, plan, or redirect the team…"
+      placeholder={freeformMode
+        ? "Type your freeform answer…"
+        : "Ask, plan, or redirect the team…"}
     ></textarea>
     {#if canInterrupt || stopping}
       <button
@@ -76,12 +249,32 @@
         <Square size={12} fill="currentColor" strokeWidth={1.5} />
         <span>{stopping ? "Stopping…" : "Stop"}</span>
       </button>
-    {:else}
+    {/if}
+    {#if canAnswerQuestion || canSend}
+      <button
+        class="send-button"
+        type="submit"
+        aria-label={canAnswerQuestion
+          ? "Answer question"
+          : busy
+            ? "Steer the lead"
+            : "Send message"}
+        title={canAnswerQuestion
+          ? "Answer question"
+          : busy
+            ? "Steer the lead"
+            : "Send message"}
+        disabled={!canSubmit || submitting || answering}
+      >
+        <ArrowUp size={17} strokeWidth={2} />
+      </button>
+    {:else if !canInterrupt}
       <button
         class="send-button"
         type="submit"
         aria-label="Send message"
-        disabled={!draft.trim() || !canSend}
+        title="Send message"
+        disabled
       >
         <ArrowUp size={17} strokeWidth={2} />
       </button>
@@ -91,12 +284,54 @@
     <LeadModelPicker compact />
     <div class="composer-status" aria-live="polite">
       {#if connecting}<span>Connecting</span>{/if}
+      {#if attaching}<span>Attaching image</span>{/if}
+      {#if freeformMode}<span>Freeform answer — Enter to send, Esc to cancel</span>{/if}
+      {#if submitting}<span>Sending</span>{/if}
     </div>
   </div>
 </form>
 
 <style>
   .composer { width: 100%; margin: 0; }
+  .draft-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+  }
+  .draft-image {
+    position: relative;
+    width: 52px;
+    height: 52px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface-soft);
+  }
+  .draft-image img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 9px;
+    object-fit: cover;
+  }
+  .remove-image {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    display: grid;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    place-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  .remove-image:hover { background: var(--line); }
   .composer-input {
     display: flex;
     align-items: flex-end;

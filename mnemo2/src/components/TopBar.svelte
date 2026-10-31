@@ -19,8 +19,8 @@
   let usageTipOpen = $state(false);
 
   function handleTeam() {
-    if ($app.route === "lead") actions.toggleTeamPeek();
-    else actions.openTeam();
+    // Team always opens Mission Control directly — never the right-side peek.
+    actions.openTeam();
   }
 
   function setSlots(event: Event) {
@@ -41,13 +41,13 @@
 
   <nav class="primary-nav" aria-label="Workspace">
     <button class:active={$app.route === "lead"} aria-pressed={$app.route === "lead"} onclick={actions.openLead}><MessageSquare size={14} /> Lead</button>
-    <button class:active={$app.route === "team"} aria-expanded={$app.route === "lead" ? $app.teamPeekOpen : undefined} onclick={handleTeam}><UsersRound size={14} /> Team
+    <button class:active={$app.route === "team"} aria-pressed={$app.route === "team"} onclick={handleTeam}><UsersRound size={14} /> Team
       {#if $needsYouCount > 0}<span class="nav-badge">{$needsYouCount}</span>{/if}
     </button>
   </nav>
 
   <div class="topbar-right">
-    <button class="team-stack" onclick={handleTeam} title="Peek at the team or open Mission Control">
+    <button class="team-stack" onclick={handleTeam} title="Open Mission Control">
       <AvatarStack workers={visibleWorkers} max={4} />
       <span>{activeCount} active</span>
     </button>

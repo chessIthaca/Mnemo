@@ -1,9 +1,16 @@
 import { fireEvent, render, screen } from "@testing-library/svelte";
+import { get } from "svelte/store";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { actions, app } from "../lib/store";
 import { fixtureState } from "../test/fixtures";
 import { initialLeadRuntime } from "../lib/leadState";
 import Composer from "./Composer.svelte";
+
+const attach = vi.hoisted(() => ({ fileToAttachedDataUrl: vi.fn() }));
+
+vi.mock("../../../frontend/src/lib/attachImages", () => ({
+  fileToAttachedDataUrl: attach.fileToAttachedDataUrl,
+}));
 
 function setLead(busy: boolean, status: "ready" | "opening" = "ready") {
   app.update((state) => ({
@@ -29,6 +36,10 @@ function setLead(busy: boolean, status: "ready" | "opening" = "ready") {
   }));
 }
 
+const draft = () => get(app).leadDraft;
+const textbox = () =>
+  screen.getByRole("textbox", { name: "Message the lead" }) as HTMLTextAreaElement;
+
 describe("Composer", () => {
   beforeEach(() => {
     app.set(fixtureState());
@@ -38,11 +49,14 @@ describe("Composer", () => {
     vi.restoreAllMocks();
   });
 
-  it("offers a stop control while the lead is working", async () => {
+  it("keeps the textarea editable with steer and stop available while working", async () => {
     setLead(true);
-    const stop = vi.spyOn(actions, "interruptLead");
+    const stop = vi.spyOn(actions, "interruptLead").mockResolvedValue(undefined);
     render(Composer);
+
+    expect(textbox().disabled).toBe(false);
     expect(screen.queryByRole("button", { name: "Send message" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Steer the lead" })).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Stop the lead" }));
     expect(stop).toHaveBeenCalled();
   });
@@ -74,6 +88,262 @@ describe("Composer", () => {
     expect(stop).toHaveBeenCalled();
   });
 
+  it("answers a pending question with a numeric choice", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-1",
+          question: "Which approach?",
+          options: [
+            { label: "Fast" },
+            { label: "Thorough" },
+            { label: "Ask again" },
+          ],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-1", { kind: "choice", index: 1 });
+    expect(draft()).toEqual({ text: "", images: [] });
+  });
+
+  it("answers a pending question with freeform text", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-2",
+          question: "When should this land?",
+          options: [{ label: "Now" }, { label: "Later" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("Run it on Friday instead");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-2", {
+      kind: "freeform",
+      text: "Run it on Friday instead",
+    });
+    expect(draft()).toEqual({ text: "", images: [] });
+  });
+
+  it("opens freeform mode instead of submitting the let's-talk number", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-3",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }, { label: "Ask again" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("4)");
+    render(Composer);
+
+    // `4)` is the "let's talk about it" sentinel (3 options + 1): it must open
+    // freeform mode, never submit the sentinel as the answer text.
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).not.toHaveBeenCalled();
+    expect(draft().text).toBe("");
+    expect(screen.getByText(/freeform answer/i)).toBeTruthy();
+
+    await fireEvent.input(textbox(), { target: { value: "Let's spike it" } });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-3", {
+      kind: "freeform",
+      text: "Let's spike it",
+    });
+  });
+
+  it("keeps the draft when the store rejects a send", async () => {
+    setLead(false);
+    const image = "data:image/png;base64,keep";
+    actions.setLeadDraftText("keep me");
+    actions.addLeadDraftImage(image);
+    const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(false);
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await vi.waitFor(() =>
+      expect(send).toHaveBeenCalledWith("keep me", [image]),
+    );
+    expect(draft()).toEqual({ text: "keep me", images: [image] });
+  });
+
+  it("clears the draft only after the store confirms acceptance", async () => {
+    setLead(false);
+    actions.setLeadDraftText("send me");
+    let accept!: (value: boolean) => void;
+    vi.spyOn(actions, "sendLeadMessage").mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(draft().text).toBe("send me");
+
+    accept(true);
+    await vi.waitFor(() => expect(draft().text).toBe(""));
+  });
+
+  it("toasts rejected pasted image conversions", async () => {
+    setLead(false);
+    attach.fileToAttachedDataUrl.mockRejectedValue(new Error("decode failed"));
+    const toast = vi.spyOn(actions, "showToast");
+    render(Composer);
+
+    const file = new File(["binary"], "broken.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      },
+    });
+    await fireEvent(textbox(), paste);
+
+    await vi.waitFor(() =>
+      expect(toast).toHaveBeenCalledWith("Could not attach the pasted image."),
+    );
+    expect(draft().images).toEqual([]);
+  });
+
+  it("keeps the typed answer when the host rejects it", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(false);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-4",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    await vi.waitFor(() =>
+      expect(answer).toHaveBeenCalledWith("q-4", { kind: "choice", index: 1 }),
+    );
+    // The question is still pending and the rejected answer must survive.
+    expect(draft().text).toBe("2)");
+  });
+
+  it("preserves attached images after a text-only answer", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+    const image = "data:image/png;base64,kept";
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-5",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    actions.addLeadDraftImage(image);
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    await vi.waitFor(() =>
+      expect(answer).toHaveBeenCalledWith("q-5", { kind: "choice", index: 1 }),
+    );
+    // An answer is text-only: the command clears and the attachment stays.
+    await vi.waitFor(() =>
+      expect(draft()).toEqual({ text: "", images: [image] }),
+    );
+  });
+
+  it("submits a pending-question answer only once on a double click", async () => {
+    setLead(false);
+    let accept!: (value: boolean) => void;
+    const answer = vi.spyOn(actions, "answerLead").mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-6",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("2)");
+    render(Composer);
+
+    const button = screen.getByRole("button", { name: "Answer question" });
+    await fireEvent.click(button);
+    await fireEvent.click(button);
+    expect(answer).toHaveBeenCalledTimes(1);
+
+    accept(true);
+    await vi.waitFor(() => expect(draft().text).toBe(""));
+  });
+
+  it("keeps pending approvals on their own buttons, not the composer", () => {
+    setLead(false);
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: { kind: "approval", request_id: "req-1" },
+      },
+    }));
+    render(Composer);
+    expect(screen.queryByRole("button", { name: "Answer question" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop the lead" })).toBeTruthy();
+  });
+
   it("keeps Stopping visible until the engine confirms completion", async () => {
     setLead(true);
     let finish!: () => void;
@@ -92,5 +362,99 @@ describe("Composer", () => {
       leadRuntime: { ...state.leadRuntime, busy: false },
     }));
     expect(await screen.findByRole("button", { name: "Send message" })).toBeTruthy();
+  });
+
+  it("steers a busy lead with the current text and images", async () => {
+    setLead(true);
+    const image = "data:image/png;base64,one";
+    actions.setLeadDraftText("tighten the brief");
+    actions.addLeadDraftImage(image);
+    const send = vi.spyOn(actions, "sendLeadMessage");
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Steer the lead" }));
+    expect(send).toHaveBeenCalledWith("tighten the brief", [image]);
+  });
+
+  it("sends an image-only draft", async () => {
+    setLead(false);
+    const image = "data:image/png;base64,one";
+    actions.addLeadDraftImage(image);
+    const send = vi.spyOn(actions, "sendLeadMessage");
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(send).toHaveBeenCalledWith("", [image]);
+  });
+
+  it("clears the draft after a steer", async () => {
+    setLead(true);
+    actions.setLeadDraftText("ship it");
+    const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Steer the lead" }));
+    expect(send).toHaveBeenCalledWith("ship it", []);
+    await vi.waitFor(() => expect(draft()).toEqual({ text: "", images: [] }));
+  });
+
+  it("leaves the unsent draft untouched when stopping", async () => {
+    setLead(true);
+    const image = "data:image/png;base64,one";
+    actions.setLeadDraftText("do not lose me");
+    actions.addLeadDraftImage(image);
+    vi.spyOn(actions, "interruptLead").mockResolvedValue(undefined);
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Stop the lead" }));
+    expect(draft()).toEqual({ text: "do not lose me", images: [image] });
+  });
+
+  it("writes typing into the store draft so it survives unmounting", async () => {
+    setLead(false);
+    const { unmount } = render(Composer);
+    await fireEvent.input(textbox(), { target: { value: "draft survives" } });
+    expect(draft().text).toBe("draft survives");
+
+    unmount();
+    render(Composer);
+    expect(textbox().value).toBe("draft survives");
+  });
+
+  it("pastes clipboard images through the shared attachment pipeline", async () => {
+    setLead(false);
+    attach.fileToAttachedDataUrl.mockResolvedValue("data:image/png;base64,downscaled");
+    render(Composer);
+
+    const file = new File(["binary"], "shot.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      },
+    });
+    await fireEvent(textbox(), paste);
+
+    expect(attach.fileToAttachedDataUrl).toHaveBeenCalledWith(file);
+    await vi.waitFor(() =>
+      expect(draft().images).toEqual(["data:image/png;base64,downscaled"]),
+    );
+    expect(
+      (await screen.findByAltText("Attachment 1")).getAttribute("src"),
+    ).toBe("data:image/png;base64,downscaled");
+  });
+
+  it("removes an attached image without touching the text", async () => {
+    setLead(false);
+    const image = "data:image/png;base64,one";
+    actions.setLeadDraftText("keep text");
+    actions.addLeadDraftImage(image);
+    render(Composer);
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Remove attachment 1" }),
+    );
+    expect(draft()).toEqual({ text: "keep text", images: [] });
+    expect(screen.queryByAltText("Attachment 1")).toBeNull();
   });
 });

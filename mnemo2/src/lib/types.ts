@@ -209,6 +209,12 @@ export interface LeadToolResult {
   data?: unknown;
 }
 
+/** The unsent composer draft, kept in store state so navigation preserves it. */
+export interface LeadDraft {
+  text: string;
+  images: string[];
+}
+
 export type LeadEntry =
   | {
       id: string;
@@ -216,6 +222,8 @@ export type LeadEntry =
       time: string;
       author: "lead" | "user";
       body: string;
+      /** Attachment data URLs that accompanied a user message. */
+      images?: string[];
     }
   | {
       id: string;
@@ -473,6 +481,8 @@ export interface AppState {
   projects: Project[];
   workers: Worker[];
   leadEntries: LeadEntry[];
+  /** Unsent composer text and attachments for the open project. */
+  leadDraft: LeadDraft;
   leadRuntime: LeadRuntimeInfo;
   selectedWorkerId: string | null;
   teamPeekOpen: boolean;

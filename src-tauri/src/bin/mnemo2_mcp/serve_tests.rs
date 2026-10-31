@@ -271,13 +271,13 @@ fn a_rejected_token_is_retried_once_then_reported() {
 
 // ---- reconnecting and starting --------------------------------------------
 
-fn process(bridge: &Bridge, line: &str) {
+fn process(bridge: &Arc<Bridge>, line: &str) {
     bridge.process(line, serde_json::from_str(line).ok());
 }
 
-fn test_bridge(env: Env) -> (Bridge, SharedBuf) {
+fn test_bridge(env: Env) -> (Arc<Bridge>, SharedBuf) {
     let out = SharedBuf::default();
-    let bridge = Bridge::new(env, None, Box::new(out.clone()));
+    let bridge = Arc::new(Bridge::new(env, None, Box::new(out.clone())));
     (bridge, out)
 }
 
@@ -504,7 +504,7 @@ fn initialize_is_answered_at_once_while_mnemo2_is_still_starting() {
         let init = &out.messages()[0];
         assert_eq!(init["id"], 1);
         assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
-        assert_eq!(init["result"]["capabilities"], json!({ "tools": {} }));
+        assert_eq!(init["result"]["capabilities"], json!({ "tools": { "listChanged": true } }));
         assert_eq!(init["result"]["serverInfo"]["name"], "mnemo");
         assert_eq!(init["result"]["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
         let brief = init["result"]["instructions"].as_str().expect("instructions");
@@ -590,6 +590,96 @@ fn requests_queued_behind_a_failed_start_share_its_error_and_the_next_one_retrie
     assert_eq!(starts.load(Ordering::SeqCst), 2);
 }
 
+/// Wait until `out` has written a `notifications/tools/list_changed`.
+fn wait_for_list_changed(out: &SharedBuf, within: Duration) {
+    let started = Instant::now();
+    while !out
+        .messages()
+        .iter()
+        .any(|message| message["method"] == "notifications/tools/list_changed")
+    {
+        assert!(started.elapsed() < within, "no list_changed: {:?}", out.messages());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Claude Code drops a `tools/list` after 30 s and then keeps no tools for the
+/// session. A start slower than `list_wait` gets an empty list in time and a
+/// `list_changed` once Mnemo2 is up, after which the real list comes through.
+#[test]
+fn a_start_slower_than_list_wait_answers_no_tools_then_announces_them() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let up = Arc::new(AtomicBool::new(false));
+    let keep = Arc::new(Mutex::new(None));
+    let mut env = sandbox.env();
+    env.list_wait = Duration::from_millis(150);
+    env.spawner = slow_start(&sandbox, Duration::from_millis(600), up.clone(), keep.clone());
+    let (bridge, out) = test_bridge(env);
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| process(&bridge, &initialize(1)));
+        let started = Instant::now();
+        process(&bridge, &request(2, "tools/list"));
+        assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+        assert!(!up.load(Ordering::SeqCst));
+        let answer = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+        assert_eq!(answer["result"], json!({ "tools": [] }));
+
+        wait_for_list_changed(&out, Duration::from_secs(3));
+        assert!(up.load(Ordering::SeqCst), "announced before Mnemo2 was up");
+    });
+    process(&bridge, &request(3, "tools/list"));
+    let messages = out.messages();
+    let changed = messages
+        .iter()
+        .filter(|message| message["method"] == "notifications/tools/list_changed")
+        .count();
+    assert_eq!(changed, 1, "{messages:?}");
+    let refreshed = messages.iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(refreshed["result"]["tools"][0]["name"], "team_status");
+}
+
+/// A failed start leaves Claude Code without tools; a Mnemo2 the user then
+/// starts by hand is found without a reconnect and the tools announced.
+#[test]
+fn after_a_failed_start_a_mnemo2_started_by_hand_brings_the_tools_in() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let mut env = sandbox.env();
+    env.spawner = Arc::new(|_| Err("could not start the Mnemo2 app".to_string()));
+    let (bridge, out) = test_bridge(env);
+
+    process(&bridge, &initialize(1));
+    process(&bridge, &request(2, "tools/list"));
+    let failed = out.messages().into_iter().find(|message| message["id"] == 2).expect("answer");
+    let message = failed["error"]["message"].as_str().expect("error");
+    assert!(message.contains("could not start the Mnemo2 app"), "{message}");
+
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    wait_for_list_changed(&out, Duration::from_secs(3));
+    process(&bridge, &request(3, "tools/list"));
+    let listed = out.messages().into_iter().find(|message| message["id"] == 3).expect("answer");
+    assert_eq!(listed["result"]["tools"][0]["name"], "team_status");
+}
+
+/// Nothing announces a change that did not happen.
+#[test]
+fn a_tools_list_answered_in_time_announces_nothing() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    let (bridge, out) = test_bridge(sandbox.env());
+    process(&bridge, &initialize(1));
+    process(&bridge, &request(2, "tools/list"));
+    std::thread::sleep(Duration::from_millis(100));
+    let messages = out.messages();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages.iter().all(|message| message.get("method").is_none()), "{messages:?}");
+}
+
 #[test]
 fn the_stub_keeps_answering_initialize_itself_outside_registered_projects() {
     let sandbox = Sandbox::new();
@@ -603,9 +693,9 @@ fn the_stub_keeps_answering_initialize_itself_outside_registered_projects() {
 
 // ---- the one-time permissions note ------------------------------------------
 
-fn test_bridge_with_claude_dir(env: Env, claude_dir: PathBuf) -> (Bridge, SharedBuf) {
+fn test_bridge_with_claude_dir(env: Env, claude_dir: PathBuf) -> (Arc<Bridge>, SharedBuf) {
     let out = SharedBuf::default();
-    let bridge = Bridge::new(env, Some(claude_dir), Box::new(out.clone()));
+    let bridge = Arc::new(Bridge::new(env, Some(claude_dir), Box::new(out.clone())));
     (bridge, out)
 }
 

@@ -80,23 +80,16 @@ fn restrict_to_user(path: &Path) {
     }
 }
 
-/// Restrict the run folder to the current user (`0700` on Unix, the same
-/// user-only DACL as the file on Windows). Best effort, like the file.
+/// Restrict the run folder to the current user (`0700` on Unix, a user-only
+/// DACL that files created inside inherit on Windows: the helper's spawn lock
+/// must stay readable to the helper). Best effort, like the file.
 fn restrict_dir_to_user(dir: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if let Err(error) =
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        {
-            eprintln!(
-                "mnemo2: could not restrict '{}' to the current user: {error}",
-                dir.display()
-            );
-        }
+    if let Err(error) = mnemo::config::keys::restrict_dir_permissions(dir) {
+        eprintln!(
+            "mnemo2: could not restrict '{}' to the current user: {error}",
+            dir.display()
+        );
     }
-    #[cfg(not(unix))]
-    restrict_to_user(dir);
 }
 
 /// Write the run file atomically (temp file in the same folder, then rename).
@@ -420,6 +413,11 @@ mod tests {
                 assert!(!text.contains(other), "{other} still has access: {text}");
             }
         }
+        // Files other processes create in the folder (the helper's spawn
+        // lock) inherit the user's entry, so they can be read back.
+        let lock = run_dir(dir.path()).join("spawn-test.lock");
+        std::fs::write(&lock, "token").expect("a helper can create its lock");
+        assert_eq!(std::fs::read_to_string(&lock).expect("and read it back"), "token");
         // A rewrite (new project) keeps the restriction.
         let handle = RunFileHandle::create(dir.path(), 1, new_token()).expect("create");
         handle.set_project(Some(Path::new("C:/work"))).expect("rewrite");

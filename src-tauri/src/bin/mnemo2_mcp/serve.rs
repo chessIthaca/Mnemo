@@ -12,7 +12,11 @@
 //! Inside a registered project `initialize` is answered here, at once: Claude
 //! Code gives an MCP server about 30 s to connect and a cold Mnemo2 start can
 //! take longer. The instance is found (or started) in the background and every
-//! later request waits for it.
+//! later request waits for it. `tools/list` gets the same 30 s, so it waits at
+//! most `Env::list_wait`: past that it is answered with no tools, and the
+//! bridge sends `notifications/tools/list_changed` once the instance is up.
+//! After a failed start it keeps looking, so a Mnemo2 the user starts by hand
+//! still brings the tools in.
 //!
 //! The first tool result of a session may carry a one-time note asking the
 //! user whether Mnemo may run without permission prompts (see `permissions`).
@@ -20,14 +24,16 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use mnemo_app::mnemo2::mcp_server::lead_instructions;
 use serde_json::{json, Value};
 
 use crate::http::{self, Response};
-use crate::instance::{canonical, registered_root, resolve, root_body, Env, Instance, Resolution};
+use crate::instance::{
+    canonical, find_instance, registered_root, resolve, root_body, Env, Instance, Resolution,
+};
 use crate::permissions::{self, Offer};
 
 /// After stdin closes, how long in-flight requests may still finish.
@@ -39,6 +45,8 @@ const QUEUE_SLACK: Duration = Duration::from_secs(15);
 const SERVER_ERROR: i64 = -32000;
 const METHOD_NOT_FOUND: i64 = -32601;
 const PARSE_ERROR: i64 = -32700;
+/// Tells Claude Code to fetch the tool list again.
+const LIST_CHANGED: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 #[derive(Clone)]
 enum Target {
@@ -74,6 +82,21 @@ struct Bridge {
     offer: Offer,
     /// The cwd is in a registered project: answer `initialize` locally.
     local_initialize: bool,
+    /// Claude Code holds an out-of-date tool list (an empty or failed
+    /// `tools/list` while Mnemo2 was starting or down): announce the change
+    /// once there is an instance.
+    stale_list: AtomicBool,
+    /// A thread is looking for an instance after a failed start.
+    watching: AtomicBool,
+}
+
+/// How a bounded wait for the instance ended.
+enum Ready {
+    Yes,
+    /// Still starting.
+    Pending,
+    /// The lookup ended without an instance, for this reason.
+    Failed(String),
 }
 
 enum Forward {
@@ -175,6 +198,8 @@ impl Bridge {
             attached: AtomicBool::new(false),
             offer,
             local_initialize,
+            stale_list: AtomicBool::new(false),
+            watching: AtomicBool::new(false),
         }
     }
 
@@ -194,7 +219,7 @@ impl Bridge {
     }
 
     /// Handle one stdin line and write its answer, if it has one.
-    fn process(&self, line: &str, parsed: Option<Value>) {
+    fn process(self: &Arc<Self>, line: &str, parsed: Option<Value>) {
         let reply = match &parsed {
             None => Some(rpc_error(&Value::Null, PARSE_ERROR, "Parse error")),
             Some(msg) => self.answer(line, msg),
@@ -202,6 +227,9 @@ impl Bridge {
         if let Some(reply) = reply {
             self.emit(&reply);
         }
+        // An answer that left the tool list out of date is followed by the
+        // announcement as soon as there is something to announce.
+        self.settle();
         // The client has its handshake answer; now find (or start) Mnemo2 on
         // this worker thread, so the instance is up before the first real request.
         let is_initialize = parsed
@@ -212,7 +240,7 @@ impl Bridge {
         }
     }
 
-    fn answer(&self, line: &str, msg: &Value) -> Option<String> {
+    fn answer(self: &Arc<Self>, line: &str, msg: &Value) -> Option<String> {
         let id = request_id(msg);
         let method = method_of(msg);
         if self.local_initialize {
@@ -226,6 +254,20 @@ impl Bridge {
                 ("notifications/initialized", None) => return None,
                 // Without an instance there is nobody to tell.
                 (_, None) if !self.is_ready() => return None,
+                // Answer in time even while Mnemo2 starts: Claude Code keeps
+                // no tools for the session after a `tools/list` times out.
+                ("tools/list", Some(id)) => match self.wait_ready(self.env.list_wait) {
+                    Ready::Yes => {}
+                    Ready::Pending => {
+                        self.stale_list.store(true, Ordering::SeqCst);
+                        let result = json!({ "tools": [] });
+                        return Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string());
+                    }
+                    Ready::Failed(message) => {
+                        self.stale_list.store(true, Ordering::SeqCst);
+                        return Some(rpc_error(id, SERVER_ERROR, &message));
+                    }
+                },
                 _ => {}
             }
         }
@@ -276,7 +318,7 @@ impl Bridge {
     /// One thread does the lookup; concurrent requests queue behind it (up to
     /// the lookup's own limit plus a slack) and share its outcome, a failure
     /// included, instead of each starting Mnemo2 again.
-    fn target(&self) -> Result<Target, String> {
+    fn target(self: &Arc<Self>) -> Result<Target, String> {
         let limit = self.env.spawn_timeout + QUEUE_SLACK;
         let deadline = Instant::now() + limit;
         let mut slot = self.lock_slot();
@@ -311,7 +353,12 @@ impl Bridge {
         }
         slot.resolving = true;
         drop(slot);
+        self.finish_resolve()
+    }
 
+    /// Run the lookup this thread claimed (`resolving` is set) and publish its
+    /// outcome to every request waiting on it.
+    fn finish_resolve(self: &Arc<Self>) -> Result<Target, String> {
         let resolution = resolve(&self.env, &self.cwd);
 
         let mut slot = self.lock_slot();
@@ -331,7 +378,76 @@ impl Bridge {
         }
         drop(slot);
         self.resolved.notify_all();
+        self.settle();
         result
+    }
+
+    /// Wait up to `limit` for the instance without blocking on a lookup of
+    /// this thread's own: when none is running one starts in the background,
+    /// and it carries on if the wait ends first.
+    fn wait_ready(self: &Arc<Self>, limit: Duration) -> Ready {
+        let deadline = Instant::now() + limit;
+        let mut slot = self.lock_slot();
+        let mut seen = slot.generation;
+        loop {
+            if slot.target.is_some() {
+                return Ready::Yes;
+            }
+            if slot.generation != seen {
+                if let Some(error) = slot.last_error.clone() {
+                    return Ready::Failed(error);
+                }
+                seen = slot.generation;
+                continue;
+            }
+            if !slot.resolving {
+                slot.resolving = true;
+                let bridge = Arc::clone(self);
+                std::thread::spawn(move || {
+                    let _ = bridge.finish_resolve();
+                });
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ready::Pending;
+            }
+            slot = self
+                .resolved
+                .wait_timeout(slot, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
+    /// Bring an out-of-date tool list in Claude Code up to date: announce the
+    /// change once there is an instance or, after a failed start, keep
+    /// looking for one (the user may start Mnemo2 or fix the project).
+    fn settle(self: &Arc<Self>) {
+        if !self.stale_list.load(Ordering::SeqCst) {
+            return;
+        }
+        let slot = self.lock_slot();
+        let (ready, idle) = (slot.target.is_some(), !slot.resolving);
+        drop(slot);
+        if ready {
+            if self.stale_list.swap(false, Ordering::SeqCst) {
+                self.emit(LIST_CHANGED);
+            }
+        } else if idle && !self.watching.swap(true, Ordering::SeqCst) {
+            let bridge = Arc::downgrade(self);
+            std::thread::spawn(move || watch(bridge));
+        }
+    }
+
+    /// Use an instance found outside a lookup (by the watcher).
+    fn adopt(&self, instance: Instance) {
+        let mut slot = self.lock_slot();
+        if slot.target.is_none() {
+            slot.target = Some(Target::Live(instance));
+            slot.last_error = None;
+        }
+        drop(slot);
+        self.resolved.notify_all();
     }
 
     /// Forget `instance` if it is still the cached target.
@@ -383,6 +499,30 @@ impl Bridge {
     }
 }
 
+/// After a failed start: look for an instance every `Env::wait_poll` until one
+/// serves the project (then announce the tools) or the bridge is gone. Only
+/// looks; starting Mnemo2 again is left to the next request.
+fn watch(bridge: Weak<Bridge>) {
+    loop {
+        let Some(poll) = bridge.upgrade().map(|bridge| bridge.env.wait_poll) else {
+            return;
+        };
+        std::thread::sleep(poll);
+        let Some(bridge) = bridge.upgrade() else {
+            return;
+        };
+        let ready = bridge.is_ready()
+            || find_instance(&bridge.env, &bridge.cwd)
+                .map(|instance| bridge.adopt(instance))
+                .is_some();
+        if ready {
+            bridge.watching.store(false, Ordering::SeqCst);
+            bridge.settle();
+            return;
+        }
+    }
+}
+
 /// Turn Mnemo2's HTTP answer into the line to write, if any.
 fn reply_from(id: Option<&Value>, response: Response) -> Option<String> {
     if response.status == 202 {
@@ -415,14 +555,19 @@ fn reply_from(id: Option<&Value>, response: Response) -> Option<String> {
 }
 
 /// The `initialize` answer: the client's protocol version echoed, tools only,
-/// and the lead brief when there is one (the inert stub has none).
+/// and the lead brief when there is one (the inert stub has none). The bridge
+/// that gives the brief also announces tool-list changes; the stub never does.
 fn initialize_reply(msg: &Value, id: &Value, instructions: Option<&str>) -> String {
+    let tools = match instructions {
+        Some(_) => json!({ "listChanged": true }),
+        None => json!({}),
+    };
     let mut result = json!({
         "protocolVersion": msg
             .pointer("/params/protocolVersion")
             .and_then(Value::as_str)
             .unwrap_or("2025-06-18"),
-        "capabilities": { "tools": {} },
+        "capabilities": { "tools": tools },
         "serverInfo": { "name": "mnemo", "version": env!("CARGO_PKG_VERSION") },
     });
     if let Some(text) = instructions {

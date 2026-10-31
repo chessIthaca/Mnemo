@@ -435,6 +435,113 @@ fn a_second_helper_waits_instead_of_starting_a_second_mnemo2() {
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the loser must not spawn");
 }
 
+/// The pid of a process that has already exited.
+fn dead_pid() -> u32 {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    child.wait().unwrap();
+    child.id()
+}
+
+/// An `Env` whose spawner counts its calls and, like the real app, publishes a
+/// run file for `project` a moment later.
+fn publishing_env(sandbox: &Sandbox, pid: u32, port: u16) -> (Env, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut env = sandbox.env();
+    env.spawner = {
+        let calls = calls.clone();
+        let (run_dir, project) = (sandbox.run_dir.clone(), sandbox.project_str());
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let (run_dir, project) = (run_dir.clone(), project.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                write_run_file(&run_dir, pid, port, "tok", Some(&project), 1);
+            });
+            Ok(None)
+        })
+    };
+    (env, calls)
+}
+
+/// A session that ended while its helper was starting Mnemo2 leaves a young
+/// lock behind and takes that Mnemo2 along. The next helper must start one
+/// itself, not wait out the lock.
+#[test]
+fn a_young_lock_whose_helper_and_mnemo2_are_gone_does_not_block_the_next_start() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let path = lock_path(&sandbox.run_dir, &project);
+    std::fs::create_dir_all(&sandbox.run_dir).unwrap();
+    std::fs::write(&path, format!("{}-1-0\n{}", dead_pid(), dead_pid())).unwrap();
+    let server = live(812, Some(&project));
+    let (mut env, calls) = publishing_env(&sandbox, 812, server.port);
+    env.spawn_timeout = Duration::from_secs(5);
+    let started = Instant::now();
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("expected a live instance");
+    };
+    assert_eq!(instance.pid, 812);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(started.elapsed() < Duration::from_secs(3), "waited out a dead lock");
+    assert!(lock_files(&sandbox).is_empty(), "the taken-over lock is released");
+}
+
+/// A helper that found the lock taken starts Mnemo2 itself once the holder
+/// lets go without an instance having come up.
+#[test]
+fn a_waiting_helper_starts_mnemo2_when_the_holder_gives_up() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let project = sandbox.project_str();
+    let held = SpawnLock::acquire(&sandbox.run_dir, &project);
+    assert!(matches!(held, SpawnLock::Owned { .. }));
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+    });
+    let server = live(813, Some(&project));
+    let (mut env, calls) = publishing_env(&sandbox, 813, server.port);
+    env.spawn_timeout = Duration::from_secs(5);
+    let Resolution::Live(instance) = resolve(&env, &sandbox.deep) else {
+        panic!("expected a live instance");
+    };
+    assert_eq!(instance.pid, 813);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_lock_names_its_helper_and_later_its_mnemo2() {
+    assert_eq!(lock_pids("4242-1700000000-3"), vec![4242]);
+    assert_eq!(lock_pids("4242-1700000000-3\n977"), vec![4242, 977]);
+    assert!(lock_pids("crashed").is_empty());
+    assert!(lock_pids("").is_empty());
+    let alive = |pid: u32| pid == 977;
+    // Mnemo2 still starting: the lock stands though its helper is gone.
+    assert!(!owners_gone("4242-1-0\n977", alive));
+    assert!(owners_gone("4242-1-0\n978", alive));
+    assert!(owners_gone("4242-1-0", alive));
+    // A lock that names nobody is judged by its age alone.
+    assert!(!owners_gone("crashed", alive));
+}
+
+#[test]
+fn the_owner_records_the_mnemo2_it_started_and_still_releases_its_lock() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_str();
+    let lock = SpawnLock::acquire(&sandbox.run_dir, &project);
+    let path = owned_path(&lock).to_path_buf();
+    lock.record_app(std::process::id());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(lock_pids(&text), vec![std::process::id(), std::process::id()]);
+    assert!(!lock_is_stale(&path, LOCK_STALE));
+    drop(lock);
+    assert!(!path.exists());
+}
+
 /// Every spawn lock or takeover guard left in the run dir.
 fn lock_files(sandbox: &Sandbox) -> Vec<PathBuf> {
     std::fs::read_dir(&sandbox.run_dir)

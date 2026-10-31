@@ -87,7 +87,7 @@
         <!-- Three lines of Markdown prose: 3 × (14px font × 1.62 line-height) ≈ 68px. -->
         <div class="worker-brief">
           <Collapsible maxHeight={68} label="worker brief">
-            <Markdown source={worker.task} />
+            <Markdown source={worker.task} onOpenLink={actions.openBrowser} />
           </Collapsible>
         </div>
         {#if audit}

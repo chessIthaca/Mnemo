@@ -444,6 +444,54 @@ describe("Composer", () => {
     ).toBe("data:image/png;base64,downscaled");
   });
 
+  it("a real pasted PNG renders its thumbnail before sending", async () => {
+    setLead(false);
+    // No converter mock for this test: wire the REAL shared pipeline into the
+    // module the component imports, so the paste exercises the true
+    // clipboard File -> FileReader -> data URL -> store -> <img> path.
+    const actual =
+      await vi.importActual<
+        typeof import("../../../frontend/src/lib/attachImages")
+      >("../../../frontend/src/lib/attachImages");
+    attach.fileToAttachedDataUrl.mockImplementation(actual.fileToAttachedDataUrl);
+    render(Composer);
+
+    // A genuine 1x1 transparent PNG (68 bytes, zlib-verified), not mock bytes.
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=";
+    const file = new File(
+      [Uint8Array.from(atob(pngBase64), (c) => c.charCodeAt(0))],
+      "shot.png",
+      { type: "image/png" },
+    );
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      },
+    });
+    await fireEvent(textbox(), paste);
+
+    // The real converter must have read the same bytes the file carries.
+    const expected = `data:image/png;base64,${pngBase64}`;
+    await vi.waitFor(() => expect(draft().images).toEqual([expected]));
+    expect(
+      (await screen.findByAltText("Attachment 1")).getAttribute("src"),
+    ).toBe(expected);
+
+    // Ordinary text pastes stay untouched: no image is attached and the
+    // default paste behavior (no preventDefault) is preserved.
+    const textPaste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(textPaste, "clipboardData", {
+      value: {
+        items: [{ kind: "string", type: "text/plain", getAsFile: () => null }],
+      },
+    });
+    await fireEvent(textbox(), textPaste);
+    expect(textPaste.defaultPrevented).toBe(false);
+    expect(draft().images).toEqual([expected]);
+  });
+
   it("removes an attached image without touching the text", async () => {
     setLead(false);
     const image = "data:image/png;base64,one";

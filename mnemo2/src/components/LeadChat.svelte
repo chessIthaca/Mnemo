@@ -79,7 +79,7 @@
                 <div class="entry-label">LEAD</div>
                 <Markdown source={entry.body} onOpenLink={actions.openBrowser} />
               {:else}
-                <p>{entry.body}</p>
+                {#if entry.body}<p>{entry.body}</p>{/if}
                 {#if entry.images && entry.images.length > 0}
                   <div class="user-images" aria-label="Attached images">
                     {#each entry.images as image, imageIndex}

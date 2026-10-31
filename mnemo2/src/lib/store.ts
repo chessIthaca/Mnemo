@@ -955,19 +955,30 @@ function closeScreenshot(): void {
   app.update((state) => ({ ...state, browserImage: null }));
 }
 
-async function sendNativeLeadMessage(message: string, images: string[]): Promise<void> {
+/**
+ * Send one submission to the native lead.
+ *
+ * Resolves `true` only when the host accepted it. A rejected steer keeps the
+ * turn's running state (busy, elapsed clock, streaming entry) intact — the
+ * engine may still be working — and a rejected idle prompt becomes an error
+ * instead of a fabricated idle turn. Either failure rolls back the optimistic
+ * transcript entry and surfaces a toast.
+ */
+async function sendNativeLeadMessage(message: string, images: string[]): Promise<boolean> {
   const transport = leadTransport;
-  if (!transport) return;
+  if (!transport) return false;
   const token = leadSessionToken;
+  const before = get(app).leadRuntime;
   // A submission on a busy turn steers the running turn instead of starting
   // a new one: the elapsed clock and the streaming entry must survive.
-  const steering = get(app).leadRuntime.busy;
+  const steering = before.busy;
+  const entryId = nextId("user");
   app.update((state) => ({
     ...state,
     leadEntries: [
       ...state.leadEntries,
       {
-        id: nextId("user"),
+        id: entryId,
         kind: "message",
         author: "user",
         body: message,
@@ -987,43 +998,71 @@ async function sendNativeLeadMessage(message: string, images: string[]): Promise
   }));
   try {
     await transport.prompt(message, images);
+    return true;
   } catch (error) {
     if (token === leadSessionToken) {
-      app.update((state) => ({
-        ...state,
-        leadRuntime: {
-          ...state.leadRuntime,
-          status: "error",
-          busy: false,
-          error: leadError(error),
-          errorRetrying: false,
-        },
-      }));
+      const failure = leadError(error);
+      app.update((state) => {
+        // Roll back the optimistic entry unless a later turn update followed
+        // it, so a rejected submission is never shown as delivered.
+        const entries = state.leadEntries.at(-1)?.id === entryId
+          ? state.leadEntries.slice(0, -1)
+          : state.leadEntries;
+        const runtime = steering
+          ? // The turn was already running: never fake idle after a rejected
+            // steer, and leave busy/clock/streaming exactly as the engine set
+            // them (a `finished` event during the await still wins).
+            { ...state.leadRuntime, error: null, errorRetrying: false }
+          : {
+              ...state.leadRuntime,
+              status: "error" as const,
+              busy: false,
+              error: failure,
+              errorRetrying: false,
+              turnStartedAtMs: before.turnStartedAtMs,
+              streamingEntryId: before.streamingEntryId,
+            };
+        return withToast({ ...state, leadEntries: entries, leadRuntime: runtime }, failure);
+      });
     }
+    return false;
   }
 }
 
-function sendLeadMessage(body: string, images: string[] = []) {
+/**
+ * Submit text (and optional image data URLs) to the lead.
+ *
+ * Resolves `true` when the submission was accepted (a prompt when idle, a
+ * steer while busy) and `false` when it was refused. The unsent draft is
+ * owned by the caller, so a refusal never discards it.
+ */
+async function sendLeadMessage(body: string, images: string[] = []): Promise<boolean> {
   const message = body.trim();
   const attachments = images.filter(
     (image) => typeof image === "string" && image.length > 0,
   );
   // An image-only submission is still a real message for a vision model.
-  if (!message && attachments.length === 0) return;
+  if (!message && attachments.length === 0) return false;
   const state = get(app);
   if (state.leadRuntime.mode === "native") {
     if (!leadTransport) {
       app.update((current) => withToast(current, "The native lead is not connected."));
-      return;
+      return false;
     }
     if (state.leadRuntime.status !== "ready") {
       app.update((current) => withToast(current, "The lead is still connecting."));
-      return;
+      return false;
     }
-    // A pending question or approval owns the turn; answer it first.
-    if (state.leadRuntime.pending) return;
-    void sendNativeLeadMessage(message, attachments);
-    return;
+    // A pending question or approval owns the turn; answer it first. This is
+    // the race-safe gate: a pending interaction that appeared after the
+    // composer's own check still refuses the send and keeps the draft.
+    if (state.leadRuntime.pending) {
+      app.update((current) =>
+        withToast(current, "Answer the lead's question before sending."),
+      );
+      return false;
+    }
+    return sendNativeLeadMessage(message, attachments);
   }
   // Browser-only Vite sessions have no engine behind them. Keep the typed
   // message, but never fabricate a lead reply.
@@ -1044,6 +1083,7 @@ function sendLeadMessage(body: string, images: string[] = []) {
       },
     ],
   }));
+  return true;
 }
 
 /** Replace the unsent composer text, keeping any attached images. */
@@ -1088,6 +1128,11 @@ function clearLeadDraft(): void {
       ? state
       : { ...state, leadDraft: { text: "", images: [] } },
   );
+}
+
+/** Surface a transient status or failure message to the user. */
+function showToast(message: string): void {
+  app.update((state) => withToast(state, message));
 }
 
 async function interruptLead(): Promise<void> {
@@ -1782,6 +1827,7 @@ export const actions = {
   addLeadDraftImage,
   removeLeadDraftImage,
   clearLeadDraft,
+  showToast,
   interruptLead,
   approveLead,
   answerLead,

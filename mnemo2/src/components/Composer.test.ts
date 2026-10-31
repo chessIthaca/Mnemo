@@ -145,6 +145,98 @@ describe("Composer", () => {
     expect(draft()).toEqual({ text: "", images: [] });
   });
 
+  it("opens freeform mode instead of submitting the let's-talk number", async () => {
+    setLead(false);
+    const answer = vi.spyOn(actions, "answerLead").mockImplementation(() => {});
+    app.update((state) => ({
+      ...state,
+      leadRuntime: {
+        ...state.leadRuntime,
+        pending: {
+          kind: "question",
+          question_id: "q-3",
+          question: "Which approach?",
+          options: [{ label: "Fast" }, { label: "Thorough" }, { label: "Ask again" }],
+        },
+      },
+    }));
+    actions.setLeadDraftText("4)");
+    render(Composer);
+
+    // `4)` is the "let's talk about it" sentinel (3 options + 1): it must open
+    // freeform mode, never submit the sentinel as the answer text.
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).not.toHaveBeenCalled();
+    expect(draft().text).toBe("");
+    expect(screen.getByText(/freeform answer/i)).toBeTruthy();
+
+    await fireEvent.input(textbox(), { target: { value: "Let's spike it" } });
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Answer question" }),
+    );
+    expect(answer).toHaveBeenCalledWith("q-3", {
+      kind: "freeform",
+      text: "Let's spike it",
+    });
+  });
+
+  it("keeps the draft when the store rejects a send", async () => {
+    setLead(false);
+    const image = "data:image/png;base64,keep";
+    actions.setLeadDraftText("keep me");
+    actions.addLeadDraftImage(image);
+    const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(false);
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await vi.waitFor(() =>
+      expect(send).toHaveBeenCalledWith("keep me", [image]),
+    );
+    expect(draft()).toEqual({ text: "keep me", images: [image] });
+  });
+
+  it("clears the draft only after the store confirms acceptance", async () => {
+    setLead(false);
+    actions.setLeadDraftText("send me");
+    let accept!: (value: boolean) => void;
+    vi.spyOn(actions, "sendLeadMessage").mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    render(Composer);
+
+    await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(draft().text).toBe("send me");
+
+    accept(true);
+    await vi.waitFor(() => expect(draft().text).toBe(""));
+  });
+
+  it("toasts rejected pasted image conversions", async () => {
+    setLead(false);
+    attach.fileToAttachedDataUrl.mockRejectedValue(new Error("decode failed"));
+    const toast = vi.spyOn(actions, "showToast");
+    render(Composer);
+
+    const file = new File(["binary"], "broken.png", { type: "image/png" });
+    const paste = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => file }],
+      },
+    });
+    await fireEvent(textbox(), paste);
+
+    await vi.waitFor(() =>
+      expect(toast).toHaveBeenCalledWith("Could not attach the pasted image."),
+    );
+    expect(draft().images).toEqual([]);
+  });
+
   it("keeps pending approvals on their own buttons, not the composer", () => {
     setLead(false);
     app.update((state) => ({
@@ -205,12 +297,12 @@ describe("Composer", () => {
   it("clears the draft after a steer", async () => {
     setLead(true);
     actions.setLeadDraftText("ship it");
-    const send = vi.spyOn(actions, "sendLeadMessage");
+    const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
     render(Composer);
 
     await fireEvent.click(screen.getByRole("button", { name: "Steer the lead" }));
     expect(send).toHaveBeenCalledWith("ship it", []);
-    expect(draft()).toEqual({ text: "", images: [] });
+    await vi.waitFor(() => expect(draft()).toEqual({ text: "", images: [] }));
   });
 
   it("leaves the unsent draft untouched when stopping", async () => {

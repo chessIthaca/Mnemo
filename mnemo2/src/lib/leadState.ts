@@ -53,6 +53,59 @@ export function messageText(content: unknown): string {
   return "";
 }
 
+/**
+ * Extract the image data URLs from a transcript message's content blocks.
+ *
+ * The headless transcript serializes user attachments as provider-neutral
+ * `image_url` blocks; Anthropic-style base64 sources and legacy `data_url`
+ * blocks are accepted too so a restored conversation keeps every image.
+ */
+export function messageImages(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const images: string[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const record = block as Record<string, unknown>;
+    if (record.type === "image_url") {
+      const imageUrl = record.image_url;
+      const url =
+        typeof imageUrl === "string"
+          ? imageUrl
+          : imageUrl && typeof imageUrl === "object"
+            ? (imageUrl as { url?: unknown }).url
+            : record.url;
+      if (typeof url === "string" && url) images.push(url);
+      continue;
+    }
+    if (record.type === "data_url") {
+      const url = record.data_url ?? record.url;
+      if (typeof url === "string" && url) images.push(url);
+      continue;
+    }
+    if (record.type !== "image") continue;
+    const direct = record.data_url ?? record.url;
+    if (typeof direct === "string" && direct) {
+      images.push(direct);
+      continue;
+    }
+    const source = record.source;
+    if (!source || typeof source !== "object") continue;
+    const { type, media_type: mediaType, data } = source as {
+      type?: unknown;
+      media_type?: unknown;
+      data?: unknown;
+    };
+    if (
+      type === "base64" &&
+      typeof mediaType === "string" &&
+      typeof data === "string"
+    ) {
+      images.push(`data:${mediaType};base64,${data}`);
+    }
+  }
+  return images;
+}
+
 /** Live output kept per running tool; the final result carries the full text. */
 const LIVE_OUTPUT_CAP = 16 * 1024;
 
@@ -284,12 +337,16 @@ export function leadEntriesFromTranscript(
         });
         return;
       }
-      if (body) {
+      const images = messageImages(message.content);
+      // Keep a message when it has text OR attachments: an image-only user
+      // turn must survive the snapshot round-trip instead of disappearing.
+      if (body || images.length > 0) {
         entries.push({
           id: `history-${index}`,
           kind: "message",
           author: message.role === "user" ? "user" : "lead",
           body,
+          ...(images.length > 0 ? { images } : {}),
           time: "restored",
         });
       }

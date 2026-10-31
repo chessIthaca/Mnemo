@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ArrowUp, Square, X } from "@lucide/svelte";
+  import { get } from "svelte/store";
   import { parseNumericAnswer } from "../../../frontend/src/lib/answerSelect";
   import { fileToAttachedDataUrl } from "../../../frontend/src/lib/attachImages";
   import { actions, app } from "../lib/store";
@@ -7,6 +8,8 @@
 
   let stopping = $state(false);
   let attaching = $state(false);
+  let submitting = $state(false);
+  let freeformQuestionId = $state<string | null>(null);
   // The draft lives in store state (not component state) so unmounting the
   // Lead view — for example by opening the Team view — never loses it.
   const draft = $derived($app.leadDraft);
@@ -43,9 +46,24 @@
   const canSubmit = $derived(
     canAnswerQuestion ? draft.text.trim().length > 0 : hasContent,
   );
+  // Selecting the trailing "let's talk" number (`options+1)`) opens freeform
+  // mode instead of submitting the sentinel itself; the next submission is
+  // the freeform answer text.
+  const freeformMode = $derived(
+    pendingQuestion !== null &&
+      freeformQuestionId === pendingQuestion.question_id,
+  );
 
   $effect(() => {
     if (!canInterrupt) stopping = false;
+  });
+  $effect(() => {
+    if (
+      pendingQuestion === null ||
+      pendingQuestion.question_id !== freeformQuestionId
+    ) {
+      freeformQuestionId = null;
+    }
   });
 
   async function stop() {
@@ -59,31 +77,62 @@
     }
   }
 
-  function send() {
+  async function send() {
     if (canAnswerQuestion && pendingQuestion) {
       submitAnswer(pendingQuestion);
       return;
     }
-    if (!canSend) return;
+    if (!canSend || submitting) return;
     const message = draft.text.trim();
     const images = draft.images;
     // An image-only submission is a real message for a vision model.
     if (!message && images.length === 0) return;
-    actions.sendLeadMessage(message, images);
-    actions.clearLeadDraft();
+    const submittedText = draft.text;
+    const submittedImages = [...images];
+    submitting = true;
+    try {
+      // Clear only after the host confirms acceptance: a rejected or raced
+      // submission keeps the draft instead of destroying text/attachments.
+      const accepted = await actions.sendLeadMessage(message, images);
+      if (!accepted) return;
+      const current = get(app).leadDraft;
+      const unchanged =
+        current.text === submittedText &&
+        current.images.length === submittedImages.length &&
+        current.images.every((image, index) => image === submittedImages[index]);
+      if (unchanged) actions.clearLeadDraft();
+    } finally {
+      submitting = false;
+    }
   }
 
   function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
     const questionId = question.question_id;
     const answer = draft.text.trim();
-    if (!questionId || !answer) return;
+    if (!questionId) return;
+    if (freeformMode) {
+      if (!answer) return;
+      actions.answerLead(questionId, { kind: "freeform", text: answer });
+      freeformQuestionId = null;
+      actions.clearLeadDraft();
+      return;
+    }
+    if (!answer) return;
     const parsed = parseNumericAnswer(answer, question.options?.length ?? 0);
     if (parsed?.kind === "choice") {
       actions.answerLead(questionId, { kind: "choice", index: parsed.index });
-    } else {
-      // Any other text (including a bare number) is a freeform answer.
-      actions.answerLead(questionId, { kind: "freeform", text: answer });
+      actions.clearLeadDraft();
+      return;
     }
+    if (parsed?.kind === "freeform") {
+      // The "let's talk" number is a mode switch, not an answer: never submit
+      // the sentinel text. Clear just the command and keep any attachments.
+      freeformQuestionId = questionId;
+      actions.setLeadDraftText("");
+      return;
+    }
+    // Any other text (including a bare number) is a freeform answer.
+    actions.answerLead(questionId, { kind: "freeform", text: answer });
     actions.clearLeadDraft();
   }
 
@@ -114,6 +163,16 @@
       for (const result of attached) {
         if (result.status === "fulfilled") actions.addLeadDraftImage(result.value);
       }
+      // Never swallow a rejected conversion: the user must know the image
+      // never made it into the draft.
+      const failed = attached.filter((result) => result.status === "rejected").length;
+      if (failed > 0) {
+        actions.showToast(
+          failed === 1
+            ? "Could not attach the pasted image."
+            : `Could not attach ${failed} pasted images.`,
+        );
+      }
     } finally {
       attaching = false;
     }
@@ -125,6 +184,11 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && freeformMode) {
+      event.preventDefault();
+      freeformQuestionId = null;
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       send();
@@ -159,7 +223,9 @@
       onkeydown={handleKeydown}
       rows="2"
       aria-label="Message the lead"
-      placeholder="Ask, plan, or redirect the team…"
+      placeholder={freeformMode
+        ? "Type your freeform answer…"
+        : "Ask, plan, or redirect the team…"}
     ></textarea>
     {#if canInterrupt || stopping}
       <button
@@ -188,7 +254,7 @@
           : busy
             ? "Steer the lead"
             : "Send message"}
-        disabled={!canSubmit}
+        disabled={!canSubmit || submitting}
       >
         <ArrowUp size={17} strokeWidth={2} />
       </button>
@@ -209,6 +275,8 @@
     <div class="composer-status" aria-live="polite">
       {#if connecting}<span>Connecting</span>{/if}
       {#if attaching}<span>Attaching image</span>{/if}
+      {#if freeformMode}<span>Freeform answer — Enter to send, Esc to cancel</span>{/if}
+      {#if submitting}<span>Sending</span>{/if}
     </div>
   </div>
 </form>

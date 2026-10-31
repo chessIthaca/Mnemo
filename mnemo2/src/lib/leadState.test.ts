@@ -216,6 +216,88 @@ describe("lead event reducer", () => {
     });
   });
 
+  it("restores image attachments, including image-only messages", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Look at this" },
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AAAA" },
+              },
+            ],
+          },
+          // Image-only turn: the body is empty and must not be dropped.
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/jpeg;base64,BBBB" },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: "CCCC",
+                },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "data_url", data_url: "data:image/png;base64,DDDD" },
+            ],
+          },
+          { role: "assistant", content: [{ type: "text", text: "Got it" }] },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    };
+
+    const state = applyLeadSnapshot(nativeState(), snapshot);
+    expect(state.leadEntries).toHaveLength(5);
+    expect(state.leadEntries[0]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "Look at this",
+      images: ["data:image/png;base64,AAAA"],
+    });
+    expect(state.leadEntries[1]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "",
+      images: ["data:image/jpeg;base64,BBBB"],
+    });
+    expect(state.leadEntries[2]).toMatchObject({
+      body: "",
+      images: ["data:image/png;base64,CCCC"],
+    });
+    expect(state.leadEntries[3]).toMatchObject({
+      body: "",
+      images: ["data:image/png;base64,DDDD"],
+    });
+    expect(state.leadEntries[4]).toMatchObject({ author: "lead", body: "Got it" });
+  });
+
   it("renders worker notices as team activity rather than human input", () => {
     const entries = leadEntriesFromTranscript({
       messages: [

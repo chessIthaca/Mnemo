@@ -35,10 +35,11 @@ npm run build:mnemo2:native
 ```
 
 `mnemo2` is a separate npm workspace (`mnemo2/`). Vite uses port **5180** and
-outputs to `target/mnemo2-dist`, distinct from the Mnemo1 frontend on 5179. The
-native host uses its own `src-tauri/mnemo2-app/tauri.conf.json` and binary; it does not
-replace or extend Mnemo1's IPC surface. It also clears inherited
-`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, so it never reuses Mnemo1's CDP port 9222.
+outputs to `target/mnemo2-dist`, distinct from the Mnemo1 frontend on 5179.
+The native host uses its own `src-tauri/mnemo2-app/tauri.conf.json` and
+binary; it does not replace or extend Mnemo1's IPC surface. It also clears
+inherited `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, so it never reuses
+Mnemo1's CDP port 9222.
 
 The native host is the `mnemo2` Cargo feature. The default `cargo test
 --workspace` compiles Mnemo1 alone; `npm run test:mnemo2:native` runs the
@@ -56,6 +57,11 @@ feature-enabled Mnemo2 lib tests.
   generations.
 - **Commands.** `lead_open`, `lead_snapshot`, `lead_prompt`, `lead_interrupt`,
   `lead_set_model`, `lead_approve`, `lead_answer`, `lead_close`.
+  `lead_prompt` takes `{ text, images }` — base64 data-URL attachments ride
+  the turn like a headless prompt's images, the `images` key may be omitted
+  by legacy callers, and a busy lead receives the submission as a queued
+  steer (`SessionCommand::Steer`, same payload) injected at the next safe
+  turn boundary instead of an error.
 - **State.** App-owned state lives under the Tauri app-data directory for
   `com.mnemo.mnemo2`, in `projects/<sha256-of-canonical-project-path>/`.
   `lead.json` holds the model spec, project identity, transcript, and save time;
@@ -274,9 +280,9 @@ reviewer workflow is unchanged.
   before landing. Successful merge closes the worker session, removes a verified
   clean worktree, and keeps the branch for audit; new dirty work is retained.
 - **Real limits and telemetry:** live-session slots (`DEFAULT_SLOTS = 3`) and
-  worker
-  turn/wall-clock limits. There is no per-lead-turn delegation cap (removed by
-  user decision 2026-10-31) and no cumulative worker token or cost budget.
+  worker turn/wall-clock limits. There is no per-lead-turn delegation cap
+  (removed by user decision 2026-10-31) and no cumulative worker token or
+  cost budget.
   Requests, prompt/completion/cached tokens, turns, and elapsed time come from
   real events and never trigger a budget pause. Cost is shown only when model
   pricing is configured; unknown cost remains unknown, and usage is always shown.

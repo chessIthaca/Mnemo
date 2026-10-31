@@ -374,11 +374,10 @@ impl LeadRuntime {
         let live = live_guard
             .as_ref()
             .ok_or_else(|| "the lead session is not open".to_string())?;
-        // Mark the team's lead busy on both paths. While a turn runs
-        // this is an idempotent re-arm; it also closes the gate in the
-        // race where the running turn finishes between the busy check
-        // and the steer send — the steer drives a follow-up turn, so
-        // the merge gate must stay shut for it.
+        // Mark the team's lead busy up front on both paths. The pump
+        // clears the team gate WITHOUT the live lock, so a terminal
+        // event processed while we hold this lock can still reopen the
+        // gate; the busy branch therefore re-arms after its send lands.
         if let Some(team) = &team {
             team.begin_lead_turn();
         }
@@ -386,20 +385,44 @@ impl LeadRuntime {
             // Busy: not an error and not a second prompt — a queued
             // steer injected at the next safe boundary. The busy flag
             // stays with the running turn.
-            return live
+            let result = live
                 .session
                 .send(SessionCommand::Steer { text, images })
-                .await
-                .map_err(|err| format!("could not steer the busy lead: {err}"));
+                .await;
+            // Re-arm AFTER a successful send: the running turn may have
+            // just finished at the kernel (the busy flag above was
+            // stale), and the pump processes that terminal event
+            // without the live lock — including during this send —
+            // clearing the gate while the steer's follow-up turn is
+            // already queued. The up-front arm cannot cover a clear that
+            // lands inside the send; this re-arm does. On failure the
+            // gate stays armed: the running turn is still live and its
+            // terminal event clears it through the pump.
+            if result.is_ok() {
+                if let Some(team) = &team {
+                    team.begin_lead_turn();
+                }
+            }
+            return result.map_err(|err| format!("could not steer the busy lead: {err}"));
         }
         live.busy.store(true, Ordering::SeqCst);
-        live.session
+        let result = live
+            .session
             .send(SessionCommand::Prompt { text, images })
-            .await
-            .map_err(|err| {
-                live.busy.store(false, Ordering::SeqCst);
-                format!("could not send the prompt: {err}")
-            })
+            .await;
+        if let Err(err) = result {
+            // The rejected prompt started no turn, so no terminal
+            // event will ever arrive to clear the team gate — a parked
+            // or closed session rejects the prompt right here, and the
+            // up-front begin_lead_turn already armed the gate. Clear it
+            // on this arm or every later merge stays blocked.
+            if let Some(team) = &team {
+                team.set_lead_busy(false);
+            }
+            live.busy.store(false, Ordering::SeqCst);
+            return Err(format!("could not send the prompt: {err}"));
+        }
+        Ok(())
     }
 
     /// Cancel the current generation; the session remains open.
@@ -1688,6 +1711,117 @@ mod tests {
             "the follow-up provider request must contain the steered image URL: {:?}",
             recorded[1]
         );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_idle_prompt_reopens_the_merge_gate() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (runtime, team) = open_git_team_spawns(
+            &root,
+            &config,
+            &state,
+            Arc::new(ScriptedLlm::new(Vec::new())),
+            1,
+        )
+        .await;
+        // Wire the team in directly — the pump was spawned before the
+        // team existed, so only send_prompt itself touches the gate and
+        // the test is deterministic.
+        let team = Arc::new(team);
+        *runtime.team.lock().await = Some(team.clone());
+        assert!(
+            !team.lead_is_busy(),
+            "baseline: nothing has armed the merge gate"
+        );
+
+        // The finding's failure path: a session that rejects an idle
+        // prompt (a parked session refuses prompts in production; a
+        // closed one is the deterministic harness for the same arm —
+        // both fail inside `Session::send` before any turn can run).
+        // No turn ever started, so live.busy stays false.
+        {
+            let live = runtime.live.lock().await;
+            live.as_ref()
+                .expect("the lead session is live")
+                .session
+                .close()
+                .await
+                .expect("close the session");
+        }
+        let err = runtime
+            .send_prompt("hello".to_string(), Vec::new())
+            .await
+            .expect_err("a closed session rejects the idle prompt");
+        assert!(
+            err.starts_with("could not send the prompt"),
+            "{err}"
+        );
+        // THE regression: `begin_lead_turn` armed the team gate on the
+        // way in; the failed prompt leaves no turn running, so no
+        // terminal event will ever arrive to clear it — the error arm
+        // must re-open the gate or every later merge stays blocked.
+        assert!(
+            !team.lead_is_busy(),
+            "a failed idle prompt must clear the merge gate"
+        );
+        team.shutdown().await;
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_successful_busy_steer_keeps_the_merge_gate_closed() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let llm = Arc::new(ScriptedLlm::new_gated(
+            vec!["scripted-a"],
+            vec![
+                (Some(gate_rx), text_turn(&["turn one"])),
+                (None, text_turn(&["turn two"])),
+            ],
+        ));
+        let (runtime, team) = open_git_team_spawns(&root, &config, &state, llm, 1).await;
+        // Pump unwired (spawned before the team was attached), so the
+        // gate reflects only send_prompt's arms and the test's writes.
+        let team = Arc::new(team);
+        *runtime.team.lock().await = Some(team.clone());
+        runtime
+            .send_prompt("first".to_string(), Vec::new())
+            .await
+            .expect("the first prompt is accepted");
+        assert!(
+            runtime.snapshot().await.expect("snapshot").busy,
+            "the gated turn is busy"
+        );
+        assert!(
+            team.lead_is_busy(),
+            "the first prompt armed the merge gate"
+        );
+
+        // The pump clears the team gate without the live lock, so when
+        // the busy flag is stale (the turn just finished at the kernel,
+        // its terminal event still queued in the pump) that clear can
+        // interleave with the steer send itself. Simulate the worst
+        // case by clearing the gate immediately before the busy
+        // submission: send_prompt must return with the gate closed.
+        team.set_lead_busy(false);
+        assert!(!team.lead_is_busy());
+        runtime
+            .send_prompt("a steer".to_string(), Vec::new())
+            .await
+            .expect("the busy submission queues as a steer");
+        assert!(
+            team.lead_is_busy(),
+            "a successful busy steer send ends with the merge gate closed"
+        );
+
+        gate_tx.send(()).expect("the first turn is released");
+        wait_until_idle(&runtime).await;
+        team.shutdown().await;
         runtime.shutdown().await;
     }
 

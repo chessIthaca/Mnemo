@@ -2356,6 +2356,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reopened_lead_answers_a_new_prompt() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        let state = tempfile::tempdir().expect("state");
+        write_config(config.path(), &["scripted-a"]);
+        let first = LeadRuntime::open_inner(
+            options(&root, &config, &state),
+            Some(Arc::new(ScriptedLlm::new(vec![text_turn(&["saved"])]))),
+        )
+        .await
+        .expect("the first lead opens");
+        let mut rx = first.subscribe();
+        first
+            .send_prompt("remember this".to_string(), Vec::new())
+            .await
+            .expect("the first prompt is accepted");
+        drain_turn(&mut rx).await;
+        let saved = wait_for_persisted(&state.path().join(LEAD_STATE_FILE)).await;
+        let restored_len = saved.transcript.messages.len();
+        first.shutdown().await;
+
+        let llm = Arc::new(ScriptedLlm::new(vec![text_turn(&["after ", "reopen"])]));
+        let second = LeadRuntime::open_inner(options(&root, &config, &state), Some(llm.clone()))
+            .await
+            .expect("the lead reopens");
+        let mut rx = second.subscribe();
+        second
+            .send_prompt("are you there?".to_string(), Vec::new())
+            .await
+            .expect("the reopened prompt is accepted");
+        let events = drain_turn(&mut rx).await;
+        let text = events
+            .iter()
+            .filter_map(|event| match &event.event.event {
+                SerializableAgentEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "after reopen");
+        assert_eq!(llm.calls(), 1);
+        let snapshot = second.snapshot().await.expect("snapshot");
+        assert!(!snapshot.busy, "the reopened lead returned to idle");
+        assert_eq!(snapshot.transcript.messages.len(), restored_len + 2);
+        assert_eq!(
+            serde_json::to_value(&snapshot.transcript.messages[..restored_len])
+                .expect("serialize the resumed prefix"),
+            serde_json::to_value(&saved.transcript.messages)
+                .expect("serialize the saved history"),
+            "the restored history is retained"
+        );
+        for _ in 0..100 {
+            if let Ok(bytes) = std::fs::read(state.path().join(LEAD_STATE_FILE)) {
+                if let Ok(saved) = serde_json::from_slice::<PersistedLead>(&bytes) {
+                    if saved.transcript.messages.len() == restored_len + 2 {
+                        assert_eq!(
+                            serde_json::to_value(&saved.transcript.messages)
+                                .expect("serialize the persisted transcript"),
+                            serde_json::to_value(&snapshot.transcript.messages)
+                                .expect("serialize the live transcript")
+                        );
+                        second.shutdown().await;
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the reopened lead did not persist its longer transcript");
+    }
+
+    #[tokio::test]
     async fn a_new_project_holds_until_its_first_code_index_ends() {
         use crate::mnemo2::indexing::PassState;
 

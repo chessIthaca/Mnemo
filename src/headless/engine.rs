@@ -74,6 +74,10 @@ pub struct Engine {
     configured_embedding_model: Option<String>,
     /// The event pump task — `shutdown` aborts it.
     pump: tokio::task::JoinHandle<()>,
+    /// Whether the builder supplied the model transport. An injected
+    /// provider remains the transport for model-pinned sessions instead of
+    /// being replaced by a config-resolved client.
+    has_injected_provider: bool,
     /// The runtime this engine owns when started via
     /// [`start_blocking`](Engine::start_blocking) — `None` when the
     /// caller's runtime hosts it. Held purely for its lifetime.
@@ -102,7 +106,8 @@ impl EngineBuilder {
 
     /// Replace the factory's base provider — the scripted-mock seam for
     /// the engine fixtures (and custom endpoints before job 4's register
-    /// surface).
+    /// surface). The injected client also serves model-pinned sessions;
+    /// per-turn config resolution never replaces it.
     pub fn provider(mut self, provider: Arc<dyn LlmClient>) -> Self {
         self.provider = Some(provider);
         self
@@ -289,6 +294,11 @@ impl Engine {
         let name = opts.name.unwrap_or_else(|| "session".to_string());
         let model = forced_model_ref(opts.model.as_deref(), opts.reasoning_effort)
             .map_err(EngineError::spawn_failed)?;
+        let model = if self.has_injected_provider {
+            None
+        } else {
+            model
+        };
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
@@ -670,6 +680,7 @@ async fn start_inner(
         crate::headless::types::MemoryBackend::Sqlite { path } => (true, path),
         crate::headless::types::MemoryBackend::Disabled => (false, None),
     };
+    let has_injected_provider = provider.is_some();
     let brain = wire_brain(
         config_dir.clone(),
         config,
@@ -766,6 +777,7 @@ async fn start_inner(
         default_permissions: opts.permissions,
         configured_embedding_model,
         pump,
+        has_injected_provider,
         _owned_runtime: None,
     })
 }

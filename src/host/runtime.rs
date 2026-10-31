@@ -120,8 +120,10 @@ pub struct SessionOptions {
 /// UI-button spawns and the main agent) — used to notify the parent when this
 /// agent finishes. Returns `(agent_id, name)`.
 ///
-/// The only supported role is `reviewer`; any other role rejects the spawn
-/// before an agent id is allocated or any agent state is constructed.
+/// The only supported role is `reviewer`; any other role rejects the spawn.
+/// A supplied parent id must have a registered loop. Either validation failure
+/// rejects the spawn before an agent id is allocated or any agent state is
+/// constructed.
 pub async fn spawn_agent_shared(
     host: SpawnHost,
     name: String,
@@ -150,6 +152,11 @@ pub async fn spawn_agent_shared(
             return Err(format!(
                 "unknown role '{other}'; supported roles: reviewer"
             ));
+        }
+    }
+    if let Some(parent_id) = parent_id {
+        if !agent_loops.lock().await.contains_key(&parent_id) {
+            return Err(format!("parent agent {parent_id} has no registered loop"));
         }
     }
 
@@ -429,8 +436,9 @@ const ALWAYS_SAFE_ROLE_TOOLS: &[&str] = &["git_read", "write_review_report"];
 /// A parentless reviewer receives exactly [`REVIEWER_BASE_TOOLS`]; there is no
 /// parent permission set to intersect, but the read-only role boundary still
 /// applies. Unknown roles are rejected by [`spawn_agent_shared`] before agent
-/// construction. A KNOWN `parent_id` whose loop is missing from the map returns
-/// `Some(vec![])`, so a missing parent cannot escalate the agent's permissions.
+/// construction. [`spawn_agent_shared`] rejects a supplied `parent_id` whose
+/// loop is missing before construction; this helper retains an empty-list
+/// fallback if its parent disappears between that check and this computation.
 ///
 /// The intersection is a snapshot of the parent's permissions at spawn time;
 /// it does not track parent state changes mid-spawn.
@@ -1573,18 +1581,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_parent_loop_denies_all() {
-        // C1 fail-closed: a KNOWN parent id whose loop is missing from the map
-        // returns an empty allow-list (deny all tools) — NOT None (which would
-        // mean "no restriction" and grant the subagent the full tool set). The
-        // parent's loop should always be present for a tool-spawned subagent;
-        // if it isn't, deny everything rather than silently escalating.
-        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let list = compute_subagent_allowlist(&map, Some(999), &Some("reviewer".into())).await;
+    async fn missing_parent_loop_rejects_roleless_spawn_before_registration() {
+        // An empty Skill allow-list still auto-grants memory writes, ask_user,
+        // and backlog mutations, so a stale parent must reject the whole spawn
+        // rather than reaching the roleless allow-list path.
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let error = spawn_agent_shared(
+            host,
+            "stale-parent".to_string(),
+            None,
+            Some(999),
+            test_session(None),
+        )
+        .await
+        .expect_err("a missing parent loop must refuse a roleless spawn");
+        assert_eq!(error, "parent agent 999 has no registered loop");
         assert!(
-            list.as_ref().is_some_and(|v| v.is_empty()),
-            "missing parent loop → deny all (Some(vec![])), got: {:?}",
-            list
+            agent_loops.lock().await.is_empty(),
+            "a rejected stale-parent spawn must not register an agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_parent_loop_rejects_reviewer_spawn_before_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (host, agent_loops) = test_spawn_host(dir.path());
+        let error = spawn_agent_shared(
+            host,
+            "stale-parent-reviewer".to_string(),
+            None,
+            Some(999),
+            test_session(Some("reviewer")),
+        )
+        .await
+        .expect_err("a missing parent loop must refuse a reviewer spawn");
+        assert_eq!(error, "parent agent 999 has no registered loop");
+        assert!(
+            agent_loops.lock().await.is_empty(),
+            "a rejected stale-parent reviewer must not register an agent"
         );
     }
 }

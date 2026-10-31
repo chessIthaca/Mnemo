@@ -2156,6 +2156,10 @@ mod tests {
         let manager = Arc::new(tokio::sync::Mutex::new(mgr));
         let agent_loops: AgentLoopMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        agent_loops
+            .lock()
+            .await
+            .insert(7, factory.build_with_id(7));
 
         let spawner = HostSpawner::new(factory, manager.clone(), agent_loops.clone());
         let id = spawner

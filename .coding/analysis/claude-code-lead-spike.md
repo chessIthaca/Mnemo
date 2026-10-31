@@ -36,14 +36,16 @@ Date: 2026-10-31. Terminal CLI: `claude` 2.1.138. A throwaway plugin was run wit
 3. **`mnemo2-mcp wait`** is a Bash background command that Claude starts. It is not an MCP call, so MCP timeouts don't apply.
 4. **The agent gate matches `Agent|Task|Workflow`.**
 
-## Still to verify (needs the model)
+## Verified with the model (2026-10-31, after the user's `claude auth login`; CLI 2.1.138, Haiku)
 
-The terminal CLI's stored claude.ai sign-in is expired. The API returns 401 "OAuth access token has expired", even though `claude auth status` still says logged in. The user has to run `claude auth login` once in their own terminal. Then re-run `spike/` to check:
-- instructions reach the model;
-- PostToolUse `additionalContext` reaches the model;
-- the Stop block and its continuation;
-- PreToolUse `ask` on `Agent`/`Task` in `-p` mode.
+- **MCP `instructions` reach the model.** It quoted the marker number and token from the server instructions.
+- **SessionStart `additionalContext` reaches the model.**
+- **PostToolUse `additionalContext` reaches the model after every tool call**, including ToolSearch and the MCP tool itself.
+- **Text appended to an MCP tool result** ("Since your last call: ...") is seen as normal tool output.
+- **PreToolUse `ask` on the subagent tool works.** The tool_use name is `Agent`; the result's permission_denials list it as `Task`, so keep both in the matcher.
+  - In `-p` mode, `ask` becomes a refusal whose result text is our reason.
+  - The Desktop app shows its permission prompt instead (it has the same permission machinery). Check this in the step-9 Desktop run.
+- **The Stop hook works.** `decision:"block"` made the model continue once. On the next Stop, `stop_hook_active` was true, our hook printed nothing, and the session ended.
+- **MCP tools are deferred behind ToolSearch in this CLI.** The model loads them on demand, while the instructions are always in context. The lead brief must therefore name the tools so the model knows what to search for.
 
-These checks fold into the final step-9 run against the real plugin.
-
-Note: a `claude` started from inside a Desktop session inherits the Desktop host's `ANTHROPIC_BASE_URL` and `CLAUDE_CODE_*` environment. Scripted runs therefore unset every `CLAUDE*`/`ANTHROPIC*` variable first (the `cleanrun.sh` wrapper).
+All spike items are now verified.

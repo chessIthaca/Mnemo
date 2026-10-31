@@ -675,33 +675,53 @@ impl AgentSession {
     /// Worktree-bound callers use this before deleting the checkout: the loop
     /// owns that checkout's code graph and its open SQLite connection.
     pub async fn close_and_wait(&self) -> Result<(), EngineError> {
-        let mut events = self.events();
-        let sent = self.agent_command(AgentCommand::Cancel).await.is_ok();
+        let (manager_present, sent) = {
+            let manager = self.inner.host.manager.lock().await;
+            let present = manager.get(self.agent).is_some();
+            let sent = manager.send(self.agent, AgentCommand::Cancel).is_ok();
+            (present, sent)
+        };
         self.inner.sessions.lock().await.remove(&self.id);
-        if !sent {
-            return Ok(());
+
+        // A missing manager entry is not sufficient proof: the event pump
+        // removes it before dropping the engine's AgentLoop reference. A full
+        // or closed queue with a manager entry is a failed close, unless the
+        // loop has already gone independently.
+        if manager_present
+            && !sent
+            && self
+                .inner
+                .host
+                .agent_loops
+                .lock()
+                .await
+                .contains_key(&self.agent)
+        {
+            return Err(EngineError::session_closed(
+                "could not queue cancellation; the agent is still live",
+            ));
         }
-        let exited = async {
+        let released = async {
             loop {
-                match events.recv().await {
-                    Ok(event)
-                        if event.agent == self.agent
-                            && matches!(event.event, SerializableAgentEvent::Exited) =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(_) | Err(crate::headless::types::RecvError::Lagged(_)) => continue,
-                    Err(crate::headless::types::RecvError::Closed) => {
-                        return Err(EngineError::session_closed(
-                            "the event pump ended before the agent exited",
-                        ));
-                    }
+                if !self
+                    .inner
+                    .host
+                    .agent_loops
+                    .lock()
+                    .await
+                    .contains_key(&self.agent)
+                {
+                    return;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), exited)
+        tokio::time::timeout(std::time::Duration::from_secs(10), released)
             .await
-            .map_err(|_| EngineError::session_closed("timed out waiting for the agent to exit"))?
+            .map_err(|_| {
+                EngineError::session_closed("timed out waiting for the agent loop to be released")
+            })?;
+        Ok(())
     }
 
     async fn agent_command(&self, command: AgentCommand) -> Result<(), EngineError> {

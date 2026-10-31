@@ -1325,3 +1325,90 @@ async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
         "the lead root stays untouched"
     );
 }
+
+struct PendingLlm {
+    caps: Capabilities,
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl LlmClient for PendingLlm {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::OpenAI
+    }
+
+    fn model(&self) -> &str {
+        "pending"
+    }
+
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _tool_choice: Option<ToolChoice>,
+    ) -> mnemo::error::Result<BoxStream<'_, LlmEvent>> {
+        self.started.notify_one();
+        Ok(Box::pin(futures::stream::pending()))
+    }
+}
+
+#[tokio::test]
+async fn close_and_wait_rejects_a_full_command_queue() {
+    let root = tempfile::tempdir().expect("workspace");
+    let cfg = tempfile::tempdir().expect("config");
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(PendingLlm {
+        caps: Capabilities::openai(),
+        started: tokio::sync::Notify::new(),
+    });
+    let engine = Engine::builder(opts)
+        .provider(llm.clone())
+        .start()
+        .await
+        .expect("start the pending-provider engine");
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    session
+        .send(SessionCommand::Prompt {
+            text: "hold the turn open".into(),
+            images: vec![],
+        })
+        .await
+        .expect("queue the prompt");
+    llm.started.notified().await;
+
+    let mut queue_filled = false;
+    for _ in 0..1024 {
+        if session.send(SessionCommand::Compact).await.is_err() {
+            queue_filled = true;
+            break;
+        }
+    }
+    assert!(queue_filled, "the pending turn leaves its command queue full");
+
+    let error = session
+        .close_and_wait()
+        .await
+        .expect_err("a full queue must not be mistaken for an exited agent");
+    assert!(error.to_string().contains("still live"), "{error}");
+}
+
+#[tokio::test]
+async fn close_and_wait_accepts_an_already_exited_agent() {
+    let (_engine, session, _root, _cfg) = scripted_engine(vec![]).await;
+    session.close().await.expect("queue the first close");
+    for _ in 0..100 {
+        if session.send(SessionCommand::Compact).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    session
+        .close_and_wait()
+        .await
+        .expect("an already-exited agent has released its loop");
+}

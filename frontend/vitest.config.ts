@@ -87,6 +87,7 @@ export default defineConfig({
       "src/lib/toolCardPaths.test.ts",
       "src/lib/traceStats.test.ts",
       "src/components/chat/ToolImage.test.ts",
+      "src/components/layout/MainPanel.addAgent.test.tsx",
       "src/components/layout/MainPanel.tabStyle.test.ts",
       "src/components/layout/ExecutingStepPopup.test.tsx",
       "src/components/layout/StatusBar.truncate.test.ts",

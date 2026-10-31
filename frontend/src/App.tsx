@@ -16,6 +16,7 @@ import {
   getSettings,
   getNeedsProject,
   getEmbedderStatus,
+  isIncumbentAlive,
   onEmbedderStatus,
   onReconcileEvent,
 } from "./lib/tauri";
@@ -25,6 +26,7 @@ import { fmtPct } from "./lib/format";
 import { hiddenKeysFromConfig } from "./lib/delegationNotes";
 import { clampRestoredGeometry } from "./lib/windowRestore";
 import { registerWindowGeometryFlusher } from "./lib/windowGeometryFlush";
+import { watchIncumbentLiveness } from "./lib/incumbentWatch";
 import { Sidebar } from "./components/layout/Sidebar";
 import { MainPanel } from "./components/layout/MainPanel";
 import { RightPanel } from "./components/layout/RightPanel";
@@ -113,10 +115,12 @@ export default function App() {
   const [checkedStartup, setCheckedStartup] = useState(false);
   const [embedderStatus, setEmbedderStatus] = useState<string | Record<string, unknown> | null>(null);
   const [embedderBannerDismissed, setEmbedderBannerDismissed] = useState(false);
-  // Same-project instance conflict (startup snapshot): another LIVE mnemo
-  // instance holds this project — the dialog asks before opening. The
-  // [Choose another project] flow opens the picker on top of it (the picker
-  // restarts the app into the chosen project).
+  // Same-project instance conflict (startup snapshot): another mnemo
+  // instance had this project open at launch — the dialog asks before
+  // opening here. It is a launch-time snapshot, re-checked live while
+  // visible (the watchIncumbentLiveness effect below) so it retracts once
+  // the incumbent exits. The [Choose another project] flow opens the
+  // picker on top of it (the picker restarts the app into it).
   const [instanceConflict, setInstanceConflict] = useState<InstanceConflict | null>(null);
   const [instanceConflictPicker, setInstanceConflictPicker] = useState(false);
   // The startup reconciliation dialog: `null` = no reconcile running (silent
@@ -137,6 +141,20 @@ export default function App() {
   // every other modal. Called with the hooks at the top (before the
   // early-return branches) per rules of hooks.
   useBrowserOverlay(reconcile !== null || instanceConflict !== null);
+
+  // Live retraction for the instance-conflict dialog: the conflict is a
+  // launch-time snapshot, but the incumbent may exit while the dialog (or
+  // the picker variant) is up. Re-check its pid on an interval + on window
+  // focus; once it is dead the dialog retracts without a restart (backlog
+  // ea9576d7).
+  useEffect(() => {
+    if (instanceConflict === null) return;
+    return watchIncumbentLiveness(
+      instanceConflict.pid,
+      isIncumbentAlive,
+      () => setInstanceConflict(null)
+    );
+  }, [instanceConflict]);
 
   // Subscribe to the startup reconciliation stream once. The backend emits
   // ONLY when the corpus drifted (git merge / edit / deleted DB) — an
@@ -774,11 +792,12 @@ export default function App() {
           </SplashCard>
         </div>
       )}
-      {/* Same-project instance conflict — a second instance on a LIVE
-          project: ask before opening (two instances on one project are
-          supported now, but two agents on the same files can step on each
-          other). The picker variant runs on top until a project is chosen
-          (it restarts the app into it). */}
+      {/* Same-project instance conflict — another mnemo instance launched
+           on this project: ask before opening here (two agents on the same
+           files can step on each other). Retracts live once the incumbent
+           exits (the watchIncumbentLiveness effect). The picker variant
+           runs on top until a project is chosen (it restarts the app into
+           it). */}
       {instanceConflict !== null && !instanceConflictPicker && (
         <InstanceConflictDialog
           conflict={instanceConflict}

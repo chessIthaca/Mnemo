@@ -487,7 +487,9 @@ describe("IPC contract — DTO fixture field shapes", () => {
     expect(typeof dtoGetSettings.general.optimizer.archive_min_chars).toBe("number");
     expect(typeof dtoGetSettings.general.optimizer.nudge_cooldown_requests).toBe("number");
     expect(typeof dtoGetSettings.context.summarize_at_fill_rate).toBe("number");
-    expect(typeof dtoGetSettings.context.proxy_cache_ceiling_tokens).toBe("number");
+    // Removed 2027-01-25: the proxy-cache ceiling dial is gone from the
+    // wire — pin that it stays gone.
+    expect(dtoGetSettings.context).not.toHaveProperty("proxy_cache_ceiling_tokens");
     expect(typeof dtoGetSettings.ui.theme).toBe("string");
     expect(typeof dtoGetSettings.ui.show_token_usage).toBe("boolean");
     expect(typeof dtoGetSettings.ui.show_tool_activity).toBe("boolean");

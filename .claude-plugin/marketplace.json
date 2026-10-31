@@ -1,0 +1,16 @@
+{
+  "name": "mnemo",
+  "owner": {
+    "name": "Carsten Hess"
+  },
+  "metadata": {
+    "description": "Plugins for working with Mnemo2 from Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "mnemo",
+      "source": "./mnemo2/plugin",
+      "description": "Lead a Mnemo2 team from Claude Code: plan, dispatch workers by tier, review and merge through Mnemo2's team tools."
+    }
+  ]
+}

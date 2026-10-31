@@ -256,6 +256,11 @@ pub(crate) fn render_event(event: &SerializableAgentEvent) -> Rendered {
         SerializableAgentEvent::ToolCallStart { name, .. } => {
             Rendered::Lines(vec![format!("→ {name}")])
         }
+        // Execution-start marker (plan b2052a9c): a UI-timer affordance —
+        // the card's duration re-anchors on it. The console already printed
+        // the call header on ToolCallStart and prints the result when it
+        // finishes; nothing to say in between.
+        SerializableAgentEvent::ToolExecutionStart { .. } => Rendered::Silent,
         SerializableAgentEvent::ToolCallArgDelta { .. } => Rendered::Silent,
         // Live partial output is a UI affordance, not console text: the console
         // prints the FULL result when the call finishes, so streaming chunks
@@ -2315,6 +2320,10 @@ mod tests {
         let manager = Arc::new(tokio::sync::Mutex::new(mgr));
         let agent_loops: AgentLoopMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        agent_loops
+            .lock()
+            .await
+            .insert(7, factory.build_with_id(7));
 
         let spawner = HostSpawner::new(factory, manager.clone(), agent_loops.clone());
         let id = spawner

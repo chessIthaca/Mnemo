@@ -20,7 +20,6 @@ import type {
 } from "../lib/types";
 import type { SoundKind } from "../lib/sounds";
 import { fmtTokens } from "../lib/format";
-import { isBrowserToolName } from "../lib/toolCardPaths";
 
 import type {
   ActivityEntry,
@@ -511,12 +510,12 @@ export function parseMemoryEntry(
 }
 
 /**
- * tool_call_start: flush pre-tool text, then merge consecutive calls to the
- * same tool into one card (append to the last entry when it's a tool with
- * the same name), else push a new tool transcript entry. Shell, browser
- * (`browser_*`/`offscreen_browser_*`), and search (`search`/`search_read`)
- * calls never merge — each starts its own card (backlog daa38cbe,
- * 24ddb845).
+ * tool_call_start: flush pre-tool text, then merge consecutive calls into ONE
+ * card (a run may mix tools — the collapsed card shows a single human
+ * headline, per-call detail lives in its expanded rows; user decision
+ * 2026-10-18, superseding the shell/browser/search never-merge rule from
+ * backlog daa38cbe + 24ddb845). The chain breaks on intervening text (the
+ * flush above), a failed last call, or the per-card cap.
  */
 export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event) => {
   const next = { ...agent };
@@ -550,14 +549,14 @@ export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event
     next.transcript = capTranscript(transcript);
     return { agent: next };
   }
-  // Merge consecutive calls to the same tool into one card: if the last
-  // transcript entry is a tool with the same name, append to it. This covers
-  // both sequential calls (call→result→call) and parallel calls (multiple
-  // tool_call_start in one response). The only things that break the chain
-  // are intervening text (handled by the flush above), a different tool, or
-  // the shell/browser exception below.
+  // Merge consecutive calls into one card: if the last transcript entry is a
+  // tool card, append to it — including calls to DIFFERENT tools (a run reads
+  // like one narrative). This covers sequential calls (call→result→call) and
+  // parallel calls (multiple tool_call_start in one response). The chain
+  // breaks on intervening text (the flush above), a failed last call, or the
+  // cap below.
   // Past MAX_CALLS_PER_TOOL_CARD a fresh card starts (review M2: otherwise
-  // one card's calls array grows without bound in long same-tool runs).
+  // one card's calls array grows without bound in long runs).
   const transcript = [...next.transcript];
   const last = transcript[transcript.length - 1];
   // A failed call breaks the merge chain: if the last call in the existing
@@ -570,21 +569,11 @@ export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event
     lastCall !== undefined &&
     lastCall.result !== null &&
     !lastCall.result.success;
-  // Shell commands, browser actions (live-tab browser_* + headless
-  // offscreen_browser_*), and search queries (search/search_read) never
-  // merge: the command/target/query of each call is the point of the card,
-  // and grouped chips bury it — every such call renders on its own line
-  // (user directive, backlog daa38cbe + 24ddb845).
-  const neverGroups =
-    event.name === "shell" ||
-    event.name === "search" ||
-    event.name === "search_read" ||
-    isBrowserToolName(event.name);
+  // A run may mix tools: no tool-name match is required (user decision
+  // 2026-10-18 — one human headline per card, per-call detail behind expand).
   const canMerge =
-    !neverGroups &&
     last !== undefined &&
     last.kind === "tool" &&
-    last.name === event.name &&
     !lastCallFailed &&
     last.calls.length < MAX_CALLS_PER_TOOL_CARD;
   if (canMerge) {
@@ -595,6 +584,7 @@ export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event
         {
           id: event.id,
           index: event.index,
+          name: event.name,
           args: "",
           result: null,
           // Timing stamp (tool-card duration display): when this call was
@@ -611,6 +601,7 @@ export const reduceToolCallStart: Reducer<Ev<"tool_call_start">> = (agent, event
         {
           id: event.id,
           index: event.index,
+          name: event.name,
           args: "",
           result: null,
           startedAt: Date.now(),
@@ -785,7 +776,11 @@ export const reduceToolResult: Reducer<Ev<"tool_result">> = (agent, event) => {
         };
         transcript[i] = { ...entry, calls };
         completedCall = calls[callIdx];
-        completedToolName = entry.name;
+        // The COMPLETED call's own name — with mixed-tool cards the entry name
+        // is only the run's FIRST call, so a file_edit completing inside a card
+        // led by read_files would fail the diff-snapshot gate below. The
+        // fallback covers legacy persisted calls that predate the field.
+        completedToolName = calls[callIdx].name ?? entry.name;
         break;
       }
     }

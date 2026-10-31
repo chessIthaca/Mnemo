@@ -10,15 +10,18 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mnemo = { path = "..", features = ["browser", "embeddings"] }
-tauri = { version = "2", features = ["unstable"] }
+tauri = { version = "2", features = ["unstable", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"
+dunce = "1.0"
+open = "5.4"
 log = "0.4"
 # Managed Laya runtime (ipc/laya.rs): the uv download + readiness probe ride
 # reqwest (same version/feature set as the mnemo lib so the crate unifies),
@@ -31,9 +34,30 @@ flate2 = "1"
 # uv release-asset digest verification (ipc/laya.rs verify_sha256) — same
 # version the mnemo lib pins for oauth PKCE, so the crate unifies.
 sha2 = "0.11"
+# The per-machine owner id that stamps project state folders (mnemo2).
+uuid = { version = "1", features = ["v4"] }
+# The `[claude_lead]` agent allow-list in config.toml (mnemo2/mcp_server.rs);
+# same version the mnemo lib pins, so the crate unifies.
+toml = "1"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+# The Mnemo2 host is a separate shell. Gating it keeps its
+# `generate_context!` out of the Mnemo1 main-bin link unit, which would
+# otherwise double-embed `_EMBED_INFO_PLIST` in macOS dev/test builds.
+mnemo2 = []
+
+[[bin]]
+name = "mnemo2"
+path = "src/bin/mnemo2.rs"
+required-features = ["mnemo2"]
+
+# The stdio helper the "mnemo" Claude Code plugin runs: a console binary that
+# bridges MCP to a running Mnemo2 (or starts one) and answers the plugin hooks.
+[[bin]]
+name = "mnemo2-mcp"
+path = "src/bin/mnemo2_mcp.rs"
+required-features = ["mnemo2"]
 
 [dev-dependencies]
 tempfile = "3"

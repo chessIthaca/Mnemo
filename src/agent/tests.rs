@@ -1733,6 +1733,93 @@ async fn repeat_failure_injects_schema_correction_on_second_identical_error() {
     }
 }
 
+struct DomainFailureTool;
+
+#[async_trait]
+impl crate::tool::Tool for DomainFailureTool {
+    fn name(&self) -> &str {
+        "team_domain"
+    }
+
+    fn category(&self) -> crate::tool::ToolCategory {
+        crate::tool::ToolCategory::Agent
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: self.name().to_string(),
+            description: "A valid TeamManager call that returns a domain failure".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            strict: None,
+        }
+    }
+
+    fn safety(&self) -> crate::tool::SafetyLevel {
+        crate::tool::SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> crate::tool::ToolResult {
+        crate::tool::ToolResult::error("unknown worker 'missing'").with_data(
+            serde_json::json!({"error_kind": "domain"}),
+        )
+    }
+}
+
+#[tokio::test]
+async fn domain_errors_do_not_trigger_malformed_call_correction() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let mut registry = make_registry((*sandbox).clone(), workflow.clone());
+    Arc::get_mut(&mut registry)
+        .expect("unique test registry")
+        .register(Box::new(DomainFailureTool));
+    let call = |index: usize| {
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: format!("domain_{index}"),
+                name: "team_domain".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: "{}".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ]
+    };
+    let provider = Arc::new(MockProvider::sequence(vec![
+        call(1),
+        call(2),
+        vec![
+            LlmEvent::TextDelta { text: "done".into() },
+            LlmEvent::Finish { reason: FinishReason::Stop },
+        ],
+    ]));
+    let agent = AgentLoop::new(
+        test_config(provider, registry, workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("check the worker")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    assert_eq!(messages.iter().filter(|message| message.role == Role::Tool).count(), 2);
+    assert!(messages.iter().all(|message| {
+        !message.content.as_text().contains("[harness tool-call correction")
+            && !message.content.as_text().contains("malformed")
+    }));
+    assert_eq!(messages.last().map(|message| message.content.as_text()).as_deref(), Some("done"));
+}
+
 #[tokio::test]
 async fn correction_schema_matches_the_advertised_strict_schema() {
     // Plan 21118961 consistency: on a strict-capable endpoint the
@@ -6161,6 +6248,113 @@ async fn dispatch_drops_stringified_nulls_from_optional_params() {
     assert!(
         result.output.contains("\"required_field\":\"null\""),
         "required \"null\" is kept for the tool to reject, tool saw: {}",
+        result.output
+    );
+}
+
+/// Backlog c19ec2ff (c): a sequence-typed argument delivered as one
+/// stringified JSON array is repaired at the dispatch seam before the tool
+/// sees the args — pinned end-to-end through execute_tool_call with an
+/// echo tool whose result IS the args it received. A string that parses to
+/// another kind stays untouched — the tool's own positional error names
+/// it (read_files' recovery layer).
+#[tokio::test]
+async fn dispatch_repairs_stringified_sequence_args() {
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(tokio::sync::Mutex::new(Workflow::new(
+        dir.path().join("plans"),
+    )));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // A purpose-built echo tool: the assertion pins the SEAM (what crossed
+    // execute_tool_call), not any one tool's internals. Memory category =
+    // available in every workflow state, so the filter admits it in
+    // Planning without a live plan.
+    struct SequenceEchoTool;
+    #[async_trait]
+    impl crate::tool::Tool for SequenceEchoTool {
+        fn name(&self) -> &str {
+            "sequence_echo"
+        }
+        fn category(&self) -> crate::tool::ToolCategory {
+            crate::tool::ToolCategory::Memory
+        }
+        fn schema(&self) -> crate::provider::ToolSchema {
+            crate::provider::ToolSchema::new(
+                "sequence_echo",
+                "echo the args it received",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "items": {"type": "array"},
+                        "note": {"type": "string"}
+                    },
+                    "required": ["items"]
+                }),
+            )
+        }
+        fn safety(&self) -> crate::tool::SafetyLevel {
+            crate::tool::SafetyLevel::AutoRun
+        }
+        async fn execute(&self, args: serde_json::Value) -> crate::tool::ToolResult {
+            crate::tool::ToolResult::success(args.to_string())
+        }
+    }
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(SequenceEchoTool));
+    let provider = Arc::new(MockProvider {
+        responses: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        caps: Capabilities::openai(),
+        tools_phases: Arc::new(std::sync::Mutex::new(Vec::new())),
+        name: String::new(),
+    });
+    let agent = AgentLoop::new(
+        test_config(provider, Arc::new(registry), workflow, sandbox),
+        crate::project::Constitution::default(),
+    );
+    let (fanin_tx, _fanin_rx) = mpsc::channel(8);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut deny_all_latched = false;
+    let mut stop_signal: Option<super::StopReason> = None;
+
+    let call = |id: &str, args: &str| {
+        crate::provider::ToolCall::new(id, "sequence_echo", args.to_string())
+    };
+
+    // A clean stringified JSON array is spliced in: the tool sees the
+    // parsed array, not the string (the 2027-01-25 read_files failures
+    // were exactly this shape, rejected with the generic sequence error).
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c1", r#"{"items":"[\"a\",\"b\"]"}"#),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(result.success, "echo call ran: {}", result.output);
+    assert!(
+        result.output.contains(r#""items":["a","b"]"#),
+        "stringified array must be repaired at the seam, tool saw: {}",
+        result.output
+    );
+
+    // A string that parses to an OBJECT stays a string — the seam repairs
+    // arrays only; the tool's own decode error names the rest.
+    let (result, _) = agent
+        .execute_tool_call(
+            &call("c2", r#"{"items":"{\"a\":1}"}"#),
+            &fanin_tx,
+            1,
+            &mut cmd_rx,
+            &mut deny_all_latched,
+            &mut stop_signal,
+        )
+        .await;
+    assert!(
+        result.output.contains(r#""items":"{\"a\":1}""#),
+        "non-array string stays for the tool to reject, tool saw: {}",
         result.output
     );
 }
@@ -12168,6 +12362,281 @@ async fn recall_delta_elides_a_repeat_recall_but_not_a_new_one() {
 }
 
 #[tokio::test]
+async fn recall_feedback_dismissed_row_never_reinjects_this_session() {
+    // Session dismissal (backlog c68a8c3b), end-to-end: turn 1 recalls both
+    // merge-topic rows; turn 2 calls recall_feedback dismissing M1's id;
+    // turn 3 re-runs the same query — M1 must NOT re-inject while M2 still
+    // does, and the store row must survive untouched (dismissal is
+    // injection-scoped, never a delete).
+    const M1: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path so the history stays linear";
+    const M1_HEAD: &str = "how to merge feature branches into main safely";
+    const M2: &str = "steps to merge a release branch into main";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    // Registry with ONLY recall_feedback — the dismissal tool and the
+    // loop's injector share one per-loop Arc.
+    let dismissed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(crate::tool::memory::RecallFeedbackTool::new(
+        dismissed.clone(),
+    )));
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    let m1_id = store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions",
+            M1,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "merge checklist",
+            M2,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![
+        // Turn 1: text only — recalls M1 + M2 in full.
+        vec![
+            LlmEvent::TextDelta { text: "one".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // Turn 2: the model dismisses M1 via recall_feedback ...
+        vec![
+            LlmEvent::ToolCallStart {
+                index: 0,
+                id: "call_dismiss".into(),
+                name: "recall_feedback".into(),
+            },
+            LlmEvent::ToolCallArgumentDelta {
+                index: 0,
+                fragment: format!(r#"{{"dismissed":["{}"]}}"#, m1_id),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+            },
+        ],
+        // ... then finishes the turn with text.
+        vec![
+            LlmEvent::TextDelta { text: "two".into() },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        // Turn 3: same query — the dismissal must hold.
+        vec![
+            LlmEvent::TextDelta {
+                text: "three".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: Arc::new(registry),
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_dismissed_recall(dismissed.clone());
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tails = probe.request_tails();
+    let turn1 = &tails[0];
+    let turn3 = tails.last().unwrap();
+    assert!(
+        turn1.contains(M1_HEAD) && turn1.contains("merge checklist"),
+        "turn 1 recalls both rows: {turn1}"
+    );
+    assert!(
+        !turn3.contains(M1_HEAD),
+        "the dismissed row never re-injects: {turn3}"
+    );
+    assert!(
+        turn3.contains("merge checklist"),
+        "the undismissed row still injects: {turn3}"
+    );
+    // Dismissal never deletes: the row still ranks in the store's own
+    // recall path (the injector filter is render-scoped only).
+    let hits = store
+        .recall_peek("merge it", &crate::memory::MemoryFilter::new().limit(5))
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|sm| sm.memory.id == m1_id),
+        "the dismissed row still ranks in the store — dismissal is injection-scoped: {hits:?}"
+    );
+}
+
+#[tokio::test]
+async fn plan_active_recall_ranks_the_plans_own_records_above_generic_rows() {
+    // Task-scoped ranking (backlog c68a8c3b), end-to-end: with a plan
+    // active whose goal+context is all quokka-gallery vocabulary and a
+    // user message ("merge it") that generically matches the merge-topic
+    // record, the recall block must rank the PLAN's own record above the
+    // generic one. Pre-fix (the query = the last message ALONE) the
+    // generic row outranks the plan's row (or the plan's row never
+    // makes the cut) — red.
+    const PLAN_GOAL: &str = "Ship the quokka gallery: rotate the quokka image viewer so the quokka photos render upright in the gallery grid";
+    const PLAN_CONTEXT: &str = "The quokka viewer currently renders rotated quokka photos; the gallery grid needs upright quokka image thumbnails. The quokka photo test fails on the rotated fixture.";
+    const P: &str = "quokka gallery fix: rotate the quokka image viewer so quokka photos render upright in the gallery grid, per the quokka photo test";
+    const G: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    workflow
+        .lock()
+        .await
+        .create_plan(
+            "Quokka gallery upright photos",
+            PLAN_GOAL,
+            PLAN_CONTEXT,
+            vec!["Fix the quokka viewer".into()],
+        )
+        .unwrap();
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "rotate quokka thumbnails", // P — the plan's own record
+            P,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions", // G — generic, matches the message alone
+            G,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![vec![
+        LlmEvent::TextDelta { text: "ok".into() },
+        LlmEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ]]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tail = &probe.request_tails()[0];
+    let p_pos = tail
+        .find("rotate quokka thumbnails")
+        .expect("the plan's own record injects");
+    let g_pos = tail
+        .find("merge instructions")
+        .expect("the generic row injects");
+    assert!(
+        p_pos < g_pos,
+        "with a plan active, the plan's own record outranks the generic match: {tail}"
+    );
+}
+
+#[test]
+fn recall_query_text_caps_plan_text_and_falls_back_to_the_message() {
+    use crate::agent::turn::recall_query_text;
+    // No plan — exactly today's single-message query.
+    assert_eq!(recall_query_text("merge it", None), "merge it");
+    // Blank plan text is treated as absent.
+    assert_eq!(recall_query_text("merge it", Some("   ")), "merge it");
+    // A plan rides along under its marked header.
+    assert_eq!(
+        recall_query_text("merge it", Some("quokka gallery")),
+        "merge it\n\n[ACTIVE PLAN — goal+context]\nquokka gallery"
+    );
+    const HEADER: &str = "\n\n[ACTIVE PLAN — goal+context]\n";
+    // Oversized plan text is cut at a whitespace boundary (never
+    // mid-word): 2 002 bytes of "quokka " repetitions.
+    let long = "quokka ".repeat(286);
+    let capped = recall_query_text("merge it", Some(&long));
+    let plan = &capped["merge it".len() + HEADER.len()..];
+    assert!(plan.len() <= 1_000, "the cap holds: {}", plan.len());
+    assert!(
+        plan.ends_with("quokka"),
+        "the cut lands at a whitespace boundary (never mid-word): {plan:?}"
+    );
+    // Multibyte safety: a CJK-only plan (no whitespace) is hard-cut at
+    // the cap, always on a char boundary — never mid-UTF-8-sequence.
+    let cjk = "照片旋转".repeat(400); // 4 800 bytes, 3 bytes per char
+    let capped_cjk = recall_query_text("merge it", Some(&cjk));
+    let plan_cjk = &capped_cjk["merge it".len() + HEADER.len()..];
+    assert!(plan_cjk.len() <= 1_000);
+    assert_eq!(
+        plan_cjk.len() % 3,
+        0,
+        "the hard cut lands on a char boundary"
+    );
+}
+
+#[tokio::test]
 async fn auto_recall_emits_memory_recalled_event() {
     // Regression (2026-04-20, user request + review finding 1): the per-turn
     // AUTO-recall injected memories into the prompt invisibly — there must be
@@ -13107,6 +13576,37 @@ fn one_call_batch(call_id: &str, name: &str) -> Vec<LlmEvent> {
     ]
 }
 
+/// A tool-call response batch carrying TWO calls — the shape a model produces
+/// when it announces several calls in one assistant message (both streamed
+/// back to back, one `ToolCalls` finish). The engine then executes them
+/// sequentially, which is exactly what the execution-marker tests need: the
+/// second call is queued behind the first.
+fn two_call_batch(id_a: &str, id_b: &str) -> Vec<LlmEvent> {
+    vec![
+        LlmEvent::ToolCallStart {
+            index: 0,
+            id: id_a.to_string(),
+            name: "memory_search".to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 0,
+            fragment: r#"{"query":"first"}"#.to_string(),
+        },
+        LlmEvent::ToolCallStart {
+            index: 1,
+            id: id_b.to_string(),
+            name: "memory_search".to_string(),
+        },
+        LlmEvent::ToolCallArgumentDelta {
+            index: 1,
+            fragment: r#"{"query":"second"}"#.to_string(),
+        },
+        LlmEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ]
+}
+
 /// A plain text response that ends the turn.
 fn text_stop(text: &str) -> Vec<LlmEvent> {
     vec![
@@ -13174,13 +13674,31 @@ async fn transient_read_only_failure_is_auto_retried_without_a_model_roundtrip()
     )
     .with_failure_triage(triage_gate("transient", 0.95, true, log.clone()));
 
-    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(64);
     let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let mut messages = vec![Message::user_text("read x.txt")];
     agent
         .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
         .await
         .unwrap();
+
+    // One logical call, two execution attempts (the harness auto-retry): the
+    // execution-start marker fires exactly ONCE — a re-run is part of the
+    // same logical call, so the card's timer must not reset mid-call (plan
+    // b2052a9c).
+    let mut markers = 0;
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        if matches!(
+            ev,
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call_1"
+        ) {
+            markers += 1;
+        }
+    }
+    assert_eq!(
+        markers, 1,
+        "the failure-triage auto-retry must not re-emit the execution marker"
+    );
 
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
@@ -13215,6 +13733,247 @@ async fn transient_read_only_failure_is_auto_retried_without_a_model_roundtrip()
     assert_eq!(rows[0].class, "transient");
     assert_eq!(rows[0].action, "auto_retry");
     assert_eq!(rows[0].disposition.as_deref(), Some("retry_succeeded"));
+}
+
+#[tokio::test]
+async fn sequential_tool_calls_time_from_execution_not_announcement() {
+    // Regression (plan b2052a9c): a model batch ANNOUNCES all of its calls
+    // together (ToolCallStart, mid-stream), but the engine executes them one
+    // at a time. A tool card whose timer anchors on the announcement bills
+    // the earlier siblings' running time to the later ones — suffixes look
+    // cumulative. Each call therefore emits its own ToolExecutionStart,
+    // immediately before its first execution attempt. The proof that the
+    // second card's anchor is the execution, not the announcement: the
+    // second marker must arrive only AFTER the first call's result.
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let provider = Arc::new(MockProvider::sequence(vec![
+        two_call_batch("call_a", "call_b"),
+        text_stop("done"),
+    ]));
+    let agent = AgentLoop::new(
+        test_config(
+            provider,
+            make_registry((*sandbox).clone(), workflow.clone()),
+            workflow,
+            sandbox,
+        ),
+        crate::project::Constitution::default(),
+    );
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run both searches")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let mut events = Vec::new();
+    while let Ok((_, ev)) = fanin_rx.try_recv() {
+        events.push(ev);
+    }
+
+    let announce_a = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCallStart { id, .. } if id == "call_a"))
+        .expect("the first call is announced mid-stream");
+    let announce_b = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::ToolCallStart { id, .. } if id == "call_b"))
+        .expect("the second call is announced mid-stream");
+    let exec = |id: &str| {
+        events.iter().position(|e| {
+            matches!(e, AgentEvent::ToolExecutionStart { tool_call_id } if tool_call_id == id)
+        })
+    };
+    let result = |id: &str| {
+        events.iter().position(|e| {
+            matches!(e, AgentEvent::ToolResult { tool_call_id, .. } if tool_call_id == id)
+        })
+    };
+
+    let exec_a = exec("call_a").expect(
+        "RED pre-fix: the first call has no execution-start marker — its card \
+         could only anchor the timer on the shared batch announcement",
+    );
+    let exec_b = exec("call_b").expect(
+        "RED pre-fix: the second call has no execution-start marker — its card \
+         could only anchor the timer on the shared batch announcement",
+    );
+    let result_a = result("call_a").expect("the first call finished with a result");
+    let result_b = result("call_b").expect("the second call finished with a result");
+
+    // Exactly ONE marker per logical call.
+    let markers = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }))
+        .count();
+    assert_eq!(markers, 2, "exactly one execution-start marker per call");
+
+    // Markers are execution-anchored, not announcement-anchored: both calls
+    // were announced (in the same stream) before any execution began.
+    assert!(announce_a < announce_b, "announcements arrive in stream order");
+    assert!(
+        exec_a > announce_b && exec_b > announce_b,
+        "both markers come after the WHOLE batch was announced"
+    );
+
+    // The core property (plan b2052a9c): the first call's result precedes
+    // the second call's marker — the second card's clock starts only when
+    // the second call actually starts running, so it never bills the time
+    // its sibling spent running.
+    assert!(
+        result_a < exec_b,
+        "the first call's result ({result_a}) must precede the second call's \
+         execution-start ({exec_b}) — sequential execution, independent timers"
+    );
+    assert!(exec_a < result_a, "the first marker precedes its own result");
+    assert!(exec_b < result_b, "the second marker precedes its own result");
+}
+
+#[tokio::test]
+async fn not_run_synthesized_calls_never_get_execution_markers() {
+    // Companion (plan b2052a9c): calls that never executed must NOT get an
+    // execution-start marker. An Interrupt arriving mid-stream (after the
+    // whole batch was announced but before any call ran) makes the stop path
+    // synthesize "interrupted: not run" results for both calls; their cards
+    // keep the ToolCallStart timestamp as the compatibility-fallback anchor —
+    // a marker would claim execution that never happened.
+    use crate::runtime::AgentCommand;
+    use tokio::sync::Notify;
+
+    struct BatchPausingProvider {
+        gate: Arc<Notify>,
+        caps: Capabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for BatchPausingProvider {
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAI
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _tool_choice: Option<crate::provider::ToolChoice>,
+        ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
+            use futures::StreamExt;
+            let gate = self.gate.clone();
+            // Both calls announce together, then the stream PENDS — the
+            // interrupt lands while the batch is announced but idle.
+            let stream = futures::stream::iter(vec![
+                LlmEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_a".into(),
+                    name: "memory_search".into(),
+                },
+                LlmEvent::ToolCallArgumentDelta {
+                    index: 0,
+                    fragment: r#"{"query":"first"}"#.into(),
+                },
+                LlmEvent::ToolCallStart {
+                    index: 1,
+                    id: "call_b".into(),
+                    name: "memory_search".into(),
+                },
+                LlmEvent::ToolCallArgumentDelta {
+                    index: 1,
+                    fragment: r#"{"query":"second"}"#.into(),
+                },
+            ])
+            .chain(futures::stream::once(async move {
+                gate.notified().await;
+                LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                }
+            }));
+            Ok(Box::pin(stream))
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let gate = Arc::new(Notify::new());
+    let provider: Arc<dyn LlmClient> = Arc::new(BatchPausingProvider {
+        gate: gate.clone(),
+        caps: Capabilities::openai(),
+    });
+    let agent = Arc::new(AgentLoop::new(
+        test_config(
+            provider,
+            make_registry((*sandbox).clone(), workflow.clone()),
+            workflow,
+            sandbox,
+        ),
+        crate::project::Constitution::default(),
+    ));
+
+    let (fanin_tx, mut fanin_rx) = mpsc::channel(256);
+    let turn_tx = fanin_tx.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("run both searches")];
+
+    let collect_handle = tokio::spawn(async move {
+        let mut events: Vec<AgentEvent> = Vec::new();
+        while let Some((_id, event)) = fanin_rx.recv().await {
+            events.push(event);
+        }
+        events
+    });
+
+    let agent_clone = Arc::clone(&agent);
+    let turn_handle = tokio::spawn(async move {
+        let outcome = agent_clone
+            .run_turn(&mut messages, &turn_tx, 1, &mut cmd_rx, None)
+            .await
+            .unwrap();
+        (outcome, messages)
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    cmd_tx.send(AgentCommand::Interrupt).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    gate.notify_one();
+
+    let (outcome, _messages) = turn_handle.await.unwrap();
+    assert_eq!(
+        outcome.stop_reason,
+        Some(crate::agent::StopReason::Interrupt),
+        "the mid-stream interrupt must stop the batch"
+    );
+
+    drop(fanin_tx);
+    let events = collect_handle.await.unwrap();
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })),
+        "calls the stop gate skipped must never emit an execution marker"
+    );
+    // Both calls DID get their terminal (synthetic) results, so their cards
+    // resolve instead of spinning "running" forever — with only the
+    // announcement anchor for their duration.
+    for id in ["call_a", "call_b"] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolResult { tool_call_id, result }
+                    if tool_call_id == id && result.output.contains("not run")
+            )),
+            "{id} must carry the synthetic not-run result"
+        );
+    }
 }
 
 #[tokio::test]
@@ -16663,15 +17422,15 @@ async fn guardrails_is_default_and_gate_rules() {
         Continuation::Stop
     ));
 
-    // The free-agent defaults: the ungated surface (advertise None —
-    // the registry narrows; gate Free) over the plain spec.
+    // The registry narrows the selected groups; the policy must not inherit
+    // the unwired workflow's read-only Complete filter.
     let plain = DeclarativePolicy::new(std::sync::Arc::new(Guardrails::default()))
         .expect("the default spec compiles");
     let surface = plain.tool_surface().await;
-    assert!(
-        surface.advertise.is_none(),
-        "the registry narrows; the policy does not filter"
-    );
+    assert!(matches!(
+        surface.advertise,
+        Some(crate::tool::ToolFilter::Free)
+    ));
     assert!(matches!(
         surface.gate,
         Some(crate::tool::ToolFilter::Free)
@@ -16686,4 +17445,167 @@ async fn guardrails_is_default_and_gate_rules() {
         ..Guardrails::default()
     }))
     .is_err());
+}#[tokio::test]
+async fn recall_delta_all_elided_set_costs_one_sentinel_line() {
+    // (d) Set-level sentinel (backlog c68a8c3b): when EVERY recalled row
+    // was already injected (the set is unchanged since its last
+    // sighting), the block collapses into ONE sentinel line — an N-row
+    // repeat costs one line, not N per-row references. Pre-fix, turn 2
+    // below rendered the per-row references (red).
+    const M1: &str = "how to merge feature branches into main safely: rebase the working branch onto main, run the whole test suite, then land through the approved merge path so the history stays linear";
+    const M2: &str = "steps to merge a release branch into main";
+    const M3: &str = "merge checklist: run the workspace suite before landing the release branch merge";
+
+    let dir = tempdir().unwrap();
+    let workflow = Arc::new(Mutex::new(Workflow::new(dir.path().join("plans"))));
+    let sandbox = Arc::new(Sandbox::new(dir.path()).unwrap());
+    let registry = make_registry((*sandbox).clone(), workflow.clone());
+    let embedder: Arc<dyn crate::memory::Embedder> = Arc::new(HashEmbedder::new());
+    let store: Arc<dyn crate::memory::MemoryStoreTrait> =
+        Arc::new(MemoryStore::open_in_memory(embedder).unwrap());
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Semantic,
+            "merge instructions",
+            M1,
+            1_700_000_000,
+        ))
+        .await
+        .unwrap();
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "merge checklist",
+            M2,
+            1_700_000_100,
+        ))
+        .await
+        .unwrap();
+
+    let scripted = MockProvider::sequence(vec![
+        vec![
+            LlmEvent::TextDelta {
+                text: "one".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta {
+                text: "two".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+        vec![
+            LlmEvent::TextDelta {
+                text: "three".into(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ],
+    ]);
+    let provider = Arc::new(RecordingProvider::new(scripted));
+    let probe = provider.clone();
+    let agent = AgentLoop::new(
+        AgentLoopConfig {
+            provider,
+            tools: registry,
+            workflow: crate::app::workflow::as_handle(workflow.clone()),
+            sandbox,
+            safety_mode: SafetyMode::Autonomous,
+            context_manager: context::ContextManager::new(128_000, 0.5),
+            memory: Some(store.clone()),
+            vision: None,
+        },
+        crate::project::Constitution::default(),
+    )
+    .with_optimizer(Arc::new(std::sync::RwLock::new(
+        crate::config::OptimizerConfig::default(),
+    )));
+
+    let (fanin_tx, _fanin_rx) = mpsc::channel(64);
+    let (_cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let mut messages = vec![Message::user_text("merge it")];
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // Turn 2 — same query, same corpus: every row is already injected.
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    // A new equally-matching memory lands between turns 2 and 3: turn 3
+    // is a MIXED set and must still render the delta block (the new row
+    // full, the repeats as references) — the sentinel only fires when
+    // the WHOLE set is unchanged.
+    store
+        .write(crate::memory::Memory::new(
+            MemoryTier::Procedural,
+            "release checklist",
+            M3,
+            1_700_000_200,
+        ))
+        .await
+        .unwrap();
+    messages.push(Message::user_text("merge it"));
+    agent
+        .run_turn(&mut messages, &fanin_tx, 1, &mut cmd_rx, None)
+        .await
+        .unwrap();
+
+    let tails = probe.request_tails();
+    let turn1 = &tails[0];
+    let turn2 = &tails[1];
+    let turn3 = &tails[2];
+
+    // Turn 1: both rows arrive in full.
+    assert!(
+        turn1.contains("how to merge feature branches into main safely") && turn1.contains(M2),
+        "turn 1 injects both rows in full: {turn1}"
+    );
+
+    // Turn 2: the UNCHANGED set costs ONE line — the sentinel names the
+    // count and the first injection turn, and no per-row references
+    // render (RED pre-fix: turn 2 rendered the references).
+    assert!(
+        turn2.contains(
+            "2 recalled memories unchanged since injection (first at turn 1); re-read with memory_search if needed."
+        ),
+        "the all-elided set renders the one-line sentinel: {turn2}"
+    );
+    assert!(
+        !turn2.contains("unchanged since injection (turn 1);"),
+        "no per-row references when the whole set is elided: {turn2}"
+    );
+
+    // Turn 3: the MIXED set still renders the delta block — the new row
+    // in full, the repeats as per-row references.
+    assert!(
+        turn3.contains("unchanged since injection (turn 1);"),
+        "a mixed set keeps per-row references: {turn3}"
+    );
+    assert!(
+        turn3.contains(M3),
+        "the newly recalled row arrives in full: {turn3}"
+    );
+
+    // The savings ledger records the sentinel's saved chars.
+    let rows = store.savings_events_rows(None).await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == "recall_delta"
+                && r
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("sentinel"))),
+        "a savings row names the sentinel: {rows:?}"
+    );
 }

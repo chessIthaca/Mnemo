@@ -295,10 +295,6 @@ pub struct AgentLoopFactory {
     /// The fill rate the context manager was built with — needed to rebuild a
     /// `ContextManager` when the provider (and thus its max context) changes.
     fill_rate: f64,
-    /// The proxy cache ceiling (cliff guard) — preserved across model swaps
-    /// so the rebuilt `ContextManager` keeps it (same preservation contract
-    /// as the preflight settings).
-    proxy_cache_ceiling: Option<usize>,
     /// Whether the pre-flight hard-ceiling guard is enabled — preserved across
     /// model swaps so the rebuilt `ContextManager` keeps the setting.
     preflight_compact: bool,
@@ -511,15 +507,11 @@ impl AgentLoopFactory {
         // swap) keep the same hard-ceiling guard behavior.
         let preflight_compact = context_manager.preflight_compact();
         let compact_headroom_tokens = context_manager.compact_headroom_tokens();
-        // Preserve the proxy cache ceiling so rebuilt ContextManagers keep
-        // the cliff guard (same preservation contract as preflight).
-        let proxy_cache_ceiling = context_manager.proxy_cache_ceiling();
         Self {
             provider: Arc::new(RwLock::new(provider.clone())),
             default_display_effort: Arc::new(RwLock::new(None)),
             context_manager: Arc::new(RwLock::new(context_manager)),
             fill_rate,
-            proxy_cache_ceiling,
             preflight_compact,
             compact_headroom_tokens,
             constitution_source,
@@ -945,8 +937,7 @@ impl AgentLoopFactory {
             .write()
             .expect("context_manager lock poisoned") =
             ContextManager::new(max_context, self.fill_rate)
-                .with_preflight(self.preflight_compact, self.compact_headroom_tokens)
-                .with_proxy_cache_ceiling(self.proxy_cache_ceiling);
+                .with_preflight(self.preflight_compact, self.compact_headroom_tokens);
     }
 
     /// Record the DISPLAY-space effort of the shared default provider slot
@@ -1036,7 +1027,6 @@ impl AgentLoopFactory {
     pub fn context_manager_for(&self, provider: &dyn LlmClient) -> ContextManager {
         ContextManager::new(provider.capabilities().max_context, self.fill_rate)
             .with_preflight(self.preflight_compact, self.compact_headroom_tokens)
-            .with_proxy_cache_ceiling(self.proxy_cache_ceiling)
     }
 
     /// A handle to the shared memory store (if any). The IPC layer uses this
@@ -1044,17 +1034,6 @@ impl AgentLoopFactory {
     /// store's SQLite DB at `.coding/memory.db`).
     pub fn memory_handle(&self) -> Option<Arc<dyn MemoryStoreTrait>> {
         self.memory.clone()
-    }
-
-
-    /// The proxy cache ceiling the factory's context managers are built
-    /// with — the startup snapshot (backlog ffd4bac3): the run-all
-    /// between-items auto-compact gate reads it so its threshold uses the
-    /// SAME ceiling the engine's fill-rate path applies, even after a
-    /// mid-session settings edit (the config file may be newer than the
-    /// factory until restart).
-    pub fn proxy_cache_ceiling(&self) -> Option<usize> {
-        self.proxy_cache_ceiling
     }
 
     /// Build a fresh `AgentLoop` with its own `Workflow` + `ToolRegistry`,
@@ -1160,7 +1139,20 @@ impl AgentLoopFactory {
 
         // Fresh per-agent tool registry, wired to this agent's workflow and
         // stamped with this agent's id (for the parent-aware spawn_agent tool).
-        let registry = self.build_registry(&workflow, agent_id, root, &plans_dir);
+        let mut registry = self.build_registry(&workflow, agent_id, root, &plans_dir);
+        // Session dismissal (backlog c68a8c3b): ONE Arc per built loop,
+        // shared between the recall_feedback tool registered here and the
+        // loop's auto-recall injector (with_dismissed_recall below), so the
+        // tool's writes and the injector's filter see the same per-session
+        // set. Registered at the array tail — AFTER build_registry — so the
+        // grouped registration order inside build_registry (and its test
+        // callers) stays untouched.
+        let dismissed_recall = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        registry.register(Box::new(crate::tool::memory::RecallFeedbackTool::new(
+            dismissed_recall.clone(),
+        )));
 
         // Snapshot the shared provider + context manager (swappable at
         // runtime). The locks are released immediately (cheap clones).
@@ -1200,6 +1192,9 @@ impl AgentLoopFactory {
         // the ingestion-time levers (progressive disclosure, compaction
         // survival) see a config save without rebuilding the loop.
         .with_optimizer(Arc::clone(&self.optimizer))
+        // Backlog c68a8c3b: share the per-loop dismissal set with the
+        // recall_feedback tool registered above.
+        .with_dismissed_recall(dismissed_recall)
         // Wire the plans dir so session-end consolidation can digest the
         // accumulated plan/review corpus (learning material). Uses the
         // per-build override (main dir or per-agent dir).
@@ -1449,6 +1444,9 @@ impl AgentLoopFactory {
             for name in &sel.exclude {
                 registry.unregister(name);
             }
+        }
+        if let Some(factory) = self.policy_factory.get() {
+            factory.finalize_tools(&mut registry);
         }
         // The static deferred tools' schemas render in the reveal response —
         // snapshot them (Arc clones) before LoadToolsTool registers; static
@@ -3817,6 +3815,27 @@ mod tests {
             count,
             expected,
             "free surface minus the carved tool and the (unrequired) git pair"
+        );
+    }
+
+    #[test]
+    fn policy_factory_blocked_tools_are_pruned_after_spawn_registration() {
+        let dir = tempdir().unwrap();
+        let factory = make_factory(dir.path());
+        factory.set_policy_factory(Arc::new(
+            crate::app::policy_factory::WorkflowPolicyFactory::default()
+                .with_blocked_tools(vec!["spawn_agent".to_string()]),
+        ));
+        factory.set_spawner(Arc::new(MockSpawner));
+
+        let registry = registry_for_factory(&factory, &dir);
+        assert!(
+            registry.get("spawn_agent").is_none(),
+            "the final advertised registry must honor policy-factory vetoes"
+        );
+        assert!(
+            registry.get("ask_user").is_some(),
+            "unrelated app tools remain registered"
         );
     }
 

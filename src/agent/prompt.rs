@@ -79,7 +79,8 @@ last resort.
 - REVIEWING: steps done + kind=implementation. Run the closing sequence (APP \
 RULES): reviewer subagent → fix findings → re-run tests → commit → finish. \
 finish is the only exit to Complete and is gated on a non-empty review \
-report.
+report; it also ticks any step appended during review, so a completed plan \
+shows no open checkbox.
 - COMPLETE: read tools + create_plan + web interaction (web_fetch / the \
 revealed browser tools) — plan any follow-up change. \
 Skills (e.g. merge_to_main) may also start here.
@@ -419,6 +420,34 @@ pub(crate) fn append_plan_nudge(
 /// `WORKFLOW STATE` or `RECALLED MEMORIES`. Keep it short (30-60 chars).
 pub const CONTEXT_FOOTER: &str = "<context footer — cache-stable sentinel, ignore>";
 
+/// The conversation without request scaffolding: every [`CONTEXT_FOOTER`]
+/// message and the volatile tail pushed directly before it. The turn pushes
+/// both right before a provider request and pops them right after, so they
+/// never belong in an exported or resumed conversation — a stale workflow
+/// tail resumed as history misleads the model and shows up in transcripts.
+pub fn strip_request_scaffolding(
+    messages: Vec<crate::provider::Message>,
+) -> Vec<crate::provider::Message> {
+    let footer: Vec<bool> = messages
+        .iter()
+        .map(|message| {
+            matches!(
+                message.role,
+                crate::provider::Role::User | crate::provider::Role::System
+            ) && message.content.as_text() == CONTEXT_FOOTER
+        })
+        .collect();
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            // Index 0 is the stable head, never a tail.
+            !footer[*index] && !(*index > 0 && footer.get(index + 1).copied().unwrap_or(false))
+        })
+        .map(|(_, message)| message)
+        .collect()
+}
+
 /// The coding default's identity — what the mnemo console/GUI free mode
 /// passes (§5.9.1 :631-632). Deliberately WITHOUT the plan-first-workflow
 /// phrasing of the workflow preamble's identity (row 6's grep): the free
@@ -587,7 +616,11 @@ pub fn prompt_block_text(block: &PromptBlock) -> &'static str {
 pub fn assemble_spec_head(spec: &PromptSpec, c: &Constitution) -> String {
     // §5.9.1 :621: the spec's constitution mode filters the loaded sources
     // BEFORE the sections push (None drops both; Both = today's bytes).
-    let c = c.restricted(spec.constitution);
+    // Spec heads are headless guardrail sessions (Mnemo2 executor workers):
+    // they read the Team-scoped constitution, without Mnemo1's plan rules.
+    let c = c
+        .restricted(spec.constitution)
+        .scoped(crate::project::ConstitutionScope::Team);
     let mut out = String::new();
     push_spec_section(&mut out, &spec.identity);
     for block in &spec.blocks {
@@ -771,6 +804,19 @@ pub fn format_recall_context_delta(
     out
 }
 
+/// Format the all-elided recall block as ONE sentinel line (backlog
+/// c68a8c3b): when every recalled row was already injected this session —
+/// the set is unchanged since its last sighting — N per-row references
+/// collapse into a single line naming the count and the first injection
+/// turn. A 5-row repeat costs ~1 line instead of ~5. Like a per-row
+/// reference, the sentinel is a pointer, not a replacement: it tells the
+/// model to `memory_search` when it needs the text (or an id to dismiss
+/// via `recall_feedback`). The caller (recall_block) owns the decision;
+/// this function stays pure.
+pub fn format_recall_sentinel(count: usize, first_turn: u64) -> String {
+    format!("{count} recalled memories unchanged since injection (first at turn {first_turn}); re-read with memory_search if needed.\n\n")
+}
+
 /// Format the standing project-memory primer (the top strongest
 /// semantic+procedural memories) into a compact section for the stable head.
 ///
@@ -808,6 +854,33 @@ mod tests {
     use tempfile::tempdir;
     use crate::app::workflow_policy::workflow_section;
     use crate::app::workflow::WorkflowState;
+
+    #[test]
+    fn strip_request_scaffolding_drops_each_tail_and_footer_pair() {
+        use crate::provider::Message;
+        let texts = |messages: Vec<Message>| -> Vec<String> {
+            messages.iter().map(|message| message.content.as_text()).collect()
+        };
+        let stripped = strip_request_scaffolding(vec![
+            Message::system("head"),
+            Message::user_text("task"),
+            Message::system("# WORKFLOW STATE\nExecuting"),
+            Message::system(CONTEXT_FOOTER),
+            Message::assistant_text("answer"),
+            Message::user_text("# CAPABILITIES"),
+            Message::user_text(CONTEXT_FOOTER),
+        ]);
+        assert_eq!(texts(stripped), ["head", "task", "answer"]);
+        // The stable head at index 0 is never mistaken for a tail.
+        let head_only = strip_request_scaffolding(vec![
+            Message::system("head"),
+            Message::system(CONTEXT_FOOTER),
+        ]);
+        assert_eq!(texts(head_only), ["head"]);
+        // A conversation without scaffolding is untouched.
+        let clean = vec![Message::user_text("a"), Message::assistant_text("b")];
+        assert_eq!(texts(strip_request_scaffolding(clean)), ["a", "b"]);
+    }
 
     /// The composed volatile tail's section ORDER is pinned (2a.4, step file
     /// :649-652): no existing test asserted the composed order — memories,
@@ -993,9 +1066,11 @@ mod tests {
         // GOLDEN_HEAD from that left side, then re-run green.
         // Golden bumped 2027-01-14: the web-interaction carve-out joined the
         // Planning/Complete state rules (backlog 3cc97a3d, plan 254091f1) —
-        // a deliberate, documented head change.
+        // a deliberate, documented head change. Re-pinned on the wt/mnemo
+        // merge for the intentional WORKFLOW_LIFECYCLE REVIEWING addition
+        // (finish ticks any step appended during review — plan 33a7341e).
         const GOLDEN_HEAD: &str =
-            "len=12464|sha256=226b726944df3be804df6ddd9b5c58d498e8a0c19b7808642a3d6678ebb15f98";
+            "len=12555|sha256=99de55ccaba5345c242dbcb8f2aec2eb43800adc8185f4d95a9a2153bf668f06";
         for marker in [
             "CORE PRINCIPLES:",
             "WORKFLOW LIFECYCLE — a plan-first state machine.",
@@ -2067,6 +2142,19 @@ mod tests {
             mixed.contains("other body"),
             "the newly recalled entry still arrives full: {mixed}"
         );
+    }
+
+    #[test]
+    fn format_recall_sentinel_is_one_line_with_the_re_read_hint() {
+        // (d) Set-level sentinel (backlog c68a8c3b): the all-elided set
+        // renders ONE line — the count, the first injection turn, and
+        // the memory_search re-read hint. No per-row bytes.
+        let s = format_recall_sentinel(5, 4);
+        assert_eq!(
+            s,
+            "5 recalled memories unchanged since injection (first at turn 4); re-read with memory_search if needed.\n\n"
+        );
+        assert!(!s.contains("(id:"), "no per-row ids/titles in the sentinel");
     }
 
     #[test]

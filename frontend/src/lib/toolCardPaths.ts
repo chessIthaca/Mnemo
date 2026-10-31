@@ -3,12 +3,18 @@
 // See LICENSE in the repository root.
 
 /**
- * Pure path/label extraction from a tool call's JSON args — drives the
- * ToolCard header's clickable file-name links (Message.tsx) — plus
+ * Pure path/label extraction from a tool call's JSON args — the ToolCard's
+ * human labels and its clickable file-name links (Message.tsx) — plus
  * readable-IO parsing for the expanded call-detail body: shell calls
  * (`shellCallFromArgs` / `parseShellOutput`: command block, stdout/stderr
  * split, exit-code chip; backlog 8c1d8a47), file_edit diffs
  * (`fileEditDiff`), and read_files line ranges (`parseReadFilesSections`).
+ *
+ * The card's COLLAPSED label is a human sentence, never the raw tool name
+ * (2026-10-18 one-headline decision): `actionPhrase` phrases one call and
+ * `groupPhrase` summarizes a whole run — consecutive calls to DIFFERENT tools
+ * bundle into one card, so the headline joins their phrases. The raw name
+ * renders only in the expanded per-call rows, next to that call's chips.
  *
  * Kept React-free so the node-env unit tests can exercise it directly.
  */
@@ -98,13 +104,7 @@ export function argPaths(args: string, toolName?: string): string[] {
   if (toolName === "read_files" || toolName === "multi_edit") {
     const files = parsed.files;
     if (Array.isArray(files)) {
-      return files
-        .map((f) =>
-          f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string"
-            ? (f as Record<string, string>).path
-            : null,
-        )
-        .filter((p): p is string => !!p);
+      return files.map((f) => readSpec(f)?.path ?? null).filter((p): p is string => !!p);
     }
   }
   // write_review_report takes a BARE filename — the tool writes it under
@@ -130,6 +130,32 @@ export interface PathLine {
   line: number | null;
 }
 
+/** The 1-based line a read starts at: a positive `start_line`, else 1. */
+function startLineOf(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 1 ? Math.floor(value) : 1;
+}
+
+/**
+ * One `read_files` `files` entry as its path and start line, in either form
+ * the tool accepts: the compact string `"path"`, `"path:start+count"` or
+ * `"path:start-end"` (the advertised one), or the `{path, start_line?}`
+ * object. Only a trailing numeric range is split off, as in
+ * `parse_compact_spec` (src/tool/agent/read_files.rs).
+ */
+export function readSpec(entry: unknown): PathLine | null {
+  if (typeof entry === "string") {
+    const spec = entry.trim();
+    if (!spec) return null;
+    const range = /^(.*):(\d+)(?:[+-]\d+)?$/.exec(spec);
+    return range ? { path: range[1], line: startLineOf(parseInt(range[2], 10)) } : { path: spec, line: 1 };
+  }
+  if (entry !== null && typeof entry === "object" && typeof (entry as Record<string, unknown>).path === "string") {
+    const spec = entry as Record<string, unknown>;
+    return { path: spec.path as string, line: startLineOf(spec.start_line) };
+  }
+  return null;
+}
+
 /**
  * Extract the file paths referenced by a tool call's args, each paired with
  * the 1-based line a `read_files` spec started at (`start_line ?? 1`) so its
@@ -149,26 +175,13 @@ export function argPathLines(args: string, toolName?: string): PathLine[] {
     // Malformed JSON: fall back to argPaths' literal-salvage extraction.
     return argPaths(args, toolName).map((path) => ({ path, line: null }));
   }
-  const lineOf = (spec: Record<string, unknown>): number | null =>
-    typeof spec.start_line === "number" && Number.isFinite(spec.start_line) && spec.start_line >= 1
-      ? Math.floor(spec.start_line)
-      : 1;
   const files = parsed.files;
   if (Array.isArray(files)) {
-    const out: PathLine[] = [];
-    for (const f of files) {
-      if (f !== null && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string") {
-        out.push({
-          path: (f as Record<string, unknown>).path as string,
-          line: lineOf(f as Record<string, unknown>),
-        });
-      }
-    }
-    return out;
+    return files.map(readSpec).filter((spec): spec is PathLine => spec !== null);
   }
   // Single-file shorthand: top-level path (+ optional start_line).
   const path = typeof parsed.path === "string" ? parsed.path : null;
-  return path !== null ? [{ path, line: lineOf(parsed) }] : [];
+  return path !== null ? [{ path, line: startLineOf(parsed.start_line) }] : [];
 }
 
 /** A header chip for a ToolCard: a clickable file link (`path !== null`), a
@@ -181,6 +194,11 @@ export interface ToolCardChip {
   /** The 1-based line a read_files chip's read started at — deep-links the
    *  Files viewer to that line (null = top of file / not applicable). */
   line: number | null;
+  /** The producing call was file_edit/multi_edit — the chip deep-links into
+   *  the right-panel Diff tab instead of the Files viewer. Set per call in
+   *  `buildPathChips` (a card may bundle calls to different tools since the
+   *  2026-10-18 bundling decision). */
+  opensDiff?: boolean;
   /** Render the label as inline markdown (bold/code, truncation-safe) — set
    *  only on backlog_add's argLabel chip, which carries the queued item's
    *  title (plan 2026-12). Every other pathless chip stays plain text. */
@@ -276,27 +294,37 @@ function disambiguateDuplicateTexts(entries: { text: string; path: string }[]): 
   }
 }
 
-/** Build the file-path chips for a ToolCard header from its grouped calls,
+/** Build the file-path chips for a ToolCard's calls (the caller passes the
+ *  run's calls, or just one call when rendering the expanded per-call row),
  *  deduplicated so each file appears at most once. Paths are collected across
- *  ALL calls (the same file read in multiple calls → one chip), deduped by
- *  normalized path (first occurrence wins, keeping its link), then capped at 3
- *  with a `+N` overflow chip. Display names are made unique: when deduped
- *  paths share a basename, colliding chips are qualified with parent dirs
- *  (see {@link disambiguateDuplicateTexts}) so the header never prints the
- *  same name twice. read_files chips carry the 1-based line the read started
- *  at (`line`, via {@link argPathLines}) so the link opens the file there.
- *  Returns `[]` for label-only tools (git, shell, search) whose calls carry
- *  no file path — those render a label chip via `argLabel` in Message.tsx
- *  instead.
+ *  ALL given calls (the same file read in multiple calls → one chip), deduped
+ *  by normalized path (first occurrence wins, keeping its link), then capped
+ *  at 3 with a `+N` overflow chip. Display names are made unique: when deduped
+ *  paths share a basename, colliding chips are qualified with parent dirs (see
+ *  {@link disambiguateDuplicateTexts}) so the row never prints the same name
+ *  twice. read_files chips carry the 1-based line the read started at
+ *  (`line`, via {@link argPathLines}) so the link opens the file there, and a
+ *  chip keeps the Diff-tab hint (`opensDiff`) of the call that first produced
+ *  it. Returns `[]` for label-only tools (git, shell, search) whose calls
+ *  carry no file path — those render a label chip via `argLabel` in
+ *  Message.tsx instead.
  *
  *  React-free so the node-env unit tests can exercise it directly. */
 export function buildPathChips(
-  calls: ReadonlyArray<{ id: string; args: string }>,
-  name: string,
+  calls: ReadonlyArray<{ id: string; name: string; args: string }>,
 ): ToolCardChip[] {
   const entries: PathLine[] = [];
+  // Which call produced each normalized path (first occurrence wins, mirroring
+  // the line map below) — decides the chip's tab: file_edit/multi_edit chips
+  // deep-link into the Diff tab, every other tool into the Files tab.
+  const opensDiffByPath = new Map<string, boolean>();
   for (const c of calls) {
-    entries.push(...argPathLines(c.args, name));
+    const opensDiff = c.name === "file_edit" || c.name === "multi_edit";
+    for (const e of argPathLines(c.args, c.name)) {
+      entries.push(e);
+      const norm = normalizePath(e.path);
+      if (!opensDiffByPath.has(norm)) opensDiffByPath.set(norm, opensDiff);
+    }
   }
   // First occurrence's line wins per normalized path (mirrors dedupePaths'
   // first-wins dedup below).
@@ -310,12 +338,17 @@ export function buildPathChips(
   const shown = deduped.slice(0, 3).map((p) => ({ text: basename(p), path: p }));
   disambiguateDuplicateTexts(shown);
   for (const e of shown) {
-    chips.push({
-      key: `path:${normalizePath(e.path)}`,
+    const norm = normalizePath(e.path);
+    const chip: ToolCardChip = {
+      key: `path:${norm}`,
       text: e.text,
       path: e.path,
-      line: lineByPath.get(normalizePath(e.path)) ?? null,
-    });
+      line: lineByPath.get(norm) ?? null,
+    };
+    // Omitted when false so a chip stays shape-identical to the pre-bundling
+    // chips (existing toEqual pins) — only diff-opening chips carry the flag.
+    if (opensDiffByPath.get(norm) === true) chip.opensDiff = true;
+    chips.push(chip);
   }
   if (deduped.length > 3) {
     chips.push({ key: "path:overflow", text: `+${deduped.length - 3}`, path: null, line: null });
@@ -473,9 +506,8 @@ export function searchResultInfo(output: string): SearchResultInfo | null {
  * Is `toolName` one of the browser tools? TRUE for BOTH families: the
  * live-tab `browser_*` tools and the headless `offscreen_browser_*` tools
  * (navigate/click/type/eval/screenshot/snapshot). Shared by the ToolCard
- * label/result helpers and by the transcript reducer, which never groups
- * shell or browser calls — every such call renders on its own line
- * (backlog daa38cbe).
+ * label/result helpers. The transcript reducer no longer special-cases these
+ * names: since the 2026-10-18 bundling decision every tool joins the run.
  *
  * React-free so the node-env unit tests can exercise it directly.
  */
@@ -953,7 +985,7 @@ export function argLabel(args: string, toolName?: string): string | null {
     const files = parsed.files;
     if (Array.isArray(files)) {
       const names = files
-        .map((f) => (f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string" ? (f as Record<string, string>).path : null))
+        .map((f) => readSpec(f)?.path ?? null)
         .filter((p): p is string => !!p)
         .map((p) => basename(p));
       if (names.length === 0) return null;
@@ -1025,26 +1057,280 @@ export function argLabel(args: string, toolName?: string): string | null {
   return null;
 }
 
-/** Map a raw tool name to a friendlier display label for the ToolCard header
- *  (e.g. "spawn_agent" → "Spawn Agent"). Falls back to the raw name. The
- *  existing `(name)` parenthetical from `argLabel` is appended separately. */
-export function displayName(name: string): string {
-  switch (name) {
-    case "spawn_agent":
-      return "Spawn Agent";
-    case "graph_search":
-      return "Graph Search";
-    case "graph_context":
-      return "Graph Context";
-    case "graph_impact":
-      return "Graph Impact";
-    case "graph_path":
-      return "Graph Path";
-    case "multi_edit":
-      return "Multi Edit";
-    default:
-      return name;
+/** Clamp one line of free text for a header phrase (first line, bounded). */
+function clampedText(text: string | null, max: number): string | null {
+  if (text === null) return null;
+  const oneLine = text.split(/\r?\n/)[0].trim();
+  if (!oneLine) return null;
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1).trimEnd()}…` : oneLine;
+}
+
+/** How many entries a multi-file arg array carries (`files[]`/`ops[]`). */
+function entryCount(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+/**
+ * A human sentence for the ToolCard header's COLLAPSED state — what the call
+ * is doing, derived from its args (e.g. `Searching for "WorkflowState"`,
+ * `Editing files`, `Running tests`, `Fetching https://…`).
+ *
+ * The raw tool name (search, file_edit, shell, …) is deliberately NOT part of
+ * the phrase: the expanded detail renders it, so a collapsed transcript reads
+ * like a narrative instead of a list of tool identifiers.
+ *
+ * Returns `null` when the tool is unknown (incl. MCP `mcp__server__tool`
+ * names) or the args cannot be parsed — the caller falls back to
+ * {@link prettyToolName}. React-free so the node-env unit tests can exercise
+ * it directly.
+ */
+export function actionPhrase(toolName: string, argsJson: string): string | null {
+  // A legacy saved call may predate the per-call `name` field (see the /load
+  // normalization): a missing name cannot yield a phrase — the caller falls
+  // back to `Using <prettyToolName>`.
+  if (typeof toolName !== "string" || toolName === "") return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(argsJson);
+  } catch {
+    return null;
   }
+  const str = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() ? v.trim() : null;
+
+  // Read surface.
+  if (toolName === "search" || toolName === "search_read") {
+    const pattern = str(parsed.pattern);
+    if (pattern === null) return "Searching the code";
+    const glob = str(parsed.glob);
+    return glob !== null
+      ? `Searching for "${pattern}" in ${glob}`
+      : `Searching for "${pattern}"`;
+  }
+  if (toolName === "read_files") {
+    const files = entryCount(parsed.files);
+    const single = str(parsed.path) !== null || str(parsed.file) !== null;
+    const count = files > 0 ? files : single ? 1 : 0;
+    if (count === 1) return "Reading a file";
+    return count > 1 ? `Reading ${count} files` : "Reading files";
+  }
+  if (toolName === "expand_result") return "Expanding an earlier result";
+
+  // Write surface.
+  if (toolName === "file_edit") return "Editing files";
+  if (toolName === "multi_edit") {
+    const count = entryCount(parsed.files);
+    return count > 1 ? `Editing ${count} files` : "Editing files";
+  }
+  if (toolName === "file_write") return "Writing files";
+  if (toolName === "file_append") return "Appending to a file";
+  if (toolName === "convert_line_endings") return "Converting line endings";
+
+  // Shell / git.
+  if (toolName === "shell") {
+    // A purpose is already a gerund phrase ("running tests") — capitalizing it
+    // IS the sentence; prefixing "Running" would double the verb.
+    const purpose = str(parsed.purpose);
+    return purpose !== null
+      ? purpose.charAt(0).toUpperCase() + purpose.slice(1)
+      : "Running a command";
+  }
+  if (toolName === "git") {
+    const sub = str(parsed.subcommand) ?? str(parsed.action);
+    if (sub === null) return "Running git";
+    const verbs: Record<string, string> = {
+      commit: "Committing",
+      status: "Checking git status",
+      log: "Reading the git log",
+      diff: "Reviewing a diff",
+      merge: "Merging",
+      push: "Pushing",
+      restore: "Restoring files",
+      stash: "Stashing changes",
+      checkout: "Switching branches",
+      branch: "Managing branches",
+      create: "Creating a branch",
+      delete: "Deleting a branch",
+      pop: "Popping the stash",
+      drop: "Dropping the stash",
+    };
+    return verbs[sub] ?? `Running git ${sub}`;
+  }
+  if (toolName === "git_read") {
+    const op = str(parsed.op);
+    if (op === null) return "Reading git history";
+    const verbs: Record<string, string> = {
+      log: "Reading the git log",
+      show: "Reading a commit",
+      diff: "Reviewing a diff",
+      status: "Checking git status",
+    };
+    return verbs[op] ?? `Reading git ${op}`;
+  }
+
+  // Network / browser.
+  if (toolName === "web_fetch") {
+    const url = str(parsed.url);
+    if (url === null) return "Fetching a page";
+    return `Fetching ${clampedText(url, 60) ?? url}`;
+  }
+  if (isBrowserToolName(toolName)) {
+    if (toolName.endsWith("_navigate")) {
+      const url = str(parsed.url);
+      return url !== null ? `Opening ${clampedText(url, 60) ?? url}` : "Opening a page";
+    }
+    if (toolName.endsWith("_click")) {
+      const selector = str(parsed.selector);
+      return selector !== null ? `Clicking ${selector}` : "Clicking on the page";
+    }
+    if (toolName.endsWith("_type")) {
+      const selector = str(parsed.selector);
+      return selector !== null ? `Typing into ${selector}` : "Typing on the page";
+    }
+    if (toolName.endsWith("_eval")) return "Running JavaScript";
+    if (toolName.endsWith("_screenshot")) return "Taking a screenshot";
+    if (toolName.endsWith("_snapshot")) return "Reading the page";
+    if (toolName.endsWith("_console")) return "Reading console logs";
+    if (toolName.endsWith("_switch_page")) return "Switching page";
+    if (toolName.endsWith("_list_pages")) return "Listing pages";
+    if (toolName.endsWith("_close_page")) return "Closing a page";
+    return null;
+  }
+
+  // Code graph.
+  if (toolName === "graph_search") {
+    const query = str(parsed.query) ?? str(parsed.name);
+    return query !== null
+      ? `Searching the code graph for "${query}"`
+      : "Searching the code graph";
+  }
+  if (toolName === "graph_context") {
+    const symbol = str(parsed.id) ?? str(parsed.name);
+    return symbol !== null ? `Inspecting ${symbol}` : "Inspecting a symbol";
+  }
+  if (toolName === "graph_impact") {
+    const symbol = str(parsed.id) ?? str(parsed.name);
+    return symbol !== null
+      ? `Checking the blast radius of ${symbol}`
+      : "Checking a symbol's blast radius";
+  }
+  if (toolName === "graph_path") {
+    const from = str(parsed.from);
+    const to = str(parsed.to);
+    return from !== null && to !== null
+      ? `Tracing a path from ${from} to ${to}`
+      : "Tracing a path";
+  }
+
+  // Memory.
+  if (toolName === "memory_write") {
+    const title = clampedText(str(parsed.title), 50);
+    return title !== null ? `Recording a memory: ${title}` : "Recording a memory";
+  }
+  if (toolName === "memory_search" || toolName === "memory_recall") return "Searching memories";
+  if (toolName === "memory_consolidate") return "Consolidating memory";
+  if (toolName === "memory_update") return "Updating a memory";
+  if (toolName === "memory_supersede") return "Superseding a memory";
+  if (toolName === "memory_amend") return "Amending a memory";
+  if (toolName === "memory_delete") return "Deleting a memory";
+
+  // Agents / reviews.
+  if (toolName === "spawn_agent") {
+    const name = str(parsed.name);
+    return name !== null ? `Spawning ${name}` : "Spawning a background agent";
+  }
+  if (toolName === "write_review_report") return "Writing the review report";
+
+  // Plan / backlog / skills.
+  if (toolName === "create_plan") return "Creating a plan";
+  if (toolName === "update_plan") return "Updating the plan";
+  if (toolName === "complete_step") return "Checking off a plan step";
+  if (toolName === "abandon_plan") return "Abandoning the plan";
+  if (toolName === "finish") return "Finishing the plan";
+  if (toolName === "backlog_add") return "Queueing a backlog item";
+  if (toolName === "backlog_status") return "Updating a backlog item";
+  if (toolName === "backlog_list") return "Reading the backlog";
+  if (toolName === "skill_start") {
+    const skill = str(parsed.skill);
+    return skill !== null ? `Starting skill ${skill}` : "Starting a skill";
+  }
+  if (toolName === "skill_end") return "Ending the skill";
+  if (toolName === "skill_reload") return "Reloading skills";
+  if (toolName === "skill_create") {
+    const name = str(parsed.name);
+    return name !== null ? `Creating skill ${name}` : "Creating a skill";
+  }
+
+  // Misc.
+  if (toolName === "ask_user") return "Asking you a question";
+  if (toolName === "list_models") return "Listing models";
+  if (toolName === "load_tools") return "Loading tools";
+  if (toolName === "image_ui_diff") return "Comparing two images";
+  if (toolName.startsWith("image_")) return "Analyzing the image";
+
+  return null;
+}
+
+/**
+ * Humanize a tool name that {@link actionPhrase} does not know (e.g. an MCP
+ * `mcp__server__tool`) for the header's `Using …` fallback: MCP's leading
+ * `mcp` segment is dropped, `__`/`_` become spaces, and the first letter is
+ * capitalized (`mcp__github__search` → `Github search`, `shell` → `Shell`).
+ */
+export function prettyToolName(name: string): string {
+  if (typeof name !== "string" || !name.trim()) return "tool";
+  const parts = name
+    .split(/_{2,}/)
+    .map((p) => p.replace(/_/g, " ").trim())
+    .filter(Boolean);
+  if (parts.length > 1 && parts[0].toLowerCase() === "mcp") parts.shift();
+  const joined = parts.join(" ").trim();
+  if (!joined) return name;
+  return joined.charAt(0).toUpperCase() + joined.slice(1);
+}
+
+/**
+ * One human headline for a whole ToolCard RUN — the collapsed label. A card
+ * may bundle calls to DIFFERENT tools (the 2026-10-18 bundling decision), so
+ * the headline summarizes the run instead of naming one tool:
+ *
+ *  - one call → that call's {@link actionPhrase};
+ *  - several → each call's phrase, consecutive repeats collapsed with a `×N`
+ *    count, joined with `, ` and ` and ` before the last, lowercased after the
+ *    first so the sentence reads continuously;
+ *  - an unknown tool (MCP `mcp__server__tool`) never drops a leg — it joins as
+ *    `Using <prettyToolName>`;
+ *  - the result is clamped (~120 chars) so a long run cannot wrap the header.
+ *
+ * Returns null only for an EMPTY run (the caller falls back to
+ * `Using <prettyToolName>`). React-free so the node-env unit tests can
+ * exercise it directly.
+ */
+export function groupPhrase(
+  calls: ReadonlyArray<{ name: string; args: string }>,
+): string | null {
+  if (calls.length === 0) return null;
+  const phrases: { text: string; count: number }[] = [];
+  for (const c of calls) {
+    const text = actionPhrase(c.name, c.args) ?? `Using ${prettyToolName(c.name)}`;
+    const last = phrases[phrases.length - 1];
+    if (last !== undefined && last.text === text) last.count += 1;
+    else phrases.push({ text, count: 1 });
+  }
+  const lower = (s: string) => s.charAt(0).toLowerCase() + s.slice(1);
+  const parts = phrases.map((p) => (p.count > 1 ? `${p.text} ×${p.count}` : p.text));
+  // Every leg after the first is lowercased so the run reads as one continuous
+  // sentence ("Reading a file, searching for \"foo\" and editing files").
+  const normalized = parts.map((p, i) => (i === 0 ? p : lower(p)));
+  let joined: string;
+  if (normalized.length === 1) {
+    joined = normalized[0];
+  } else if (normalized.length === 2) {
+    joined = `${normalized[0]} and ${normalized[1]}`;
+  } else {
+    joined = `${normalized.slice(0, -1).join(", ")} and ${normalized[normalized.length - 1]}`;
+  }
+  return clampedText(joined, 120) ?? joined;
 }
 
 /**

@@ -67,7 +67,8 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
             embed_dim       INTEGER,
             record_class    TEXT NOT NULL DEFAULT 'authored',
             record_type     TEXT NOT NULL DEFAULT 'none',
-            superseded_by   TEXT
+            superseded_by   TEXT,
+            quarantined     TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -318,6 +319,12 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'none'",
     )?;
     migrate_add_column_if_missing(conn, "memories", "superseded_by", "TEXT")?;
+
+    // Digest-integrity quarantine (backlog c68a8c3b): the reason set by
+    // the startup sweep (src/memory/integrity.rs); NULL = live. Existing
+    // rows migrate to NULL — nothing is quarantined until the sweep
+    // finds it malformed.
+    migrate_add_column_if_missing(conn, "memories", "quarantined", "TEXT")?;
 
     // The serving-endpoint dimension on request stats (per-endpoint tok/s
     // breakdown). Existing rows get NULL → grouped as one per-model row,

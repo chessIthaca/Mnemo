@@ -766,6 +766,27 @@ pub(crate) fn wire_brain(
                     Err(e) => eprintln!("warning: authored-row migration failed: {e}"),
                 }
             }
+            // Digest-integrity sweep (backlog c68a8c3b): quarantine —
+            // never delete — records corrupted at write/index time (the
+            // ".c"-truncated digest class) or self-marked no-longer-true
+            // bodies, so malformed digests never inject. Always at
+            // startup (cheap: one list + a heuristic scan; writes only
+            // when it finds something) and idempotent — the default
+            // filter already excludes quarantined rows from the scan.
+            // Runs BEFORE the staleness pre-check: integrity is not
+            // content-hash drift — it must hold even when the derived
+            // index is otherwise fresh.
+            match crate::memory::integrity::quarantine_malformed(store_for_index.as_ref())
+                .await
+            {
+                Ok(ids) if ids.is_empty() => {}
+                Ok(ids) => eprintln!(
+                    "memory integrity: quarantined {} malformed record(s): {:?}",
+                    ids.len(),
+                    ids
+                ),
+                Err(e) => eprintln!("warning: digest-integrity sweep failed: {e}"),
+            }
             // The staleness pre-check decides whether the reconcile runs at
             // all. A failure here (store error, scan failure) degrades to
             // "run the index anyway" — the reconcile is the recovery path
@@ -901,8 +922,7 @@ pub(crate) fn wire_brain(
     .with_preflight(
         config.general.context.preflight_compact,
         config.general.context.compact_headroom_tokens,
-    )
-    .with_proxy_cache_ceiling(config.general.context.proxy_cache_ceiling_tokens);
+    );
 
     // Vision client from config (shared helper — also used by Settings rewire).
     // Still useful when the main provider is multimodal (describe_image tool

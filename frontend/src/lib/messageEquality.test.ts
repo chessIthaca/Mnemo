@@ -174,7 +174,7 @@ describe("arePropsEqual", () => {
     // The reducer/store build a NEW calls array on every mutation; that (and
     // nothing else) is what makes a streaming tool card re-render as its live
     // output tail grows (tool_output_delta) while a finalized card stays put.
-    const call: ToolInvocation = { id: "c1", index: 0, args: "{}", result: null };
+    const call: ToolInvocation = { id: "c1", index: 0, name: "shell", args: "{}", result: null };
     const entry: TranscriptEntry = { kind: "tool", name: "shell", calls: [call] };
     expect(arePropsEqual({ entry }, { entry })).toBe(true);
 

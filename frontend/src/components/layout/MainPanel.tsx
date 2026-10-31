@@ -2,13 +2,60 @@
 // SPDX-License-Identifier: MIT
 // See LICENSE in the repository root.
 
-import { ShieldAlert, X } from "lucide-react";
+import { Plus, ShieldAlert, X } from "lucide-react";
+import { useState } from "react";
 import { useAgentStore } from "../../hooks/useAgentStore";
 import { useShallow } from "zustand/react/shallow";
 import type { AgentId } from "../../lib/types";
-import { cancel } from "../../lib/tauri";
+import { cancel, errMsg, spawnAgent } from "../../lib/tauri";
 import { Conversation } from "../chat/Conversation";
 import { Tabs, TabsList, TabsTrigger } from "../ui/tabs";
+
+/** Result of the add-agent form's submission (see submitAddAgent). */
+export interface AddAgentResult {
+  ok: boolean;
+  /** The spawned agent's id — set only on success. */
+  agentId: AgentId | null;
+  /** Human-readable failure message — set only on failure. */
+  error: string | null;
+}
+
+/**
+ * Create a new agent from the tab-rail "+" form (plan 2c26d533).
+ *
+ * The form's pure IPC + store seam — no React state — exported so the
+ * node-env vitest suite can drive the real spawn → register → activate
+ * chain without DOM test infra (the openMarkdownTarget pattern in
+ * MarkdownLink.test.tsx):
+ *  - trims the name and fails fast on blank (no IPC call);
+ *  - spawns via the `spawn_agent` IPC wrapper (spawnAgent); `reviewOnly`
+ *    true asks the backend for the strict read-only reviewer tool surface
+ *    (role "reviewer", REVIEWER_BASE_TOOLS);
+ *  - on success registers the new agent in the SAME single registry
+ *    runtime-spawned agents land in (useAgentEvents → registerAgents —
+ *    no parallel bookkeeping) and activates its tab;
+ *  - on failure returns errMsg's message for the inline form display; the
+ *    caller keeps the form open with its inputs intact.
+ */
+export async function submitAddAgent(
+  name: string,
+  reviewOnly: boolean,
+): Promise<AddAgentResult> {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return { ok: false, agentId: null, error: "Agent name is required" };
+  }
+  try {
+    const info = await spawnAgent(trimmed, reviewOnly);
+    // Register exactly like runtime-spawned agents so the new tab's
+    // name/model/parent come from the shared store, then make it active.
+    useAgentStore.getState().registerAgents([info]);
+    useAgentStore.getState().setActiveAgent(info.id);
+    return { ok: true, agentId: info.id, error: null };
+  } catch (e) {
+    return { ok: false, agentId: null, error: errMsg(e) };
+  }
+}
 
 /**
  * Top tab bar: one tab per agent (main + subagents). Clicking a tab makes it
@@ -31,6 +78,18 @@ import { Tabs, TabsList, TabsTrigger } from "../ui/tabs";
  *
  * Built on Radix Tabs: provides role="tablist"/"tab", aria-selected, and
  * left/right/Home/End arrow-key navigation for free.
+ *
+ * A "+" button at the end of the tab rail opens a small inline form that
+ * spawns a new agent: a name (default "agent") and a "Read-only review
+ * agent" checkbox (default off). The "+" is deliberately a PLAIN button — a
+ * sibling of the TabsTrigger elements, never nested inside one — so there
+ * are no nested buttons and Radix arrow-key navigation skips it (it is not
+ * part of the tab collection). Checking the box spawns the agent with
+ * reviewOnly=true, which the backend maps to the "reviewer" role and the
+ * strict read-only reviewer tool surface — the same allowlist a spawned
+ * review subagent gets. On success the new agent is registered exactly like
+ * runtime-spawned agents and its tab becomes active; on failure the error
+ * shows inline and the form stays open (see submitAddAgent above).
  */
 export function MainPanel() {
   const activeAgent = useAgentStore((s) => s.activeAgent);
@@ -78,6 +137,45 @@ export function MainPanel() {
     .sort((a, b) => a.id - b.id);
   const otherApproval = otherApprovals[0];
   const otherApprovalCount = otherApprovals.length;
+
+  // ── Add-agent form (the "+" button at the end of the tab rail) ──────────
+  // All form state is local: the form is a transient UI affordance; the
+  // created agent lands in the shared agent store via submitAddAgent above.
+  const [addOpen, setAddOpen] = useState(false);
+  // Name field — defaults to "agent", the backend's usual default naming.
+  const [addName, setAddName] = useState("agent");
+  // The "Read-only review agent" checkbox — off by default: a spawned agent
+  // is privileged unless the user explicitly asks for the reviewer surface.
+  const [addReviewOnly, setAddReviewOnly] = useState(false);
+  // Inline error from a failed spawn; null while closed/clean.
+  const [addError, setAddError] = useState<string | null>(null);
+  // True while the spawn request is in flight — disables Create.
+  const [addBusy, setAddBusy] = useState(false);
+
+  /** Close and reset the add-agent form (Cancel, Esc, and after success). */
+  const closeAddForm = () => {
+    setAddOpen(false);
+    setAddName("agent");
+    setAddReviewOnly(false);
+    setAddError(null);
+  };
+
+  /** Submit the add-agent form (Create / Enter). The IPC + store wiring
+   * lives in submitAddAgent; this handler only owns the form's UI state:
+   * close + reset on success, show the error inline and keep the inputs
+   * intact otherwise so the user can fix the name and retry. */
+  const submitAdd = async () => {
+    if (addBusy || !addName.trim()) return;
+    setAddBusy(true);
+    setAddError(null);
+    const res = await submitAddAgent(addName, addReviewOnly);
+    setAddBusy(false);
+    if (res.ok) {
+      closeAddForm();
+    } else {
+      setAddError(res.error ?? "Failed to spawn agent");
+    }
+  };
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -177,8 +275,95 @@ export function MainPanel() {
           {tabs.length === 0 && (
             <span className="px-2 py-1 text-xs text-slate-500">No agents</span>
           )}
+          {/* Add agent: a "+" at the end of the rail. Deliberately a PLAIN
+              button and a sibling of the TabsTrigger elements (never nested
+              inside one) — no nested buttons (the f3dd412 fix), and Radix
+              arrow-key navigation skips it since it is not part of the tab
+              collection. */}
+          <button
+            type="button"
+            onClick={() => {
+              setAddOpen(true);
+              setAddError(null);
+            }}
+            className="ml-1 flex h-7 w-7 shrink-0 self-center items-center justify-center rounded-sm text-slate-400 transition-colors hover:bg-bg-tertiary hover:text-cyan-400"
+            title="Add agent"
+            aria-label="Add agent"
+          >
+            <Plus className="h-4 w-4" />
+          </button>
         </TabsList>
       </Tabs>
+
+      {/* Add-agent inline form (plan 2c26d533): its own chrome row directly
+          below the tab rail — NOT inside the scrollable TabsList (no
+          overflow clipping) and clear of the tablist's keyboard semantics.
+          Enter submits, Esc cancels; Create is disabled while the spawn
+          request is in flight or the name is blank after trimming. A failed
+          spawn shows the error inline and leaves the form + inputs intact
+          so the user can fix the name and retry. */}
+      {addOpen && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submitAdd();
+          }}
+          onKeyDown={(e) => {
+            // Esc cancels from anywhere inside the form (key events bubble
+            // up from the focused input).
+            if (e.key === "Escape") {
+              e.preventDefault();
+              closeAddForm();
+            }
+          }}
+          aria-label="Add agent form"
+          className="flex items-center gap-2 border-b border-border bg-bg-secondary px-3 py-1.5 text-sm"
+        >
+          <input
+            value={addName}
+            onChange={(e) => setAddName(e.target.value)}
+            autoFocus
+            required
+            aria-label="Agent name"
+            placeholder="Agent name"
+            className="w-44 shrink-0 rounded-sm border border-border bg-bg-primary px-2.5 py-1 text-sm text-slate-200 outline-none focus:border-cyan-500"
+          />
+          <label className="flex shrink-0 cursor-pointer select-none items-center gap-1.5 text-xs text-slate-400">
+            <input
+              type="checkbox"
+              checked={addReviewOnly}
+              onChange={(e) => setAddReviewOnly(e.target.checked)}
+              className="h-3.5 w-3.5 accent-(--accent-color)"
+            />
+            Read-only review agent
+          </label>
+          <button
+            type="submit"
+            disabled={addBusy || !addName.trim()}
+            className="shrink-0 rounded-sm bg-cyan-600 px-3 py-1 text-xs font-medium text-white hover:bg-cyan-500 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {addBusy ? "Creating…" : "Create"}
+          </button>
+          <button
+            type="button"
+            onClick={closeAddForm}
+            className="shrink-0 rounded-sm border border-border px-3 py-1 text-xs text-slate-400 hover:text-slate-200"
+          >
+            Cancel
+          </button>
+          {/* Inline spawn error (errMsg of the backend's IpcError DTO) —
+              keeps the form + inputs intact; see submitAdd. */}
+          {addError && (
+            <span
+              role="alert"
+              className="min-w-0 flex-1 truncate text-xs text-red-400"
+              title={addError}
+            >
+              {addError}
+            </span>
+          )}
+        </form>
+      )}
 
       {/* Non-active agent needs approval — banner only; never auto-steal focus. */}
       {otherApproval && (

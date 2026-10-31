@@ -266,10 +266,7 @@ pub fn context_manager_for_model(
     // by the resolver with the shared log, does the recording).
     let provider = build_provider_for(config, model, None)?;
     let max_context = provider.capabilities().max_context;
-    Some(
-        ContextManager::new(max_context, fill_rate)
-            .with_proxy_cache_ceiling(config.general.context.proxy_cache_ceiling_tokens),
-    )
+    Some(ContextManager::new(max_context, fill_rate))
 }
 
 /// Build the vision image-to-text client from config, if configured and the

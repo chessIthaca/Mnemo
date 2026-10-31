@@ -148,6 +148,31 @@ pub struct PlanFile {
     /// frontend wire shape (`PlanFile` is serialized directly to the UI).
     #[serde(skip)]
     pub reviews: Vec<ReviewRoundStamp>,
+    /// The plan board's decision log (Mnemo2 Phase 6): the raw `## Decisions`
+    /// body, one dated bullet per decision. `None` for Mnemo1 plans.
+    /// Persisted verbatim; `#[serde(skip)]` keeps it off the frontend wire
+    /// shape.
+    #[serde(skip)]
+    pub decisions: Option<String>,
+    /// The plan board's interface contracts: the raw `## Interfaces` body,
+    /// one dated bullet per contract (exports, signatures, data shapes, file
+    /// ownership). `None` for older plans. Persisted verbatim;
+    /// `#[serde(skip)]` keeps it off the frontend wire shape.
+    #[serde(skip)]
+    pub interfaces: Option<String>,
+    /// The plan's acceptance scenarios: the raw `## Acceptance scenarios`
+    /// body, one observable bullet per scenario. Mnemo2's high-risk dispatch
+    /// and audits read them from the dispatched board plan. `None` when the
+    /// plan declares none. Persisted verbatim; `#[serde(skip)]` keeps it off
+    /// the frontend wire shape.
+    #[serde(skip)]
+    pub acceptance: Option<String>,
+    /// The plan board's outcome log (Mnemo2 Phase 6): the raw `## Progress`
+    /// body, one bullet per step outcome. `None` for Mnemo1 plans.
+    /// Persisted verbatim; `#[serde(skip)]` keeps it off the frontend wire
+    /// shape.
+    #[serde(skip)]
+    pub progress: Option<String>,
     pub steps: Vec<Step>,
 }
 
@@ -199,6 +224,10 @@ pub struct Step {
         let mut landed_design = false;
         let mut detailed_steps = String::new();
         let mut reviews: Vec<ReviewRoundStamp> = Vec::new();
+        let mut decisions = String::new();
+        let mut interfaces = String::new();
+        let mut acceptance = String::new();
+        let mut progress = String::new();
         let mut steps = Vec::new();
 
         let mut section = Section::Preamble;
@@ -223,6 +252,10 @@ pub struct Step {
                     "regression test" => Section::RegressionTest,
                     "landed design" => Section::LandedDesign,
                     "reviews" => Section::Reviews,
+                    "decisions" => Section::Decisions,
+                    "interfaces" => Section::Interfaces,
+                    "acceptance scenarios" => Section::Acceptance,
+                    "progress" => Section::Progress,
                     "steps" => Section::Steps,
                     "detailed steps" => Section::DetailedSteps,
                     _ => {
@@ -306,6 +339,30 @@ pub struct Step {
                     }
                     detailed_steps.push_str(line);
                 }
+                Section::Decisions => {
+                    if !decisions.is_empty() {
+                        decisions.push('\n');
+                    }
+                    decisions.push_str(line);
+                }
+                Section::Interfaces => {
+                    if !interfaces.is_empty() {
+                        interfaces.push('\n');
+                    }
+                    interfaces.push_str(line);
+                }
+                Section::Acceptance => {
+                    if !acceptance.is_empty() {
+                        acceptance.push('\n');
+                    }
+                    acceptance.push_str(line);
+                }
+                Section::Progress => {
+                    if !progress.is_empty() {
+                        progress.push('\n');
+                    }
+                    progress.push_str(line);
+                }
                 Section::Reviews => {
                     // One `<round> <base>` line per stamp (our serialize).
                     // A malformed line is SKIPPED, never an error: the
@@ -342,6 +399,10 @@ pub struct Step {
                 Some(detailed_steps.trim().to_string())
             },
             reviews,
+            decisions: Some(decisions.trim().to_string()).filter(|d| !d.is_empty()),
+            interfaces: Some(interfaces.trim().to_string()).filter(|d| !d.is_empty()),
+            acceptance: Some(acceptance.trim().to_string()).filter(|a| !a.is_empty()),
+            progress: Some(progress.trim().to_string()).filter(|p| !p.is_empty()),
             steps,
         })
     }
@@ -357,6 +418,10 @@ enum Section {
     RegressionTest,
     LandedDesign,
     Reviews,
+    Decisions,
+    Interfaces,
+    Acceptance,
+    Progress,
     Other,
 }
 
@@ -541,4 +606,27 @@ fn strip_leading_number(s: &str) -> String {
         }
     }
     s.to_string()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn board_sections_parse_and_unknown_sections_stay_ignored() {
+        let text = "# Plan: T\n\n## Goal\nG\n\n## Kind\nbug_fixing\n\n## Context\nWhy.\n\n\
+                    ## Steps\n- [x] 1. one\n- [ ] 2. two\n\n## Decisions\n- d1\n- d2\n\n\
+                    ## Interfaces\n- i1\n\n## Notes\nfree text\n\n## Progress\n- p1\n";
+        let plan = PlanFile::parse(text).unwrap();
+        assert_eq!(plan.kind, PlanKind::BugFixing);
+        assert_eq!(plan.context, "Why.");
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.steps[0].done);
+        assert_eq!(plan.decisions.as_deref(), Some("- d1\n- d2"));
+        assert_eq!(plan.interfaces.as_deref(), Some("- i1"));
+        assert_eq!(plan.progress.as_deref(), Some("- p1"));
+
+        // A Mnemo1 file has neither section.
+        let old = PlanFile::parse("# Plan: T\n\n## Goal\nG\n\n## Steps\n- [ ] 1. one\n").unwrap();
+        assert!(old.decisions.is_none() && old.progress.is_none() && old.interfaces.is_none());
+    }
 }

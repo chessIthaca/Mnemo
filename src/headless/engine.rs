@@ -29,7 +29,9 @@ use crate::headless::codegraph_api::CodegraphApi;
 use crate::headless::memory_api::MemoryApi;
 use crate::host::brain::{wire_brain, Brain, BrainMemoryOptions};
 use crate::host::notifier::{HostNotifier, SharedNotifier};
-use crate::host::runtime::{spawn_agent_shared, HostRuntime, SessionOptions, SpawnHost};
+use crate::host::runtime::{
+    spawn_agent_shared, HostRuntime, SessionOptions, SpawnHost, WorktreeBinding,
+};
 use crate::provider::LlmClient;
 
 /// The fan-out notifier: every host event lands on the engine's broadcast
@@ -60,8 +62,11 @@ pub struct Engine {
     brain: Arc<Brain>,
     /// The shared state (host core + session registry + responder maps).
     inner: Arc<EngineInner>,
-    /// The session event bus — `AgentSession::events()` subscribes.
-    bus: broadcast::Sender<SessionEvent>,
+    /// The session event bus — `AgentSession::events()` subscribes. Behind a
+    /// lock so `shutdown(&self)` can DROP the engine's sender: a shared
+    /// `Arc<Engine>` that is shut down must still let the bus close, or a
+    /// subscriber's `recv` would wait forever (§7 row 15).
+    bus: std::sync::Mutex<Option<broadcast::Sender<SessionEvent>>>,
     /// The host-event bus — `host_events()` subscribes.
     host_events_tx: broadcast::Sender<HostEvent>,
     /// The default permission policy for spawned sessions (§5.4); a
@@ -177,6 +182,25 @@ impl EngineBuilder {
     }
 }
 
+/// Build the root binding for a worktree-bound session: the canonical
+/// worktree checkout plus its own code graph. A missing worktree is a spawn
+/// error (never a silent fallback to the engine's root, which would let two
+/// workers edit one tree).
+fn worktree_binding(root: std::path::PathBuf) -> Result<WorktreeBinding, EngineError> {
+    let worktree = std::fs::canonicalize(&root)
+        .map_err(|e| EngineError::spawn_failed(format!("worktree '{}': {e}", root.display())))?;
+    let coding_dir = worktree.join(".coding");
+    let _ = std::fs::create_dir_all(&coding_dir);
+    let codegraph =
+        crate::codegraph::CodeGraph::open(worktree.clone(), &coding_dir.join("codegraph.db"))
+            .ok()
+            .map(Arc::new);
+    Ok(WorktreeBinding {
+        worktree,
+        codegraph,
+    })
+}
+
 impl Engine {
     /// The engine's brain (job 4 D4): `Setup::for_engine` Arc-clones
     /// the shared handles for the live-apply; the `memory()`/`codegraph()`
@@ -248,6 +272,12 @@ impl Engine {
     /// `SpawnOptions::permissions` override, else the engine default
     /// (§5.4's engine exposure).
     pub async fn spawn(&self, opts: SpawnOptions) -> Result<AgentSession, EngineError> {
+        // Fail fast on a shut-down engine (review round-1 F2): the bus check
+        // must precede any host work or session registration, or a rejected
+        // spawn leaves a registered-but-unusable idle agent behind.
+        let bus = self
+            .session_bus()
+            .ok_or_else(|| EngineError::session_closed("the engine is shut down"))?;
         // 3c/G6 tiers 1 + 2 (D4, §5.9.6): the named-policy resolution
         // and the declarative guardrails. A named policy (tier 1) IS
         // the policy — exclusive with a non-default guardrails spec
@@ -304,13 +334,19 @@ impl Engine {
             .and_then(|g| g.limits.clone())
             .or(opts.limits);
         let name = opts.name.unwrap_or_else(|| "session".to_string());
-        let model = match opts.model.as_deref() {
-            Some(spec) => Some(parse_model_ref(spec).map_err(EngineError::spawn_failed)?),
-            None => None,
-        };
+        let model = forced_model_ref(opts.model.as_deref(), opts.reasoning_effort)
+            .map_err(EngineError::spawn_failed)?;
         let permission = opts
             .permissions
             .unwrap_or_else(|| self.default_permissions.clone());
+        // A worktree-bound session (a Mnemo2 worker / run-all agent) runs
+        // entirely inside its own checkout: the sandbox, project root, plans
+        // dir, and code graph all resolve there, so concurrent workers never
+        // share a working tree.
+        let worktree = match opts.worktree {
+            Some(root) => Some(worktree_binding(root)?),
+            None => None,
+        };
         // 3c/G2 (§5.9.2): the session's host tools — engine-registered
         // Rust tools plus the per-spawn spec shims. Duplicate names within
         // the combined list refuse the spawn; a name colliding with a
@@ -357,14 +393,23 @@ impl Engine {
             SessionOptions {
                 model,
                 role: None, // no role
-                // own plans dir (a parentless session agent)
-                own_plans_dir: true,
-                // no worktree binding (the option wires with 3c)
-                worktree: None,
+                // own plans dir (a parentless session agent) unless the host
+                // opted into the project's shared plans dir
+                own_plans_dir: !self
+                    .inner
+                    .shared_plans
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                // 3c: a worktree-bound session gets its own sandbox, root,
+                // plans dir, and graph (Mnemo2 workers / run-all agents).
+                worktree,
                 permission: Some(permission),
                 // 3a.6 (G5): the resume seed — the transcript's messages
                 // become the initial conversation (§5.9.5 :693-695).
-                initial_messages: opts.resume.map(|transcript| transcript.messages),
+                // Scaffolding an older export leaked into the saved
+                // transcript is dropped, never resumed as history.
+                initial_messages: opts.resume.map(|transcript| {
+                    crate::agent::prompt::strip_request_scaffolding(transcript.messages)
+                }),
                 // 3a.7 (G7, §5.9.7) + 3c/G6 tier 2: the per-session limits —
                 // the guardrails' limits override the option's.
                 limits: effective_limits,
@@ -418,7 +463,7 @@ impl Engine {
             id,
             agent,
             inner: self.inner.clone(),
-            bus: self.bus.clone(),
+            bus,
         })
     }
 
@@ -429,15 +474,30 @@ impl Engine {
     /// F1/F3).
     pub async fn session(&self, id: &SessionId) -> Option<AgentSession> {
         let agent = *self.inner.sessions.lock().await.get(id)?;
+        let bus = self.session_bus()?;
         Some(AgentSession {
             id: *id,
             agent,
             inner: self.inner.clone(),
-            bus: self.bus.clone(),
+            bus,
         })
     }
 
+    /// The session-bus sender, or `None` once the engine shut down. A
+    /// shut-down engine has no bus: the sender is dropped so every
+    /// subscriber's `recv` observes `Closed` (§7 row 15) even though
+    /// `shutdown` borrows `&self` (a shared `Arc<Engine>` cannot move).
+    fn session_bus(&self) -> Option<broadcast::Sender<SessionEvent>> {
+        self.bus.lock().expect("session bus lock poisoned").clone()
+    }
+
     /// The engine's host-event bus (§5.3 :300).
+    ///
+    /// Unlike the session bus (§7 row 15), this one closes on engine *drop*,
+    /// not on `shutdown()`: the brain's notifier holds a sender clone for the
+    /// engine's lifetime, so a shared `Arc<Engine>` cannot close it inside
+    /// `shutdown(&self)` (review round-1 F1 — latent; no production code
+    /// subscribes host events on a shared engine today).
     pub fn host_events(&self) -> EventReceiver<HostEvent> {
         EventReceiver {
             rx: self.host_events_tx.subscribe(),
@@ -447,7 +507,7 @@ impl Engine {
     /// Shut the engine down (§5.3 :301): cancel every live session,
     /// deregister, stop the pump. (The session-end consolidation rides
     /// the kernel's existing shutdown path when the loops' tasks end.)
-    pub async fn shutdown(self) -> Result<(), EngineError> {
+    pub async fn shutdown(&self) -> Result<(), EngineError> {
         let agents: Vec<crate::runtime::AgentId> = self
             .inner
             .sessions
@@ -462,7 +522,43 @@ impl Engine {
         }
         self.inner.sessions.lock().await.clear();
         self.pump.abort();
+        // Drop the engine's bus sender LAST: every subscriber's `recv` then
+        // observes `Closed`. `shutdown` borrows `&self` so a shared
+        // `Arc<Engine>` can shut down, which means the sender must be
+        // takeable rather than left alive with the struct (§7 row 15).
+        let _ = self.bus.lock().expect("session bus lock poisoned").take();
         Ok(())
+    }
+
+    /// Let worktree-less sessions use the project's main plans dir
+    /// (`<state_dir>/plans`, the stack Mnemo1's main agent uses) instead of a
+    /// private `agents/<id>` dir, so plans survive respawns and are shared
+    /// with other hosts of the project. Affects sessions spawned afterwards;
+    /// worktree-bound sessions keep their in-checkout plans dir.
+    pub fn use_project_plans(&self) {
+        self.inner
+            .shared_plans
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The project memory store the brain wired, if memory is enabled.
+    pub fn memory_store_handle(&self) -> Option<std::sync::Arc<dyn crate::memory::MemoryStoreTrait>> {
+        self.brain.factory.memory_handle()
+    }
+
+    /// The project knowledge store (`<state_dir>/knowledge`), if wired.
+    pub fn knowledge_store_handle(&self) -> Option<std::sync::Arc<crate::memory::knowledge::KnowledgeStore>> {
+        self.brain.factory.knowledge_handle()
+    }
+
+    /// The engine's own code graph, if `index_codegraph` opened one.
+    pub fn codegraph_handle(&self) -> Option<std::sync::Arc<crate::codegraph::CodeGraph>> {
+        self.brain.factory.codegraph_handle()
+    }
+
+    /// The directory the `finish` tool writes review reports to.
+    pub fn reviews_dir(&self) -> std::path::PathBuf {
+        self.brain.factory.reviews_dir()
     }
 
     /// §5.6's memory data API — the debug/read + maintenance surface,
@@ -745,6 +841,7 @@ async fn start_inner(
         policy_registry: std::sync::Mutex::new(HashMap::new()),
         parked: Mutex::new(HashSet::new()),
         tallies: std::sync::Mutex::new(HashMap::new()),
+        shared_plans: std::sync::atomic::AtomicBool::new(false),
     });
     let pump = tokio::spawn(pump_task(fanin, bus.clone(), inner.clone()));
 
@@ -788,7 +885,7 @@ async fn start_inner(
     Ok(Engine {
         brain,
         inner,
-        bus,
+        bus: std::sync::Mutex::new(Some(bus)),
         host_events_tx,
         default_permissions: opts.permissions,
         configured_embedding_model,
@@ -807,6 +904,24 @@ fn parse_model_ref(spec: &str) -> Result<crate::config::ModelRef, String> {
         model: model.to_string(),
         reasoning_effort: None,
     })
+}
+
+/// The spawn's forced model with its optional reasoning effort. An effort
+/// needs a model to apply to — it is refused rather than silently dropped.
+fn forced_model_ref(
+    spec: Option<&str>,
+    reasoning_effort: Option<String>,
+) -> Result<Option<crate::config::ModelRef>, String> {
+    match (spec, reasoning_effort) {
+        (Some(spec), effort) => Ok(Some(crate::config::ModelRef {
+            reasoning_effort: effort,
+            ..parse_model_ref(spec)?
+        })),
+        (None, Some(effort)) => Err(format!(
+            "reasoning_effort '{effort}' needs an explicit model to apply to"
+        )),
+        (None, None) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -957,6 +1072,48 @@ mod tests {
         ) -> crate::error::Result<BoxStream<'_, LlmEvent>> {
             unimplemented!("the exclusivity refusal precedes any transport")
         }
+    }
+
+    #[test]
+    fn forced_model_carries_the_requested_reasoning_effort() {
+        let forced = forced_model_ref(Some("Kimi/kimi-k3.1-pro"), Some("high".into()))
+            .expect("valid spec")
+            .expect("a forced model");
+        assert_eq!(forced.endpoint, "Kimi");
+        assert_eq!(forced.model, "kimi-k3.1-pro");
+        assert_eq!(forced.reasoning_effort.as_deref(), Some("high"));
+        let default_effort = forced_model_ref(Some("Kimi/kimi-k3.1-pro"), None)
+            .expect("valid spec")
+            .expect("a forced model");
+        assert_eq!(default_effort.reasoning_effort, None);
+        assert!(forced_model_ref(None, None).expect("routing").is_none());
+        let refused = forced_model_ref(None, Some("high".into())).expect_err("no model");
+        assert!(refused.contains("needs an explicit model"), "{refused}");
+    }
+
+    #[test]
+    fn worktree_binding_uses_the_worktree_checkout() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let binding = worktree_binding(dir.path().to_path_buf()).expect("binding");
+        assert_eq!(
+            binding.worktree,
+            std::fs::canonicalize(dir.path()).expect("canonical")
+        );
+        assert!(
+            binding.codegraph.is_some(),
+            "the worktree gets its own code graph"
+        );
+    }
+
+    #[test]
+    fn worktree_binding_rejects_a_missing_worktree() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let err = match worktree_binding(dir.path().join("missing")) {
+            Ok(_) => panic!("a missing worktree must fail the spawn"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "spawn_failed");
+        assert!(err.to_string().contains("worktree"), "{err}");
     }
 }
 

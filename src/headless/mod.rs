@@ -31,7 +31,9 @@ pub use host_tools::{HostTool, HostToolSpec, HOST_TOOL_DEFAULT_TIMEOUT_MS};
 /// headless defines no data of its own; the definitions live where the
 /// kernel consumers see them).
 pub use crate::agent::factory::{ToolGroup, ToolSelection};
-pub use crate::agent::policy::{GateRule, Guardrails, QuestionPolicy, TurnEndPolicy};
+pub use crate::agent::policy::{GateRule, GateVerdict, Guardrails, QuestionPolicy, TurnEndPolicy};
+pub use crate::agent::prompt::{assemble_spec_head, ConstitutionMode, PromptBlock, PromptSpec};
+pub use crate::project::Constitution;
 pub use memory_api::{
     MemoryApi, MemoryCounts, MemoryDebugOverview, MemoryDebugWire, MemoryIndexStatus,
     ScoredMemoryDebugWire,
@@ -54,13 +56,14 @@ pub use crate::host::runtime::{
     SessionOptions, SpawnHost, WorktreeBinding,
 };
 pub use setup::{
+    EndpointDetailDto, EndpointTestDto, ModelDetailDto, PriceDto, ProviderModelDto, TiersDto,
     EmbedderReadiness, EmbeddingModelDto, EndpointDto, EndpointReadiness, EngineConfig,
     InitProjectOptions, McpTestResult, ProjectInfo, ProjectReadiness, SafetyRuleDto,
     SafetyRulesDto, Scope, Setup, SetupEvent, SetupStatus, SetupStep,
 };
 pub use stats::{EngineStats, SessionStats, TraceApi, UsageRates};
 pub use types::{
-    EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
+    AgentPlan, EngineOptions, EventReceiver, HostEvent, MemoryBackend, PendingInteraction, RecvError,
     SessionCommand, SessionEvent, SessionId, SessionLimits, SessionSnapshot, SpawnOptions,
     Transcript, TurnOutcome,
 };

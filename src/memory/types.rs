@@ -224,6 +224,13 @@ pub struct Memory {
     /// default, retrievable via `include_superseded`.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Why this record was quarantined by the startup digest-integrity
+    /// sweep (backlog c68a8c3b — src/memory/integrity.rs); `None` while
+    /// the record is live. Quarantined records are excluded from
+    /// recall/listing/primer by default, retrievable via
+    /// `include_quarantined` — recoverable history, never a delete.
+    #[serde(default)]
+    pub quarantined: Option<String>,
     /// Optional embedding vector (not serialized to JSON normally).
     #[serde(default, skip_serializing)]
     pub embedding: Vec<f32>,
@@ -251,6 +258,7 @@ impl Memory {
             record_class: MemoryClass::Authored,
             record_type: MemoryRecordType::None,
             superseded_by: None,
+            quarantined: None,
             embedding: Vec::new(),
         }
     }
@@ -344,6 +352,13 @@ pub struct MemoryFilter {
     /// recall/listing — supersession is history, not live knowledge. Set to
     /// `false` via [`MemoryFilter::include_superseded`] to retrieve history.
     pub exclude_superseded: bool,
+    /// When `true` (the default), quarantined records (the startup
+    /// digest-integrity sweep's finds, backlog c68a8c3b) are excluded
+    /// from recall/listing and the session primer — a malformed or
+    /// self-contradicted record is not live knowledge. Set to `false`
+    /// via [`MemoryFilter::include_quarantined`] to retrieve them
+    /// (recoverable history — quarantine never deletes).
+    pub exclude_quarantined: bool,
     /// Optional typed-record filter — restrict results to one record type
     /// (`SPEC:`/`DECISION:`/`BUG:`/`PLAN:`/`HOW:`/`REVIEW:`). `None` matches all.
     pub record_type: Option<MemoryRecordType>,
@@ -360,6 +375,7 @@ impl Default for MemoryFilter {
             limit: None,
             exclude_working: true,
             exclude_superseded: true,
+            exclude_quarantined: true,
             record_type: None,
             title_prefix: None,
         }
@@ -392,6 +408,15 @@ impl MemoryFilter {
     /// superseded records are excluded entirely, not merely downranked.
     pub fn include_superseded(mut self) -> Self {
         self.exclude_superseded = false;
+        self
+    }
+
+    /// Opt into listing/recalling quarantined records (the startup
+    /// digest-integrity sweep's finds — recoverable history). Off by
+    /// default — quarantined records are excluded entirely, not merely
+    /// downranked.
+    pub fn include_quarantined(mut self) -> Self {
+        self.exclude_quarantined = false;
         self
     }
 

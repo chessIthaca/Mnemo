@@ -133,7 +133,11 @@ pub struct FileEditArgs {
     /// re-emitted in the file's detected style; an empty file takes the
     /// caller's text verbatim (no style to preserve). Mutually exclusive
     /// with `ops`, line-range mode, `old_string`, and the matching knobs
-    /// (`use_regex`/`replace_all`/`count`/`fuzzy_whitespace`). Errors when
+    /// (`use_regex`/`replace_all`/`count`/`fuzzy_whitespace`). With an
+    /// empty/omitted `new_string` it instead ENSURES the file ends with
+    /// exactly one final newline: the detected line ending is added when
+    /// missing; an already-terminated (or empty) file is returned
+    /// unchanged with a note (backlog c19ec2ff). Errors when
     /// the file is missing — use `file_write` to create it.
     #[serde(default, deserialize_with = "crate::tool::null_to_default")]
     pub append: bool,
@@ -191,7 +195,8 @@ fn large_payload_note(args: &FileEditArgs) -> Option<String> {
     // Ops mode measures each element — the largest single emitted fragment
     // is what the advisory is about (anchor objects: their old/new pair;
     // compact line ops: the whole op string, payload included).
-    if let Some(ops) = args.ops.as_deref() {
+    if ops_present(args) {
+        let ops = args.ops.as_deref().unwrap_or(&[]);
         let largest = ops
             .iter()
             .map(|value| match value {
@@ -255,7 +260,7 @@ fn prepare_edit_ctx(
     if args.from_read.is_some() {
         // The read-receipt cite (backlog 3fdc605f) is the lines mode's
         // validated anchor — it combines with lines + new_string only.
-        if args.ops.is_some() {
+        if ops_present(args) {
             return Err(crate::error::Error::InvalidInput(
                 "from_read is mutually exclusive with ops — the anchor items carry \
                  their own from_read cites"
@@ -275,7 +280,7 @@ fn prepare_edit_ctx(
             ));
         }
     }
-    if args.ops.is_some() {
+    if ops_present(args) {
         prepare_edit_ops(args, content, validated_path)
     } else if args.append {
         prepare_edit_append(args, content)
@@ -306,6 +311,17 @@ fn prepare_edit_ctx(
             prepare_edit_literal(args, content)
         }
     }
+}
+
+/// Backlog c19ec2ff (b): `ops` counts as present only when `Some` AND
+/// non-empty — a delivered `Some([])` means the caller populated the
+/// single-edit fields and merely passed an empty array for the unused
+/// parameter (hit twice mid-plan 2027-01-25); treating it as ops-mode
+/// hard-errored with "ops is empty" instead of performing the obvious
+/// single edit. All ops-mode branches use this predicate so an empty
+/// array behaves exactly like an absent one everywhere.
+fn ops_present(args: &FileEditArgs) -> bool {
+    args.ops.as_deref().is_some_and(|v| !v.is_empty())
 }
 
 /// Line-range edit path: replace the `lines` range — `[start, end]`
@@ -552,9 +568,12 @@ fn prepare_edit_ops(
 /// file takes the caller's text verbatim — there is no style to preserve,
 /// matching `detect_line_ending_path`'s None convention). The caller must
 /// have left `old_string` and the matching knobs unset (validated here);
-/// execute() steers a missing file to `file_write`.
+/// execute() steers a missing file to `file_write`. An empty/omitted
+/// `new_string` instead ENSURES the final newline: the detected line
+/// ending is added when missing; an already-terminated (or empty) file
+/// is returned unchanged with a note (backlog c19ec2ff).
 fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdit> {
-    if args.ops.is_some() {
+    if ops_present(args) {
         return Err(crate::error::Error::InvalidInput(
             "append is mutually exclusive with ops".into(),
         ));
@@ -599,10 +618,32 @@ fn prepare_edit_append(args: &FileEditArgs, content: &str) -> Result<PreparedEdi
                 .into(),
         ));
     }
+    // Backlog c19ec2ff (a): an empty/omitted new_string is the
+    // ensure-final-newline affordance — the one-call way to restore a
+    // missing trailing EOF newline WITHOUT the newline byte having to
+    // survive the delivered arguments (the 2027-01-25 restore attempts
+    // failed because the trailing newline never arrived: the single-mode
+    // no-op guard and the r-op payload-equals rejection both saw
+    // newline-less strings, forcing a shell fallback).
     if args.new_string.is_empty() {
-        return Err(crate::error::Error::InvalidInput(
-            "new_string is empty — there is nothing to append".into(),
-        ));
+        let mut notes = Vec::new();
+        let new_content = if content.is_empty() {
+            notes.push("file is empty — there is no final newline to ensure".into());
+            content.to_string()
+        } else if content.ends_with('\n') {
+            notes.push("file already ends with a newline — nothing to ensure".into());
+            content.to_string()
+        } else {
+            notes.push("ensured final newline".into());
+            format!("{content}{}", detect_line_ending(content))
+        };
+        let diff = compute_diff(&args.path, content, &new_content);
+        return Ok(PreparedEdit {
+            path: args.path.clone(),
+            diff,
+            new_content,
+            notes,
+        });
     }
 
     let le = detect_line_ending(content);
@@ -812,8 +853,8 @@ impl Tool for FileEditTool {
                     "ops": {"type": "array", "description": "Ops array: the edits to apply IN ORDER, written ONCE — any failing op aborts the whole array with every file untouched on disk. A compact line op is a string: {i|b|d|r}{N|N-M|N-}[:payload], 1-indexed inclusive — 'i101:text' inserts after line 101 ('i0:' top, 'i<line count>:' EOF), 'b101:text' inserts before line 101, 'd202-205' deletes ('d202' one line, 'd100-' to EOF), 'r102:text' replaces a line ('r100-120:text' a range; 'r102:' leaves one empty line). Line numbers refer to the content as left by the preceding ops. An anchor object {old_string, new_string, count?, fuzzy_whitespace?} — or the \
                   read-receipt cite {from_read, lines, new_string} (backlog \
                   3fdc605f: validated server-side against the cited read's bytes; \
-                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines.", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
-                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
+                  drift hard-fails with a fresh-read steer) — is also an element; its anchor must match exactly once unless it sets count. Mutually exclusive with old_string/new_string/use_regex/replace_all/count/lines. An empty array is treated as absent (falls back to single-edit/append/line-range mode).", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"old_string": {"type": "string", "description": "The exact text to find (EOL-agnostic matching)."}, "new_string": {"type": "string", "description": "The replacement text."}, "count": {"type": "integer", "description": "Replace at most N occurrences of this item's old_string (default 1)."}, "fuzzy_whitespace": {"type": "boolean", "description": "Whitespace-tolerant matching for this item (default: the array-level fuzzy_whitespace)."}, "from_read": {"type": "string", "description": "Read-receipt cite: the id a prior read_files trailer minted (backlog 3fdc605f)."}, "lines": {"type": "array", "items": {"type": "integer"}, "description": "The cite's line range [start, end], 1-indexed inclusive — validated against the receipt."}}, "required": ["new_string"]}]}},
+                    "append": {"type": "boolean", "description": "Append mode: add new_string at EOF (on a fresh line, in the file's detected line-ending style) instead of replacing — no old_string needed. With an empty/omitted new_string it instead ENSURES the file ends with exactly one final newline (adds the detected line ending when missing; idempotent success + note when already terminated) — the affordance for restoring a lost trailing EOF newline. Mutually exclusive with ops/line-range/old_string and the matching knobs. Errors when the file is missing — use file_write to create it (default: false)."},
                     "artifact_check": {"type": "boolean", "description": "Last resort: false skips the emission-artifact validation (see the rejection message)."}
                 },
                 "required": ["path"]
@@ -872,7 +913,7 @@ impl Tool for FileEditTool {
         // changing the content); the normalized-equal guards (whitespace/
         // EOL) stay in the splice — only the byte-identical case is
         // knowable pre-read.
-        if args.ops.is_none()
+        if !ops_present(&args)
             && !args.append
             && args.lines.is_none()
             && !args.use_regex
@@ -2623,6 +2664,134 @@ mod tests {
         let mut args = append_args("a.txt", "tail");
         args.use_regex = true;
         assert!(prepare_edit(&args, "x\n").is_err());
+    }
+
+    /// Backlog c19ec2ff (a): append mode with an empty/omitted new_string is
+    /// the ensure-final-newline affordance — the one-call way to restore a
+    /// file's missing trailing newline WITHOUT the newline byte having to
+    /// survive the delivered arguments (the 2027-01-25 restore attempts
+    /// failed because the trailing newline never arrived: the single-mode
+    /// no-op guard and the r-op payload-equals rejection both saw
+    /// newline-less strings, forcing a shell fallback).
+    #[test]
+    fn append_empty_new_string_ensures_final_newline() {
+        // LF file missing the trailing newline: exactly one '\n' added.
+        let args = append_args("a.txt", "");
+        let prepared = prepare_edit(&args, "alpha\n}").unwrap();
+        assert_eq!(prepared.new_content, "alpha\n}\n");
+        assert!(
+            prepared
+                .notes
+                .iter()
+                .any(|n| n.contains("ensured final newline")),
+            "notes: {:?}",
+            prepared.notes
+        );
+
+        // CRLF file: the detected CRLF ending is added.
+        let prepared = prepare_edit(&args, "alpha\r\n}").unwrap();
+        assert_eq!(prepared.new_content, "alpha\r\n}\r\n");
+
+        // Already terminated: idempotent — unchanged content + a note.
+        let prepared = prepare_edit(&args, "alpha\n}\n").unwrap();
+        assert_eq!(prepared.new_content, "alpha\n}\n");
+        assert!(
+            prepared
+                .notes
+                .iter()
+                .any(|n| n.contains("already ends with a newline")),
+            "notes: {:?}",
+            prepared.notes
+        );
+
+        // Empty file: nothing to ensure — no bytes added.
+        let prepared = prepare_edit(&args, "").unwrap();
+        assert_eq!(prepared.new_content, "");
+    }
+
+    /// Backlog c19ec2ff (a): end-to-end restore — append with an OMITTED
+    /// new_string must leave the file ending with exactly one newline
+    /// (byte-exact, no shell fallback).
+    #[tokio::test]
+    async fn append_empty_restores_missing_eof_newline_byte_exactly() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n}").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool.execute(json!({"path": "a.txt", "append": true})).await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\n}\n"
+        );
+    }
+
+    /// Backlog c19ec2ff (b): an empty ops array is treated as absent — the
+    /// caller populated old_string/new_string and merely passed [] for the
+    /// unused field (hit twice mid-plan 2027-01-25: validate_ops' "ops is
+    /// empty" hard error made the obvious single edit impossible).
+    #[tokio::test]
+    async fn empty_ops_array_falls_back_to_single_edit() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "same content\n").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "old_string": "same",
+                "new_string": "SAME",
+                "ops": [],
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "SAME content\n"
+        );
+
+        // ops:[] must not trip append mode's ops mutual-exclusion either.
+        std::fs::write(dir.path().join("b.txt"), "x\n").unwrap();
+        let result = tool
+            .execute(json!({"path": "b.txt", "append": true, "new_string": "y", "ops": []}))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "x\ny"
+        );
+
+        // ops:[] with nothing else falls through to string mode's validation.
+        let result = tool.execute(json!({"path": "a.txt", "ops": []})).await;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("old_string is empty"),
+            "{}",
+            result.output
+        );
+    }
+
+    /// Backlog c19ec2ff (a) pin: the no-op guard and the splice are
+    /// byte-exact — new_string differing from old_string ONLY by a trailing
+    /// newline is NOT a no-op and restores the missing EOF newline with no
+    /// doubled newline. Locks the byte-faithfulness the 2027-01-25 session
+    /// doubted (BUG 330dd32d): the restore failed because the trailing
+    /// newline never arrived in the args, not because the engine trims it.
+    #[tokio::test]
+    async fn single_mode_trailing_newline_edit_restores_eof_newline() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n}").unwrap();
+        let tool = make_tool(dir.path());
+        let result = tool
+            .execute(json!({
+                "path": "a.txt",
+                "old_string": "alpha\n}",
+                "new_string": "alpha\n}\n",
+            }))
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\n}\n"
+        );
     }
 
     #[test]

@@ -275,6 +275,16 @@ pub struct AgentLoop {
     /// Per-session state (session id + prompt-token cache heuristic).
     /// Extracted from the flat fields (A2).
     pub(crate) session: SessionState,
+    /// Session-scoped dismissal of auto-recalled rows (backlog c68a8c3b):
+    /// the record ids the agent dismissed via the `recall_feedback` tool.
+    /// Shared with that tool — the factory mints ONE Arc per built loop and
+    /// hands clones to both — so the tool's writes and the auto-recall
+    /// injector's filter see the same set, and a dismissed row never
+    /// re-injects for this session's remainder. Fresh per loop (a new
+    /// session starts with nothing dismissed); a directly-built loop
+    /// without wiring keeps an empty set, so recall is unfiltered.
+    pub(crate) dismissed_recall:
+        Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// This agent's id in the runtime (`AgentManager`), used so the agent's
     /// `spawn_agent` tool can record itself as the parent of any background
     /// agent it spawns (for the completion-notification feedback loop).
@@ -1058,6 +1068,9 @@ impl AgentLoop {
             safety_rules: None,
             vision,
             session: SessionState::new(),
+            dismissed_recall: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             agent_id: std::sync::Mutex::new(None),
             event_fanin: std::sync::Mutex::new(None),
             plan_mutations_allowed: std::sync::Mutex::new(true),
@@ -1101,6 +1114,20 @@ impl AgentLoop {
                 crate::agent::policy::NoPolicy::with_coding_default(),
             )),
         }
+    }
+
+    /// Wire the per-loop dismissal set (backlog c68a8c3b): the factory
+    /// mints ONE `Arc<Mutex<HashSet>>` per built loop and shares it with
+    /// the `recall_feedback` tool registered for the same loop, so the
+    /// tool's writes and the auto-recall injector's filter see the same
+    /// per-session set. Directly-built loops keep the fresh empty set
+    /// from `from_config` (recall unfiltered).
+    pub fn with_dismissed_recall(
+        mut self,
+        dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dismissed_recall = dismissed;
+        self
     }
 
     /// Attach the project's plans dir so consolidation can digest the

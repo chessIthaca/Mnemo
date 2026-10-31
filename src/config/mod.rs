@@ -22,7 +22,7 @@ pub mod patch;
 pub mod projects;
 pub mod settings_dto;
 
-pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, kind_wire};
+pub use endpoints::{Endpoint, EndpointKind, ModelSpec, PricingEntry, Tiers, kind_wire};
 pub use general::{
     BudgetConfig, EmbeddingModel, GeneralConfig, GeneralSection, GitConfig, LayaConfig,
     MarkdownConfig, ModelRef, ModelsConfig, OptimizerConfig, RoutingConfig, SafetyMode,
@@ -153,6 +153,9 @@ impl Config {
             let file = endpoints::EndpointsFile {
                 endpoint: self.endpoints.clone(),
                 pricing: self.pricing.clone(),
+                // `[tiers]` is not part of the in-memory Config: carry the
+                // on-disk table through every Mnemo1 save.
+                tiers: endpoints::load_tiers(&config_dir.join("endpoints.toml")),
             };
             toml::to_string_pretty(&file)?
         };

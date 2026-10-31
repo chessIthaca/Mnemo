@@ -62,6 +62,10 @@ jobs:
         run: npm ci
       - name: Rust tests (workspace, mnemo + mnemo-app)
         run: cargo test --workspace
+      - name: Build + test Mnemo2 host (feature-enabled)
+        run: |
+          cargo build -p mnemo-app --features mnemo2 --bin mnemo2
+          cargo test -p mnemo-app --features mnemo2 --lib
       - name: Frontend type-check
         run: npx tsc --noEmit
         working-directory: frontend
@@ -144,6 +148,10 @@ jobs:
           name: macos-test-output
           path: macos-test-output.txt
           if-no-files-found: warn
+      - name: Build + test Mnemo2 host (feature-enabled)
+        run: |
+          cargo build -p mnemo-app --features mnemo2 --bin mnemo2
+          cargo test -p mnemo-app --features mnemo2 --lib
       - name: Fail if tests failed
         if: ${{ steps.rust-tests.outcome == 'failure' }}
         run: |

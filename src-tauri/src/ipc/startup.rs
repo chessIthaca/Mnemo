@@ -63,6 +63,23 @@ pub struct InstanceConflict {
     pub started_at: u64,
 }
 
+/// Re-check the incumbent's liveness for the same-project conflict dialog.
+///
+/// The startup snapshot's `instance_conflict` is a launch-time snapshot: it
+/// reports the state that existed the moment this instance launched, and the
+/// incumbent may exit while the dialog is on screen. The frontend polls this
+/// while the dialog is visible (interval + window focus) and retracts it
+/// once the pid is dead — so closing the warned-about instance also clears
+/// the surviving instance's warning without a restart (backlog ea9576d7, SPEC
+/// 2027-01-11-same-project-instance-warning-is-a-launch-time-s.md). The
+/// re-check probes the SNAPSHOT's pid — the on-disk marker already names
+/// THIS instance (it was overwritten at launch) — so pid recycling stays a
+/// documented benign residual: a recycled pid keeps the dialog up.
+#[tauri::command]
+pub async fn incumbent_pid_alive(pid: u32) -> Result<bool, IpcError> {
+    Ok(crate::startup::instance_pid_alive(pid))
+}
+
 /// Fetch the startup snapshot: agents, context caps, ALL workflow states,
 /// backlog, and embedder + classifier status in one call.
 ///

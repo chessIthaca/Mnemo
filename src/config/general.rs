@@ -658,11 +658,13 @@ fn budget_retries_is_default(count: &u32) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OptimizerConfig {
-    /// **Lever 1 — delta + skeleton re-reads.** When `true`, `read_files`
-    /// serves a signature/import skeleton for re-reads of unchanged files
-    /// and a unified diff for changed ones, instead of the full content
-    /// every time. First reads and ranged reads still serve full content.
-    /// On by default.
+    /// **Lever 1 — delta, skeleton + outline reads.** When `true`,
+    /// `read_files` serves a signature/import skeleton for re-reads of
+    /// unchanged files and a unified diff for changed ones, instead of the
+    /// full content every time, and a first whole read of a source file over
+    /// 300 lines serves its signature outline (the agent then reads the
+    /// region it needs). Other first reads and ranged reads still serve full
+    /// content. On by default.
     pub delta_reads: bool,
     /// **Lever 2 — semantic command-output compression.** When `true`,
     /// large shell-tool output from known command families (cargo, npm,
@@ -940,12 +942,6 @@ pub struct ContextConfig {
     /// for a substantial response while leaving room for the system prompt +
     /// tools array the conversation-token count doesn't include.
     pub compact_headroom_tokens: usize,
-    /// Total input tokens above which LiteLLM-class proxies drop
-    /// whole-conversation prefix caching (hit rate collapses from ~99% to
-    /// ~4%). When set, the context manager summarizes before
-    /// `ceiling - 32_768` so long sessions stay below the proxy cliff.
-    /// Default 340 000; set 0 (or omit) to disable the guard.
-    pub proxy_cache_ceiling_tokens: Option<usize>,
 }
 
 impl Default for ContextConfig {
@@ -954,7 +950,6 @@ impl Default for ContextConfig {
             summarize_at_fill_rate: 0.3,
             preflight_compact: true,
             compact_headroom_tokens: 32_000,
-            proxy_cache_ceiling_tokens: Some(crate::provider::PROXY_CACHE_CEILING_TOKENS),
         }
     }
 }
@@ -2624,7 +2619,6 @@ chat_hover_timestamps = true
                 summarize_at_fill_rate: 0.3,
                 preflight_compact: true,
                 compact_headroom_tokens: 32_000,
-                proxy_cache_ceiling_tokens: Some(340_000),
             },
             ui: UiConfig {
                 theme: "light".into(),

@@ -294,8 +294,26 @@ describe("activity classification", () => {
         running: false,
       }),
     ).toBe(true);
-    expect(isKnowledgeActivityEntry({ kind: "tool", name: "graph_search", calls: [] })).toBe(true);
+    expect(
+      isKnowledgeActivityEntry({
+        kind: "tool",
+        name: "graph_search",
+        calls: [{ id: "c0", index: 0, name: "graph_search", args: "{}", result: null }],
+      }),
+    ).toBe(true);
     expect(isKnowledgeActivityEntry({ kind: "tool", name: "shell", calls: [] })).toBe(false);
+    // Regression (review round 1, H4): a graph lookup bundled behind another
+    // tool still counts as knowledge activity.
+    expect(
+      isKnowledgeActivityEntry({
+        kind: "tool",
+        name: "read_files",
+        calls: [
+          { id: "c1", index: 0, name: "read_files", args: "{}", result: null },
+          { id: "c2", index: 1, name: "graph_search", args: "{}", result: null },
+        ],
+      }),
+    ).toBe(true);
     expect(
       isKnowledgeActivityEntry({
         kind: "vision",

@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use super::optimizer::{estimate_tokens, savings_event};
 use super::output_compactor::redact_secrets;
+use super::read_files::numbered_line;
 use crate::memory::MemoryStoreTrait;
 use crate::provider::ToolSchema;
 use crate::tool::agent::tool_contract;
@@ -248,7 +249,8 @@ fn slice_lines(
     };
     let mut body = String::new();
     for (offset, line) in lines[idx..end].iter().enumerate() {
-        body.push_str(&format!("{:>5}: {line}\n", idx + offset + 1));
+        body.push_str(&numbered_line(idx + offset + 1, line));
+        body.push('\n');
     }
     let note = if end < total {
         format!(

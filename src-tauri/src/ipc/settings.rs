@@ -666,10 +666,6 @@ pub struct GetSettingsGeneral {
 pub struct GetSettingsContext {
     /// Fraction of the context window at which to summarize.
     pub summarize_at_fill_rate: f64,
-    /// Proxy cache ceiling in tokens — the context manager summarizes before
-    /// the ~340K-token cliff where proxies drop whole-conversation prefix
-    /// caching. `None` disables the guard.
-    pub proxy_cache_ceiling_tokens: Option<usize>,
 }
 
 /// The `ui` object inside [`GetSettingsResponse`].
@@ -983,7 +979,6 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<GetSettingsRespo
         },
         context: GetSettingsContext {
             summarize_at_fill_rate: config.general.context.summarize_at_fill_rate,
-            proxy_cache_ceiling_tokens: config.general.context.proxy_cache_ceiling_tokens,
         },
         ui: GetSettingsUi {
             theme: config.general.ui.theme.clone(),
@@ -1687,7 +1682,6 @@ mod settings_dto_tests {
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.3,
-                proxy_cache_ceiling_tokens: Some(340_000),
             },
             ui: GetSettingsUi {
                 theme: "dark".into(),
@@ -1859,7 +1853,6 @@ mod settings_dto_tests {
             },
             context: GetSettingsContext {
                 summarize_at_fill_rate: 0.4,
-                proxy_cache_ceiling_tokens: Some(340_000),
             },
             ui: GetSettingsUi {
                 theme: "system".into(),

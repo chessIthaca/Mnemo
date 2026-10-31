@@ -294,6 +294,196 @@ fn sanitize_stringified_nulls(schema: &Value, args: &mut Value) {
     }
 }
 
+/// Backlog c19ec2ff (c): parse a sequence-typed argument that arrived as
+/// one stringified JSON value — the same transport degradation class that
+/// produces the "null" artifact [`drop_stringified_nulls`] cleans. On
+/// success returns the parsed elements; on failure returns the 0-based
+/// ABSOLUTE byte position of serde's error in the delivered string (0
+/// when the payload parses to another JSON kind) plus the reason, so
+/// callers can point the model at the exact spot instead of getting a
+/// re-emitted identical payload.
+///
+/// Review L1 (plan 7446b6dc round 1): the UN-trimmed string is parsed —
+/// serde skips leading whitespace itself, so positions stay absolute
+/// (trimming shifted them) — and serde's line-relative column is
+/// converted to the absolute offset, so multi-line payloads point at
+/// the real defect, not a byte of the wrong line.
+///
+/// A payload that fails only because of stray quotes after numeric values
+/// (observed on every spec of one call: `{"start_line": 3530"}`) is
+/// repaired and parsed; any other failure reports the original position.
+pub(crate) fn parse_stringified_sequence(s: &str) -> Result<Vec<Value>, (usize, String)> {
+    fn parse(s: &str) -> Result<Vec<Value>, (usize, String)> {
+        match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(elements)) => Ok(elements),
+            Ok(other) => Err((0, format!("parses to {}, not an array", json_kind(&other)))),
+            Err(e) => Err((
+                absolute_byte_position(s, e.line(), e.column()),
+                e.to_string(),
+            )),
+        }
+    }
+    parse(s).or_else(|err| match drop_stray_quotes_after_numbers(s) {
+        Some(repaired) => parse(&repaired).map_err(|_| err),
+        None => Err(err),
+    })
+}
+
+/// Drop each `"` that directly follows an object's numeric value and
+/// precedes `,`, `}` or `]` — `{"start_line": 3530"}` becomes
+/// `{"start_line": 3530}`. Well-formed JSON never has a quote outside a
+/// string right after a number, so a valid payload is never changed.
+/// `None` when there was nothing to drop.
+pub(crate) fn drop_stray_quotes_after_numbers(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let follows_number_value = |quote: usize| {
+        let mut i = quote;
+        while i > 0 && (bytes[i - 1].is_ascii_digit() || b".-+eE".contains(&bytes[i - 1])) {
+            i -= 1;
+        }
+        if i == quote || !bytes[quote - 1].is_ascii_digit() {
+            return false;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i > 0 && bytes[i - 1] == b':'
+    };
+    let precedes_delimiter = |quote: usize| {
+        bytes[quote + 1..]
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| b",}]".contains(b))
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' if in_string => in_string = false,
+            b'"' if follows_number_value(i) && precedes_delimiter(i) => {
+                out.push_str(&s[copied..i]);
+                copied = i + 1;
+            }
+            b'"' => in_string = true,
+            _ => {}
+        }
+        i += 1;
+    }
+    (copied > 0).then(|| {
+        out.push_str(&s[copied..]);
+        out
+    })
+}
+
+/// Convert serde's 1-based, line-relative `line`/`column` (review L1,
+/// plan 7446b6dc round 1: a multi-line stringified payload would
+/// otherwise point at a byte within the wrong line) into the 0-based
+/// absolute byte offset of the reported spot.
+fn absolute_byte_position(s: &str, line: usize, column: usize) -> usize {
+    if line <= 1 {
+        return column.saturating_sub(1);
+    }
+    let mut line_start = 0;
+    let mut remaining = line;
+    for (idx, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            remaining -= 1;
+            if remaining == 1 {
+                line_start = idx + 1;
+                break;
+            }
+        }
+    }
+    line_start + column.saturating_sub(1)
+}
+
+/// The JSON kind name for a parse-repair error message.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Object(_) => "an object",
+        Value::Array(_) => "an array",
+    }
+}
+
+/// Whether a property schema declares a sequence type — `"type": "array"`
+/// or a type union listing it.
+fn schema_declares_array(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(t)) => t == "array",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("array")),
+        _ => false,
+    }
+}
+
+/// Backlog c19ec2ff (c): repair sequence-typed arguments delivered as one
+/// stringified JSON array at the dispatch seam — the same single seam
+/// every model-generated call flows through as [`drop_stringified_nulls`]
+/// (read_files' `files` was hit 3x in one turn, 2027-01-25, and the
+/// generic "an argument must be a sequence, not a string" taught
+/// nothing). When the string cleanly parses as a JSON array it is spliced
+/// in place; unparseable strings and other kinds are left untouched — the
+/// tool's own decode (or read_files' positional recovery) names them.
+///
+/// The walk mirrors [`drop_stringified_nulls`] (`normalize_in_place`,
+/// `src/provider/strict.rs`): it recurses into `anyOf`/`oneOf`/`allOf`
+/// branches, `items` (single schema or draft-04 tuple), and nested
+/// properties, so entries inside arrays (a `multi_edit` file entry's
+/// `ops`) get the same repair.
+pub(crate) fn repair_stringified_sequences(schema: &Value, args: &mut Value) {
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(branches)) = schema.get(key) {
+            for branch in branches {
+                repair_stringified_sequences(branch, args);
+            }
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        match items {
+            Value::Array(schemas) => {
+                if let Value::Array(arr) = args {
+                    for (s, a) in schemas.iter().zip(arr.iter_mut()) {
+                        repair_stringified_sequences(s, a);
+                    }
+                }
+            }
+            single => {
+                if let Value::Array(arr) = args {
+                    for a in arr.iter_mut() {
+                        repair_stringified_sequences(single, a);
+                    }
+                }
+            }
+        }
+    }
+    let Some(Value::Object(props)) = schema.get("properties") else {
+        return;
+    };
+    let Some(args_obj) = args.as_object_mut() else {
+        return;
+    };
+    for (name, value) in args_obj.iter_mut() {
+        let Some(prop_schema) = props.get(name) else {
+            continue;
+        };
+        if schema_declares_array(prop_schema) {
+            if let Some(repaired) = value
+                .as_str()
+                .and_then(|s| parse_stringified_sequence(s).ok())
+            {
+                *value = Value::Array(repaired);
+            }
+        }
+        repair_stringified_sequences(prop_schema, value);
+    }
+}
+
 /// The trait every tool implements.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -1408,6 +1598,121 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog c19ec2ff (c): a sequence-typed param delivered as one
+    /// stringified JSON array is repaired at the dispatch seam; anything
+    /// that doesn't parse as a clean array is left for the tool's own
+    /// positional error.
+    #[test]
+    fn repair_stringified_sequences_splices_parsed_array() {
+        // A clean stringified array is spliced in.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["files"]
+        });
+        let mut args = serde_json::json!({
+            "files": "[{\"path\": \"a.rs\"}, {\"path\": \"b.rs\"}]"
+        });
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(
+            args["files"],
+            serde_json::json!([{"path": "a.rs"}, {"path": "b.rs"}])
+        );
+
+        // A string-typed param is untouched.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let mut args = serde_json::json!({"path": "a.rs"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["path"], serde_json::json!("a.rs"));
+
+        // A string parsing to an OBJECT is left for the tool's error.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"files": {"type": "array"}}
+        });
+        let mut args = serde_json::json!({"files": "{\"path\": \"a.rs\"}"});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], serde_json::json!("{\"path\": \"a.rs\"}"));
+
+        // A malformed string stays a string (read_files' lenient layer).
+        let mut args = serde_json::json!({"files": "[{\"path\": \"a.rs\""});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"], serde_json::json!("[{\"path\": \"a.rs\""));
+
+        // Nested repair: an array-typed property inside array items
+        // (the multi_edit files[].ops shape) is repaired too.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "ops": {"type": "array"}
+                        }
+                    }
+                }
+            }
+        });
+        let mut args = serde_json::json!({"files": [{"path": "a.rs", "ops": "[\"d2\"]"}]});
+        repair_stringified_sequences(&schema, &mut args);
+        assert_eq!(args["files"][0]["ops"], serde_json::json!(["d2"]));
+    }
+
+    /// Backlog c19ec2ff (c): the parse helper reports the 0-based byte
+    /// position of a parse failure and names the JSON kind on a clean
+    /// non-array parse — the positional input read_files' error needs.
+    #[test]
+    fn parse_stringified_sequence_reports_byte_position() {
+        assert_eq!(
+            Value::Array(parse_stringified_sequence("[1, 2]").unwrap()),
+            serde_json::json!([1, 2])
+        );
+        // A stray quote lands the position at the offending byte.
+        let (pos, reason) = parse_stringified_sequence("[1, 2\"").unwrap_err();
+        assert_eq!(pos, 5, "reason: {reason}");
+        // Review L1: a MULTI-LINE payload points at the ABSOLUTE byte of
+        // the defect — serde's line-2 column 2 converted past the newline
+        // (the stray quote is byte 5, not 1).
+        let (pos, reason) = parse_stringified_sequence("[1,\n2\"").unwrap_err();
+        assert_eq!(pos, 5, "reason: {reason}");
+        // Review L1: leading whitespace no longer shifts the pointer —
+        // the UN-trimmed string is parsed, so the position is absolute.
+        let (pos, reason) = parse_stringified_sequence("  [1, 2\"").unwrap_err();
+        assert_eq!(pos, 7, "reason: {reason}");
+        // A clean object parse reports kind, position 0 (nothing to point at).
+        let (pos, reason) = parse_stringified_sequence("{\"a\": 1}").unwrap_err();
+        assert_eq!(pos, 0);
+        assert!(reason.contains("object"), "reason: {reason}");
+    }
+
+    /// A stray quote after every numeric value (observed live, both specs
+    /// of one read_files call) is repaired; quotes inside strings and
+    /// well-formed payloads are left alone.
+    #[test]
+    fn stray_quotes_after_numbers_are_repaired() {
+        let raw = r#"[{"max_lines": 100, "path": "C:/a/factory.rs", "start_line": 3530"}, {"max_lines": 100, "path": "b.rs", "start_line": 4010"}]"#;
+        assert_eq!(
+            Value::Array(parse_stringified_sequence(raw).unwrap()),
+            serde_json::json!([
+                {"max_lines": 100, "path": "C:/a/factory.rs", "start_line": 3530},
+                {"max_lines": 100, "path": "b.rs", "start_line": 4010}
+            ])
+        );
+        let valid = r#"[{"path": "notes: 12", "n": 1.5e3}, "x: 7\"]"]"#;
+        assert_eq!(drop_stray_quotes_after_numbers(valid), None);
+        // Not after an object value, or not before a delimiter: untouched.
+        assert!(parse_stringified_sequence("[1, 2\"").is_err());
+        assert_eq!(drop_stray_quotes_after_numbers(r#"{"a": 1"x"}"#), None);
+    }
 
     #[test]
     fn stringified_null_dropped_from_optional_properties() {

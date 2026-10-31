@@ -4,8 +4,10 @@
 
 //! Memory tools — `memory_write`, `memory_recall`, `memory_consolidate`, plus the
 //! hygiene tools `memory_update`, `memory_amend`, `memory_supersede`, `memory_delete`,
-//! `memory_list`, and the Phase-3 retrieval tools `plans_search`, `reviews_search`,
-//! `past_fixes`, `context_pack` (in [`retrieval`]).
+//! `memory_list`, the session-dismissal tool `recall_feedback` (backlog c68a8c3b —
+//! a per-loop Arc shared with the auto-recall injector), and the Phase-3 retrieval
+//! tools `memory_search`, `plans_search`, `reviews_search`, `past_fixes`,
+//! `context_pack` (in [`retrieval`]).
 //!
 //! Always available regardless of workflow state. All are auto-run — they
 //! only touch the project's own memory store (sandboxed bookkeeping), so they
@@ -22,6 +24,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::memory::auto_typing::{self, TypingDecision};
+use crate::memory::plan_scope;
 use crate::memory::classifier::Classifier;
 use crate::memory::consolidation::consolidate_session;
 use crate::memory::indexer::{index_derived, reindex_knowledge_files};
@@ -262,11 +265,17 @@ impl Tool for MemoryWriteTool {
             None => None,
         };
         let record_type = MemoryRecordType::from_title(&title);
+        // Plan-scoped notes (plan id / branch references) are only true while
+        // the plan lives: file them episodic + tagged, and keep them out of
+        // the durable knowledge store, so closing the plan can retire them.
+        let scope = plan_scope::scoped_tier(tier, &title, &args.content);
+        let rerouted = scope.tier != tier;
+        let tier = scope.tier;
         // Knowledge-backed typed write: the record's FILE is the truth — the
         // body is UNBOUNDED (the indexer budgets the derived digest, so the
         // digest stays a budgeted pointer while the file carries everything).
         let is_knowledge_type = record_type != MemoryRecordType::None
-            && knowledge::dir_for_record_type(record_type).is_some();
+            && knowledge::dir_for_record_type(record_type).is_some() && !scope.is_scoped();
         // Knowledge-backed write: the record's FILE is the truth —
         // write it, reindex the one file (the derived row), and report the
         // deterministic row id. Without a knowledge
@@ -331,7 +340,8 @@ impl Tool for MemoryWriteTool {
             }
         } else {
             let now = (self.now)();
-            let memory = Memory::new(tier, title.clone(), args.content, now);
+            let mut memory = Memory::new(tier, title.clone(), args.content, now);
+            memory.data = scope.data();
             match self.store.write(memory).await {
                 Ok(id) => {
                     // Human-readable confirmation (backlog 2026-08-20: "wrote
@@ -351,10 +361,20 @@ impl Tool for MemoryWriteTool {
                         msg.push_str(" — ");
                         msg.push_str(note);
                     }
+                    if scope.is_scoped() {
+                        msg.push_str(" — filed as a plan-scoped note");
+                        if rerouted {
+                            msg.push_str(" (episodic, not semantic)");
+                        }
+                        msg.push_str("; it references a plan/branch, so it is retired when the plan closes.");
+                        msg.push_str(" Store any durable fact separately, WITHOUT plan or branch references");
+                    }
                     ToolResult::success(msg).with_data(json!({
                         "id": id,
                         "tier": tier.as_str(),
                         "title": title,
+                        "plan_scoped": scope.is_scoped(),
+                        "plan_ids": scope.plan_ids,
                         "auto_typed": typing_note,
                     }))
                 }
@@ -1505,6 +1525,107 @@ impl Tool for MemoryDeleteTool {
     }
 }
 
+/// Per-session dismissal of auto-recalled rows (backlog c68a8c3b).
+///
+/// The agent calls this after judging recall rows as noise: the ids are
+/// the `(id: ...)` values printed in the volatile tail's RECALLED
+/// MEMORIES block. Dismissal is SESSION-SCOPED — the tool and this loop's
+/// auto-recall injector share ONE `Arc<Mutex<HashSet>>` (the factory mints
+/// it per built loop), and the store is never touched: a dismissed row
+/// still ranks in `memory_search` and re-derives normally next session.
+pub struct RecallFeedbackTool {
+    /// Dismissed record ids, shared with this agent loop's injector.
+    dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl RecallFeedbackTool {
+    /// Wire the tool to the per-loop dismissal set — the same Arc the
+    /// loop's injector filters on (see `AgentLoop::with_dismissed_recall`).
+    pub fn new(dismissed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>) -> Self {
+        Self { dismissed }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RecallFeedbackArgs {
+    dismissed: Vec<String>,
+}
+
+#[async_trait]
+impl Tool for RecallFeedbackTool {
+    fn name(&self) -> &str {
+        "recall_feedback"
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Memory
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema::new(
+            "recall_feedback",
+            "Dismiss noisy auto-recalled memories for the REST of this session. Call it when the \
+             RECALLED MEMORIES block surfaces rows irrelevant to the active task — pass their \
+             (id: ...) values. Dismissed rows never re-inject this session (the store is \
+             untouched; they rank again next session and stay reachable via memory_search).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "dismissed": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The memory ids to dismiss — the (id: ...) values from the RECALLED MEMORIES block."
+                    }
+                },
+                "required": ["dismissed"]
+            }),
+        )
+    }
+
+    fn safety(&self) -> SafetyLevel {
+        // Session-scoped prompt-rendering bookkeeping only — never prompts
+        // for approval.
+        SafetyLevel::AutoRun
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> ToolResult {
+        let args: RecallFeedbackArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolResult::error(crate::tool::error_message::sanitize_arguments_error(
+                    self.name(),
+                    &e,
+                ))
+            }
+        };
+        if args.dismissed.is_empty() {
+            return ToolResult::error(
+                "dismissed must name at least one memory id — the (id: ...) values from the RECALLED MEMORIES block.",
+            );
+        }
+        let mut set = match self.dismissed.lock() {
+            Ok(set) => set,
+            Err(_) => {
+                return ToolResult::error(
+                    "the dismissal set is unavailable (poisoned lock); nothing was dismissed",
+                )
+            }
+        };
+        let newly = args
+            .dismissed
+            .iter()
+            .filter(|id| set.insert((*id).clone()))
+            .count();
+        let total = set.len();
+        drop(set);
+        ToolResult::success(format!(
+            "{newly} dismissed ({total} total this session): they will not be auto-recalled again \
+             this session. The store is untouched — memory_search still finds them, and future \
+             sessions re-derive normally."
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2490,6 +2611,50 @@ mod tests {
         assert!(data["id"].as_str().is_some_and(|s| !s.is_empty()));
         assert_eq!(data["tier"], "semantic");
         assert_eq!(data["title"], "auth fact");
+    }
+
+    /// Plan/branch-referencing notes are filed episodic + tagged with the
+    /// plan id; a plain SPEC stays semantic and untagged.
+    #[tokio::test]
+    async fn plan_scoped_note_is_filed_episodic_and_tagged() {
+        let store = make_store();
+        let tool = MemoryWriteTool::new(store.clone());
+        let r = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Pac-Man Game module contract",
+                "content": "Plan 64694f06, branch feature/pacman-game. src/game.js exports Game."
+            }))
+            .await;
+        assert!(r.success, "{}", r.output);
+        assert!(r.output.contains("plan-scoped"), "{}", r.output);
+        assert!(r.output.contains("WITHOUT plan or branch references"), "{}", r.output);
+        let plain = tool
+            .execute(json!({
+                "tier": "semantic",
+                "title": "SPEC: Game export",
+                "content": "Game is a named ES-module export."
+            }))
+            .await;
+        assert!(plain.success && !plain.output.contains("plan-scoped"), "{}", plain.output);
+
+        let all = store
+            .list_filtered(&MemoryFilter::new())
+            .await
+            .unwrap();
+        let scoped = all.iter().find(|m| m.title.contains("module contract")).unwrap();
+        assert_eq!(scoped.tier, MemoryTier::Episodic);
+        assert_eq!(scoped.data["plan_ids"][0], "64694f06");
+        let durable = all.iter().find(|m| m.title == "SPEC: Game export").unwrap();
+        assert_eq!(durable.tier, MemoryTier::Semantic);
+        assert!(durable.data.is_null());
+
+        let notes = crate::memory::plan_scope::settle_plan_memories(store.as_ref(), "64694f06")
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        let left = store.list_filtered(&MemoryFilter::new()).await.unwrap();
+        assert_eq!(left.len(), 1);
     }
 
     /// Every tier gets its own human phrase (+ its tier word), and none of

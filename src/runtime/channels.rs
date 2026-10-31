@@ -225,6 +225,22 @@ pub enum AgentEvent {
     },
     /// A fragment of a tool-call's arguments.
     ToolCallArgDelta { index: u32, fragment: String },
+    /// A tool call's actual execution start on the engine side.
+    ///
+    /// `ToolCallStart` announces a call mid-stream when the MODEL emits it —
+    /// and a model batch announces all its calls together, while the engine
+    /// executes them one at a time. A tool card that anchors its duration on
+    /// the announcement therefore bills later calls the running time of their
+    /// earlier siblings (suffixes look cumulative). This event marks each
+    /// call's own execution start: emitted once per logical call, immediately
+    /// before its first execution attempt (after the between-call stop gate) —
+    /// never for failure-triage auto-retries and never for "not run"
+    /// synthesized results. Consumers re-anchor the matching card's duration
+    /// on this event; `ToolCallStart`'s timestamp remains the compatibility
+    /// fallback (old histories, or until this event arrives).
+    ToolExecutionStart {
+        tool_call_id: String,
+    },
     /// A chunk of a running tool call's output — the LIVE VIEW of a call that
     /// has not finished yet (user request 2027-01-16: `shell` used to show
     /// nothing until the child exited).
@@ -701,6 +717,14 @@ pub enum SerializableAgentEvent {
         index: u32,
         fragment: String,
     },
+    /// A tool call's actual execution start — emitted once per logical call,
+    /// immediately before its first execution attempt. See
+    /// [`AgentEvent::ToolExecutionStart`]: UI timers re-anchor here so a
+    /// batched card's duration measures its own call, not the queue time
+    /// behind its earlier siblings.
+    ToolExecutionStart {
+        tool_call_id: String,
+    },
     /// A chunk of a running tool call's output. See
     /// [`AgentEvent::ToolOutputDelta`] — display-only, stream-ordered, and
     /// always ahead of the matching `ToolResult`.
@@ -976,6 +1000,13 @@ impl AgentEvent {
             },
             AgentEvent::ToolCallArgDelta { index, fragment } => SerializedEvent {
                 event: SerializableAgentEvent::ToolCallArgDelta { index, fragment },
+                approval_sender: None,
+                question_sender: None,
+                host_tool_sender: None,
+                policy_hook_sender: None,
+            },
+            AgentEvent::ToolExecutionStart { tool_call_id } => SerializedEvent {
+                event: SerializableAgentEvent::ToolExecutionStart { tool_call_id },
                 approval_sender: None,
                 question_sender: None,
                 host_tool_sender: None,
@@ -1557,6 +1588,43 @@ mod tests {
             _ => panic!("expected ApprovalRequest"),
         }
         assert!(sender.is_some(), "sender should be extracted");
+    }
+
+    /// Plan b2052a9c: the execution-start marker forwards without senders and
+    /// pins its wire shape — `{ "kind": "tool_execution_start", "tool_call_id"
+    /// }` (the serde tag/casing conventions), so a frontend reducer can
+    /// re-anchor a tool card's timer from the announcement to the actual
+    /// execution start.
+    #[test]
+    fn tool_execution_start_forwards_and_pins_wire_shape() {
+        let event = AgentEvent::ToolExecutionStart {
+            tool_call_id: "call_1".into(),
+        };
+        let SerializedEvent {
+            event: serial,
+            approval_sender,
+            question_sender,
+            host_tool_sender,
+            policy_hook_sender,
+        } = event.into_serializable();
+        match serial {
+            SerializableAgentEvent::ToolExecutionStart { ref tool_call_id } => {
+                assert_eq!(tool_call_id, "call_1");
+            }
+            _ => panic!("expected ToolExecutionStart"),
+        }
+        assert!(
+            approval_sender.is_none()
+                && question_sender.is_none()
+                && host_tool_sender.is_none()
+                && policy_hook_sender.is_none()
+        );
+        let wire = serde_json::to_value(&serial).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "tool_execution_start", "tool_call_id": "call_1" }),
+            "the wire shape is the serde-tagged snake_case form"
+        );
     }
 
     /// 2c.5 (§5.4 :365-369): ApprovalBypassed forwards without senders —

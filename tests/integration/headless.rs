@@ -62,6 +62,7 @@ fn public_types_serde_roundtrip() {
     roundtrip(&SpawnOptions {
         name: Some("worker".into()),
         model: Some("local/m2".into()),
+        reasoning_effort: Some("high".into()),
         worktree: Some("/tmp/wt".into()),
         permissions: Some(PermissionPolicy::OverridePermissions),
         policy: Some("mnemo.workflow".into()),
@@ -137,7 +138,10 @@ fn public_types_serde_roundtrip() {
             text: "hi".into(),
             images: vec!["data:image/png;base64,AAA".into()],
         },
-        SessionCommand::Steer { text: "go".into() },
+        SessionCommand::Steer {
+            text: "go".into(),
+            images: vec![],
+        },
         SessionCommand::CancelSteer { text: "go".into() },
         SessionCommand::Interrupt,
         SessionCommand::Compact,
@@ -248,6 +252,28 @@ fn public_types_serde_roundtrip() {
         .unwrap(),
         json!({"type": "prompt", "text": "hi", "images": []})
     );
+    // A steer serializes with its images — and a legacy steer without
+    // the `images` key still decodes (the field defaults to none).
+    assert_eq!(
+        serde_json::to_value(SessionCommand::Steer {
+            text: "go".into(),
+            images: vec!["data:image/png;base64,AAA".into()],
+        })
+        .unwrap(),
+        json!({"type": "steer", "text": "go", "images": ["data:image/png;base64,AAA"]})
+    );
+    let legacy_steer: SessionCommand = serde_json::from_value(json!({"type": "steer", "text": "go"}))
+        .expect("a legacy steer without images decodes");
+    match legacy_steer {
+        SessionCommand::Steer { text, images } => {
+            assert_eq!(text, "go");
+            assert!(
+                images.is_empty(),
+                "the missing images key decodes to no images: {images:?}"
+            );
+        }
+        other => panic!("expected a steer command, got {other:?}"),
+    }
     // The permission policy rides along in kebab-case (the 2c.5 lesson:
     // SafetyMode is kebab-case on the wire; the tag is "mode").
     let opts_json = serde_json::to_value(sample_options()).unwrap();
@@ -587,6 +613,55 @@ async fn closed_session_error_code() {
     assert_eq!(err.code(), "session_closed");
 }
 
+/// A steer's image attachments survive the command boundary:
+/// `SessionCommand::Steer` must forward `images` to the kernel as
+/// `AgentCommand::Suggestion`, and the kernel's `SuggestionInjected`
+/// event re-attaches them. Regression: the session layer previously
+/// hardcoded empty images, so a steered image never reached the model.
+#[tokio::test]
+async fn steer_command_forwards_images_to_the_kernel() {
+    let (_engine, session, _root, _cfg) =
+        scripted_engine(vec![text_turn(&["one"]), text_turn(&["two"])]).await;
+    let mut rx = session.events();
+    session
+        .send(SessionCommand::Prompt {
+            text: "go".into(),
+            images: vec![],
+        })
+        .await
+        .expect("prompt");
+    session
+        .send(SessionCommand::Steer {
+            text: "a steer".into(),
+            images: vec!["data:image/png;base64,AAA".into()],
+        })
+        .await
+        .expect("steer");
+    let mut injected: Vec<(String, Vec<String>)> = Vec::new();
+    let mut finished = 0;
+    while finished < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the engine stayed responsive")
+            .expect("the bus stayed open");
+        match event.event {
+            SerializableAgentEvent::SuggestionInjected { text, images } => {
+                injected.push((text, images));
+            }
+            SerializableAgentEvent::Finished { .. } => finished += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        injected.iter().any(|(text, images)| {
+            text == "a steer"
+                && images.len() == 1
+                && images[0] == "data:image/png;base64,AAA"
+        }),
+        "the injected steer must re-attach its text and images: {injected:?}"
+    );
+}
+
 /// §7 row 15: shutdown ends the sessions — the event bus closes.
 #[tokio::test]
 async fn shutdown_leaves_no_tasks() {
@@ -603,6 +678,43 @@ async fn shutdown_leaves_no_tasks() {
         Err(RecvError::Closed) => {}
         other => panic!("the bus must close after shutdown: {:?}", other.is_ok()),
     }
+}
+
+/// §7 row 15, shared-handle form: a shut-down engine behind an `Arc` (the
+/// Mnemo2 lead/team runtime holds one) must STILL close the session bus —
+/// `shutdown(&self)` cannot drop the whole engine, so it must take the
+/// sender out. Regression: leaving the sender alive made `recv` wait
+/// forever (the integration suite hung on `shutdown_leaves_no_tasks`).
+#[tokio::test]
+async fn shutdown_through_a_shared_arc_closes_the_bus() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let llm = std::sync::Arc::new(ScriptedLlm::new(vec![]));
+    let engine = std::sync::Arc::new(
+        Engine::builder(opts)
+            .provider(llm)
+            .start()
+            .await
+            .expect("the scripted engine starts"),
+    );
+    let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+    let mut rx = session.events();
+    engine.shutdown().await.expect("shutdown");
+    drop(session);
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+    match closed {
+        Ok(Err(RecvError::Closed)) => {}
+        Ok(other) => panic!("the bus must close after shutdown: {:?}", other.is_ok()),
+        Err(_) => panic!("recv hung: a shared-arc shutdown left the bus open"),
+    }
+    // A shut-down engine refuses new sessions rather than resurrect a
+    // bus nobody can observe.
+    let err = match engine.spawn(SpawnOptions::default()).await {
+        Ok(_) => panic!("a shut-down engine rejects spawns"),
+        Err(err) => err,
+    };
+    assert_eq!(err.code(), "session_closed", "{err}");
 }
 
 /// §5.3 :350-354 (row 14): a question with ZERO subscribers gets the
@@ -853,6 +965,9 @@ impl MemoryStoreTrait for LoggingStore {
     }
     async fn supersede_memory(&self, old_id: &str, new_memory: Memory) -> MemResult<String> {
         self.inner.supersede_memory(old_id, new_memory).await
+    }
+    async fn quarantine_memory(&self, id: &str, reason: &str) -> MemResult<()> {
+        self.inner.quarantine_memory(id, reason).await
     }
     async fn delete_memory(&self, id: &str) -> MemResult<bool> {
         self.inner.delete_memory(id).await
@@ -1172,5 +1287,41 @@ async fn classifier_setup_flip_reaches_the_live_config_before_the_guard() {
         live.live_laya_enabled().await,
         Some(false),
         "the disable wins the race — the Arc flips back immediately"
+    );
+}
+
+#[tokio::test]
+async fn spawn_with_worktree_binds_tools_to_the_worktree_root() {
+    let root = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let opts = engine_opts(Workspace::new(root.path()), Some(cfg.path().to_path_buf()));
+    let engine = Engine::builder(opts)
+        .provider(std::sync::Arc::new(ScriptedLlm::new(vec![
+            tool_turn("file_write", r#"{"path":"probe.txt","content":"worker"}"#),
+            text_turn(&["done"]),
+        ])))
+        .start()
+        .await
+        .expect("starts");
+    let session = engine
+        .spawn(SpawnOptions {
+            worktree: Some(worktree.path().to_path_buf()),
+            ..SpawnOptions::default()
+        })
+        .await
+        .expect("the worktree-bound spawn");
+    session
+        .run_to_completion("write the probe")
+        .await
+        .expect("the turn completes");
+    assert_eq!(
+        std::fs::read_to_string(worktree.path().join("probe.txt")).unwrap(),
+        "worker",
+        "the file tool wrote inside the worker's worktree"
+    );
+    assert!(
+        !root.path().join("probe.txt").exists(),
+        "the lead root stays untouched"
     );
 }

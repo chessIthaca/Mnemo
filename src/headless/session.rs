@@ -17,8 +17,8 @@ use tokio::sync::{broadcast, mpsc, Mutex, oneshot};
 use crate::headless::error::EngineError;
 use crate::headless::stats::{SessionStats, UsageRates};
 use crate::headless::types::{
-    EventReceiver, PendingInteraction, SessionCommand, SessionEvent, SessionId, SessionSnapshot,
-    Transcript, TurnOutcome,
+    AgentPlan, EventReceiver, PendingInteraction, SessionCommand, SessionEvent, SessionId,
+    SessionSnapshot, Transcript, TurnOutcome,
 };
 use crate::runtime::channels::ConversationExport;
 use crate::host::runtime::HostRuntime;
@@ -27,6 +27,11 @@ use crate::runtime::channels::{
     SteerPayload, UserAnswer,
 };
 use crate::runtime::AgentCommand;
+
+/// Pending responders by interaction id, each tagged with the agent whose
+/// event raised it — the engine is shared, so a session's snapshot reports
+/// only its own (or its spawned descendants') interactions.
+pub(crate) type PendingMap<T> = Mutex<HashMap<String, (AgentId, oneshot::Sender<T>)>>;
 
 /// Shared engine state the sessions + the pump hold: the host core, the
 /// live-session registry (the closed check), and the pending responder
@@ -37,15 +42,15 @@ pub(crate) struct EngineInner {
     /// Live sessions (SessionId → the agent id).
     pub(crate) sessions: Mutex<HashMap<SessionId, AgentId>>,
     /// Approval responders by request id.
-    pub(crate) pending_approvals: Mutex<HashMap<String, oneshot::Sender<Approval>>>,
+    pub(crate) pending_approvals: PendingMap<Approval>,
     /// Question responders by question id.
-    pub(crate) pending_questions: Mutex<HashMap<String, oneshot::Sender<UserAnswer>>>,
+    pub(crate) pending_questions: PendingMap<UserAnswer>,
     /// Host-tool outcome responders by call id (3c/G2) — the pump stashes
     /// them; `SessionCommand::HostToolResult` resolves.
-    pub(crate) pending_host_tools: Mutex<HashMap<String, oneshot::Sender<HostToolOutcome>>>,
+    pub(crate) pending_host_tools: PendingMap<HostToolOutcome>,
     /// Policy-hook answer responders by hook id (3c/G6 tier 3) — the pump
     /// stashes them; `SessionCommand::PolicyAnswer` resolves.
-    pub(crate) pending_hooks: Mutex<HashMap<String, oneshot::Sender<PolicyAnswer>>>,
+    pub(crate) pending_hooks: PendingMap<PolicyAnswer>,
     /// Engine-registered Rust custom tools (3c/G2, §5.9.2) — the Host
     /// group, joined into every subsequent spawn's registry (in-process
     /// execution like any kernel tool — NOT a spec-based host tool; no
@@ -74,6 +79,11 @@ pub(crate) struct EngineInner {
     /// like `parked` (the pump is the single writer); `std::sync` —
     /// the fold is sync, so `stats()` never awaits.
     pub(crate) tallies: std::sync::Mutex<HashMap<AgentId, SessionStats>>,
+    /// Whether worktree-less sessions share the project's main plans dir
+    /// (`<state_dir>/plans`) instead of a private `agents/<id>` one. Off by
+    /// default; a host opts in with `Engine::use_project_plans`. Worktree-bound
+    /// sessions always keep their own plans dir inside their checkout.
+    pub(crate) shared_plans: std::sync::atomic::AtomicBool,
 }
 
 /// §5.3 :350-354 — the constant answer a zero-subscriber question gets
@@ -159,7 +169,7 @@ pub(crate) async fn pump_task(
                     .pending_approvals
                     .lock()
                     .await
-                    .insert(tool_call_id.clone(), responder);
+                    .insert(tool_call_id.clone(), (agent, responder));
             }
         }
         // The question responder — zero subscribers means the constant
@@ -176,7 +186,7 @@ pub(crate) async fn pump_task(
                     .pending_questions
                     .lock()
                     .await
-                    .insert(question_id.clone(), responder);
+                    .insert(question_id.clone(), (agent, responder));
             }
         }
         // Stash the host-tool responder for SessionCommand::HostToolResult
@@ -189,7 +199,7 @@ pub(crate) async fn pump_task(
                     .pending_host_tools
                     .lock()
                     .await
-                    .insert(call_id.clone(), responder);
+                    .insert(call_id.clone(), (agent, responder));
             }
         }
         // Stash the policy-hook responder for SessionCommand::PolicyAnswer
@@ -201,7 +211,7 @@ pub(crate) async fn pump_task(
                     .pending_hooks
                     .lock()
                     .await
-                    .insert(hook_id.clone(), responder);
+                    .insert(hook_id.clone(), (agent, responder));
             }
         }
         // Best-effort broadcast: zero subscribers → the event drops.
@@ -261,12 +271,9 @@ impl AgentSession {
                 self.agent_command(AgentCommand::Prompt { text, images })
                     .await
             }
-            SessionCommand::Steer { text } => {
-                self.agent_command(AgentCommand::Suggestion(SteerPayload {
-                    text,
-                    images: vec![],
-                }))
-                .await
+            SessionCommand::Steer { text, images } => {
+                self.agent_command(AgentCommand::Suggestion(SteerPayload { text, images }))
+                    .await
             }
             SessionCommand::CancelSteer { text } => {
                 self.agent_command(AgentCommand::CancelSuggestion(text))
@@ -279,7 +286,13 @@ impl AgentSession {
                 request_id,
                 decision,
             } => {
-                let responder = self.inner.pending_approvals.lock().await.remove(&request_id);
+                let responder = self
+                    .inner
+                    .pending_approvals
+                    .lock()
+                    .await
+                    .remove(&request_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(decision).map_err(|_| {
                         EngineError::unknown_request("the approval already resolved")
@@ -293,7 +306,13 @@ impl AgentSession {
                 question_id,
                 answer,
             } => {
-                let responder = self.inner.pending_questions.lock().await.remove(&question_id);
+                let responder = self
+                    .inner
+                    .pending_questions
+                    .lock()
+                    .await
+                    .remove(&question_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(answer).map_err(|_| {
                         EngineError::unknown_request("the question already resolved")
@@ -320,7 +339,13 @@ impl AgentSession {
                         )))
                     }
                 };
-                let responder = self.inner.pending_host_tools.lock().await.remove(&call_id);
+                let responder = self
+                    .inner
+                    .pending_host_tools
+                    .lock()
+                    .await
+                    .remove(&call_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(outcome).map_err(|_| {
                         EngineError::unknown_request("the host-tool call already resolved")
@@ -331,7 +356,13 @@ impl AgentSession {
                 }
             }
             SessionCommand::PolicyAnswer { hook_id, answer } => {
-                let responder = self.inner.pending_hooks.lock().await.remove(&hook_id);
+                let responder = self
+                    .inner
+                    .pending_hooks
+                    .lock()
+                    .await
+                    .remove(&hook_id)
+                    .map(|(_, responder)| responder);
                 match responder {
                     Some(responder) => responder.send(answer).map_err(|_| {
                         EngineError::unknown_request("the policy hook already resolved")
@@ -355,6 +386,43 @@ impl AgentSession {
         })
     }
 
+    /// Read the session's registered tool names for diagnostics.
+    pub async fn tool_names(&self) -> Result<Vec<String>, EngineError> {
+        let agent = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&self.agent)
+            .cloned()
+            .ok_or_else(|| EngineError::session_closed("the agent task has ended"))?;
+        Ok(agent
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect())
+    }
+
+    /// Read this session's active plan from its exact plans directory.
+    pub async fn plan(&self) -> Result<Option<AgentPlan>, EngineError> {
+        let plans_dir = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&self.agent)
+            .map(|agent| agent.plans_dir().to_path_buf())
+            .ok_or_else(|| EngineError::session_closed("the agent task has ended"))?;
+        if plans_dir.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        tokio::task::spawn_blocking(move || read_agent_plan(plans_dir))
+            .await
+            .map_err(|err| EngineError::plan_failed(format!("plan read task failed: {err}")))?
+    }
+
     /// A snapshot (§5.3 :324 / §5.9.5): the transcript + the model + the
     /// context usage + the pending interaction (if any). The turn
     /// stats land with 3b's spend accounting.
@@ -376,32 +444,19 @@ impl AgentSession {
         // The four pending maps in a fixed order (approval → question →
         // host tool → policy hook): only one interaction kind is normally
         // live at a time, and the snapshot reports the first it finds.
-        let pending = {
-            let approvals = self.inner.pending_approvals.lock().await;
-            if let Some(id) = approvals.keys().next() {
-                Some(PendingInteraction::Approval {
-                    request_id: id.clone(),
-                })
-            } else {
-                let questions = self.inner.pending_questions.lock().await;
-                if let Some(id) = questions.keys().next() {
-                    Some(PendingInteraction::Question {
-                        question_id: id.clone(),
-                    })
-                } else {
-                    let host_tools = self.inner.pending_host_tools.lock().await;
-                    if let Some(id) = host_tools.keys().next() {
-                        Some(PendingInteraction::HostToolCall {
-                            call_id: id.clone(),
-                        })
-                    } else {
-                        let hooks = self.inner.pending_hooks.lock().await;
-                        hooks.keys().next().map(|id| PendingInteraction::PolicyHook {
-                            hook_id: id.clone(),
-                        })
-                    }
-                }
-            }
+        // The maps are engine-wide, so only this session's own (or its
+        // spawned descendants') entries count — a sibling session on a
+        // shared engine never shows up as this session's pending.
+        let pending = if let Some(id) = self.first_owned(&self.inner.pending_approvals).await {
+            Some(PendingInteraction::Approval { request_id: id })
+        } else if let Some(id) = self.first_owned(&self.inner.pending_questions).await {
+            Some(PendingInteraction::Question { question_id: id })
+        } else if let Some(id) = self.first_owned(&self.inner.pending_host_tools).await {
+            Some(PendingInteraction::HostToolCall { call_id: id })
+        } else {
+            self.first_owned(&self.inner.pending_hooks)
+                .await
+                .map(|id| PendingInteraction::PolicyHook { hook_id: id })
         };
         Ok(SessionSnapshot {
             transcript,
@@ -410,6 +465,43 @@ impl AgentSession {
             max_tokens,
             pending,
         })
+    }
+
+    /// The id of the first entry in `map` raised by this session's agent
+    /// or one of its spawned descendants (whose interactions only this
+    /// session's host can answer — children get no session handle).
+    async fn first_owned<T>(&self, map: &PendingMap<T>) -> Option<String> {
+        let candidates: Vec<(String, AgentId)> = map
+            .lock()
+            .await
+            .iter()
+            .map(|(id, (agent, _))| (id.clone(), *agent))
+            .collect();
+        for (id, agent) in candidates {
+            if self.owns_agent(agent).await {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Whether `agent` is this session's agent or a descendant of it (a
+    /// walk up the manager's parent chain, bounded against a malformed
+    /// cycle).
+    async fn owns_agent(&self, agent: AgentId) -> bool {
+        if agent == self.agent {
+            return true;
+        }
+        let manager = self.inner.host.manager.lock().await;
+        let mut current = agent;
+        for _ in 0..64 {
+            match manager.parent_id(current) {
+                Some(parent) if parent == self.agent => return true,
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// §5.7's live session stats — the running totals the pump folded
@@ -584,4 +676,114 @@ impl AgentSession {
         mgr.send(self.agent, command)
             .map_err(|_| EngineError::session_closed("the agent task ended"))
     }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn write_plan(plans_dir: &std::path::Path, id: &str, title: &str) {
+        std::fs::create_dir_all(plans_dir).expect("plans directory");
+        std::fs::write(
+            plans_dir.join("stack.json"),
+            format!(r#"{{"stack":["{id}"],"reviewed":false,"review_required":false}}"#),
+        )
+        .expect("stack");
+        std::fs::write(
+            plans_dir.join(format!("{id}.md")),
+            format!("# Plan: {title}\n\n## Goal\nA real goal\n\n## Steps\n- [x] 1. **Read** — src/a.rs\n- [ ] 2. Implement src/b.rs\n"),
+        )
+        .expect("plan");
+    }
+
+    #[test]
+    fn reads_the_plan_from_the_exact_session_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lead = dir.path().join("agents/1");
+        let other = dir.path().join("agents/2");
+        write_plan(&lead, "lead1234", "Lead plan");
+        write_plan(&other, "other123", "Other plan");
+
+        let plan = read_agent_plan(lead).expect("read plan").expect("active plan");
+        assert_eq!(plan.id, "lead1234");
+        assert_eq!(plan.title, "Lead plan");
+        assert_eq!(plan.goal, "A real goal");
+        assert_eq!(plan.steps.len(), 2);
+        assert!(plan.steps[0].done);
+        assert!(!plan.steps[1].done);
+    }
+
+    #[test]
+    fn absent_stack_is_empty_but_a_missing_or_invalid_active_plan_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_agent_plan(dir.path().to_path_buf())
+            .expect("missing stack")
+            .is_none());
+        write_plan(dir.path(), "valid123", "Valid");
+        std::fs::remove_file(dir.path().join("valid123.md")).expect("remove active plan");
+        assert!(read_agent_plan(dir.path().to_path_buf()).is_err());
+
+        std::fs::write(
+            dir.path().join("stack.json"),
+            r#"{"stack":["../outside"],"reviewed":false,"review_required":false}"#,
+        )
+        .expect("unsafe stack");
+        assert!(read_agent_plan(dir.path().to_path_buf()).is_err());
+    }
+
+    #[test]
+    fn malformed_stack_does_not_become_an_empty_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("stack.json"), "not json").expect("stack");
+        assert!(read_agent_plan(dir.path().to_path_buf()).is_err());
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AgentPlanStack {
+    #[serde(default)]
+    stack: Vec<String>,
+}
+
+fn read_agent_plan(plans_dir: std::path::PathBuf) -> Result<Option<AgentPlan>, EngineError> {
+    let stack_path = plans_dir.join("stack.json");
+    let bytes = match std::fs::read(&stack_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(EngineError::plan_failed(format!(
+                "could not read {}: {err}",
+                stack_path.display()
+            )))
+        }
+    };
+    let stack: AgentPlanStack = serde_json::from_slice(&bytes).map_err(|err| {
+        EngineError::plan_failed(format!("could not decode {}: {err}", stack_path.display()))
+    })?;
+    let Some(id) = stack.stack.last() else {
+        return Ok(None);
+    };
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(EngineError::plan_failed(format!(
+            "invalid active plan id '{id}'"
+        )));
+    }
+    let path = plans_dir.join(format!("{id}.md"));
+    let source = std::fs::read_to_string(&path).map_err(|err| {
+        EngineError::plan_failed(format!("could not read active plan {}: {err}", path.display()))
+    })?;
+    let plan = crate::memory::plan_format::PlanFile::parse(&source).map_err(|err| {
+        EngineError::plan_failed(format!("could not parse active plan {}: {err}", path.display()))
+    })?;
+    Ok(Some(AgentPlan {
+        id: id.clone(),
+        title: plan.title,
+        goal: plan.goal,
+        steps: plan.steps,
+    }))
 }

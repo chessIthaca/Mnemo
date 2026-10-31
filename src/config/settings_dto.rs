@@ -407,9 +407,6 @@ pub struct SettingsSaveDto {
     pub optimizer_compress_extra_commands: Option<Vec<String>>,
     #[serde(default)]
     pub summarize_at_fill_rate: Option<f64>,
-    /// Proxy cache ceiling in tokens (cliff guard). `Some(0)` clears it.
-    #[serde(default)]
-    pub proxy_cache_ceiling_tokens: Option<usize>,
     // G9 (§5.9.9 :733-738, job 4 D3): the `[ui]` fields (theme, the
     // show_*/chat_*/sound_* toggles, steering_notes) are ABSENT from
     // the engine patch — compile-time absent (row 33: "SettingsPatch
@@ -466,13 +463,6 @@ pub fn validate_and_apply_settings_patch(
         if !(0.05..=0.95).contains(&rate) {
             return Err(format!(
                 "summarize_at_fill_rate must be between 0.05 and 0.95 (got {rate})"
-            ));
-        }
-    }
-    if let Some(ceiling) = patch.proxy_cache_ceiling_tokens {
-        if ceiling > 0 && ceiling < 65_536 {
-            return Err(format!(
-                "proxy_cache_ceiling_tokens must be 0 (disable) or at least 65_536 tokens (got {ceiling})"
             ));
         }
     }
@@ -768,9 +758,6 @@ pub fn validate_and_apply_settings_patch(
     }
     if let Some(rate) = patch.summarize_at_fill_rate {
         general.context.summarize_at_fill_rate = rate;
-    }
-    if let Some(ceiling) = patch.proxy_cache_ceiling_tokens {
-        general.context.proxy_cache_ceiling_tokens = if ceiling == 0 { None } else { Some(ceiling) };
     }
     if let Some(mb) = patch.trace_memory_budget_mb {
         general.trace.memory_budget_mb = super::TraceConfig::clamp_budget(mb);
@@ -1180,32 +1167,6 @@ mod tests {
             Config::default().general.general.optimizer.archive_min_chars,
             crate::config::general::OptimizerConfig::DEFAULT_ARCHIVE_MIN_CHARS
         );
-    }
-
-    #[test]
-    fn proxy_cache_ceiling_validation_rejects_tiny_and_accepts_disable_or_sane() {
-        // Ported from the removed patch.rs twin (quality review HIGH 3): a
-        // tiny ceiling would summarize constantly — meaningless as a cliff
-        // guard, so it is rejected. 0 (disable) and sane values pass, and 0
-        // clears the stored guard to None.
-        let current = Config::default();
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(1024),
-            ..Default::default()
-        };
-        let r = validate_and_apply_settings_patch(&current, &patch).unwrap_err();
-        assert!(r.contains("proxy_cache_ceiling_tokens"));
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(340_000),
-            ..Default::default()
-        };
-        assert!(validate_and_apply_settings_patch(&current, &patch).is_ok());
-        let patch = SettingsSaveDto {
-            proxy_cache_ceiling_tokens: Some(0),
-            ..Default::default()
-        };
-        let next = validate_and_apply_settings_patch(&current, &patch).unwrap();
-        assert_eq!(next.general.context.proxy_cache_ceiling_tokens, None);
     }
 
     #[test]

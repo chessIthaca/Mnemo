@@ -15,6 +15,17 @@
 //! (`startup::instance_pid_alive` in the app — Windows `OpenProcess` probe,
 //! elsewhere a `ps` check) instead of enumerating processes here, which
 //! keeps this module platform-neutral and unit-testable.
+//!
+//! The write has a removal counterpart: on clean exit and when an instance
+//! switches away from a project, `remove_marker_if_self` deletes the marker
+//! — but only while it still names this process (last-writer-wins: a newer
+//! instance that launched meanwhile owns the file, and its marker must
+//! survive our exit). Without the removal a stale marker survives shutdown
+//! and can re-warn on the next launch via pid recycling (backlog ea9576d7).
+//! The read→remove guard is check-then-act, so a launch landing inside
+//! that tiny window can lose its fresh marker to the older instance's exit
+//! — an accepted benign residual (the marker warns, it never locks), the
+//! same class as pid recycling.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +57,7 @@ impl InstanceMarker {
 
     /// Best-effort write of this marker to `<dir>/.coding/instance.json`
     /// (last writer wins — the next launch overwrites the previous one).
+    /// The exit-time counterpart is `remove_marker_if_self` below.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let coding = dir.join(CODING_DIR_NAME);
         std::fs::create_dir_all(&coding)?;
@@ -55,10 +67,44 @@ impl InstanceMarker {
     }
 }
 
+/// Whether a marker's process still exists, without a platform-specific libc dependency.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // SAFETY: fixed flags, no handle inheritance; the handle is closed immediately.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        // SAFETY: the handle was returned by OpenProcess and is no longer used.
+        unsafe { CloseHandle(handle) };
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// The marker file: `<dir>/.coding/instance.json`.
+fn marker_path(dir: &Path) -> std::path::PathBuf {
+    dir.join(CODING_DIR_NAME).join("instance.json")
+}
+
 /// Read the marker another instance left in `<dir>/.coding/instance.json`.
 pub fn read_marker(dir: &Path) -> Option<InstanceMarker> {
-    let bytes =
-        std::fs::read(dir.join(CODING_DIR_NAME).join("instance.json")).ok()?;
+    let bytes = std::fs::read(marker_path(dir)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -72,6 +118,31 @@ pub fn conflict_for(dir: &Path, own_pid: u32, alive: impl Fn(u32) -> bool) -> Op
         return None;
     }
     alive(marker.pid).then_some(marker)
+}
+
+/// Remove this instance's marker from `<dir>/.coding/instance.json` — the
+/// counterpart of [`InstanceMarker::write`], called on clean app exit and
+/// when an instance switches away from a project, so the next launch does
+/// not read a stale claim. The pid guard is the point: only a marker that
+/// still names THIS process is deleted — last-writer-wins means a newer
+/// instance that launched since owns the file, and its marker must survive
+/// our exit. That guard is check-then-act (read → remove): a newer
+/// instance whose write lands inside that microseconds-wide window can
+/// lose its fresh marker to this exit — an accepted benign residual (the
+/// marker warns, it never locks), the same class as pid recycling; an
+/// atomic conditional delete is not expressible with `std::fs`, and a
+/// lock file is not warranted for a single-slot advisory marker.
+///
+/// Returns whether the marker was removed. A missing marker and a
+/// malformed one (ownership unverifiable — preserved) both return
+/// `Ok(false)`; the whole operation is best-effort, mirroring `write`.
+pub fn remove_marker_if_self(dir: &Path, own_pid: u32) -> std::io::Result<bool> {
+    match read_marker(dir) {
+        Some(marker) if marker.pid == own_pid => {
+            std::fs::remove_file(marker_path(dir)).map(|_| true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +213,60 @@ mod tests {
         // ... but with the pid dead the marker is stale → ignored.
         assert_eq!(conflict_for(&dir, 99, |_| false), None);
         assert_eq!(conflict_for(&dir, 99, |pid| pid == 7), Some(other));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_marker_if_self_removes_only_our_marker() {
+        let dir = temp_dir("remove-self");
+        // A sibling file proves the removal touches ONLY instance.json,
+        // never the rest of .coding/.
+        let sibling = dir.join(CODING_DIR_NAME).join("backlog.jsonl");
+        std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        std::fs::write(&sibling, "[]").unwrap();
+        InstanceMarker {
+            pid: 99,
+            started_at: 7,
+        }
+        .write(&dir)
+        .unwrap();
+        // A different pid's marker is not ours → preserved.
+        assert!(!remove_marker_if_self(&dir, 98).unwrap());
+        assert!(read_marker(&dir).is_some());
+        // Our own marker → removed, the sibling untouched.
+        assert!(remove_marker_if_self(&dir, 99).unwrap());
+        assert_eq!(read_marker(&dir), None);
+        assert!(sibling.exists());
+        // Already gone → idempotent no-op, not an error.
+        assert!(!remove_marker_if_self(&dir, 99).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_marker_if_self_preserves_newer_incumbent() {
+        let dir = temp_dir("remove-incumbent");
+        // We (pid 11) launched first and are exiting, but a newer instance
+        // (pid 22) overwrote the marker — last writer wins, so the
+        // incumbent's marker must survive our exit.
+        let incumbent = InstanceMarker {
+            pid: 22,
+            started_at: 2,
+        };
+        incumbent.write(&dir).unwrap();
+        assert!(!remove_marker_if_self(&dir, 11).unwrap());
+        assert_eq!(read_marker(&dir), Some(incumbent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_marker_if_self_leaves_malformed_marker_in_place() {
+        let dir = temp_dir("remove-malformed");
+        let path = dir.join(CODING_DIR_NAME).join("instance.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not a marker").unwrap();
+        // Ownership unverifiable → preserved, reported as not-removed.
+        assert!(!remove_marker_if_self(&dir, 42).unwrap());
+        assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

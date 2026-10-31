@@ -1599,6 +1599,19 @@ mod tests {
         }
     }
 
+    /// Backlog c19ec2ff (a) pin: an r-op whose payload carries the trailing
+    /// newline restores a missing EOF newline — the payload "}\n" splits to
+    /// ["}", ""] and the empty final element re-appends the newline
+    /// (join_lines adds nothing because the original had no trailing
+    /// newline). Locks the ops-mode half of the byte-faithful restore path.
+    #[test]
+    fn replace_op_payload_with_trailing_newline_restores_eof_newline() {
+        assert_eq!(
+            apply_ok("alpha\n}", &line_ops(&["r2:}\n"])),
+            "alpha\n}\n"
+        );
+    }
+
     #[test]
     fn parse_covers_every_verb_and_span() {
         let values = line_ops(&[

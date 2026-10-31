@@ -1,0 +1,1150 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  applyLeadEvent,
+  applyLeadSnapshot,
+  initialLeadRuntime,
+  leadEntriesFromTranscript,
+  leadEventNeedsSnapshot,
+} from "./leadState";
+import { createInitialState } from "./store";
+import type { AppState, LeadEvent, LeadSnapshot } from "./types";
+
+function nativeState(generation = 3): AppState {
+  const state = createInitialState();
+  state.projectId = "mnemo";
+  state.leadRuntime = {
+    ...initialLeadRuntime(),
+    mode: "native",
+    status: "ready",
+    generation,
+  };
+  return state;
+}
+
+function textEvent(generation: number, text: string): LeadEvent {
+  return {
+    generation,
+    event: { agent: 1, event: { kind: "text_delta", text } },
+  };
+}
+
+describe("lead event reducer", () => {
+  it("restores the actual lead plan and marks only its first open step active", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      plan: {
+        id: "plan-1",
+        title: "Actual plan",
+        goal: "Read real state",
+        steps: [
+          { index: 0, text: "**Read** — src/a.rs", header: "Read", done: true },
+          { index: 1, text: "**Build** — src/b.rs", header: "Build", done: false },
+          { index: 2, text: "Verify src/c.rs", done: false },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    };
+    const next = applyLeadSnapshot(nativeState(), snapshot);
+    expect(next.plan?.title).toBe("Actual plan");
+    expect(next.planItems.map((step) => step.status)).toEqual(["done", "active", "queued"]);
+    expect(next.planItems[0].detail).toBe("src/a.rs");
+    expect(next.planItems.every((step) => step.owner === "lead")).toBe(true);
+  });
+
+  it("accumulates streamed deltas into one lead entry", () => {
+    const first = applyLeadEvent(nativeState(3), textEvent(3, "Hello "));
+    const second = applyLeadEvent(first, textEvent(3, "world"));
+    expect(second.leadEntries.at(-1)).toMatchObject({
+      kind: "message",
+      author: "lead",
+      body: "Hello world",
+    });
+    expect(second.leadRuntime.streamingEntryId).toBeTruthy();
+  });
+
+  it("ignores events from a replaced session generation", () => {
+    const state = nativeState(3);
+    expect(applyLeadEvent(state, textEvent(2, "stale"))).toBe(state);
+  });
+
+  it("tracks cancellation from Started through Finished", () => {
+    const started = applyLeadEvent(nativeState(), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    expect(started.leadRuntime.busy).toBe(true);
+    const finished = applyLeadEvent(started, {
+      generation: 3,
+      event: { agent: 1, event: { kind: "finished" } },
+    });
+    expect(finished.leadRuntime.busy).toBe(false);
+    expect(finished.leadRuntime.streamingEntryId).toBeNull();
+  });
+
+  it("applies context_usage events with their per-role breakdown", () => {
+    const state = nativeState(3);
+    const updated = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "context_usage",
+          used: 150_000,
+          max: 200_000,
+          breakdown: { system: 20_000, user: 5_000, assistant: 25_000, tool: 100_000 },
+        },
+      },
+    });
+    expect(updated).not.toBe(state);
+    expect(updated.leadRuntime.usedTokens).toBe(150_000);
+    expect(updated.leadRuntime.maxTokens).toBe(200_000);
+    expect(updated.leadRuntime.contextBreakdown).toEqual({
+      system: 20_000,
+      user: 5_000,
+      assistant: 25_000,
+      tool: 100_000,
+    });
+
+    const malformed = applyLeadEvent(updated, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "context_usage", used: 10, max: 20, breakdown: "unavailable" },
+      },
+    });
+    expect(malformed.leadRuntime.usedTokens).toBe(10);
+    expect(malformed.leadRuntime.contextBreakdown).toBeNull();
+  });
+
+  it("tracks compaction from compact_started through compacted", () => {
+    const started = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    });
+    expect(started.leadRuntime.compacting).toBe(true);
+
+    const compacted = applyLeadEvent(started, {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compacted", before: 150_000, after: 30_000 } },
+    });
+    expect(compacted.leadRuntime.compacting).toBe(false);
+    expect(compacted.leadRuntime.usedTokens).toBe(30_000);
+
+    const stale = applyLeadEvent(compacted, {
+      generation: 2,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    });
+    expect(stale.leadRuntime.compacting).toBe(false);
+  });
+
+  it("requests a snapshot refresh when a compaction finishes", () => {
+    const compacted: LeadEvent = {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compacted", before: 10, after: 5 } },
+    };
+    expect(leadEventNeedsSnapshot(compacted)).toBe(true);
+    const started: LeadEvent = {
+      generation: 3,
+      event: { agent: 1, event: { kind: "compact_started" } },
+    };
+    expect(leadEventNeedsSnapshot(started)).toBe(false);
+  });
+
+  it("maps a real approval event to a resolvable pending interaction", () => {
+    const pending = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "approval_request",
+          tool_call_id: "call-1",
+          tool_name: "write_file",
+          args: {},
+          core_operation: false,
+        },
+      },
+    });
+    expect(pending.leadRuntime.busy).toBe(true);
+    expect(pending.leadRuntime.pending).toMatchObject({
+      kind: "approval",
+      request_id: "call-1",
+      tool_name: "write_file",
+    });
+
+    const merged = applyLeadSnapshot(pending, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: { kind: "approval", request_id: "call-1" },
+      busy: true,
+    });
+    expect(merged.leadRuntime.pending).toMatchObject({
+      kind: "approval",
+      request_id: "call-1",
+      tool_name: "write_file",
+    });
+    expect(merged.leadRuntime.busy).toBe(true);
+  });
+
+  it("preserves a real question across the snapshot merge", () => {
+    const pending = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "user_question",
+          question_id: "q-1",
+          question: "Which branch?",
+          options: [{ label: "main" }, { label: "wt/mnemo" }],
+        },
+      },
+    });
+    expect(pending.leadRuntime.busy).toBe(true);
+    expect(pending.leadRuntime.pending).toMatchObject({
+      kind: "question",
+      question_id: "q-1",
+      question: "Which branch?",
+    });
+
+    const merged = applyLeadSnapshot(pending, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: { kind: "question", question_id: "q-1" },
+      busy: true,
+    });
+    expect(merged.leadRuntime.pending).toMatchObject({
+      kind: "question",
+      question_id: "q-1",
+      question: "Which branch?",
+      options: [{ label: "main" }, { label: "wt/mnemo" }],
+    });
+  });
+
+  it("never pins an old question's text onto a different pending question", () => {
+    const pending = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "user_question",
+          question_id: "q-1",
+          question: "Which branch?",
+          options: [{ label: "main" }],
+        },
+      },
+    });
+    const merged = applyLeadSnapshot(pending, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: { kind: "question", question_id: "q-2", question: "Which model for the UI worker?" },
+      busy: true,
+    });
+    expect(merged.leadRuntime.pending).toEqual({
+      kind: "question",
+      question_id: "q-2",
+      question: "Which model for the UI worker?",
+    });
+  });
+
+  it("shows the question a snapshot carries when the live event was missed", () => {
+    const restored = applyLeadSnapshot(nativeState(3), {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: {
+        kind: "question",
+        question_id: "q-9",
+        question: "Ship it?",
+        options: [{ label: "yes" }, { label: "no" }],
+      },
+      busy: true,
+    });
+    expect(restored.leadRuntime.pending).toMatchObject({
+      question_id: "q-9",
+      question: "Ship it?",
+      options: [{ label: "yes" }, { label: "no" }],
+    });
+  });
+
+  it("restores the transcript and configured model from a snapshot", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 7,
+      model: "test/scripted-b",
+      model_id: "scripted-b",
+      models: [
+        {
+          endpoint: "test",
+          model: "scripted-b",
+          spec: "test/scripted-b",
+          is_default: false,
+        },
+      ],
+      default_model: "test/scripted-a",
+      transcript: {
+        messages: [
+          { role: "user", content: "Remember this" },
+          { role: "assistant", content: [{ type: "text", text: "Saved" }] },
+          { role: "tool", content: "ignored" },
+        ],
+      },
+      used_tokens: 42,
+      max_tokens: 2000,
+      pending: null,
+      busy: false,
+    };
+    const state = applyLeadSnapshot(nativeState(), snapshot);
+    expect(state.leadRuntime).toMatchObject({
+      mode: "native",
+      status: "ready",
+      generation: 7,
+      model: "test/scripted-b",
+      modelId: "scripted-b",
+      usedTokens: 42,
+      maxTokens: 2000,
+    });
+    expect(state.leadEntries).toHaveLength(3);
+    expect(state.leadEntries[0]).toMatchObject({ author: "user", body: "Remember this" });
+    expect(state.leadEntries[1]).toMatchObject({ author: "lead", body: "Saved" });
+    expect(state.leadEntries[2]).toMatchObject({
+      kind: "tool",
+      toolCallId: "",
+      toolName: "tool",
+      result: { success: true, output: "ignored" },
+    });
+  });
+
+  it("never restores remote image URLs from a transcript", () => {
+    const entries = leadEntriesFromTranscript({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "remote" },
+            {
+              type: "image_url",
+              image_url: { url: "https://evil.example/pixel.png" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: "http://evil.example/pixel.png" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "text/html",
+                data: "AAAA",
+              },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "data_url", data_url: "javascript:alert(1)" }],
+        },
+      ],
+    });
+
+    // Only the text survives; a restored transcript must never make the
+    // renderer fetch a remote URL the user did not send.
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "remote",
+    });
+    expect(entries[0].kind === "message" ? entries[0].images : undefined).toBeUndefined();
+  });
+
+  it("restores image attachments, including image-only messages", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Look at this" },
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AAAA" },
+              },
+            ],
+          },
+          // Image-only turn: the body is empty and must not be dropped.
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/jpeg;base64,BBBB" },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/png",
+                  data: "CCCC",
+                },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "data_url", data_url: "data:image/png;base64,DDDD" },
+            ],
+          },
+          { role: "assistant", content: [{ type: "text", text: "Got it" }] },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    };
+
+    const state = applyLeadSnapshot(nativeState(), snapshot);
+    expect(state.leadEntries).toHaveLength(5);
+    expect(state.leadEntries[0]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "Look at this",
+      images: ["data:image/png;base64,AAAA"],
+    });
+    expect(state.leadEntries[1]).toMatchObject({
+      kind: "message",
+      author: "user",
+      body: "",
+      images: ["data:image/jpeg;base64,BBBB"],
+    });
+    expect(state.leadEntries[2]).toMatchObject({
+      body: "",
+      images: ["data:image/png;base64,CCCC"],
+    });
+    expect(state.leadEntries[3]).toMatchObject({
+      body: "",
+      images: ["data:image/png;base64,DDDD"],
+    });
+    expect(state.leadEntries[4]).toMatchObject({ author: "lead", body: "Got it" });
+  });
+
+  it("renders worker notices as team activity rather than human input", () => {
+    const entries = leadEntriesFromTranscript({
+      messages: [
+        { role: "user", content: "human request" },
+        {
+          role: "user",
+          content: "[TeamManager notice — not the human] worker_id=worker0001\nWorker worker00 is blocked.\nUse team_status.",
+        },
+      ],
+    });
+    expect(entries[0]).toMatchObject({ kind: "message", author: "user", body: "human request" });
+    expect(entries[1]).toMatchObject({
+      kind: "team-message",
+      workerId: "worker0001",
+      body: "Worker worker00 is blocked.\nUse team_status.",
+    });
+  });
+
+  it("keeps real tool activity between the text that surrounds it", () => {
+    let state = applyLeadEvent(nativeState(3), textEvent(3, "Checking the tree."));
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_arg_delta", index: 0, fragment: '{"command":' },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_call_arg_delta",
+          index: 0,
+          fragment: ' "git status"}',
+        },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-1",
+          stream: "stdout",
+          text: "clean",
+        },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "call-1",
+          result: { success: true, output: "working tree clean" },
+        },
+      },
+    });
+    state = applyLeadEvent(state, textEvent(3, "The tree is clean."));
+
+    expect(state.leadEntries).toHaveLength(3);
+    expect(state.leadEntries[0]).toMatchObject({
+      kind: "message",
+      body: "Checking the tree.",
+    });
+    expect(state.leadEntries[1]).toMatchObject({
+      kind: "tool",
+      toolCallId: "call-1",
+      toolName: "shell",
+      arguments: '{"command": "git status"}',
+      liveOutput: "",
+      result: { success: true, output: "working tree clean" },
+    });
+    expect(state.leadEntries[2]).toMatchObject({
+      kind: "message",
+      body: "The tree is clean.",
+    });
+  });
+
+  it("shows a host tool as running and clears its pending state on the result", () => {
+    const running = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "host_tool_call",
+          call_id: "host-1",
+          name: "spawn_agent",
+          args: { task: "review the diff" },
+        },
+      },
+    });
+    expect(running.leadEntries.at(-1)).toMatchObject({
+      kind: "tool",
+      toolCallId: "host-1",
+      toolName: "spawn_agent",
+      arguments: '{"task":"review the diff"}',
+      result: null,
+    });
+    expect(running.leadRuntime.pending).toMatchObject({
+      kind: "host_tool_call",
+      request_id: "host-1",
+      tool_call_id: "host-1",
+      tool_name: "spawn_agent",
+    });
+
+    const completed = applyLeadEvent(running, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "host-1",
+          result: { success: true, output: "review started" },
+        },
+      },
+    });
+    expect(completed.leadRuntime.pending).toBeNull();
+    expect(completed.leadEntries.at(-1)).toMatchObject({
+      kind: "tool",
+      toolCallId: "host-1",
+      result: { success: true, output: "review started" },
+    });
+  });
+
+  it("ignores unknown and late output chunks without changing state", () => {
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+      },
+    });
+    const unknown = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-unknown",
+          stream: "stdout",
+          text: "stray",
+        },
+      },
+    });
+    expect(unknown).toBe(state);
+
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "call-1",
+          result: { success: true, output: "done" },
+        },
+      },
+    });
+    const late = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-1",
+          stream: "stdout",
+          text: "late",
+        },
+      },
+    });
+    expect(late).toBe(state);
+  });
+
+  it("bounds live tool output to its 16 KiB tail", () => {
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-1",
+          stream: "stdout",
+          text: "a".repeat(20_000),
+        },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-1",
+          stream: "stdout",
+          text: "b",
+        },
+      },
+    });
+    const entry = state.leadEntries.at(-1);
+    expect(entry).toMatchObject({ kind: "tool" });
+    if (entry?.kind === "tool") {
+      expect(entry.liveOutput).toHaveLength(16 * 1024);
+      expect(entry.liveOutput.endsWith("b")).toBe(true);
+    }
+  });
+
+  it("drops a split surrogate at the live-tail cut", () => {
+    const cap = 16 * 1024;
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-1", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_output_delta",
+          tool_call_id: "call-1",
+          stream: "stdout",
+          text: "\uD83D\uDE00" + "a".repeat(cap - 1),
+        },
+      },
+    });
+    const entry = state.leadEntries.at(-1);
+    expect(entry).toMatchObject({ kind: "tool" });
+    if (entry?.kind === "tool") {
+      expect(entry.liveOutput).toHaveLength(cap - 1);
+      expect(entry.liveOutput).toBe("a".repeat(cap - 1));
+      expect(entry.liveOutput.charCodeAt(0)).toBe("a".charCodeAt(0));
+    }
+  });
+
+  it("restores persisted tool calls and their results from a snapshot", () => {
+    const state = applyLeadSnapshot(nativeState(), {
+      generation: 4,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          { role: "user", content: "Run the checks" },
+          {
+            role: "assistant",
+            content: "Starting with the tests.",
+            tool_calls: [
+              {
+                id: "call-1",
+                name: "shell",
+                arguments: '{"command":"cargo test"}',
+              },
+            ],
+          },
+          {
+            role: "tool",
+            content: "all tests passed",
+            tool_call_id: "call-1",
+            name: "shell",
+          },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "call-2", name: "read_files", arguments: '{"files":[]}' },
+            ],
+          },
+          {
+            role: "tool",
+            content: "no files matched",
+            tool_call_id: "call-2",
+            name: "read_files",
+            tool_is_error: true,
+          },
+        ],
+      },
+      used_tokens: 10,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+
+    expect(state.leadEntries).toHaveLength(4);
+    expect(state.leadEntries[0]).toMatchObject({ kind: "message", author: "user" });
+    expect(state.leadEntries[1]).toMatchObject({
+      kind: "message",
+      author: "lead",
+      body: "Starting with the tests.",
+    });
+    expect(state.leadEntries[2]).toMatchObject({
+      kind: "tool",
+      toolCallId: "call-1",
+      toolName: "shell",
+      arguments: '{"command":"cargo test"}',
+      result: { success: true, output: "all tests passed" },
+    });
+    expect(state.leadEntries[3]).toMatchObject({
+      kind: "tool",
+      toolCallId: "call-2",
+      toolName: "read_files",
+      result: { success: false, output: "no files matched" },
+    });
+  });
+
+  it("scopes argument fragments to the current turn", () => {
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "old-call", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_arg_delta", index: 0, fragment: '{"old":true}' },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "new-call", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_arg_delta", index: 0, fragment: '{"new":true}' },
+      },
+    });
+
+    expect(
+      state.leadEntries.find(
+        (entry) => entry.kind === "tool" && entry.toolCallId === "old-call",
+      ),
+    ).toMatchObject({ arguments: '{"old":true}' });
+    expect(
+      state.leadEntries.find(
+        (entry) => entry.kind === "tool" && entry.toolCallId === "new-call",
+      ),
+    ).toMatchObject({ arguments: '{"new":true}' });
+  });
+
+  it("preserves restored finalized calls and scopes live calls after a snapshot", () => {
+    let state = applyLeadSnapshot(nativeState(3), {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "restored-1", name: "shell", arguments: '{"old":1}' },
+            ],
+          },
+          {
+            role: "tool",
+            content: "done",
+            tool_call_id: "restored-1",
+            name: "shell",
+          },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "restored-1", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "live-2", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_arg_delta", index: 0, fragment: '{"new":2}' },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "live-2",
+          result: { success: true, output: "new done" },
+        },
+      },
+    });
+
+    expect(
+      state.leadEntries.find(
+        (entry) => entry.kind === "tool" && entry.toolCallId === "restored-1",
+      ),
+    ).toMatchObject({
+      arguments: '{"old":1}',
+      result: { success: true, output: "done" },
+    });
+    expect(
+      state.leadEntries.find(
+        (entry) => entry.kind === "tool" && entry.toolCallId === "live-2",
+      ),
+    ).toMatchObject({
+      arguments: '{"new":2}',
+      result: { success: true, output: "new done" },
+    });
+  });
+
+  it("tracks actual tool durations and preserves them across snapshots", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    expect(state.leadRuntime.turnStartedAtMs).toBe(1000);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "timed", name: "shell" },
+      },
+    });
+    expect(state.leadEntries[0]).toMatchObject({ startedAtMs: 1000 });
+    now.mockReturnValue(4500);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: "timed",
+          result: { success: true, output: "done" },
+        },
+      },
+    });
+    expect(state.leadEntries[0]).toMatchObject({
+      startedAtMs: 1000,
+      endedAtMs: 4500,
+    });
+
+    const restored = applyLeadSnapshot(state, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: "timed", name: "shell", arguments: "{}" }],
+          },
+          { role: "tool", content: "done", tool_call_id: "timed", name: "shell" },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+    expect(restored.leadEntries[0]).toMatchObject({
+      startedAtMs: 1000,
+      endedAtMs: 4500,
+    });
+    expect(restored.leadRuntime.turnStartedAtMs).toBeNull();
+    now.mockRestore();
+  });
+
+  it("times batched tool calls from their own execution start, not the announcement", () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    const tool = (state: AppState, callId: string) => {
+      const entry = state.leadEntries.find(
+        (item) => item.kind === "tool" && item.toolCallId === callId,
+      );
+      if (entry?.kind !== "tool") throw new Error(`missing tool entry ${callId}`);
+      return entry;
+    };
+    const executionStart = (callId: string): LeadEvent => ({
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_execution_start", tool_call_id: callId },
+      },
+    });
+    const result = (callId: string, output: string): LeadEvent => ({
+      generation: 3,
+      event: {
+        agent: 1,
+        event: {
+          kind: "tool_result",
+          tool_call_id: callId,
+          tool_name: "shell",
+          result: { success: true, output },
+        },
+      },
+    });
+
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: { agent: 1, event: { kind: "started" } },
+    });
+    // One assistant batch announces both calls at the same instant.
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 0, id: "call-a", name: "shell" },
+      },
+    });
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "tool_call_start", index: 1, id: "call-b", name: "shell" },
+      },
+    });
+    expect(tool(state, "call-a").startedAtMs).toBe(1000);
+    expect(tool(state, "call-b").startedAtMs).toBe(1000);
+
+    now.mockReturnValue(2000);
+    state = applyLeadEvent(state, executionStart("call-a"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, result: null });
+
+    now.mockReturnValue(6000);
+    state = applyLeadEvent(state, result("call-a", "a done"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    // Call B waited in the queue, so its clock has not started yet.
+    expect(tool(state, "call-b")).toMatchObject({ startedAtMs: 1000, result: null });
+
+    state = applyLeadEvent(state, executionStart("call-b"));
+    expect(tool(state, "call-b")).toMatchObject({
+      startedAtMs: 6000,
+      arguments: "",
+      liveOutput: "",
+      result: null,
+    });
+    // A finished call keeps its measured span; execution-start never reopens it.
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+
+    now.mockReturnValue(9000);
+    state = applyLeadEvent(state, result("call-b", "b done"));
+    expect(tool(state, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    expect(tool(state, "call-b")).toMatchObject({ startedAtMs: 6000, endedAtMs: 9000 });
+    // Each suffix measures only its own execution: 4s and 3s, never cumulative.
+    expect(tool(state, "call-a").endedAtMs! - tool(state, "call-a").startedAtMs!).toBe(4000);
+    expect(tool(state, "call-b").endedAtMs! - tool(state, "call-b").startedAtMs!).toBe(3000);
+
+    // Execution-start timestamps survive a transcript snapshot restore.
+    const restored = applyLeadSnapshot(state, {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: {
+        messages: [
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "call-a", name: "shell", arguments: "{}" },
+              { id: "call-b", name: "shell", arguments: "{}" },
+            ],
+          },
+          { role: "tool", content: "a done", tool_call_id: "call-a", name: "shell" },
+          { role: "tool", content: "b done", tool_call_id: "call-b", name: "shell" },
+        ],
+      },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: false,
+    });
+    expect(tool(restored, "call-a")).toMatchObject({ startedAtMs: 2000, endedAtMs: 6000 });
+    expect(tool(restored, "call-b")).toMatchObject({ startedAtMs: 6000, endedAtMs: 9000 });
+    now.mockRestore();
+  });
+
+  it("keeps LLM errors visible across snapshots and clears transient retries on progress", () => {
+    const snapshot: LeadSnapshot = {
+      generation: 3,
+      model: "test/scripted-a",
+      model_id: "scripted-a",
+      models: [],
+      default_model: null,
+      transcript: { messages: [] },
+      used_tokens: 0,
+      max_tokens: 1000,
+      pending: null,
+      busy: true,
+    };
+    let state = applyLeadEvent(nativeState(3), {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "error", error: "HTTP 429 overloaded", retrying: true },
+      },
+    });
+    expect(state.leadRuntime.errorRetrying).toBe(true);
+    state = applyLeadSnapshot(state, snapshot);
+    expect(state.leadRuntime.error).toBe("HTTP 429 overloaded");
+    expect(state.leadRuntime.errorRetrying).toBe(true);
+
+    state = applyLeadEvent(state, textEvent(3, "Recovered"));
+    expect(state.leadRuntime.error).toBeNull();
+    expect(state.leadRuntime.errorRetrying).toBe(false);
+    state = applyLeadEvent(state, {
+      generation: 3,
+      event: {
+        agent: 1,
+        event: { kind: "error", error: "provider failed", retrying: false },
+      },
+    });
+    state = applyLeadSnapshot(state, { ...snapshot, busy: false });
+    expect(state.leadRuntime.status).toBe("error");
+    expect(state.leadRuntime.error).toBe("provider failed");
+    expect(state.leadRuntime.errorRetrying).toBe(false);
+
+    const replaced = applyLeadSnapshot(state, { ...snapshot, generation: 4, busy: false });
+    expect(replaced.leadRuntime.error).toBeNull();
+    expect(replaced.leadRuntime.errorRetrying).toBe(false);
+  });
+});

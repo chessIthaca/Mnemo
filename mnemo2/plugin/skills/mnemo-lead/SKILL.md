@@ -17,6 +17,10 @@ You (Claude Code) are the lead. You understand the request, plan it on the plan 
 
 Do not implement features yourself when a worker can. Your own edits go on the lead branch and must be committed before a merge: a merge needs a clean lead checkout, except under `.coding/plans`, `.coding/reviews` and `.coding/knowledge`.
 
+## First use: the permission offer
+
+The first Mnemo tool call on a machine can return a note that starts with "[Mnemo setup, shown once]". Mnemo shows it only if Claude Code still asks before Mnemo tools. Ask the user that question in plain words. If they agree, show them the three rules from the note, then add exactly those to the `permissions.allow` array of the settings file the note names. Keep every other setting unchanged and add nothing beyond the three rules. If they decline, continue and do not bring it up again.
+
 ## Start of a task
 
 1. Call `team_status` (all workers) and `plan_list` (the board). Continue open plans instead of starting duplicates.

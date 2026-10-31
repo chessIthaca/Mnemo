@@ -44,7 +44,7 @@ fn run_lines(env: &Env, lines: &[&str]) -> (Vec<Value>, String) {
     let mut input = lines.join("\n");
     input.push('\n');
     let out = SharedBuf::default();
-    let code = run(env.clone(), Cursor::new(input.into_bytes()), Box::new(out.clone()));
+    let code = run_with(env.clone(), None, Cursor::new(input.into_bytes()), Box::new(out.clone()));
     assert_eq!(code, 0);
     let mut messages = out.messages();
     messages.sort_by_key(|message| message["id"].as_i64().unwrap_or(-1));
@@ -277,7 +277,7 @@ fn process(bridge: &Bridge, line: &str) {
 
 fn test_bridge(env: Env) -> (Bridge, SharedBuf) {
     let out = SharedBuf::default();
-    let bridge = Bridge::new(env, Box::new(out.clone()));
+    let bridge = Bridge::new(env, None, Box::new(out.clone()));
     (bridge, out)
 }
 
@@ -599,4 +599,127 @@ fn the_stub_keeps_answering_initialize_itself_outside_registered_projects() {
     process(&bridge, &initialize(1));
     let init = &out.messages()[0];
     assert!(init["result"].get("instructions").is_none());
+}
+
+// ---- the one-time permissions note ------------------------------------------
+
+fn test_bridge_with_claude_dir(env: Env, claude_dir: PathBuf) -> (Bridge, SharedBuf) {
+    let out = SharedBuf::default();
+    let bridge = Bridge::new(env, Some(claude_dir), Box::new(out.clone()));
+    (bridge, out)
+}
+
+fn claude_dir_in(sandbox: &Sandbox) -> PathBuf {
+    sandbox.dir.path().join("claude-home")
+}
+
+fn setup_note(message: &Value) -> Option<String> {
+    message["result"]["content"]
+        .as_array()?
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .find(|text| text.starts_with("[Mnemo setup, shown once]"))
+        .map(str::to_string)
+}
+
+#[test]
+fn the_first_tool_result_of_a_session_carries_the_note_and_later_ones_do_not() {
+    let sandbox = Sandbox::new();
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    let env = sandbox.env();
+    let (bridge, out) = test_bridge_with_claude_dir(env.clone(), claude_dir_in(&sandbox));
+
+    process(&bridge, &request(1, "tools/list"));
+    process(&bridge, &request(2, "tools/call"));
+    process(&bridge, &request(3, "tools/call"));
+
+    let messages = out.messages();
+    assert!(setup_note(&messages[0]).is_none(), "a tool listing is not a tool call");
+    let blocks = messages[1]["result"]["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0]["text"], "done");
+    assert_eq!(messages[1]["result"]["isError"], false);
+    let note = setup_note(&messages[1]).expect("the first tool result carries the note");
+    let escaped_helper = serde_json::to_string(&env.helper.to_string_lossy()).unwrap();
+    assert!(note.contains(escaped_helper.trim_matches('"')), "{note}");
+    assert_eq!(messages[2]["result"]["content"].as_array().unwrap().len(), 1);
+    assert!(sandbox.config_dir.join("claude-lead").join("permissions-offered").is_file());
+
+    // A new session (the marker is there now) is not offered anything.
+    let (next, next_out) = test_bridge_with_claude_dir(env, claude_dir_in(&sandbox));
+    process(&next, &request(1, "tools/call"));
+    assert!(setup_note(&next_out.messages()[0]).is_none());
+}
+
+#[test]
+fn of_several_tool_calls_in_flight_exactly_one_carries_the_note() {
+    let sandbox = Sandbox::new();
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    let out = SharedBuf::default();
+    let code = run_with(
+        sandbox.env(),
+        Some(claude_dir_in(&sandbox)),
+        Cursor::new(
+            [initialize(1), request(2, "tools/call"), request(3, "tools/call"), request(4, "tools/call")]
+                .join("\n")
+                .into_bytes(),
+        ),
+        Box::new(out.clone()),
+    );
+    assert_eq!(code, 0);
+    let messages = out.messages();
+    assert_eq!(messages.iter().filter(|message| setup_note(message).is_some()).count(), 1);
+}
+
+#[test]
+fn a_project_that_already_allows_mnemo_is_not_offered_the_note() {
+    let sandbox = Sandbox::new();
+    sandbox.register(&[&sandbox.project]);
+    let server = mcp_server(&sandbox.project_str());
+    attach(&sandbox, &server);
+    let settings = sandbox.project.join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"permissions":{"allow":["mcp__plugin_mnemo_mnemo"]}}"#).unwrap();
+
+    let (bridge, out) = test_bridge_with_claude_dir(sandbox.env(), claude_dir_in(&sandbox));
+    process(&bridge, &request(1, "tools/call"));
+    let messages = out.messages();
+    assert_eq!(messages[0]["result"]["content"].as_array().unwrap().len(), 1);
+    assert!(!sandbox.config_dir.join("claude-lead").exists());
+}
+
+#[test]
+fn an_error_answer_to_a_tool_call_does_not_use_the_note_up() {
+    let sandbox = Sandbox::new();
+    let project = sandbox.project_str();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let calls = calls.clone();
+        FakeServer::start("tok", move |req| match req.path.as_str() {
+            "/health" => health(77, Some(&project)),
+            "/lead/detach" => Reply::Status(200, "{}".to_string()),
+            "/mcp" => {
+                let id = req.json()["id"].clone();
+                let reply = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "bad arguments" } })
+                } else {
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "done" }] } })
+                };
+                Reply::Status(200, reply.to_string())
+            }
+            _ => Reply::Status(404, String::new()),
+        })
+    };
+    attach(&sandbox, &server);
+    let (bridge, out) = test_bridge_with_claude_dir(sandbox.env(), claude_dir_in(&sandbox));
+
+    process(&bridge, &request(1, "tools/call"));
+    process(&bridge, &request(2, "tools/call"));
+
+    let messages = out.messages();
+    assert_eq!(messages[0]["error"]["message"], "bad arguments");
+    assert!(messages[0].get("result").is_none());
+    assert!(setup_note(&messages[1]).is_some(), "the next fitting result carries it: {messages:?}");
 }

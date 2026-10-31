@@ -80,14 +80,19 @@ agents_without_prompt = ["Explore", "claude-code-guide"]
 
 ## Permissions
 
-By default Claude Code asks before every MCP tool call and every Bash command. A lead that waits on a permission prompt stalls, including its background waiter. To let it work without prompts, allow the Mnemo tools and the waiter in your Claude Code settings (`~/.claude/settings.json`, or the project's `.claude/settings.json`). Review the rules before adding them:
+By default Claude Code asks before every MCP tool call and every Bash command. A lead that waits on a permission prompt stalls, including its background waiter.
+
+The first time Claude Code uses a Mnemo tool on this machine, Mnemo asks it to offer you a fix. Claude then asks you whether Mnemo may run without these prompts. If you agree, Claude adds three rules to your Claude Code user settings with a normal file edit, so you see the change. The rules allow the Mnemo tools and the waiter command, in both Bash and PowerShell form. You are asked once: Mnemo records that in `~/.mnemo/claude-lead/permissions-offered`, and delete that file to be asked again. You are not asked at all if your settings already allow the Mnemo tools.
+
+To add the rules yourself instead, put them in `~/.claude/settings.json` (or the project's `.claude/settings.json`). Review them first:
 
 ```json
 {
   "permissions": {
     "allow": [
       "mcp__plugin_mnemo_mnemo__*",
-      "Bash(*mnemo2-mcp* wait*)"
+      "Bash(\"C:\\Users\\<you>\\.mnemo\\bin\\mnemo2-mcp.exe\" wait *)",
+      "PowerShell(& \"C:\\Users\\<you>\\.mnemo\\bin\\mnemo2-mcp.exe\" wait *)"
     ]
   }
 }

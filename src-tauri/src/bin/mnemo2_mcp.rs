@@ -26,6 +26,8 @@ mod hooks;
 mod http;
 #[path = "mnemo2_mcp/instance.rs"]
 mod instance;
+#[path = "mnemo2_mcp/permissions.rs"]
+mod permissions;
 #[path = "mnemo2_mcp/serve.rs"]
 mod serve;
 #[cfg(test)]

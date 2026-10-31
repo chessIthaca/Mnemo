@@ -13,9 +13,12 @@
 //! Code gives an MCP server about 30 s to connect and a cold Mnemo2 start can
 //! take longer. The instance is found (or started) in the background and every
 //! later request waits for it.
+//!
+//! The first tool result of a session may carry a one-time note asking the
+//! user whether Mnemo may run without permission prompts (see `permissions`).
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,6 +28,7 @@ use serde_json::{json, Value};
 
 use crate::http::{self, Response};
 use crate::instance::{canonical, registered_root, resolve, root_body, Env, Instance, Resolution};
+use crate::permissions::{self, Offer};
 
 /// After stdin closes, how long in-flight requests may still finish.
 const EOF_GRACE: Duration = Duration::from_secs(5);
@@ -66,6 +70,8 @@ struct Bridge {
     /// This process forwarded a `tools/call`, which is what attaches the
     /// external lead on the server. Only then may it detach it again.
     attached: AtomicBool,
+    /// The one-time "run Mnemo without prompts" note for the first tool result.
+    offer: Offer,
     /// The cwd is in a registered project: answer `initialize` locally.
     local_initialize: bool,
 }
@@ -80,8 +86,19 @@ enum Forward {
 }
 
 /// Run the bridge until `input` ends. Returns the process exit code.
-pub fn run<R: BufRead>(env: Env, mut input: R, out: Box<dyn Write + Send>) -> u8 {
-    let bridge = std::sync::Arc::new(Bridge::new(env, out));
+pub fn run<R: BufRead>(env: Env, input: R, out: Box<dyn Write + Send>) -> u8 {
+    run_with(env, permissions::claude_dir_from_process(), input, out)
+}
+
+/// [`run`] with Claude Code's user config dir given (None: no permissions
+/// offer), so tests never read the real one.
+pub fn run_with<R: BufRead>(
+    env: Env,
+    claude_dir: Option<PathBuf>,
+    mut input: R,
+    out: Box<dyn Write + Send>,
+) -> u8 {
+    let bridge = std::sync::Arc::new(Bridge::new(env, claude_dir, out));
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -142,8 +159,9 @@ fn rpc_error(id: &Value, code: i64, message: &str) -> String {
 }
 
 impl Bridge {
-    fn new(env: Env, out: Box<dyn Write + Send>) -> Bridge {
+    fn new(env: Env, claude_dir: Option<PathBuf>, out: Box<dyn Write + Send>) -> Bridge {
         let cwd = canonical(&env.process_cwd);
+        let offer = Offer::new(&env, claude_dir);
         // Only a registered project gets the local handshake; anywhere else the
         // normal lookup decides (and usually ends in the stub).
         let local_initialize = matches!(registered_root(&env, &cwd), Ok(Some(_)));
@@ -155,6 +173,7 @@ impl Bridge {
             out: Mutex::new(out),
             in_flight: AtomicUsize::new(0),
             attached: AtomicBool::new(false),
+            offer,
             local_initialize,
         }
     }
@@ -226,7 +245,14 @@ impl Bridge {
                 self.attached.store(true, Ordering::SeqCst);
             }
             match self.forward(&instance, line) {
-                Forward::Reply(response) => return reply_from(id.as_ref(), response),
+                Forward::Reply(response) => {
+                    return match reply_from(id.as_ref(), response) {
+                        Some(line) if method == "tools/call" => {
+                            Some(self.offer.apply(line, Path::new(&instance.root)))
+                        }
+                        other => other,
+                    };
+                }
                 Forward::Retry(reason) => {
                     self.invalidate(&instance);
                     last_error = reason;

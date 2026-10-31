@@ -885,3 +885,103 @@ fn stop_inheriting_stdio_clears_the_inherit_flag_of_the_std_handles() {
         assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "{handle:?} is still inheritable");
     }
 }
+
+/// Claude Desktop terminates each Claude Code session's job object when it
+/// quits or restarts, so Mnemo2 breaks away from it; inside a job that forbids
+/// breakaway it still starts, inside that job.
+#[cfg(windows)]
+#[test]
+fn the_app_breaks_away_from_a_session_job_and_starts_inside_one_that_forbids_it() {
+    use std::os::windows::io::AsRawHandle;
+    type Handle = *mut std::ffi::c_void;
+    // BREAKAWAY_OK is an extended limit: the basic class rejects it.
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION, with its nested
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION and IO_COUNTERS spelled out.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+        io_counters: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *const std::ffi::c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *const std::ffi::c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn GetCurrentProcess() -> Handle;
+    }
+    // The test process joins a new job, nested in any job it is already in,
+    // for good: neither job here limits or kills anything.
+    let join_new_job = |limit_flags: u32| -> Handle {
+        let limits = ExtendedLimits {
+            limit_flags,
+            ..ExtendedLimits::default()
+        };
+        let os_error = std::io::Error::last_os_error;
+        // SAFETY: plain Win32 calls on a job this test owns; the limits struct
+        // outlives the call that reads it.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            assert!(!job.is_null(), "CreateJobObjectW: {}", os_error());
+            let set = SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                (&limits as *const ExtendedLimits).cast(),
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            );
+            assert_ne!(set, 0, "SetInformationJobObject: {}", os_error());
+            let joined = AssignProcessToJobObject(job, GetCurrentProcess());
+            assert_ne!(joined, 0, "AssignProcessToJobObject: {}", os_error());
+            job
+        }
+    };
+    let sleeper = || {
+        let mut command = Command::new("ping");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    // Whether `child` is in `job`; the child is killed either way.
+    let in_job_then_kill = |mut child: Child, job: Handle| -> bool {
+        let mut result = 0;
+        // SAFETY: a live child handle and a job handle this test keeps open.
+        let queried = unsafe { IsProcessInJob(child.as_raw_handle(), job, &mut result) };
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(queried, 0, "IsProcessInJob: {error}");
+        result != 0
+    };
+
+    let session = join_new_job(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+    let child = spawn_detached(sleeper).expect("a job that allows breakaway starts the app");
+    assert!(
+        !in_job_then_kill(child, session),
+        "the app stayed in the session job, so a Desktop restart would kill it"
+    );
+
+    let strict = join_new_job(0);
+    let child = spawn_detached(sleeper).expect("a job that forbids breakaway still starts the app");
+    assert!(
+        in_job_then_kill(child, strict),
+        "the app started outside a job it may not leave"
+    );
+}

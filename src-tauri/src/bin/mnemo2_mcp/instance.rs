@@ -816,14 +816,32 @@ pub fn resolve_app(search: &AppSearch) -> Result<PathBuf, String> {
     ))
 }
 
+/// Spawn the command `build` makes, detached from this console and process
+/// group and, where the job allows it, out of this process's job object.
+///
+/// Claude Desktop runs each Claude Code session, with everything it starts,
+/// in a job object of its own, and terminates that job when it quits or
+/// restarts: every process still in it dies, whatever its parent and however
+/// detached. Mnemo2 must outlive the session (its workers run inside it), so
+/// it breaks away. The session job permits that. A job that does not (such as
+/// Desktop's own outer job, which a restart leaves alone) makes `CreateProcess`
+/// fail with ERROR_ACCESS_DENIED, and Mnemo2 then starts inside it as before.
 #[cfg(windows)]
-fn detach(command: &mut Command) {
+fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
     // The stdio handles stopped being inheritable when `main` started (see
     // `stop_inheriting_stdio`), so the child cannot hold Claude's pipes.
+    let spawn = |flags: u32| build().creation_flags(flags).spawn();
+    match spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB) {
+        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        }
+        spawned => spawned,
+    }
 }
 
 /// Mark this process's own stdio handles non-inheritable. `main` does this
@@ -867,27 +885,28 @@ pub(crate) fn stop_inheriting_stdio() {
 pub(crate) fn stop_inheriting_stdio() {}
 
 #[cfg(unix)]
-fn detach(command: &mut Command) {
+fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
     use std::os::unix::process::CommandExt;
-    command.process_group(0);
+    build().process_group(0).spawn()
 }
 
 /// Start `mnemo2 --hidden --project <root>` detached, with no stdio. It runs
 /// from the config dir so it never pins the project folder as its cwd.
 fn spawn_app(app: &Path, root: &Path, cwd: &Path) -> std::io::Result<Child> {
-    let mut command = Command::new(app);
-    command
-        .arg("--hidden")
-        .arg("--project")
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if cwd.is_dir() {
-        command.current_dir(cwd);
-    }
-    detach(&mut command);
-    command.spawn()
+    spawn_detached(|| {
+        let mut command = Command::new(app);
+        command
+            .arg("--hidden")
+            .arg("--project")
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if cwd.is_dir() {
+            command.current_dir(cwd);
+        }
+        command
+    })
 }
 
 #[cfg(test)]

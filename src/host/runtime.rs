@@ -413,11 +413,12 @@ const ALWAYS_SAFE_ROLE_TOOLS: &[&str] = &["git_read", "write_review_report"];
 ///   allowed tool set (so a subagent spawned from Planning can't reach
 ///   `file_edit`, since Planning hides it).
 ///
-/// Returns `None` (no restriction) ONLY when there is no parent (a UI-button
-/// spawn or the main agent — unrestricted). A KNOWN `parent_id` whose loop is
-/// missing from the map returns `Some(vec![])` (deny all tools) — fail-closed,
-/// so a missing parent loop can never silently escalate the subagent to the
-/// full tool set.
+/// Returns `None` (no restriction) only when there is no parent and no role.
+/// A parentless reviewer receives exactly [`REVIEWER_BASE_TOOLS`]; there is no
+/// parent permission set to intersect, but the read-only role boundary still
+/// applies. A parentless unknown role fails closed with `Some(vec![])`, as does
+/// a KNOWN `parent_id` whose loop is missing from the map, so neither case can
+/// silently escalate the agent to the full tool set.
 ///
 /// The intersection is a snapshot of the parent's permissions at spawn time;
 /// it does not track parent state changes mid-spawn.
@@ -438,7 +439,21 @@ async fn compute_subagent_allowlist(
     parent_id: Option<AgentId>,
     role: &Option<String>,
 ) -> Option<Vec<String>> {
-    let parent_id = parent_id?;
+    let Some(parent_id) = parent_id else {
+        return match role.as_deref() {
+            Some("reviewer") => Some(
+                REVIEWER_BASE_TOOLS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
+            Some(other) => {
+                eprintln!("spawn: unknown role '{other}' reached allowlist compute");
+                Some(Vec::new())
+            }
+            None => None,
+        };
+    };
 
     // Snapshot the parent's current ToolFilter + the set of tools its registry
     // actually registers, each paired with its real category + safety (read off
@@ -1386,15 +1401,143 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_parent_returns_none() {
-        // A UI-button spawn (no parent) is unrestricted — None means "apply
-        // no allow-list override, use the state-derived filter".
+    async fn parentless_reviewer_gets_strict_base_tools() {
+        // A UI-created review agent has no parent to intersect with, so it
+        // receives exactly the strict reviewer base list — never the full
+        // unrestricted tool surface.
         let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let list = compute_subagent_allowlist(&map, None, &Some("reviewer".into())).await;
+        let list = compute_subagent_allowlist(&map, None, &Some("reviewer".into()))
+            .await
+            .expect("a parentless reviewer must have an allow-list");
+        let expected: Vec<String> = REVIEWER_BASE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(list, expected);
+
+        for forbidden in [
+            "file_write",
+            "file_edit",
+            "shell",
+            "git",
+            "spawn_agent",
+            "memory_write",
+            "backlog_add",
+            "ask_user",
+            "create_plan",
+            "finish",
+        ] {
+            assert!(
+                !list.contains(&forbidden.to_string()),
+                "parentless reviewer must not receive {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parentless_spawn_without_role_returns_none() {
+        // An ordinary UI-button spawn (no parent, no role) stays unrestricted
+        // — None means "apply no allow-list override, use the state filter".
+        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let list = compute_subagent_allowlist(&map, None, &None).await;
         assert!(
             list.is_none(),
-            "no parent → no restriction (None), got: {:?}",
+            "no parent and no role → no restriction (None), got: {:?}",
             list
+        );
+    }
+
+    #[tokio::test]
+    async fn parentless_unknown_role_denies_all() {
+        // Unknown roles fail closed even without a parent to intersect with.
+        let map = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let list = compute_subagent_allowlist(&map, None, &Some("unknown".into())).await;
+        assert!(
+            list.as_ref().is_some_and(|v| v.is_empty()),
+            "parentless unknown role → deny all (Some(vec![])), got: {:?}",
+            list
+        );
+    }
+
+    #[tokio::test]
+    async fn parentless_reviewer_spawn_uses_strict_reviewer_filter() {
+        // Exercise the real shared spawn path used by the review_only IPC:
+        // the role must reach the workflow as ToolFilter::Reviewer, not merely
+        // produce the right standalone vector in the allow-list helper.
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.md");
+        let project = dir.path().join("project.md");
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(&project, "").unwrap();
+        let memory: Arc<dyn crate::memory::MemoryStoreTrait> = Arc::new(
+            crate::memory::MemoryStore::open_in_memory(Arc::new(
+                crate::memory::embedder::HashEmbedder::new(),
+            ))
+            .unwrap(),
+        );
+        let factory = Arc::new(AgentLoopFactory::new(
+            crate::agent::factory::FactoryDeps {
+                provider: Arc::new(NoopProvider),
+                constitution_source: crate::project::ConstitutionSource::new(&global, &project)
+                    .unwrap(),
+                memory: Some(memory),
+                sandbox: Arc::new(
+                    crate::tool::agent::sandbox::Sandbox::new(dir.path()).unwrap(),
+                ),
+                project_root: dir.path().to_path_buf(),
+                safety_rules: None,
+                safety_mode: Arc::new(std::sync::RwLock::new(
+                    crate::config::SafetyMode::Autonomous,
+                )),
+                context_manager: crate::agent::context::ContextManager::new(128_000, 0.5),
+                plans_dir: dir.path().join("plans"),
+                vision: None,
+            },
+        ));
+        factory.set_policy_factory(Arc::new(
+            crate::app::policy_factory::WorkflowPolicyFactory::new(
+                None,
+                None,
+                None,
+                std::path::PathBuf::new(),
+                None,
+            ),
+        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(AgentManager::new(8)));
+        let agent_loops: AgentLoopMap =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let (agent_id, _) = spawn_agent_shared(
+            SpawnHost {
+                factory,
+                manager,
+                agent_loops: agent_loops.clone(),
+            },
+            "reviewer".to_string(),
+            None,
+            None,
+            SessionOptions {
+                model: None,
+                role: Some("reviewer".to_string()),
+                own_plans_dir: true,
+                worktree: None,
+                permission: None,
+                initial_messages: None,
+                limits: None,
+                host_tools: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let agent = agent_loops.lock().await.get(&agent_id).cloned().unwrap();
+        let expected: Vec<String> = REVIEWER_BASE_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            agent.workflow_handle().allowed_tools().await,
+            ToolFilter::Reviewer(expected)
         );
     }
 

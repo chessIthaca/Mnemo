@@ -4766,7 +4766,10 @@ mod tests {
             )
             .await
             .expect_err("a retry cannot silently change the worker model");
-        assert!(model_conflict.contains("different brief or model"), "{model_conflict}");
+        assert!(
+            model_conflict.contains("different brief, model"),
+            "{model_conflict}"
+        );
         let step_conflict = team
             .handle_lead_host_tool(
                 "team_dispatch",

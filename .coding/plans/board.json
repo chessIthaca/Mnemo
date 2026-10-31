@@ -79,6 +79,14 @@
       "closed_at_ms": 1793452560832,
       "report_path": "C:\\Mnemo\\.coding\\reviews\\team-edbb0411-20261031-131600.md",
       "abandon_reason": null
+    },
+    {
+      "id": "0f378abe",
+      "status": "closed",
+      "created_at_ms": 1793449591831,
+      "closed_at_ms": 1793457381988,
+      "report_path": ".coding/reviews/claude-lead-0f378abe-round1.md",
+      "abandon_reason": null
     }
   ]
 }

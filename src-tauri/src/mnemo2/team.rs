@@ -11,7 +11,7 @@
 //! interaction, and event pump. It deliberately has no Tauri types so the
 //! worker lifecycle is testable against a scripted LLM.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -50,6 +50,13 @@ const EVENT_BUFFER: usize = 1024;
 
 /// The default number of concurrently live worker sessions.
 pub const DEFAULT_SLOTS: usize = 3;
+
+/// How long an attached external lead may go without calling in before it is
+/// detached and the in-app lead takes over again.
+pub const EXTERNAL_LEAD_IDLE_MS: u64 = 10 * 60 * 1000;
+
+/// The most notices an unread external queue keeps; the oldest are dropped.
+const EXTERNAL_QUEUE_CAP: usize = 256;
 
 /// The real lifecycle state of one worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -471,6 +478,83 @@ impl LiveWorker {
     }
 }
 
+/// The state of an external lead (Claude Code leading over MCP) on one team.
+#[derive(Debug, Default)]
+struct ExternalLead {
+    /// When it attached (Unix epoch milliseconds); `None` while detached.
+    since_ms: Option<u64>,
+    /// Notices queued for it, oldest first. The text is exactly what the
+    /// in-app lead would have been sent.
+    queue: VecDeque<String>,
+    /// Notices an external lead never read and the in-app lead could not take
+    /// (no session to receive them). They wait here, oldest first, for the
+    /// in-app lead's next notice or the next external lead.
+    undelivered: VecDeque<String>,
+    /// Its last call (MCP, notices or wait), in Unix epoch milliseconds.
+    last_activity_ms: u64,
+    /// Waiters currently blocked in [`TeamRuntime::wait_external_notices`].
+    waiters: usize,
+}
+
+/// How a [`TeamRuntime::wait_external`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalWaitStatus {
+    /// At least one notice was queued.
+    Notices,
+    /// Nothing arrived before the timeout.
+    Timeout,
+    /// The external lead detached while waiting (or was not attached).
+    Detached,
+}
+
+impl ExternalWaitStatus {
+    /// The wire name `/lead/wait` reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Notices => "notices",
+            Self::Timeout => "timeout",
+            Self::Detached => "detached",
+        }
+    }
+}
+
+/// The result of a [`TeamRuntime::wait_external`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalWait {
+    /// The drained notices, oldest first (empty unless the status is
+    /// [`ExternalWaitStatus::Notices`]).
+    pub notices: Vec<String>,
+    /// Why the wait ended.
+    pub status: ExternalWaitStatus,
+}
+
+/// Counts one blocked waiter for as long as it lives, and counts the end of
+/// the wait as activity.
+struct ExternalWaiter<'a>(&'a TeamRuntime);
+
+impl<'a> ExternalWaiter<'a> {
+    fn new(team: &'a TeamRuntime) -> Self {
+        let mut state = team.external_state();
+        state.waiters += 1;
+        state.last_activity_ms = unix_ms();
+        drop(state);
+        Self(team)
+    }
+}
+
+impl Drop for ExternalWaiter<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.external_state();
+        state.waiters = state.waiters.saturating_sub(1);
+        state.last_activity_ms = unix_ms();
+    }
+}
+
+/// Unix epoch milliseconds now.
+fn unix_ms() -> u64 {
+    u64::try_from(phase3::now_ms()).unwrap_or(u64::MAX)
+}
+
 /// The shared team runtime: one engine, many real worker sessions.
 pub struct TeamRuntime {
     engine: Arc<Engine>,
@@ -496,6 +580,10 @@ pub struct TeamRuntime {
     save_lock: Arc<Mutex<()>>,
     board: std::sync::Mutex<Option<Arc<PlanBoard>>>,
     signals: broadcast::Sender<BoardSignal>,
+    /// The external lead's attach flag, notice queue and activity clock.
+    external: std::sync::Mutex<ExternalLead>,
+    /// Wakes [`TeamRuntime::wait_external_notices`] on a push or a detach.
+    external_wake: tokio::sync::Notify,
 }
 
 /// The model tiers the lead may dispatch by, with their one-line purpose.
@@ -555,6 +643,8 @@ impl TeamRuntime {
             save_lock: Arc::new(Mutex::new(())),
             board: std::sync::Mutex::new(None),
             signals,
+            external: std::sync::Mutex::new(ExternalLead::default()),
+            external_wake: tokio::sync::Notify::new(),
         };
         runtime.persist().await?;
         Ok(runtime)
@@ -796,6 +886,254 @@ impl TeamRuntime {
 
     pub(crate) async fn lead_is_current(&self, session_id: SessionId) -> bool {
         *self.lead_session.lock().await == Some(session_id)
+    }
+
+    fn external_state(&self) -> std::sync::MutexGuard<'_, ExternalLead> {
+        self.external.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make an external lead (Claude Code over MCP) this team's lead: from
+    /// now on lead notices queue for it instead of reaching the in-app lead.
+    /// Notices a previous external lead never read (and the in-app lead could
+    /// not take) are handed to this one. Returns `true` when it was not
+    /// attached before. Counts as activity.
+    pub fn attach_external_lead(&self) -> bool {
+        let mut state = self.external_state();
+        state.last_activity_ms = unix_ms();
+        if state.since_ms.is_some() {
+            return false;
+        }
+        state.since_ms = Some(state.last_activity_ms);
+        state.queue = std::mem::take(&mut state.undelivered);
+        true
+    }
+
+    /// Hand the team back to the in-app lead and wake blocked waiters.
+    /// Returns `true` when an external lead was attached.
+    ///
+    /// Notices it never read are not dropped: they move to the undelivered
+    /// list, which [`TeamRuntime::take_undelivered_notices`] hands over (the
+    /// caller gives them to the in-app lead, see
+    /// `LeadRuntime::release_external_lead`).
+    pub fn detach_external_lead(&self) -> bool {
+        let was_attached = {
+            let mut state = self.external_state();
+            let was_attached = state.since_ms.take().is_some();
+            // They are newer than anything already held back.
+            let unread = std::mem::take(&mut state.queue);
+            state.undelivered.extend(unread);
+            while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
+                state.undelivered.pop_front();
+            }
+            was_attached
+        };
+        self.external_wake.notify_waiters();
+        was_attached
+    }
+
+    /// Whether an external lead currently leads this team.
+    pub fn external_lead_attached(&self) -> bool {
+        self.external_state().since_ms.is_some()
+    }
+
+    /// When the external lead attached (Unix epoch milliseconds), if it is.
+    pub fn external_lead_since_ms(&self) -> Option<u64> {
+        self.external_state().since_ms
+    }
+
+    /// Record a call from the external lead (keeps it from idling out).
+    pub fn touch_external_lead(&self) {
+        self.external_state().last_activity_ms = unix_ms();
+    }
+
+    /// Whether the attached external lead has been silent for `idle_ms` as of
+    /// `now_ms`. A blocked waiter counts as presence, so a long-poll never
+    /// idles out.
+    pub fn external_idle_expired(&self, now_ms: u64, idle_ms: u64) -> bool {
+        let state = self.external_state();
+        state.since_ms.is_some()
+            && state.waiters == 0
+            && now_ms.saturating_sub(state.last_activity_ms) >= idle_ms
+    }
+
+    /// Whether a `wait` long-poll is blocked right now.
+    pub fn external_waiter_alive(&self) -> bool {
+        self.external_state().waiters > 0
+    }
+
+    /// Queue a notice for the external lead and wake any waiter. The text is
+    /// the exact string the in-app lead would have been sent.
+    ///
+    /// The check and the push happen under one lock: with no external lead
+    /// attached nothing is queued and this returns `false`, so the caller
+    /// gives the notice to the in-app lead instead (a detach can never
+    /// strand a notice in a queue nobody reads).
+    pub fn push_external_notice(&self, text: String) -> bool {
+        {
+            let mut state = self.external_state();
+            if state.since_ms.is_none() {
+                return false;
+            }
+            if state.queue.len() >= EXTERNAL_QUEUE_CAP {
+                state.queue.pop_front();
+            }
+            state.queue.push_back(text);
+        }
+        self.external_wake.notify_waiters();
+        true
+    }
+
+    /// Take every queued notice, oldest first.
+    pub fn drain_external_notices(&self) -> Vec<String> {
+        self.external_state().queue.drain(..).collect()
+    }
+
+    /// Put notices that were drained but never reached the external lead
+    /// (the response write failed) back at the front of its queue, in their
+    /// original order. If the lead detached meanwhile they join the
+    /// undelivered list instead, ahead of anything newer.
+    pub fn requeue_external_notices(&self, notices: Vec<String>) {
+        if notices.is_empty() {
+            return;
+        }
+        {
+            let mut state = self.external_state();
+            let attached = state.since_ms.is_some();
+            let target = if attached {
+                &mut state.queue
+            } else {
+                &mut state.undelivered
+            };
+            for notice in notices.into_iter().rev() {
+                target.push_front(notice);
+            }
+            while target.len() > EXTERNAL_QUEUE_CAP {
+                target.pop_front();
+            }
+        }
+        self.external_wake.notify_waiters();
+    }
+
+    /// Take the notices an external lead never read and the in-app lead has
+    /// not yet received, oldest first.
+    pub fn take_undelivered_notices(&self) -> Vec<String> {
+        self.external_state().undelivered.drain(..).collect()
+    }
+
+    /// Put notices the in-app lead could not take back on the undelivered
+    /// list, ahead of anything newer.
+    pub fn restore_undelivered_notices(&self, notices: Vec<String>) {
+        let mut state = self.external_state();
+        for notice in notices.into_iter().rev() {
+            state.undelivered.push_front(notice);
+        }
+        while state.undelivered.len() > EXTERNAL_QUEUE_CAP {
+            state.undelivered.pop_front();
+        }
+    }
+
+    /// The queued notices, left in place.
+    pub fn peek_external_notices(&self) -> Vec<String> {
+        self.external_state().queue.iter().cloned().collect()
+    }
+
+    /// Block until a notice is queued (then drain and return all of them), the
+    /// external lead detaches, or `timeout` passes (then return `[]`).
+    pub async fn wait_external_notices(&self, timeout: std::time::Duration) -> Vec<String> {
+        self.wait_external(timeout).await.notices
+    }
+
+    /// Like [`TeamRuntime::wait_external_notices`], and says how the wait
+    /// ended.
+    pub async fn wait_external(&self, timeout: std::time::Duration) -> ExternalWait {
+        let _waiter = ExternalWaiter::new(self);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Arm the wake-up before looking, so a push in between is not lost.
+            let woken = self.external_wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            let notices = self.drain_external_notices();
+            if !notices.is_empty() {
+                return ExternalWait {
+                    notices,
+                    status: ExternalWaitStatus::Notices,
+                };
+            }
+            if !self.external_lead_attached() {
+                return ExternalWait {
+                    notices,
+                    status: ExternalWaitStatus::Detached,
+                };
+            }
+            if tokio::time::timeout_at(deadline, woken).await.is_err() {
+                let notices = self.drain_external_notices();
+                let status = if !notices.is_empty() {
+                    ExternalWaitStatus::Notices
+                } else if self.external_lead_attached() {
+                    ExternalWaitStatus::Timeout
+                } else {
+                    ExternalWaitStatus::Detached
+                };
+                return ExternalWait { notices, status };
+            }
+        }
+    }
+
+    /// How many worker turns are running now (dispatching, working, fixing or
+    /// merging).
+    pub async fn live_worker_turns(&self) -> usize {
+        ledger::live_turns(&self.records.lock().await)
+    }
+
+    /// A short board, workers and tiers line for the external lead's session
+    /// start.
+    pub async fn external_summary(&self) -> String {
+        let (running, waiting, merged, total) = {
+            let workers = self.records.lock().await;
+            (
+                ledger::live_turns(&workers),
+                workers
+                    .iter()
+                    .filter(|w| {
+                        matches!(
+                            w.status,
+                            WorkerStatus::Completed
+                                | WorkerStatus::InReview
+                                | WorkerStatus::NeedsYou
+                                | WorkerStatus::Failed
+                                | WorkerStatus::Conflict
+                                | WorkerStatus::Interrupted
+                        )
+                    })
+                    .count(),
+                workers.iter().filter(|w| ledger::merged(w)).count(),
+                workers.len(),
+            )
+        };
+        let mut summary = format!(
+            "Mnemo2 team: {running} worker(s) running, {waiting} waiting on you (review, blocked or failed), {merged} merged, {total} total."
+        );
+        let plans: Vec<String> = self
+            .board()
+            .and_then(|board| board.list().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|plan| plan.status == BoardStatus::Open)
+            .map(|plan| {
+                let done = plan.steps.iter().filter(|step| step.done).count();
+                format!("{} \"{}\" ({done}/{} steps done)", plan.id, plan.title, plan.steps.len())
+            })
+            .collect();
+        if plans.is_empty() {
+            summary.push_str(" No open plans.");
+        } else {
+            summary.push_str(&format!(" Open plans: {}.", plans.join("; ")));
+        }
+        if let Some(tiers) = self.tier_guidance() {
+            summary.push_str(&format!(" Tiers - {}", tiers.replace('\n', "; ")));
+        }
+        summary
     }
 
     /// Persist a new live-session cap without dropping active workers.

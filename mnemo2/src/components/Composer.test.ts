@@ -549,4 +549,137 @@ describe("Composer", () => {
     expect(draft()).toEqual({ text: "keep text", images: [] });
     expect(screen.queryByAltText("Attachment 1")).toBeNull();
   });
+
+  describe("with Claude Code leading the project", () => {
+    const attachExternalLead = () =>
+      app.update((state) => ({
+        ...state,
+        externalLead: { attached: true, root: "C:/Mnemo", sinceMs: 1_000 },
+      }));
+    const confirmation = () => screen.queryByRole("dialog", { name: "Send to the built-in lead?" });
+
+    it("asks before sending to the built-in lead and keeps the draft on cancel", async () => {
+      setLead(false);
+      attachExternalLead();
+      actions.setLeadDraftText("redirect the team");
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      render(Composer);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      expect(confirmation()).toBeTruthy();
+      expect(
+        screen.getByText("Claude Code is leading this project. Send this to the built-in lead anyway?"),
+      ).toBeTruthy();
+      expect(send).not.toHaveBeenCalled();
+
+      await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      expect(confirmation()).toBeNull();
+      expect(send).not.toHaveBeenCalled();
+      expect(draft().text).toBe("redirect the team");
+    });
+
+    it("sends to the built-in lead once confirmed", async () => {
+      setLead(false);
+      attachExternalLead();
+      actions.setLeadDraftText("redirect the team");
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      render(Composer);
+
+      await fireEvent.keyDown(textbox(), { key: "Enter" });
+      expect(confirmation()).toBeTruthy();
+      expect(send).not.toHaveBeenCalled();
+
+      await fireEvent.click(screen.getByRole("button", { name: "Send anyway" }));
+      await vi.waitFor(() => expect(send).toHaveBeenCalledWith("redirect the team", []));
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(confirmation()).toBeNull();
+      await vi.waitFor(() => expect(draft().text).toBe(""));
+    });
+
+    it("drops the confirmation when Claude Code detaches", async () => {
+      setLead(false);
+      attachExternalLead();
+      actions.setLeadDraftText("redirect the team");
+      render(Composer);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      expect(confirmation()).toBeTruthy();
+
+      app.update((state) => ({
+        ...state,
+        externalLead: { attached: false, root: null, sinceMs: null },
+      }));
+      await vi.waitFor(() => expect(confirmation()).toBeNull());
+      expect(draft().text).toBe("redirect the team");
+    });
+
+    it("never turns a confirmed prompt into an answer to a question that arrived meanwhile", async () => {
+      setLead(false);
+      attachExternalLead();
+      actions.setLeadDraftText("redirect the team");
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+      render(Composer);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      expect(confirmation()).toBeTruthy();
+      app.update((state) => ({
+        ...state,
+        leadRuntime: {
+          ...state.leadRuntime,
+          pending: {
+            kind: "question",
+            question_id: "q-late",
+            question: "Which approach?",
+            options: [{ label: "Fast" }, { label: "Thorough" }],
+          },
+        },
+      }));
+
+      // The question now owns the turn, so the prompt waits; the draft is
+      // neither sent as the answer nor lost.
+      await fireEvent.click(screen.getByRole("button", { name: "Send anyway" }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(answer).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(draft().text).toBe("redirect the team");
+    });
+
+    it("does not ask when answering a question the built-in lead asked", async () => {
+      setLead(false);
+      attachExternalLead();
+      const answer = vi.spyOn(actions, "answerLead").mockResolvedValue(true);
+      app.update((state) => ({
+        ...state,
+        leadRuntime: {
+          ...state.leadRuntime,
+          pending: {
+            kind: "question",
+            question_id: "q-ext",
+            question: "Which approach?",
+            options: [{ label: "Fast" }, { label: "Thorough" }],
+          },
+        },
+      }));
+      actions.setLeadDraftText("2)");
+      render(Composer);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Answer question" }));
+      expect(confirmation()).toBeNull();
+      await vi.waitFor(() =>
+        expect(answer).toHaveBeenCalledWith("q-ext", { kind: "choice", index: 1 }),
+      );
+    });
+
+    it("sends without asking when no external lead is attached", async () => {
+      setLead(false);
+      actions.setLeadDraftText("plan the work");
+      const send = vi.spyOn(actions, "sendLeadMessage").mockResolvedValue(true);
+      render(Composer);
+
+      await fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await vi.waitFor(() => expect(send).toHaveBeenCalledWith("plan the work", []));
+      expect(confirmation()).toBeNull();
+    });
+  });
 });

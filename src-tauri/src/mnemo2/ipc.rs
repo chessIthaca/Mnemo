@@ -26,8 +26,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri_plugin_notification::NotificationExt;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -35,9 +36,11 @@ use tokio::sync::{broadcast, Mutex};
 
 use mnemo::{Approval, UserAnswer};
 
+use crate::mnemo2::mcp_server::{McpServer, OpenFailure};
 use crate::mnemo2::phase3::{Finding, ReviewEvidence};
 use crate::mnemo2::project::{self, ProjectPreferences, ProjectRecord};
 use crate::mnemo2::indexing::{IndexingSnapshot, INDEXING_CHANNEL};
+use crate::mnemo2::run_file::RunFileHandle;
 use crate::mnemo2::runtime::{LeadRuntime, LeadRuntimeOptions, LeadSnapshot, LEAD_EVENT_CHANNEL};
 use crate::mnemo2::team::{
     BoardSignal, BoardSnapshot, TeamMessage, TeamRuntime, TeamSnapshot, WorkerDeletion, WorkerRecord, TEAM_EVENT_CHANNEL,
@@ -58,6 +61,130 @@ pub struct Mnemo2State {
     marker_root: Mutex<Option<PathBuf>>,
     preferences: Mutex<Option<(PathBuf, ProjectPreferences)>>,
     notified: Mutex<HashSet<String>>,
+    /// The canonical `--project` from the command line, until the frontend
+    /// takes it.
+    startup_project: std::sync::Mutex<Option<String>>,
+    /// This process's run file, once the local endpoint is up.
+    run_file: std::sync::Mutex<Option<Arc<RunFileHandle>>>,
+    /// The local endpoint for an external lead; dropping it stops listening.
+    endpoint: std::sync::Mutex<Option<McpServer>>,
+    /// Why the UI could not open a project Claude Code asked for: the
+    /// canonical root, the reason and when it was reported, until the next
+    /// request or open.
+    open_failure: std::sync::Mutex<Option<(PathBuf, String, Instant)>>,
+}
+
+impl Mnemo2State {
+    /// The reported failure to open the project at `root`.
+    pub(crate) fn open_failure(&self, root: &std::path::Path) -> Option<OpenFailure> {
+        let failure = self.open_failure.lock().unwrap_or_else(|e| e.into_inner());
+        failure
+            .as_ref()
+            .filter(|(failed, _, _)| failed.as_path() == root)
+            .map(|(_, reason, reported)| OpenFailure {
+                reason: reason.clone(),
+                age: reported.elapsed(),
+            })
+    }
+
+    /// Remember that the UI could not open `root` (canonical). `open` is the
+    /// canonical root of the project open right now: a report that arrives
+    /// after that project opened is late and would only mislead the helper.
+    pub(crate) fn record_open_failure(
+        &self,
+        root: PathBuf,
+        reason: String,
+        open: Option<&std::path::Path>,
+    ) {
+        if open == Some(root.as_path()) {
+            return;
+        }
+        *self.open_failure.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((root, reason, Instant::now()));
+    }
+
+    /// Forget a reported open failure (a new request, or a project opened).
+    pub(crate) fn clear_open_failure(&self) {
+        *self.open_failure.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The external lead's state on the open project, as the UI reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExternalLeadStatus {
+    /// Whether an external lead (Claude Code over MCP) leads the open project.
+    pub attached: bool,
+    /// The open project's root while attached.
+    pub root: Option<String>,
+    /// When it attached, in Unix epoch milliseconds.
+    pub since_ms: Option<u64>,
+}
+
+impl Mnemo2State {
+    /// Remember the `--project` the app was started with.
+    pub fn set_startup_project(&self, root: Option<String>) {
+        *self.startup_project.lock().unwrap_or_else(|e| e.into_inner()) = root;
+    }
+
+    /// Take the `--project` once; later calls get `None`.
+    pub fn take_startup_project(&self) -> Option<String> {
+        self.startup_project
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Keep the running endpoint and this process's run file.
+    pub fn install_endpoint(&self, server: McpServer, run_file: Arc<RunFileHandle>) {
+        *self.endpoint.lock().unwrap_or_else(|e| e.into_inner()) = Some(server);
+        *self.run_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(run_file);
+    }
+
+    /// Stop the endpoint and remove the run file (app exit).
+    pub fn shutdown_endpoint(&self) {
+        self.endpoint.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(run_file) = self.run_file.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            run_file.remove();
+        }
+    }
+
+    /// Record the open project (`None` once closed) in the run file.
+    fn sync_run_file(&self, project: Option<&std::path::Path>) {
+        if project.is_some() {
+            self.clear_open_failure();
+        }
+        let run_file = self.run_file.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(run_file) = run_file {
+            if let Err(error) = run_file.set_project(project) {
+                eprintln!("mnemo2: could not update the run file: {error}");
+            }
+        }
+    }
+
+    /// The open project's lead, if one is open.
+    pub async fn open_lead(&self) -> Option<Arc<LeadRuntime>> {
+        self.runtime.lock().await.clone()
+    }
+
+    /// The team of the open project, if one is open.
+    pub async fn open_team(&self) -> Option<Arc<TeamRuntime>> {
+        self.open_lead().await?.team_handle().await.ok()
+    }
+
+    /// Hand the open project back to the in-app lead if an external lead
+    /// leads it (its unread notices go to the in-app lead), telling the UI.
+    /// Run before the project closes or is replaced.
+    async fn release_external_lead(&self, app: &AppHandle) {
+        let Some(lead) = self.open_lead().await else {
+            return;
+        };
+        if lead.release_external_lead().await {
+            let _ = app.emit(
+                crate::mnemo2::mcp_server::EXTERNAL_LEAD_CHANNEL,
+                serde_json::json!({ "attached": false, "root": null }),
+            );
+        }
+    }
 }
 
 impl Mnemo2State {
@@ -85,6 +212,7 @@ impl Mnemo2State {
             project::detach(&root);
         }
         self.preferences.lock().await.take();
+        self.sync_run_file(None);
     }
 }
 
@@ -374,9 +502,11 @@ pub async fn lead_open(
     if let Some(forwarder) = state.indexing_forwarder.lock().await.take() {
         forwarder.abort();
     }
+    state.release_external_lead(&app).await;
     if let Some(old) = state.runtime.lock().await.take() {
         let old_root = old.workspace_root().to_path_buf();
         old.shutdown().await;
+        state.sync_run_file(None);
         if old_root != root {
             project::detach(&old_root);
             let _ = browser.close().await;
@@ -497,7 +627,56 @@ pub async fn lead_open(
     *state.team_forwarder.lock().await = Some(team_forwarder);
     *state.board_forwarder.lock().await = Some(board_forwarder);
     *state.indexing_forwarder.lock().await = Some(indexing_forwarder);
+    state.sync_run_file(Some(&root));
     Ok(snapshot)
+}
+
+/// The project named by `--project` on the command line (its canonical root),
+/// once; every later call gets `None`. The frontend opens it through its
+/// normal project-open flow.
+#[tauri::command]
+pub fn mnemo2_startup_project(state: State<'_, Mnemo2State>) -> Option<String> {
+    state.take_startup_project()
+}
+
+/// The UI could not open a project Claude Code asked for (`--project` or an
+/// external open request); the local endpoint reports `reason` to the
+/// waiting helper instead of letting it time out.
+#[tauri::command]
+pub async fn external_open_failed(
+    state: State<'_, Mnemo2State>,
+    root: String,
+    reason: String,
+) -> Result<(), String> {
+    let root = project::canonical_root(std::path::Path::new(&root))?;
+    let open = state.open_lead().await.map(|lead| {
+        let open = lead.workspace_root();
+        project::canonical_root(open).unwrap_or_else(|_| open.to_path_buf())
+    });
+    state.record_open_failure(root, reason, open.as_deref());
+    Ok(())
+}
+
+/// Whether an external lead (Claude Code over MCP) leads the open project.
+/// Changes arrive on `mnemo2://external-lead`.
+#[tauri::command]
+pub async fn external_lead_status(
+    state: State<'_, Mnemo2State>,
+) -> Result<ExternalLeadStatus, String> {
+    let Some(lead) = state.open_lead().await else {
+        return Ok(ExternalLeadStatus {
+            attached: false,
+            root: None,
+            since_ms: None,
+        });
+    };
+    let team = lead.team_handle().await?;
+    let since_ms = team.external_lead_since_ms();
+    Ok(ExternalLeadStatus {
+        attached: since_ms.is_some(),
+        root: since_ms.map(|_| lead.workspace_root().to_string_lossy().into_owned()),
+        since_ms,
+    })
 }
 
 /// The open project's startup indexing status (code index + memory). Later
@@ -904,9 +1083,11 @@ pub async fn team_messages(state: State<'_, Mnemo2State>) -> Result<Vec<TeamMess
 /// Close the lead session and stop its event forwarder.
 #[tauri::command]
 pub async fn lead_close(
+    app: AppHandle,
     state: State<'_, Mnemo2State>,
     browser: State<'_, crate::mnemo2::browser::BrowserController>,
 ) -> Result<(), String> {
+    state.release_external_lead(&app).await;
     state.shutdown().await;
     browser.close().await
 }
@@ -1071,6 +1252,91 @@ mod tests {
     use super::*;
     use mnemo::headless::SessionEvent;
     use mnemo::runtime::channels::SerializableAgentEvent;
+
+    #[test]
+    fn the_startup_project_is_handed_over_once() {
+        let state = Mnemo2State::default();
+        assert_eq!(state.take_startup_project(), None);
+        state.set_startup_project(Some("C:/work/app".into()));
+        assert_eq!(state.take_startup_project().as_deref(), Some("C:/work/app"));
+        assert_eq!(state.take_startup_project(), None, "a second take gets nothing");
+    }
+
+    #[test]
+    fn the_run_file_follows_the_open_project() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let state = Mnemo2State::default();
+        // Without an endpoint there is nothing to update.
+        state.sync_run_file(Some(std::path::Path::new("/ignored")));
+
+        let handle = Arc::new(
+            RunFileHandle::create(dir.path(), 1234, "tok".into()).expect("run file"),
+        );
+        let path = crate::mnemo2::run_file::run_path(dir.path(), std::process::id());
+        *state.run_file.lock().expect("slot") = Some(handle);
+        state.sync_run_file(Some(std::path::Path::new("/work/app")));
+        assert_eq!(
+            crate::mnemo2::run_file::read(&path).expect("read").project.as_deref(),
+            Some("/work/app")
+        );
+        state.sync_run_file(None);
+        assert!(crate::mnemo2::run_file::read(&path).expect("read").project.is_none());
+        state.shutdown_endpoint();
+        assert!(!path.exists(), "the file goes with the endpoint");
+    }
+
+    #[test]
+    fn a_reported_open_failure_carries_its_age_and_is_cleared_by_a_new_attempt() {
+        let state = Mnemo2State::default();
+        let root = std::path::PathBuf::from("/work/app");
+        assert_eq!(state.open_failure(&root), None);
+        state.record_open_failure(root.clone(), "no engine".into(), None);
+        let failure = state.open_failure(&root).expect("reported");
+        assert_eq!(failure.reason, "no engine");
+        assert!(failure.age < std::time::Duration::from_secs(5));
+        assert_eq!(state.open_failure(std::path::Path::new("/work/other")), None);
+        state.clear_open_failure();
+        assert_eq!(state.open_failure(&root), None);
+        // Opening a project forgets a failure too.
+        state.record_open_failure(root.clone(), "no engine".into(), None);
+        state.sync_run_file(Some(&root));
+        assert_eq!(state.open_failure(&root), None);
+    }
+
+    #[test]
+    fn a_late_failure_report_for_the_open_project_is_ignored() {
+        let state = Mnemo2State::default();
+        let root = std::path::PathBuf::from("/work/app");
+        // The project opened while the UI was still reporting its failure.
+        state.record_open_failure(root.clone(), "late".into(), Some(&root));
+        assert_eq!(state.open_failure(&root), None);
+        // Another open project does not excuse the report.
+        let other = std::path::PathBuf::from("/work/other");
+        state.record_open_failure(root.clone(), "busy".into(), Some(&other));
+        assert_eq!(state.open_failure(&root).map(|failure| failure.reason).as_deref(), Some("busy"));
+    }
+
+    #[test]
+    fn external_lead_status_has_the_documented_wire_shape() {
+        let status = ExternalLeadStatus {
+            attached: true,
+            root: Some("/p".into()),
+            since_ms: Some(5),
+        };
+        assert_eq!(
+            serde_json::to_value(status).expect("encode"),
+            serde_json::json!({ "attached": true, "root": "/p", "since_ms": 5 })
+        );
+        let idle = ExternalLeadStatus {
+            attached: false,
+            root: None,
+            since_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_value(idle).expect("encode"),
+            serde_json::json!({ "attached": false, "root": null, "since_ms": null })
+        );
+    }
 
     #[test]
     fn approval_decisions_parse_from_the_wire() {

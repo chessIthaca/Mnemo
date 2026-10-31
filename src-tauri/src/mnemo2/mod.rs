@@ -40,6 +40,12 @@ pub mod workbench;
 /// The native child-WebView2 Browser pane and its non-Windows fallback.
 pub mod browser;
 
+/// The per-instance run file the `mnemo2-mcp` helper finds a live Mnemo2 by.
+pub mod run_file;
+
+/// The local endpoint for an external lead (Claude Code over MCP).
+pub mod mcp_server;
+
 /// A liveness command used by the frontend to distinguish the Mnemo2 host
 /// from any other Tauri WebView (for example Mnemo1's Browser tab), which
 /// also exposes `__TAURI_INTERNALS__`.
@@ -48,7 +54,187 @@ fn mnemo2_host_ping() -> &'static str {
     "pong"
 }
 
-fn install_shell(app: &tauri::AppHandle) -> tauri::Result<()> {
+/// What the command line asked for: `mnemo2 [--hidden] [--project <path>]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartArgs {
+    /// Start with the main window hidden, living in the tray.
+    pub hidden: bool,
+    /// A project folder the frontend should open on startup.
+    pub project: Option<String>,
+}
+
+/// Read [`StartArgs`] from the process arguments (without the program name).
+/// Unknown arguments are ignored; the last `--project` wins.
+pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> StartArgs {
+    let mut parsed = StartArgs::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--hidden" {
+            parsed.hidden = true;
+        } else if arg == "--project" {
+            parsed.project = args.next().filter(|path| !path.is_empty());
+        } else if let Some(path) = arg.strip_prefix("--project=") {
+            parsed.project = Some(path.to_string()).filter(|path| !path.is_empty());
+        }
+    }
+    parsed
+}
+
+/// The tray's "Workers" line.
+fn workers_label(running: usize) -> String {
+    format!("Workers: {running} running")
+}
+
+/// How many worker turns are running on the open project.
+async fn running_workers(app: &tauri::AppHandle) -> usize {
+    use tauri::Manager as _;
+
+    let Some(state) = app.try_state::<ipc::Mnemo2State>() else {
+        return 0;
+    };
+    match state.open_team().await {
+        Some(team) => team.live_worker_turns().await,
+        None => 0,
+    }
+}
+
+/// Quit from the tray, asking first while workers are running.
+fn request_quit(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt as _, MessageDialogButtons, MessageDialogKind};
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let running = running_workers(&app).await;
+        if running == 0 {
+            app.exit(0);
+            return;
+        }
+        let quitting = app.clone();
+        app.dialog()
+            .message(format!(
+                "{running} worker(s) are still running. Quitting interrupts them; their branches and transcripts are kept."
+            ))
+            .title("Quit Mnemo2?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "Quit".to_string(),
+                "Keep running".to_string(),
+            ))
+            .show(move |confirmed| {
+                if confirmed {
+                    quitting.exit(0);
+                }
+            });
+    });
+}
+
+/// The tray icon: open Mnemo2, a live worker count, and quit.
+fn install_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+    let open = MenuItem::with_id(app, "open", "Open Mnemo2", true, None::<&str>)?;
+    let workers = MenuItem::with_id(app, "workers", workers_label(0), false, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &workers, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("mnemo2")
+        .tooltip("Mnemo2")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "open" => mcp_server::show_main_window(app),
+            "quit" => request_quit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                mcp_server::show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    // A cheap tick keeps the count current without tracking every event.
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut shown = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let running = running_workers(&app).await;
+            if running != shown {
+                shown = running;
+                let _ = workers.set_text(workers_label(running));
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Check every 30 s that the run file still exists and write it again if it
+/// does not, so the helper keeps finding this instance. Ends with the file's
+/// removal at exit.
+fn keep_run_file(run_file: std::sync::Arc<run_file::RunFileHandle>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(run_file::RESTORE_EVERY).await;
+            if run_file.is_removed() {
+                return;
+            }
+            match run_file.restore_if_missing() {
+                Ok(true) => eprintln!("mnemo2: the run file had disappeared; wrote it again"),
+                Ok(false) => {}
+                Err(error) => eprintln!("mnemo2: could not restore the run file: {error}"),
+            }
+        }
+    });
+}
+
+/// Start the local endpoint for an external lead and publish its run file.
+/// The app still works without it, so failures are logged, not fatal.
+fn start_endpoint(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let config_dir = mnemo::config::resolve_config_dir(None);
+    run_file::prune_stale(&config_dir, crate::instance_marker::pid_alive);
+    let token = run_file::new_token();
+    let host = std::sync::Arc::new(mcp_server::AppLeadHost::new(app.clone()));
+    let server = tauri::async_runtime::block_on(mcp_server::McpServer::start(
+        host,
+        token.clone(),
+        mcp_server::ServerOptions::default(),
+    ));
+    let server = match server {
+        Ok(server) => server,
+        Err(error) => {
+            eprintln!("mnemo2: could not start the local MCP endpoint: {error}");
+            return;
+        }
+    };
+    match run_file::RunFileHandle::create(&config_dir, server.port(), token) {
+        Ok(run_file) => {
+            let run_file = std::sync::Arc::new(run_file);
+            keep_run_file(run_file.clone());
+            let state = app.state::<ipc::Mnemo2State>();
+            state.install_endpoint(server, run_file);
+        }
+        Err(error) => eprintln!("mnemo2: could not write the run file: {error}"),
+    }
+}
+
+/// Whether the window starts hidden and hides instead of closing. `--hidden`
+/// only works with a tray icon to bring the window back from; without one the
+/// window stays visible and closes normally, or it could never be reached.
+fn starts_hidden(hidden: bool, tray_ok: bool) -> bool {
+    hidden && tray_ok
+}
+
+fn install_shell(app: &tauri::AppHandle, hidden: bool) -> tauri::Result<()> {
     use tauri::{PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl, WindowBuilder};
 
     let window = WindowBuilder::new(app, "main")
@@ -56,6 +242,7 @@ fn install_shell(app: &tauri::AppHandle) -> tauri::Result<()> {
         .inner_size(1440.0, 900.0)
         .min_inner_size(360.0, 540.0)
         .center()
+        .visible(!hidden)
         .build()?;
     crate::webview_udf::install_default_data_dir(app, std::process::id());
     let shell = window.add_child(
@@ -71,10 +258,15 @@ fn install_shell(app: &tauri::AppHandle) -> tauri::Result<()> {
     let resize_worker = mnemo::thread_util::spawn_latest_wins(move |size: PhysicalSize<u32>| {
         let _ = resize_sink.set_size(size);
     });
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::Resized(size) = event {
-            resize_worker.submit(*size);
+    let hider = window.clone();
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Resized(size) => resize_worker.submit(*size),
+        // A hidden-start Mnemo2 lives in the tray: closing only hides it.
+        tauri::WindowEvent::CloseRequested { api, .. } if hidden => {
+            api.prevent_close();
+            let _ = hider.hide();
         }
+        _ => {}
     });
     Ok(())
 }
@@ -86,17 +278,42 @@ fn install_shell(app: &tauri::AppHandle) -> tauri::Result<()> {
 pub fn run() {
     std::env::remove_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
     mnemo::app::install_panic_hook();
+    let args = parse_args(std::env::args().skip(1));
+    let state = ipc::Mnemo2State::default();
+    state.set_startup_project(args.project.as_deref().and_then(|path| {
+        match project::canonical_root(std::path::Path::new(path)) {
+            Ok(root) => Some(root.to_string_lossy().into_owned()),
+            Err(error) => {
+                eprintln!("mnemo2: ignoring --project: {error}");
+                None
+            }
+        }
+    }));
+    let hidden = args.hidden;
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .manage(ipc::Mnemo2State::default())
+        .manage(state)
         .manage(browser::BrowserController::default())
-        .setup(|app| {
-            install_shell(app.handle())?;
+        .setup(move |app| {
+            // The tray comes first: whether it exists decides whether the
+            // window may start hidden and hide on close.
+            let tray_ok = match install_tray(app.handle()) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("mnemo2: could not create the tray icon: {error}");
+                    false
+                }
+            };
+            install_shell(app.handle(), starts_hidden(hidden, tray_ok))?;
+            start_endpoint(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             mnemo2_host_ping,
+            ipc::mnemo2_startup_project,
+            ipc::external_lead_status,
+            ipc::external_open_failed,
             ipc::lead_open,
             ipc::lead_snapshot,
             ipc::indexing_snapshot,
@@ -168,6 +385,8 @@ pub fn run() {
                 use tauri::Manager as _;
                 let state = app.state::<ipc::Mnemo2State>();
                 let browser = app.state::<browser::BrowserController>();
+                // Stop advertising this instance before tearing the project down.
+                state.shutdown_endpoint();
                 let _ = tauri::async_runtime::block_on(async {
                     if let Ok(owner) = ipc::state_owner(app) {
                         let _ = state.save_cached_preferences(&owner).await;
@@ -181,6 +400,54 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> StartArgs {
+        parse_args(list.iter().map(|arg| (*arg).to_string()))
+    }
+
+    #[test]
+    fn start_args_read_hidden_and_project() {
+        assert_eq!(args(&[]), StartArgs::default());
+        assert_eq!(
+            args(&["--hidden"]),
+            StartArgs {
+                hidden: true,
+                project: None
+            }
+        );
+        assert_eq!(
+            args(&["--hidden", "--project", "C:\\work\\app"]),
+            StartArgs {
+                hidden: true,
+                project: Some("C:\\work\\app".into())
+            }
+        );
+        assert_eq!(args(&["--project=/p/q"]).project.as_deref(), Some("/p/q"));
+        // The last --project wins; unknown flags and a bare --project are fine.
+        assert_eq!(
+            args(&["--project", "a", "--other", "--project", "b"]).project.as_deref(),
+            Some("b")
+        );
+        assert_eq!(args(&["--project"]).project, None);
+        assert_eq!(args(&["--project="]).project, None);
+    }
+
+    #[test]
+    fn a_hidden_start_needs_a_tray_to_come_back_from() {
+        assert!(starts_hidden(true, true), "hidden with a tray: hide and live in the tray");
+        // Without a tray the window is shown and closing really closes it.
+        assert!(!starts_hidden(true, false), "no tray: stay visible, do not hide on close");
+        assert!(!starts_hidden(false, true));
+        assert!(!starts_hidden(false, false));
+    }
+
+    #[test]
+    fn the_tray_worker_line_counts_running_workers() {
+        assert_eq!(workers_label(0), "Workers: 0 running");
+        assert_eq!(workers_label(3), "Workers: 3 running");
+    }
+
     /// The native shell must compile with Mnemo2's own Tauri identity. Sharing
     /// Mnemo1's identity also shares its WebView2 user-data folder, which
     /// deadlocks the second process before its webview initializes.

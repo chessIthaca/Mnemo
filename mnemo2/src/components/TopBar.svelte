@@ -4,6 +4,7 @@
   import { formatTokenCount, formatUsageCost, usageIsPartial, usageTotalTokens } from "../lib/usage";
   import AvatarStack from "./AvatarStack.svelte";
   import ContextRing from "./ContextRing.svelte";
+  import ExternalLeadBadge from "./ExternalLeadBadge.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
   import Sheet from "./Sheet.svelte";
   import SettingsDialog from "./SettingsDialog.svelte";
@@ -63,6 +64,7 @@
       ><PanelsTopLeft size={15} /></button>
     {/if}
     <button class="icon-button" aria-label="Settings" onclick={() => (appSettingsOpen = true)}><Settings size={15} /></button>
+    <ExternalLeadBadge />
     <ContextRing />
     <div class="usage-chip">
       <button

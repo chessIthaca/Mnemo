@@ -7,12 +7,16 @@
   import type { LeadAnswerInput } from "../lib/types";
   import IndexingStatus from "./IndexingStatus.svelte";
   import LeadModelPicker from "./LeadModelPicker.svelte";
+  import Sheet from "./Sheet.svelte";
 
   let stopping = $state(false);
   let attaching = $state(false);
   let submitting = $state(false);
   let answering = $state(false);
   let freeformQuestionId = $state<string | null>(null);
+  // Claude Code leads this project: sending to the built-in lead asks first.
+  let confirmingExternal = $state(false);
+  const externalLeading = $derived($app.externalLead.attached);
   // The draft lives in store state (not component state) so unmounting the
   // Lead view — for example by opening the Team view — never loses it.
   const draft = $derived($app.leadDraft);
@@ -65,6 +69,9 @@
     if (!canInterrupt) stopping = false;
   });
   $effect(() => {
+    if (!externalLeading) confirmingExternal = false;
+  });
+  $effect(() => {
     if (
       pendingQuestion === null ||
       pendingQuestion.question_id !== freeformQuestionId
@@ -84,8 +91,10 @@
     }
   }
 
-  async function send() {
-    if (canAnswerQuestion && pendingQuestion) {
+  async function send(confirmedExternal = false) {
+    // A confirmed send is the prompt the user approved, even if a question
+    // arrived while the confirmation was open.
+    if (!confirmedExternal && canAnswerQuestion && pendingQuestion) {
       await submitAnswer(pendingQuestion);
       return;
     }
@@ -94,6 +103,11 @@
     const images = draft.images;
     // An image-only submission is a real message for a vision model.
     if (!message && images.length === 0) return;
+    // Cancelling the confirmation keeps the draft untouched.
+    if (externalLeading && !confirmedExternal) {
+      confirmingExternal = true;
+      return;
+    }
     const submittedText = draft.text;
     const submittedImages = [...images];
     submitting = true;
@@ -111,6 +125,11 @@
     } finally {
       submitting = false;
     }
+  }
+
+  function sendAnyway() {
+    confirmingExternal = false;
+    void send(true);
   }
 
   async function submitAnswer(question: NonNullable<typeof pendingQuestion>) {
@@ -305,6 +324,14 @@
   </div>
 </form>
 
+<Sheet open={confirmingExternal} title="Send to the built-in lead?" eyebrow="EXTERNAL LEAD" onclose={() => (confirmingExternal = false)}>
+  <p class="confirm-copy">Claude Code is leading this project. Send this to the built-in lead anyway?</p>
+  <div class="confirm-actions">
+    <button class="button button-quiet" type="button" onclick={() => (confirmingExternal = false)}>Cancel</button>
+    <button class="button button-primary" type="button" onclick={sendAnyway}>Send anyway</button>
+  </div>
+</Sheet>
+
 <style>
   .composer { width: 100%; margin: 0; }
   .draft-images {
@@ -389,5 +416,7 @@
   .stop-button:disabled { cursor: wait; }
   .composer-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 14px; padding: 8px 4px 0; }
   .composer-status { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 8px; font-weight: 600; letter-spacing: 0.04em; }
+  .confirm-copy { margin: 0 0 16px; color: var(--muted); font-family: var(--font-prose); font-size: 14px; line-height: 1.55; }
+  .confirm-actions { display: flex; justify-content: space-between; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); }
   @media (max-width: 560px) { .composer { width: 100%; } }
 </style>

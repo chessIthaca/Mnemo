@@ -1,3 +1,4 @@
+import type { ExternalLeadState } from "./externalLeadEngine";
 import type { IndexingSnapshot } from "./indexingEngine";
 import type { BoardPlan } from "./boardState";
 import type { WorkerDeletionPreview } from "./teamState";
@@ -572,6 +573,8 @@ export interface AppState {
   projectConflict: ProjectConflict | null;
   /** The open project's startup code-index and memory passes. */
   indexing: IndexingSnapshot | null;
+  /** Whether Claude Code leads the open project through the mnemo plugin. */
+  externalLead: ExternalLeadState;
   cleanupProjectId: string | null;
   cleanupBusy: boolean;
   /** An open worker-deletion confirmation with what each delete removes. */

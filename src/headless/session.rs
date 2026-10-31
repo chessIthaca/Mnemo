@@ -229,6 +229,8 @@ pub(crate) async fn pump_task(
 pub struct AgentSession {
     pub(crate) id: SessionId,
     pub(crate) agent: AgentId,
+    /// Actual loop ownership, independent of manager/registry bookkeeping.
+    pub(crate) agent_loop: std::sync::Weak<crate::agent::AgentLoop>,
     pub(crate) inner: Arc<EngineInner>,
     pub(crate) bus: broadcast::Sender<SessionEvent>,
 }
@@ -687,30 +689,14 @@ impl AgentSession {
         // removes it before dropping the engine's AgentLoop reference. A full
         // or closed queue with a manager entry is a failed close, unless the
         // loop has already gone independently.
-        if manager_present
-            && !sent
-            && self
-                .inner
-                .host
-                .agent_loops
-                .lock()
-                .await
-                .contains_key(&self.agent)
-        {
+        if manager_present && !sent && self.agent_loop.upgrade().is_some() {
             return Err(EngineError::session_closed(
                 "could not queue cancellation; the agent is still live",
             ));
         }
         let released = async {
             loop {
-                if !self
-                    .inner
-                    .host
-                    .agent_loops
-                    .lock()
-                    .await
-                    .contains_key(&self.agent)
-                {
+                if self.agent_loop.upgrade().is_none() {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -839,4 +825,68 @@ fn read_agent_plan(plans_dir: std::path::PathBuf) -> Result<Option<AgentPlan>, E
         goal: plan.goal,
         steps: plan.steps,
     }))
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::super::engine::Engine;
+    use crate::headless::SpawnOptions;
+
+    #[tokio::test]
+    async fn close_waits_for_the_loop_after_registry_exit() {
+        let root = tempfile::tempdir().expect("workspace");
+        let config = tempfile::tempdir().expect("config");
+        std::fs::write(
+            config.path().join("config.toml"),
+            "[general]\ndefault_provider = \"test\"\ndefault_model = \"local\"\n",
+        )
+        .expect("config");
+        std::fs::write(
+            config.path().join("endpoints.toml"),
+            "[[endpoint]]\nname = \"test\"\nkind = \"local\"\nbase_url = \"http://127.0.0.1:9/v1/\"\nmodels = [\"local\"]\n",
+        )
+        .expect("endpoints");
+        let engine = Engine::start(crate::headless::EngineOptions {
+            workspace: crate::workspace::Workspace::new(root.path()),
+            config_dir: Some(config.path().to_path_buf()),
+            permissions: crate::agent::policy::PermissionPolicy::OverridePermissions,
+            memory: crate::headless::MemoryBackend::Disabled,
+            index_codegraph: false,
+            require_git: false,
+            auto_install_embedder: false,
+        })
+        .await
+        .expect("start engine");
+        let session = engine.spawn(SpawnOptions::default()).await.expect("spawn");
+        let held_loop = session.agent_loop.upgrade().expect("live loop");
+        let weak_loop = session.agent_loop.clone();
+        let inner = session.inner.clone();
+        let agent = session.agent;
+        let mut closing = tokio::spawn(async move { session.close_and_wait().await });
+
+        for _ in 0..100 {
+            let manager_gone = inner.host.manager.lock().await.get(agent).is_none();
+            let registry_gone = !inner.host.agent_loops.lock().await.contains_key(&agent);
+            if manager_gone && registry_gone {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(inner.host.manager.lock().await.get(agent).is_none());
+        assert!(!inner.host.agent_loops.lock().await.contains_key(&agent));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut closing)
+                .await
+                .is_err(),
+            "registry removal returned while the AgentLoop was still alive"
+        );
+        assert!(weak_loop.upgrade().is_some());
+
+        drop(held_loop);
+        closing
+            .await
+            .expect("join close")
+            .expect("close after the final loop reference is released");
+        assert!(weak_loop.upgrade().is_none());
+    }
 }

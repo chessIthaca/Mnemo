@@ -1106,7 +1106,7 @@ impl AgentTask {
                 // precedes the memory session teardown). NoPolicy's hook is
                 // a no-op; WorkflowPolicy's is a documented no-op until the
                 // 2b/2c engine seam — the advisory seam, master-spec :230.
-                let agent_loop = self.agent_loop.clone();
+                let policy = self.agent_loop.policy();
                 // RAII guard: clears the dedup flag when the spawned task
                 // ends (success, failure, OR panic — Drop runs during
                 // unwinding). Moved into the task below.
@@ -1131,7 +1131,7 @@ impl AgentTask {
                     // panic — Drop runs during unwinding).
                     let _guard = guard;
                     // 2a.8: the policy hook precedes the teardown.
-                    agent_loop.policy().on_session_end().await;
+                    policy.on_session_end().await;
                     // The digest reads up to ~20 files synchronously — run it
                     // on the blocking pool so it never occupies a tokio
                     // worker either (review I2, 2026-08-18). Paths are owned;

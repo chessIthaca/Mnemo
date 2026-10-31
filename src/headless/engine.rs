@@ -412,9 +412,19 @@ impl Engine {
         }
         let id = SessionId::new(agent);
         self.inner.sessions.lock().await.insert(id, agent);
+        let agent_loop = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&agent)
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         Ok(AgentSession {
             id,
             agent,
+            agent_loop,
             inner: self.inner.clone(),
             bus,
         })
@@ -428,9 +438,19 @@ impl Engine {
     pub async fn session(&self, id: &SessionId) -> Option<AgentSession> {
         let agent = *self.inner.sessions.lock().await.get(id)?;
         let bus = self.session_bus()?;
+        let agent_loop = self
+            .inner
+            .host
+            .agent_loops
+            .lock()
+            .await
+            .get(&agent)
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         Some(AgentSession {
             id: *id,
             agent,
+            agent_loop,
             inner: self.inner.clone(),
             bus,
         })

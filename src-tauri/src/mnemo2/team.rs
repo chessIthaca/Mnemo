@@ -2640,8 +2640,14 @@ impl TeamRuntime {
                 .await;
             }
             if let Err(error) = live.session.close_and_wait().await {
+                let message = format!("could not close worker session: {error}");
                 self.live.lock().await.insert(worker_id.to_string(), live);
-                return Err(format!("could not close worker session: {error}"));
+                self.update_worker(worker_id, |worker| {
+                    worker.error = Some(message.clone());
+                })
+                .await;
+                self.persist().await?;
+                return Err(message);
             }
         }
         self.persist().await?;
@@ -3309,8 +3315,13 @@ impl TeamRuntime {
             if let Err(error) = live.session.close_and_wait().await {
                 self.live.lock().await.insert(worker_id.to_string(), live);
                 self.update_worker(worker_id, |worker| {
+                    // The Git merge landed, but keep the worker retryable:
+                    // `team.merge` skips Merged records and would otherwise
+                    // never retry session shutdown or checkout cleanup.
+                    worker.status = WorkerStatus::InReview;
+                    worker.merge = None;
                     worker.error = Some(format!(
-                        "merged, but worktree cleanup needs attention: could not close the worker session: {error}"
+                        "merge was committed, but cleanup needs attention; retry merge after closing the worker session: {error}"
                     ));
                 })
                 .await;
